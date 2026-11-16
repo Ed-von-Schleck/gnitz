@@ -4,8 +4,9 @@ use super::tests::Harness;
 use super::{ReducePlan, op_reduce};
 use crate::repr::{Batch, BatchBuilder, MappedShard, Run, from_runs_in_band};
 use crate::schema::{SchemaColumn, SchemaDescriptor, group_band};
-use crate::test_support::{assert_folds, map_shard, mix, pk_payload_schema, u64_pk_schema};
+use crate::test_support::{assert_folds, map_shard, pk_payload_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::PkBuf;
 use gnitz_wire::{AggDescriptor, AggFunc, TypeCode};
 

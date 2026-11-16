@@ -2,6 +2,7 @@
 //! desugar share, and the one SQL-name ↔ aggregate map. It reads no SQL text.
 
 use crate::error::{GnitzSqlError, unsupported_clause};
+use gnitz_expr::ReduceOutSlot;
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 
@@ -150,7 +151,8 @@ pub(crate) fn agg_col_def(op: WireAggFunc, src: Option<&ColumnDef>, ungrouped: b
 /// Hidden: the synthetic group key is a physical PK column but not a presentation
 /// column, so `SELECT *` shows the grouping values and aggregates, not the hash.
 pub(crate) fn group_pk_def() -> ColumnDef {
-    ColumnDef::new("_group_pk", TypeCode::U128, false).hidden()
+    let col = ReduceOutSlot::SYNTHETIC_KEY_COL;
+    ColumnDef::new("_group_pk", col.type_code, col.nullable).hidden()
 }
 
 /// AVG divides to F64; every other aggregate renders its raw value type.

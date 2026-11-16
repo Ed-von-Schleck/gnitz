@@ -7,10 +7,11 @@ use crate::repr::scatter::{Pick, UnifiedSet};
 use crate::repr::string_heap::{carried_dead, long_bytes_outside};
 use crate::schema::{SchemaColumn, probe_key};
 use crate::test_support::{
-    Rng, make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
     weighted_rows,
 };
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
 use std::rc::Rc;
@@ -96,7 +97,7 @@ fn shard_read_bench() {
     let nullable_i64 = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let one_in_ten = |i: usize| i.is_multiple_of(10).then_some(3_000_000_000 + i as u128);
     // A full-range i64, which no frame shrinks.
-    let scattered = |i: usize| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128;
+    let scattered = |i: usize| mix(i as u64) as u128;
 
     let tenants: Vec<String> = (0..50).map(|i| format!("tenant-{i:03}")).collect();
     let urls: Vec<String> = (0..2_000)

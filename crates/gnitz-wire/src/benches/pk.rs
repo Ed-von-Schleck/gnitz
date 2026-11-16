@@ -1,5 +1,6 @@
 use super::*;
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
 /// Instructions and cycles per key of [`PkKeys::from_keys`] at a stride in each of
@@ -12,27 +13,19 @@ fn pk_keys_from_keys_bench() {
     for shape in ["random", "dense-shuffled", "dense-ascending"] {
         for n in [1024usize, 65_536, 4 << 20] {
             for stride in [8usize, 16, 24, 40] {
-                let mut x = 0x5EED_0000 + stride as u64;
-                let mut next = || {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    x
-                };
+                let mut rng = Rng::new(0x5EED_0000 + stride as u64);
                 let mut flat = vec![0u8; n * stride];
                 match shape {
                     "random" => {
                         for word in flat.as_chunks_mut::<8>().0 {
-                            *word = next().to_be_bytes();
+                            *word = rng.next_u64().to_be_bytes();
                         }
                     }
                     _ => {
                         // OPK of i64 ids 0..n in the last 8 bytes, the rest a constant.
                         let mut ids: Vec<u64> = (0..n as u64).collect();
                         if shape == "dense-shuffled" {
-                            for i in (1..n).rev() {
-                                ids.swap(i, (next() % (i as u64 + 1)) as usize);
-                            }
+                            rng.shuffle(&mut ids);
                         }
                         for (key, id) in flat.chunks_exact_mut(stride).zip(ids) {
                             key.fill(0x80);

@@ -1,5 +1,6 @@
 use super::*;
 use crate::repr::pool::MAX_POOLED_BYTES;
+use gnitz_foundation::rng::mix;
 
 /// Carrying two whole heaps charges each source's rows the output leaves out —
 /// survivors interleaved across both — and every kept string reads back.
@@ -109,7 +110,7 @@ fn gather_rows_reads_every_backing_alike() {
         for key in (s..ROWS).step_by(SOURCES) {
             b.begin_row(key as u128, 1);
             b.put_int(match spread {
-                true => (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128,
+                true => mix(key as u64) as u128,
                 false => key as u128,
             });
             b.put_string(&format!("gathered-string-{key:08}"));

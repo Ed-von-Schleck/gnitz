@@ -2,9 +2,10 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema, string_batch, u64_pk_schema,
+    make_batch_raw, make_schema_u64_i64, make_string_batch, pk_payload_schema, string_batch, u64_pk_schema,
 };
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
@@ -79,7 +80,7 @@ fn consolidate_bench() {
 /// `i` of `0..n`, a power of two, to its place in a scattered permutation of
 /// `0..n`.
 fn dense(i: u64, n: u64) -> u64 {
-    i.wrapping_mul(0x9E37_79B9_7F4A_7C15) & (n - 1)
+    mix(i) & (n - 1)
 }
 
 /// `into_consolidated` over the rows a window emits into a view keyed by its

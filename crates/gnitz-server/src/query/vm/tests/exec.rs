@@ -7,7 +7,7 @@ use crate::test_support::{
     register_full_pk, weighted_rows, zset_of,
 };
 use gnitz_store::relation::{PkRule, RelationKind, StoreConfig};
-use gnitz_wire::{AggDescriptor, AggFunc, JoinKind, TypeCode, ViewBudget};
+use gnitz_wire::{AggDescriptor, AggFunc, JoinKind, TypeCode, ViewBudget, WeightSlots};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
 
@@ -452,7 +452,7 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
 fn a_second_topn_epoch_displaces_the_first_ones_row() {
     let schema = make_schema_u128_i64();
     let order = [gnitz_wire::OrderKey { col: 1, desc: true, nulls_first: false }];
-    let plan = stream::OrderedPlan::top_n(&schema, &[], &order, 1, 0).unwrap();
+    let plan = stream::OrderedPlan::top_n(&schema, &[], &order, WeightSlots { skip: 0, keep: 1 }).unwrap();
     let out_schema = *plan.output_schema();
     let mut p = ProgramBuilder::default();
     let index_table = p.declare("topnidx".into(), *plan.index_schema());

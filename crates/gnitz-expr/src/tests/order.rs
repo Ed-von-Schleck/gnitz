@@ -16,13 +16,13 @@ fn order_bits_reads_a_float_slot_as_its_image() {
             &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
             &[0],
         );
-        let mut v = TestView::for_schema(&schema, FLOATS.len());
+        let mut v = TestView::new(&schema, FLOATS.len());
         let bits = |f: f64| match kind {
             ScalarKind::F32 => (f as f32).to_bits() as u64,
             _ => f.to_bits(),
         };
         for (row, &f) in FLOATS.iter().enumerate() {
-            v.set_native(&schema, row, 1, bits(f) as u128);
+            v.set(row, 1, bits(f) as u128);
         }
         let loc = schema.locate(1);
         for (row, &f) in FLOATS.iter().enumerate() {
@@ -91,10 +91,10 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
 #[test]
 fn null_placement_ignores_the_direction() {
     let schema = schema_pk_ints(1, true);
-    let mut v = TestView::for_schema(&schema, 3);
-    v.set_int(1, 0, 5);
-    v.set_null(0, 0);
-    v.set_null(2, 0);
+    let mut v = TestView::new(&schema, 3);
+    v.set(1, 1, 5i64);
+    v.set_null(0, 1);
+    v.set_null(2, 1);
     let loc = schema.locate(1);
     for nulls_first in [false, true] {
         let want = if nulls_first { Ordering::Less } else { Ordering::Greater };
@@ -121,7 +121,7 @@ fn null_placement_ignores_the_direction() {
 fn a_pk_key_never_takes_the_null_arm() {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     // Keys 1 and 2.
-    let mut v = TestView::for_schema(&schema, 2);
+    let mut v = TestView::new(&schema, 2);
     for row in 0..2 {
         v.set_null_word(row, u64::MAX);
     }
@@ -172,8 +172,7 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
         b"abcdefghijklmnoq",
         b"b",
     ];
-    let mut st = 0x9E3779B97F4A7C15u64;
-    let mut rng = move || crate::test_support::xorshift(&mut st) as usize;
+    let mut rng = gnitz_foundation::rng::Rng::new(0x9E3779B97F4A7C15);
     for &tc in TypeCode::ALL {
         // `(key column 0, the leading key, a payload column)`, the leading key a payload column.
         let schema = SchemaDescriptor::new(
@@ -184,16 +183,16 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
             ],
             &[0],
         );
-        let mut v = TestView::for_schema(&schema, ROWS);
+        let mut v = TestView::new(&schema, ROWS);
         for row in 0..ROWS {
             match tc.is_german_string() {
-                true => v.set_string(row, 0, STRINGS[rng() % STRINGS.len()]),
-                false => v.set_native(&schema, row, 1, PATTERNS[rng() % PATTERNS.len()]),
+                true => v.set(row, 1, rng.pick(STRINGS)),
+                false => v.set(row, 1, rng.pick(PATTERNS)),
             }
-            if rng() % 5 == 0 {
-                v.set_null(row, 0);
+            if rng.gen_range(5) == 0 {
+                v.set_null(row, 1);
             }
-            v.set_int(row, 1, (rng() % 3) as i64);
+            v.set(row, 2, rng.gen_range(3) as i64);
         }
         let mut cases = vec![(schema, v, 1u16)];
         if tc.is_pk_eligible() {
@@ -206,9 +205,9 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
                 ],
                 &[0, 1],
             );
-            let mut v = TestView::for_schema(&schema, ROWS);
+            let mut v = TestView::new(&schema, ROWS);
             for row in 0..ROWS {
-                v.set_native(&schema, row, 0, PATTERNS[rng() % PATTERNS.len()]);
+                v.set(row, 0, rng.pick(PATTERNS));
             }
             cases.push((schema, v, 0));
         }
@@ -237,10 +236,10 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
 fn max_lead_after_a_sort_is_the_leading_keys() {
     // `(id, v, w)`: v ties on rows 0 and 1, which w tells apart far above any v.
     let schema = schema_pk_ints(2, false);
-    let mut v = TestView::for_schema(&schema, 3);
-    for (row, (lead, next)) in [(1, 100), (1, 50), (0, 7)].into_iter().enumerate() {
-        v.set_int(row, 0, lead);
-        v.set_int(row, 1, next);
+    let mut v = TestView::new(&schema, 3);
+    for (row, (lead, next)) in [(1i64, 100i64), (1, 50), (0, 7)].into_iter().enumerate() {
+        v.set(row, 1, lead);
+        v.set(row, 2, next);
     }
     let order = [
         OrderKey { col: 1, desc: false, nulls_first: false },

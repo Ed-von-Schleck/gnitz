@@ -43,12 +43,19 @@ impl EmitStore {
         if type_code.wire_stride() == 8 {
             return Some(EmitStore::W8);
         }
-        let fi = FixedInt::from_type_code(type_code).filter(|&fi| src.range_check() == Some(fi))?;
+        FixedInt::from_type_code(type_code)
+            .filter(|&fi| src.range_check() == Some(fi))
+            .map(EmitStore::int)
+    }
+
+    /// The store for a slot holding exactly integer type `fi`: its low
+    /// `fi.width()` bytes.
+    pub(crate) fn int(fi: FixedInt) -> Self {
         match fi.width() {
-            1 => Some(EmitStore::W1),
-            2 => Some(EmitStore::W2),
-            4 => Some(EmitStore::W4),
-            _ => None,
+            1 => EmitStore::W1,
+            2 => EmitStore::W2,
+            4 => EmitStore::W4,
+            _ => EmitStore::W8,
         }
     }
 
@@ -119,9 +126,9 @@ impl LogicalProgram {
                 num_payload_cols,
             });
         }
-        let out_slots = out_schema.payload_locator_iter();
         let (mut copies, mut emits) = (Vec::new(), Vec::new());
-        for (slot, (sink, out_loc)) in self.sinks().iter().zip(out_slots).enumerate() {
+        for (slot, sink) in self.sinks().iter().enumerate() {
+            let out_loc = out_schema.payload_locator(slot);
             let (out, type_code) = (slot as u32, out_loc.type_code());
             match *sink {
                 Sink::Col(col) => {
@@ -148,7 +155,7 @@ impl LogicalProgram {
                 }
             }
         }
-        Ok((ColMoves::new(copies, in_schema.nullable_payload_slots()), emits))
+        Ok((ColMoves::new(copies, in_schema), emits))
     }
 }
 

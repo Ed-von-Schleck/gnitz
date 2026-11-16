@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{OrderLocator, RowRanking, WeightSlots, order_locators};
-use gnitz_wire::OrderKey;
+use gnitz_expr::{OrderLocator, RowRanking, order_locators};
+use gnitz_wire::{OrderKey, WeightSlots};
 
 use crate::error::GnitzSqlError;
 

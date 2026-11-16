@@ -1,8 +1,8 @@
 use super::*;
-use crate::test_support::{col, ncol, schema, xorshift};
+use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
-use gnitz_expr::WeightSlots;
-use gnitz_wire::{OrderKey, TypeCode};
+use gnitz_foundation::rng::Rng;
+use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 /// `rows` rows of `(id U64 pk, v)`, ids ascending, each `v` written by `write` from a
 /// pseudo-random word.
@@ -10,10 +10,10 @@ fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchAppender<'_>, u64))
     let sch = schema(vec![col("id", TypeCode::U64), ncol("v", tc)], &[0]);
     let mut b = ZSetBatch::new(&sch);
     let mut app = BatchAppender::new(&mut b);
-    let mut st = 0x9E3779B97F4A7C15u64;
+    let mut rng = Rng::new(0x9E3779B97F4A7C15);
     for i in 0..rows {
         app.add_row(i as u128, 1);
-        write(&mut app, xorshift(&mut st));
+        write(&mut app, rng.next_u64());
     }
     (sch, b)
 }
@@ -21,8 +21,8 @@ fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchAppender<'_>, u64))
 /// `rows` rows of `(id U64 pk, v I64)`, the ids `w` concatenated ascending runs of
 /// pseudo-random values: a multi-worker PK walk's reply, one worker after another.
 fn runs(rows: usize, w: usize) -> (Schema, ZSetBatch) {
-    let mut st = 0x9E3779B97F4A7C15u64;
-    let mut ids: Vec<u64> = (0..rows).map(|_| xorshift(&mut st)).collect();
+    let mut rng = Rng::new(0x9E3779B97F4A7C15);
+    let mut ids: Vec<u64> = (0..rows).map(|_| rng.next_u64()).collect();
     for run in ids.chunks_mut(rows.div_ceil(w)) {
         run.sort_unstable();
     }

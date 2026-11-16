@@ -2,10 +2,9 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::repr::merge::run_merge;
 use crate::schema::SchemaColumn;
-use crate::test_support::{
-    map_coded_shard, map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema, prose, u64_pk_schema,
-};
+use crate::test_support::{map_coded_shard, map_shard, pk_payload_schema, pk_u64_two_i64_schema, prose, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::{PkBuf, TypeCode};
 use std::hint::black_box;
 use std::rc::Rc;

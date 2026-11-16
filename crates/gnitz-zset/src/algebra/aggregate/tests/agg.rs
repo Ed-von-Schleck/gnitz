@@ -2,7 +2,8 @@ use super::*;
 use crate::algebra::aggregate::ReduceShape;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{Rng, STRS, le_cell, pk_payload_schema};
+use crate::test_support::{STRS, le_cell, pk_payload_schema};
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{AggDescriptor, TypeCode};
 
 const N: usize = 97;

@@ -1,6 +1,7 @@
 use super::*;
 use crate::BatchAppender;
 use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{ColumnDef, TypeCode};
 use std::hint::black_box;
 
@@ -44,7 +45,7 @@ fn pk_column_push_bench() {
 fn gather_bench() {
     const ROWS: usize = 262_144;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let mut rng = gnitz_zset_testkit::Rng::new(0x9E3779B97F4A7C15);
+    let mut rng = Rng::new(0x9E3779B97F4A7C15);
     let mut perm: Vec<u32> = (0..ROWS as u32).collect();
     rng.shuffle(&mut perm);
     for (name, ints, string) in [

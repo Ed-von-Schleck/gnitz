@@ -5,7 +5,8 @@ use super::tests::stride_schema;
 use super::tests::trailing_gk;
 use super::tests::trailing_key_batch;
 use crate::storage::Cut;
-use crate::test_support::{Rng, make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use gnitz_foundation::rng::Rng;
 use gnitz_zset::schema::probe_key;
 
 /// The two read entries over a tree the upkeep built from scattered spills, at

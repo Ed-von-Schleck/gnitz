@@ -1,8 +1,9 @@
 use super::AdhocFold;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{mix, u64_pk_schema};
+use crate::test_support::u64_pk_schema;
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, TypeCode};
 
 const N: u64 = 1 << 20;

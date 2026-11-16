@@ -1,9 +1,10 @@
 use super::*;
 use crate::relation::{IndexClaim, PkRule, RelationKind};
 use crate::test_support::{
-    RelationFixture, Rng, TID, batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema,
+    RelationFixture, TID, batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema,
     relation_fixture, zset_of,
 };
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{PkColList, ReadSpec, TypeCode, ViewBudget, image_mask, opk_bias};
 use gnitz_zset::repr::{BatchBuilder, Run};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};

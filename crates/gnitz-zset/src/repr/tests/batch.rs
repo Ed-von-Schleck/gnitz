@@ -7,6 +7,7 @@ use crate::test_support::{
     make_schema_u64_i64, make_string_batch, payload0_i64, pk_only_schema, ragged_batch, ragged_schema, read_strings,
     u64_pk_schema, weighted_rows,
 };
+use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 
 /// `append_row_from_source` copies the PK verbatim and carries the
@@ -751,9 +752,7 @@ fn naive_runs(n: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
 fn runs_where_zip_matches_a_per_position_scan_across_word_boundaries() {
     // Lengths around one and two 64-position words, and a short tail.
     for n in [0, 1, 63, 64, 65, 127, 128, 129, 200] {
-        let a: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61)
-            .collect();
+        let a: Vec<u64> = (0..n as u64).map(|i| mix(i) >> 61).collect();
         let b: Vec<u64> = (0..n as u64).map(|i| (i * 7 + 3) % 5).collect();
         let keep = |x: &u64, y: &u64| *x != 0 && *y != 0;
         assert_eq!(

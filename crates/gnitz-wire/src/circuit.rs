@@ -3,7 +3,7 @@
 //! whole circuit out as one catalog cell.
 
 use crate::codec::{Reader, Writer, decode_all};
-use crate::operator::{ComputeMap, GroupAggs, OrderKey, col_list, order_keys};
+use crate::operator::{ComputeMap, GroupAggs, OrderKey, WeightSlots, col_list, order_keys};
 use crate::{MAX_COLUMNS, TypeCode};
 
 // ---------------------------------------------------------------------------
@@ -37,8 +37,8 @@ wire_enum! {
         JoinCross = 14,
         ExchangeShard = 16,
         NullExtend = 17,
-        /// Per-group top-N: the rows filling the first `limit` weight slots past
-        /// `offset` of each group in ORDER BY order.
+        /// Per-group top-N: the rows filling the first `slots.keep` weight slots
+        /// past `slots.skip` of each group in ORDER BY order.
         TopN = 19,
         /// Per-group running values: every row of a group, widened by its
         /// values over the rows at or before it in ORDER BY order.
@@ -194,14 +194,13 @@ pub enum OpNode {
         nulls_first: bool,
     },
     /// Per-group top-N: for each `group_cols` value, the rows filling weight slots
-    /// `offset .. offset + limit` of the group in `order`, each at the weight of
+    /// `slots.skip .. slots.skip + slots.keep` of the group in `order`, each at the weight of
     /// the slots it fills. Keyed like a `Reduce` over the same group set, and reads
     /// its input co-located by it.
     TopN {
         group_cols: Vec<u32>,
         order: Vec<OrderKey>,
-        limit: u64,
-        offset: u64,
+        slots: WeightSlots,
     },
     /// Per-group running values: every row of each `group_cols` value at its own
     /// weight, widened by its values over the rows of the group at or before its
@@ -278,6 +277,9 @@ impl OpNode {
             OpNode::Reduce { group: g, .. } if !g.aggs.iter().any(|d| d.agg_op == crate::AggFunc::Count) => {
                 return Err("a reduce carries no COUNT(*)".into());
             }
+            OpNode::TopN { slots, .. } if slots.keep == 0 => {
+                return Err("a top-N keeps no slot".into());
+            }
             _ => {}
         }
         Ok(())
@@ -313,12 +315,7 @@ impl OpNode {
             OpNode::NullExtend { type_codes, nulls_first } => {
                 w.put(&Opcode::NullExtend).bool(*nulls_first).list(type_codes)
             }
-            OpNode::TopN { group_cols, order, limit, offset } => w
-                .put(&Opcode::TopN)
-                .u64(*limit)
-                .u64(*offset)
-                .list(group_cols)
-                .list(order),
+            OpNode::TopN { group_cols, order, slots } => w.put(&Opcode::TopN).put(slots).list(group_cols).list(order),
             OpNode::Window { group, order, rank, dense_rank } => w
                 .put(&Opcode::Window)
                 .bool(*rank)
@@ -369,11 +366,10 @@ impl OpNode {
                 OpNode::NullExtend { type_codes, nulls_first }
             }
             Opcode::TopN => {
-                let limit = r.u64()?;
-                let offset = r.u64()?;
+                let slots = r.get()?;
                 let group_cols = col_list(r)?;
                 let order = order_keys(r)?;
-                OpNode::TopN { group_cols, order, limit, offset }
+                OpNode::TopN { group_cols, order, slots }
             }
             Opcode::Window => {
                 let (rank, dense_rank) = (r.bool()?, r.bool()?);
@@ -612,12 +608,11 @@ impl Circuit {
     }
 
     /// [`OpNode::TopN`].
-    pub fn top_n(&mut self, input: NodeId, group_cols: &[u32], order: &[OrderKey], limit: u64, offset: u64) -> NodeId {
+    pub fn top_n(&mut self, input: NodeId, group_cols: &[u32], order: &[OrderKey], slots: WeightSlots) -> NodeId {
         let op = OpNode::TopN {
             group_cols: group_cols.to_vec(),
             order: order.to_vec(),
-            limit,
-            offset,
+            slots,
         };
         self.add(op, &[input])
     }

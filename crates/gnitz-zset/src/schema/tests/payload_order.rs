@@ -1,7 +1,8 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
-use crate::test_support::{FLOATS, Rng, STRS, edge_native, opk_pk, random_schema, row_key};
+use crate::test_support::{FLOATS, STRS, edge_native, opk_pk, random_schema, row_key};
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{ScalarKind, TypeCode, key_image};
 
 /// A payload cell by its type's order: an integer by its key image, a float by

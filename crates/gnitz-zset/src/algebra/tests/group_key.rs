@@ -2,9 +2,10 @@ use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, make_schema_pk_u64_payload_string, mix, opk_pk,
-    pk_only_schema, radix_fold_rows, u64_pk_schema,
+    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, make_schema_pk_u64_payload_string, opk_pk, pk_only_schema,
+    radix_fold_rows, u64_pk_schema,
 };
+use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 use proptest::prelude::*;
 use std::collections::HashMap;

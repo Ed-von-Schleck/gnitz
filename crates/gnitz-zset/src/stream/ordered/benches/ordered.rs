@@ -3,9 +3,10 @@ use super::OrderedPlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
-use crate::test_support::{mix, u64_pk_schema};
+use crate::test_support::u64_pk_schema;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{OrderKey, TypeCode};
+use gnitz_foundation::rng::mix;
+use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 const N: u64 = 1 << 16;
 
@@ -155,7 +156,8 @@ fn order_index_entries_bench() {
         let pk = index.schema.pk_stride();
         let (folded, fold) = counter.measure(|| std::hint::black_box(entries.to_consolidated()));
         assert_eq!(folded.len(), d1.len(), "no two entries are one element");
-        let mut h = Harness::new(OrderedPlan::top_n(&schema, group_cols, &keys, 10, 0).unwrap());
+        let mut h =
+            Harness::new(OrderedPlan::top_n(&schema, group_cols, &keys, WeightSlots { skip: 0, keep: 10 }).unwrap());
         let [e1, e2, e3] = h.bulk_epochs(&counter, &d1, &d2);
         println!(
             "order_index_entries_bench {label:<33} index {bytes:6.1} B/row (pk {pk:2}), build {:6.1}, fold {:7.1}; \

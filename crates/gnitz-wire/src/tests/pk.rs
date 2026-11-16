@@ -1,5 +1,6 @@
 use super::*;
 use crate::{FixedInt, TypeCode, cmp_col_window};
+use gnitz_foundation::rng::Rng;
 
 /// Bit patterns every width-parameterized sweep below truncates to its type's
 /// width: both sign boundaries, the all-ones edges, and the 2^63 / 2^64 / 2^127
@@ -171,16 +172,10 @@ fn a_pk_buf_reads_back_as_written_or_is_refused() {
 #[test]
 fn pk_keys_from_images_is_the_byte_sort() {
     assert_eq!(PkKeys::from_sorted(2, vec![]).bounds(), None);
-    let mut x = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834u128;
-    let mut next = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
     for stride in 1..=MAX_PK_BYTES {
         let mut raw: Vec<Vec<u8>> = (0..64)
-            .map(|_| (0..stride).map(|_| next() as u8 & 1).collect())
+            .map(|_| (0..stride).map(|_| rng.gen_range(2) as u8).collect())
             .collect();
         raw.push(raw[3].clone());
         let mut want = raw.clone();
@@ -298,13 +293,7 @@ fn pk_keys_from_ascending_drops_repeats() {
 /// the byte sort of its keys, and at a narrow stride sorting their images agrees.
 #[test]
 fn pk_keys_from_images_radix_is_the_byte_sort() {
-    let mut x = 0x2545_F491_4F6C_DD1Du64;
-    let mut next = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut rng = Rng::new(0x2545_F491_4F6C_DD1D);
     for stride in 1..=2 * NARROW_PK_MAX_BYTES {
         for n in [255usize, 256, 300, 5000] {
             for sparse in [true, false] {
@@ -312,13 +301,13 @@ fn pk_keys_from_images_radix_is_the_byte_sort() {
                     .map(|_| match sparse {
                         // Only the lowest byte and the highest vary.
                         true => {
-                            let r = next();
+                            let r = rng.next_u64();
                             let mut key = vec![0u8; stride];
                             key[0] |= (r >> 8) as u8 & 3;
                             key[stride - 1] = r as u8;
                             key
                         }
-                        false => (0..stride).map(|_| next() as u8).collect(),
+                        false => (0..stride).map(|_| rng.next_u64() as u8).collect(),
                     })
                     .collect();
                 let mut want = raw.clone();

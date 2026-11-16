@@ -20,9 +20,11 @@
 //! [`ExprBuilder`] assembles a [`LogicalProgram`], the wire form, which encodes
 //! to a blob and decodes back from one. Resolved against a schema, it becomes a
 //! [`RowFilter`], a [`ScalarEval`] or a [`MapEval`], each running the morsel
-//! kernels of `morsel.rs` and `simd.rs`. The wire ids, both instruction tables
-//! and the blob framing live in `blob.rs`, and `tests/blob.rs` binds them to each
-//! other and to `EXPR_BLOB_VERSION`. The selector families are declared in
+//! kernels of `morsel.rs` and `simd.rs`. Each instruction's wire layout is
+//! declared on its `LogicalInstr` variant in `program.rs`, from which
+//! `blob.rs`'s `expr_instrs!` derives the opcodes and both instruction tables;
+//! `blob.rs` also holds the blob framing, and `tests/blob.rs` pins all of it to
+//! `EXPR_BLOB_VERSION`. The selector families are declared in
 //! `program.rs`, except `CalendarOp`, which `calendar.rs` declares beside the
 //! arithmetic it selects. `gnitz-wire` keeps only `EXPR_BLOB_VERSION`, the word
 //! its `SYS_SCHEMA_DIGEST` const fold must see — it cannot depend on this crate
@@ -39,14 +41,12 @@
 //!
 //! Client and engine compute these alike because they call the same code:
 //!
-//! - the ORDER BY ranking and the LIMIT/OFFSET weight-slot cut ([`RowRanking`],
-//!   [`WeightSlots`], [`order_locators`]);
+//! - the ORDER BY ranking ([`RowRanking`], [`order_locators`]);
 //! - a column copy and the null bits it moves ([`ColCopy`], [`ColMoves`]), and
 //!   a copy-only map ([`LogicalProgram::copy_cols`]);
 //! - a reduce's output key and layout ([`SchemaDescriptor::reduce_out_key`],
 //!   [`SchemaDescriptor::reduce_out_layout`]);
-//! - LIKE patterns ([`LikePattern`], [`LikeMatcher`]);
-//! - a float's text ([`FloatText`]).
+//! - LIKE patterns ([`LikePattern`], [`LikeMatcher`]).
 //!
 //! # Layout
 //!
@@ -102,7 +102,6 @@ pub use eval::*;
 pub use like::*;
 pub use locator::*;
 pub use map::MapEval;
-pub use morsel::FloatText;
 pub use order::*;
 pub use program::*;
 pub use schema::*;

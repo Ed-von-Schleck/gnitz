@@ -6,9 +6,7 @@ use crate::hir::bind::tests::bound;
 fn cut(sql: &str) -> Option<(u64, u64)> {
     fn find(rel: &RelExpr) -> Option<(u64, u64)> {
         match rel {
-            RelExpr::Ordered {
-                op: OrderedOp::TopN { limit, offset }, ..
-            } => Some((*limit, *offset)),
+            RelExpr::Ordered { op: OrderedOp::TopN(slots), .. } => Some((slots.keep, slots.skip)),
             RelExpr::Project { input, .. } | RelExpr::Filter { input, .. } => find(input),
             _ => None,
         }

@@ -63,8 +63,7 @@ fn sample(op: Opcode) -> OpNode {
                 crate::OrderKey { col: 3, desc: true, nulls_first: false },
                 crate::OrderKey { col: 0, desc: false, nulls_first: true },
             ],
-            limit: 10,
-            offset: 5,
+            slots: crate::WeightSlots { skip: 5, keep: 10 },
         },
         Opcode::Window => OpNode::Window {
             group: GroupAggs {
@@ -150,13 +149,11 @@ fn every_op_node_variant_roundtrips() {
             },
             local: false,
         },
-        // The global shape: no group, one key, no offset — and a zero limit,
-        // which frames fine: refusing it is the top-N kernel's.
+        // The global shape: no group, one key, no offset.
         OpNode::TopN {
             group_cols: vec![],
             order: vec![crate::OrderKey { col: 2, desc: false, nulls_first: false }],
-            limit: 0,
-            offset: 0,
+            slots: crate::WeightSlots { skip: 0, keep: 1 },
         },
         // The other NULL-key rule than the sample's.
         OpNode::Map(MapKind::Reindex {
@@ -332,8 +329,14 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
         },
         local: false,
     };
-    let cases: [(OpNode, &[NodeId], &str); 7] = [
+    let keepless = OpNode::TopN {
+        group_cols: vec![],
+        order: vec![crate::OrderKey { col: 0, desc: false, nulls_first: false }],
+        slots: crate::WeightSlots { skip: 3, keep: 0 },
+    };
+    let cases: [(OpNode, &[NodeId], &str); 8] = [
         (keyless, &[0], "a reindex names no key columns"),
+        (keepless, &[0], "a top-N keeps no slot"),
         (
             OpNode::Map(MapKind::HashRow { cols: vec![] }),
             &[0],

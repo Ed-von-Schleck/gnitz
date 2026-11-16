@@ -1,7 +1,7 @@
 use super::tests::{key_region, pack};
 use super::*;
 use crate::repr::seek::{ColPtr, seek_lower_bound};
-use crate::test_support::Rng;
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{FixedInt, TypeCode};
 
 /// Instructions per value to decode a framed region in bulk, at each cell

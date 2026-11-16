@@ -154,7 +154,7 @@ impl JoinPlan {
                 .zip(t_cols)
                 .map(|(slot, src)| ColCopy { src, slot, width: src.size() })
                 .collect(),
-            walked.nullable_payload_slots(),
+            walked,
         );
         Ok(JoinPlan {
             output_schema,

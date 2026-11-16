@@ -26,10 +26,10 @@ use crate::repr::{Batch, CursorRow, MemBatch, ReadCursor, Run, pk_group_end};
 use crate::schema::{DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, compare_pk_ordering};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
-use gnitz_wire::{OrderKey, TypeCode};
+use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 use crate::algebra::{IMAGE_COL, ImageCol, copy_columns, image_slot_col};
-use gnitz_expr::{ColCopy, ColMoves, ColumnLocator, WeightSlots};
+use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
 
 use window::{Running, Window};
 
@@ -495,7 +495,7 @@ impl OrderIndex {
             lead,
             rest,
             row: (first..first + row_cols).map(|c| schema.locate(c)).collect(),
-            moves: ColMoves::new(copies, input.nullable_payload_slots()),
+            moves: ColMoves::new(copies, input),
             images: (first - images..first).map(|c| schema.locate(c)).collect(),
             schema,
         };

@@ -25,10 +25,9 @@ const EDGES: [i64; 15] = [
 /// arbitrary patterns and small values that collide.
 fn operand_lanes() -> (Vec<i64>, Vec<i64>) {
     let (mut a, mut b) = pairs(&EDGES);
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || crate::test_support::xorshift(&mut state) as i64;
+    let mut rng = gnitz_foundation::rng::Rng::new(0x9e37_79b9_7f4a_7c15);
     while !a.len().is_multiple_of(64) || a.len() < 512 {
-        let (x, y) = (next(), next());
+        let (x, y) = (rng.next_u64() as i64, rng.next_u64() as i64);
         let small = a.len().is_multiple_of(3);
         a.push(if small { x % 4 } else { x });
         b.push(if small { y % 4 } else { y });

@@ -5,6 +5,7 @@ use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
 };
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, TypeCode};
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
@@ -391,7 +392,7 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
         &[0xA9],
         b"0123456789",
     ];
-    let mut rng = crate::test_support::Rng::new(0x9E37_79B9_7F4A_7C15);
+    let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
     let mut rnd = |m: u64| rng.gen_range(m);
     let (mut ok_n, mut bad_n) = (0, 0);
     for _ in 0..20000 {

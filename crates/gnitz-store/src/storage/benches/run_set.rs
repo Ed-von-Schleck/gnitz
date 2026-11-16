@@ -1,7 +1,8 @@
 use super::super::table::{DEFAULT_RAM_TIER_BYTES, MEMTABLE_BYTES};
 use super::*;
-use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, mix};
+use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::{self, Counter};
+use gnitz_foundation::rng::mix;
 use gnitz_zset::repr::BatchBuilder;
 use std::rc::Rc;
 

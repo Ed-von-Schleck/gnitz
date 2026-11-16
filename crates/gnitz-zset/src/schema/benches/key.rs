@@ -1,6 +1,6 @@
 use super::*;
-use crate::test_support::Rng;
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
 /// Instructions per comparison of `stride`-byte key pairs laid out in `flat`.

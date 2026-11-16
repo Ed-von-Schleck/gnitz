@@ -3,7 +3,8 @@ use std::cmp::Ordering;
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, range_band};
-use crate::test_support::{Rng, edge_native, pk_only_schema, random_schema};
+use crate::test_support::{edge_native, pk_only_schema, random_schema};
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{KeyRange, MAX_PK_COLUMNS, PkColList, TypeCode, cmp_col_window, key_image};
 
 /// Over PKs of every suffix width and a nullable indexed column of every

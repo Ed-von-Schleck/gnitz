@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::Rng;
+use gnitz_foundation::rng::Rng;
 use xorf::Filter;
 
 /// A `u128` PK through the real key derivation, as its OPK bytes.

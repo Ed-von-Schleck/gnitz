@@ -10,9 +10,10 @@ use gnitz_core::{RelDescriptor, RelName, Schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
 use gnitz_zset::schema::encode_schema_block;
-use gnitz_zset_testkit::{encode_to_wire_vec, make_batch, make_schema_u64_i64, mix};
+use gnitz_zset_testkit::{encode_to_wire_vec, make_batch, make_schema_u64_i64};
 
 use super::*;
+use gnitz_foundation::rng::mix;
 
 /// Rows the copy starts with, at `v = id`.
 const ROWS: u64 = 200_000;

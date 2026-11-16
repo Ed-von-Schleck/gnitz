@@ -2,9 +2,10 @@ use super::*;
 use crate::repr::{BatchBuilder, MemBatch};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    Rng, STRS, edge_native, le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, random_schema,
+    STRS, edge_native, le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, random_schema,
     u64_pk_schema,
 };
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
 
 /// `native`, a `tc` value in its low bytes, sign- or zero-extended to 128 bits.

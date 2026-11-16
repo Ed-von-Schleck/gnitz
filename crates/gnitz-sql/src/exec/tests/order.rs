@@ -2,8 +2,7 @@ use super::*;
 use crate::test_support::Cell::{self, Int, Null, Str};
 use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
-use gnitz_expr::WeightSlots;
-use gnitz_wire::{OrderKey, TypeCode};
+use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 /// A wire key over column `col`.
 const fn key(col: u16, desc: bool, nulls_first: bool) -> OrderKey {

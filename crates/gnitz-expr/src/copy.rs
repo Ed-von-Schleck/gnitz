@@ -1,7 +1,7 @@
 //! Columns copied verbatim from one row layout into another, and the null bits
 //! and string slots that follow from the copies.
 
-use crate::ColumnLocator;
+use crate::{ColumnLocator, SchemaDescriptor};
 
 /// A column copied verbatim into another row layout.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -43,9 +43,9 @@ impl NullMove {
 }
 
 impl ColMoves {
-    /// The moves of `copies`; `nullable` is the input's payload slots that admit
-    /// NULL.
-    pub fn new(copies: Vec<ColCopy>, nullable: u64) -> Self {
+    /// The moves of `copies`, each reading a column of `src`.
+    pub fn new(copies: Vec<ColCopy>, src: &SchemaDescriptor) -> Self {
+        let nullable = src.nullable_payload_slots();
         let mut moves: Vec<NullMove> = Vec::new();
         let mut string_slots = 0u64;
         for c in &copies {

@@ -1,8 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{Rng, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, weighted_rows};
+use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, weighted_rows};
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
 

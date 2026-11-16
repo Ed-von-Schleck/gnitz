@@ -4,8 +4,8 @@ use super::{ColKind, FloatUnaryOp, IntUnaryOp, ReadAs};
 use crate::SchemaDescriptor;
 use crate::eval::Resolved;
 use crate::test_support::{
-    in_set, is_not_null_op, is_null_op, make_n_col_view, make_string_view, result_prog, row_values, scalar_prog,
-    schema_pk, schema_pk_ints, schema_pk_strings, verdicts,
+    fill, in_set, is_not_null_op, is_null_op, result_prog, row_values, scalar_prog, schema_pk, schema_pk_ints,
+    schema_pk_strings, verdicts,
 };
 use crate::{
     CalendarOp, CmpOp, ConstIdx, ExprValidateErr, IntArithOp, LogicalInstr, LogicalProgram, PoolEntry, Reg, Sink,
@@ -396,7 +396,7 @@ fn int_in_set_membership_over_every_pool_shape() {
         let (instrs, consts) = in_set(pool.iter().copied());
         // One row per probe, then a NULL operand.
         let n = probes.len() + 1;
-        let mb = make_n_col_view(
+        let mb = fill(
             &schema,
             n,
             |row, _| probes.get(row).map_or(0, |&(value, _)| value),
@@ -404,7 +404,7 @@ fn int_in_set_membership_over_every_pool_shape() {
         );
         let want: Vec<Option<i128>> = probes.iter().map(|&(_, member)| Some(member)).chain([None]).collect();
         assert_eq!(
-            verdicts(&schema, instrs, consts, &mb),
+            verdicts(instrs, consts, &mb),
             want,
             "tc={col_tc} pool_len={}",
             pool.len()
@@ -524,7 +524,7 @@ fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     let schema = schema_pk_strings(1, false);
     let like = |ci| LogicalInstr::StrLike { src: Reg(0), pat_idx: ConstIdx(0), ci };
     let instrs = [LogicalInstr::LoadColStr { col: 1 }, like(false), like(true)];
-    let view = make_string_view(&schema, 1, |_, _| b"ABC", |_, _| false);
+    let view = fill(&schema, 1, |_, _| b"ABC", |_, _| false);
     // LIKE misses and ILIKE matches, each read as its own program's result.
     for (result, want) in [(1, 0), (2, 1)] {
         let mut ev = scalar_prog(&schema, instrs[..=result].to_vec(), vec![b"abc".to_vec()]);
@@ -563,6 +563,6 @@ fn a_scalar_register_past_a_string_one_has_its_lane() {
         LogicalInstr::LoadColStr { col: 2 },
         LogicalInstr::StrLen { a: Reg(2), chars: false },
     ];
-    let view = make_string_view(&schema, 1, |_, c| ["ab", "cdef"][c], |_, _| false);
+    let view = fill(&schema, 1, |_, c| ["ab", "cdef"][c], |_, _| false);
     assert_eq!(row_values(&mut scalar_prog(&schema, instrs, vec![]), &view), [Some(4)]);
 }

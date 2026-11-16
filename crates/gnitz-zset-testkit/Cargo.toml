@@ -12,6 +12,7 @@ test = false
 doctest = false
 
 [dependencies]
+gnitz-foundation = { path = "../gnitz-foundation" }
 gnitz-zset   = { path = "../gnitz-zset" }
 gnitz-wire   = { path = "../gnitz-wire" }
 gnitz-expr   = { path = "../gnitz-expr" }

@@ -30,12 +30,12 @@ fn every_walk_admits_exactly_the_rows_within_its_bounds() {
         for (schema, [pin_col, range_col]) in [(walked_key, [0, 1]), (walked_payload, [1, 2])] {
             let pin_tc = schema.columns()[pin_col].type_code;
             let null = |row: usize, ci: usize| schema.payload_slot(ci).is_some() && row.is_multiple_of(10 + ci);
-            let mut v = TestView::for_schema(&schema, N);
+            let mut v = TestView::new(&schema, N);
             for row in 0..N {
-                v.set_native(&schema, row, pin_col, pinned(row));
-                v.set_native(&schema, row, range_col, img(row) ^ gnitz_wire::opk_bias(tc));
+                v.set(row, pin_col, pinned(row));
+                v.set(row, range_col, img(row) ^ gnitz_wire::opk_bias(tc));
                 for ci in [pin_col, range_col].into_iter().filter(|&ci| null(row, ci)) {
-                    v.set_null(row, schema.payload_slot(ci).unwrap());
+                    v.set_null(row, ci);
                 }
             }
             let over_wide_pin = key_image(pin_tc, 7) | 1 << 100;

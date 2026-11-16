@@ -7,9 +7,6 @@
 //! which is what lets LLVM auto-vectorize the arithmetic opcodes. The loops that
 //! end in packed bits or start from them are [`crate::simd`]'s; the string
 //! kernels do not vectorize.
-//!
-//! [`FloatText`] is the float spelling `FloatToStr` writes, public so a client
-//! prints a float as the engine casts it.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -21,7 +18,7 @@ use crate::search::{fields, find, lit_eq};
 use crate::simd::{self, LanePred, Level, decode_f64, encode_f64};
 use crate::{BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram, calendar};
 use gnitz_wire::{
-    FixedInt, Heap, compare_german_strings, german_string_content, german_string_heap, german_string_inline,
+    FixedInt, FloatText, Heap, compare_german_strings, german_string_content, german_string_heap, german_string_inline,
     low_bits_mask, null_word_get,
 };
 
@@ -774,26 +771,6 @@ fn arena_push_int(arena: &mut Vec<u8>, magnitude: u64, neg: bool) -> StrView {
     let mut buf = [0; gnitz_wire::DECIMAL_TEXT_MAX];
     arena.extend_from_slice(gnitz_wire::write_scaled(magnitude, neg, 0, &mut buf).as_bytes());
     StrView::at(SRC_ARENA, off, arena.len() - off)
-}
-
-/// A float's decimal text: shortest round-trip, scientific outside
-/// `[1e-4, 1e15)` so the text stays short, non-finite values as PostgreSQL
-/// spells them. An `f32` keeps its own shortest form.
-pub struct FloatText<T>(pub T);
-
-impl<T: Copy + Into<f64> + fmt::Display + fmt::LowerExp> fmt::Display for FloatText<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let v: f64 = self.0.into();
-        if v.is_nan() {
-            f.write_str("NaN")
-        } else if v.is_infinite() {
-            f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" })
-        } else if v == 0.0 || (1e-4..1e15).contains(&v.abs()) {
-            fmt::Display::fmt(&self.0, f)
-        } else {
-            fmt::LowerExp::fmt(&self.0, f)
-        }
-    }
 }
 
 /// The arena as a `fmt::Write` sink, which cannot fail. Formatting through

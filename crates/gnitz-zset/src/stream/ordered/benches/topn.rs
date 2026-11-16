@@ -1,9 +1,10 @@
 use crate::schema::SchemaColumn;
 use crate::stream::ordered::OrderedPlan;
 use crate::stream::ordered::tests::{Harness, bench_rows};
-use crate::test_support::{mix, u64_pk_schema};
+use crate::test_support::u64_pk_schema;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{OrderKey, TypeCode};
+use gnitz_foundation::rng::mix;
+use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 const N: u64 = 1 << 16;
 
@@ -37,7 +38,8 @@ fn op_topn_bench() {
         let group = |i: u64| mix(i) % groups;
         // Bulk keys stand in the upper half of the key space.
         let bulk = |i: u64| (mix(i) >> 2) | (1 << 62);
-        let plan = OrderedPlan::top_n(&schema, &[1], &by_key(false), limit, offset).unwrap();
+        let plan =
+            OrderedPlan::top_n(&schema, &[1], &by_key(false), WeightSlots { skip: offset, keep: limit }).unwrap();
         let mut h = Harness::new(plan);
         let [e1, e2, e3] = h.bulk_epochs(
             &counter,
@@ -70,7 +72,7 @@ fn op_topn_ordered_bench() {
     let schema = u64_pk_schema(&GROUP_AND_KEY);
     for (groups, limit) in [(1u64, 10u64), (1, 100_000), (16, 10)] {
         let group = |i: u64| i * groups / (4 * N);
-        let plan = OrderedPlan::top_n(&schema, &[1], &by_key(false), limit, 0).unwrap();
+        let plan = OrderedPlan::top_n(&schema, &[1], &by_key(false), WeightSlots { skip: 0, keep: limit }).unwrap();
         let [e1, e2, e3] = Harness::new(plan).bulk_epochs(
             &counter,
             &bench_rows(&schema, 0..N, group, |i| i, 1),
@@ -91,7 +93,7 @@ fn op_topn_descending_bench() {
     let counter = Counter::instructions();
     let schema = u64_pk_schema(&GROUP_AND_KEY);
     for limit in [10u64, 1000] {
-        let plan = OrderedPlan::top_n_partial(&schema, &by_key(true), limit, 0).unwrap();
+        let plan = OrderedPlan::top_n_partial(&schema, &by_key(true), WeightSlots { skip: 0, keep: limit }).unwrap();
         let [e1, e2, e3] = Harness::new(plan).bulk_epochs(
             &counter,
             &bench_rows(&schema, 0..N, |_| 0, |i| i, 1),

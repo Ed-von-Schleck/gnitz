@@ -1,8 +1,9 @@
 use crate::schema::SchemaColumn;
 use crate::stream::ordered::OrderedPlan;
 use crate::stream::ordered::tests::{Harness, bench_rows};
-use crate::test_support::{mix, u64_pk_schema};
+use crate::test_support::u64_pk_schema;
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey, TypeCode};
 
 const N: u64 = 1 << 16;

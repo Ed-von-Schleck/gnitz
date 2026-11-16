@@ -2,14 +2,14 @@
 //! or a read's predicate — read off arbitrary bytes, resolved every way a
 //! program is (as a filter, a scalar and a map) against a schema holding every
 //! column type, and run over rows holding each type's edge values across a
-//! morsel boundary.
+//! morsel boundary. Each run's result is asserted the same on every arm the
+//! program can run and at every instruction set its kernels can run at.
 
 use super::*;
 use crate::morsel::MORSEL;
-use crate::test_support::{TestView, filter_verdicts};
-use crate::{SchemaColumn, SchemaDescriptor};
+use crate::test_support::{Cell, TestView, arms_agree, filter_verdicts, map_cells, scalar_cells};
+use crate::{ScalarCell, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{FixedInt, TypeCode};
-use std::convert::Infallible;
 
 #[test]
 fn program_fuzz() {
@@ -20,14 +20,18 @@ fn program_fuzz() {
             return;
         };
         if let Ok(mut filter) = program.resolve_filter(&schema) {
-            filter_verdicts(&mut filter, &rows);
+            arms_agree(&mut filter, &rows, |f, mb| filter_verdicts(f, mb));
         }
         if let Ok(mut scalar) = program.resolve_scalar(&schema) {
-            let _ = scalar.for_each(&rows, |_, _| Ok::<_, Infallible>(()));
+            arms_agree(&mut scalar, &rows, |s, mb| {
+                scalar_cells(s, mb, |cell| match cell {
+                    ScalarCell::Int(v) => Ok(v),
+                    ScalarCell::Str(s) => Err(s.map(<[u8]>::to_vec)),
+                })
+            });
         }
         if let Ok(mut map) = program.resolve_map(&schema, &schema) {
-            let mut out = TestView::for_schema(&schema, ROWS);
-            map.write_computed(&rows, 0, ROWS, &mut out, 0);
+            arms_agree(&mut map, &rows, |m, mb| map_cells(m, &schema, mb));
         }
     });
 }
@@ -52,31 +56,28 @@ fn every_type() -> SchemaDescriptor {
 fn edge_rows(schema: &SchemaDescriptor) -> TestView {
     const FLOATS: [f64; 6] = [0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5];
     const TEXTS: [&str; 5] = ["", "a", "a string past the inline twelve", "ünïcødé", "%_\\"];
-    let mut view = TestView::for_schema(schema, ROWS);
+    let mut view = TestView::new(schema, ROWS);
     for pi in 0..schema.num_payload_cols() {
         let ci = schema.payload_col_idx(pi);
         let col = schema.columns()[ci];
         for row in 0..ROWS {
             if col.nullable && row % 3 == 0 {
-                view.set_null(row, pi);
+                view.set_null(row, ci);
                 continue;
             }
             let float = FLOATS[row % FLOATS.len()];
-            let native = match col.type_code {
-                TypeCode::String | TypeCode::Blob => {
-                    view.set_string(row, pi, TEXTS[row % TEXTS.len()].as_bytes());
-                    continue;
-                }
-                TypeCode::F64 => float.to_bits().into(),
-                TypeCode::F32 => (float as f32).to_bits().into(),
-                TypeCode::Bool => (row % 2) as u128,
-                // Each integer type's own ends; `set_native` keeps the cell's low bytes.
+            let cell: Cell = match col.type_code {
+                TypeCode::String | TypeCode::Blob => TEXTS[row % TEXTS.len()].into(),
+                TypeCode::F64 => u128::from(float.to_bits()).into(),
+                TypeCode::F32 => u128::from((float as f32).to_bits()).into(),
+                TypeCode::Bool => ((row % 2) as u128).into(),
+                // Each integer type's own ends; `set` keeps the cell's low bytes.
                 tc => {
                     let (min, max) = FixedInt::from_type_code(tc).map_or((i128::MIN, i128::MAX), FixedInt::range);
-                    [0, 1, -1, min, max, 7][row % 6] as u128
+                    ([0, 1, -1, min, max, 7][row % 6] as u128).into()
                 }
             };
-            view.set_native(schema, row, ci, native);
+            view.set(row, ci, cell);
         }
     }
     view

@@ -1,9 +1,10 @@
 //! The expression blob: its framing guards, its layout pinned to
-//! `EXPR_BLOB_VERSION`, and the encoder and decoder tables held to each other.
+//! `EXPR_BLOB_VERSION`, and the wire form `expr_instrs!` derives round-tripping.
 
 use gnitz_wire::{FixedInt, TypeCode};
 
-use super::{ExprOp, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS, decode_load_const, encode_expr_blob, encode_load_const};
+use super::{A1, Field, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS, encode_expr_blob};
+use crate::program::ExprOp;
 use crate::{CmpOp, ConstIdx, ExprValidateErr, IntUnaryOp, LogicalInstr, LogicalProgram, Reg, Sink};
 
 // ---------------------------------------------------------------------------
@@ -316,69 +317,8 @@ fn a_forged_selector_is_refused_at_decode() {
 }
 
 // ---------------------------------------------------------------------------
-// Encoder / decoder drift — the two tables over one opcode space
+// The derived wire form: every field's word and domain round-trip
 // ---------------------------------------------------------------------------
-
-/// The number of [`LogicalInstr`] variants. A new variant stops the match below
-/// compiling until it is listed and counted.
-impl LogicalInstr {
-    const VARIANT_COUNT: usize = 46;
-
-    /// Exhaustive by construction — the compile error on a new variant is the
-    /// whole point, so this must never gain a `_` arm.
-    #[allow(dead_code)]
-    fn assert_every_variant_is_listed(&self) {
-        use LogicalInstr as L;
-        match *self {
-            L::LoadCol { .. }
-            | L::LoadConst { .. }
-            | L::IntArith { .. }
-            | L::FloatArith { .. }
-            | L::Cmp { .. }
-            | L::FCmp { .. }
-            | L::IntToFloat { .. }
-            | L::FloatUnary { .. }
-            | L::IntUnary { .. }
-            | L::Calendar { .. }
-            | L::FloatToInt { .. }
-            | L::IntCast { .. }
-            | L::FloatToF32 { .. }
-            | L::IntMinMax2 { .. }
-            | L::FloatMinMax2 { .. }
-            | L::Select { .. }
-            | L::LoadNull
-            | L::BoolBinary { .. }
-            | L::BoolNot { .. }
-            | L::IsNull { .. }
-            | L::IsNullReg { .. }
-            | L::StrColConst { .. }
-            | L::StrColCol { .. }
-            | L::StrColPrefix { .. }
-            | L::IntInSet { .. }
-            | L::LoadColStr { .. }
-            | L::LoadConstStr { .. }
-            | L::LoadNullStr
-            | L::StrSelect { .. }
-            | L::StrCmp { .. }
-            | L::StrLen { .. }
-            | L::StrCase { .. }
-            | L::StrSubstr { .. }
-            | L::StrTrim { .. }
-            | L::StrLike { .. }
-            | L::StrConcat { .. }
-            | L::IntToStr { .. }
-            | L::FloatToStr { .. }
-            | L::StrToInt { .. }
-            | L::StrToFloat { .. }
-            | L::StrSide { .. }
-            | L::StrPos { .. }
-            | L::StrReverse { .. }
-            | L::StrReplace { .. }
-            | L::StrPad { .. }
-            | L::StrSplitPart { .. } => {}
-        }
-    }
-}
 
 /// Every instruction the decoder accepts over each opcode's selector word and a
 /// few operand shapes. Operands are distinct so a swapped pair cannot
@@ -404,41 +344,23 @@ fn every_decodable_instruction_round_trips_through_the_wire_form() {
         let again = LogicalInstr::from_wire(back);
         assert_eq!(again, Ok(x), "{x:?}: decode of its own encoding");
     }
-    assert_eq!(ExprOp::ALL.len(), LogicalInstr::VARIANT_COUNT);
     let seen: std::collections::HashSet<_> = words.iter().map(|(_, x)| std::mem::discriminant(x)).collect();
-    assert_eq!(
-        seen.len(),
-        LogicalInstr::VARIANT_COUNT,
-        "variants the decoder accepts a word for"
-    );
+    assert_eq!(seen.len(), ExprOp::ALL.len(), "variants the decoder accepts a word for");
     assert!(
         words.iter().all(|(w, _)| w[1] < 64),
         "a selector family reaches the sweep's last selector: widen the sweep"
     );
 }
 
-/// Every decodable instruction placed first reads only registers not yet
-/// written, so it is refused unless it reads none.
+/// Every register field of every decodable instruction is a read the program
+/// checks, and placed first such an instruction is refused unless it has none.
 #[test]
 fn every_register_operand_is_checked_read_before_write() {
-    use LogicalInstr as L;
     for (_, x) in decodable_words() {
-        let reads_none = matches!(
-            x,
-            L::LoadCol { .. }
-                | L::LoadConst { .. }
-                | L::LoadNull
-                | L::IsNull { .. }
-                | L::StrColConst { .. }
-                | L::StrColCol { .. }
-                | L::StrColPrefix { .. }
-                | L::LoadColStr { .. }
-                | L::LoadConstStr { .. }
-                | L::LoadNullStr
-        );
+        assert_eq!(crate::program::checked_reads(&x), x.regs(), "{x:?}");
         // Eight zero bytes are a well-formed entry of every pool kind.
         let got = LogicalProgram::new(vec![x], vec![], vec![vec![0u8; 8]; 14]).err();
-        match reads_none {
+        match x.regs().is_empty() {
             true => assert_eq!(got, None, "{x:?}"),
             false => assert!(
                 matches!(got, Some(ExprValidateErr::RegReadBeforeWrite { .. })),
@@ -448,10 +370,10 @@ fn every_register_operand_is_checked_read_before_write() {
     }
 }
 
-/// `LoadConst`'s `i64` is the one operand spanning two words: the split and the
-/// join are inverses over the whole range, sign bit of the low half included.
+/// An `i64` is the one field spanning two words: the split and the join are
+/// inverses over the whole range, sign bit of the low half included.
 #[test]
-fn load_const_round_trips() {
+fn an_i64_field_round_trips_through_its_two_words() {
     for v in [
         0i64,
         1,
@@ -461,7 +383,8 @@ fn load_const_round_trips() {
         0x0000_0001_0000_0000,
         -0x0000_0001_0000_0000,
     ] {
-        let (a1, a2) = encode_load_const(v);
-        assert_eq!(decode_load_const(a1, a2), v, "load_const round-trip for {v}");
+        let mut w = [0; INSTR_WORDS];
+        v.put(&mut w, A1);
+        assert_eq!(<i64 as Field>::get(&w, A1), Some(v), "i64 round-trip for {v}");
     }
 }

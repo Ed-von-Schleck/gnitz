@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use gnitz_core::{ScanReply, ZSetBatch};
-use gnitz_expr::{ColumnLocator, FloatText};
-use gnitz_wire::{ColType, FixedInt, TypeCode, format_date, format_decimal, format_timestamp, format_uuid};
+use gnitz_expr::ColumnLocator;
+use gnitz_wire::{ColType, FixedInt, FloatText, TypeCode, format_date, format_decimal, format_timestamp, format_uuid};
 
 /// One cell. Each variant keeps what its renderings need: the text a terminal
 /// shows, and the JSON type a script reads back.

@@ -8,13 +8,14 @@ use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::simd::Level;
 use crate::simd::encode_f64;
 use crate::test_support::{
-    Meter, TestView, bench_rows, filter_prog, filter_verdicts, in_set, int, make_n_col_view, make_string_view,
-    map_prog, map_rows, passing_rows, result_prog, schema_pk, schema_pk_ints, schema_pk_strings, strings, view,
+    Meter, TestView, bench_rows, fill, filter_prog, filter_verdicts, in_set, int, map_prog, map_rows, passing_rows,
+    result_prog, schema_pk, schema_pk_ints, schema_pk_strings, strings, view,
 };
 use crate::{
     CalendarOp, CmpOp, ConstIdx, FloatArithOp, IntArithOp, LikePattern, LogicalInstr as L, LogicalInstr,
     LogicalProgram, Reg, RowFilter, SchemaDescriptor, Sink, TrimMode,
 };
+use gnitz_foundation::rng::mix;
 
 /// `k` values spread over 1..=1000.
 fn spread(k: usize) -> impl Iterator<Item = i64> {
@@ -71,7 +72,7 @@ fn str_const_filter_bench() {
     ];
 
     for (domain, constant, prefix, value) in domains {
-        let mb = make_string_view(&schema, n, |row, _| value(row), |_, _| false);
+        let mb = fill(&schema, n, |row, _| value(row), |_, _| false);
         for (name, op) in [("eq", CmpOp::Eq), ("ne", CmpOp::Ne), ("lt", CmpOp::Lt)] {
             let consts = vec![constant.as_bytes().to_vec()];
             let mut fused = filter_prog(
@@ -144,7 +145,7 @@ fn filter_kernel_bench() {
 
     // `pk > n/2` over a `U64` key, and over an `I64` one: the signed OPK decode.
     let pk = schema_pk_ints(1, false);
-    let pk_view = make_n_col_view(&pk, n, |_, _| 1, |_, _| false);
+    let pk_view = fill(&pk, n, |_, _| 1i64, |_, _| false);
     let pk_i64 = SchemaDescriptor::new(
         &[
             crate::SchemaColumn::new(TypeCode::I64, false),
@@ -152,7 +153,7 @@ fn filter_kernel_bench() {
         ],
         &[0],
     );
-    let pk_i64_view = make_n_col_view(&pk_i64, n, |_, _| 1, |_, _| false);
+    let pk_i64_view = fill(&pk_i64, n, |_, _| 1i64, |_, _| false);
 
     // One NOT NULL column holding `row % 1000`: as an `I32`, a payload load
     // narrower than the 8-byte arm every other shape reads; as an `F32`, the
@@ -165,7 +166,7 @@ fn filter_kernel_bench() {
     // `-a > 0 AND b < 80` over nullable columns — unary, the 3VL AND, and the
     // per-column null-bit gather.
     let nn = schema_pk_ints(2, true);
-    let nn_view = make_n_col_view(
+    let nn_view = fill(
         &nn,
         n,
         |row, col| ((row * 7 + col) % 100) as i64,
@@ -210,7 +211,7 @@ fn filter_kernel_bench() {
     // `s1 = s2` / `s1 < s2` over two NOT NULL string columns: short strings that
     // agree on every third row, and long ones sharing a prefix on every seventh.
     let cc = schema_pk_strings(2, false);
-    let cc_view = make_string_view(
+    let cc_view = fill(
         &cc,
         n,
         |row, pi| match (row % 7, row % 3) {
@@ -314,11 +315,11 @@ fn is_null_arm_bench() {
 
     // NULLs 16 per morsel, 4 per morsel, and none in 7 of every 8 morsels.
     let value = |row: usize, col: usize| ((row * 7 + col * 13) % 100) as i64;
-    let spread = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(16));
-    let clustered = make_n_col_view(&schema, n, value, |row, col| {
+    let spread = fill(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(16));
+    let clustered = fill(&schema, n, value, |row, col| {
         col == 0 && (row / MORSEL).is_multiple_of(8)
     });
-    let rare = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(64));
+    let rare = fill(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(64));
 
     // `k = 50` passes about half the rows; `k = -1` passes every row, which is
     // the non-selective variant.
@@ -345,7 +346,7 @@ fn is_null_arm_bench() {
     let out = schema_pk_ints(1, false);
     let mut map = map_prog(&schema, &out, is_null_chain(0, 0), vec![Sink::Reg(Reg(0))], vec![]);
     map_rows(&mut map, &out, &spread);
-    let mut dst = TestView::for_schema(&out, n);
+    let mut dst = TestView::new(&out, n);
     for (arm, null_regs) in [("fast", 0), ("nullable", u64::MAX)] {
         map.set_arm(null_regs, Level::new());
         meter.levels("is_null_arm_bench", &format!("map/{arm}"), n, &mut map, |m| {
@@ -363,7 +364,7 @@ fn range_walk_bench() {
     let meter = Meter::new();
     let n = bench_rows();
     let schema = schema_pk_ints(1, true);
-    let view = make_n_col_view(&schema, n, |row, _| (row % 1000) as i64, |row, _| row % 16 == 0);
+    let view = fill(&schema, n, |row, _| (row % 1000) as i64, |row, _| row % 16 == 0);
     let range = KeyRange::new(
         PkColList::from_slice(&[1]),
         &[],
@@ -379,7 +380,7 @@ fn range_walk_bench() {
 /// into a digit so no matcher hoists out of the row loop.
 fn fixed_len_str_view(schema: &SchemaDescriptor, n: usize, len: usize, unit: &[u8]) -> TestView {
     let base: Vec<u8> = unit.iter().copied().cycle().take(len).collect();
-    make_string_view(
+    fill(
         schema,
         n,
         |row, _| {
@@ -424,7 +425,7 @@ fn expr_kernel_bench() {
     let run = |schema: &SchemaDescriptor, view: &TestView, shapes: Vec<Shape>| {
         for (name, prog, out) in shapes {
             let mut ev = prog.resolve_map(schema, &out).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let mut dst = TestView::for_schema(&out, n);
+            let mut dst = TestView::new(&out, n);
             meter.levels("expr_kernel_bench", &name, n, &mut ev, |ev| {
                 dst.clear_blob();
                 ev.write_computed(view, 0, n, &mut dst, 0)
@@ -480,7 +481,7 @@ fn expr_kernel_bench() {
     };
 
     let ints = schema_pk_ints(2, true);
-    let int_view = make_n_col_view(
+    let int_view = fill(
         &ints,
         n,
         |row, col| ((row * 7 + col) % 1000 + 1) as i64,
@@ -506,7 +507,7 @@ fn expr_kernel_bench() {
     drop(int_view);
 
     let ints_nn = schema_pk_ints(3, false);
-    let nn_view = make_n_col_view(&ints_nn, n, |row, col| ((row * 7 + col) % 1000) as i64, |_, _| false);
+    let nn_view = fill(&ints_nn, n, |row, col| ((row * 7 + col) % 1000) as i64, |_, _| false);
     let floats = |op: L| vec![c1, L::IntToFloat { a: r(0) }, op];
     let cal = |op, micros: bool| {
         let mut instrs = vec![c1];
@@ -582,7 +583,7 @@ fn expr_kernel_bench() {
     drop(nn_view);
 
     let strs = schema_pk_strings(2, false);
-    let str_view = make_string_view(&strs, n, either_side_of_inline, |_, _| false);
+    let str_view = fill(&strs, n, either_side_of_inline, |_, _| false);
     run(
         &strs,
         &str_view,
@@ -669,7 +670,7 @@ fn expr_kernel_bench() {
 
     // Decimal text: an integer, and a float with a fraction and an exponent.
     let digits = schema_pk_strings(2, false);
-    let digit_view = make_string_view(
+    let digit_view = fill(
         &digits,
         n,
         |row, pi| match pi {
@@ -696,7 +697,7 @@ fn expr_kernel_bench() {
     // `CASE WHEN k > 500 THEN s1 ELSE s2 END`: a condition no branch predictor
     // learns, and a NULL in the first branch so the blend runs on the nullable
     // arm.
-    let shuffled = |row: usize| (((row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) % 1000) as i64;
+    let shuffled = |row: usize| ((mix(row as u64) >> 40) % 1000) as i64;
     let string = |pi: usize, null: fn(usize) -> bool| {
         strings((0..n).map(|row| (!null(row)).then(|| either_side_of_inline(row, pi).into_bytes())))
     };

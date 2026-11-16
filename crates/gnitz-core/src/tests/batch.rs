@@ -3,7 +3,6 @@ use crate::BatchAppender;
 use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
 use gnitz_expr::{BatchView, CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarCell, ScalarEval, Sink};
 use gnitz_wire::{ColumnDef, payload_str, payload_u64};
-use std::convert::Infallible;
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
@@ -682,14 +681,12 @@ fn appending_columns_whole_matches_a_full_gather() {
 /// Every row's integer result of a scalar program.
 fn row_values(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<i128>> {
     let mut vals = Vec::new();
-    ev.for_each(mb, |_, cell| {
+    ev.for_each(mb, |cell| {
         let ScalarCell::Int(v) = cell else {
             panic!("row_values over a string-valued program")
         };
         vals.push(v);
-        Ok::<_, Infallible>(())
-    })
-    .unwrap();
+    });
     vals
 }
 

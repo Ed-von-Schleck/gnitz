@@ -335,286 +335,148 @@ impl Sink {
     }
 }
 
-/// One instruction with logical (schema) column indices, mirroring the wire
-/// opcodes the client emits. `LogicalProgram::resolve_program` lowers each into
-/// `Instr`.
-///
-/// Every variant writes the register named by its own position, so none carries
-/// a destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogicalInstr {
-    /// A fixed-width integer or float column into a scalar register; the kernel
-    /// is picked from the column's type.
-    LoadCol {
-        col: u32,
-    },
-    /// `unsigned`: `val`'s bits are a `u64`, and the register is U64-tracked.
-    LoadConst {
-        val: i64,
-        unsigned: bool,
-    },
-    IntArith {
-        op: IntArithOp,
-        a: Reg,
-        b: Reg,
-    },
-    FloatArith {
-        op: FloatArithOp,
-        a: Reg,
-        b: Reg,
-    },
-    Cmp {
-        op: CmpOp,
-        a: Reg,
-        b: Reg,
-    },
-    FCmp {
-        op: CmpOp,
-        a: Reg,
-        b: Reg,
-    },
-    IntToFloat {
-        a: Reg,
-    },
-    FloatUnary {
-        op: FloatUnaryOp,
-        a: Reg,
-    },
-    IntUnary {
-        op: IntUnaryOp,
-        a: Reg,
-    },
-    /// A calendar transform of a temporal register, read as microseconds when
-    /// `micros` and as days otherwise. The two conversion ops may yield NULL.
-    Calendar {
-        op: CalendarOp,
-        a: Reg,
-        micros: bool,
-    },
-    /// Truncate-toward-zero float→int cast with a range check against `fi`.
-    /// NaN, ±∞ and an out-of-range truncated value all produce NULL.
-    FloatToInt {
-        a: Reg,
-        fi: FixedInt,
-    },
-    /// Integer domain cast: the register bits pass through unchanged when the
-    /// value is in `fi`'s domain, and the row is NULLed otherwise. The source is
-    /// read signed or unsigned per the resolve-time U64 tracking of `a`.
-    IntCast {
-        a: Reg,
-        fi: FixedInt,
-    },
-    /// [`gnitz_wire::narrow_f32`], NULL where that has no value: NaN and ±∞ pass
-    /// through, as does underflow to ±0.
-    FloatToF32 {
-        a: Reg,
-    },
-    /// Null-*skipping* 2-ary extremum: a NULL operand yields the other operand,
-    /// and the result is NULL only when both are. Compares signed or unsigned
-    /// per the U64 tracking of either operand.
-    IntMinMax2 {
-        a: Reg,
-        b: Reg,
-        is_max: bool,
-    },
-    /// [`LogicalInstr::IntMinMax2`]'s float twin, comparing by `f64::total_cmp`
-    /// — never `==` or `partial_cmp`.
-    FloatMinMax2 {
-        a: Reg,
-        b: Reg,
-        is_max: bool,
-    },
-    /// SQL CASE blend: takes `a`'s value + null bit where `cond` is non-NULL and
-    /// truthy, else `b`'s. Carries a value, never a boolean.
-    Select {
-        cond: Reg,
-        a: Reg,
-        b: Reg,
-    },
-    /// An always-NULL value (0, null bit set): CASE without ELSE, NULLIF's match
-    /// branch.
-    LoadNull,
-    /// Three-valued AND, or OR when `is_or` — one kernel, the operator carried
-    /// as data.
-    BoolBinary {
-        a: Reg,
-        b: Reg,
-        is_or: bool,
-    },
-    BoolNot {
-        a: Reg,
-    },
-    /// `IS NULL`, or `IS NOT NULL` when `invert`. The two read the same
-    /// null-bitmap bit and differ only in its polarity, so they share one
-    /// variant and one kernel — the `StrLen { chars }` / `StrCase { upper }`
-    /// shape. Reads the batch bitmap without a load, which is what lets it alone
-    /// serve a column no load opcode admits (U128, BLOB).
-    IsNull {
-        col: u32,
-        invert: bool,
-    },
-    /// `IS NULL` (`IS NOT NULL` when `invert`) over a register's null lane. The
-    /// operand may be of either class — only its null bit is read — which is
-    /// what lets a computed value of any type be null-tested.
-    IsNullReg {
-        a: Reg,
-        invert: bool,
-    },
-    StrColConst {
-        op: CmpOp,
-        col: u32,
-        const_idx: ConstIdx,
-    },
-    StrColCol {
-        op: CmpOp,
-        col_a: u32,
-        col_b: u32,
-    },
-    /// `col LIKE 'lit%'`: whether German-string column `col` starts with the
-    /// text at `const_idx`.
-    StrColPrefix {
-        col: u32,
-        const_idx: ConstIdx,
-    },
-    /// Integer set membership: `value_reg ∈ set[set_idx]`, over the strictly
-    /// ascending pool of packed `N × 8-byte LE` values at const index `set_idx`,
-    /// decoded once at `resolve_program`. NULL input propagates to NULL.
-    IntInSet {
-        value_reg: Reg,
-        set_idx: ConstIdx,
-    },
-    /// A German-string column into a string register; nulls come from the batch
-    /// bitmap.
-    LoadColStr {
-        col: u32,
-    },
-    /// A const-pool entry's raw bytes into a string register.
-    LoadConstStr {
-        const_idx: ConstIdx,
-    },
-    /// An always-NULL string — the string-class twin of
-    /// [`LogicalInstr::LoadNull`], which a string context must emit instead so
-    /// its consumers' operand class matches.
-    LoadNullStr,
-    /// String CASE blend. `cond` is a scalar register; `a`/`b` and the result
-    /// are string.
-    StrSelect {
-        cond: Reg,
-        a: Reg,
-        b: Reg,
-    },
-    /// String compare writing a boolean into a *scalar* register.
-    /// Byte-lexicographic (`[u8]::cmp` over the content bytes), the same order
-    /// `compare_german_strings` imposes on canonical cells.
-    StrCmp {
-        op: CmpOp,
-        a: Reg,
-        b: Reg,
-    },
-    /// Length into a *scalar* register: bytes, or `chars` — the codepoint count.
-    StrLen {
-        a: Reg,
-        chars: bool,
-    },
-    /// ASCII-only case fold (`a-z`/`A-Z`); every other byte passes through, so a
-    /// multibyte UTF-8 sequence is unchanged.
-    StrCase {
-        a: Reg,
-        upper: bool,
-    },
-    /// Half-open character window `[start, start + len)`, 1-based, intersected
-    /// with the string. `len_reg = None` runs to the end; a negative length is
-    /// NULL.
-    StrSubstr {
-        src: Reg,
-        start_reg: Reg,
-        len_reg: Option<Reg>,
-    },
-    /// Strip the byte set at const index `set_idx` from the end(s) `mode` names.
-    StrTrim {
-        a: Reg,
-        mode: TrimMode,
-        set_idx: ConstIdx,
-    },
-    /// SQL LIKE into a scalar register, a definite 0/1. `pat_idx` names a
-    /// [`crate::LikePattern`]'s bytes; `ci` is ILIKE.
-    StrLike {
-        src: Reg,
-        pat_idx: ConstIdx,
-        ci: bool,
-    },
-    /// `skip_null` is CONCAT's asymmetric null rule: a NULL `b` contributes the
-    /// empty string, a NULL `a` (the fold accumulator) still propagates. `false`
-    /// is SQL `||` — NULL in either operand, NULL out.
-    StrConcat {
-        a: Reg,
-        b: Reg,
-        skip_null: bool,
-    },
-    /// Integer register to decimal text, read signed or unsigned per the
-    /// resolve-time U64 tracking of `a`.
-    IntToStr {
-        a: Reg,
-    },
-    /// Float register to text, as [`crate::FloatText`] spells it. `f32`: `a`
-    /// holds a widened f32, spelled as that f32's shortest form.
-    FloatToStr {
-        a: Reg,
-        f32: bool,
-    },
-    /// Parse ASCII decimal — surrounding whitespace and an optional sign
-    /// allowed, nothing else — into the scalar register. An unparsable string or
-    /// a value outside `fi`'s domain is NULL, never a wrap.
-    StrToInt {
-        a: Reg,
-        fi: FixedInt,
-    },
-    /// Parse into an f64 scalar register; any failure, non-UTF-8 bytes included,
-    /// is NULL.
-    StrToFloat {
-        a: Reg,
-    },
-    /// LEFT (`left`) / RIGHT: `n_reg` characters from one end, a negative count
-    /// dropping that many from the other. A sub-view; never NULL of its own.
-    StrSide {
-        src: Reg,
-        n_reg: Reg,
-        left: bool,
-    },
-    /// 1-based character index of `needle` in `hay` into a *scalar* register:
-    /// 0 when absent, 1 for an empty needle.
-    StrPos {
-        hay: Reg,
-        needle: Reg,
-    },
-    /// The characters in reverse order, a fresh arena copy.
-    StrReverse {
-        a: Reg,
-    },
-    /// Every non-overlapping `from` in `s` replaced by `to`; an empty `from`
-    /// leaves `s` unchanged. NULL past `u32::MAX` bytes, CONCAT's rule.
-    StrReplace {
-        s: Reg,
-        from: Reg,
-        to: Reg,
-    },
-    /// LPAD (`left`) / RPAD to `n_reg` characters with `fill` repeated; a longer
-    /// `s` truncates, `n <= 0` is empty, an empty `fill` pads nothing. NULL past
-    /// `u32::MAX` bytes.
-    StrPad {
-        s: Reg,
-        n_reg: Reg,
-        fill: Reg,
-        left: bool,
-    },
-    /// The `n_reg`-th field of `s` split on `delim` (from the right when
-    /// negative), empty past the last field; `n = 0` is NULL. A sub-view.
-    StrSplitPart {
-        s: Reg,
-        delim: Reg,
-        n_reg: Reg,
-    },
+crate::blob::expr_instrs! {
+    /// One instruction with logical (schema) column indices, mirroring the wire
+    /// opcodes the client emits. `LogicalProgram::resolve_program` lowers each into
+    /// `Instr`.
+    ///
+    /// Every variant writes the register named by its own position, so none carries
+    /// a destination.
+    ///
+    /// Each variant states its wire opcode, and each field the instruction word
+    /// it sits at, `SEL` or `A1`–`A3`; `expr_instrs!` derives the wire form from
+    /// that.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LogicalInstr {
+        /// A fixed-width integer or float column into a scalar register; the kernel
+        /// is picked from the column's type.
+        LoadCol = 1 { col @ A1: u32 },
+        /// `unsigned`: `val`'s bits are a `u64`, and the register is U64-tracked.
+        LoadConst = 2 { val @ A1: i64, unsigned @ SEL: bool },
+        IntArith = 3 { op @ SEL: IntArithOp, a @ A1: Reg, b @ A2: Reg },
+        FloatArith = 4 { op @ SEL: FloatArithOp, a @ A1: Reg, b @ A2: Reg },
+        Cmp = 5 { op @ SEL: CmpOp, a @ A1: Reg, b @ A2: Reg },
+        FCmp = 6 { op @ SEL: CmpOp, a @ A1: Reg, b @ A2: Reg },
+        IntToFloat = 7 { a @ A1: Reg },
+        FloatUnary = 8 { op @ SEL: FloatUnaryOp, a @ A1: Reg },
+        IntUnary = 9 { op @ SEL: IntUnaryOp, a @ A1: Reg },
+        /// Truncate-toward-zero float→int cast with a range check against `fi`.
+        /// NaN, ±∞ and an out-of-range truncated value all produce NULL.
+        FloatToInt = 10 { a @ A1: Reg, fi @ SEL: FixedInt },
+        /// Integer domain cast: the register bits pass through unchanged when the
+        /// value is in `fi`'s domain, and the row is NULLed otherwise. The source is
+        /// read signed or unsigned per the resolve-time U64 tracking of `a`.
+        IntCast = 11 { a @ A1: Reg, fi @ SEL: FixedInt },
+        /// [`gnitz_wire::narrow_f32`], NULL where that has no value: NaN and ±∞ pass
+        /// through, as does underflow to ±0.
+        FloatToF32 = 12 { a @ A1: Reg },
+        /// Null-*skipping* 2-ary extremum: a NULL operand yields the other operand,
+        /// and the result is NULL only when both are. Compares signed or unsigned
+        /// per the U64 tracking of either operand.
+        IntMinMax2 = 13 { a @ A1: Reg, b @ A2: Reg, is_max @ SEL: bool },
+        /// [`LogicalInstr::IntMinMax2`]'s float twin, comparing by `f64::total_cmp`
+        /// — never `==` or `partial_cmp`.
+        FloatMinMax2 = 14 { a @ A1: Reg, b @ A2: Reg, is_max @ SEL: bool },
+        /// SQL CASE blend: takes `a`'s value + null bit where `cond` is non-NULL and
+        /// truthy, else `b`'s. Carries a value, never a boolean.
+        Select = 15 { cond @ A1: Reg, a @ A2: Reg, b @ A3: Reg },
+        /// An always-NULL value (0, null bit set): CASE without ELSE, NULLIF's match
+        /// branch.
+        LoadNull = 16,
+        /// Three-valued AND, or OR when `is_or` — one kernel, the operator carried
+        /// as data.
+        BoolBinary = 17 { a @ A1: Reg, b @ A2: Reg, is_or @ SEL: bool },
+        BoolNot = 18 { a @ A1: Reg },
+        /// `IS NULL`, or `IS NOT NULL` when `invert`. The two read the same
+        /// null-bitmap bit and differ only in its polarity, so they share one
+        /// variant and one kernel — the `StrLen { chars }` / `StrCase { upper }`
+        /// shape. Reads the batch bitmap without a load, which is what lets it alone
+        /// serve a column no load opcode admits (U128, BLOB).
+        IsNull = 19 { col @ A1: u32, invert @ SEL: bool },
+        /// `IS NULL` (`IS NOT NULL` when `invert`) over a register's null lane. The
+        /// operand may be of either class — only its null bit is read — which is
+        /// what lets a computed value of any type be null-tested.
+        IsNullReg = 20 { a @ A1: Reg, invert @ SEL: bool },
+        StrColConst = 21 { op @ SEL: CmpOp, col @ A1: u32, const_idx @ A2: ConstIdx },
+        StrColCol = 22 { op @ SEL: CmpOp, col_a @ A1: u32, col_b @ A2: u32 },
+        /// Integer set membership: `value_reg ∈ set[set_idx]`, over the strictly
+        /// ascending pool of packed `N × 8-byte LE` values at const index `set_idx`,
+        /// decoded once at `resolve_program`. NULL input propagates to NULL.
+        IntInSet = 23 { value_reg @ A1: Reg, set_idx @ A2: ConstIdx },
+        /// A German-string column into a string register; nulls come from the batch
+        /// bitmap.
+        LoadColStr = 24 { col @ A1: u32 },
+        /// A const-pool entry's raw bytes into a string register.
+        LoadConstStr = 25 { const_idx @ A1: ConstIdx },
+        /// An always-NULL string — the string-class twin of
+        /// [`LogicalInstr::LoadNull`], which a string context must emit instead so
+        /// its consumers' operand class matches.
+        LoadNullStr = 26,
+        /// String CASE blend. `cond` is a scalar register; `a`/`b` and the result
+        /// are string.
+        StrSelect = 27 { cond @ A1: Reg, a @ A2: Reg, b @ A3: Reg },
+        /// String compare writing a boolean into a *scalar* register.
+        /// Byte-lexicographic (`[u8]::cmp` over the content bytes), the same order
+        /// `compare_german_strings` imposes on canonical cells.
+        StrCmp = 28 { op @ SEL: CmpOp, a @ A1: Reg, b @ A2: Reg },
+        /// Length into a *scalar* register: bytes, or `chars` — the codepoint count.
+        StrLen = 29 { a @ A1: Reg, chars @ SEL: bool },
+        /// ASCII-only case fold (`a-z`/`A-Z`); every other byte passes through, so a
+        /// multibyte UTF-8 sequence is unchanged.
+        StrCase = 30 { a @ A1: Reg, upper @ SEL: bool },
+        /// Half-open character window `[start, start + len)`, 1-based, intersected
+        /// with the string. `len_reg = None` runs to the end; a negative length is
+        /// NULL.
+        StrSubstr = 31 { src @ A1: Reg, start_reg @ A2: Reg, len_reg @ A3: Option<Reg> },
+        /// Strip the byte set at const index `set_idx` from the end(s) `mode` names.
+        StrTrim = 32 { a @ A1: Reg, mode @ SEL: TrimMode, set_idx @ A2: ConstIdx },
+        /// SQL LIKE into a scalar register, a definite 0/1. `pat_idx` names a
+        /// [`crate::LikePattern`]'s bytes; `ci` is ILIKE.
+        StrLike = 33 { src @ A1: Reg, pat_idx @ A2: ConstIdx, ci @ SEL: bool },
+        /// `skip_null` is CONCAT's asymmetric null rule: a NULL `b` contributes the
+        /// empty string, a NULL `a` (the fold accumulator) still propagates. `false`
+        /// is SQL `||` — NULL in either operand, NULL out.
+        StrConcat = 34 { a @ A1: Reg, b @ A2: Reg, skip_null @ SEL: bool },
+        /// Integer register to decimal text, read signed or unsigned per the
+        /// resolve-time U64 tracking of `a`.
+        IntToStr = 35 { a @ A1: Reg },
+        /// Float register to text, as [`gnitz_wire::FloatText`] spells it. `f32`: `a`
+        /// holds a widened f32, spelled as that f32's shortest form.
+        FloatToStr = 36 { a @ A1: Reg, f32 @ SEL: bool },
+        /// Parse ASCII decimal — surrounding whitespace and an optional sign
+        /// allowed, nothing else — into the scalar register. An unparsable string or
+        /// a value outside `fi`'s domain is NULL, never a wrap.
+        StrToInt = 37 { a @ A1: Reg, fi @ SEL: FixedInt },
+        /// Parse into an f64 scalar register; any failure, non-UTF-8 bytes included,
+        /// is NULL.
+        StrToFloat = 38 { a @ A1: Reg },
+        /// LEFT (`left`) / RIGHT: `n_reg` characters from one end, a negative count
+        /// dropping that many from the other. A sub-view; never NULL of its own.
+        StrSide = 39 { src @ A1: Reg, n_reg @ A2: Reg, left @ SEL: bool },
+        /// 1-based character index of `needle` in `hay` into a *scalar* register:
+        /// 0 when absent, 1 for an empty needle.
+        StrPos = 40 { hay @ A1: Reg, needle @ A2: Reg },
+        /// The characters in reverse order, a fresh arena copy.
+        StrReverse = 41 { a @ A1: Reg },
+        /// Every non-overlapping `from` in `s` replaced by `to`; an empty `from`
+        /// leaves `s` unchanged. NULL past `u32::MAX` bytes, CONCAT's rule.
+        StrReplace = 42 { s @ A1: Reg, from @ A2: Reg, to @ A3: Reg },
+        /// LPAD (`left`) / RPAD to `n_reg` characters with `fill` repeated; a longer
+        /// `s` truncates, `n <= 0` is empty, an empty `fill` pads nothing. NULL past
+        /// `u32::MAX` bytes.
+        StrPad = 43 { s @ A1: Reg, n_reg @ A2: Reg, fill @ A3: Reg, left @ SEL: bool },
+        /// The `n_reg`-th field of `s` split on `delim` (from the right when
+        /// negative), empty past the last field; `n = 0` is NULL. A sub-view.
+        StrSplitPart = 44 { s @ A1: Reg, delim @ A2: Reg, n_reg @ A3: Reg },
+        /// A calendar transform of a temporal register, read as microseconds when
+        /// `micros` and as days otherwise. The two conversion ops may yield NULL.
+        Calendar = 45 { op @ SEL: CalendarOp, a @ A1: Reg, micros @ A2: bool },
+        /// `col LIKE 'lit%'`: whether German-string column `col` starts with the
+        /// text at `const_idx`.
+        StrColPrefix = 46 { col @ A1: u32, const_idx @ A2: ConstIdx },
+    }
 }
+
 // ---------------------------------------------------------------------------
 // Instr — the resolved/evaluable form (physical payload/PK indices)
 // ---------------------------------------------------------------------------
@@ -972,7 +834,7 @@ impl LogicalProgram {
 
     /// Every input column the program reads: an instruction's column operand or
     /// a sink's copied column.
-    pub fn cols_read(&self) -> impl Iterator<Item = u32> {
+    fn cols_read(&self) -> impl Iterator<Item = u32> {
         let ops = self
             .instrs
             .iter()
@@ -1720,6 +1582,12 @@ impl ResolvedProgram {
     pub(crate) fn is_u64(&self, reg: u16) -> bool {
         (self.reg_u64 >> reg) & 1 != 0
     }
+}
+
+/// The registers [`LogicalProgram::new`] checks `li` reads, in order.
+#[cfg(test)]
+pub(crate) fn checked_reads(li: &LogicalInstr) -> Vec<Reg> {
+    operands(li).reads.iter().flatten().map(|&(r, _)| r).collect()
 }
 
 #[cfg(test)]

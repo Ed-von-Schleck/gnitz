@@ -4,6 +4,7 @@ use crate::test_support::{
     make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
     scratch_table, table_shards, zset_of,
 };
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -171,19 +172,19 @@ fn enforce_unique_pk_ordered_walk_matches_map() {
     let dir = tempfile::tempdir().unwrap();
     let mut pt = scratch_table(dir.path(), schema);
     let k: Vec<Vec<u8>> = (0..12i64).map(|i| opk_pk(&schema, &[(i - 6) as u64 as u128])).collect();
-    let mut state = 0x2545_F491_4F6C_DD1Du64;
-    let mut next = |bound: u64| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state % bound
-    };
+    let mut rng = Rng::new(0x2545_F491_4F6C_DD1D);
 
     let mut unordered_pushes = 0;
     for round in 0..300 {
-        let len = 1 + next(24) as usize;
+        let len = 1 + rng.gen_range(24) as usize;
         let rows: Vec<(usize, i64, i64)> = (0..len)
-            .map(|_| (next(k.len() as u64) as usize, next(5) as i64 - 2, next(3) as i64))
+            .map(|_| {
+                (
+                    rng.gen_range(k.len() as u64) as usize,
+                    rng.gen_range(5) as i64 - 2,
+                    rng.gen_range(3) as i64,
+                )
+            })
             .collect();
         let mut sorted = rows.clone();
         sorted.sort_by(|a, b| k[a.0].cmp(&k[b.0]));

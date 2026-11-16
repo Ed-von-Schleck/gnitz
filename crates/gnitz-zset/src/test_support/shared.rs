@@ -538,7 +538,7 @@ pub fn arb_fold_case() -> impl Strategy<Value = (SchemaDescriptor, Vec<FoldRow>)
 pub fn radix_fold_rows(stride: usize, n: u64) -> Vec<FoldRow> {
     (0..n)
         .map(|i| {
-            let r = super::rng::mix(i);
+            let r = gnitz_foundation::rng::mix(i);
             let mut pk = vec![0u8; stride];
             pk[0] = (r >> 40) as u8 & 1;
             pk[stride - 1] = (r >> 48) as u8;

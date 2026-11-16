@@ -3,8 +3,9 @@ use super::Fold;
 use crate::storage::Cut;
 use crate::storage::manifest::{self, StoreDir};
 use crate::test_support::{
-    make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, pk_payload_schema,
+    make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
+use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::probe_key;
@@ -1277,7 +1278,6 @@ fn a_jump_in_r_is_merged_within_each_calls_budget() {
 /// destination it was on: never the folds a spill set off.
 #[test]
 fn a_call_stops_at_the_destination_past_its_budget() {
-    use crate::test_support::Rng;
     const KEYS: u64 = 400_000;
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
@@ -1473,7 +1473,7 @@ impl Model {
     }
 
     /// One spill's delta as a (PK, payload)-sorted batch, applied to the model.
-    fn spill(&mut self, rng: &mut crate::test_support::Rng, pk_cols: usize, monotone: bool) -> Batch {
+    fn spill(&mut self, rng: &mut Rng, pk_cols: usize, monotone: bool) -> Batch {
         let n = 200 + rng.gen_range(2800);
         let mut delta: BTreeMap<Elem, i64> = BTreeMap::new();
         for _ in 0..n {
@@ -1606,7 +1606,7 @@ fn shard_index_model() {
             for (ci, &(budget, monotone, seeded)) in configs.iter().enumerate() {
                 let tmp = tempfile::tempdir().unwrap();
                 let schema = stride_schema(pk_cols);
-                let mut rng = crate::test_support::Rng::new(seed * 1_000_003 + (pk_cols * 16 + ci) as u64);
+                let mut rng = Rng::new(seed * 1_000_003 + (pk_cols * 16 + ci) as u64);
                 let mut idx = open(tmp.path(), schema, budget);
                 let mut m = Model::default();
                 if seeded {
@@ -1720,7 +1720,6 @@ fn shard_index_model() {
 /// never rests over the file threshold, and a reopen holds the same rows.
 #[test]
 fn tier_folds_keep_the_zset() {
-    use crate::test_support::Rng;
     const KEYS: u64 = 400_000;
     for budget in [None, Some(3 << 20)] {
         let tmp = tempfile::tempdir().unwrap();

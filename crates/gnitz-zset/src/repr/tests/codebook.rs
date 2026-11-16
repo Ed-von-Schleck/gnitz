@@ -1,5 +1,6 @@
 use super::*;
-use crate::test_support::{map_coded_shard, mix, prose, string_batch};
+use crate::test_support::{map_coded_shard, prose, string_batch};
+use gnitz_foundation::rng::mix;
 
 fn prose_batch(range: std::ops::Range<usize>) -> Batch {
     string_batch(&range.map(|i| (i as u64, prose(i))).collect::<Vec<_>>())

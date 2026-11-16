@@ -33,7 +33,7 @@ pub(super) fn lower_ordered(
 
     let aggs: &[AggCol] = match op {
         OrderedOp::Window { aggs, .. } => aggs,
-        OrderedOp::TopN { .. } => &[],
+        OrderedOp::TopN(_) => &[],
     };
     let group = resolve_reduce_specs(partition, aggs, &frame)?.agg;
     crate::tail::reject_order_key_count(order.len())?;
@@ -53,9 +53,9 @@ pub(super) fn lower_ordered(
     let out = keyed_frame(&frame, &group.group_cols, 0..frame.schema.columns().len() as u32, tail)?;
     // The operator, and whether a partition — the key — holds more than one row.
     let pk_repeats = match op {
-        OrderedOp::TopN { limit, offset } => {
-            cb.top_n(node, &group.group_cols, &keys, *limit, *offset);
-            *limit > 1
+        OrderedOp::TopN(slots) => {
+            cb.top_n(node, &group.group_cols, &keys, *slots);
+            slots.keep > 1
         }
         OrderedOp::Window { rank, dense_rank, .. } => {
             cb.window(node, group, &keys, (rank.is_some(), dense_rank.is_some()));

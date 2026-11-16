@@ -5,7 +5,7 @@ use super::{MORSEL, decode_f64, encode_f64};
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp, ResolvedProgram};
 use crate::test_support::{
-    Col, PATTERNS, TestView, f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values,
+    Col, PATTERNS, TestView, f64s, fill, filter_prog, i64s, int, pairs, passing_rows, row_strs, row_values,
     scalar_prog, schema_pk_strings, text, verdicts, view,
 };
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
@@ -15,24 +15,29 @@ use crate::{SchemaColumn, SchemaDescriptor};
 // The harness: one U64 PK plus the operand columns a program loads in order
 // ---------------------------------------------------------------------------
 
-/// The schema, instructions and rows of [`prog`]: one U64 PK and `cols`, each
+/// The instructions and rows of [`prog`]: one U64 PK and `cols`, each
 /// loaded into its own register, in order, ahead of `mk`'s instructions.
-fn build(
-    cols: &[Col],
-    mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>,
-) -> (SchemaDescriptor, Vec<LogicalInstr>, TestView) {
-    let (schema, view) = view(cols);
-    let mut instrs: Vec<LogicalInstr> = cols.iter().zip(1..).map(|(c, col)| c.load(col)).collect();
+fn build(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (Vec<LogicalInstr>, TestView) {
+    let (_, view) = view(cols);
+    let mut instrs: Vec<LogicalInstr> = cols.iter().zip(1..).map(|(c, col)| load(c, col)).collect();
     let regs: Vec<Reg> = (0..cols.len() as u16).map(Reg).collect();
     instrs.extend(mk(&regs));
-    (schema, instrs, view)
+    (instrs, view)
+}
+
+/// The instruction loading column `col`, of `c`'s type, into a register.
+fn load(c: &Col, col: u32) -> LogicalInstr {
+    match c.tc.is_german_string() {
+        true => LogicalInstr::LoadColStr { col },
+        false => LogicalInstr::LoadCol { col },
+    }
 }
 
 /// A program loading each of `cols` into its own register, in order, then `mk`'s
 /// instructions over those registers; the last is the result.
 fn prog(cols: &[Col], consts: Vec<Vec<u8>>, mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (ScalarEval, TestView) {
-    let (schema, instrs, view) = build(cols, mk);
-    (scalar_prog(&schema, instrs, consts), view)
+    let (instrs, view) = build(cols, mk);
+    (scalar_prog(view.schema(), instrs, consts), view)
 }
 
 /// Every row's result of an integer-valued [`prog`], as the register's `i64`
@@ -44,8 +49,8 @@ fn ints(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> Vec<Optio
 
 /// [`ints`] for a boolean result, which is read back as a filter verdict too.
 fn bools(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
-    let (schema, instrs, view) = build(cols, mk);
-    let vals = verdicts(&schema, instrs, vec![], &view);
+    let (instrs, view) = build(cols, mk);
+    let vals = verdicts(instrs, vec![], &view);
     vals.into_iter().map(|v| v.map(|x| x as i64)).collect()
 }
 
@@ -165,10 +170,10 @@ fn every_int_load_reads_its_value_from_either_region() {
             3 => u128::from((p as u64).rotate_left(8)),
             _ => p,
         };
-        let mut view = TestView::for_schema(&schema, PATTERNS.len());
+        let mut view = TestView::new(&schema, PATTERNS.len());
         for (row, &p) in PATTERNS.iter().enumerate() {
             for col in [0, 2, 3] {
-                view.set_native(&schema, row, col, value(col as u32, p));
+                view.set(row, col, value(col as u32, p));
             }
         }
         for col in [0, 2, 3] {
@@ -551,7 +556,7 @@ fn every_string_column_addresses_its_own_region_in_place() {
             _ => format!("column-{c}-is-past-twelve-bytes"),
         })
         .collect();
-    let view = make_string_view(&schema, 1, |_, c| &vals[c], |_, _| false);
+    let view = fill(&schema, 1, |_, c| &vals[c], |_, _| false);
 
     let mut instrs: Vec<LogicalInstr> = (0..N).map(|c| LogicalInstr::LoadColStr { col: c as u32 + 1 }).collect();
     // Fold left, so every column's view is resolved into the result.
@@ -789,7 +794,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
         // Row `i * len + j` compares corpus[i] against corpus[j].
         let null = |row: usize, c: usize| nullable && row.is_multiple_of([7, 11][c]);
         let schema = schema_pk_strings(2, nullable);
-        let view = make_string_view(
+        let view = fill(
             &schema,
             len * len,
             |row, c| [corpus[row / len], corpus[row % len]][c],
@@ -805,13 +810,13 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                 LogicalInstr::StrCmp { op, a: Reg(0), b: Reg(1) },
             ];
             assert_eq!(
-                verdicts(&schema, by_regs, vec![], &view),
+                verdicts(by_regs, vec![], &view),
                 want,
                 "nullable={nullable} StrCmp {op:?}"
             );
             let in_place = vec![LogicalInstr::StrColCol { op, col_a: 1, col_b: 2 }];
             assert_eq!(
-                verdicts(&schema, in_place, vec![], &view),
+                verdicts(in_place, vec![], &view),
                 want,
                 "nullable={nullable} StrColCol {op:?}"
             );
@@ -819,7 +824,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
             // rows whose right-hand side it is; only the left column is read.
             for (j, b) in corpus.iter().enumerate() {
                 let vs_const = vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }];
-                let got = verdicts(&schema, vs_const, vec![b.to_vec()], &view);
+                let got = verdicts(vs_const, vec![b.to_vec()], &view);
                 for row in (j..len * len).step_by(len) {
                     let want = (!null(row, 0)).then(|| cmp(op, row / len, j));
                     assert_eq!(got[row], want, "nullable={nullable} StrColConst {op:?} row {row}");
@@ -852,7 +857,7 @@ fn the_fused_prefix_agrees_with_the_like_matcher() {
     for nullable in [false, true] {
         let null = |row: usize| nullable && row.is_multiple_of(5);
         let schema = schema_pk_strings(1, nullable);
-        let view = make_string_view(&schema, rows, |row, _| &corpus[row % corpus.len()], |row, _| null(row));
+        let view = fill(&schema, rows, |row, _| &corpus[row % corpus.len()], |row, _| null(row));
         for l in 0..=gnitz_wire::SHORT_STRING_THRESHOLD + 2 {
             let lit = &text[..l];
             let pattern = crate::LikePattern::encode(&format!("{}%", std::str::from_utf8(lit).unwrap()), None).unwrap();
@@ -862,7 +867,7 @@ fn the_fused_prefix_agrees_with_the_like_matcher() {
                 .collect();
             let fused = vec![LogicalInstr::StrColPrefix { col: 1, const_idx: ConstIdx(0) }];
             assert_eq!(
-                verdicts(&schema, fused, vec![lit.to_vec()], &view),
+                verdicts(fused, vec![lit.to_vec()], &view),
                 want,
                 "nullable={nullable} prefix length {l}"
             );
@@ -880,7 +885,7 @@ fn a_fused_compare_reads_its_constant_at_any_pool_index() {
     let zulu: &[u8] = b"zulu-value-past-twelve";
     // PKs are 1..=4; the set admits rows 1 and 2.
     let vals: [[&[u8]; 2]; 4] = [[zulu, zulu], [a, b], [a, b"short"], [b"short", b]];
-    let view = make_string_view(&schema, vals.len(), |r, c| vals[r][c], |_, _| false);
+    let view = fill(&schema, vals.len(), |r, c| vals[r][c], |_, _| false);
     let mut ev = filter_prog(
         &schema,
         vec![
@@ -1034,7 +1039,7 @@ fn text_to_float_parses_or_nulls() {
 fn a_constant_string_outlives_every_morsel_reset() {
     let n = MORSEL + 7;
     let schema = schema_pk_strings(1, false);
-    let view = make_string_view(&schema, n, |row, _| format!("row{row}-abcdefghijklmnop"), |_, _| false);
+    let view = fill(&schema, n, |row, _| format!("row{row}-abcdefghijklmnop"), |_, _| false);
     let constant = vec![LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) }];
     assert_eq!(
         text_rows(
@@ -1411,10 +1416,10 @@ mod shapes {
     #[test]
     #[should_panic(expected = "payload column 0")]
     fn an_evaluation_refuses_a_view_whose_shapes_disagree() {
-        let (schema, instrs, view) = build(&[i64s([1, 2])], |r| {
+        let (instrs, view) = build(&[i64s([1, 2])], |r| {
             vec![LogicalInstr::Cmp { op: CmpOp::Eq, a: r[0], b: r[0] }]
         });
-        let mut f = filter_prog(&schema, instrs, vec![]);
+        let mut f = filter_prog(view.schema(), instrs, vec![]);
         crate::test_support::filter_verdicts(&mut f, &SkewedCells(view));
     }
 }

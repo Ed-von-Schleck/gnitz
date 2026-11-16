@@ -51,7 +51,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
 use crate::rules::{find_unique_column, reject_float_key};
 use crate::tail::{OrderKey, parse_order_key};
-use gnitz_wire::{ColType, ColumnDef, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, TypeCode, WeightSlots};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, Select, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowSpec, WindowType,
@@ -471,11 +471,10 @@ fn effective_order(call: &Call, key: Option<&[ColId]>) -> Vec<OrderCol> {
     order
 }
 
-/// The `(limit, offset)` of the slots `offset .. offset + limit` a QUALIFY
-/// conjunct `rn <= n`, `rn < n` or `rn = n` over placeholder `rn` keeps of each
+/// The weight slots a QUALIFY conjunct `rn <= n`, `rn < n` or `rn = n` over placeholder `rn` keeps of each
 /// partition, the literal on either side; `None` for any other predicate, or a
 /// bound keeping no slot.
-fn row_number_bound(conjunct: &HirExpr, rn: ColId) -> Option<(u64, u64)> {
+fn row_number_bound(conjunct: &HirExpr, rn: ColId) -> Option<WeightSlots> {
     let BExpr::BinOp(l, op, r) = conjunct else {
         return None;
     };
@@ -493,13 +492,13 @@ fn row_number_bound(conjunct: &HirExpr, rn: ColId) -> Option<(u64, u64)> {
         BinOp::Eq => (1, n.saturating_sub(1)),
         _ => return None,
     };
-    (n >= 1 && limit >= 1).then_some((limit as u64, offset as u64))
+    (n >= 1 && limit >= 1).then_some(WeightSlots { skip: offset as u64, keep: limit as u64 })
 }
 
 /// The body's top-N cut: a ROW_NUMBER with an order, bounded by one QUALIFY
 /// conjunct and read by nothing else — its index in `calls`, that conjunct's in
-/// `qualify`, and the `(limit, offset)` the bound keeps.
-fn top_n_cut(calls: &[Call], items: &[ProjEntry], qualify: &[HirExpr]) -> Option<(usize, usize, (u64, u64))> {
+/// `qualify`, and the slots the bound keeps.
+fn top_n_cut(calls: &[Call], items: &[ProjEntry], qualify: &[HirExpr]) -> Option<(usize, usize, WeightSlots)> {
     calls.iter().enumerate().find_map(|(ci, call)| {
         if call.func != WinFunc::RowNumber || call.order.is_empty() {
             return None;
@@ -618,8 +617,8 @@ fn desugar<L: ItemLeaf>(
     for spec in ordered {
         rows = running_values(ids, rows, spec, &mut values)?;
     }
-    if let Some((call, (limit, offset))) = cut {
-        rows = RelExpr::top_n(rows, call.partition, call.order, limit, offset);
+    if let Some((call, slots)) = cut {
+        rows = RelExpr::top_n(rows, call.partition, call.order, slots);
     }
     // Every unordered specification's `γ_P(W)`, joined onto the rows. One with no
     // partition key is a keyless (cross) join against the one global row.

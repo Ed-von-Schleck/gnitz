@@ -7,6 +7,7 @@ use crate::test_support::{
     RowKey, arb_fold_case, assert_folds, fold_batch, make_batch, make_batch_u128, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, make_schema_u128_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of,
 };
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{PkKeys, TypeCode};
 use proptest::prelude::*;
 use std::ops::ControlFlow;
@@ -478,7 +479,7 @@ fn a_drain_decides_only_a_chunk_of_in_memory_rows() {
 /// their runs, weights included; a dropped cursor holds none of its runs.
 #[test]
 fn cursors_over_pooled_buffers_drain_their_own_runs() {
-    let mut rng = crate::test_support::Rng::new(11);
+    let mut rng = Rng::new(11);
     for (round, k) in [0usize, 5, 1, 9, 2, 0, 3, 17, 1, 4, 2, 6, 0, 8]
         .into_iter()
         .cycle()

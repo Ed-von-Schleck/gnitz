@@ -1,5 +1,6 @@
-//! The process and the OS under it. Sibling leaves, NOT a unifying facade: each
-//! keeps its own narrow surface.
+//! The process and the OS under it, and the probes and PRNG every crate's tests
+//! and benchmarks share. Sibling leaves, NOT a unifying facade: each keeps its
+//! own narrow surface.
 //!   - `log`        — level/tag state. The `gnitz_*!` macros it backs are
 //!     `#[macro_export]`ed, so they land at this crate's root, not in `log`
 //!   - `env`        — `GNITZ_*` environment-variable overrides
@@ -9,6 +10,7 @@
 //!   - `perf`       — cost probes: instructions retired, context switches and
 //!     resident-set bytes, for benchmarks and cost-claim tests. Linux only
 //!   - `process`    — a child process: tied to the thread that spawns it, awaited on its log
+//!   - `rng`        — the deterministic PRNG of tests and benchmarks
 //!
 //! The server is Linux-only; a client is not. What a client links of this crate
 //! builds on any Unix: `perf` and the server-only `posix_io` idioms are gated to
@@ -26,3 +28,4 @@ pub mod log;
 pub mod perf;
 pub mod posix_io;
 pub mod process;
+pub mod rng;

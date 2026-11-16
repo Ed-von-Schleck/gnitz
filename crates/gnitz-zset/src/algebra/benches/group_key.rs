@@ -1,7 +1,8 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
-use crate::test_support::{mix, pk_payload_schema, u64_pk_schema};
+use crate::test_support::{pk_payload_schema, u64_pk_schema};
+use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 
 /// Instructions per [`GroupOutKey::numbered_into`] call and per row, per key form,

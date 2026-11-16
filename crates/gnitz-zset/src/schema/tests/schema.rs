@@ -31,3 +31,53 @@ fn derived_schema_refuses_past_max_columns() {
     b.push(k);
     assert_eq!(b.finish(), Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 2)));
 }
+
+/// A schema record's arity prefix carries no redundancy of its own, so every
+/// flip in it must either be refused or change the descriptor.
+#[test]
+fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
+    use gnitz_wire::TypeCode::{F64, I64, U64};
+    let cols = [
+        SchemaColumn::new(U64, false),
+        SchemaColumn::new(I64, false),
+        SchemaColumn::new(I64, true),
+        SchemaColumn::new(F64, true),
+    ];
+    let reference = SchemaDescriptor::new(&cols, &[0]);
+    let mut buf = encode_schema_block(&reference);
+    for byte in 0..4 + 1 + reference.pk_cols().len() {
+        for bit in 0..8 {
+            buf[byte] ^= 1 << bit;
+            if let Ok(decoded) = decode_schema_block(&buf) {
+                assert_ne!(decoded, reference, "prefix byte {byte} bit {bit} changed nothing");
+            }
+            buf[byte] ^= 1 << bit;
+        }
+    }
+}
+
+/// The decode of a schema record refuses what the descriptor refuses: a
+/// nullable PK column, and a column count past `MAX_COLUMNS`.
+#[test]
+fn decode_schema_block_refuses_what_the_descriptor_refuses() {
+    use gnitz_wire::TypeCode::U64;
+    let cases = [
+        ("nullable PK column", vec![SchemaColumn::new(U64, true)]),
+        (
+            "column count past MAX_COLUMNS",
+            vec![SchemaColumn::new(U64, false); MAX_COLUMNS + 2],
+        ),
+    ];
+    for (what, cols) in &cases {
+        let record = gnitz_wire::schema_block::encode(
+            cols.iter().map(|c| SchemaBlockCol {
+                ty: ColType::of(c.type_code),
+                nullable: c.nullable,
+                hidden: false,
+                name: b"k",
+            }),
+            &[0],
+        );
+        assert!(decode_schema_block(&record).is_err(), "{what}");
+    }
+}

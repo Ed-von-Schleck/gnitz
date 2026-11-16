@@ -1,10 +1,9 @@
 //! The schema descriptor: a column table and PK list with every layout fact
 //! derived from them — the *schema* peer of [`crate::BatchView`]'s *access*
 //! contract, linked by the engine and the client alike. A reduce's output key is
-//! one of those facts, and the descriptor's schema-block codec is here too.
+//! one of those facts.
 
-use gnitz_wire::schema_block::SchemaBlockCol;
-use gnitz_wire::{ColType, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PkListRole, PkRule, TypeCode};
+use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PkListRole, PkRule, TypeCode};
 
 use crate::ColumnLocator;
 
@@ -343,6 +342,17 @@ impl SchemaDescriptor {
         Self::try_new(&cols[..n], leading_pk(n)).expect("a valid schema's PK is a valid PK-only schema")
     }
 
+    /// Where payload slot `pi`'s value sits; `pi` must be below `num_payload_cols()`.
+    #[inline]
+    pub fn payload_locator(&self, pi: usize) -> ColumnLocator {
+        let c = &self.columns[self.payload_col_idx(pi)];
+        ColumnLocator::Payload {
+            slot: pi as u8,
+            size: c.size,
+            type_code: c.type_code,
+        }
+    }
+
     /// The column index of payload slot `pi`, which must be below `num_payload_cols()`.
     #[inline]
     pub fn payload_col_idx(&self, pi: usize) -> usize {
@@ -426,16 +436,9 @@ impl SchemaDescriptor {
 
     /// Every payload column's locator, in slot order.
     pub fn payload_locators(&self) -> Vec<ColumnLocator> {
-        self.payload_locator_iter().collect()
-    }
-
-    /// [`Self::payload_locators`], uncollected.
-    pub(crate) fn payload_locator_iter(&self) -> impl Iterator<Item = ColumnLocator> {
-        self.payload_columns().map(|(pi, c)| ColumnLocator::Payload {
-            slot: pi as u8,
-            size: c.size,
-            type_code: c.type_code,
-        })
+        (0..self.num_payload_cols())
+            .map(|pi| self.payload_locator(pi))
+            .collect()
     }
 
     /// The PK column when the PK is exactly one column.
@@ -564,31 +567,6 @@ impl PartialEq for SchemaDescriptor {
 
 impl Eq for SchemaDescriptor {}
 
-/// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
-/// carried on the wire but nothing engine-side reads one.
-pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
-    let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
-    let mut n = 0;
-    let pk = gnitz_wire::schema_block::decode(data, |c| {
-        cols[n] = SchemaColumn::new(c.ty.tc, c.nullable);
-        n += 1;
-        Ok(())
-    })?;
-    Ok(SchemaDescriptor::try_new(&cols[..n], pk.as_slice())?)
-}
-
-/// Encode `schema`'s physical column shape — the inverse of
-/// [`decode_schema_block`]: no names, no hidden flag, every scale zero.
-pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
-    let cols = schema.columns().iter().map(|c| SchemaBlockCol {
-        ty: ColType::of(c.type_code),
-        nullable: c.nullable,
-        hidden: false,
-        name: b"",
-    });
-    gnitz_wire::schema_block::encode(cols, schema.pk_cols())
-}
-
 /// How a reduce keys its output. For a `Reduce` node it is derived, never
 /// transmitted: the planner and the engine both call
 /// [`SchemaDescriptor::reduce_out_key`] over the reduce's input schema. The fold
@@ -608,13 +586,19 @@ pub enum ReduceOutKey {
 /// [`SchemaDescriptor::reduce_out_layout`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReduceOutSlot {
-    /// The synthetic `U128` fold key: slot 0 of the fold arm, and its whole PK.
+    /// The synthetic fold key, [`Self::SYNTHETIC_KEY_COL`]: slot 0 of the fold
+    /// arm, and its whole PK.
     SyntheticKey,
     /// The source column it names, in the output's PK region.
     Key(u32),
     /// The source column it names, carried into the payload — a column of the
     /// output's row the key region does not spell.
     Carried(u32),
+}
+
+impl ReduceOutSlot {
+    /// The column of [`Self::SyntheticKey`]: the hidden `_group_pk`.
+    pub const SYNTHETIC_KEY_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 }
 
 #[cfg(test)]

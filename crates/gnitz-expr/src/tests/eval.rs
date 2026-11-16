@@ -10,8 +10,8 @@ use crate::eval::Resolved;
 use crate::morsel::MORSEL;
 use crate::simd::encode_f64;
 use crate::test_support::{
-    TestView, filter_prog, i64s, is_not_null_op, is_null_op, make_n_col_view, map_prog, map_rows, passing_rows,
-    result_prog, row_values, scalar_prog, schema_pk, schema_pk_ints, strings, verdicts, view,
+    Cell, fill, filter_prog, i64s, is_not_null_op, is_null_op, map_prog, map_rows, passing_rows, result_prog,
+    row_values, scalar_prog, schema_pk, schema_pk_ints, strings, verdicts, view,
 };
 use crate::{CmpOp, IntArithOp, LogicalInstr};
 
@@ -148,7 +148,7 @@ fn filter_runs_are_maximal_across_morsels() {
         for nullable in [false, true] {
             let schema = schema_pk_ints(1, nullable);
             let null = |row: usize| nullable && row % 5 == 1;
-            let mb = make_n_col_view(&schema, n, |row, _| i64::from(pass(row, n)), |row, _| null(row));
+            let mb = fill(&schema, n, |row, _| i64::from(pass(row, n)), |row, _| null(row));
             let want: Vec<bool> = (0..n).map(|row| pass(row, n) && !null(row)).collect();
             for instrs in [&gt_0, &not_le_0] {
                 let mut ev = filter_prog(&schema, instrs.clone(), vec![]);
@@ -212,12 +212,12 @@ fn three_and_chain_matches_the_three_valued_reference() {
             "{label}: wrong arm"
         );
         let n = 77;
-        let mb = make_n_col_view(&schema, n, value, null_at);
+        let mb = fill(&schema, n, value, null_at);
         let want = (0..n).map(|row| {
             let clause = |col| (!null_at(row, col)).then(|| value(row, col) > 1);
             and3(and3(clause(0), clause(1)), clause(2))
         });
-        assert_eq!(verdicts(&schema, instrs, vec![], &mb), as_value(want), "{label}");
+        assert_eq!(verdicts(instrs, vec![], &mb), as_value(want), "{label}");
     }
 }
 
@@ -232,7 +232,7 @@ fn every_boolean_combinator_covers_the_whole_three_valued_table() {
     // keeps it from reading as TRUE.
     const TRUTHY: i64 = -5;
     let cells: Vec<[Option<bool>; 2]> = STATES.iter().flat_map(|&a| STATES.map(|b| [a, b])).collect();
-    let mb = make_n_col_view(
+    let mb = fill(
         &schema,
         cells.len(),
         |row, col| if cells[row][col] == Some(false) { 0 } else { TRUTHY },
@@ -252,7 +252,7 @@ fn every_boolean_combinator_covers_the_whole_three_valued_table() {
     ];
     for (name, instrs, reference) in combinators {
         let want = cells.iter().map(|&[a, b]| reference(a, b));
-        let got = verdicts(&schema, instrs, vec![], &mb);
+        let got = verdicts(instrs, vec![], &mb);
         // A bare load reads back its value, not its truth.
         let got: Vec<Option<i128>> = got.into_iter().map(|v| v.map(|x| i128::from(x != 0))).collect();
         assert_eq!(got, as_value(want), "{name}");
@@ -276,13 +276,13 @@ fn a_select_feeding_a_boolean_is_read_as_its_truthiness() {
     let value = |row: usize, col: usize| (row / [1, 2, 4, 8][col] % 3) as i64;
     let null = |row: usize, col: usize| row % [5, 7, 11, 13][col] == 1;
     let n = 90;
-    let mb = make_n_col_view(&schema, n, value, null);
+    let mb = fill(&schema, n, value, null);
     let truth = |row, col| (!null(row, col)).then(|| value(row, col) != 0);
     let want = (0..n).map(|row| {
         let chosen = if truth(row, 0) == Some(true) { 1 } else { 2 };
         and3(truth(row, chosen), truth(row, 3))
     });
-    assert_eq!(verdicts(&schema, instrs, vec![], &mb), as_value(want));
+    assert_eq!(verdicts(instrs, vec![], &mb), as_value(want));
 }
 
 /// No NULL, all NULL, and NULLs scattered through every word.
@@ -346,7 +346,7 @@ fn is_null_shapes_select_the_reference_rows() {
         assert_eq!(ev.null_regs(), 0, "{name}: must resolve no nullable register");
         for (arrangement, null_pred) in NULL_ARRANGEMENTS {
             let n = 70;
-            let mb = make_n_col_view(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
+            let mb = fill(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
             let want: Vec<bool> = (0..n)
                 .map(|row| reference(&|col| col > 0 && null_pred(row, col as usize - 1)))
                 .collect();
@@ -373,7 +373,7 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
         );
         assert_eq!(ev.null_regs(), 0);
         for (arrangement, null_pred) in NULL_ARRANGEMENTS {
-            let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, null_pred);
+            let mb = fill(&in_schema, n, |row, _| row as i64, null_pred);
             let want: Vec<(u64, Vec<Vec<u8>>)> = (0..n)
                 .map(|row| (0, vec![u64::from(null_pred(row, 0) ^ invert).to_le_bytes().to_vec()]))
                 .collect();
@@ -413,20 +413,19 @@ fn nullable_and_not_null_columns_side_by_side() {
         _ => row % 7 == 3,
     };
     let n = 300;
-    let mut v = TestView::for_schema(&schema, n);
-    for row in 0..n {
-        let mut word = 0u64;
-        for pi in 0..6 {
-            gnitz_wire::null_word_set(&mut word, pi, slot_bit(pi, row));
-        }
-        v.set_null_word(row, word);
-        v.set_int(row, 0, row as i64);
-        v.set_int(row, 1, row as i64);
-        v.set_string(row, 2, if row % 3 == 0 { b"alpha" } else { b"zeta" });
-        v.set_string(row, 3, if row % 2 == 0 { b"beta" } else { b"omega" });
-        v.set_int(row, 4, (row as f32).to_bits() as i64);
-        v.set_int(row, 5, (row as f32).to_bits() as i64);
-    }
+    let v = fill(
+        &schema,
+        n,
+        |row, pi| -> Cell {
+            match pi {
+                0 | 1 => (row as i64).into(),
+                2 => if row % 3 == 0 { "alpha" } else { "zeta" }.into(),
+                3 => if row % 2 == 0 { "beta" } else { "omega" }.into(),
+                _ => u128::from((row as f32).to_bits()).into(),
+            }
+        },
+        |row, pi| slot_bit(pi, row),
+    );
 
     let instrs = vec![
         LogicalInstr::LoadCol { col: 1 },
@@ -475,7 +474,7 @@ fn int_results_widen_by_the_result_registers_signedness() {
     let schema = schema_pk(&[TypeCode::U64, TypeCode::I64], true);
     // Bit 63 set, so an unsigned and a signed reading differ.
     let big = (1u64 << 63) | 6;
-    let mb = make_n_col_view(&schema, 1, |_, col| [big as i64, -1][col], |_, _| false);
+    let mb = fill(&schema, 1, |_, col| [big as i64, -1][col], |_, _| false);
     let u64_col = LogicalInstr::LoadCol { col: 1 };
     let i64_col = LogicalInstr::LoadCol { col: 2 };
     let k = |val| LogicalInstr::LoadConst { val, unsigned: false };
@@ -584,7 +583,7 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
             let label = format!("{pred_name} × {bound_name}");
             let mut f = crate::RowFilter::for_read(pred, bound.as_ref(), &schema).unwrap();
             for n in [100, 0, 10] {
-                let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null(row));
+                let mb = fill(&schema, n, |row, _| row as i64, |row, _| null(row));
                 assert_eq!(
                     passing_rows(&mut f, &mb),
                     (0..n)
@@ -629,7 +628,7 @@ fn ranges_on_a_reused_filter_match_a_fresh_filters() {
     for make in fresh {
         let mut reused = make();
         for &(n, pass) in &inputs {
-            let mb = make_n_col_view(&schema, n, |row, _| i64::from(pass(row)), |_, _| false);
+            let mb = fill(&schema, n, |row, _| i64::from(pass(row)), |_, _| false);
             let want = make().ranges(&mb).to_vec();
             let got = reused.ranges(&mb);
             assert_eq!(*got, want, "n = {n}");

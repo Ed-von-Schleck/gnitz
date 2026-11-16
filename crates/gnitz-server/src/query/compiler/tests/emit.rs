@@ -3,7 +3,7 @@ use crate::query::compiler::fixtures::*;
 use crate::query::vm::Vm;
 use crate::test_support::{make_schema_u64_i64, map_copy, reindexed_on_col1, scan_keyed, self_typed_slots};
 use gnitz_store::relation::RelationKind::{self, BaseTable, Stream};
-use gnitz_wire::{Circuit, JoinKind, ReindexSlot, TypeCode};
+use gnitz_wire::{Circuit, JoinKind, ReindexSlot, TypeCode, WeightSlots};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
 
@@ -673,7 +673,7 @@ fn a_scan_reads_the_columns_its_readers_name() {
             |c| {
                 let a = scan(c, 10);
                 let by = gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false };
-                c.top_n(a, &[4], &[by], 3, 0);
+                c.top_n(a, &[4], &[by], WeightSlots { skip: 0, keep: 3 });
             },
             0b11111,
         ),

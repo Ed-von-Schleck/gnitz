@@ -13,10 +13,11 @@ use crate::algebra::copy_columns;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::stream_input::{Cells, Row, batch, schema};
-use crate::test_support::{TestTrace, cell, mix};
+use crate::test_support::{TestTrace, cell};
 use gnitz_expr::{OrderLocator, ReduceOutSlot, cmp_order_keys, order_locators};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{OrderKey, TypeCode};
+use gnitz_foundation::rng::mix;
+use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 /// One to three order keys, over any column of [`schema`].
 pub(super) fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
@@ -155,7 +156,7 @@ pub(super) fn bench_rows(
 #[test]
 fn a_fixed_width_key_sits_whole_in_the_index_pk() {
     let key = OrderKey { col: 3, desc: false, nulls_first: false };
-    let plan = OrderedPlan::top_n(&schema(), &[], &[key], 1, 0).unwrap();
+    let plan = OrderedPlan::top_n(&schema(), &[], &[key], WeightSlots { skip: 0, keep: 1 }).unwrap();
     assert_eq!(plan.index_schema().pk_stride(), 8, "no group, no rank, the whole image");
     assert_eq!(
         plan.index_schema().num_payload_cols(),
@@ -172,9 +173,9 @@ fn a_fixed_width_key_sits_whole_in_the_index_pk() {
 fn a_shape_the_order_index_cannot_hold_is_refused() {
     let s = schema();
     let err = |r: Result<OrderedPlan, String>| r.err().expect("refused");
-    assert!(err(OrderedPlan::top_n(&s, &[], &[], 1, 0)).contains("no order keys"));
+    assert!(err(OrderedPlan::top_n(&s, &[], &[], WeightSlots { skip: 0, keep: 1 })).contains("no order keys"));
     let oob = [OrderKey { col: 9, desc: false, nulls_first: false }];
-    assert!(err(OrderedPlan::top_n(&s, &[], &oob, 1, 0)).contains("order column"));
+    assert!(err(OrderedPlan::top_n(&s, &[], &oob, WeightSlots { skip: 0, keep: 1 })).contains("order column"));
 }
 
 /// [`OrderIndex::entries`] a row at a time: each row's lead and every other
@@ -263,7 +264,7 @@ fn entries_are_the_row_at_a_time_entries() {
             ] {
                 // No group, an I64 one, a nullable I64 one.
                 for group in [&[][..], &[7], &[8]] {
-                    let plan = OrderedPlan::top_n(&s, group, &keys, 1, 0).unwrap();
+                    let plan = OrderedPlan::top_n(&s, group, &keys, WeightSlots { skip: 0, keep: 1 }).unwrap();
                     let (got, want) = (plan.index.entries(&delta), entries_by_row(&plan.index, &delta));
                     let at = format!("keys {keys:?}, group {group:?}");
                     assert_eq!(got.pk(), want.pk(), "{at}: PK");

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::Rng;
+use gnitz_foundation::rng::Rng;
 
 /// A value's player key: coarser than the value, so adjacent values tie on it,
 /// and `u128::MAX` for the highest, which is the sentinel's.

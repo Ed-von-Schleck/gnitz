@@ -12,6 +12,7 @@ use std::hint::black_box;
 
 use super::*;
 use gnitz_foundation::perf;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec};
 
 /// Base rows, and so view rows.

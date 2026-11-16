@@ -1,5 +1,6 @@
 use super::*;
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
 /// Instructions, cycles and branch misses per cell of
@@ -10,19 +11,13 @@ use std::hint::black_box;
 fn shift_german_string_heaps_bench() {
     const N: usize = 1 << 20;
     let counters = [Counter::instructions(), Counter::cycles(), Counter::branch_misses()];
-    let mut x = 0x5EED_6E57u64;
-    let mut next = move || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut rng = Rng::new(0x5EED_6E57);
     // (name, shortest length, lengths drawn): mixed straddles the threshold.
     let shapes = [("mixed", 0, 25), ("all-short", 0, 13), ("all-long", 13, 12)];
     for (name, lo, span) in shapes {
         let mut cells = vec![0u8; N * 16];
         for (i, cell) in cells.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-            let len = lo + (next() % span) as u32;
+            let len = lo + rng.gen_range(span) as u32;
             write_u32_le(cell, 0, len);
             if len as usize > SHORT_STRING_THRESHOLD {
                 write_u64_le(cell, 8, i as u64 * 24);

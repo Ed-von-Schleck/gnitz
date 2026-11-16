@@ -53,9 +53,9 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> gnitz_sto
 use crate::test_support::{
     apply_ddl, bundle, chunked, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit,
     empty_catalog, empty_catalog_with, equi_join_circuit, fk_child_cols, fk_def, fk_def_on_delete, fk_parent,
-    idx_tab_batch, left_join_engine, mix, negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema,
-    push_and_tick, push_sys_row, read_rows, refusal, register_full_pk, register_identity_view, scan_all,
-    schema_tab_batch, sum_weights, sys_batch, table_engine, table_engine_with, table_tab_batch, table_tab_row,
+    idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_and_tick,
+    push_sys_row, read_rows, refusal, register_full_pk, register_identity_view, scan_all, schema_tab_batch,
+    sum_weights, sys_batch, table_engine, table_engine_with, table_tab_batch, table_tab_row,
     try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks, view_tab_row, weights,
 };
 

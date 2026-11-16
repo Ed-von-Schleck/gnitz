@@ -11,8 +11,9 @@
 
 use super::*;
 use gnitz_foundation::perf;
+use gnitz_foundation::rng::mix;
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, ReadBound};
+use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, ReadBound, WeightSlots};
 
 /// Base rows a table-sourced fixture loads before its view is created.
 const ROWS: u64 = 1_000_000;
@@ -331,9 +332,10 @@ fn top_n_view(engine: &mut CatalogEngine, t: u64, group: &[u32], limit: u64) -> 
     let order = [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }];
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(t, ReadBound::None);
-    circuit.top_n(scan, group, &order, limit, 0);
+    let slots = WeightSlots { skip: 0, keep: limit };
+    circuit.top_n(scan, group, &order, slots);
     let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-    let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, group, &order, limit, 0)
+    let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, group, &order, slots)
         .unwrap()
         .output_schema();
     try_register_view(engine, circuit, "v", &cols_of(&out), 0, 0).unwrap()

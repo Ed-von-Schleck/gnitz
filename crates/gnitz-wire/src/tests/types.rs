@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_foundation::rng::mix;
 
 /// Every type-code predicate over every `TypeCode`.
 #[test]
@@ -240,7 +241,7 @@ fn an_integers_order_image_is_its_opk_key_promoted() {
             1 | 2 => (0..=mask).collect(),
             _ => [0, 1, mask, mask >> 1, (mask >> 1) + 1]
                 .into_iter()
-                .chain((1..=64u64).map(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i) & mask))
+                .chain((1..=64u64).map(|i| mix(i) & mask))
                 .collect(),
         };
         let kind = ScalarKind::Int(fi);

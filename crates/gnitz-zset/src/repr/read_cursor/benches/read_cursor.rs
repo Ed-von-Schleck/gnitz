@@ -2,8 +2,9 @@ use super::tests::create_read_cursor;
 use super::*;
 use crate::repr::{Batch, BatchBuilder, MappedShard, Run};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
+use crate::test_support::{map_shard, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::mix;
 use gnitz_wire::{PkKeys, TypeCode};
 use std::hint::black_box;
 use std::path::Path;
@@ -227,7 +228,7 @@ fn pk_set_gather_drain_bench() {
     for backing in ["mem", "shard packed", "shard raw"] {
         // The integer cells of row `i`, spread over the whole range in `raw`.
         let val = |i: u64, m: u64| match backing {
-            "shard raw" => (i * m).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128,
+            "shard raw" => mix(i * m) as u128,
             _ => (i * m) as u128,
         };
         for (label, with_str) in [("3xI64", false), ("2xI64+string", true)] {

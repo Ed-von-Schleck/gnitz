@@ -15,8 +15,8 @@ use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, group
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{PkBuf, TypeCode};
 
-use super::rng::Rng;
 use super::shared::{make_schema_pk_u64_payload_string, self_typed_slots, u64_pk_schema, zset_of, zset_sum};
+use gnitz_foundation::rng::Rng;
 
 /// The reindex of `source` onto its columns `key`, each at its own slot type,
 /// keeping `keep` and doing `nulls` with a NULL key: with `Drop`, the map a

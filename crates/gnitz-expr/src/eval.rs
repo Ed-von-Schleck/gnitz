@@ -11,7 +11,7 @@ use gnitz_wire::{FixedInt, KeyRange, TypeCode};
 #[cfg(test)]
 use crate::ResolvedProgram;
 use crate::map::{Emit, EmitStore};
-use crate::morsel::{Evaluator, MorselOut};
+use crate::morsel::Evaluator;
 use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
@@ -179,33 +179,27 @@ pub struct ScalarEval {
 }
 
 impl ScalarEval {
-    /// `f(row, value)` for every row of `mb` in order. Returns the first `Err`
-    /// of `f`, after which `f` is not called again.
-    pub fn for_each<E>(
-        &mut self,
-        mb: &dyn BatchView,
-        mut f: impl FnMut(usize, ScalarCell<'_>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let r = self.result_reg;
-        let unsigned = match self.class {
-            ResultClass::Str => {
-                return self.try_rows(mb, |out, i, row| {
-                    f(row, ScalarCell::Str((!out.is_null(r, i)).then(|| out.str_bytes(r, i))))
-                });
-            }
-            ResultClass::Signed => false,
-            ResultClass::Unsigned => true,
-        };
-        self.try_rows(mb, |out, i, row| {
-            let v = (!out.is_null(r, i)).then(|| {
-                let x = out.reg_values(r)[i];
-                match unsigned {
-                    true => i128::from(x as u64),
-                    false => i128::from(x),
+    /// `f(value)` for every row of `mb`, in row order.
+    pub fn for_each(&mut self, mb: &dyn BatchView, mut f: impl FnMut(ScalarCell<'_>)) {
+        let (r, class) = (self.result_reg, self.class);
+        self.ev.eval_morsels(mb, 0, mb.row_count(), |_, out| {
+            let rows = 0..out.rows();
+            let some = |i| !out.is_null(r, i);
+            match class {
+                ResultClass::Str => rows.for_each(|i| f(ScalarCell::Str(some(i).then(|| out.str_bytes(r, i))))),
+                class => {
+                    let vals = out.reg_values(r);
+                    let unsigned = matches!(class, ResultClass::Unsigned);
+                    rows.for_each(|i| {
+                        let x = vals[i];
+                        f(ScalarCell::Int(some(i).then(|| match unsigned {
+                            true => i128::from(x as u64),
+                            false => i128::from(x),
+                        })))
+                    })
                 }
-            });
-            f(row, ScalarCell::Int(v))
-        })
+            }
+        });
     }
 
     /// Write each row of `mb`'s value into payload slot `slot` of `dst`, whose
@@ -226,13 +220,7 @@ impl ScalarEval {
             ResultClass::Str => (EmitStore::Str, None),
             class => {
                 let fi = FixedInt::from_type_code(tc).expect("an integer is stored only into an integer-stored slot");
-                let store = match fi.width() {
-                    1 => EmitStore::W1,
-                    2 => EmitStore::W2,
-                    4 => EmitStore::W4,
-                    _ => EmitStore::W8,
-                };
-                (store, Some((fi, matches!(class, ResultClass::Unsigned))))
+                (EmitStore::int(fi), Some((fi, matches!(class, ResultClass::Unsigned))))
             }
         };
         let e = Emit { reg, slot, store };
@@ -248,22 +236,6 @@ impl ScalarEval {
                 return;
             }
             out.emit(&e, dst.slot_mut(slot), row0);
-        });
-        res
-    }
-
-    /// `f(morsel, i, row)` for row `i` of each morsel, `row` its index in `mb`, up
-    /// to the first `Err`.
-    fn try_rows<E>(
-        &mut self,
-        mb: &dyn BatchView,
-        mut f: impl FnMut(&MorselOut<'_>, usize, usize) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let mut res = Ok(());
-        self.ev.eval_morsels(mb, 0, mb.row_count(), |rel_start, out| {
-            if res.is_ok() {
-                res = (0..out.rows()).try_for_each(|i| f(out, i, rel_start + i));
-            }
         });
         res
     }

@@ -20,10 +20,10 @@ fn every_locator_read_agrees_with_the_values_encoding() {
             &[0, 1],
         );
         let natives: Vec<Vec<u8>> = PATTERNS.iter().map(|p| p.to_le_bytes()[..w].to_vec()).collect();
-        let mut v = TestView::for_schema(&schema, PATTERNS.len());
+        let mut v = TestView::new(&schema, PATTERNS.len());
         for (row, &p) in PATTERNS.iter().enumerate() {
-            v.set_native(&schema, row, 1, p);
-            v.set_native(&schema, row, 3, p);
+            v.set(row, 1, p);
+            v.set(row, 3, p);
             v.set_null_word(row, u64::from(row % 2 == 0) | u64::from(row % 3 == 0) << 1);
         }
         let (from_pk, from_payload) = (schema.locate(1), schema.locate(3));

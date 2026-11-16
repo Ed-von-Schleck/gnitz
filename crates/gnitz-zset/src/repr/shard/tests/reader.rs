@@ -6,9 +6,10 @@ use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64, map_coded_shard, mix,
+    make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64, map_coded_shard,
     payload0_i64, pk_only_schema, prose, string_batch, sweep_bit_flips, u64_pk_schema,
 };
+use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::write_u64_le;
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, TypeCode, num_regions};
 
@@ -561,7 +562,7 @@ fn shapes() -> Vec<Shape> {
         Shape {
             label: "an incompressible heap stays plain",
             written: {
-                let mut rng = crate::test_support::Rng::new(7);
+                let mut rng = Rng::new(7);
                 build(string, 600, |b, i| {
                     b.begin_row(i as u128, 1);
                     b.put_string(

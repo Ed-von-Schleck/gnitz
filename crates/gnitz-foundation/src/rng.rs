@@ -1,6 +1,5 @@
-//! The test-only deterministic PRNG (xorshift64*, deterministic across hosts)
-//! and the `u64` scrambler `mix`, compiled here and as part of
-//! `gnitz-zset-testkit`.
+//! The deterministic PRNG of the workspace's tests and benchmarks
+//! (xorshift64*, the same stream on every host), and the `u64` scrambler `mix`.
 
 /// A bijection of `u64` that scatters consecutive values.
 pub fn mix(i: u64) -> u64 {

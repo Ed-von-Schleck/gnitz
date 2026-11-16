@@ -1,12 +1,11 @@
 //! Incremental top-N operator: per group, the rows filling weight slots
-//! `offset .. offset + limit` of the group in ORDER BY order. It is maintained
+//! `skip .. skip + keep` of the group in ORDER BY order. It is maintained
 //! through the order index of every input row (the integral, `I` in
 //! `Q^Δ = D ∘ Q ∘ I`), so a retracted leader's successor is the next row of a
 //! prefix walk of it: δ_out = TopN(history + δ_in) − TopN(history), per group
 //! the delta touched.
 
-use gnitz_expr::WeightSlots;
-use gnitz_wire::OrderKey;
+use gnitz_wire::{OrderKey, WeightSlots};
 
 use super::{OrderIndex, OrderedKind, OrderedPlan, Walk};
 use crate::repr::Batch;
@@ -14,45 +13,37 @@ use crate::schema::SchemaDescriptor;
 
 impl OrderedPlan {
     /// A top-N. `Err` for a shape an untrusted producer can name and the
-    /// operator cannot execute, a zero limit among them.
+    /// operator cannot execute; a decoded circuit's top-N keeps at least one slot.
     pub fn top_n(
         input_schema: &SchemaDescriptor,
         group_cols: &[u32],
         order: &[OrderKey],
-        limit: u64,
-        offset: u64,
+        slots: WeightSlots,
     ) -> Result<Self, String> {
-        if limit == 0 {
-            return Err("top-n: a zero limit selects nothing".to_string());
-        }
+        debug_assert!(slots.keep >= 1, "a top-N keeps at least one slot");
         let (index, row) = OrderIndex::new(input_schema, group_cols, order, [])?;
         let output_schema = row.finish().map_err(|e| format!("top-n: output {e}"))?;
         Ok(OrderedPlan {
             index,
             output_schema,
-            kind: OrderedKind::TopN(WeightSlots { skip: offset, keep: limit }),
+            kind: OrderedKind::TopN(slots),
         })
     }
 
-    /// One worker's share of a global top-N: its first `limit + offset` slots,
-    /// which hold every global slot.
+    /// One worker's share of a global top-N: its first slots up to the end of
+    /// `slots`, which hold every global slot.
     pub fn top_n_partial(
         input_schema: &SchemaDescriptor,
         order: &[OrderKey],
-        limit: u64,
-        offset: u64,
+        slots: WeightSlots,
     ) -> Result<Self, String> {
-        Self::top_n(input_schema, &[], order, limit.saturating_add(offset), 0)
+        let keep = slots.end().unwrap_or(u64::MAX);
+        Self::top_n(input_schema, &[], order, WeightSlots { skip: 0, keep })
     }
 
     /// The global top-N over relayed [`Self::top_n_partial`] outputs, grouped on
     /// their key.
-    pub fn top_n_combine(
-        partials: &SchemaDescriptor,
-        order: &[OrderKey],
-        limit: u64,
-        offset: u64,
-    ) -> Result<Self, String> {
+    pub fn top_n_combine(partials: &SchemaDescriptor, order: &[OrderKey], slots: WeightSlots) -> Result<Self, String> {
         // A partial's key, then the input's columns in order.
         let key = partials.pk_cols();
         let shifted: Vec<OrderKey> = order
@@ -62,7 +53,7 @@ impl OrderedPlan {
                 ..*k
             })
             .collect();
-        let plan = Self::top_n(partials, key, &shifted, limit, offset)?;
+        let plan = Self::top_n(partials, key, &shifted, slots)?;
         debug_assert_eq!(plan.output_schema, *partials);
         Ok(plan)
     }

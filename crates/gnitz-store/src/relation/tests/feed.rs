@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use gnitz_foundation::rng::Rng;
 
 fn round_of(rows: u64) -> Rc<Batch> {
     let schema = make_schema_u64_i64();
@@ -16,7 +17,6 @@ fn lens(feed: &Feed, after: u64) -> Option<Vec<usize>> {
 /// its floor is the round before them.
 #[test]
 fn a_feed_holds_its_newest_whole_rounds_within_budget() {
-    use crate::test_support::Rng;
     for seed in 0..200u64 {
         let mut rng = Rng::new(seed + 1);
         let budget = 2_000 + rng.gen_range(40_000) as usize;

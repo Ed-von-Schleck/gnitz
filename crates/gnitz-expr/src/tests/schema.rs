@@ -1,11 +1,7 @@
 //! The descriptor's layout facts, checked against absolute answers.
 
-use crate::{
-    ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn, SchemaDescriptor, SchemaRefusal, decode_schema_block,
-    encode_schema_block, leading_pk,
-};
-use gnitz_wire::schema_block::SchemaBlockCol;
-use gnitz_wire::{ColType, MAX_COLUMNS, TypeCode};
+use crate::{ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn, SchemaDescriptor, SchemaRefusal, leading_pk};
+use gnitz_wire::{MAX_COLUMNS, TypeCode};
 
 fn col(tc: TypeCode) -> SchemaColumn {
     SchemaColumn::new(tc, false)
@@ -183,7 +179,6 @@ fn layout_facts_match_the_column_table() {
             };
             assert_eq!(s.arena_rows(rows), want, "{ctx}: {rows} rows");
         }
-        assert_eq!(decode_schema_block(&encode_schema_block(&s)).unwrap(), s, "{ctx}");
     }
 }
 
@@ -258,9 +253,8 @@ fn leading_pk_keys_by_the_leading_columns() {
 }
 
 /// `try_new` refuses a column count past `MAX_COLUMNS`, counted over the whole
-/// list, and forwards the PK rule with each column's own nullability; the decode
-/// of a schema record carrying either shape refuses it too. The PK rule's own
-/// cases are `gnitz-wire`'s.
+/// list, and forwards the PK rule with each column's own nullability. The PK
+/// rule's own cases are `gnitz-wire`'s.
 #[test]
 fn admission_refuses_what_the_constructor_aborts_on() {
     let k = col(TypeCode::U64);
@@ -270,45 +264,12 @@ fn admission_refuses_what_the_constructor_aborts_on() {
     ];
     for (what, cols) in &cases {
         assert!(SchemaDescriptor::try_new(cols, &[0]).is_err(), "try_new: {what}");
-        let record = gnitz_wire::schema_block::encode(
-            cols.iter().map(|c| SchemaBlockCol {
-                ty: ColType::of(c.type_code),
-                nullable: c.nullable,
-                hidden: false,
-                name: b"k",
-            }),
-            &[0],
-        );
-        assert!(decode_schema_block(&record).is_err(), "decode: {what}");
     }
     assert_eq!(
         SchemaDescriptor::try_new(&[k; MAX_COLUMNS + 2], &[0]),
         Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 2))
     );
     assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
-}
-
-/// A schema record's arity prefix carries no redundancy of its own, so every
-/// flip in it must either be refused or change the descriptor.
-#[test]
-fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
-    let cols = [
-        col(TypeCode::U64),
-        col(TypeCode::I64),
-        SchemaColumn::new(TypeCode::I64, true),
-        SchemaColumn::new(TypeCode::F64, true),
-    ];
-    let reference = SchemaDescriptor::new(&cols, &[0]);
-    let mut buf = encode_schema_block(&reference);
-    for byte in 0..4 + 1 + reference.pk_cols().len() {
-        for bit in 0..8 {
-            buf[byte] ^= 1 << bit;
-            if let Ok(decoded) = decode_schema_block(&buf) {
-                assert_ne!(decoded, reference, "prefix byte {byte} bit {bit} changed nothing");
-            }
-            buf[byte] ^= 1 << bit;
-        }
-    }
 }
 
 /// The reduce output key: the source PK list keys on itself, and so does a

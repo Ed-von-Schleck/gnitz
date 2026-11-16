@@ -273,7 +273,7 @@ fn fold_pk_reply<'a>(
     reply: &SchemaDescriptor,
     old: Option<&mut FxHashMap<&'a [u8], u128>>,
 ) -> Result<(), WireFault> {
-    let mut old = old.map(|old| (old, reply.locate(reply.payload_col_idx(0))));
+    let mut old = old.map(|old| (old, reply.payload_locator(0)));
     for (j, pk) in answered(rows) {
         let Some(e) = t.fold.get_mut(pk) else {
             continue;

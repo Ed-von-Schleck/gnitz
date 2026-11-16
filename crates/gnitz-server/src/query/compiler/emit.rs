@@ -351,11 +351,11 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
 
         OpNode::Reduce { group, .. } => emit_reduce(ctx, nid, group),
 
-        OpNode::TopN { group_cols, order, limit, offset } => {
+        OpNode::TopN { group_cols, order, slots } => {
             let in_reg = ctx.unary_delta_in(nid);
             let partial = match ctx.pre_aggregates(nid, group_cols) {
                 true => {
-                    let plan = OrderedPlan::top_n_partial(&ctx.prog.schema_of(in_reg), order, *limit, *offset)?;
+                    let plan = OrderedPlan::top_n_partial(&ctx.prog.schema_of(in_reg), order, *slots)?;
                     Some(push_ordered(ctx, nid, in_reg, "topnpart", plan))
                 }
                 false => None,
@@ -363,8 +363,8 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
             let reg = co_locate(ctx, nid, partial.unwrap_or(in_reg), group_cols)?;
             let schema = ctx.prog.schema_of(reg);
             let plan = match partial {
-                Some(_) => OrderedPlan::top_n_combine(&schema, order, *limit, *offset)?,
-                None => OrderedPlan::top_n(&schema, group_cols, order, *limit, *offset)?,
+                Some(_) => OrderedPlan::top_n_combine(&schema, order, *slots)?,
+                None => OrderedPlan::top_n(&schema, group_cols, order, *slots)?,
             };
             Ok(push_ordered(ctx, nid, reg, "topnidx", plan))
         }

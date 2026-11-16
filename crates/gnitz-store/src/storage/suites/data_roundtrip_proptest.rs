@@ -16,6 +16,7 @@ use crate::storage::shard_index::L0_COMPACT_THRESHOLD;
 use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table, flush_barrier};
 use crate::test_support::{self, arb_schema, row_key, zset_of, zset_sum};
 
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -29,7 +30,7 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// Returns the batch plus the fixed leading PK column values (empty for a
 /// single-column PK), so a caller can synthesize an absent prefix-twin key.
 fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128>) {
-    let mut rng = crate::test_support::Rng::new(seed);
+    let mut rng = Rng::new(seed);
     let mut batch = BatchBuilder::new(schema);
 
     let pk_widths: Vec<usize> = schema
@@ -75,7 +76,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
 /// Empty / inline (<=12) / blob (>12) lengths exercise the inline German-string
 /// struct, the blob arena, and the offset path. Bytes need not be valid UTF-8:
 /// the storage layer stores raw bytes and decode returns them verbatim.
-fn arb_string(rng: &mut crate::test_support::Rng) -> Vec<u8> {
+fn arb_string(rng: &mut Rng) -> Vec<u8> {
     let len = match rng.gen_range(3) {
         0 => 0,
         1 => 1 + rng.gen_range(12) as usize,  // 1..=12, inline

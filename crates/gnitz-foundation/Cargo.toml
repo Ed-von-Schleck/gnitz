@@ -1,6 +1,6 @@
 [package]
 name = "gnitz-foundation"
-description = "Process and OS primitives shared by the gnitz crates: logging, environment overrides, fault injection and syscall helpers"
+description = "Process and OS primitives shared by the gnitz crates: logging, environment overrides, fault injection, syscall helpers, and the cost probes and PRNG of tests and benchmarks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

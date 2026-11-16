@@ -5,7 +5,6 @@ use crate::test_support::{batch_of, bind_sql, bind_where, col, ncol, schema};
 use gnitz_core::Schema;
 use gnitz_expr::ScalarCell;
 use gnitz_wire::ColumnDef;
-use std::convert::Infallible;
 
 /// `(pk | u U64 | u32 | i8 | i I64 | f F64 | f32 | s STRING | d DATE | ts TIMESTAMP
 /// | p DECIMAL(·,2) | q DECIMAL(·,3))`, every payload column nullable.
@@ -292,11 +291,9 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         };
         lowered += 1;
         let mut nulls = 0;
-        ev.for_each(&batch, |_, cell| {
+        ev.for_each(&batch, |cell| {
             nulls += matches!(cell, ScalarCell::Int(None) | ScalarCell::Str(None)) as usize;
-            Ok::<_, Infallible>(())
-        })
-        .unwrap();
+        });
         assert_eq!(nulls, 0, "{sql} is proven never NULL");
     }
     assert!(lowered >= 17, "only {lowered} proven shapes lower");

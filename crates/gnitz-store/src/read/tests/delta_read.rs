@@ -4,11 +4,12 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    Rng, TID, batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw,
+    TID, batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw,
     make_schema_u64_i64, map_of, pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec,
     spec,
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::BatchBuilder;

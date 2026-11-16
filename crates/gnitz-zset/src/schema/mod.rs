@@ -1,9 +1,11 @@
-//! The key and payload-order kernels over a schema, and the shaping of a derived
-//! schema: an operator's output or an index's layout. The descriptor itself is
-//! `gnitz-expr`'s.
+//! The key and payload-order kernels over a schema, the shaping of a derived
+//! schema (an operator's output or an index's layout), and the nameless
+//! schema-block codec a descriptor is stored and shipped as. The descriptor
+//! itself is `gnitz-expr`'s.
 
 use gnitz_expr::{SchemaRefusal, leading_pk};
-use gnitz_wire::MAX_COLUMNS;
+use gnitz_wire::schema_block::SchemaBlockCol;
+use gnitz_wire::{ColType, MAX_COLUMNS};
 use smallvec::SmallVec;
 
 mod key;
@@ -11,11 +13,34 @@ mod payload_order;
 
 /// The schema descriptor, homed in `gnitz-expr` so the client links the same
 /// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
-pub use gnitz_expr::{SchemaColumn, SchemaDescriptor, decode_schema_block, encode_schema_block};
+pub use gnitz_expr::{SchemaColumn, SchemaDescriptor};
 pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range_band};
 
 pub(crate) use key::{PkSortKey, band, compare_pk_ordering, group_floor, pack_pk_be, pk_width_dispatch};
 pub(crate) use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
+
+/// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
+/// carried on the wire but nothing engine-side reads one.
+pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
+    let mut cols: SmallVec<[SchemaColumn; MAX_COLUMNS]> = SmallVec::new();
+    let pk = gnitz_wire::schema_block::decode(data, |c| {
+        cols.push(SchemaColumn::new(c.ty.tc, c.nullable));
+        Ok(())
+    })?;
+    Ok(SchemaDescriptor::try_new(&cols, pk.as_slice())?)
+}
+
+/// Encode `schema`'s physical column shape — the inverse of
+/// [`decode_schema_block`]: no names, no hidden flag, every scale zero.
+pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
+    let cols = schema.columns().iter().map(|c| SchemaBlockCol {
+        ty: ColType::of(c.type_code),
+        nullable: c.nullable,
+        hidden: false,
+        name: b"",
+    });
+    gnitz_wire::schema_block::encode(cols, schema.pk_cols())
+}
 
 /// Builder for a derived schema: its PK columns, then its payload columns.
 /// Inline up to `MAX_COLUMNS`; a longer list spills and `finish` refuses it.

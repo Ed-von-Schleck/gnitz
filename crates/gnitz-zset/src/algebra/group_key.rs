@@ -14,7 +14,7 @@
 use super::key_pack::{FOLD_CHUNK_MIN_ROWS, KeyPacker, locate_key_col, pk_run};
 use super::zeroed;
 use crate::repr::{Batch, MemBatch, vec_bytes};
-use crate::schema::{DerivedSchema, PkSortKey, SchemaColumn, SchemaDescriptor, pk_width_dispatch};
+use crate::schema::{DerivedSchema, PkSortKey, SchemaDescriptor, pk_width_dispatch};
 use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
 use gnitz_wire::{NARROW_PK_MAX_BYTES, TypeCode};
 use rustc_hash::FxHashMap;
@@ -177,10 +177,9 @@ macro_rules! for_key_cells {
 }
 pub(crate) use for_key_cells;
 
-/// The synthetic `_group_pk` key — the whole PK region of an output whose group
-/// set has no natural key.
-const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
-const GROUP_PK_BYTES: usize = GROUP_PK_COL.size();
+/// The width of the synthetic `_group_pk` key — the whole PK region of an
+/// output whose group set has no natural key.
+const GROUP_PK_BYTES: usize = ReduceOutSlot::SYNTHETIC_KEY_COL.size();
 
 /// One row's group output PK: borrowed out of the batch, or held inline.
 pub(crate) enum OutPk<'a> {
@@ -247,9 +246,10 @@ impl GroupOutKey {
         let key = GroupKey::new(input, group_cols)?;
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
+        let synthetic = input.reduce_out_key(group_cols) == ReduceOutKey::SyntheticFold;
         for slot in input.reduce_out_layout(group_cols, row) {
             match slot {
-                ReduceOutSlot::SyntheticKey => b.push_pk(GROUP_PK_COL),
+                ReduceOutSlot::SyntheticKey => b.push_pk(ReduceOutSlot::SYNTHETIC_KEY_COL),
                 ReduceOutSlot::Key(c) => b.push_pk(input.columns()[c as usize]),
                 ReduceOutSlot::Carried(c) => {
                     carried.push(input.locate(c as usize));
@@ -257,7 +257,6 @@ impl GroupOutKey {
                 }
             }
         }
-        let synthetic = input.reduce_out_key(group_cols) == ReduceOutKey::SyntheticFold;
         Ok((GroupOutKey { key, synthetic, carried }, b))
     }
 

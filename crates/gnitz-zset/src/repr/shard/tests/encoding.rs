@@ -1,6 +1,7 @@
 use super::*;
 use crate::schema::SchemaDescriptor;
-use crate::test_support::{Rng, mix, opk_pk, pk_only_schema};
+use crate::test_support::{opk_pk, pk_only_schema};
+use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::{FixedInt, TypeCode};
 
 /// Pack signed/unsigned values into a raw `fi.width()`-byte-per-cell LE

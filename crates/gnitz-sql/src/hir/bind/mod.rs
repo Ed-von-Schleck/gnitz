@@ -43,7 +43,7 @@ use crate::validate::{
     reject_unhonored_select_clauses,
 };
 use gnitz_core::Schema;
-use gnitz_wire::{ColType, ColumnDef};
+use gnitz_wire::{ColType, ColumnDef, WeightSlots};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
 use sqlparser::ast::{
@@ -322,8 +322,7 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
 /// no rows), and the counts are literals.
 struct QueryTail<'a> {
     keys: Vec<OrderKey<'a>>,
-    limit: u64,
-    offset: u64,
+    slots: WeightSlots,
 }
 
 impl<'a> QueryTail<'a> {
@@ -343,15 +342,17 @@ impl<'a> QueryTail<'a> {
             (false, Some(0), _) => Err(GnitzSqlError::Rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
             (false, Some(limit), offset) => Ok(Some(QueryTail {
                 keys,
-                limit: limit as u64,
-                offset: offset.unwrap_or(0) as u64,
+                slots: WeightSlots {
+                    skip: offset.unwrap_or(0) as u64,
+                    keep: limit as u64,
+                },
             })),
         }
     }
 
     /// Wrap `rel` in the top-N this tail names, sorted on `order`.
     fn wrap(&self, rel: Rc<RelExpr>, order: Vec<OrderCol>) -> Rc<RelExpr> {
-        RelExpr::top_n(rel, Vec::new(), order, self.limit, self.offset)
+        RelExpr::top_n(rel, Vec::new(), order, self.slots)
     }
 
     /// [`Self::wrap`] over a body whose keys can only be its output columns — a

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::Rng;
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::MAX_PK_BYTES;
 
 /// Every byte primitive over OPK keys, at every PK width and over key pairs

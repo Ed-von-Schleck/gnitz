@@ -1,6 +1,7 @@
 //! The parameters an operator carries on both wire paths, a circuit node and a
 //! `ReadSpec` sink: the aggregate functions and the typing rules both sides read,
-//! a grouped aggregation, the computed projection, and the ORDER BY key. A layout
+//! a grouped aggregation, the computed projection, the ORDER BY key, and the
+//! LIMIT/OFFSET weight slots, whose cut client and engine compute alike. A layout
 //! here is stored inside a `CIRCUIT_TAB` cell, so changing it bumps
 //! `CIRCUIT_VERSION`, which moves `WIRE_VERSION` through `SYS_SCHEMA_DIGEST`.
 
@@ -197,6 +198,49 @@ impl Wire for OrderKey {
             desc: flags & ORDER_DESC != 0,
             nulls_first: flags & ORDER_NULLS_FIRST != 0,
         })
+    }
+}
+
+/// The weight slots of a window still to skip, then to keep: OFFSET and LIMIT
+/// counted in logical rows, an element of weight `w` standing for `w` of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeightSlots {
+    pub skip: u64,
+    pub keep: u64,
+}
+
+impl WeightSlots {
+    /// The whole input: no OFFSET, no LIMIT. A SQL LIMIT is at most `i64::MAX`, so a
+    /// `keep` of `u64::MAX` names none.
+    pub const ALL: WeightSlots = WeightSlots { skip: 0, keep: u64::MAX };
+
+    /// The slot the window ends before; `None` when it keeps everything past `skip`.
+    pub fn end(&self) -> Option<u64> {
+        (self.keep != u64::MAX).then(|| self.skip.saturating_add(self.keep))
+    }
+
+    /// How many of the next element's `weight` slots are kept.
+    #[inline(always)]
+    pub fn take(&mut self, weight: i64) -> i64 {
+        let slots = weight.max(0) as u64;
+        let skipped = slots.min(self.skip);
+        self.skip -= skipped;
+        let take = (slots - skipped).min(self.keep);
+        self.keep -= take;
+        take as i64
+    }
+}
+
+/// `keep`, then `skip`.
+impl Wire for WeightSlots {
+    fn write(&self, w: &mut Writer) {
+        w.u64(self.keep).u64(self.skip);
+    }
+
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        let keep = r.u64()?;
+        let skip = r.u64()?;
+        Ok(WeightSlots { skip, keep })
     }
 }
 

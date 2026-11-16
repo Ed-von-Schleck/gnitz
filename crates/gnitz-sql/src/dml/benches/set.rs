@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{parse_stmt, xorshift};
+use crate::test_support::parse_stmt;
 use gnitz_core::BatchAppender;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::Statement;
@@ -19,9 +19,9 @@ fn apply_set_bench() {
     let schema = Schema::from_parts(columns, &[0]).unwrap();
     let mut rows = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut rows);
-    let mut state = 0x9E37_79B9_7F4A_7C15;
+    let mut rng = gnitz_foundation::rng::Rng::new(0x9E37_79B9_7F4A_7C15);
     for i in 0..ROWS {
-        let r = xorshift(&mut state);
+        let r = rng.next_u64();
         app.add_row(i as u128, 1);
         for _ in 0..8 {
             app.int_val(r as i64);

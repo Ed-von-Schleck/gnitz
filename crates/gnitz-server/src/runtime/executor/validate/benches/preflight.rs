@@ -5,6 +5,7 @@ use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::test_support::try_poll_once;
 use crate::test_support::{apply_ddl, col_def, idx_tab_batch, make_batch_raw, table_engine, u64_i64_cols};
 use gnitz_foundation::perf::Counter;
+use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
 
@@ -41,13 +42,13 @@ fn preflight_probe_bench() {
         {
             let mut ids: Vec<u64> = (0..rows).collect();
             if order == "scrambled" {
-                gnitz_zset_testkit::Rng::new(0x9E37_79B9_7F4A_7C15).shuffle(&mut ids);
+                Rng::new(0x9E37_79B9_7F4A_7C15).shuffle(&mut ids);
             }
             let mut bb = BatchBuilder::new(&schema);
             for &i in &ids {
                 bb.begin_row(i as u128, 1);
                 match payload {
-                    TypeCode::UUID => bb.put_int(gnitz_zset_testkit::mix(i) as u128 | (i as u128) << 64),
+                    TypeCode::UUID => bb.put_int(mix(i) as u128 | (i as u128) << 64),
                     _ => bb.put_int(i as u128),
                 }
                 bb.end_row();
@@ -111,7 +112,7 @@ fn preflight_sink_bench() {
     {
         let mut ids: Vec<u64> = (0..rows).collect();
         if order == "scrambled" {
-            gnitz_zset_testkit::Rng::new(0x9E37_79B9_7F4A_7C15).shuffle(&mut ids);
+            Rng::new(0x9E37_79B9_7F4A_7C15).shuffle(&mut ids);
         }
         let upserts: Vec<_> = ids.iter().map(|&i| (i, 1, (i + 1_000_000) as i64)).collect();
         let families = vec![TxnFamily::new(

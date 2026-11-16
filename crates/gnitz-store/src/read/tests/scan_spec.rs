@@ -2,10 +2,11 @@ use super::*;
 use crate::read::SourceCursor;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    RelationFixture, Rng, TID, batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch_raw,
+    RelationFixture, TID, batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch_raw,
     make_schema_u64_i64, map_of, order_by, relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
+use gnitz_foundation::rng::Rng;
 use gnitz_wire::{AggDescriptor, GroupAggs, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
 use gnitz_wire::{PkKeys, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;

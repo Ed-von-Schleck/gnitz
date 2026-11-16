@@ -6,7 +6,6 @@ use crate::test_support::{
 use gnitz_expr::{ConstIdx, FloatArithOp, IntUnaryOp, RowFilter, ScalarCell};
 use gnitz_wire::TypeCode as T;
 use gnitz_wire::as_le_bytes;
-use std::convert::Infallible;
 
 // Every expression here is SQL bound over `typed_schema`: `(pk, c1, c2, …)`, the
 // payload columns nullable and of the types the test lists.
@@ -43,24 +42,20 @@ fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]]
     // A program's results are all of one class; a string's text is owned
     // here, since a `Cell` borrows it.
     let (mut got, mut texts) = (Vec::new(), Vec::new());
-    ev.for_each(&b, |_, cell| {
-        match cell {
-            ScalarCell::Int(v) => {
-                assert_ne!(ty, T::String, "{sql}: typed a string, computed a scalar");
-                got.push(match v {
-                    None => Null,
-                    Some(v) if ty.is_float() => F64(f64::from_bits(v as u64)),
-                    Some(v) => Int(v),
-                });
-            }
-            ScalarCell::Str(v) => {
-                assert_eq!(ty, T::String, "{sql}: computed a string, typed {ty}");
-                texts.push(v.map(|v| String::from_utf8(v.to_vec()).unwrap()));
-            }
+    ev.for_each(&b, |cell| match cell {
+        ScalarCell::Int(v) => {
+            assert_ne!(ty, T::String, "{sql}: typed a string, computed a scalar");
+            got.push(match v {
+                None => Null,
+                Some(v) if ty.is_float() => F64(f64::from_bits(v as u64)),
+                Some(v) => Int(v),
+            });
         }
-        Ok::<_, Infallible>(())
-    })
-    .unwrap();
+        ScalarCell::Str(v) => {
+            assert_eq!(ty, T::String, "{sql}: computed a string, typed {ty}");
+            texts.push(v.map(|v| String::from_utf8(v.to_vec()).unwrap()));
+        }
+    });
     got.extend(texts.iter().map(|v| v.as_deref().map_or(Null, Str)));
     assert_eq!(got, want, "{sql} over {rows:?}");
 }

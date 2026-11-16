@@ -94,12 +94,7 @@ fn payload_differs(
     b: &impl RowSource,
     rb: usize,
 ) -> bool {
-    BitIter(schema.payload_slots() & !mask).any(|pi| {
-        schema
-            .locate(schema.payload_col_idx(pi))
-            .cmp_non_null(a, ra, b, rb)
-            .is_ne()
-    })
+    BitIter(schema.payload_slots() & !mask).any(|pi| schema.payload_locator(pi).cmp_non_null(a, ra, b, rb).is_ne())
 }
 
 /// A rewrite pair's `+1` may differ from its `-1` only in the family's declared

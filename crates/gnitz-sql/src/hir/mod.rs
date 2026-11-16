@@ -23,7 +23,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_wire::AggFunc as WireAggFunc;
-use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode, WeightSlots};
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -341,12 +341,12 @@ pub(crate) enum RelExpr {
 
 /// What a [`RelExpr::Ordered`] computes over each partition.
 pub(crate) enum OrderedOp {
-    /// Top-N: the rows filling weight slots `offset .. offset + limit` in
+    /// Top-N: the rows filling weight slots `skip .. skip + keep` in
     /// `order`, then the whole row, which leads with the input's key — a total
     /// order, so the result is a function of the Z-set. Its output is the
     /// input's columns. `ORDER BY … LIMIT` on a view body is the empty
     /// partition; `QUALIFY ROW_NUMBER() OVER (…) <= n` names one.
-    TopN { limit: u64, offset: u64 },
+    TopN(WeightSlots),
     /// Running values: every row, widened by its values over the rows of its
     /// partition at or before its peers — the rows equal to it on every key of
     /// `order`. Its output is the input's columns, then `rank` — one more than
@@ -366,7 +366,7 @@ impl OrderedOp {
     pub(crate) fn added_cols(&self) -> impl Iterator<Item = &HirCol> {
         let (aggs, rank, dense_rank): (&[AggCol], _, _) = match self {
             OrderedOp::Window { aggs, rank, dense_rank } => (aggs, rank.as_ref(), dense_rank.as_ref()),
-            OrderedOp::TopN { .. } => (&[], None, None),
+            OrderedOp::TopN(_) => (&[], None, None),
         };
         rank.into_iter().chain(dense_rank).chain(aggs.iter().map(|c| &c.col))
     }
@@ -780,20 +780,19 @@ impl RelExpr {
         Ok(Rc::new(RelExpr::Distinct { input }))
     }
 
-    /// A top-N over `input`. `limit ≥ 1`, and every key names an input column.
+    /// A top-N over `input`. `slots.keep ≥ 1`, and every key names an input column.
     pub(crate) fn top_n(
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
         order: Vec<OrderCol>,
-        limit: u64,
-        offset: u64,
+        slots: WeightSlots,
     ) -> Rc<RelExpr> {
-        debug_assert!(limit >= 1, "a top-N selects at least one slot");
+        debug_assert!(slots.keep >= 1, "a top-N selects at least one slot");
         Rc::new(RelExpr::Ordered {
             input,
             partition,
             order,
-            op: OrderedOp::TopN { limit, offset },
+            op: OrderedOp::TopN(slots),
         })
     }
 

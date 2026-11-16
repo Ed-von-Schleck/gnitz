@@ -1,8 +1,9 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{
-    make_schema_u64_i64, map_copy, mix, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
+    make_schema_u64_i64, map_copy, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
 };
+use gnitz_foundation::rng::mix;
 use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReadBound, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::BatchBuilder;

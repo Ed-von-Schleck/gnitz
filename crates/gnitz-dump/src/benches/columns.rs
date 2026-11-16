@@ -1,5 +1,6 @@
 use super::*;
 use gnitz_core::BatchAppender;
+use gnitz_foundation::rng::mix;
 
 /// Rows a bench table holds.
 const ROWS: usize = 1 << 20;
@@ -32,11 +33,6 @@ fn groups(schema: &Arc<Schema>, cell: impl Fn(&mut BatchAppender<'_>, usize)) ->
         .collect()
 }
 
-/// A value of `i` that does not follow the key's order.
-fn scramble(i: usize) -> u64 {
-    (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-}
-
 /// Instructions per row to write a 1M-row table and read it back, per type of
 /// its one payload column, and the file's bytes.
 #[test]
@@ -47,34 +43,34 @@ fn columns_bench() {
     type Fill = fn(&mut BatchAppender<'_>, usize);
     let cases: [(&str, ColType, bool, Fill); 9] = [
         ("BOOLEAN", ColType::of(TypeCode::Bool), false, |r, i| {
-            r.int_val(i128::from(scramble(i) & 1));
+            r.int_val(i128::from(mix(i as u64) & 1));
         }),
         ("SMALLINT", ColType::of(TypeCode::I16), false, |r, i| {
-            r.int_val(i128::from(scramble(i) as i16));
+            r.int_val(i128::from(mix(i as u64) as i16));
         }),
         ("INT", ColType::of(TypeCode::I32), false, |r, i| {
-            r.int_val(i128::from(scramble(i) as i32));
+            r.int_val(i128::from(mix(i as u64) as i32));
         }),
         ("BIGINT", ColType::of(TypeCode::I64), false, |r, i| {
-            r.int_val(i128::from(scramble(i) as i64));
+            r.int_val(i128::from(mix(i as u64) as i64));
         }),
         ("DOUBLE", ColType::of(TypeCode::F64), false, |r, i| {
-            r.f64_val(scramble(i) as f64 / 3.0);
+            r.f64_val(mix(i as u64) as f64 / 3.0);
         }),
         ("TEXT", ColType::of(TypeCode::String), false, |r, i| {
-            r.str_val(&format!("row-{:016x}", scramble(i)));
+            r.str_val(&format!("row-{:016x}", mix(i as u64)));
         }),
         ("BIGINT NULL", ColType::of(TypeCode::I64), true, |r, i| {
             match i % 10 {
                 0 => r.null(),
-                _ => r.int_val(i128::from(scramble(i) as i64)),
+                _ => r.int_val(i128::from(mix(i as u64) as i64)),
             };
         }),
         ("DECIMAL", ColType::decimal(2), false, |r, i| {
-            r.int_val(i128::from((scramble(i) >> 8) as i64));
+            r.int_val(i128::from((mix(i as u64) >> 8) as i64));
         }),
         ("UUID", ColType::of(TypeCode::UUID), false, |r, i| {
-            r.u128_val(u128::from(scramble(i)) << 64 | u128::from(scramble(i + 1)));
+            r.u128_val(u128::from(mix(i as u64)) << 64 | u128::from(mix(i as u64 + 1)));
         }),
     ];
     for (name, ty, nullable, fill) in cases {

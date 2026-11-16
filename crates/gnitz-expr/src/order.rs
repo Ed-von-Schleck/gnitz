@@ -1,4 +1,4 @@
-//! The order of rows under ORDER BY keys, and the weight-slot cut of LIMIT/OFFSET.
+//! The order of rows under ORDER BY keys.
 
 use std::cmp::Ordering;
 
@@ -34,7 +34,7 @@ pub fn order_locators(order: &[OrderKey], schema: &SchemaDescriptor, total: bool
     let mut keys = Vec::with_capacity(order.len());
     let mut push = |loc: ColumnLocator, desc, nulls_first| {
         let tc = loc.type_code();
-        let wide = ScalarKind::from_type_code(tc).is_none() && !tc.is_german_string();
+        let wide = tc.is_wide_int();
         let halves: &[u8] = if wide { &[64, 0] } else { &[0] };
         keys.extend(
             halves
@@ -253,36 +253,6 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
 #[inline(never)]
 fn cmp_tail<S: RowSource>(tail: &[OrderLocator], src: &S, a: u32, b: u32) -> Ordering {
     cmp_order_keys(tail, src, a as usize, b as usize)
-}
-
-/// The weight slots of a window still to skip, then to keep: OFFSET and LIMIT
-/// counted in logical rows, an element of weight `w` standing for `w` of them.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct WeightSlots {
-    pub skip: u64,
-    pub keep: u64,
-}
-
-impl WeightSlots {
-    /// The whole input: no OFFSET, no LIMIT. A SQL LIMIT is at most `i64::MAX`, so a
-    /// `keep` of `u64::MAX` names none.
-    pub const ALL: WeightSlots = WeightSlots { skip: 0, keep: u64::MAX };
-
-    /// The slot the window ends before; `None` when it keeps everything past `skip`.
-    pub fn end(&self) -> Option<u64> {
-        (self.keep != u64::MAX).then(|| self.skip.saturating_add(self.keep))
-    }
-
-    /// How many of the next element's `weight` slots are kept.
-    #[inline]
-    pub fn take(&mut self, weight: i64) -> i64 {
-        let slots = weight.max(0) as u64;
-        let skipped = slots.min(self.skip);
-        self.skip -= skipped;
-        let take = (slots - skipped).min(self.keep);
-        self.keep -= take;
-        take as i64
-    }
 }
 
 #[cfg(test)]
