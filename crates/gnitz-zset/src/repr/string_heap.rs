@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 
-use super::batch::{range_rows, MemBatch};
+use super::batch::{MemBatch, range_rows};
 use super::codebook::Codebook;
 use super::pool::{self, is_tight};
 use crate::schema::SchemaDescriptor;
@@ -91,7 +91,7 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
         // No string cell to rebase onto a heap.
         return None;
     }
-    debug_assert!(kept.windows(2).all(|w| w[0].1 <= w[1].0) && kept.last().is_none_or(|k| k.1 <= src.count));
+    debug_assert!(kept.is_sorted_by(|a, b| a.1 <= b.0) && kept.last().is_none_or(|k| k.1 <= src.count));
     debug_assert_eq!(kept_slots & !mask, 0, "carry_dead: a kept slot is not a string slot");
     let heap = src.blob.len();
     if kept_slots == 0 && heap != 0 {

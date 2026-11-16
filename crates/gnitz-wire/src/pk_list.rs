@@ -1,7 +1,7 @@
 //! A key or index column list: its admission rules and its packed `u64` word.
 
 use crate::codec::{Reader, Wire, Writer};
-use crate::{TypeCode, MAX_COLUMNS};
+use crate::{MAX_COLUMNS, TypeCode};
 
 /// Which rule a candidate primary key broke, worded by [`PkRule::named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

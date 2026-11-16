@@ -504,12 +504,12 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
         match op {
             OpNode::ScanDelta { source, scatter, .. } => {
                 let use_ = uses.entry(*source).or_default();
-                if let Some(stated) = scatter {
-                    if use_.key.get_or_insert_with(|| stated.clone()) != stated {
-                        return Err(format!(
-                            "source {source} is scanned under several distinct scatter keys"
-                        ));
-                    }
+                if let Some(stated) = scatter
+                    && use_.key.get_or_insert_with(|| stated.clone()) != stated
+                {
+                    return Err(format!(
+                        "source {source} is scanned under several distinct scatter keys"
+                    ));
                 }
                 owner[nid] = Some(*source);
             }

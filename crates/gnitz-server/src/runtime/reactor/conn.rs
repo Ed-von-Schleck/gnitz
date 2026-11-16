@@ -11,7 +11,7 @@ use gnitz_wire::{Deframer, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD
 use gnitz_zset::repr::PooledBuf;
 
 use super::*;
-use crate::runtime::sync::{select2, Either, WakeQueue};
+use crate::runtime::sync::{Either, WakeQueue, select2};
 use crate::runtime::w2m::W2mSlot;
 
 /// The ceilings and deadlines a reactor's connections are held to, fixed for its
@@ -109,7 +109,7 @@ struct Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        self.budget.held.set(self.budget.held.get() - self.weight);
+        self.budget.held.update(|v| v - self.weight);
     }
 }
 
@@ -884,11 +884,7 @@ impl Peer {
     }
 
     fn live(&self) -> Result<(), PeerGone> {
-        if self.conn.is_gone() {
-            Err(PeerGone)
-        } else {
-            Ok(())
-        }
+        if self.conn.is_gone() { Err(PeerGone) } else { Ok(()) }
     }
 
     /// The next frame, or `None` once the recv side has ended and is drained;
@@ -928,7 +924,7 @@ impl Peer {
     /// dropped.
     async fn send_raw(&self, mut body: SendBody) -> Result<(), PeerGone> {
         #[cfg(test)]
-        SENDS.with(|n| n.set(n.get() + 1));
+        SENDS.update(|n| n + 1);
         let conn = &self.conn;
         let Some(session) = &conn.session else {
             return self.reactor.send_owned(conn, body).await;

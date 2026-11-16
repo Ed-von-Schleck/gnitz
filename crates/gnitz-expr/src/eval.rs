@@ -8,13 +8,13 @@ use std::ops::Range;
 
 use gnitz_wire::KeyRange;
 
+#[cfg(test)]
+use crate::ResolvedProgram;
 use crate::morsel::{Evaluator, MorselOut};
 use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
 use crate::simd::Level;
-#[cfg(test)]
-use crate::ResolvedProgram;
 use crate::{BatchView, ExprValidateErr, LogicalProgram, SchemaDescriptor, Sink};
 
 /// One row's result of a [`ScalarEval`], in the shape its result register's
@@ -190,7 +190,7 @@ impl ScalarEval {
             ResultClass::Str => {
                 return self.try_rows(mb, |out, i, row| {
                     f(row, ScalarCell::Str((!out.is_null(r, i)).then(|| out.str_bytes(r, i))))
-                })
+                });
             }
             ResultClass::Signed => false,
             ResultClass::Unsigned => true,

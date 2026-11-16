@@ -5,15 +5,15 @@
 //! backups and a DDL's settles end a batch. Once serving, it is the one task
 //! that runs a checkpoint.
 
+use super::Shared;
 use super::family::{FamilyRows, TxnFamily};
 use super::write::HeldTables;
-use super::Shared;
-use crate::runtime::sync::{chan, oneshot, select2, Either};
+use crate::runtime::sync::{Either, chan, oneshot, select2};
 use gnitz_store::relation::PkRule;
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashMap;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -296,11 +296,7 @@ impl CommitUnit {
     /// The commit LSN of a laid unit: the zone LSN when one of its groups rode
     /// inside the zone, else `0`.
     fn lsn(&self, zone_lsn: u64) -> u64 {
-        if matches!(self.outcome, Ok(true)) {
-            zone_lsn
-        } else {
-            0
-        }
+        if matches!(self.outcome, Ok(true)) { zone_lsn } else { 0 }
     }
 
     /// Drop every client's table locks and answer it: [`CommitUnit::lsn`] for
@@ -326,15 +322,15 @@ impl CommitUnit {
 fn build_units(s: &mut CommitScratch, merge: bool) {
     s.units.reserve(s.writes.len());
     for write in s.writes.drain(..) {
-        if let ([f], true) = (&write.families[..], merge) {
-            if let Some(&at) = s.last_unit.get(&f.tid) {
-                let head = &s.units[at].writes[0].families;
-                if matches!(&head[..], [g] if g.tid == f.tid) {
-                    debug_assert!([f, &head[0]].iter().all(|g| g.pk_rule == PkRule::Enforce));
-                    s.units[at].writes.push(write);
-                    continue;
-                }
-            }
+        if merge
+            && let [f] = &write.families[..]
+            && let Some(&at) = s.last_unit.get(&f.tid)
+            && let [g] = &s.units[at].writes[0].families[..]
+            && g.tid == f.tid
+        {
+            debug_assert!([f, g].iter().all(|g| g.pk_rule == PkRule::Enforce));
+            s.units[at].writes.push(write);
+            continue;
         }
         for f in &write.families {
             s.last_unit.insert(f.tid, s.units.len());

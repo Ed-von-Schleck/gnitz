@@ -102,7 +102,7 @@ fn rename_then_reopen_resolves_flushed_data() {
 
 // ── The column-ALTER owner guard covers every rewrite pair ──────────────────
 
-fn rename_to(new_name: &str) -> impl FnOnce(&mut CatalogColumn) + '_ {
+fn rename_to(new_name: &str) -> impl FnOnce(&mut CatalogColumn) {
     move |c: &mut CatalogColumn| c.def.name = new_name.into()
 }
 

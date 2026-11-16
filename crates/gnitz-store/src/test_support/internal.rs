@@ -8,7 +8,7 @@ use std::rc::Rc;
 use crate::relation::{
     IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StateLayout, StoreConfig,
 };
-use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{
     ComputeMap, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
@@ -251,7 +251,7 @@ pub(crate) fn map_of(program: LogicalProgram, reply: &SchemaDescriptor) -> Optio
 /// strings on every other row, as a `kind` relation whose ids `0..rows` sit in
 /// `shards` shards, interleaved, and none in the RAM tier.
 pub(crate) fn wide_on_disk(kind: RelationKind, rows: u64, shards: usize) -> RelationFixture {
-    use gnitz_wire::TypeCode::{String as S, I64};
+    use gnitz_wire::TypeCode::{I64, String as S};
     use gnitz_zset::schema::SchemaColumn;
     let cols = [I64, I64, I64, I64, I64, I64, S, S].map(|tc| SchemaColumn::new(tc, false));
     let schema = gnitz_zset_testkit::u64_pk_schema(&cols);

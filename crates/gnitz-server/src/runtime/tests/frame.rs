@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
-use gnitz_wire::{peek_control_block, ClientVerb};
+use gnitz_wire::{ClientVerb, peek_control_block};
 
 /// Walk `batch` through [`WireMsg::next_train_frame`] as a sender does, each
 /// frame's returned row committed: the rows each frame carries and whether it

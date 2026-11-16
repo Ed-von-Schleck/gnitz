@@ -1,12 +1,12 @@
 //! The scatter plan of a worker exchange: [`ScatterPlan`] and the per-row
 //! routing-key kernels.
 
-use super::group_key::{cell_image, for_key_cells, GroupKey, KeyCells, KeyForm};
-use super::key_pack::{filled, KeyPacker, FOLD_CHUNK};
-use super::route::{ground_owner, worker_for_key, worker_for_wide_pk, Placement, Slot};
+use super::group_key::{GroupKey, KeyCells, KeyForm, cell_image, for_key_cells};
+use super::key_pack::{FOLD_CHUNK, KeyPacker, filled};
+use super::route::{Placement, Slot, ground_owner, worker_for_key, worker_for_wide_pk};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{zip_cells, MAX_PK_BYTES, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{MAX_PK_BYTES, NARROW_PK_MAX_BYTES, zip_cells};
 use std::mem::MaybeUninit;
 
 /// A scatter key resolved against one schema: each row goes to the owner of the

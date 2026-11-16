@@ -163,14 +163,14 @@ impl Replies {
     /// passing. Never blocks.
     pub(super) fn reply(&mut self, route: ReplyRoute, answer: Result<Rows, WireFault>) {
         let id = route.request_id;
-        if self.owed.back().is_none_or(|ahead| ahead.id() != id) {
-            if let Some(msg) = whole(&route, &answer, self.w2m.frame_budget()) {
-                let passing = !self.owed.is_empty();
-                if self.w2m.try_send_msg(id, passing, &msg).is_ok() {
-                    return;
-                }
-                self.refused(id);
+        if self.owed.back().is_none_or(|ahead| ahead.id() != id)
+            && let Some(msg) = whole(&route, &answer, self.w2m.frame_budget())
+        {
+            let passing = !self.owed.is_empty();
+            if self.w2m.try_send_msg(id, passing, &msg).is_ok() {
+                return;
             }
+            self.refused(id);
         }
         self.owed.push_back(Owed::Train(Train::new(route, answer)));
     }
@@ -243,7 +243,7 @@ impl Replies {
     /// The entries a frame may go for now, in queue order: the first of each
     /// lease's run, unless it is a parked read or a train the master holds,
     /// which hold up the rest of their run.
-    fn sendable(&self) -> impl Iterator<Item = usize> + '_ {
+    fn sendable(&self) -> impl Iterator<Item = usize> {
         (0..self.owed.len()).filter(|&i| {
             (i == 0 || self.owed[i - 1].id() != self.owed[i].id())
                 && matches!(&self.owed[i], Owed::Train(t) if !self.w2m.held(t.route.request_id))

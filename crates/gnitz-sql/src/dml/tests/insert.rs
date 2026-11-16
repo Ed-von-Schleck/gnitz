@@ -1,9 +1,9 @@
 use super::*;
 use crate::access::bound_and_predicate;
-use crate::test_support::Cell::{self, Int, Null, Str, F64};
+use crate::test_support::Cell::{self, F64, Int, Null, Str};
 use crate::test_support::{
-    assert_rejects, batch_of, bind_where, catalog, col, keyed_batch, ncol, parse_stmt, pk_schema, rel, rows_of, schema,
-    table, TestCatalog,
+    TestCatalog, assert_rejects, batch_of, bind_where, catalog, col, keyed_batch, ncol, parse_stmt, pk_schema, rel,
+    rows_of, schema, table,
 };
 use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;

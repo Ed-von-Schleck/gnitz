@@ -54,7 +54,7 @@ use std::task::{Context, Poll, Waker};
 use super::park::{Park, WorkerParks};
 use crate::runtime::frame::WireMsg;
 use gnitz_foundation::posix_io;
-use gnitz_wire::{peek_control_block, DecodedControl};
+use gnitz_wire::{DecodedControl, peek_control_block};
 use gnitz_zset::repr::PooledBuf;
 
 // ---------------------------------------------------------------------------
@@ -246,7 +246,8 @@ impl RingCursor {
     /// `at + 8` must lie within the ring, and the caller must be its producer.
     #[inline]
     unsafe fn store_prefix(&self, at: u64, val: u64) {
-        (self.base.add(at as usize) as *mut u64).write_unaligned(val);
+        // SAFETY: the caller's contract above.
+        unsafe { (self.base.add(at as usize) as *mut u64).write_unaligned(val) }
     }
 
     /// Load the 8-byte prefix word at physical offset `at`.
@@ -255,7 +256,8 @@ impl RingCursor {
     /// `at + 8` must lie within the ring, below the published write cursor.
     #[inline]
     unsafe fn load_prefix(&self, at: u64) -> u64 {
-        (self.base.add(at as usize) as *const u64).read_unaligned()
+        // SAFETY: the caller's contract above.
+        unsafe { (self.base.add(at as usize) as *const u64).read_unaligned() }
     }
 
     #[inline]

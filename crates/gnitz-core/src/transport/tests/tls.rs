@@ -1,10 +1,10 @@
 use super::*;
 use crate::test_support::{
-    flush_all, handshake, io_kind, pass, read_frame, recv_frames, tls_pair, write_frame, Loopback,
+    Loopback, flush_all, handshake, io_kind, pass, read_frame, recv_frames, tls_pair, write_frame,
 };
 use crate::transport::poll_fd;
 use crate::{ClientError, Interest};
-use gnitz_wire::{framed, CONNECT_TIMEOUT};
+use gnitz_wire::{CONNECT_TIMEOUT, framed};
 use std::io::ErrorKind;
 use std::os::fd::AsFd;
 use std::sync::mpsc;
@@ -22,11 +22,12 @@ fn drain(mut r: impl std::io::Read) {
 fn client_config_profile() {
     let cfg = build_client_config(&parse_target("127.0.0.1:1").unwrap()).expect("client config");
     assert!(!cfg.enable_early_data, "client 0-RTT early data must be off");
-    assert!(cfg
-        .crypto_provider()
-        .cipher_suites
-        .iter()
-        .all(|s| s.version() == &rustls::version::TLS13));
+    assert!(
+        cfg.crypto_provider()
+            .cipher_suites
+            .iter()
+            .all(|s| s.version() == &rustls::version::TLS13)
+    );
 }
 
 #[test]

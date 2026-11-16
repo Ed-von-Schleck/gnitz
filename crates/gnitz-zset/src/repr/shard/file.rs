@@ -10,11 +10,11 @@ use super::encoding::*;
 use super::error::StorageError;
 use super::layout::*;
 use super::pk_filter;
-use crate::repr::codebook::Codebook;
 use crate::repr::Batch;
+use crate::repr::codebook::Codebook;
 use crate::schema::SchemaColumn;
 use gnitz_expr::Level;
-use gnitz_wire::{FixedInt, Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use gnitz_wire::{FIXED_REGION_BYTES, FixedInt, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Whether every `width`-byte element of `region` is the same. Every element

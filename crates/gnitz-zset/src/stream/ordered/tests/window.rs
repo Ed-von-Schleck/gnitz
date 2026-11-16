@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
-use crate::stream::ordered::tests::{arb_keys, ordered_groups, Harness};
+use crate::stream::ordered::tests::{Harness, arb_keys, ordered_groups};
 use crate::test_support::stream_input::{
-    agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, Cells, Row, GROUPS,
+    Cells, GROUPS, Row, agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema,
 };
 use gnitz_expr::cmp_order_keys;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
@@ -48,7 +48,7 @@ fn window(
     aggs: &[AggDescriptor],
     dense: bool,
 ) -> BTreeMap<(Cells, Cells), i64> {
-    let rows: Vec<(Row, i64)> = model.iter().filter(|(_, &w)| w > 0).map(|(r, &w)| (*r, w)).collect();
+    let rows: Vec<(Row, i64)> = model.iter().filter(|&(_, &w)| w > 0).map(|(r, &w)| (*r, w)).collect();
     let (b, locs, groups) = ordered_groups(&rows, group_cols, keys);
     let mb = b.as_mem_batch();
     let int = |v: i64| Some(v.to_le_bytes().to_vec());

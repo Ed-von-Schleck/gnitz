@@ -8,12 +8,12 @@ use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gnitz_core::{block_on, BlockingHost, Catalog, ClientError, GnitzClient};
+use gnitz_core::{BlockingHost, Catalog, ClientError, GnitzClient, block_on};
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use nu_ansi_term::{Color, Style};
 
 use crate::lex::{self, Piece, Splitter};
-use crate::render::{paint, render, Target, Weights};
+use crate::render::{Target, Weights, paint, render};
 use crate::settings::{Format, Settings};
 use crate::value::Rows;
 

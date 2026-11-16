@@ -33,10 +33,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gnitz_core::{
-    CatalogRelation, ClientError, GnitzClient, RelDescriptor, RelName, Schema, ZSetBatch, DEFAULT_PAGE_ROWS,
+    CatalogRelation, ClientError, DEFAULT_PAGE_ROWS, GnitzClient, RelDescriptor, RelName, Schema, ZSetBatch,
 };
 use gnitz_foundation::posix_io::{create_dir_all_durable, fsync_dir, write_file_durable};
-use gnitz_wire::{FixedInt, RelClass, WireConflictMode, PUBLIC_SCHEMA, SYSTEM_SCHEMA};
+use gnitz_wire::{FixedInt, PUBLIC_SCHEMA, RelClass, SYSTEM_SCHEMA, WireConflictMode};
 
 use columns::{TableReader, TableWriter};
 use manifest::{Manifest, TableEntry, ViewEntry};

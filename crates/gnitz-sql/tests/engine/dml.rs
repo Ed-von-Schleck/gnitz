@@ -266,17 +266,41 @@ fn a_read_through_ctes_matches_the_flat_query() {
     let rows: Vec<Vec<i64>> = (1..=200).map(|i| vec![i, i % 7, (i * 37) % 101]).collect();
     db.insert("t", &["id", "g", "v"], &rows);
     for (cte, flat, cols) in [
-        ("WITH x AS (SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g) SELECT g, n, s FROM x",
-         "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g", vec!["g", "n", "s"]),
-        ("WITH x AS (SELECT g, SUM(v) AS s FROM t WHERE id > 30 GROUP BY g) SELECT g, s * 2 AS d FROM x WHERE s > 1150",
-         "SELECT g, SUM(v) * 2 AS d FROM t WHERE id > 30 GROUP BY g HAVING SUM(v) > 1150", vec!["g", "d"]),
-        ("WITH x AS (SELECT id, v + 1 AS q, g FROM t WHERE g < 5), y AS (SELECT q * 2 AS r, g FROM x WHERE id > 10) SELECT g, SUM(r) AS s FROM y GROUP BY g",
-         "SELECT g, SUM((v + 1) * 2) AS s FROM t WHERE g < 5 AND id > 10 GROUP BY g", vec!["g", "s"]),
-        ("WITH x AS (SELECT v AS id, id AS v FROM t) SELECT v FROM x ORDER BY id DESC, v LIMIT 5",
-         "SELECT id AS v FROM t ORDER BY t.v DESC, t.id LIMIT 5", vec!["v"]),
-        ("WITH x AS (SELECT 40 + 2 AS a) SELECT a + 1 AS b FROM x", "SELECT 43 AS b", vec!["b"]),
-        ("WITH x AS (SELECT * FROM t) SELECT DISTINCT x.g FROM x WHERE x.v > 50", "SELECT DISTINCT g FROM t WHERE v > 50", vec!["g"]),
-        ("WITH x AS (SELECT * FROM t) SELECT x.* FROM x WHERE id < 4", "SELECT * FROM t WHERE id < 4", vec!["id", "g", "v"]),
+        (
+            "WITH x AS (SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g) SELECT g, n, s FROM x",
+            "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g",
+            vec!["g", "n", "s"],
+        ),
+        (
+            "WITH x AS (SELECT g, SUM(v) AS s FROM t WHERE id > 30 GROUP BY g) SELECT g, s * 2 AS d FROM x WHERE s > 1150",
+            "SELECT g, SUM(v) * 2 AS d FROM t WHERE id > 30 GROUP BY g HAVING SUM(v) > 1150",
+            vec!["g", "d"],
+        ),
+        (
+            "WITH x AS (SELECT id, v + 1 AS q, g FROM t WHERE g < 5), y AS (SELECT q * 2 AS r, g FROM x WHERE id > 10) SELECT g, SUM(r) AS s FROM y GROUP BY g",
+            "SELECT g, SUM((v + 1) * 2) AS s FROM t WHERE g < 5 AND id > 10 GROUP BY g",
+            vec!["g", "s"],
+        ),
+        (
+            "WITH x AS (SELECT v AS id, id AS v FROM t) SELECT v FROM x ORDER BY id DESC, v LIMIT 5",
+            "SELECT id AS v FROM t ORDER BY t.v DESC, t.id LIMIT 5",
+            vec!["v"],
+        ),
+        (
+            "WITH x AS (SELECT 40 + 2 AS a) SELECT a + 1 AS b FROM x",
+            "SELECT 43 AS b",
+            vec!["b"],
+        ),
+        (
+            "WITH x AS (SELECT * FROM t) SELECT DISTINCT x.g FROM x WHERE x.v > 50",
+            "SELECT DISTINCT g FROM t WHERE v > 50",
+            vec!["g"],
+        ),
+        (
+            "WITH x AS (SELECT * FROM t) SELECT x.* FROM x WHERE id < 4",
+            "SELECT * FROM t WHERE id < 4",
+            vec!["id", "g", "v"],
+        ),
     ] {
         let (c, f) = (db.rows(cte, &cols), db.rows(flat, &cols));
         assert!(!f.is_empty(), "`{flat}` selects nothing");

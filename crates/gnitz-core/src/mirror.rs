@@ -38,10 +38,10 @@ use std::time::Duration;
 use crate::client::GnitzClient;
 use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, ScanReply, Session, Target};
 use crate::error::ClientError;
-use crate::host::{offload, BoxFut, Host, Pending, Sent};
+use crate::host::{BoxFut, Host, Pending, Sent, offload};
 use crate::{RelName, Schema, ZSetBatch};
-use gnitz_wire::txn_frame::{kept_as, DeltaPollItem, SubId};
-use gnitz_wire::{payload_str, RelClass, WireStatus, RELTAB_PAY_NAME, VIEW_TAB};
+use gnitz_wire::txn_frame::{DeltaPollItem, SubId, kept_as};
+use gnitz_wire::{RELTAB_PAY_NAME, RelClass, VIEW_TAB, WireStatus, payload_str};
 
 // ---------------------------------------------------------------------------
 // The store
@@ -646,7 +646,9 @@ impl GnitzClient {
                             (Some(e), _) | (None, Err(e)) => Err(e),
                             (None, Ok(_)) => Ok(()),
                         };
-                        if let (Ok(()), Some(view)) = (&read, views.get_mut(&tid)) {
+                        if read.is_ok()
+                            && let Some(view) = views.get_mut(&tid)
+                        {
                             view.subscribed(kept_as(first, i));
                         }
                         done.push((tid, read));
@@ -666,7 +668,9 @@ impl GnitzClient {
                 let advanced = store.clone().advance(host, std::mem::take(&mut due)).await?;
                 for (i, advanced) in ended.drain(..).zip(advanced) {
                     let tid = tids[i];
-                    if let (Ok(()), Some(view)) = (&advanced, views.get_mut(&tid)) {
+                    if advanced.is_ok()
+                        && let Some(view) = views.get_mut(&tid)
+                    {
                         view.subscribed(kept_as(first, i));
                     }
                     done.push((tid, advanced));
@@ -722,10 +726,10 @@ impl GnitzClient {
         };
         for (tid, advanced) in taken.into_iter().zip(advanced) {
             // A copy its store let go of is read whole by the next poll.
-            if advanced.is_err() {
-                if let Some(view) = views.get_mut(&tid) {
-                    view.link = Link::Due;
-                }
+            if advanced.is_err()
+                && let Some(view) = views.get_mut(&tid)
+            {
+                view.link = Link::Due;
             }
             done.push((tid, advanced));
         }
@@ -854,7 +858,7 @@ impl GnitzClient {
     /// poisoned store names none and leaves `wait` as asked: a sync advances
     /// none of its copies, so their subscriptions end, and a reader's are
     /// synced as on any client.
-    pub(crate) fn mirror_hold(&self, wait: Duration) -> (Duration, impl Iterator<Item = SubId> + '_) {
+    pub(crate) fn mirror_hold(&self, wait: Duration) -> (Duration, impl Iterator<Item = SubId>) {
         let live = self.mirror.as_deref().filter(|m| m.store.refusal().is_ok());
         let views = live.into_iter().flat_map(|m| m.views.values());
         let due = views.clone().any(|v| v.link == Link::Due || v.owed_reseed);

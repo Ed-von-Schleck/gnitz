@@ -10,21 +10,21 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use gnitz_core::{
-    BatchAppender, ClientError, DeltaCursor, GnitzClient, ScanReply, Schema, Target, ZSetBatch, MAX_IN_FLIGHT,
-    MAX_QUEUED_BYTES,
+    BatchAppender, ClientError, DeltaCursor, GnitzClient, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, ScanReply, Schema, Sent,
+    Target, ZSetBatch,
 };
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::{
-    append_frame, frame_len_prefix, peek_control_block, ClientVerb, ColumnDef, ControlHeader, ReadBound, ReadSpec,
-    TypeCode, WireConflictMode, WireFlags, WireLane, FRAME_LEN_PREFIX_BYTES,
+    ClientVerb, ColumnDef, ControlHeader, FRAME_LEN_PREFIX_BYTES, ReadBound, ReadSpec, TypeCode, WireConflictMode,
+    WireFlags, WireLane, append_frame, frame_len_prefix, peek_control_block,
 };
-use support::{settled, PATIENCE};
+use support::{PATIENCE, settled};
 use tokio::runtime::Runtime;
 
 /// A key column and nothing else; the peer never checks a layout.
@@ -46,12 +46,12 @@ const ROW_BYTES: usize = 24;
 const BIG: usize = 200_000;
 
 /// A read of every row of `tid`, submitted when called.
-fn scan(c: &AsyncClient, tid: u64) -> impl Future<Output = Result<ScanReply, ClientError>> {
+fn scan(c: &AsyncClient, tid: u64) -> Sent<ScanReply> {
     c.send(move |c| c.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema()))
 }
 
 /// A push of `batch` to `tid`, submitted when called.
-fn push(c: &AsyncClient, tid: u64, batch: ZSetBatch) -> impl Future<Output = Result<u64, ClientError>> {
+fn push(c: &AsyncClient, tid: u64, batch: ZSetBatch) -> Sent<u64> {
     c.send(move |c| c.push(tid, &schema(), batch, WireConflictMode::Update))
 }
 
@@ -506,10 +506,11 @@ fn cancel_after_the_answer(delivered: bool) {
     // follows the sync's answer, so once it is in the answer is too.
     let mut sync = Box::pin(client.sync(Duration::from_secs(30)));
     let noop = std::task::Waker::noop();
-    assert!(sync
-        .as_mut()
-        .poll(&mut std::task::Context::from_waker(noop))
-        .is_pending());
+    assert!(
+        sync.as_mut()
+            .poll(&mut std::task::Context::from_waker(noop))
+            .is_pending()
+    );
     assert_eq!(drive(&rt, &mut conn, scan(&client, 5)).unwrap().lsn, Some(55));
     // Its answer in, the sync queues the client's half and awaits it.
     let polled = rt.block_on(std::future::poll_fn(|cx| Poll::Ready(sync.as_mut().poll(cx))));

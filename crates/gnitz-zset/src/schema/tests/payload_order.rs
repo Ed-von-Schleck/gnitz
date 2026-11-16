@@ -1,8 +1,8 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
-use crate::test_support::{edge_native, opk_pk, random_schema, row_key, Rng, FLOATS, STRS};
-use gnitz_wire::{key_image, ScalarKind, TypeCode};
+use crate::test_support::{FLOATS, Rng, STRS, edge_native, opk_pk, random_schema, row_key};
+use gnitz_wire::{ScalarKind, TypeCode, key_image};
 
 /// A payload cell by its type's order: an integer by its key image, a float by
 /// its `total_cmp` image, a string by its bytes. One column always yields one

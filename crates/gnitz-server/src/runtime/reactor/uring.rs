@@ -3,7 +3,7 @@
 use std::mem::MaybeUninit;
 use std::time::Duration;
 
-use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
+use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
 /// The ring's SQ entries. This sets submit batching, not depth: [`IoUringRing::push`]
 /// flushes a full SQ.

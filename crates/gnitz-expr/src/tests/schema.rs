@@ -1,11 +1,11 @@
 //! The descriptor's layout facts, checked against absolute answers.
 
 use crate::{
-    decode_schema_block, encode_schema_block, leading_pk, ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn,
-    SchemaDescriptor, SchemaRefusal,
+    ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn, SchemaDescriptor, SchemaRefusal, decode_schema_block,
+    encode_schema_block, leading_pk,
 };
 use gnitz_wire::schema_block::SchemaBlockCol;
-use gnitz_wire::{ColType, TypeCode, MAX_COLUMNS};
+use gnitz_wire::{ColType, MAX_COLUMNS, TypeCode};
 
 fn col(tc: TypeCode) -> SchemaColumn {
     SchemaColumn::new(tc, false)
@@ -191,7 +191,7 @@ fn layout_facts_match_the_column_table() {
 /// position, type and PK membership.
 #[test]
 fn trailing_append_keeps_every_earlier_column() {
-    use TypeCode::{String, I64, U64};
+    use TypeCode::{I64, String, U64};
     let prev = SchemaDescriptor::new(&[col(U64), col(I64)], &[0]);
     let cases: [(&[SchemaColumn], &[u32], bool, &str); 5] = [
         (&[col(U64), col(I64)], &[0], true, "unchanged"),
@@ -385,7 +385,7 @@ fn reduce_out_layout_is_the_key_region_then_the_unspelled_row() {
 /// a type code and the order of two regions, and not with column numbering.
 #[test]
 fn layout_digest_separates_every_region_axis() {
-    use TypeCode::{String as Str, I64, U64};
+    use TypeCode::{I64, String as Str, U64};
     let digest = |tcs: &[TypeCode], pk: &[u32]| {
         let cols: Vec<SchemaColumn> = tcs.iter().map(|&tc| col(tc)).collect();
         SchemaDescriptor::new(&cols, pk).layout_digest()

@@ -21,7 +21,7 @@ use std::num::NonZeroU64;
 use rustc_hash::FxHashSet;
 
 use super::bundle::{FoldOp, PkFold, TxnBundle, TxnTable};
-use super::violation::{pk_violation_err, unique_violation_err, Clash};
+use super::violation::{Clash, pk_violation_err, unique_violation_err};
 use super::*;
 
 use crate::catalog::FkEdge;
@@ -256,7 +256,7 @@ impl Checks {
 }
 
 /// The `(row, key)` of each row of a probe reply that answers a probed key.
-fn answered<'r>(rows: &'r MemBatch<'_>) -> impl Iterator<Item = (usize, &'r [u8])> + 'r {
+fn answered<'r>(rows: &'r MemBatch<'_>) -> impl Iterator<Item = (usize, &'r [u8])> {
     (0..rows.len())
         .filter(|&j| rows.get_weight(j) == 1)
         .map(|j| (j, rows.get_pk_bytes(j)))
@@ -282,12 +282,12 @@ fn fold_pk_reply<'a>(
             return Err(pk_violation_err(&disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
         }
         e.committed = true;
-        if let Some((old, loc)) = &mut old {
-            if !loc.is_null(rows, j) {
-                // Keyed by the fold's own key, which outlives the reply.
-                let (&key, _) = t.fold.get_key_value(pk).expect("found above");
-                old.insert(key, loc.opk_image(rows, j));
-            }
+        if let Some((old, loc)) = &mut old
+            && !loc.is_null(rows, j)
+        {
+            // Keyed by the fold's own key, which outlives the reply.
+            let (&key, _) = t.fold.get_key_value(pk).expect("found above");
+            old.insert(key, loc.opk_image(rows, j));
         }
     }
     Ok(())
@@ -567,14 +567,14 @@ fn parent_retired_added(
         if let Some(sv) = surviving_val {
             added.insert(sv);
         }
-        if let Some(ov) = old_of(p, e) {
-            if surviving_val != Some(ov) {
-                // A value both deleted and updated away reads as deleted, so
-                // the verb does not depend on the fold's iteration order.
-                let slot = retired.entry(ov).or_insert(RetireVerb::Update);
-                if matches!(e.last, FoldOp::Deleted) {
-                    *slot = RetireVerb::Delete;
-                }
+        if let Some(ov) = old_of(p, e)
+            && surviving_val != Some(ov)
+        {
+            // A value both deleted and updated away reads as deleted, so
+            // the verb does not depend on the fold's iteration order.
+            let slot = retired.entry(ov).or_insert(RetireVerb::Update);
+            if matches!(e.last, FoldOp::Deleted) {
+                *slot = RetireVerb::Delete;
             }
         }
     }

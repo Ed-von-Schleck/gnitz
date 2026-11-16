@@ -1,6 +1,6 @@
 use super::*;
-use crate::runtime::sal::fixtures::{group_at, scan, test_log};
 use crate::runtime::sal::SalWriter;
+use crate::runtime::sal::fixtures::{group_at, scan, test_log};
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     pk_only_schema, pk_payload_schema, weighted_rows, zset_of,

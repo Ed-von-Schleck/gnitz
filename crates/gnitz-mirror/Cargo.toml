@@ -3,6 +3,7 @@ name = "gnitz-mirror"
 description = "Local mirror store for gnitz views: a copy fed by a view's delta feed and read in the client's process"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -52,7 +52,7 @@ impl CompileOutput {
     }
 
     /// The relations the circuit scans, each once, in first-scan order.
-    pub(in crate::query) fn source_ids(&self) -> impl Iterator<Item = u64> + '_ {
+    pub(in crate::query) fn source_ids(&self) -> impl Iterator<Item = u64> {
         self.sources.iter().map(|&(source, _)| source)
     }
 }

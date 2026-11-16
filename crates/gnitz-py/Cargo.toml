@@ -2,6 +2,7 @@
 name = "gnitz-py"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 
@@ -10,7 +11,7 @@ name       = "gnitz"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module"] }
 gnitz-core.workspace = true
 gnitz-expr.workspace = true
 gnitz-foundation.workspace = true

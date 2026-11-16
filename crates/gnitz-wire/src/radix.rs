@@ -47,11 +47,7 @@ impl RadixKey for [u128; 2] {
     const BYTES: usize = 32;
     #[inline(always)]
     fn byte(self, i: usize) -> u8 {
-        if i < 16 {
-            self[1].byte(i)
-        } else {
-            self[0].byte(i - 16)
-        }
+        if i < 16 { self[1].byte(i) } else { self[0].byte(i - 16) }
     }
     #[inline(always)]
     fn or_diff(self, a: Self, b: Self) -> Self {

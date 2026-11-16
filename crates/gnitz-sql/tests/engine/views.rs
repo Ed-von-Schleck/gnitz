@@ -179,7 +179,7 @@ fn reduce_maps_and_group_key_resolution() {
             &[&[5, 2], &[9, 1]],
         ),
         (
-            "having",
+            "filtered",
             "SELECT k, SUM(a) AS s1, MAX(b) AS m2 FROM t GROUP BY k HAVING MAX(b) = 3",
             &["k", "s1", "m2"],
             &[&[2, 2, 3]],
@@ -561,12 +561,14 @@ fn a_subscription_is_exactly_one_statement() {
 #[test]
 fn a_subscription_is_planned_only_from_a_select() {
     let mut db = fed_view();
-    assert!(block_on(gnitz_sql::plan_subscription(
-        &mut db.client,
-        &db.sn,
-        "SELECT id, v FROM fv"
-    ))
-    .is_ok());
+    assert!(
+        block_on(gnitz_sql::plan_subscription(
+            &mut db.client,
+            &db.sn,
+            "SELECT id, v FROM fv"
+        ))
+        .is_ok()
+    );
     for sql in [
         "EXPLAIN SELECT id, v FROM fv",
         "DESCRIBE SELECT id, v FROM fv",

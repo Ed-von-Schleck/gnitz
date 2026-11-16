@@ -12,8 +12,8 @@ use gnitz_wire::txn_frame::BLIND;
 use gnitz_wire::{ReadSpec, WireConflictMode};
 
 use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session, SubId, Target};
-use crate::error::{not_found, ClientError};
-use crate::host::{offload, serve, BlockingHost, Host, Pending, Sent};
+use crate::error::{ClientError, not_found};
+use crate::host::{BlockingHost, Host, Pending, Sent, offload, serve};
 use crate::txn::TxnBuffer;
 use crate::{PushBatch, RelName, Schema, ZSetBatch};
 

@@ -16,13 +16,13 @@ use std::time::{Duration, Instant};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::tick::fresh_read_lock;
-use super::{cork_fault, cork_msg, decode_fault, forward_scan, target_kind, Access, CatalogLock, Shared};
+use super::{Access, CatalogLock, Shared, cork_fault, cork_msg, decode_fault, forward_scan, target_kind};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Peer, PeerGone, SendBody, Train, TrainLease};
 use crate::runtime::sal::Read;
-use crate::runtime::sync::{chan, oneshot, select2, ReadGuard};
-use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem, SubId};
+use crate::runtime::sync::{ReadGuard, chan, oneshot, select2};
+use gnitz_wire::txn_frame::{DeltaPollItem, SubId, decode_delta_items, delta_poll_kept};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
 /// Delta reads at one SAL cut: the ceiling on the trains a DELTA_POLL or a
@@ -314,7 +314,7 @@ impl Outbox {
     /// Queue one train of subscription `id` to `view`: its opening marker
     /// and the frames after it.
     fn send(&self, view: u64, id: SubId, body: Rc<Vec<u8>>) {
-        self.unsynced.set(self.unsynced.get() + HEAD_FRAME_BYTES + body.len());
+        self.unsynced.update(|v| v + HEAD_FRAME_BYTES + body.len());
         self.trains.borrow_mut().push(QueuedTrain { view, id, body });
     }
 }

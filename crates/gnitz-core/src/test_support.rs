@@ -10,12 +10,12 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gnitz_foundation::posix_io::set_sockopt_int;
-use gnitz_wire::{framed, peek_control_block, ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus};
+use gnitz_wire::{ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus, framed, peek_control_block};
 
 use crate::connection::Session;
 use crate::transport::poll_fd;

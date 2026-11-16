@@ -3,7 +3,7 @@
 
 use gnitz_wire::{FixedInt, TypeCode};
 
-use super::{decode_load_const, encode_expr_blob, encode_load_const, ExprOp, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS};
+use super::{ExprOp, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS, decode_load_const, encode_expr_blob, encode_load_const};
 use crate::{CmpOp, ConstIdx, ExprValidateErr, IntUnaryOp, LogicalInstr, LogicalProgram, Reg, Sink};
 
 // ---------------------------------------------------------------------------

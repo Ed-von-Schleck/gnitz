@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gnitz_core::{GnitzClient, PollOutcome, PollResult, ScanReply, Schema, ZSetBatch};
 use gnitz_sql::SqlResult;
-use gnitz_zset_testkit::{row_key, RowKey};
+use gnitz_zset_testkit::{RowKey, row_key};
 
 pub mod common;
 

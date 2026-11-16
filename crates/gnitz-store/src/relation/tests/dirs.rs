@@ -2,8 +2,8 @@ use super::*;
 use crate::relation::{IndexClaim, StateLayout, StoreConfig};
 use crate::storage::flush_barrier;
 use crate::test_support::{
-    flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture_with, scratch_table,
-    solo, spec, spilling, zset_of, TID,
+    TID, flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture_with,
+    scratch_table, solo, spec, spilling, zset_of,
 };
 use gnitz_wire::{TypeCode, ViewBudget};
 

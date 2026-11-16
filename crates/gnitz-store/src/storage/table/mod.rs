@@ -32,14 +32,14 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use super::Cut;
 use super::manifest::RecoverySource;
 use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
-use super::Cut;
 use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
+use gnitz_zset::repr::{PkSetGather, ReadCursor, empty_cursor, from_runs, from_runs_at, from_runs_in_band};
 use gnitz_zset::repr::{Run, StoredRow};
 use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::schema::{group_band, probe_key, range_band};
@@ -292,11 +292,7 @@ impl Table {
 
     /// The runs `cut` reads whose PK extent meets the inclusive `bound`, in the
     /// newest-first order the module doc states; `None` takes them all.
-    fn sources<'s, 'b>(
-        &'s self,
-        bound: Option<(&'b [u8], &'b [u8])>,
-        cut: Cut,
-    ) -> impl Iterator<Item = Run> + use<'s, 'b> {
+    fn sources(&self, bound: Option<(&[u8], &[u8])>, cut: Cut) -> impl Iterator<Item = Run> {
         self.ram_tiers(cut)
             .flat_map(move |set| set.runs_overlapping(bound))
             .cloned()
@@ -305,7 +301,7 @@ impl Table {
     }
 
     /// Every run the store holds.
-    pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
+    pub(crate) fn runs(&self) -> impl Iterator<Item = Run> {
         self.sources(None, Cut::Now)
     }
 

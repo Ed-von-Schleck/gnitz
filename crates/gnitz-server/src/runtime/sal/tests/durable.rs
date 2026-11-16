@@ -5,8 +5,8 @@ use gnitz_foundation::posix_io::memfd;
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 /// A wake that counts itself.

@@ -22,8 +22,8 @@ fn pk_keys_from_keys_bench() {
                 let mut flat = vec![0u8; n * stride];
                 match shape {
                     "random" => {
-                        for word in flat.chunks_exact_mut(8) {
-                            word.copy_from_slice(&next().to_be_bytes());
+                        for word in flat.as_chunks_mut::<8>().0 {
+                            *word = next().to_be_bytes();
                         }
                     }
                     _ => {

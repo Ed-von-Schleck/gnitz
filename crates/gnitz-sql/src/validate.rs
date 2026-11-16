@@ -15,7 +15,7 @@
 //!
 //! What a *surface* consumes is passed in — `HonoredClauses`, `QueryEnvelope`.
 
-use crate::error::{reject_if, GnitzSqlError};
+use crate::error::{GnitzSqlError, reject_if};
 
 /// The `Select` clauses a shape legitimately consumes, beyond the universal
 /// `from` + `projection` + `WHERE` (every surface binds a top-level WHERE).

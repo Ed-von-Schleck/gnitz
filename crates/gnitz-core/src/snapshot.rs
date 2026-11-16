@@ -13,7 +13,7 @@ use gnitz_wire::{PkBuf, SeqTabRow};
 
 use crate::catalog::CATALOG_FAMILIES;
 use crate::connection::{Request, SnapshotPage};
-use crate::{sys_schema, Catalog, ClientError, GnitzClient, Pending, Schema, ZSetBatch};
+use crate::{Catalog, ClientError, GnitzClient, Pending, Schema, ZSetBatch, sys_schema};
 
 /// The rows a page holds when a caller names no other size.
 pub const DEFAULT_PAGE_ROWS: u64 = 16_384;

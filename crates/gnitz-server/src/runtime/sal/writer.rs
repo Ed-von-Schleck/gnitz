@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 
 use super::durable::Durable;
 use super::format::{
-    anchor_word, dir_sizes, directory, epoch_word, group_header_size, group_total_size, next_epoch, payload_encode,
-    payload_spans, GroupHead, Header, SalMessageKind, PAYLOAD_HEAD, PREFIX_BYTES, PRESENT,
+    GroupHead, Header, PAYLOAD_HEAD, PREFIX_BYTES, PRESENT, SalMessageKind, anchor_word, dir_sizes, directory,
+    epoch_word, group_header_size, group_total_size, next_epoch, payload_encode, payload_spans,
 };
 use super::group::{Group, Routed};
-use super::log::{SalLog, ANCHOR_BYTES, MIN_SAL_BYTES};
+use super::log::{ANCHOR_BYTES, MIN_SAL_BYTES, SalLog};
 use super::request::{Apply, Read};
 use super::tail::CommittedTail;
 use crate::catalog::SysFamily;
@@ -23,7 +23,7 @@ use crate::runtime::sync::{AsyncRwLock, Parked, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{WireFault, WireStatus, MAX_WORKERS};
+use gnitz_wire::{MAX_WORKERS, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<ddl|commit>`: crash the master between a zone's

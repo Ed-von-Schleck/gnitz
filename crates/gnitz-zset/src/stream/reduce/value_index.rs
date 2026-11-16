@@ -11,13 +11,13 @@
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
 use crate::algebra::KeyPacker;
-use crate::algebra::{image_slot_col, ImageCol, IMAGE_COL};
 use crate::algebra::{Agg, AggValues};
-use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
+use crate::algebra::{IMAGE_COL, ImageCol, image_slot_col};
+use crate::repr::{Batch, ReadCursor, copy_runs, range_rows};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
-use gnitz_wire::{payload_bytes, TypeCode, MAX_PK_BYTES};
+use gnitz_wire::{MAX_PK_BYTES, TypeCode, payload_bytes};
 use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------

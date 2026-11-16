@@ -2,10 +2,10 @@
 //! collected ahead of the user-named view. A segment is named by its position, which
 //! commit substitutes for a real id, so lowering reaches no server.
 
-use super::super::physical::Frame;
 use super::super::RelExpr;
+use super::super::physical::Frame;
 use super::{SegInput, SegSource};
-use gnitz_core::{segment_id, PlannedView, Schema};
+use gnitz_core::{PlannedView, Schema, segment_id};
 use gnitz_wire::Circuit;
 use std::collections::HashMap;
 use std::sync::Arc;

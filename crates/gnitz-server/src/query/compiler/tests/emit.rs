@@ -112,7 +112,7 @@ const ON_A: Build = |c| rekeyed_join(c, &A, false, JoinKind::Equi);
 /// holds, on this worker and in key order, every row the integral would.
 #[test]
 fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
-    use TypeCode::{U128, U32, U64, UUID};
+    use TypeCode::{U32, U64, U128, UUID};
     let table = Source::from(ab(U64));
     let partner = Source::from(make_schema_u64_i64());
     // Beside other workers, the table's delta must also stay where the table

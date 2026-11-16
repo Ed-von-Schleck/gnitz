@@ -13,20 +13,20 @@ use std::os::fd::AsRawFd;
 use crate::catalog::{CatalogEngine, SysFamily};
 use gnitz_foundation::fault::Seam;
 
+use crate::runtime::ServerExit;
 use crate::runtime::affinity;
 use crate::runtime::executor;
 use crate::runtime::listen;
 use crate::runtime::master::{MasterDispatcher, Workers};
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
-use crate::runtime::reactor::{check_host, Limits, Reactor};
+use crate::runtime::reactor::{Limits, Reactor, check_host};
 use crate::runtime::sal::{CommittedTail, Ingest, SalWriter};
 use crate::runtime::signals;
-use crate::runtime::sync::{select2, Either};
+use crate::runtime::sync::{Either, select2};
 use crate::runtime::tls::{ResolvedTls, TlsListener};
 use crate::runtime::w2m::{self, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
-use crate::runtime::ServerExit;
 use gnitz_store::relation::{PkRule, Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::Batch;
@@ -39,7 +39,7 @@ use gnitz_zset::repr::Batch;
 
 /// The tail's committed DdlSync groups, each with its LSN, in log order:
 /// what the catalog stages at open.
-fn system_tail(tail: &CommittedTail) -> impl Iterator<Item = Result<(SysFamily, u64, Batch), String>> + '_ {
+fn system_tail(tail: &CommittedTail) -> impl Iterator<Item = Result<(SysFamily, u64, Batch), String>> {
     tail.ingests().filter_map(move |group| {
         let (family, msg) = match group {
             Ok((Ingest::DdlSync { family }, msg)) => (family, msg),
@@ -288,7 +288,7 @@ fn fork_workers(
                 return Err(format!(
                     "fork of worker {w} failed: {}",
                     std::io::Error::last_os_error()
-                ))
+                ));
             }
             0 => run_worker_child(
                 Slot::new(w as u32, num_workers),
@@ -454,7 +454,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
             return Err(format!(
                 "worker {w} {end} during recovery (log: {})",
                 worker_log(data_dir, w)
-            ))
+            ));
         }
     };
     // Outside the loop: the bind may sleep on an address still in use.

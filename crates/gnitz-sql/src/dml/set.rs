@@ -11,8 +11,8 @@ use crate::ir::{BoundExpr, RegClass};
 use crate::rules::require_column;
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{ScalarCell, ScalarEval};
-use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
+use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr};
 
 /// Which row a SET right-hand side reads: the row being rewritten, or (ON
@@ -144,10 +144,11 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
         });
     }
     let src = expr.infer_ty(schema.columns());
-    if let BoundExpr::ColRef(c) = &expr {
-        if let (true, Some(slot)) = (src == ty, schema.layout().payload_slot(*c)) {
-            return Ok(SetRhs::Copy { scope, src: slot });
-        }
+    if let BoundExpr::ColRef(c) = &expr
+        && src == ty
+        && let Some(slot) = schema.layout().payload_slot(*c)
+    {
+        return Ok(SetRhs::Copy { scope, src: slot });
     }
     // An f64 register has no computed destination but a DECIMAL's cast: nothing
     // downstream can tell its bit pattern from an integer's.

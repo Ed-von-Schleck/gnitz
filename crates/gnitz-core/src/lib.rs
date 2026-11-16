@@ -29,17 +29,17 @@ mod txn;
 
 pub use batch::{BatchAppender, PayloadColumn, PkColumn, RowMark, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
-pub use client::{env_target, GnitzClient};
+pub use client::{GnitzClient, env_target};
 pub use connection::{
-    encode_ddl_txn, DeltaCursor, RelDescriptor, ScanReply, SubId, Target, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+    DeltaCursor, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply, SubId, Target, encode_ddl_txn,
 };
-pub use ddl::{segment_id, ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle};
-pub use error::{not_found, ClientError, ProtocolError};
-pub use host::{block_on, drain_cancel, promise, serve, BlockingHost, BoxFut, Host, Job, Op, Pending, Promise, Sent};
+pub use ddl::{ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle, segment_id};
+pub use error::{ClientError, ProtocolError, not_found};
+pub use host::{BlockingHost, BoxFut, Host, Job, Op, Pending, Promise, Sent, block_on, drain_cancel, promise, serve};
 pub use mirror::{MirrorStore, Planner, PollOutcome, PollResult, Subscription};
 pub use pushed::{Delivery, Pushed, Synced};
 pub use rel_name::RelName;
-pub use schema::{sys_schema, Schema};
+pub use schema::{Schema, sys_schema};
 pub use snapshot::DEFAULT_PAGE_ROWS;
 pub use transport::{ClientTransport, Interest};
 pub use txn::PushBatch;

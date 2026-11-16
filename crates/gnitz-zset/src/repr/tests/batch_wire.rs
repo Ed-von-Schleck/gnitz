@@ -1,11 +1,11 @@
 use super::*;
-use crate::repr::{merge_consolidated, BatchBuilder};
+use crate::repr::{BatchBuilder, merge_consolidated};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
 };
-use gnitz_wire::{TypeCode, REG_NULL_BMP, REG_PAYLOAD_START};
+use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, TypeCode};
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
@@ -422,11 +422,7 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
         let block = encode_to_wire_vec(&b.finish());
         let got = Batch::decode_foreign_wal_block(&block, &schema);
         assert_eq!(got.is_ok(), valid, "{:?}", got.err());
-        if valid {
-            ok_n += 1
-        } else {
-            bad_n += 1
-        }
+        if valid { ok_n += 1 } else { bad_n += 1 }
     }
     assert!(ok_n > 2000 && bad_n > 2000, "{ok_n} valid, {bad_n} invalid");
 }

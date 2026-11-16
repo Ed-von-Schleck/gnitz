@@ -4,7 +4,7 @@
 
 use super::super::{ColId, ExistsKind, HirExpr, JoinClass, JoinPlan, JoinType, ProjEntry, PureRangeKind, RelExpr};
 use super::spine::{self, Spine, Top};
-use super::{materialize, Demand, EmitPieces, ViewChain};
+use super::{Demand, EmitPieces, ViewChain, materialize};
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
@@ -262,12 +262,12 @@ impl JoinSide {
     }
 
     /// The kept payload's `ColId`s, in keep order.
-    fn ids(&self) -> impl Iterator<Item = Option<ColId>> + '_ {
+    fn ids(&self) -> impl Iterator<Item = Option<ColId>> {
         self.keep.iter().map(|&i| self.frame.layout[i as usize])
     }
 
     /// The kept payload columns' defs, in keep order.
-    fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
+    fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> {
         self.keep.iter().map(|&i| &self.frame.schema.columns()[i as usize])
     }
 

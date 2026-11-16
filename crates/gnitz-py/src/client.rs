@@ -9,10 +9,10 @@
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
-use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{BoxFut, ClientError, DeltaCursor, GnitzClient, RelName, Sent, SubId, TableDef, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
@@ -24,7 +24,7 @@ use crate::blocking::Blocking;
 use crate::read::scan_result;
 use crate::reply::{delta, none, polled, scanned, sql_results, synced, value};
 use crate::schema::PySchema;
-use crate::write::{py_key_image, py_pks_to_column, PyZSetBatch};
+use crate::write::{PyZSetBatch, py_key_image, py_pks_to_column};
 use crate::{client_err, lock};
 
 /// How a client waits, which is the whole difference between its two classes.

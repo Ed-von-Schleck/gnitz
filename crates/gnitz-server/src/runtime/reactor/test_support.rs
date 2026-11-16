@@ -8,11 +8,11 @@ use super::conn::Accepted;
 use super::op::Op;
 use super::*;
 use crate::runtime::park::WorkerSet;
-pub(super) use crate::runtime::sync::{oneshot, select2, Either};
+pub(super) use crate::runtime::sync::{Either, oneshot, select2};
 pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within, yield_once};
+use crate::runtime::w2m::W2mWriter;
 pub(super) use crate::runtime::w2m::fixtures::ring_slot;
 use crate::runtime::w2m::fixtures::test_rings;
-use crate::runtime::w2m::W2mWriter;
 
 impl Limits {
     /// Every send carries `client_send_timeout`, so it is generous here: a drain

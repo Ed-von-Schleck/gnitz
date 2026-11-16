@@ -8,8 +8,8 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, scratch_table, table_shards,
-    zset_of, zset_sum, FoldRow, RowKey,
+    FoldRow, RowKey, arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, scratch_table,
+    table_shards, zset_of, zset_sum,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;

@@ -8,15 +8,15 @@
 
 use std::ops::Range;
 
+use crate::repr::PooledBuf;
 use crate::repr::codebook::Codebook;
 use crate::repr::seek::{gallop_by, lower_bound_by};
 use crate::repr::string_heap::append_value;
-use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::{null_bits, Level};
+use gnitz_expr::{Level, null_bits};
 use gnitz_wire::{
-    read_u32_le, read_u64_le, write_u32_le, write_u64_le, CodedHeap, FixedInt, Heap, HeapValue, ScalarKind,
-    SymbolTable, GERMAN_INLINE_OFF, MAX_PK_COLUMNS, MAX_SYMBOLS, MAX_SYMBOL_LEN, SHORT_STRING_THRESHOLD,
+    CodedHeap, FixedInt, GERMAN_INLINE_OFF, Heap, HeapValue, MAX_PK_COLUMNS, MAX_SYMBOL_LEN, MAX_SYMBOLS,
+    SHORT_STRING_THRESHOLD, ScalarKind, SymbolTable, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
 };
 
 gnitz_wire::wire_enum! {
@@ -177,7 +177,7 @@ pub(crate) fn for_encode(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
 
 /// The fewest bytes that hold every offset up to `max_offset`.
 const fn for_bw(max_offset: u64) -> usize {
-    ((u64::BITS - max_offset.leading_zeros()) as usize).div_ceil(8)
+    (max_offset.bit_width() as usize).div_ceil(8)
 }
 
 /// The FoR image of `count` `values`, framed on `reference` at `bw` bytes each.
@@ -288,7 +288,7 @@ pub(crate) const DICT_MAX_ENTRIES: usize = 1 << 16;
 const fn dict_code_bits(entries: usize) -> usize {
     match entries {
         0..=2 => 1,
-        n => (usize::BITS - (n - 1).leading_zeros()) as usize,
+        n => (n - 1).bit_width() as usize,
     }
 }
 
@@ -413,12 +413,15 @@ impl KeyField {
     /// The field's bytes are readable at `row`.
     #[inline(always)]
     unsafe fn load(&self, row: *const u8) -> u64 {
-        let at = row.add(self.at);
-        match self.width {
-            8 => u64::from_be(at.cast::<u64>().read_unaligned()),
-            4 => u32::from_be(at.cast::<u32>().read_unaligned()) as u64,
-            2 => u16::from_be(at.cast::<u16>().read_unaligned()) as u64,
-            _ => *at as u64,
+        // SAFETY: the caller's contract above; each read is the field's width.
+        unsafe {
+            let at = row.add(self.at);
+            match self.width {
+                8 => u64::from_be(at.cast::<u64>().read_unaligned()),
+                4 => u32::from_be(at.cast::<u32>().read_unaligned()) as u64,
+                2 => u16::from_be(at.cast::<u16>().read_unaligned()) as u64,
+                _ => *at as u64,
+            }
         }
     }
 
@@ -428,7 +431,9 @@ impl KeyField {
     /// Eight bytes are readable at the field's start in `row`.
     #[inline(always)]
     unsafe fn load_wide(&self, row: *const u8) -> u64 {
-        u64::from_be(row.add(self.at).cast::<u64>().read_unaligned()) >> (u64::BITS as usize - 8 * self.width)
+        // SAFETY: the caller's contract above.
+        let word = unsafe { row.add(self.at).cast::<u64>().read_unaligned() };
+        u64::from_be(word) >> (u64::BITS as usize - 8 * self.width)
     }
 
     /// `value` left-aligned in a u64, so that its big-endian bytes lead with
@@ -474,11 +479,13 @@ macro_rules! impl_key_word {
             const BITS: u32 = <$word>::BITS;
             #[inline(always)]
             unsafe fn load(at: *const u8) -> $word {
-                <$word>::from_be(at.cast::<$word>().read_unaligned())
+                // SAFETY: the trait method's contract.
+                <$word>::from_be(unsafe { at.cast::<$word>().read_unaligned() })
             }
             #[inline(always)]
             unsafe fn store(self, at: *mut u8) {
-                at.cast::<$word>().write_unaligned(self.to_be())
+                // SAFETY: the trait method's contract.
+                unsafe { at.cast::<$word>().write_unaligned(self.to_be()) }
             }
             #[inline(always)]
             fn field(self, field: &KeyField) -> u64 {
@@ -602,7 +609,7 @@ pub(crate) fn key_encode(src: &[u8], schema: &SchemaDescriptor) -> Option<Vec<u8
     debug_assert!(src.chunks_exact(raw.raw_stride).is_sorted());
     let (fields, rows) = (raw.n, src.len() / raw.raw_stride);
     let spans = key_fields_dispatch!(raw, |set| key_spans(set, raw.raw_stride, src));
-    let bits = |f: usize| u64::BITS - (spans[f].1 - spans[f].0).leading_zeros();
+    let bits = |f: usize| (spans[f].1 - spans[f].0).bit_width();
     let (stride, layout) = raw.packed(bits, |f| spans[f].0)?;
     let len = key_image_len(rows, fields, stride);
     if len >= src.len() {

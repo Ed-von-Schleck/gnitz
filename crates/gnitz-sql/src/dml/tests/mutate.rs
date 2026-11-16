@@ -1,7 +1,7 @@
 use super::*;
-use crate::test_support::Cell::{self, Int, Null, Str, F64};
+use crate::test_support::Cell::{self, F64, Int, Null, Str};
 use crate::test_support::{
-    assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema, TestCatalog,
+    TestCatalog, assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema,
 };
 use gnitz_core::BatchAppender;
 use gnitz_wire::{ColType, RelClass, TypeCode};

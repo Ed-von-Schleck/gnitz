@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{flush_all, io_kind, pass, recv_frames, transport_pair, Peer};
+use crate::test_support::{Peer, flush_all, io_kind, pass, recv_frames, transport_pair};
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::framed;
 use std::io::{ErrorKind, Read};

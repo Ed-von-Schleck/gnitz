@@ -6,7 +6,7 @@
 //! which charges a frame until it is taken, so a run whose reads hold more
 //! frames at once may stop short at its cap.
 
-use super::tests::{deframe, Deframed};
+use super::tests::{Deframed, deframe};
 use super::*;
 use gnitz_fuzz::seed::HELLO_TOKEN as TOKEN;
 

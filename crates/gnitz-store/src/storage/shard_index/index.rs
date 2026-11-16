@@ -8,11 +8,11 @@
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::super::manifest::FlushWork;
 use super::super::Cut;
+use super::super::manifest::FlushWork;
 use super::{
-    extent, fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
-    GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL, UPKEEP_LEVY,
+    CANCEL_PERCENT, CompactionKind, FLSMLevel, GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, L1, LevelGuard,
+    MIN_GUARD_BYTES, SWEEP_STEPS, ShardEntry, ShardIndex, TERMINAL, UPKEEP_LEVY, extent, fold_destinations,
 };
 use crate::storage::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
@@ -71,11 +71,7 @@ impl ShardIndex {
     /// first. Every fold keeps that order, as its outputs hold no row older
     /// than one left above them, and a key lies in one guard per level, so of
     /// the shards holding a key each is newer than every later one.
-    fn entries<'s, 'b>(
-        &'s self,
-        bound: Option<(&'b [u8], &'b [u8])>,
-        cut: Cut,
-    ) -> impl Iterator<Item = &'s ShardEntry> + use<'s, 'b> {
+    fn entries(&self, bound: Option<(&[u8], &[u8])>, cut: Cut) -> impl Iterator<Item = &ShardEntry> {
         let levels = self.levels.iter().flat_map(move |level| {
             let guards = match bound {
                 Some((lo, hi)) => level.find_guards_for_range(lo, hi),
@@ -295,11 +291,7 @@ impl ShardIndex {
     }
 
     /// The shards of [`Self::entries`].
-    pub(crate) fn shard_arcs<'s, 'b>(
-        &'s self,
-        bound: Option<(&'b [u8], &'b [u8])>,
-        cut: Cut,
-    ) -> impl Iterator<Item = Rc<MappedShard>> + use<'s, 'b> {
+    pub(crate) fn shard_arcs(&self, bound: Option<(&[u8], &[u8])>, cut: Cut) -> impl Iterator<Item = Rc<MappedShard>> {
         self.entries(bound, cut).map(|e| Rc::clone(&e.shard))
     }
 

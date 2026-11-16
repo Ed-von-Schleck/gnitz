@@ -1,7 +1,7 @@
 //! Instruction benchmarks for decoding an expression blob.
 
-use crate::test_support::{in_set, result_prog, schema_pk_ints, Meter};
 use crate::LogicalProgram;
+use crate::test_support::{Meter, in_set, result_prog, schema_pk_ints};
 
 /// The decode a predicate-only read pays per request per worker: `from_blob`
 /// and the `resolve_filter` that decodes an IN list's pool entry, per entry.

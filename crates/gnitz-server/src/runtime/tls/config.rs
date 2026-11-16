@@ -13,7 +13,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::danger::ClientCertVerifier;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 
-use super::tokens::{sha256, Tokens};
+use super::tokens::{Tokens, sha256};
 
 /// The `--tls-*` and `--auth-tokens` flags.
 pub(crate) struct TlsArgs {

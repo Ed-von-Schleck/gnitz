@@ -6,8 +6,8 @@ use crate::runtime::sal::format::{epoch_word, payload_encode, payload_rows, payl
 use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Apply, SalExcl};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
-use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::runtime::w2m::RequestId;
+use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_zset::schema::encode_schema_block;
 
@@ -119,7 +119,7 @@ fn sal_cross_process_checkpoint() {
     assert_eq!(report(), (Some(SalMessageKind::FlushEph), 2));
     drop(excl);
 
-    unsafe { assert_child_exited_ok(pid) };
+    assert_child_exited_ok(pid);
 }
 
 /// A group written to 2 of 4 workers is read by those two alone, both answering

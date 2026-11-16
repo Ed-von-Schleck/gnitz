@@ -17,7 +17,7 @@ mod builder;
 mod exec;
 
 pub(in crate::query) use builder::ProgramBuilder;
-pub(in crate::query) use exec::{mint_ground_rows, replay_keys, resume, start, Epoch, Ran, Stores};
+pub(in crate::query) use exec::{Epoch, Ran, Stores, mint_ground_rows, replay_keys, resume, start};
 
 // ---------------------------------------------------------------------------
 // Instruction set

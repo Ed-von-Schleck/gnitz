@@ -1,8 +1,8 @@
 use super::*;
+use crate::ProtocolError;
 use crate::connection::Request;
 use crate::test_support::{client_pair, interrupt_self_until, kv_schema, reply_ctrl, session_pair};
 use crate::transport::poll_fd;
-use crate::ProtocolError;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, BorrowedFd};

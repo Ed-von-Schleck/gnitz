@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use gnitz_fuzz::input::Input;
-use gnitz_fuzz::seed::{self, Seeds, SEEDS_ENV};
+use gnitz_fuzz::seed::{self, SEEDS_ENV, Seeds};
 use gnitz_fuzz::session;
 
 fn main() -> ExitCode {

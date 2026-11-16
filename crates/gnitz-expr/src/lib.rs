@@ -106,7 +106,7 @@ pub use morsel::FloatText;
 pub use order::*;
 pub use program::*;
 pub use schema::*;
-pub use simd::{null_bits, Level};
+pub use simd::{Level, null_bits};
 pub use view::*;
 
 #[cfg(test)]

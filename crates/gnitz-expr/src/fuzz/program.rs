@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::morsel::MORSEL;
-use crate::test_support::{filter_verdicts, TestView};
+use crate::test_support::{TestView, filter_verdicts};
 use crate::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{FixedInt, TypeCode};
 use std::convert::Infallible;

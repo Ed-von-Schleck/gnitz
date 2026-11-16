@@ -1,9 +1,9 @@
 //! Worker routing: which worker owns a key, for a cluster of a given size.
 
-use gnitz_wire::{widen_pk_be, KeyRange, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES, widen_pk_be};
 
 use crate::repr::{stride, stride_dispatch};
-use crate::schema::{key_above, range_band, SchemaDescriptor};
+use crate::schema::{SchemaDescriptor, key_above, range_band};
 
 /// Map a 64-bit hash onto `0..num_workers` by multiply-shift.
 #[inline(always)]

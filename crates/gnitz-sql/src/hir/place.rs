@@ -2,7 +2,7 @@
 //! place each conjunct as low as it is exact — in an input, in the join's keys, or
 //! in a `Filter` above the join.
 
-use super::{cross_comparison, side, HirCol, HirExpr, JoinClass, JoinPlan, JoinType, KeyPair, RelExpr, Side};
+use super::{HirCol, HirExpr, JoinClass, JoinPlan, JoinType, KeyPair, RelExpr, Side, cross_comparison, side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
 use crate::rules::{reject_arity, reject_float_keys};

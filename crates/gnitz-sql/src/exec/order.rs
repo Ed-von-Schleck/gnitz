@@ -2,7 +2,7 @@
 //! pass over the result the client holds.
 
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{order_locators, RowRanking, WeightSlots};
+use gnitz_expr::{RowRanking, WeightSlots, order_locators};
 
 /// The OFFSET / LIMIT slice of a result, cut exactly by the client after any worker's
 /// superset cut. `limit: None` is unbounded.

@@ -2,10 +2,10 @@
 //! a region at a time.
 
 use super::batch::MemBatch;
-use super::string_heap::{rebase_string_cells, relocated_cell, BlobCache, StringDest};
+use super::string_heap::{BlobCache, StringDest, rebase_string_cells, relocated_cell};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource};
 use std::ops::Range;
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed

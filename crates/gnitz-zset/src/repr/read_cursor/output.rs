@@ -4,10 +4,10 @@ use std::ops::{ControlFlow, Range};
 use std::rc::Rc;
 
 use super::super::run::Run;
-use super::{hydrate_skeletons, ReadCursor, SkeletonKeys};
+use super::{ReadCursor, SkeletonKeys, hydrate_skeletons};
 use crate::repr::batch::Batch;
 use crate::repr::merge;
-use crate::repr::scatter::{with_picks, ColumnarSource, Pick, UnifiedSet};
+use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet, with_picks};
 use crate::schema::with_payload_cmp;
 use gnitz_expr::RowFilter;
 use gnitz_wire::{PkKeys, RowSource};

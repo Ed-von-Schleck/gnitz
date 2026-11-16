@@ -39,7 +39,7 @@ pub use ddl::render::{
 };
 pub use dialect::GnitzDialect;
 pub use error::GnitzSqlError;
-pub use literal::{parse_bool, place_scaled, Placed};
+pub use literal::{Placed, parse_bool, place_scaled};
 pub use names::{
     column_text, parse_identifier, parse_relation_name, parse_schema_name, relation_name, relation_text,
     table_factor_name,

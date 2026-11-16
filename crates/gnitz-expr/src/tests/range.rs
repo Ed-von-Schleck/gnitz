@@ -1,10 +1,10 @@
 //! Range membership over key images, driven through [`TestView`].
 
-use crate::test_support::{assert_windows_match_whole, filter_verdicts, schema_pk, TestView, PATTERNS};
 use crate::SchemaColumn;
 use crate::SchemaDescriptor;
+use crate::test_support::{PATTERNS, TestView, assert_windows_match_whole, filter_verdicts, schema_pk};
 use crate::{ExprValidateErr, RowFilter};
-use gnitz_wire::{image_mask, key_image, KeyRange, PkColList, TypeCode};
+use gnitz_wire::{KeyRange, PkColList, TypeCode, image_mask, key_image};
 
 /// A walk pinning one column and bounding the next admits exactly the rows
 /// within its bounds, every image masked to its column's width — over every key

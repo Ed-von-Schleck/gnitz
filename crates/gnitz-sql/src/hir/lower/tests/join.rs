@@ -1,10 +1,10 @@
 use super::*;
 use crate::hir::{ColIdGen, KeyPair};
 use crate::test_support::{col, schema};
-use gnitz_wire::RangeRel;
-use std::sync::Arc;
 use JoinType::{Anti, Full, Inner, Left, Mark, Right, Semi};
 use Shape::{Band, Cross, Equi, PureRange};
+use gnitz_wire::RangeRel;
+use std::sync::Arc;
 
 /// Four `U64` columns keyed on the slots `pk`, their ids minted from `ids`.
 fn frame(ids: &ColIdGen, names: [&str; 4], pk: &[u32]) -> Frame {

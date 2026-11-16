@@ -475,11 +475,13 @@ fn test_fk_index_metadata_queries() {
     // Create an explicit index
     let _iid = engine.create_index("public.parent", &["val"], false).unwrap();
 
-    assert!(!engine
-        .registry
-        .relation(tid)
-        .map_or(&[][..], Relation::indexes)
-        .is_empty());
+    assert!(
+        !engine
+            .registry
+            .relation(tid)
+            .map_or(&[][..], Relation::indexes)
+            .is_empty()
+    );
     let ic_cols = engine.registry.relation(tid).map_or(&[][..], Relation::indexes)[0].cols();
     assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 

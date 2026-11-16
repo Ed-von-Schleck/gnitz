@@ -33,12 +33,13 @@ pub(crate) fn with_routed<R>(
         return f(Routed::Same(batch.wire_whole()));
     }
     // One row has one owner, named by the placement's point query: no list is built.
-    if batch.len() == 1 && !batch.has_ghost() {
-        if let Some(owner) = placement.owner(batch.get_pk_bytes(0), num_workers) {
-            let mut each = [None; MAX_WORKERS];
-            each[owner] = batch.wire_whole();
-            return f(Routed::Each(&each[..num_workers]));
-        }
+    if batch.len() == 1
+        && !batch.has_ghost()
+        && let Some(owner) = placement.owner(batch.get_pk_bytes(0), num_workers)
+    {
+        let mut each = [None; MAX_WORKERS];
+        each[owner] = batch.wire_whole();
+        return f(Routed::Each(&each[..num_workers]));
     }
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();

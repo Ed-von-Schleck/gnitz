@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::io::Write;
 
-use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
+use gnitz_foundation::perf::{Counter, voluntary_ctx_switches};
 
 use super::super::test_support::*;
 use super::*;
@@ -18,7 +18,7 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
     r.spawn(async move {
         loop {
             park().await;
-            p.set(p.get() + 1);
+            p.update(|v| v + 1);
         }
     });
     r.tick(); // the first poll parks the task
@@ -83,7 +83,7 @@ fn reactor_pass_bench() {
         let awaited = Rc::new(Cell::new(0));
         let (r2, next) = (r.clone(), Rc::clone(&awaited));
         let acks = async move || {
-            next.set(next.get() + 1);
+            next.update(|v| v + 1);
             r2.applied_through(next.get()).acks().await;
         };
         arm(&format!("acks nw={nw}"), r, acks, || {

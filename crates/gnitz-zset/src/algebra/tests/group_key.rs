@@ -119,7 +119,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 .iter()
                 .map(|&g| out_pk(groups.first[g as usize] as usize))
                 .collect();
-            prop_assert!(pks.windows(2).all(|w| w[0] < w[1]), "{:?}: groups out of order", cols);
+            prop_assert!(pks.is_sorted_by(|a, b| a < b), "{:?}: groups out of order", cols);
 
             if in_runs {
                 prop_assert_eq!(runs.len(), groups.len(), "{:?}", cols);
@@ -226,7 +226,7 @@ fn sorted_groups_of_a_long_batch_follow_its_pk() {
 /// hashed and the sorted numbering are taken, by group count.
 #[test]
 fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
-    use TypeCode::{I32, I64, U128, U16, U32, U64};
+    use TypeCode::{I32, I64, U16, U32, U64, U128};
     let c = SchemaColumn::new;
     // `[U32 pk0, I32 pk1, U64 v NULL, U128 w, U16 n NULL, I64 s]`, PK `(pk0, pk1)`.
     let schema = SchemaDescriptor::new(

@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::sys_schema;
-use gnitz_wire::{WireStatus, TABLE_TAB};
+use gnitz_wire::{TABLE_TAB, WireStatus};
 
 #[test]
 fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {

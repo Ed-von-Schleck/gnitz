@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use super::*;
 use gnitz_store::relation::{Cut, Relation, RelationRegistry};
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::{empty_cursor, from_runs, Batch, PkSetGather, ReadCursor, Run, StorageError};
+use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, Run, StorageError, empty_cursor, from_runs};
 use gnitz_zset::{algebra, stream};
 use smallvec::SmallVec;
 
@@ -45,7 +45,7 @@ impl Stores<'_> {
     }
 
     /// The opener of `store`, as a kernel takes it.
-    fn open<'s>(&'s self, store: Trace<'s>) -> impl FnMut(&[u8], &[u8]) -> ReadCursor + 's {
+    fn open<'s>(&'s self, store: Trace<'s>) -> impl FnMut(&[u8], &[u8]) -> ReadCursor {
         move |first: &[u8], last: &[u8]| match store {
             Trace::Child(idx) => self.own.cursor_between(idx, first, last),
             Trace::Relation(relation) => relation.cursor_between(first, last, Cut::Sealed),

@@ -24,7 +24,7 @@ fn materialize_carrying_charges_each_sources_dropped_rows() {
     let out = materialize_carrying(&sources, &schema, &rows);
     assert_eq!(out.dead_heap(), 30 + 50);
     assert_eq!(out.blob().len(), a.blob().len() + b.blob().len());
-    let want: Vec<Vec<u8>> = (0..14).map(|i| vec![[b'a', b'b'][i % 2]; 40]).collect();
+    let want: Vec<Vec<u8>> = (0..14).map(|i| vec![b"ab"[i % 2]; 40]).collect();
     assert_eq!(read_strings(&out), want);
 }
 
@@ -90,7 +90,7 @@ fn gather_rows_reads_every_backing_alike() {
     use crate::repr::{BatchBuilder, MappedShard, Run};
     use crate::schema::SchemaColumn;
     use crate::test_support::{map_shard, u64_pk_schema, weighted_rows};
-    use gnitz_wire::{TypeCode, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK};
+    use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, TypeCode};
     use std::rc::Rc;
     // Five sources hoist ten fixed-region pointers, past the inline table's eight.
     const SOURCES: usize = 5;
@@ -156,12 +156,15 @@ fn gather_rows_reads_every_backing_alike() {
         mixed[1] = mem[1].clone();
         // What each set reads in place.
         let (pk, nulls, p0, p2) = (REG_PK, REG_NULL_BMP, REG_PAYLOAD_START, REG_PAYLOAD_START + 2);
-        assert!(mem
-            .iter()
-            .all(|m| m.in_place(pk).is_some() && m.in_place(nulls).is_some() && m.in_place(p0).is_some()));
-        assert!(windows
-            .iter()
-            .all(|w| w.in_place(pk).is_some() && w.in_place(nulls).is_some() && w.in_place(p2).is_some()));
+        assert!(
+            mem.iter()
+                .all(|m| m.in_place(pk).is_some() && m.in_place(nulls).is_some() && m.in_place(p0).is_some())
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|w| w.in_place(pk).is_some() && w.in_place(nulls).is_some() && w.in_place(p2).is_some())
+        );
         assert!(windows.iter().all(|w| w.in_place(p0).is_some() == spread));
         // A column the file predates is padded NULL, its fixed regions still
         // read in place.
@@ -188,9 +191,9 @@ fn gather_rows_reads_every_backing_alike() {
 /// call's picks.
 #[test]
 fn pick_scratch_interleaves_across_kernels() {
-    use crate::repr::{from_runs, PkSetGather, Run};
-    use crate::stream::{op_weight_clamp, History};
-    use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, weighted_rows, TestTrace};
+    use crate::repr::{PkSetGather, Run, from_runs};
+    use crate::stream::{History, op_weight_clamp};
+    use crate::test_support::{TestTrace, make_batch, make_batch_raw, make_schema_u64_i64, weighted_rows};
     use gnitz_wire::ClampKind::Distinct;
     use gnitz_wire::PkKeys;
     use std::borrow::Cow;

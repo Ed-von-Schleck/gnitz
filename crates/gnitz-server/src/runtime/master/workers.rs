@@ -4,7 +4,7 @@
 //! is what [`Workers::death`] reports.
 
 use std::fmt;
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::num::NonZero;
 use std::task::Poll;
 

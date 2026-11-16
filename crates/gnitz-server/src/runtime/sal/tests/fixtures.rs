@@ -8,12 +8,12 @@
 //! the damage every SAL test builds on are here.
 
 use super::*;
+use crate::runtime::ServerExit;
 use crate::runtime::sal::format::RequestHead;
 use crate::runtime::sal::log::SalMessage;
 use crate::runtime::sal::reader::SalReader;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::fixtures::id;
-use crate::runtime::ServerExit;
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_zset::schema::encode_schema_block;
 use std::fs::File;

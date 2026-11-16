@@ -7,10 +7,10 @@ use std::task::Poll;
 
 use pyo3::prelude::*;
 
-use gnitz_core::{block_on, BlockingHost, ClientError, GnitzClient, Sent};
+use gnitz_core::{BlockingHost, ClientError, GnitzClient, Sent, block_on};
 use gnitz_sql::GnitzSqlError;
 
-use crate::client::{resolve_target, Convert, Mode, PyClient, VerbOp};
+use crate::client::{Convert, Mode, PyClient, VerbOp, resolve_target};
 use crate::{client_err, gnitz_err, lock, sql_err};
 
 /// A client driven on the calling thread.
@@ -166,11 +166,13 @@ fn land(py: Python<'_>, client: &Py<PyClient>, slot: &Mutex<Reply>) -> PyResult<
     let reply = match arrived(slot) {
         Poll::Ready(reply) => reply,
         Poll::Pending => client.get().blocking(|blocking| {
-            blocking.call(py, async |c| loop {
-                if let Poll::Ready(reply) = arrived(slot) {
-                    break Ok::<_, ClientError>(reply);
+            blocking.call(py, async |c| {
+                loop {
+                    if let Poll::Ready(reply) = arrived(slot) {
+                        break Ok::<_, ClientError>(reply);
+                    }
+                    c.turn().await?;
                 }
-                c.turn().await?;
             })
         })?,
     };

@@ -7,7 +7,7 @@ use super::batch::MemBatch;
 use super::merge;
 use super::pool::PooledBuf;
 use super::scatter::{copy_ranges, scatter_copy};
-use super::string_heap::{blob_span_key, walk_heap_spans, BlobCache};
+use super::string_heap::{BlobCache, blob_span_key, walk_heap_spans};
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::ColumnLocator;
@@ -91,7 +91,10 @@ impl<'a> MemBatch<'a> {
         if start == self.len() {
             return None;
         }
-        if let Some(whole) = self.wire_whole().filter(|w| start == 0 && w.byte_size() <= budget) {
+        if start == 0
+            && let Some(whole) = self.wire_whole()
+            && whole.byte_size() <= budget
+        {
             return Some(whole);
         }
         let (rows, heap) = match self.heap_referencing_slots() {
@@ -267,10 +270,10 @@ impl<'a> MemBatch<'a> {
             return None;
         }
         // Every row, ascending, is the batch itself: framed whole, heap as it is.
-        if indices.len() == self.len() {
-            if let Some(whole) = self.wire_whole().filter(|w| w.byte_size() <= out.len()) {
-                return Some((self.len(), whole.encode(out)));
-            }
+        if indices.len() == self.len()
+            && let Some(whole) = self.wire_whole().filter(|w| w.byte_size() <= out.len())
+        {
+            return Some((self.len(), whole.encode(out)));
         }
         let slots = self.heap_referencing_slots();
         // A heap-free block fits by width alone, and the sizing pass is skipped

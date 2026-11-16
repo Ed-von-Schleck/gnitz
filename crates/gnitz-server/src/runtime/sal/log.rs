@@ -9,8 +9,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::format::{
-    anchor_word, dir_sizes, directory, group_total_size, header_len, payload_rows, payload_spans, word_epoch,
-    GroupHead, Header, HDR_PREFIX, PREFIX_BYTES,
+    GroupHead, HDR_PREFIX, Header, PREFIX_BYTES, anchor_word, dir_sizes, directory, group_total_size, header_len,
+    payload_rows, payload_spans, word_epoch,
 };
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
@@ -55,7 +55,8 @@ fn sal_mmap_size() -> usize {
 /// `group_total_size` keeps a multiple of it.
 #[inline]
 unsafe fn word_atomic<'a>(sal_ptr: *const u8, offset: usize) -> &'a AtomicU64 {
-    AtomicU64::from_ptr(sal_ptr.add(offset).cast_mut().cast())
+    // SAFETY: the caller's contract above — in bounds and aligned.
+    unsafe { AtomicU64::from_ptr(sal_ptr.add(offset).cast_mut().cast()) }
 }
 
 /// One SAL group as a reader sees it: the header verified at its own offset,
@@ -225,7 +226,8 @@ impl SalLog {
     #[inline]
     pub(super) unsafe fn span_mut(&self, off: usize, len: usize) -> &mut [u8] {
         debug_assert!(off.checked_add(len).is_some_and(|end| end <= self.ring_len));
-        std::slice::from_raw_parts_mut(self.ring.add(off), len)
+        // SAFETY: the caller's contract above — in the ring and unaliased.
+        unsafe { std::slice::from_raw_parts_mut(self.ring.add(off), len) }
     }
 
     /// The header of the group laid out at `base`, sized by its own payload
@@ -238,8 +240,12 @@ impl SalLog {
     #[inline]
     pub(super) unsafe fn header_mut(&self, base: u64) -> &mut [u8] {
         let at = base as usize + PREFIX_BYTES;
-        let fixed = self.span_mut(at, HDR_PREFIX).first_chunk().expect("HDR_PREFIX bytes");
-        self.span_mut(at, header_len(fixed))
+        // SAFETY: the caller's contract above: the header at `base` is laid out
+        // and unaliased, and its fixed prefix sizes the whole of it.
+        let fixed = unsafe { self.span_mut(at, HDR_PREFIX) }
+            .first_chunk()
+            .expect("HDR_PREFIX bytes");
+        unsafe { self.span_mut(at, header_len(fixed)) }
     }
 
     pub(super) fn anchor_atomic(&self) -> &'static AtomicU64 {
@@ -283,7 +289,8 @@ impl SalLog {
     #[inline]
     pub(super) unsafe fn set_prefix_word(&self, base: u64, word: u64) {
         debug_assert!(base as usize + PREFIX_BYTES <= self.ring_len);
-        word_atomic(self.ring, base as usize).store(word, Ordering::Release);
+        // SAFETY: the caller's contract above — `base` is an in-ring group base.
+        unsafe { word_atomic(self.ring, base as usize) }.store(word, Ordering::Release);
     }
 
     /// Whether a group of `epoch` is published at `base`: its prefix word is

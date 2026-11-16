@@ -31,7 +31,7 @@ use gnitz_zset_testkit::{assert_child_ok, run_test_in_child};
 use std::time::Duration;
 use support::common::{block_copy, has_copy, has_manifest, manifest_inode, unblock_copy};
 use support::{
-    agreement, assert_advanced, canonical, canonical_rows, cost, differential, poll, query, sql, Answer, Reply,
+    Answer, Reply, agreement, assert_advanced, canonical, canonical_rows, cost, differential, poll, query, sql,
 };
 
 /// `schema.name`.
@@ -986,8 +986,8 @@ fn a_round_of_another_view_moves_no_cursor() {
 /// answered in the order they were sent, outside the order of replies.
 #[test]
 fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
-    use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
-    use gnitz_wire::{append_frame, ControlHeader};
+    use gnitz_wire::txn_frame::{DeltaPollItem, encode_delta_poll};
+    use gnitz_wire::{ControlHeader, append_frame};
     use std::io::{Read, Write};
 
     let mut fx = Fixture::start();
@@ -1193,10 +1193,12 @@ fn a_sync_hands_a_reader_the_deltas_pushed_for_it() {
     // Ended, the subscription is no entry of a sync, and its cursor continues.
     fx.direct.unsubscribe(sub);
     churn(&mut fx.direct, 900, 910);
-    assert!(block_on(fx.direct.sync(Duration::ZERO))
-        .expect("sync")
-        .pushed
-        .is_empty());
+    assert!(
+        block_on(fx.direct.sync(Duration::ZERO))
+            .expect("sync")
+            .pushed
+            .is_empty()
+    );
     let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
     let polled = block_on(fx.direct.delta_read(&*desc, Some(reader.cursor), &desc.schema, &whole)).expect("poll");
     assert!(reader.apply(polled) > 0);

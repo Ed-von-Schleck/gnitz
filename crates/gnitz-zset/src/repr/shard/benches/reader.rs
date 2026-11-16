@@ -1,14 +1,14 @@
 use super::super::file::ShardWriteOpts;
 use super::tests::{build, wide_string};
 use super::*;
+use crate::repr::Batch;
 use crate::repr::codebook::Codebook;
 use crate::repr::scatter::{Pick, UnifiedSet};
 use crate::repr::string_heap::{carried_dead, long_bytes_outside};
-use crate::repr::Batch;
-use crate::schema::{probe_key, SchemaColumn};
+use crate::schema::{SchemaColumn, probe_key};
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
-    weighted_rows, Rng,
+    Rng, make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
+    weighted_rows,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::TypeCode;

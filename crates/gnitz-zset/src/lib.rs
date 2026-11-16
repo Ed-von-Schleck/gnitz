@@ -34,6 +34,10 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+// This crate publishes an API to the store and the server above it, so an
+// over-wide `pub` inside a private module is an error (`warnings = "deny"`).
+#![warn(unreachable_pub)]
+
 // Crate-wide scope for `gnitz_warn!` and its siblings; a plain `use` would
 // reach this module only.
 #[macro_use]

@@ -7,7 +7,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use crate::literal::assign;
-use gnitz_wire::{push_zero_cell, ColumnDef, TypeCode};
+use gnitz_wire::{ColumnDef, TypeCode, push_zero_cell};
 
 /// Append one written literal to column region `col`, spilling a string into
 /// `blob`. Dispatch is on the *column type*, never on the literal: `5` into a

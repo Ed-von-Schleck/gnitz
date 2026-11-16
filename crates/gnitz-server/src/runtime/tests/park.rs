@@ -38,7 +38,7 @@ fn a_parked_worker_wakes_on_a_forked_masters_wake() {
         parks.park(0).park(|| parks.park(0).value() == 0);
         assert_eq!(parks.park(0).value(), 1, "the park ended on the wake");
     });
-    unsafe { assert_child_exited_ok(pid) };
+    assert_child_exited_ok(pid);
 }
 
 /// Membership, the launched-worker bound and position, at a small worker count and

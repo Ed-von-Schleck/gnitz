@@ -3,10 +3,10 @@
 
 use super::super::physical::Frame;
 use super::super::{HirCol, ProjEntry, RelExpr, SetOpKind};
-use super::spine::{open, Top};
-use super::{project_front, EmitPieces, ViewChain};
+use super::spine::{Top, open};
+use super::{EmitPieces, ViewChain, project_front};
 use crate::error::GnitzSqlError;
-use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, ReadBound, ReindexSlot, TypeCode, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{Circuit, ColumnDef, NARROW_PK_MAX_BYTES, NodeId, NullKeys, ReadBound, ReindexSlot, TypeCode};
 use std::rc::Rc;
 
 /// A leaf emitted into the circuit: its columns, its node, and the frame that

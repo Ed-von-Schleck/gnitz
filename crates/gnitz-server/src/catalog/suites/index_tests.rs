@@ -457,11 +457,13 @@ fn test_composite_index_drop_exact_list() {
     engine.create_index("public.t", &["a", "b"], false).unwrap();
 
     assert!(engine.registry.relation(tid).and_then(|r| r.index_on(&[1])).is_some());
-    assert!(engine
-        .registry
-        .relation(tid)
-        .and_then(|r| r.index_on(&[1, 2]))
-        .is_some());
+    assert!(
+        engine
+            .registry
+            .relation(tid)
+            .and_then(|r| r.index_on(&[1, 2]))
+            .is_some()
+    );
 
     // Drop the composite by its generated name (cols joined by '_').
     engine.drop_index("public__t__idx_a_b").unwrap();

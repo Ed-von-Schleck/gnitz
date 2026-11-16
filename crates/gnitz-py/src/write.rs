@@ -9,17 +9,17 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 use std::sync::Arc;
 
+use pyo3::Borrowed;
 use pyo3::ffi;
 use pyo3::impl_::extract_argument::argument_extraction_error;
 use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
-use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
-use gnitz_sql::{place_scaled, Placed};
-use gnitz_wire::{parse_decimal_text, ColType, ColumnDef, FixedInt, TypeCode, MAX_PK_COLUMNS};
+use gnitz_sql::{Placed, place_scaled};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, MAX_PK_COLUMNS, TypeCode, parse_decimal_text};
 
-use crate::read::{present, PyScanResult};
+use crate::read::{PyScanResult, present};
 use crate::schema::PySchema;
 
 /// The lookup keys `pks` as a `PkColumn` for `schema`: a single-column key is
@@ -194,10 +194,10 @@ enum PayloadSrc {
 /// compared in order — interned names settle on pointer identity, the text
 /// compare is the fallback for names that were not interned.
 fn plan_hits(py: Python<'_>, plan: &KwPlan, names: &[Bound<'_, PyAny>], tuple: Option<&Bound<'_, PyTuple>>) -> bool {
-    if let Some(t) = tuple {
-        if plan.kwnames.as_ptr() == t.as_ptr() {
-            return true;
-        }
+    if let Some(t) = tuple
+        && plan.kwnames.as_ptr() == t.as_ptr()
+    {
+        return true;
     }
     let mine = plan.kwnames.bind(py).as_slice();
     mine.len() == names.len()
@@ -415,7 +415,8 @@ unsafe fn append_fastcall(
             "ZSetBatch.append() takes no positional arguments (columns are keywords)",
         ));
     }
-    let slf = Borrowed::from_ptr(py, slf);
+    // SAFETY: CPython passes the bound receiver, live for the call.
+    let slf = unsafe { Borrowed::from_ptr(py, slf) };
     let batch = slf.cast::<PyZSetBatch>()?;
     let batch: &Bound<'_, PyZSetBatch> = &batch;
     // A Python exception, not a panic: a value whose `__index__` re-enters
@@ -428,7 +429,8 @@ unsafe fn append_fastcall(
         empty = PyTuple::empty(py);
         &empty
     } else {
-        kw = Borrowed::from_ptr(py, kwnames).cast::<PyTuple>()?;
+        // SAFETY: a non-null `kwnames` is the call's live keyword-name tuple.
+        kw = unsafe { Borrowed::from_ptr(py, kwnames) }.cast::<PyTuple>()?;
         &kw
     };
     // SAFETY: the fastcall convention above — `args` holds one value per name in
@@ -555,10 +557,10 @@ fn extract_uuid(val: &Bound<'_, PyAny>) -> PyResult<u128> {
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("invalid UUID string: {s:?}")));
     }
     // Last: `uuid.UUID` and friends, reached only once the cheap type tests fail.
-    if let Ok(attr) = val.getattr(pyo3::intern!(val.py(), "int")) {
-        if let Ok(n) = attr.extract::<u128>() {
-            return Ok(n);
-        }
+    if let Ok(attr) = val.getattr(pyo3::intern!(val.py(), "int"))
+        && let Ok(n) = attr.extract::<u128>()
+    {
+        return Ok(n);
     }
     Err(pyo3::exceptions::PyTypeError::new_err(
         "expected int, uuid.UUID object, or UUID string",
@@ -587,14 +589,14 @@ fn extract_days(item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<i32> {
         return item.extract::<i32>();
     };
     // A plain `date` is no `datetime`; only a subclass pays the subtype walk.
-    if !d.is_exact_instance_of::<PyDate>() {
-        if let Ok(t) = item.cast::<PyDateTime>() {
-            refuse_aware(t)?;
-            if inexact == Inexact::Refuse
-                && (t.get_hour(), t.get_minute(), t.get_second(), t.get_microsecond()) != (0, 0, 0, 0)
-            {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!("{item} is not a DATE")));
-            }
+    if !d.is_exact_instance_of::<PyDate>()
+        && let Ok(t) = item.cast::<PyDateTime>()
+    {
+        refuse_aware(t)?;
+        if inexact == Inexact::Refuse
+            && (t.get_hour(), t.get_minute(), t.get_second(), t.get_microsecond()) != (0, 0, 0, 0)
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!("{item} is not a DATE")));
         }
     }
     Ok(py_days(d) as i32)

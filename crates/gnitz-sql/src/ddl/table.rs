@@ -2,14 +2,14 @@
 //! and CREATE INDEX.
 
 use super::guard::{
-    fk_on_delete, read_column, reject_index_type_and_options, reject_unhonored_pk_fields,
-    reject_unhonored_unique_fields, ColumnConstraint, ColumnDecl, ColumnOptionSite,
+    ColumnConstraint, ColumnDecl, ColumnOptionSite, fk_on_delete, read_column, reject_index_type_and_options,
+    reject_unhonored_pk_fields, reject_unhonored_unique_fields,
 };
 use super::options::parse_table_options;
 use crate::catalog::Catalog;
-use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::names::{extract_index_name, extract_object_name};
-use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, require_column, ClassWant};
+use crate::rules::{ClassWant, canonical_user_name, reject_duplicate_names, require_class, require_column};
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
 use sqlparser::ast::{Expr, ForeignKeyConstraint, IndexColumn, ObjectType, TableConstraint, WrappedCollection};
@@ -199,7 +199,7 @@ fn index_column_ident<'a>(c: &'a IndexColumn, context: &str) -> Result<&'a str, 
         "an operator class on an index column",
     )?;
     reject_if(
-        c.column.options.asc.is_some() || c.column.options.nulls_first.is_some() || c.column.with_fill.is_some(),
+        c.column.options.sort.is_some() || c.column.options.nulls_first.is_some() || c.column.with_fill.is_some(),
         context,
         "per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL)",
     )?;
@@ -333,6 +333,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
             TableConstraint::FulltextOrSpatial(_) => return Err(unsupported_clause(CTX, "FULLTEXT/SPATIAL index")),
             TableConstraint::PrimaryKeyUsingIndex(_) => return Err(unsupported_clause(CTX, "PRIMARY KEY USING INDEX")),
             TableConstraint::UniqueUsingIndex(_) => return Err(unsupported_clause(CTX, "UNIQUE USING INDEX")),
+            TableConstraint::Exclude(_) => return Err(unsupported_clause(CTX, "EXCLUDE constraint")),
         }
     }
 
@@ -389,10 +390,10 @@ fn name_unique_indexes(
 ) -> Result<Vec<(PkColList, IndexName)>, GnitzSqlError> {
     let mut written: HashSet<&str> = HashSet::new();
     for u in &unique {
-        if let Some(name) = &u.name {
-            if !written.insert(name) {
-                return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{name}'")));
-            }
+        if let Some(name) = &u.name
+            && !written.insert(name)
+        {
+            return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{name}'")));
         }
     }
     unique
@@ -489,6 +490,7 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
         primary_key,
         partition_of,
         for_values,
+        multiset,
         // No gnitz-honorable semantics — storage/engine/vendor metadata accepted as no-ops.
         external: _,
         dynamic: _,
@@ -501,13 +503,17 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
         file_format: _,
         location: _,
         version: _,
-        without_rowid: _,
+        sqlite_table_options: _,
+        unlogged: _,
+        with_connection: _,
+        fallback: _,
+        // Read only by CTAS, rejected below.
+        with_data: _,
         comment: _,
         on_cluster: _,
         order_by: _,
         partition_by: _,
         clustered_by: _,
-        strict: _,
         copy_grants: _,
         enable_schema_evolution: _,
         change_tracking: _,
@@ -544,6 +550,7 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
     reject_if(on_commit.is_some(), CTX, "ON COMMIT")?;
     reject_if(primary_key.is_some(), CTX, "PRIMARY KEY expression")?;
     reject_if(partition_of.is_some() || for_values.is_some(), CTX, "PARTITION OF")?;
+    reject_if(multiset.is_some(), CTX, "MULTISET/SET table kind")?;
     Ok(())
 }
 
@@ -661,14 +668,14 @@ pub(crate) fn plan_create_table(
     drop_unique_covered_by_pk(&mut unique, cols, pk_indices)?;
     // A stream holds no rows to index. A UNIQUE the PK covers was dropped above,
     // so it is no more refused here than it is on a table.
-    if props.stream {
-        if let Some(u) = unique.first() {
-            let names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
-            return Err(GnitzSqlError::Rejected(format!(
-                "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
-                names.join(", ")
-            )));
-        }
+    if props.stream
+        && let Some(u) = unique.first()
+    {
+        let names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
+        return Err(GnitzSqlError::Rejected(format!(
+            "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
+            names.join(", ")
+        )));
     }
 
     let unique = name_unique_indexes(unique, cols, pk_indices.len(), &table_name)?;
@@ -776,7 +783,7 @@ impl IndexSite {
 
 /// Reject every `CreateIndex` field `execute_create_index` does not consume (`name`, `table_name`,
 /// `columns`, `unique`). `using` is accepted only for the BTree default (gnitz's index is ordered /
-/// range-scannable); any other type, plus `predicate` (partial index → full index), `concurrently`
+/// range-scannable); any other type, plus `predicate` (partial index → full index), `concurrently`/`async`
 /// (no non-blocking-build guarantee), `include`/`nulls_distinct`/`with` (silent default semantics)
 /// are rejected. `if_not_exists` is consumed by `execute_create_index`.
 fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Result<(), GnitzSqlError> {
@@ -789,6 +796,7 @@ fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Re
         if_not_exists: _, // consumed by `execute_create_index`
         using,
         concurrently,
+        r#async,
         include,
         nulls_distinct,
         with,
@@ -798,9 +806,9 @@ fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Re
     } = ci;
     reject_if(predicate.is_some(), CTX, "WHERE (partial index)")?;
     reject_if(!alter_options.is_empty(), CTX, "ALTER options (ALGORITHM / LOCK)")?;
-    reject_index_type_and_options(using, index_options, CTX)?;
+    reject_index_type_and_options(using, index_options, include, CTX)?;
     reject_if(*concurrently, CTX, "CONCURRENTLY")?;
-    reject_if(!include.is_empty(), CTX, "INCLUDE (covering columns)")?;
+    reject_if(*r#async, CTX, "ASYNC")?;
     reject_if(nulls_distinct.is_some(), CTX, "NULLS [NOT] DISTINCT")?;
     reject_if(!with.is_empty(), CTX, "WITH (storage parameters)")?;
     Ok(())
@@ -822,12 +830,11 @@ pub(crate) async fn execute_create_index(
     // statement before the owner or the column list is resolved. Index
     // names are global, so the index may stand on any relation. sqlparser
     // requires a name under the clause.
-    if ci.if_not_exists {
-        if let Some(name) = &explicit_name {
-            if client.index_rows().await?.iter().any(|r| &r.name == name) {
-                return Ok(());
-            }
-        }
+    if ci.if_not_exists
+        && let Some(name) = &explicit_name
+        && client.index_rows().await?.iter().any(|r| &r.name == name)
+    {
+        return Ok(());
     }
     // The one resolve on this path: `create_index_core` takes the descriptor.
     let target = client.resolve_relation(&owner_name).await?;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch, make_schema_u64_i64, make_string_batch, TestTrace};
+use crate::test_support::{TestTrace, make_batch, make_schema_u64_i64, make_string_batch};
 use gnitz_wire::ClampKind::Distinct;
 
 /// Instructions per delta row of `op_weight_clamp` per shape, opening its cursor

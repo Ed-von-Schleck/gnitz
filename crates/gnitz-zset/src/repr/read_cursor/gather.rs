@@ -9,7 +9,7 @@
 use gnitz_wire::PkKeys;
 use std::ops::ControlFlow;
 
-use super::{hydrate_skeletons, ReadCursor, SkeletonKeys};
+use super::{ReadCursor, SkeletonKeys, hydrate_skeletons};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::{gather_rows, with_picks};
 use crate::schema::SchemaDescriptor;

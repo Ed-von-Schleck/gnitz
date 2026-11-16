@@ -122,6 +122,23 @@ impl Dialect for GnitzDialect {
         supports_cte_without_as,
         supports_select_item_multi_column_alias,
         supports_xml_expressions,
+        supports_map_typedef_with_parentheses,
+        supports_literal_prefix_in_qualified_name,
+        supports_sql_option_without_value,
+        supports_exclude_constraint,
+        supports_singular_value_keyword,
+        supports_comma_join_constraint,
+        supports_tilde_like_match_operator,
+        supports_aggregate_order_by_with_empty_args,
+        supports_in_table_expression,
+        supports_comparison_in_between_low_bound,
+        supports_copy_from_stdin_data,
+        supports_data_type_zerofill_suffix,
+        supports_table_partitions,
+        supports_table_inheritance_markers,
+        supports_aliased_function_args,
+        supports_alter_column_position,
+        supports_add_column_if_not_exists,
     );
 }
 

@@ -188,11 +188,7 @@ impl Reactor {
         // SAFETY: the SQE writes the boxed siginfo, which is the op's carry and
         // so stays allocated until the CQE.
         let (res, info) = unsafe { self.push_op(sqe, info) }.await;
-        if res < 0 {
-            Err(res)
-        } else {
-            Ok(*info)
-        }
+        if res < 0 { Err(res) } else { Ok(*info) }
     }
 
     /// Read up to `buf.len()` bytes of `fd` into `buf`. Yields the CQE `res`,

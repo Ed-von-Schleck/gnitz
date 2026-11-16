@@ -2,8 +2,8 @@
 //! the copy's rows.
 
 use gnitz_core::{DeltaCursor, RelDescriptor, RelName};
-use gnitz_wire::{decode_all, PkColList, Writer, MAX_LIST_LEN};
-use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
+use gnitz_wire::{MAX_LIST_LEN, PkColList, Writer, decode_all};
+use gnitz_zset::schema::{SchemaDescriptor, decode_schema_block};
 
 /// What one copy's registration fixed, and where its feed got to.
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +64,7 @@ impl MirrorRecord {
             let pk_repeats = r.bool()?;
             let indexes: Vec<PkColList> = r.list("index list", MAX_LIST_LEN)?;
             // Canonical, so a record holds no index twice.
-            if !indexes.windows(2).all(|w| w[0] < w[1]) {
+            if !indexes.is_sorted_by(|a, b| a < b) {
                 return Err("index column lists out of order".into());
             }
             Ok(MirrorRecord { feed, name, block, pk_repeats, indexes })

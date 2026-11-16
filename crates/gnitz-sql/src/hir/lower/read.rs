@@ -4,9 +4,9 @@
 //! flat query binds to, which the rows reply and [`super::fold`] then lower.
 
 use super::super::physical::{self, Frame};
-use super::super::{hircol_of, reduce_reads, AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
-use super::fold::{distinct_fold, fold, FoldPieces};
-use crate::error::{derivation, GnitzSqlError};
+use super::super::{AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr, hircol_of, reduce_reads};
+use super::fold::{FoldPieces, distinct_fold, fold};
+use crate::error::{GnitzSqlError, derivation};
 use crate::ir::{BExpr, BoundExpr};
 use crate::project::payload_program;
 use crate::tail::wire_keys;

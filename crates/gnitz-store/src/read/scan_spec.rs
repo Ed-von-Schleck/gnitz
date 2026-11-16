@@ -5,7 +5,7 @@ use gnitz_wire::{PkKeys, ReadSink, ReadSpec, SinkKind};
 
 use std::borrow::Cow;
 
-use super::{check_layout, ReadRows};
+use super::{ReadRows, check_layout};
 use crate::relation::RelationRegistry;
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_zset::algebra::SinkPlan;

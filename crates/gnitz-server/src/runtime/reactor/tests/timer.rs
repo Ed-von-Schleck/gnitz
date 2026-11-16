@@ -37,7 +37,7 @@ fn timers_sharing_a_deadline_each_fire() {
             let (sleep, fired) = (r.sleep(Duration::from_millis(5)), Rc::clone(&fired));
             r.spawn(async move {
                 sleep.await;
-                fired.set(fired.get() + 1);
+                fired.update(|v| v + 1);
             });
         }
         r.block_on(r.sleep(Duration::from_millis(10)));

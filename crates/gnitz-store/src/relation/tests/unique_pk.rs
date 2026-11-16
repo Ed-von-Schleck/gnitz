@@ -1,4 +1,4 @@
-use super::{enforce_unique_pk, under_pk_rule, PkRule};
+use super::{PkRule, enforce_unique_pk, under_pk_rule};
 use crate::storage::flush_barrier;
 use crate::test_support::{
     make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,

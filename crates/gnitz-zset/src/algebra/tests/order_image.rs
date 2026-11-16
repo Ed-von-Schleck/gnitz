@@ -1,10 +1,10 @@
 //! Order-image tests: the byte string whose plain lexicographic order is the
 //! column's typed order, and its inverse.
 
-use super::{scalar_native_of_image, wide_native, wide_native_of_image, ImageCol, ImageKind};
+use super::{ImageCol, ImageKind, scalar_native_of_image, wide_native, wide_native_of_image};
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{le_cell, STRS};
+use crate::test_support::{STRS, le_cell};
 use gnitz_wire::TypeCode;
 
 /// Over a PK and a payload column of every image kind: a row's image decodes
@@ -16,7 +16,7 @@ use gnitz_wire::TypeCode;
 /// than a slot: the cases prefix-freeness exists for.
 #[test]
 fn an_image_orders_round_trips_and_slots_as_its_value() {
-    use TypeCode::{String, F32, I128, I64, U128, U64};
+    use TypeCode::{F32, I64, I128, String, U64, U128};
     const INTS: [i128; 6] = [i128::MIN, -1, 0, 1, i128::MAX, u64::MAX as i128 + 1];
     let c = |tc| SchemaColumn::new(tc, false);
     let schema = SchemaDescriptor::new(&[c(U64), c(I128), c(I128), c(U128), c(I64), c(F32), c(String)], &[0, 1]);
@@ -103,7 +103,7 @@ fn an_image_orders_round_trips_and_slots_as_its_value() {
 /// nothing.
 #[test]
 fn write_slots_matches_write_slot_per_row() {
-    use TypeCode::{String, F32, F64, I16, I32, I64, U128, U64, U8};
+    use TypeCode::{F32, F64, I16, I32, I64, String, U8, U64, U128};
     let c = |tc| SchemaColumn::new(tc, false);
     let schema = SchemaDescriptor::new(
         &[

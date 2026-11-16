@@ -3,7 +3,7 @@
 //! a kept descriptor out once another client's DDL has made it stale.
 
 use super::*;
-use gnitz_core::{block_on, BlockingHost, Host, Interest, Job};
+use gnitz_core::{BlockingHost, Host, Interest, Job, block_on};
 use gnitz_wire::{RelClass, WireStatus::NotFound};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};

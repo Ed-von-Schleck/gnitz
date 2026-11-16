@@ -1,7 +1,7 @@
 use gnitz_store::relation::PkRule;
 
-use super::super::fixtures::test_dispatcher;
 use super::super::MasterDispatcher;
+use super::super::fixtures::test_dispatcher;
 use crate::catalog::{CatalogEngine, DdlBundle};
 use crate::runtime::reactor::test_support::reactor_with_rings;
 use crate::runtime::sal::fixtures::test_log;
@@ -430,7 +430,7 @@ fn an_ephemeral_round_calls_for_no_other_checkpoint() {
 fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     let (_tmp, engine) = empty_catalog(1);
     let (disp, _) = test_dispatcher(0, engine);
-    let gen = disp.cat().durable_generation();
+    let generation = disp.cat().durable_generation();
     let checkpoint = |disp: &MasterDispatcher| {
         let epoch = disp.sal().epoch();
         disp.reactor()
@@ -448,7 +448,7 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
         disp.cat().durable_generation()
     };
 
-    assert_eq!(checkpoint(&disp), gen, "no push since the last base round");
+    assert_eq!(checkpoint(&disp), generation, "no push since the last base round");
     {
         let mut excl = disp.sal().excl();
         let mut scope = excl.begin();
@@ -456,8 +456,12 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
         scope.push(1, PkRule::Enforce, &[], Routed::Same(None), true).unwrap();
         assert!(scope.commit().is_some(), "the push is a zone member");
     }
-    assert_eq!(checkpoint(&disp), gen + 1);
-    assert_eq!(checkpoint(&disp), gen + 1, "the base round took the push with it");
+    assert_eq!(checkpoint(&disp), generation + 1);
+    assert_eq!(
+        checkpoint(&disp),
+        generation + 1,
+        "the base round took the push with it"
+    );
 
     disp.into_catalog().close();
 }

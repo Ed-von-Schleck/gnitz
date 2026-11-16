@@ -13,8 +13,8 @@
 //! `debug-assertions` override on this crate arms or disarms every seam,
 //! wherever it is declared.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Seam {
     var: &'static str,

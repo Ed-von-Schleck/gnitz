@@ -1,8 +1,8 @@
 //! The client batch: a Z-set in the canonical region order, its builders, and
 //! its WAL-block encode and decode.
 
-use gnitz_wire::{as_le_bytes, PkKeys, Regions, TypeCode};
 use gnitz_wire::{FIXED_REGION_BYTES, MAX_PK_COLUMNS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use gnitz_wire::{PkKeys, Regions, TypeCode, as_le_bytes};
 
 use crate::{ProtocolError, Schema};
 
@@ -295,7 +295,7 @@ impl ZSetBatch {
     /// Indices of the live rows — those with positive weight. A `ZSetBatch`
     /// row with weight ≤ 0 is a retraction/ghost, not a present element, so a
     /// catalog scan over a batch iterates only its live rows.
-    pub(crate) fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn live_rows(&self) -> impl Iterator<Item = usize> {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 

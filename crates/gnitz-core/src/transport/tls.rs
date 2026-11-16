@@ -14,7 +14,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
-use super::{timed_out, write_nonblocking, ClientTransport, Inner};
+use super::{ClientTransport, Inner, timed_out, write_nonblocking};
 use crate::ProtocolError;
 
 /// Parsed `HOST:PORT[?QUERY]` (the part after the `tls://` prefix).
@@ -51,7 +51,7 @@ fn parse_target(rest: &str) -> io::Result<Target> {
             _ => {
                 return Err(bad_target(format!(
                     "param {elem:?} not recognised (expected `ca=`, `cert=`, `key=` or `token_file=`)"
-                )))
+                )));
             }
         };
         if path.is_empty() {

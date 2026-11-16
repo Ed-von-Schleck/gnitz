@@ -140,10 +140,10 @@ impl<'c> WorkerProcess<'c> {
                     gnitz_fatal_abort!("{ingest:?} inside an exchange wait — diverged from the master");
                 }
                 // A group without a data block carries an empty delta.
-                if let Some(rows) = rows {
-                    if let Err(e) = self.ingest(ingest, rows) {
-                        gnitz_fatal_abort!("worker: {ingest:?} failed: {e} — aborting for restart");
-                    }
+                if let Some(rows) = rows
+                    && let Err(e) = self.ingest(ingest, rows)
+                {
+                    gnitz_fatal_abort!("worker: {ingest:?} failed: {e} — aborting for restart");
                 }
                 true
             }

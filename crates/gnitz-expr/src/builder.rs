@@ -5,7 +5,7 @@
 use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::map::EmitStore;
-use crate::{CalendarOp, ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Reg, Sink, MAX_REGS};
+use crate::{CalendarOp, ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, MAX_REGS, Reg, Sink};
 
 /// Accumulates the instructions and constants of one expression program.
 #[derive(Default)]
@@ -38,7 +38,7 @@ impl ExprBuilder {
             // `get`, not an index: an out-of-range operand is `build`'s to reject.
             LogicalInstr::IntToFloat { a } => match self.instrs.get(a.0 as usize) {
                 Some(&LogicalInstr::LoadConst { val, unsigned }) => {
-                    return self.const_f64(if unsigned { val as u64 as f64 } else { val as f64 })
+                    return self.const_f64(if unsigned { val as u64 as f64 } else { val as f64 });
                 }
                 _ => instr,
             },
@@ -61,14 +61,14 @@ impl ExprBuilder {
             LogicalInstr::IntCast { a, fi }
                 if self.instrs.get(a.0 as usize).and_then(LogicalInstr::range_check) == Some(fi) =>
             {
-                return a
+                return a;
             }
             _ => instr,
         };
-        if self.within_reg_cap() {
-            if let Some(i) = self.instrs.iter().position(|e| *e == instr) {
-                return Reg(i as u16);
-            }
+        if self.within_reg_cap()
+            && let Some(i) = self.instrs.iter().position(|e| *e == instr)
+        {
+            return Reg(i as u16);
         }
         let reg = Reg(self.instrs.len() as u16);
         self.instrs.push(instr);
@@ -79,10 +79,10 @@ impl ExprBuilder {
     /// pool is byte-transparent — german-string cells and packed i64 sets share
     /// it, each read by the opcode that indexes it. Only a miss allocates.
     pub fn add_const_bytes(&mut self, bytes: &[u8]) -> ConstIdx {
-        if self.within_reg_cap() {
-            if let Some(i) = self.const_strings.iter().position(|c| c.as_slice() == bytes) {
-                return ConstIdx(i as u32);
-            }
+        if self.within_reg_cap()
+            && let Some(i) = self.const_strings.iter().position(|c| c.as_slice() == bytes)
+        {
+            return ConstIdx(i as u32);
         }
         let idx = ConstIdx(self.const_strings.len() as u32);
         self.const_strings.push(bytes.to_vec());

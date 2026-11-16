@@ -56,14 +56,14 @@ struct TimerFuture {
 
 impl Reactor {
     /// Future that completes once `at` has passed.
-    pub(crate) fn sleep_until(&self, at: Instant) -> impl Future<Output = ()> {
+    pub(crate) fn sleep_until(&self, at: Instant) -> impl Future<Output = ()> + use<> {
         let id = self.timers.next_id.get();
         self.timers.next_id.set(id + 1);
         TimerFuture { deadline: at, id, reactor: self.clone() }
     }
 
     /// Future that completes once `d` has passed since this pass began.
-    pub(crate) fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
+    pub(crate) fn sleep(&self, d: Duration) -> impl Future<Output = ()> + use<> {
         self.sleep_until(self.now() + d)
     }
 

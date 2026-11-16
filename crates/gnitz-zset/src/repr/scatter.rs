@@ -19,17 +19,17 @@
 use std::cell::Cell;
 use std::ops::Range;
 
-use super::batch::{range_rows, Batch, MemBatch};
+use super::batch::{Batch, MemBatch, range_rows};
 use super::codebook::Codebook;
-use super::pool::{with_scratch, PooledBuf};
+use super::pool::{PooledBuf, with_scratch};
 use super::seek::ColPtr;
 use super::string_heap::{
-    carried_dead, long_bytes, prorated_blob_cap, rebase_string_cell, relocated_cell, row_long_bytes, StringDest,
+    StringDest, carried_dead, long_bytes, prorated_blob_cap, rebase_string_cell, relocated_cell, row_long_bytes,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK};
-use smallvec::{smallvec, SmallVec};
+use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, RowSource};
+use smallvec::{SmallVec, smallvec};
 
 /// One output row of a pick-driven copy: `(source, row, weight)` — the index of
 /// the source the row is read from, its row there, and the weight it is copied
@@ -70,11 +70,7 @@ pub(crate) use stride_dispatch;
 /// `N = 0`.
 #[inline(always)]
 pub(crate) const fn stride<const N: usize>(width: usize) -> usize {
-    if N == 0 {
-        width
-    } else {
-        N
-    }
+    if N == 0 { width } else { N }
 }
 
 /// Each `[start, end)` run of `width`-byte cells of `src`, copied onto `dst`

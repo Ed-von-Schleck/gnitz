@@ -8,11 +8,11 @@
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::{BExpr, BoundExpr};
-use crate::literal::{place, Compared, Placed};
+use crate::literal::{Compared, Placed, place};
 use gnitz_core::Schema;
 use gnitz_expr::CmpOp;
-use gnitz_wire::{image_mask, key_image, KeyRange, PkColList, PkKeys, ReadBound};
-use gnitz_wire::{RelIndex, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, image_mask, key_image};
+use gnitz_wire::{PK_LIST_MAX_COLS, RelIndex, TypeCode};
 use std::cmp::Reverse;
 use std::ops::RangeInclusive;
 
@@ -223,12 +223,12 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<PkKeySet> {
     let mut lists: [Option<&[u128]>; PK_LIST_MAX_COLS] = [None; PK_LIST_MAX_COLS];
     let mut consumed = Vec::new();
     for (k, &col) in schema.pk_cols().iter().enumerate() {
-        if let Some(f) = fold(col, terms, schema) {
-            if let Some(v) = f.point() {
-                points[k] = v;
-                consumed.extend(f.consumed);
-                continue;
-            }
+        if let Some(f) = fold(col, terms, schema)
+            && let Some(v) = f.point()
+        {
+            points[k] = v;
+            consumed.extend(f.consumed);
+            continue;
         }
         // A non-point fold on a list column stays residual.
         let (conjunct, keys) = terms.iter().find_map(|t| match &t.pin {

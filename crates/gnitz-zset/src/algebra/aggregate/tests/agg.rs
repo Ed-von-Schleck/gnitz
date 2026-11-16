@@ -2,7 +2,7 @@ use super::*;
 use crate::algebra::aggregate::ReduceShape;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{le_cell, pk_payload_schema, Rng, STRS};
+use crate::test_support::{Rng, STRS, le_cell, pk_payload_schema};
 use gnitz_wire::{AggDescriptor, TypeCode};
 
 const N: usize = 97;
@@ -137,7 +137,7 @@ fn the_column_kernels_read_a_pk_column() {
 /// longer or a shorter value each time.
 #[test]
 fn a_wide_extreme_seeds_from_its_image_and_copies() {
-    use TypeCode::{String, I128, U64};
+    use TypeCode::{I128, String, U64};
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(U64, false),

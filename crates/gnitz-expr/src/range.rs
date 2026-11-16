@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use gnitz_wire::{image_mask, KeyRange};
+use gnitz_wire::{KeyRange, image_mask};
 
 use crate::simd::Level;
 use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaDescriptor};

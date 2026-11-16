@@ -6,7 +6,7 @@
 //! per-column codec is `gnitz_wire::pk`'s, shared with the client.
 use std::cmp::Ordering;
 
-use gnitz_wire::{radix_sort_by_key, KeyRange, PkBuf, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES, PkBuf, radix_sort_by_key};
 
 use crate::schema::SchemaDescriptor;
 

@@ -12,9 +12,9 @@ use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 use gnitz_core::{Catalog, CatalogRelation};
 
-use crate::lex::{lex_prefix, vocabulary, word_at, Lexeme};
+use crate::lex::{Lexeme, lex_prefix, vocabulary, word_at};
 use crate::meta::{self, ArgKind, MetaLine};
-use crate::settings::{choose, variants, Setting};
+use crate::settings::{Setting, choose, variants};
 
 /// What completion reads: the catalog snapshot and the current schema. The
 /// REPL builds one at each prompt.
@@ -319,7 +319,7 @@ fn referenced<'a>(ctx: &'a Context, stmt: &[Lexeme]) -> Vec<(String, &'a Catalog
 }
 
 /// `rel`'s visible columns, each written after `prefix` as SQL reads it back.
-fn column_candidates<'a>(rel: &'a CatalogRelation, prefix: &'a str) -> impl Iterator<Item = Candidate> + 'a {
+fn column_candidates<'a>(rel: &'a CatalogRelation, prefix: &'a str) -> impl Iterator<Item = Candidate> {
     rel.visible_columns().map(move |c| Candidate {
         kind: Kind::Column,
         value: format!("{prefix}{}", gnitz_sql::column_text(&c.name)),
@@ -348,10 +348,10 @@ fn sql_candidates(ctx: &Context, sql: &str, pos: usize, keep: fn(RelClass) -> bo
         .unwrap_or(lexemes.len());
     let stmt = &lexemes[from..to];
     let prev = stmt.iter().rev().find(|l| l.range.end <= start).map(|l| &l.token);
-    if let Some(Token::Word(w)) = prev {
-        if RELATION_KEYWORDS.contains(&w.keyword) {
-            return (relation_candidates(ctx, word, keep), start);
-        }
+    if let Some(Token::Word(w)) = prev
+        && RELATION_KEYWORDS.contains(&w.keyword)
+    {
+        return (relation_candidates(ctx, word, keep), start);
     }
     let refs = referenced(ctx, stmt);
 

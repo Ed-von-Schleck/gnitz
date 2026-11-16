@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo,
-    spec, zset_of, TID,
+    TID, assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture,
+    solo, spec, zset_of,
 };
 
 fn index(id: u64, unique: bool) -> IndexClaim {

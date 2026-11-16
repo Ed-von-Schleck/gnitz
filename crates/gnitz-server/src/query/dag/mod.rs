@@ -98,9 +98,10 @@ impl DagEngine {
         }
         let (code, placement, traces) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
         // A source not registered here is a root only if it is no view.
-        debug_assert!(code
-            .source_ids()
-            .all(|s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view())));
+        debug_assert!(
+            code.source_ids()
+                .all(|s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view()))
+        );
         let mut roots = Vec::new();
         for source in code.source_ids() {
             match self.views.get(&source) {
@@ -243,7 +244,7 @@ impl DagEngine {
         let states = self
             .views
             .iter_mut()
-            .filter(|(&id, v)| resumes(id) && (v.state.is_some() || !stamped(id)))
+            .filter(|(id, v)| resumes(**id) && (v.state.is_some() || !stamped(**id)))
             .map(|(&id, v)| open_state(&mut v.state, registry, id))
             .collect::<Result<Vec<_>, String>>()?;
         registry.checkpoint_ephemeral(states, generation, resumes)

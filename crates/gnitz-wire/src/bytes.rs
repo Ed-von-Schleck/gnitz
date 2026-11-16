@@ -93,11 +93,7 @@ pub fn extend_from_le_bytes<T: LeScalar>(dst: &mut Vec<T>, src: &[u8]) {
 /// A `u64` with its low `n` bits set; all ones for `n >= 64`.
 #[inline(always)]
 pub const fn low_bits_mask(n: usize) -> u64 {
-    if n < 64 {
-        (1u64 << n) - 1
-    } else {
-        u64::MAX
-    }
+    if n < 64 { (1u64 << n) - 1 } else { u64::MAX }
 }
 
 /// Yields the set bit positions of a mask, lowest first.
@@ -150,10 +146,10 @@ pub fn set_bit_runs_iter(words: impl IntoIterator<Item = u64>, n: usize, out: &m
 /// when this word's run reaches its top.
 #[inline(always)]
 fn scan_bit_runs(open: &mut Option<usize>, base: usize, word: u64, out: &mut Vec<(usize, usize)>) {
-    if word & 1 == 0 {
-        if let Some(s) = open.take() {
-            out.push((s, base));
-        }
+    if word & 1 == 0
+        && let Some(s) = open.take()
+    {
+        out.push((s, base));
     }
     // Unscanned bits stay in place, so no shift below reaches 64.
     let mut rest = word;

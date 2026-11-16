@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::{PkColumn, RelDescriptor};
-use gnitz_wire::{write_u64_le, WireStatus};
+use gnitz_wire::{WireStatus, write_u64_le};
 
 struct Fixture {
     _srv: ServerHandle,

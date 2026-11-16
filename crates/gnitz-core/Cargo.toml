@@ -3,6 +3,7 @@ name = "gnitz-core"
 description = "Client core for the gnitz database: connection, protocol, client-side schema and batches"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

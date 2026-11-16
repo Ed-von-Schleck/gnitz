@@ -9,7 +9,7 @@
 //! it logs is one no worker reads.
 
 use super::validate::{self, UniqueFilter};
-use super::{decode_fault, park_until, CatalogLock, Shared};
+use super::{CatalogLock, Shared, decode_fault, park_until};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
 use crate::runtime::master::ApplyLock;
 use crate::runtime::sal::Read;
@@ -167,10 +167,10 @@ async fn commit_bundle(
 
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
     // and a stream's must not reach them.
-    if families.get(SysFamily::Circuit).is_some() {
-        if let Some(wait) = shared.dispatcher.emit_tick(alone).await? {
-            wait.acks().await;
-        }
+    if families.get(SysFamily::Circuit).is_some()
+        && let Some(wait) = shared.dispatcher.emit_tick(alone).await?
+    {
+        wait.acks().await;
     }
     let (applied, zone_lsn) = {
         let mut excl = shared.dispatcher.sal().lock().await;

@@ -148,11 +148,7 @@ fn valued_null_row<const W: usize>(words: &[[u8; 8]], cells: &[u8], slot: usize)
 /// hold no bit.
 #[inline(always)]
 pub fn null_word_at(word: u64, at: usize) -> u64 {
-    if at < 64 {
-        word << at
-    } else {
-        0
-    }
+    if at < 64 { word << at } else { 0 }
 }
 
 /// Read one row's columns. The **one** per-row access shape in the system: the

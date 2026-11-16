@@ -7,19 +7,19 @@ use std::borrow::Cow;
 
 use gnitz_store::relation::{IndexClaim, Relation};
 use gnitz_wire::{
-    payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef, IdxTabRow, IdxTabSlot,
-    RowSource, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
+    BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef, IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, SchemaTabSlot,
+    TableProps, ViewParts, payload_bytes, validate_user_identifier,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashSet;
 
-use super::sys_tables::{
-    build_schema_from_col_defs, pk_signatures, read_rel_row, DdlBundle, IdSet, PkShape, PkSignature, RelDetail, RelRow,
-    SysFamily, SYSTEM_SCHEMA_ID,
-};
 use super::CatalogEngine;
+use super::sys_tables::{
+    DdlBundle, IdSet, PkShape, PkSignature, RelDetail, RelRow, SYSTEM_SCHEMA_ID, SysFamily, build_schema_from_col_defs,
+    pk_signatures, read_rel_row,
+};
 
 /// The name rule a schema, relation or index row must satisfy to be stored: a
 /// chain segment's name (`segment`) is `_` then `[A-Za-z0-9_]`, every other
@@ -400,7 +400,9 @@ impl CatalogEngine {
                     let name = &old.def.name;
                     // Before the schema build, whose PK rules would refuse a PK
                     // column's DROP NOT NULL with a less direct message.
-                    if let Some(op) = op.filter(|_| schema.is_pk_col(col_idx as usize)) {
+                    if let Some(op) = op
+                        && schema.is_pk_col(col_idx as usize)
+                    {
                         return Err(format!("cannot {op} '{name}': it is a primary-key column"));
                     }
                     // Hiding a column cannot fail the schema build, so these
@@ -622,13 +624,13 @@ impl CatalogEngine {
         let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
         // An FK probes its parent's store on every write of the child, which only
         // a base table's ingest runs; a stream push must stay a pure append.
-        if !rel.kind().is_base_table() {
-            if let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some()) {
-                return Err(format!(
-                    "{rel}: column '{}' may not carry a FOREIGN KEY; only a base table's may",
-                    cd.def.name
-                ));
-            }
+        if !rel.kind().is_base_table()
+            && let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some())
+        {
+            return Err(format!(
+                "{rel}: column '{}' may not carry a FOREIGN KEY; only a base table's may",
+                cd.def.name
+            ));
         }
         match rel.detail {
             RelDetail::Table(TableProps { serial, .. }) => {

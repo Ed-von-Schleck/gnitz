@@ -17,7 +17,7 @@ use gnitz_wire::{
     ViewParts, ViewTabRow,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_block};
 
 // ---------------------------------------------------------------------------
 // Constants

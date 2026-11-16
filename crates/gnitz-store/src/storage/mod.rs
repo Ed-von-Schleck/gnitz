@@ -13,9 +13,9 @@ mod table;
 mod suites;
 
 pub(crate) use manifest::{
-    link_stores, manifest_path, read_at, read_intact, retire_stores, shard_files, RecoverySource,
+    RecoverySource, link_stores, manifest_path, read_at, read_intact, retire_stores, shard_files,
 };
-pub(crate) use table::{flush_barrier, Table, DEFAULT_RAM_TIER_BYTES};
+pub(crate) use table::{DEFAULT_RAM_TIER_BYTES, Table, flush_barrier};
 
 /// Which time-prefix of a store's ingests a read sees. A store's runs are its
 /// history in order, so a prefix of them is the Z-set the store held then.

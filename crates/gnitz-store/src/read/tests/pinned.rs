@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::{RelationKind, Snapshot};
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spec, spilling, TID,
+    TID, make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spec, spilling,
 };
 use gnitz_wire::PkBuf;
 

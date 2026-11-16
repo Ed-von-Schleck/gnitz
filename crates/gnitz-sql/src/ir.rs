@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use gnitz_expr::CalendarOp;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, MAX_DECIMAL_SCALE};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, MAX_DECIMAL_SCALE, TypeCode};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -602,10 +602,11 @@ fn adopt_decimal_literals<'e, R: 'e>(items: impl IntoIterator<Item = &'e BExpr<R
         return;
     }
     for (e, ty) in items.into_iter().zip(tys) {
-        if let BExpr::LitFloat { dec: Some((v, s)), .. } = e {
-            if *s <= MAX_DECIMAL_SCALE && i64::try_from(*v).is_ok() {
-                *ty = ColType::decimal(*s);
-            }
+        if let BExpr::LitFloat { dec: Some((v, s)), .. } = e
+            && *s <= MAX_DECIMAL_SCALE
+            && i64::try_from(*v).is_ok()
+        {
+            *ty = ColType::decimal(*s);
         }
     }
 }

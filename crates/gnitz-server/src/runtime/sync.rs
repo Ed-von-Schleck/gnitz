@@ -353,13 +353,13 @@ impl<K> AsyncRwLock<K> {
     /// parked reader when no writer waits.
     fn wake_next(&self) {
         let mut s = self.0.borrow_mut();
-        if s.free() {
-            if let Some((_, slot)) = s.write_waiters.front_mut() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-                return;
+        if s.free()
+            && let Some((_, slot)) = s.write_waiters.front_mut()
+        {
+            if let Some(w) = slot.take() {
+                w.wake();
             }
+            return;
         }
         if s.read_ok() {
             for w in s.read_waiters.drain(..) {

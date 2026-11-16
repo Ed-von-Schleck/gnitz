@@ -2,14 +2,14 @@
 //! implementor.
 
 use super::*;
+use crate::BlockingHost;
 use crate::block_on;
 use crate::test_support::{
-    client_pair, delta_frame, delta_terminal, encode_frame, interrupt_self_until, kv_rows, kv_schema, pushed_train,
-    rel, reply_ctrl, reply_status, sync_answer, sync_header, sync_held, Peer,
+    Peer, client_pair, delta_frame, delta_terminal, encode_frame, interrupt_self_until, kv_rows, kv_schema,
+    pushed_train, rel, reply_ctrl, reply_status, sync_answer, sync_header, sync_held,
 };
-use crate::transport::{poll_fd, Interest};
-use crate::BlockingHost;
-use gnitz_wire::{framed, peek_control_block, ControlHeader, RelDescriptorBlob, TypeCode};
+use crate::transport::{Interest, poll_fd};
+use gnitz_wire::{ControlHeader, RelDescriptorBlob, TypeCode, framed, peek_control_block};
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;

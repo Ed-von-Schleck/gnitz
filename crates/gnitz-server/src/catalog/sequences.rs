@@ -4,9 +4,9 @@
 use gnitz_wire::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
+use super::CatalogEngine;
 use super::sys_tables::SysFamily;
 use super::write_path::{ZoneError, ZoneSink};
-use super::CatalogEngine;
 
 /// The next catalog object id to allocate.
 const SEQ_ID_NEXT_ID: u64 = 1;

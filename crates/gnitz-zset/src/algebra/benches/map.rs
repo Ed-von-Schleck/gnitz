@@ -1,5 +1,5 @@
-use super::tests::{compute, make_schema, project};
 use super::MapPlan;
+use super::tests::{compute, make_schema, project};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{pk_payload_schema, rekey_plan, u64_pk_schema};
@@ -14,7 +14,7 @@ use std::hint::black_box;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn map_ranges_bench() {
-    use TypeCode::{String as STR, I32, I64, U16, U64};
+    use TypeCode::{I32, I64, String as STR, U16, U64};
     const N: usize = 262_144;
     const GAP: usize = 16;
     let counter = gnitz_foundation::perf::Counter::instructions();

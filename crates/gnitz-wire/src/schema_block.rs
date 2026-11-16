@@ -15,7 +15,7 @@
 //!
 //! The record carries no length of its own; every carrier length-prefixes it.
 
-use crate::codec::{decode_all, Reader, Writer};
+use crate::codec::{Reader, Writer, decode_all};
 use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 
 /// One column as the record carries it. `name` borrows the record's own bytes on

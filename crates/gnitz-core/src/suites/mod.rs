@@ -16,12 +16,12 @@ use std::sync::Arc;
 use crate::connection::{Request, Session};
 use crate::test_support::{drive, park, rel};
 use crate::{
-    block_on, BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Schema, Sent, TableDef,
-    ViewBundle, ZSetBatch,
+    BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Schema, Sent, TableDef, ViewBundle,
+    ZSetBatch, block_on,
 };
-use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_test_harness::{ServerHandle, unique_schema};
 use gnitz_wire::{
-    read_i64_le, Circuit, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode,
+    Circuit, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode, read_i64_le,
 };
 
 /// Non-nullable `columns`, the first one the PK.

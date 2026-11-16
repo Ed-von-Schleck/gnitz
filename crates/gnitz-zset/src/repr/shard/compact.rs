@@ -8,9 +8,9 @@ use super::reader::MappedShard;
 use crate::repr::codebook::Codebook;
 use crate::repr::merge::{disjoint_order, run_merge};
 use crate::repr::scatter::UnifiedSet;
-use crate::repr::string_heap::{long_bytes, prorated_blob_cap, BlobCache, StringDest};
+use crate::repr::string_heap::{BlobCache, StringDest, long_bytes, prorated_blob_cap};
 use crate::repr::{Batch, StorageError};
-use crate::schema::{compare_pk_ordering, SchemaDescriptor};
+use crate::schema::{SchemaDescriptor, compare_pk_ordering};
 use gnitz_wire::RowSource;
 use gnitz_wire::{CodedHeap, Heap, PkBuf};
 use smallvec::SmallVec;
@@ -120,7 +120,7 @@ impl GuardMerge {
     /// payload to write back.
     pub fn begin(shards: Vec<Rc<MappedShard>>, fences: Vec<PkBuf>, dehydrate: bool) -> Result<Self, StorageError> {
         let schema = *shards.first().expect("a guard merge has an input shard").schema();
-        assert!(fences.windows(2).all(|w| w[0] < w[1]), "a guard merge's fences ascend");
+        assert!(fences.is_sorted_by(|a, b| a < b), "a guard merge's fences ascend");
         debug_assert!(
             shards.iter().all(|s| *s.schema() == schema),
             "a guard merge's shards share one schema"

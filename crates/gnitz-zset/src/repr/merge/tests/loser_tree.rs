@@ -9,7 +9,7 @@ fn key(value: u128) -> u128 {
 
 /// The order of two players whose keys tie: the value at `(source_idx, row)`,
 /// then `source_idx` for a stable tiebreak.
-fn run_less(runs: &[Vec<u128>]) -> impl Fn(&Player, &Player) -> bool + '_ {
+fn run_less(runs: &[Vec<u128>]) -> impl Fn(&Player, &Player) -> bool {
     move |a, b| {
         let ka = (runs[a.source_idx as usize][a.row as usize], a.source_idx);
         let kb = (runs[b.source_idx as usize][b.row as usize], b.source_idx);

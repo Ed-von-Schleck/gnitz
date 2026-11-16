@@ -4,15 +4,16 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw, make_schema_u64_i64,
-    map_of, pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec, spec, Rng, TID,
+    Rng, TID, batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw,
+    make_schema_u64_i64, map_of, pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec,
+    spec,
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_zset_testkit::{zset_of, RowKey};
+use gnitz_zset_testkit::{RowKey, zset_of};
 use std::collections::HashMap;
 
 /// `(k1, k2, a, b, s)`: the PK is `(k2, k1)`.

@@ -2,7 +2,7 @@
 //! its traffic. Every byte string decodes to one, so an engine mutating bytes
 //! mutates inputs.
 
-use crate::edit::{Edit, EDIT_BYTES};
+use crate::edit::{EDIT_BYTES, Edit};
 use crate::seed::Frame;
 
 /// How the server an input runs against is booted, and how its session ends.
@@ -58,8 +58,10 @@ impl Input {
             boot: Boot::decode(head[0]),
             seed: u16::from_le_bytes([head[1], head[2]]),
             edits: bytes[n..]
-                .chunks_exact(EDIT_BYTES)
-                .map(|c| Edit::decode(c.try_into().unwrap()))
+                .as_chunks::<EDIT_BYTES>()
+                .0
+                .iter()
+                .map(Edit::decode)
                 .collect(),
         }
     }

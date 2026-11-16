@@ -3,6 +3,7 @@ name = "gnitz-zset"
 description = "The Z-set kernel of the gnitz database: schema, columnar batches, cursors and operators"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,7 +21,7 @@ rustc-hash.workspace = true
 libc.workspace = true
 # The UTF-8 check on a pushed block's STRING cells.
 simdutf8 = "0.1"
-fsst-rs = "0.6"
+fsst-rs = "0.7"
 # Inline storage for the per-materialize index tables of `repr::scatter`.
 smallvec.workspace = true
 
@@ -28,13 +29,5 @@ smallvec.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 
-# Spelled out rather than `workspace = true`, which cannot be extended: this
-# crate publishes an API to the store and the server above it, so it also wants
-# `unreachable_pub` — allow-by-default, so `warnings = "deny"` does not imply it
-# — to make an over-wide `pub` inside a private module a compile error.
-[lints.rust]
-warnings = "deny"
-unreachable_pub = "warn"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

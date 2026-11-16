@@ -1,7 +1,7 @@
 //! Range bounds: the wire form of an ordered range walk over a key list.
 
 use crate::codec::{Reader, Wire, Writer};
-use crate::{PkColList, PK_LIST_MAX_COLS};
+use crate::{PK_LIST_MAX_COLS, PkColList};
 
 /// A range walk over the key list `cols`: the leading `eq_vals()` columns pinned to one
 /// key image ([`crate::key_image`]) each, the next bounded by the inclusive

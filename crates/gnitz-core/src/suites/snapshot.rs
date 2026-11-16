@@ -3,7 +3,7 @@
 //! checkpoint that a server boots on.
 
 use super::*;
-use crate::{BatchAppender, PkColumn, DEFAULT_PAGE_ROWS};
+use crate::{BatchAppender, DEFAULT_PAGE_ROWS, PkColumn};
 use gnitz_wire::TableDistribution;
 
 const WORKERS: usize = 4;

@@ -10,7 +10,7 @@ use crate::test_support::{arb_schema, cols_of};
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{ColumnDef, MAX_PK_COLUMNS};
 use gnitz_zset::repr::{Batch, MemBatch};
-use gnitz_zset::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, decode_schema_block};
 use proptest::prelude::*;
 
 proptest! {

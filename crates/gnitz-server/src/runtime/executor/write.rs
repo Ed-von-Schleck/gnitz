@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use super::family::{FamilyRows, PushedBlock, TxnFamily};
 use super::validate::Checks;
-use super::{decode_fault, target_kind, Access, CatalogLock, Shared};
+use super::{Access, CatalogLock, Shared, decode_fault, target_kind};
 use crate::catalog::{CatalogEngine, LockSet};
 use crate::runtime::reactor::RecvBuf;
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};

@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use gnitz_wire::{Reader, Writer, WIRE_VERSION};
+use gnitz_wire::{Reader, WIRE_VERSION, Writer};
 
 /// The directory every connection of this process records into.
 const RECORD_ENV: &str = "GNITZ_RECORD_FRAMES";

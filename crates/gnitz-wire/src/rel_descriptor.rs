@@ -1,6 +1,6 @@
 //! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
 
-use crate::codec::{decode_all, Reader, Wire, Writer, MAX_LIST_LEN};
+use crate::codec::{MAX_LIST_LEN, Reader, Wire, Writer, decode_all};
 use crate::{PkColList, ViewBudget};
 
 wire_enum! {

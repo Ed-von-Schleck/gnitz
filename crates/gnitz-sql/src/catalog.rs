@@ -1,6 +1,6 @@
 //! The relations a statement's plan reads, as every planner probes them.
 
-use crate::error::{missing_relation, GnitzSqlError};
+use crate::error::{GnitzSqlError, missing_relation};
 use gnitz_core::{RelDescriptor, RelName};
 use std::sync::Arc;
 

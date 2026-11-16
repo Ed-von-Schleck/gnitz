@@ -11,12 +11,12 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use gnitz_core::{sys_schema, Schema};
+use gnitz_core::{Schema, sys_schema};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::fields::{self, Field, List, Section};
 use gnitz_wire::{
-    peek_control_block, txn_frame, wal, Circuit, ClientVerb, DecodedControl, ReadSpec, REG_NULL_BMP, REG_PAYLOAD_START,
-    REG_PK, REG_WEIGHT,
+    Circuit, ClientVerb, DecodedControl, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, ReadSpec,
+    peek_control_block, txn_frame, wal,
 };
 
 /// One data block, and the schema its rows decode under.

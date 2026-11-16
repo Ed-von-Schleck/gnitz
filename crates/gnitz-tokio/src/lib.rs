@@ -7,7 +7,7 @@ use std::os::fd::OwnedFd;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use gnitz_core::{promise, serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced};
+use gnitz_core::{BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced, promise, serve};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::mpsc;
 
@@ -68,7 +68,7 @@ impl Host for TokioHost {
         if let Some(mut guard) = read {
             guard.clear_ready();
         }
-        if let (Some(mut guard), true) = (write, refused) {
+        if refused && let Some(mut guard) = write {
             guard.clear_ready();
         }
         Poll::Ready(Ok(()))

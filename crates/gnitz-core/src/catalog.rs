@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use gnitz_wire::{
-    qualified_key, CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkRef, IdxTabRow, PkColList, RelClass,
-    SchemaTabRow, TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, SYSTEM_SCHEMA,
+    CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkRef, IdxTabRow, PkColList, RelClass, SYSTEM_SCHEMA,
+    SchemaTabRow, TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, qualified_key,
 };
 
 use crate::{ProtocolError, RelName, ZSetBatch};

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::format::{epoch_word, next_epoch, word_epoch, SalMessageKind};
+use super::format::{SalMessageKind, epoch_word, next_epoch, word_epoch};
 use super::log::{SalLog, SalMessage};
 use super::reader::SalReader;
 use super::request::{Ingest, SalRequest};

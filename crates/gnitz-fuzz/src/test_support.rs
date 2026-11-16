@@ -2,12 +2,12 @@
 
 use std::num::NonZeroU64;
 
-use gnitz_core::{encode_ddl_txn, sys_schema, BatchAppender, ZSetBatch};
+use gnitz_core::{BatchAppender, ZSetBatch, encode_ddl_txn, sys_schema};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, Sink};
-use gnitz_wire::txn_frame::{encode_scan_multi, ScanItem};
+use gnitz_wire::txn_frame::{ScanItem, encode_scan_multi};
 use gnitz_wire::{
-    Circuit, CircuitRow, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, SysRow,
-    Target, CIRCUIT_TAB,
+    CIRCUIT_TAB, Circuit, CircuitRow, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind,
+    SysRow, Target,
 };
 
 /// `col > 7`, as an expression program's blob.

@@ -1,6 +1,6 @@
 use crate::schema::SchemaColumn;
-use crate::stream::ordered::tests::{bench_rows, Harness};
 use crate::stream::ordered::OrderedPlan;
+use crate::stream::ordered::tests::{Harness, bench_rows};
 use crate::test_support::{mix, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{OrderKey, TypeCode};

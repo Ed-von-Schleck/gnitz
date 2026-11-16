@@ -1,7 +1,7 @@
 use super::{
-    dir_sizes, directory, group_header_size, payload_encode, payload_parse, payload_rows, payload_size, GroupHead,
-    Header, PayloadRows, SalMessageKind, FLAG_SHARED, FLAG_ZONE, FLAG_ZONE_END, KNOWN_FLAGS, MAX_WORKERS, OFF_ARG0,
-    OFF_BASE, OFF_FLAGS, OFF_KIND, OFF_TARGETS, OFF_WIDTH, PAYLOAD_HEAD,
+    FLAG_SHARED, FLAG_ZONE, FLAG_ZONE_END, GroupHead, Header, KNOWN_FLAGS, MAX_WORKERS, OFF_ARG0, OFF_BASE, OFF_FLAGS,
+    OFF_KIND, OFF_TARGETS, OFF_WIDTH, PAYLOAD_HEAD, PayloadRows, SalMessageKind, dir_sizes, directory,
+    group_header_size, payload_encode, payload_parse, payload_rows, payload_size,
 };
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::{assert_fail_stops, group_at, test_log};
@@ -9,10 +9,10 @@ use crate::runtime::sal::format::RequestHead;
 use crate::runtime::sal::{Apply, Inbound};
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows};
-use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_wire::TypeCode;
+use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_zset::repr::{Batch, BatchBuilder, WireRows};
-use gnitz_zset::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_block};
 
 // ---------------------------------------------------------------------------
 // The header codec: every field round-trips, the bytes are pinned, and a value

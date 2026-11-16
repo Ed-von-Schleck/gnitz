@@ -21,7 +21,7 @@ use crate::source::split_statements;
 use crate::test_support::*;
 use gnitz_core::{PlannedView, ViewBundle};
 use gnitz_wire::{OpNode, RelClass, TypeCode};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{AlterView, AlterViewOperation, Statement};
 
 /// The fixture every pure file plans against. Every `BIGINT` column is `I64`.
 ///
@@ -92,9 +92,11 @@ fn plan(cat: &dyn Catalog, sql: &str) -> Result<ViewBundle, GnitzSqlError> {
         Statement::CreateView(cv) => {
             plan_create_view(&cv, text, cat).map(|p| p.unwrap_or_else(|| panic!("`{sql}` planned nothing")))
         }
-        Statement::AlterView { name, columns, query, with_options } => {
-            plan_alter_view(&name, &columns, &query, &with_options, text, cat)
-        }
+        Statement::AlterView(AlterView {
+            name,
+            operation: AlterViewOperation::As { columns, query, with_options },
+            ..
+        }) => plan_alter_view(&name, &columns, &query, &with_options, text, cat),
         _ => panic!("`{sql}` is not a view statement"),
     }
 }

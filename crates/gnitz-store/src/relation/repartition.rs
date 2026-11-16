@@ -10,9 +10,9 @@ use std::fs;
 
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind, StoreConfig};
-use crate::storage::{flush_barrier, link_stores, retire_stores, RecoverySource, Table};
+use crate::storage::{RecoverySource, Table, flush_barrier, link_stores, retire_stores};
 use gnitz_zset::algebra::{Placement, ScatterPlan, Slot};
-use gnitz_zset::repr::{from_runs, Batch, StorageError};
+use gnitz_zset::repr::{Batch, StorageError, from_runs};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
@@ -31,7 +31,7 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, String> {
                     "{rel_dir}/{name} is in no child-directory grammar this build knows; \
                      it may hold rows written by an incompatible layout. Refusing to boot — \
                      delete the relation directory deliberately if the data is expendable."
-                ))
+                ));
             }
         }
     }

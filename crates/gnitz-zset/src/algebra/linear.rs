@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use gnitz_expr::RowFilter;
 
-use crate::repr::{merge_consolidated, Batch};
+use crate::repr::{Batch, merge_consolidated};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
 

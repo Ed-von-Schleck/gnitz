@@ -1,7 +1,7 @@
 //! One group as the writer encodes it: the request its header carries, plus
 //! the rows or blob each worker is sent.
 
-use super::format::{payload_size, PayloadRows, RequestHead};
+use super::format::{PayloadRows, RequestHead, payload_size};
 use super::request::{Apply, Ingest, Read};
 use crate::catalog::SysFamily;
 use crate::runtime::park::WorkerSet;

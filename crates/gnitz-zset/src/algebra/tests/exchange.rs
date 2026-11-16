@@ -1,7 +1,7 @@
 use super::*;
 use crate::algebra::group_key::GroupOutKey;
 use crate::algebra::route::worker_for_pk_bytes;
-use crate::algebra::{ground_owner, MapPlan, Placement};
+use crate::algebra::{MapPlan, Placement, ground_owner};
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
 use crate::test_support::{pk_payload_schema, self_typed_slots, u64_pk_schema, weighted_rows};

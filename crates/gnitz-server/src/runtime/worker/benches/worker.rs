@@ -45,10 +45,12 @@ fn arm(
     for id in 1..=requests {
         acked = request(&mut sal.excl(), tid, &record, id).expect("group fits");
     }
-    let ((), instructions) = Counter::instructions().measure(|| loop {
-        wp.drain_sal(false);
-        if wp.replies.is_empty() {
-            break;
+    let ((), instructions) = Counter::instructions().measure(|| {
+        loop {
+            wp.drain_sal(false);
+            if wp.replies.is_empty() {
+                break;
+            }
         }
     });
     let sent = frames(&rx);

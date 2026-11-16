@@ -1,8 +1,8 @@
 use super::*;
-use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
 use crate::BatchAppender;
+use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
 use gnitz_expr::{BatchView, CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarCell, ScalarEval, Sink};
-use gnitz_wire::{payload_str, payload_u64, ColumnDef};
+use gnitz_wire::{ColumnDef, payload_str, payload_u64};
 use std::convert::Infallible;
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
@@ -151,10 +151,12 @@ fn a_compound_key_has_no_scalar_form() {
     let schema = fixture_a_schema();
     let panics = |f: &(dyn Fn() + std::panic::RefUnwindSafe)| std::panic::catch_unwind(f).is_err();
     let mut b = ZSetBatch::new(&schema);
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        BatchAppender::new(&mut b).add_row(1, 1);
-    }))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            BatchAppender::new(&mut b).add_row(1, 1);
+        }))
+        .is_err()
+    );
     assert!(
         b.weights.is_empty() && b.nulls.is_empty() && b.pks.is_empty(),
         "a refused key leaves no partial row"

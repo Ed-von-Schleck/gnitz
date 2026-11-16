@@ -2,7 +2,7 @@
 //! the global group key on client and engine, a persisted digest read back by a
 //! later build — agrees bit for bit only because both call these functions.
 
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
 
 /// XXH3-64 over `b`.
 #[inline]

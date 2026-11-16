@@ -12,7 +12,7 @@
 use crate::calendar::CalendarOp;
 use crate::like::{LikeMatcher, LikePattern};
 use crate::{ColumnLocator, SchemaDescriptor};
-use gnitz_wire::{encode_german_string, FixedInt, ScalarKind, TypeCode};
+use gnitz_wire::{FixedInt, ScalarKind, TypeCode, encode_german_string};
 use std::fmt;
 
 /// The register file is capped at 64: the `BoolBinary` 3VL paths, the
@@ -972,7 +972,7 @@ impl LogicalProgram {
 
     /// Every input column the program reads: an instruction's column operand or
     /// a sink's copied column.
-    pub fn cols_read(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn cols_read(&self) -> impl Iterator<Item = u32> {
         let ops = self
             .instrs
             .iter()
@@ -1268,7 +1268,7 @@ impl LogicalProgram {
             const_arena,
             // A register file is exactly one entry per instruction.
             num_regs: self.instrs.len() as u32,
-            str_lanes: MAX_REGS as u32 - self.str_class.leading_zeros(),
+            str_lanes: self.str_class.bit_width(),
         })
     }
 
@@ -1484,11 +1484,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::FloatUnary { op: _, a } | L::IntToFloat { a } => writes(WVal(Fixed(false))).reading(a, RVal),
         L::Calendar { op, a, micros: _ } => {
             let ops = writes(WVal(Fixed(false))).reading(a, RVal);
-            if op.may_null() {
-                ops.may_null()
-            } else {
-                ops
-            }
+            if op.may_null() { ops.may_null() } else { ops }
         }
         // The three narrowing casts yield NULL on an out-of-range value.
         L::FloatToF32 { a } => writes(WVal(Fixed(false))).reading(a, RVal).may_null(),

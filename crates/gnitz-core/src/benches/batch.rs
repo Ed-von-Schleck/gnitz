@@ -1,6 +1,6 @@
 use super::*;
-use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
 use crate::BatchAppender;
+use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
 use gnitz_wire::{ColumnDef, TypeCode};
 use std::hint::black_box;
 

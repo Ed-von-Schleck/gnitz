@@ -5,9 +5,9 @@
 //!
 //! It reaches nothing: describing a query is as server-free as compiling one.
 
-use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
-use crate::error::{reject_if, GnitzSqlError};
 use crate::SqlResult;
+use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
+use crate::error::{GnitzSqlError, reject_if};
 use gnitz_core::{BatchAppender, GnitzClient, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{AggFunc, GroupAggs, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -72,7 +72,7 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
                 "predicate: none".to_string(),
                 projection_line(schema, false),
                 order_limit,
-            ]
+            ];
         }
         ReadCase::Rows { read, reply_schema, .. } => {
             (read, projection_line(reply_schema, read.spec.sink.map.is_none()))
@@ -106,15 +106,15 @@ fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
     let mut facts = Vec::new();
     // The per-worker cut is OFFSET+LIMIT deep, because the client cuts the exact slice. A cut
     // shipping no ORDER BY keys stops the worker at its first rows.
-    if let ReadCase::Rows { read, .. } = &plan.case {
-        if let SinkKind::Rows { cut: Some(RowsCut { k, order }) } = &read.spec.sink.kind {
-            let at = if local { "local" } else { "server" };
-            facts.push(if order.is_empty() {
-                format!("{at} early-stop {k}")
-            } else {
-                format!("{at} top-{k}")
-            });
-        }
+    if let ReadCase::Rows { read, .. } = &plan.case
+        && let SinkKind::Rows { cut: Some(RowsCut { k, order }) } = &read.spec.sink.kind
+    {
+        let at = if local { "local" } else { "server" };
+        facts.push(if order.is_empty() {
+            format!("{at} early-stop {k}")
+        } else {
+            format!("{at} top-{k}")
+        });
     }
     if !plan.order.is_empty() {
         facts.push("client sort".to_string());

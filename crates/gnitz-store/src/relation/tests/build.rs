@@ -111,9 +111,11 @@ fn a_refused_index_rolls_its_registration_back() {
     // A UNIQUE index on a view is refused: its circuit cannot refuse a duplicate.
     let view = spec(9, RelationKind::View(ViewBudget::Plain), schema);
     let unique = (IndexClaim::Index { id: 10, unique: true }, PkColList::from_slice(&[1]));
-    assert!(registry
-        .register_at(view, schema, &[unique], StateLayout::default(), None)
-        .is_err());
+    assert!(
+        registry
+            .register_at(view, schema, &[unique], StateLayout::default(), None)
+            .is_err()
+    );
     assert!(registry.relation(9).is_none(), "a refused registration enters nothing");
     registry
         .register(view, schema)

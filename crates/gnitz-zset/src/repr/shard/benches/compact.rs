@@ -1,6 +1,6 @@
 use super::*;
-use crate::repr::merge::run_merge;
 use crate::repr::BatchBuilder;
+use crate::repr::merge::run_merge;
 use crate::schema::SchemaColumn;
 use crate::test_support::{
     map_coded_shard, map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema, prose, u64_pk_schema,
@@ -85,11 +85,7 @@ fn distinct_compaction_bench() {
         ("5 equal sources", 5, |k| (mix(k) >> 20) % 5),
         ("1 large and 4 small sources", 5, |k| {
             let h = mix(k) >> 20;
-            if h % 16 < 12 {
-                0
-            } else {
-                1 + h % 4
-            }
+            if h % 16 < 12 { 0 } else { 1 + h % 4 }
         }),
         ("5 ascending blocks", 5, |k| k * 5 / TOTAL),
         ("1 large and 1 tiny source", 2, |k| {
@@ -97,11 +93,7 @@ fn distinct_compaction_bench() {
         }),
         ("1 large and 4 tiny sources", 5, |k| {
             let h = mix(k) >> 20;
-            if h.is_multiple_of(64) {
-                1 + (h >> 6) % 4
-            } else {
-                0
-            }
+            if h.is_multiple_of(64) { 1 + (h >> 6) % 4 } else { 0 }
         }),
     ];
     for (pk, (pk_label, pk_cols, key_col)) in pks.into_iter().enumerate() {

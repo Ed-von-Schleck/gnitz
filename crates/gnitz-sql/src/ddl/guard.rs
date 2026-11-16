@@ -2,7 +2,7 @@
 //! UNIQUE / FOREIGN KEY constraint fields that CREATE TABLE, CREATE INDEX and
 //! ALTER TABLE each meet. They keep the guard contract `crate::validate` states.
 
-use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::types::declared_type;
 use gnitz_wire::{ColumnDef, FkAction};
 
@@ -71,8 +71,9 @@ pub(super) fn reject_unhonored_pk_fields(
         index_type,
         index_options,
         characteristics,
+        include,
     } = pk;
-    reject_index_constraint_extras(index_type, index_options, characteristics, context)
+    reject_index_constraint_extras(index_type, index_options, include, characteristics, context)
 }
 
 /// Reject every UNIQUE constraint field beyond the column list and the
@@ -98,6 +99,7 @@ pub(super) fn reject_unhonored_unique_fields(
         index_options,
         characteristics,
         nulls_distinct,
+        include,
     } = u;
     reject_if(
         index_name.is_some(),
@@ -109,15 +111,17 @@ pub(super) fn reject_unhonored_unique_fields(
         context,
         "NULLS [NOT] DISTINCT",
     )?;
-    reject_index_constraint_extras(index_type, index_options, characteristics, context)
+    reject_index_constraint_extras(index_type, index_options, include, characteristics, context)
 }
 
 /// The index-shape tail every index-creating surface shares: accept only the
-/// BTree default `USING` (it names gnitz's real ordered index), and no index
-/// options. CREATE INDEX, PRIMARY KEY and UNIQUE all read it.
+/// BTree default `USING` (it names gnitz's real ordered index), no index
+/// options and no INCLUDE columns. CREATE INDEX, PRIMARY KEY and UNIQUE all
+/// read it.
 pub(super) fn reject_index_type_and_options(
     index_type: &Option<sqlparser::ast::IndexType>,
     index_options: &[sqlparser::ast::IndexOption],
+    include: &[sqlparser::ast::Ident],
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     reject_if(
@@ -127,7 +131,8 @@ pub(super) fn reject_index_type_and_options(
         context,
         "USING (non-default index type)",
     )?;
-    reject_if(!index_options.is_empty(), context, "index options")
+    reject_if(!index_options.is_empty(), context, "index options")?;
+    reject_if(!include.is_empty(), context, "INCLUDE (covering columns)")
 }
 
 /// The PK/UNIQUE-shared tail: the index shape above, plus no constraint
@@ -135,10 +140,11 @@ pub(super) fn reject_index_type_and_options(
 fn reject_index_constraint_extras(
     index_type: &Option<sqlparser::ast::IndexType>,
     index_options: &[sqlparser::ast::IndexOption],
+    include: &[sqlparser::ast::Ident],
     characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    reject_index_type_and_options(index_type, index_options, context)?;
+    reject_index_type_and_options(index_type, index_options, include, context)?;
     reject_constraint_characteristics(characteristics, context)
 }
 
@@ -250,6 +256,7 @@ pub(super) fn read_column(
             O::Srid(_) => return Err(unsupported_clause(context, "SRID")),
             O::Invisible => return Err(unsupported_clause(context, "INVISIBLE column")),
             O::DialectSpecific(_) => return Err(unsupported_clause(context, "dialect-specific column option")),
+            O::GenericOptions(_) => return Err(unsupported_clause(context, "foreign-table column OPTIONS")),
         }
     }
     let (ty, serial) = declared_type(data_type)?;

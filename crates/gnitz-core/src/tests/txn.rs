@@ -1,8 +1,8 @@
 use super::*;
 use crate::test_support::{client_pair, kv_rows, kv_schema};
-use crate::{block_on, BatchAppender, PkColumn};
-use gnitz_wire::{payload_u64, ColumnDef, TypeCode};
+use crate::{BatchAppender, PkColumn, block_on};
 use WireConflictMode::{Error, Update};
+use gnitz_wire::{ColumnDef, TypeCode, payload_u64};
 
 fn del(pk: u64) -> ZSetBatch {
     let s = Arc::new(kv_schema(TypeCode::I64));

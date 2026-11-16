@@ -5,13 +5,13 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::Schema;
 use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
 use crate::connection::{DeltaCursor, RawBlock, ScanReply, SubId, Target};
 use crate::error::ClientError;
 use crate::host::Sent;
 use crate::mirror::PollOutcome;
-use crate::Schema;
 use gnitz_wire::txn_frame::kept_as;
 
 /// What a sync hands a reader for one of its subscriptions.

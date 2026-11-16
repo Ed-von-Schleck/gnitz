@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use super::*;
-use crate::{AggDescriptor, AggFunc, PkColList, TypeCode, MAX_COLUMNS};
+use crate::{AggDescriptor, AggFunc, MAX_COLUMNS, PkColList, TypeCode};
 
 fn sample_order() -> Vec<OrderKey> {
     vec![
@@ -149,9 +149,11 @@ fn a_pk_probe_round_trips() {
     assert_eq!(PkKeys::decode_probe(&blob), Ok(keys));
     assert!(PkKeys::decode_probe(&[blob, vec![0]].concat()).is_err());
     assert!(PkKeys::decode_probe(&[]).is_err());
-    assert!(PkKeys::decode_probe(&[BoundTag::None.as_wire()])
-        .unwrap_err()
-        .contains("PkSet"));
+    assert!(
+        PkKeys::decode_probe(&[BoundTag::None.as_wire()])
+            .unwrap_err()
+            .contains("PkSet")
+    );
 }
 
 /// A list longer than any 16-bit count round-trips whole: the frame is the only

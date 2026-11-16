@@ -1,4 +1,4 @@
-use super::{flush_barrier, Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
+use super::{Cut, DEFAULT_RAM_TIER_BYTES, RecoverySource, flush_barrier};
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, mix, new_table, scratch_table, table_shards,
 };

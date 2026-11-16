@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use gnitz_core::{block_on, BatchAppender, Catalog, GnitzClient, RelName, ZSetBatch};
+use gnitz_core::{BatchAppender, Catalog, GnitzClient, RelName, ZSetBatch, block_on};
 use gnitz_sql::SqlResult;
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{Circuit, OpNode, ReadBound, RelClass, WireConflictMode};

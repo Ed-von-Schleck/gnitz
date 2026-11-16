@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::{BatchBuilder, MemBatch};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    edge_native, le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, random_schema,
-    u64_pk_schema, Rng, STRS,
+    Rng, STRS, edge_native, le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, random_schema,
+    u64_pk_schema,
 };
 use gnitz_wire::TypeCode;
 

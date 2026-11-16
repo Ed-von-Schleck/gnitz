@@ -121,12 +121,12 @@ impl TableProps {
     /// The rules against a PK of `pk_len` columns that the flags word cannot
     /// encode.
     pub fn validate(&self, pk_len: usize) -> Result<(), String> {
-        if let TableDistribution::Keyed { prefix_len } = self.distribution {
-            if prefix_len as usize > pk_len {
-                return Err(format!(
-                    "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
-                ));
-            }
+        if let TableDistribution::Keyed { prefix_len } = self.distribution
+            && prefix_len as usize > pk_len
+        {
+            return Err(format!(
+                "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
+            ));
         }
         if self.compress && self.stream {
             return Err("a stream cannot be compressed: it holds no rows".to_string());

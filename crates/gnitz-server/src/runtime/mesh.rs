@@ -29,7 +29,7 @@ use crate::runtime::park::{Park, WorkerParks, WorkerSet};
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
+use gnitz_zset::repr::{Batch, MemBatch, merge_consolidated};
 use gnitz_zset::schema::SchemaDescriptor;
 use smallvec::SmallVec;
 

@@ -2,7 +2,7 @@
 //! representations, which [`CalendarOp`] selects. The representations, the
 //! civil-calendar conversions and the text forms are `gnitz-wire`'s.
 
-use gnitz_wire::{civil_from_days, days_from_civil, MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
+use gnitz_wire::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC, civil_from_days, days_from_civil};
 
 /// Monday = 1 … Sunday = 7.
 const fn iso_dow(days: i64) -> i64 {

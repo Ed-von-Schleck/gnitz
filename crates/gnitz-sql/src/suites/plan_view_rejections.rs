@@ -3,7 +3,7 @@
 //! the substring names the rule, never the sentence.
 
 use super::*;
-use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{ColType, ColumnDef, PK_LIST_MAX_COLS, RelClass, TypeCode};
 
 /// [`base`] plus the shapes the rejections need: `w` (a second typed table),
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
@@ -289,37 +289,118 @@ fn subquery_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.v > 5)", "hoist it into the view's own WHERE"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "match-existence"),
-            ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "match-existence"),
-            ("SELECT * FROM a WHERE v = 1 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "match-existence"),
-            ("SELECT a.id FROM a WHERE a.v < ANY (SELECT v FROM n)", "must be NOT NULL"),
+            (
+                "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.v > 5)",
+                "hoist it into the view's own WHERE",
+            ),
+            (
+                "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)",
+                "match-existence",
+            ),
+            (
+                "SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)",
+                "match-existence",
+            ),
+            (
+                "SELECT * FROM a WHERE v = 1 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)",
+                "match-existence",
+            ),
+            (
+                "SELECT a.id FROM a WHERE a.v < ANY (SELECT v FROM n)",
+                "must be NOT NULL",
+            ),
             ("SELECT * FROM n WHERE k NOT IN (SELECT k FROM b)", "NOT NULL"),
             ("SELECT * FROM a WHERE k NOT IN (SELECT k FROM n)", "NOT NULL"),
             ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "tuple"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "needs at least one equijoin"),
-            ("SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k", "GROUP BY/aggregates"),
-            ("SELECT k, COUNT(*) FROM a GROUP BY k HAVING COUNT(*) > (SELECT COUNT(*) FROM b)", "HAVING: a subquery is not supported together with GROUP BY/aggregates"),
-            ("SELECT DISTINCT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", "a subquery is not supported together with SELECT DISTINCT"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "single FROM table without JOINs"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)", "GROUP BY"),
-            ("SELECT a.id FROM a WHERE EXISTS (SELECT COUNT(*) FROM b WHERE b.k = a.k)", "aggregate subquery returns one row"),
-            ("SELECT a.id FROM a WHERE NOT EXISTS (SELECT COUNT(*) FROM b WHERE b.k = a.k)", "aggregate subquery returns one row"),
-            ("SELECT a.id, EXISTS (SELECT 1 + SUM(w) FROM b WHERE b.k = a.k) AS e FROM a", "aggregate subquery returns one row"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS (SELECT 1 FROM b AS z WHERE z.k = b.w))", "nested subqueries"),
-            ("SELECT * FROM a WHERE k IN (SELECT k, w FROM b)", "exactly one plain column"),
-            ("SELECT * FROM a AS t WHERE EXISTS (SELECT 1 FROM b AS t WHERE t.k = t.k)", "rename one"),
-            ("SELECT id FROM n WHERE n.k IN (SELECT k FROM b) OR n.v = 1", "IN (SELECT …) in a mark position"),
-            ("SELECT id, k IN (SELECT k FROM b) AS f FROM n", "IN (SELECT …) in a mark position"),
+            (
+                "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)",
+                "needs at least one equijoin",
+            ),
+            (
+                "SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k",
+                "GROUP BY/aggregates",
+            ),
+            (
+                "SELECT k, COUNT(*) FROM a GROUP BY k HAVING COUNT(*) > (SELECT COUNT(*) FROM b)",
+                "HAVING: a subquery is not supported together with GROUP BY/aggregates",
+            ),
+            (
+                "SELECT DISTINCT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+                "a subquery is not supported together with SELECT DISTINCT",
+            ),
+            (
+                "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)",
+                "single FROM table without JOINs",
+            ),
+            (
+                "SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)",
+                "GROUP BY",
+            ),
+            (
+                "SELECT a.id FROM a WHERE EXISTS (SELECT COUNT(*) FROM b WHERE b.k = a.k)",
+                "aggregate subquery returns one row",
+            ),
+            (
+                "SELECT a.id FROM a WHERE NOT EXISTS (SELECT COUNT(*) FROM b WHERE b.k = a.k)",
+                "aggregate subquery returns one row",
+            ),
+            (
+                "SELECT a.id, EXISTS (SELECT 1 + SUM(w) FROM b WHERE b.k = a.k) AS e FROM a",
+                "aggregate subquery returns one row",
+            ),
+            (
+                "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS (SELECT 1 FROM b AS z WHERE z.k = b.w))",
+                "nested subqueries",
+            ),
+            (
+                "SELECT * FROM a WHERE k IN (SELECT k, w FROM b)",
+                "exactly one plain column",
+            ),
+            (
+                "SELECT * FROM a AS t WHERE EXISTS (SELECT 1 FROM b AS t WHERE t.k = t.k)",
+                "rename one",
+            ),
+            (
+                "SELECT id FROM n WHERE n.k IN (SELECT k FROM b) OR n.v = 1",
+                "IN (SELECT …) in a mark position",
+            ),
+            (
+                "SELECT id, k IN (SELECT k FROM b) AS f FROM n",
+                "IN (SELECT …) in a mark position",
+            ),
             ("SELECT id FROM n WHERE NOT (k IN (SELECT k FROM b))", "NOT NULL"),
-            ("SELECT id FROM n WHERE (k IN (SELECT k FROM b)) IS NULL", "IN (SELECT …) in a mark position"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k GROUP BY b.w) FROM a", "GROUP BY"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k < a.k) FROM a", "range correlation"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k) FROM a", "single FROM table without JOINs"),
-            ("SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)", "scalar subqueries are not supported"),
-            ("SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a", "single aggregate over its correlation group"),
-            ("SELECT a.v FROM a WHERE a.k = ALL (SELECT k FROM b)", "`= ALL (SELECT …)` is not supported"),
-            ("SELECT a.v FROM a WHERE a.k <> ANY (SELECT k FROM b)", "`<> ANY (SELECT …)` is not supported"),
+            (
+                "SELECT id FROM n WHERE (k IN (SELECT k FROM b)) IS NULL",
+                "IN (SELECT …) in a mark position",
+            ),
+            (
+                "SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k GROUP BY b.w) FROM a",
+                "GROUP BY",
+            ),
+            (
+                "SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k < a.k) FROM a",
+                "range correlation",
+            ),
+            (
+                "SELECT a.id, (SELECT COUNT(*) FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k) FROM a",
+                "single FROM table without JOINs",
+            ),
+            (
+                "SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)",
+                "scalar subqueries are not supported",
+            ),
+            (
+                "SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a",
+                "single aggregate over its correlation group",
+            ),
+            (
+                "SELECT a.v FROM a WHERE a.k = ALL (SELECT k FROM b)",
+                "`= ALL (SELECT …)` is not supported",
+            ),
+            (
+                "SELECT a.v FROM a WHERE a.k <> ANY (SELECT k FROM b)",
+                "`<> ANY (SELECT …)` is not supported",
+            ),
         ],
     );
 }

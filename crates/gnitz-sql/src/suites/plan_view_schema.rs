@@ -2,7 +2,7 @@
 //! key slots, nullability, type codes and the PK column set — planned with no
 //! server against a hand-built catalog.
 
-use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{ColType, ColumnDef, PK_LIST_MAX_COLS, RelClass, TypeCode};
 use std::sync::Arc;
 
 use super::*;
@@ -700,7 +700,7 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
 /// keeps the nullability its leaf answers for it, whatever minted it.
 #[test]
 fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
-    use TypeCode::{String as Str, F32, F64, I16, I32, I64};
+    use TypeCode::{F32, F64, I16, I32, I64, String as Str};
     let cat = catalog(vec![
         ("o", table(30, vec![col("id", I64), col("k", I64)], vec![0])),
         (

@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::storage::Table;
 
-use gnitz_zset::repr::{merge_consolidated, Batch, StoredRow};
+use gnitz_zset::repr::{Batch, StoredRow, merge_consolidated};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// How a base table's write meets its unique PK.

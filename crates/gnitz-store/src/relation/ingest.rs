@@ -1,8 +1,8 @@
 //! The write path: unique-PK enforcement, store + secondary-index application,
 //! delta capture, the seal, and the checkpoint rounds.
 
-use super::store::{not_held, Rows};
-use super::unique_pk::{under_pk_rule, PkRule};
+use super::store::{Rows, not_held};
+use super::unique_pk::{PkRule, under_pk_rule};
 use super::{CircuitState, Relation, RelationKind, RelationRegistry, SecondaryIndex};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};

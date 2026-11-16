@@ -1,7 +1,7 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
-use crate::test_support::{rekey_plan, TestTrace};
+use crate::test_support::{TestTrace, rekey_plan};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{NullKeys, RangeRel, TypeCode};
 

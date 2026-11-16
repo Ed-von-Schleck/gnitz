@@ -33,17 +33,17 @@ mod route;
 mod sink;
 
 pub use exchange::ScatterPlan;
-pub use index_entry::{extend_spans, index_entries, KeySpec};
+pub use index_entry::{KeySpec, extend_spans, index_entries};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
-pub use route::{ground_owner, Placement, Slot};
+pub use route::{Placement, Slot, ground_owner};
 pub use sink::SinkPlan;
 
-pub(crate) use aggregate::{resolve_aggs, Agg, AggValues, RangeGroups, ReduceShape};
-pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey, GroupScratch, OutPk};
+pub(crate) use aggregate::{Agg, AggValues, RangeGroups, ReduceShape, resolve_aggs};
+pub(crate) use group_key::{GroupOrdinals, GroupOutKey, GroupScratch, OutPk, ground_pk};
 pub(crate) use key_pack::KeyPacker;
 pub(crate) use map::copy_columns;
-pub(crate) use order_image::{image_slot_col, ImageCol, IMAGE_COL};
+pub(crate) use order_image::{IMAGE_COL, ImageCol, image_slot_col};
 
 /// `v` as `n` zeros: freshly allocated zeroed where it lacks the room, else
 /// overwritten in place.

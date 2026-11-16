@@ -1,8 +1,8 @@
 //! Access tokens, `gnitz_` and 64 random hex digits, and the file `--auth-tokens`
 //! names: one `<name> <sha256-hex>` line per token, holding no token itself.
 
-use ring::digest::{digest, SHA256};
-use ring::rand::{generate, SystemRandom};
+use ring::digest::{SHA256, digest};
+use ring::rand::{SystemRandom, generate};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use gnitz_foundation::posix_io::write_file_durable;

@@ -2,9 +2,9 @@
 //! and the engine compiles, the graph they make up, and the codec that lays a
 //! whole circuit out as one catalog cell.
 
-use crate::codec::{decode_all, Reader, Writer};
-use crate::operator::{col_list, order_keys, ComputeMap, GroupAggs, OrderKey};
-use crate::{TypeCode, MAX_COLUMNS};
+use crate::codec::{Reader, Writer, decode_all};
+use crate::operator::{ComputeMap, GroupAggs, OrderKey, col_list, order_keys};
+use crate::{MAX_COLUMNS, TypeCode};
 
 // ---------------------------------------------------------------------------
 // Circuit opcodes
@@ -491,7 +491,7 @@ impl Circuit {
     }
 
     /// Every node reading `nid`, in topological order.
-    pub fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    pub fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> {
         (nid + 1..self.nodes.len()).filter(move |&n| self.inputs(n).contains(&nid))
     }
 
@@ -502,7 +502,7 @@ impl Circuit {
     }
 
     /// Every relation the circuit scans, once per scan.
-    pub fn sources(&self) -> impl Iterator<Item = u64> + '_ {
+    pub fn sources(&self) -> impl Iterator<Item = u64> {
         self.nodes.iter().filter_map(|n| match n.op {
             OpNode::ScanDelta { source, .. } => Some(source),
             _ => None,

@@ -41,7 +41,7 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn exchange_route_bench() {
-    use TypeCode::{I128, I64, U128, U16, U64, U8};
+    use TypeCode::{I64, I128, U8, U16, U64, U128};
     let instructions = gnitz_foundation::perf::Counter::instructions();
     let (one, two) = (make_schema_u64_i64(), pk_u64_two_i64_schema());
     let wide = pk_payload_schema(&[U64; 3]);

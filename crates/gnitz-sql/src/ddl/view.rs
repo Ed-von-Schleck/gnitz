@@ -5,10 +5,10 @@
 use super::options::decode_view_options;
 use super::view_def::{RelationRef, ViewDefinition};
 use crate::catalog::Catalog;
-use crate::error::{reject_if, GnitzSqlError};
+use crate::error::{GnitzSqlError, reject_if};
 use crate::hir::{BoundRef, LoweredView, ViewBody};
 use crate::names::extract_object_name;
-use crate::rules::{require_class, ClassWant};
+use crate::rules::{ClassWant, require_class};
 use crate::source::StatementText;
 use gnitz_core::{RelName, ViewBundle};
 use gnitz_wire::{ViewBudget, ViewProps};

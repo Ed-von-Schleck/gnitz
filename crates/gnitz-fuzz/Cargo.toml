@@ -3,6 +3,7 @@ name = "gnitz-fuzz"
 description = "Fuzzing gnitz through everything a network delivers"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

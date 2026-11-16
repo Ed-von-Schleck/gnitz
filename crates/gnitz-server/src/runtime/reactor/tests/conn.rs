@@ -274,7 +274,7 @@ fn a_connection_past_its_share_holds_off_and_refuses_no_other() {
     r.spawn(async move {
         while let Some(frame) = conn.recv().await {
             assert_eq!(frame.as_slice().len(), FRAME);
-            n.set(n.get() + 1);
+            n.update(|v| v + 1);
         }
     });
     assert!(

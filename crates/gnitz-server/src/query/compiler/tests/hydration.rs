@@ -1,6 +1,6 @@
 use super::*;
 use crate::query::compiler::fixtures::{
-    compile, count_by, predicate, rejection, scan, sources, tables_at, Build, Source,
+    Build, Source, compile, count_by, predicate, rejection, scan, sources, tables_at,
 };
 use crate::test_support::{make_schema_u64_i64, map_copy, reindexed_on_col1};
 use gnitz_wire::{Circuit, JoinKind, TypeCode};

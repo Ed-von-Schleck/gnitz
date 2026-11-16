@@ -5,7 +5,7 @@
 //! `CIRCUIT_VERSION`, which moves `WIRE_VERSION` through `SYS_SCHEMA_DIGEST`.
 
 use crate::codec::{Reader, Wire, Writer};
-use crate::{ScalarKind, TypeCode, MAX_COLUMNS};
+use crate::{MAX_COLUMNS, ScalarKind, TypeCode};
 
 wire_enum! {
     /// Aggregate function discriminant. The values are durable catalog state and
@@ -45,11 +45,7 @@ impl AggFunc {
     /// The op a reduce folds this aggregate's own output with: linear partials add,
     /// extremes compete.
     pub const fn merge_op(self) -> AggFunc {
-        if self.is_linear() {
-            AggFunc::Sum
-        } else {
-            self
-        }
+        if self.is_linear() { AggFunc::Sum } else { self }
     }
 
     /// True iff a reduce's raw output column for this aggregate can hold NULL.
@@ -123,7 +119,7 @@ pub struct GroupAggs {
 impl GroupAggs {
     /// Every input column the aggregation reads: its group columns, then each
     /// aggregate's.
-    pub fn cols(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn cols(&self) -> impl Iterator<Item = u32> {
         let aggs = self.aggs.iter().map(|a| a.col_idx);
         self.group_cols.iter().copied().chain(aggs)
     }

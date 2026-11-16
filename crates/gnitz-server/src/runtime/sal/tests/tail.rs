@@ -1,7 +1,7 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::sal::fixtures::{scan, test_log, unanswered, zone_rows};
-use crate::runtime::sal::format::{anchor_word, RequestHead, PREFIX_BYTES};
+use crate::runtime::sal::format::{PREFIX_BYTES, RequestHead, anchor_word};
 use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Routed, SalWriter};
 use crate::test_support::sweep_bit_flips;

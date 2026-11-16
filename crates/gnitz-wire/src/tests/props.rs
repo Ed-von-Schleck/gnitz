@@ -45,9 +45,11 @@ fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
         );
     }
     // The one state the packing can hold and `TableProps` cannot.
-    assert!(TableProps::from_flags(0b01 | 2 << 8)
-        .unwrap_err()
-        .contains("mutually exclusive"));
+    assert!(
+        TableProps::from_flags(0b01 | 2 << 8)
+            .unwrap_err()
+            .contains("mutually exclusive")
+    );
 }
 
 /// `validate` refuses what the flags word can hold but the table cannot: a
@@ -67,10 +69,12 @@ fn table_props_validate_refuses_what_the_pk_cannot_carry() {
     let stream = TableProps { stream: true, ..serial };
     assert!(stream.validate(1).unwrap_err().contains("a stream cannot be SERIAL"));
     let compressed = TableProps { compress: true, ..stream };
-    assert!(compressed
-        .validate(1)
-        .unwrap_err()
-        .contains("a stream cannot be compressed"));
+    assert!(
+        compressed
+            .validate(1)
+            .unwrap_err()
+            .contains("a stream cannot be compressed")
+    );
 }
 
 /// `cluster_by` gives a keyed distribution the prefix, and refuses one on a
@@ -84,8 +88,10 @@ fn cluster_by_takes_a_prefix_only_on_a_keyed_distribution() {
         TableDistribution::Replicated.cluster_by(0),
         Ok(TableDistribution::Replicated)
     );
-    assert!(TableDistribution::Replicated
-        .cluster_by(2)
-        .unwrap_err()
-        .contains("(k=2)"));
+    assert!(
+        TableDistribution::Replicated
+            .cluster_by(2)
+            .unwrap_err()
+            .contains("(k=2)")
+    );
 }

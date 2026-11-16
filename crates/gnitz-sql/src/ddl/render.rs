@@ -85,18 +85,18 @@ pub fn create_table_statement(catalog: &Catalog, rel: &CatalogRelation) -> Resul
         lines.join(",\n    ")
     );
     out.push_str(&with_clause(&rel.props));
-    if let TableDistribution::Keyed { prefix_len } = props.distribution {
-        if prefix_len > 0 {
-            let prefix = &rel.column_names(&rel.pk)[..usize::from(prefix_len).min(pk.len())];
-            out.push_str(&format!(" CLUSTER BY {}", column_list(prefix.iter().copied())));
-        }
+    if let TableDistribution::Keyed { prefix_len } = props.distribution
+        && prefix_len > 0
+    {
+        let prefix = &rel.column_names(&rel.pk)[..usize::from(prefix_len).min(pk.len())];
+        out.push_str(&format!(" CLUSTER BY {}", column_list(prefix.iter().copied())));
     }
     Ok(out)
 }
 
 /// The `CREATE INDEX` statements of every index of `rel` that its own `CREATE`
 /// statement does not declare: a view's every index, a table's non-unique ones.
-pub fn create_index_statements(rel: &CatalogRelation) -> impl Iterator<Item = String> + '_ {
+pub fn create_index_statements(rel: &CatalogRelation) -> impl Iterator<Item = String> {
     let view = matches!(rel.props, RelProps::View(_));
     rel.indexes
         .iter()

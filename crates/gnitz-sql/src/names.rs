@@ -1,9 +1,9 @@
 //! How SQL text spells a name, both ways: a name written so it reads back as
 //! itself, and a written name read as the relation or index it names.
 
-use crate::error::{reject_if, GnitzSqlError};
-use crate::rules::canonical_user_name;
 use crate::GnitzDialect;
+use crate::error::{GnitzSqlError, reject_if};
+use crate::rules::canonical_user_name;
 use gnitz_core::RelName;
 use sqlparser::ast::{Expr, Ident, ObjectName, SelectItem, Spanned, TableAliasColumnDef, TableFactor};
 use sqlparser::parser::Parser;
@@ -148,8 +148,9 @@ pub(crate) fn extract_table_ref<'a>(
     let sqlparser::ast::TableFactor::Table {
         name,
         alias,
-        with_hints: _,  // advisory locking hints (T-SQL WITH (NOLOCK)): no result impact
-        index_hints: _, // advisory index hints (MySQL USE/FORCE INDEX): no result impact
+        with_hints: _,       // advisory locking hints (T-SQL WITH (NOLOCK)): no result impact
+        index_directives: _, // advisory index hints (USE/FORCE INDEX, INDEXED BY): no result impact
+        inheritance: _,      // ONLY / `*`: gnitz has no table inheritance, so no result impact
         args,
         version,
         with_ordinality,

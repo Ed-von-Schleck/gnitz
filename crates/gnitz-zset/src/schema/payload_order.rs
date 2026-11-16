@@ -4,9 +4,9 @@
 
 use std::cmp::Ordering;
 
-use super::key::compare_pk_ordering;
 use super::SchemaDescriptor;
-use gnitz_wire::{cmp_col_window, compare_german_strings, native_key_image, null_word_get, RowSource};
+use super::key::compare_pk_ordering;
+use gnitz_wire::{RowSource, cmp_col_window, compare_german_strings, native_key_image, null_word_get};
 
 /// A payload row order. Generic over both sources, so one selected order also
 /// compares rows of two source types, as the read cursor does a run's row

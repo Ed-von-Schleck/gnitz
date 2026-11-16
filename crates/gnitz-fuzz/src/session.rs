@@ -13,16 +13,16 @@
 //! arriving means the request before it was answered whole, however many
 //! frames that took — which only the client that built the request knows.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant};
 
-use gnitz_core::{block_on, ClientError, ClientTransport, GnitzClient, RelName};
+use gnitz_core::{ClientError, ClientTransport, GnitzClient, RelName, block_on};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{
-    append_frame, peek_control_block, ClientVerb, ControlHeader, ReadBound, ReadSpec, Target, WireStatus,
-    CATALOG_ID_CEILING,
+    CATALOG_ID_CEILING, ClientVerb, ControlHeader, ReadBound, ReadSpec, Target, WireStatus, append_frame,
+    peek_control_block,
 };
 
 use crate::input::Input;

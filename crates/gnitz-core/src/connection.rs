@@ -11,18 +11,18 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use crate::batch::{decode_wal_blocks, parse_wal_block};
 use crate::error::ClientError;
-use crate::host::{promise, Host, Promise, Sent};
+use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
-use crate::{sys_schema, ClientTransport, ProtocolError, Schema, ZSetBatch};
-use gnitz_wire::txn_frame::{self, encode_items, kept_as, FrameItem};
+use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch, sys_schema};
+use gnitz_wire::txn_frame::{self, FrameItem, encode_items, kept_as};
 use gnitz_wire::{
-    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob,
-    RelIndex, WireConflictMode, WireLane, WireStatus, CONNECT_TIMEOUT,
+    CONNECT_TIMEOUT, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob, RelIndex,
+    WireConflictMode, WireLane, WireStatus, append_frame, peek_control_block,
 };
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
@@ -461,7 +461,7 @@ impl Inbox {
             _ if in_train => {
                 return Err(ProtocolError::DecodeError(
                     "a pushed train split by a frame that is not of it".into(),
-                ))
+                ));
             }
             WireLane::PushedTrain => {
                 let h = &ctrl.hdr;
@@ -1020,15 +1020,15 @@ impl Slot {
                 None => {
                     return Err(ProtocolError::DecodeError(
                         "a data block on a reply that carries no rows".into(),
-                    ))
+                    ));
                 }
             },
         }
 
-        if let Slot::Page { train, worker_ends, .. } = &mut *self {
-            if ctrl.hdr.flags.scan_last {
-                worker_ends.push(train.rows);
-            }
+        if let Slot::Page { train, worker_ends, .. } = &mut *self
+            && ctrl.hdr.flags.scan_last
+        {
+            worker_ends.push(train.rows);
         }
         if ctrl.hdr.flags.continuation {
             return Ok(false);

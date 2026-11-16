@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 
 use smallvec::SmallVec;
 
-use super::violation::{pk_violation_err, Clash};
+use super::violation::{Clash, pk_violation_err};
 use super::*;
 
 use crate::catalog::RowConstraints;
@@ -120,7 +120,7 @@ impl<'a> TxnBundle<'a> {
                                     // Existence is cumulative in frame order, and a
                                     // cascade's families come later and only delete.
                                     FoldOp::Inserted(..) => {
-                                        return Err(pk_violation_err(cat, tid, &schema, pk, Clash::Committed))
+                                        return Err(pk_violation_err(cat, tid, &schema, pk, Clash::Committed));
                                     }
                                     FoldOp::Deleted => {}
                                 }
@@ -166,7 +166,7 @@ impl<'a> TxnBundle<'a> {
     }
 
     /// The rows of `tid` that survive the whole bundle: `(pk, family, row)`.
-    pub(super) fn surviving(&self, tid: u64) -> impl Iterator<Item = (&'a [u8], u32, u32)> + '_ {
+    pub(super) fn surviving(&self, tid: u64) -> impl Iterator<Item = (&'a [u8], u32, u32)> {
         self.table(tid).fold.iter().filter_map(|(pk, e)| match e.last {
             FoldOp::Inserted(f, r) => Some((*pk, f, r)),
             FoldOp::Deleted => None,

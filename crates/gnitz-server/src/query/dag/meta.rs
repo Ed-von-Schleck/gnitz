@@ -190,7 +190,7 @@ impl DagEngine {
 
     /// The relations `view_id` scans directly, each once, in its plan's scan order.
     /// Empty when it is no registered view.
-    pub(crate) fn sources_of(&self, view_id: u64) -> impl Iterator<Item = u64> + '_ {
+    pub(crate) fn sources_of(&self, view_id: u64) -> impl Iterator<Item = u64> {
         self.views.get(&view_id).into_iter().flat_map(|v| v.code.source_ids())
     }
 

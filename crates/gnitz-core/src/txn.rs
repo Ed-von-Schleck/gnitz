@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_expr::{leading_pk, LogicalProgram, RowFilter};
+use gnitz_expr::{LogicalProgram, RowFilter, leading_pk};
 use gnitz_wire::txn_frame::BLIND;
 use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
 

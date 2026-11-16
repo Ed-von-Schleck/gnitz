@@ -18,7 +18,7 @@ use gnitz_wire::GroupAggs;
 
 use super::agg::{AggValues, RangeGroups};
 use super::shape::ReduceShape;
-use crate::algebra::group_key::{ground_pk, GroupNumbers, GroupOutKey, IdentityLoop};
+use crate::algebra::group_key::{GroupNumbers, GroupOutKey, IdentityLoop, ground_pk};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
 

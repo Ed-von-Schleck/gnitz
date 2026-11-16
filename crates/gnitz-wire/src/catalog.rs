@@ -56,7 +56,7 @@ pub struct WireSysFamily {
 impl WireSysFamily {
     /// The family's columns as the column definitions every schema of it is
     /// built from: non-nullable, as every system column is.
-    pub fn column_defs(&self) -> impl Iterator<Item = ColumnDef> + '_ {
+    pub fn column_defs(&self) -> impl Iterator<Item = ColumnDef> {
         self.cols.iter().map(|c| ColumnDef::new(c.name, c.type_code, false))
     }
 }

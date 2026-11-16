@@ -1,6 +1,6 @@
 use super::*;
-use crate::test_support::{pk_only_schema, pk_payload_schema, Rng};
-use gnitz_wire::{key_image, PkBuf, PkColList, TypeCode};
+use crate::test_support::{Rng, pk_only_schema, pk_payload_schema};
+use gnitz_wire::{PkBuf, PkColList, TypeCode, key_image};
 
 /// The largest worker count a server launches.
 const NW_MAX: usize = 64;

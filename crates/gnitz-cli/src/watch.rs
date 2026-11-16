@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use gnitz_core::{block_on, ClientError, ScanReply, SubId, Subscription};
+use gnitz_core::{ClientError, ScanReply, SubId, Subscription, block_on};
 use gnitz_sql::GnitzSqlError;
 use gnitz_wire::WireStatus;
 use nu_ansi_term::{Color, Style};
 
-use crate::render::{paint, render, Target, Weights};
+use crate::render::{Target, Weights, paint, render};
 use crate::settings::{Expanded, Format, Settings};
 use crate::shell::{Failed, Shell};
 use crate::value::Rows;

@@ -6,9 +6,9 @@
 use std::convert::Infallible;
 
 use crate::agg::{AggArg, AggFunc};
-use crate::ast_util::{classify_agg_call, col_ref_parts, peel_nested, single_part_ident, CallSurface, PlainCall};
-use crate::error::{reject_if, GnitzSqlError};
-use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, LeafTyping, NumFunc, NumLit, StrArg, StrFunc, TrimMode, BOOL};
+use crate::ast_util::{CallSurface, PlainCall, classify_agg_call, col_ref_parts, peel_nested, single_part_ident};
+use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
+use crate::ir::{BExpr, BOOL, BinOp, BoundExpr, FloatUnaryOp, LeafTyping, NumFunc, NumLit, StrArg, StrFunc, TrimMode};
 use crate::literal::{decimal_of_number_text, invalid_literal, parse_bool, parse_temporal};
 use crate::rules::single_relation_col_idx;
 use crate::types::sql_col_type;
@@ -16,8 +16,8 @@ use gnitz_core::Schema;
 use gnitz_expr::{CalendarOp, LikePattern};
 use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
-    UnaryOperator, Value, ValueWithSpan, WindowType,
+    BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, InTarget, TrimWhereField,
+    TypedString, UnaryOperator, Value, WindowType,
 };
 
 /// A WHERE / ON clause as its bound conjunct list — the one home of that shape,
@@ -85,10 +85,10 @@ fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
             if let Ok(i) = n.parse::<i64>() {
                 return Ok(BExpr::LitInt(i));
             }
-            if n.bytes().all(|b| b.is_ascii_digit()) {
-                if let Ok(mag) = n.parse::<u128>() {
-                    return Ok(BExpr::LitWide(NumLit { mag, neg: false }));
-                }
+            if n.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(mag) = n.parse::<u128>()
+            {
+                return Ok(BExpr::LitWide(NumLit { mag, neg: false }));
             }
             n.parse::<f64>()
                 .map(|v| BExpr::LitFloat { v, dec: decimal_of_number_text(n) })
@@ -216,10 +216,8 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
             kind: _,
             expr: e,
             data_type,
-            array,
             format,
         } => {
-            reject_if(*array, "CAST", "an ARRAY target type")?;
             reject_if(format.is_some(), "CAST", "FORMAT")?;
             bind_cast(bind_structural(e, leaf)?, data_type)
         }
@@ -315,7 +313,7 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
             escape_char,
         } => {
             reject_if(*any, "LIKE", "ANY")?;
-            let escape = like_escape(escape_char.as_ref())?;
+            let escape = like_escape(escape_char.as_deref())?;
             let node = BExpr::Like {
                 s: Box::new(bind_structural(subject, leaf)?),
                 pattern: like_pattern(pattern, escape)?,
@@ -401,7 +399,13 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
         // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above. Two or
         // more items keep the faithful `InList` node for lowering to shape. `NOT IN`
         // wraps whichever node the arity picked.
-        Expr::InList { expr: e, list, negated } => {
+        Expr::In { global: true, .. } => Err(unsupported_clause("IN", "GLOBAL")),
+        Expr::In {
+            expr: e,
+            target: InTarget::List(list),
+            negated,
+            global: false,
+        } => {
             let node = match list.as_slice() {
                 [] => return Err(GnitzSqlError::Rejected("IN with an empty list".into())),
                 [only] => BExpr::bin(bind_structural(e, leaf)?, BinOp::Eq, bind_structural(only, leaf)?),
@@ -416,9 +420,11 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
             Ok(maybe_negate(node, *negated))
         }
         // Subquery placement is the leaf's decision.
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
-            leaf.bind_subquery(expr)
-        }
+        Expr::Exists { .. }
+        | Expr::In { target: InTarget::Subquery(_), .. }
+        | Expr::Subquery(_)
+        | Expr::AnyOp { .. }
+        | Expr::AllOp { .. } => leaf.bind_subquery(expr),
         // Rendered as SQL, never `Debug`: the parser's `Debug` is a wall of
         // spans, and the reader wants the form they wrote.
         _ => Err(GnitzSqlError::Rejected(format!("expression not supported: {expr}"))),
@@ -439,11 +445,7 @@ fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
 /// The `NOT` wrapper the negatable predicates (BETWEEN, IN, LIKE, a subquery's
 /// `NOT EXISTS` / `NOT IN`) share.
 pub(crate) fn maybe_negate<R>(node: BExpr<R>, negated: bool) -> BExpr<R> {
-    if negated {
-        BExpr::Not(Box::new(node))
-    } else {
-        node
-    }
+    if negated { BExpr::Not(Box::new(node)) } else { node }
 }
 
 /// The string a compile-time-data position (TRIM's byte set, LIKE's pattern)
@@ -468,13 +470,7 @@ pub(crate) fn bind_constant(e: &Expr) -> Result<BExpr<Infallible>, GnitzSqlError
             op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
             expr,
         } => bind_unary(op, bind_constant(expr)?)?,
-        Expr::Cast {
-            expr,
-            data_type,
-            array: false,
-            format: None,
-            kind: _,
-        } => bind_cast(bind_constant(expr)?, data_type)?,
+        Expr::Cast { expr, data_type, format: None, kind: _ } => bind_cast(bind_constant(expr)?, data_type)?,
         _ => return Err(not_constant()),
     };
     lit.is_literal().then_some(lit).ok_or_else(not_constant)
@@ -490,14 +486,10 @@ fn like_pattern(pattern: &Expr, escape: Option<char>) -> Result<LikePattern, Gni
 }
 
 /// `\` by default, as in PostgreSQL and MySQL; `None` for `ESCAPE ''`.
-fn like_escape(escape_char: Option<&ValueWithSpan>) -> Result<Option<char>, GnitzSqlError> {
-    let Some(v) = escape_char else { return Ok(Some('\\')) };
+fn like_escape(escape_char: Option<&Expr>) -> Result<Option<char>, GnitzSqlError> {
+    let Some(e) = escape_char else { return Ok(Some('\\')) };
     let bad = || GnitzSqlError::Rejected("LIKE: ESCAPE must be a single character or ''".into());
-    // A `ValueWithSpan`, not an `Expr`: the parser puts the escape in its own
-    // slot, so there is no sign or parenthesis to peel.
-    let Value::SingleQuotedString(s) = &v.value else {
-        return Err(bad());
-    };
+    let s = literal_expr_string(e).ok_or_else(bad)?;
     let mut chars = s.chars();
     match (chars.next(), chars.next()) {
         (None, _) => Ok(None),

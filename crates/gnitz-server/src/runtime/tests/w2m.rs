@@ -25,18 +25,22 @@ fn an_empty_ring_starts_over_at_its_head() {
     let (mut writer, recv) = make_ring(MSG, 8, 8);
     for round in 0..3u8 {
         let at = recv.write_cursor(0);
-        assert!(writer
-            .try_publish(id(round as u32 + 1), false, MSG, |slot| {
-                let origin = recv.header(0).origin.load(Ordering::Acquire);
-                assert_eq!(origin, at, "round {round}: the origin moves first");
-                assert_eq!(recv.write_cursor(0), at, "and the message is not yet published");
-                slot.fill(round * 2);
-            })
-            .is_ok());
+        assert!(
+            writer
+                .try_publish(id(round as u32 + 1), false, MSG, |slot| {
+                    let origin = recv.header(0).origin.load(Ordering::Acquire);
+                    assert_eq!(origin, at, "round {round}: the origin moves first");
+                    assert_eq!(recv.write_cursor(0), at, "and the message is not yet published");
+                    slot.fill(round * 2);
+                })
+                .is_ok()
+        );
         // The second one is published into a ring that holds the first.
-        assert!(writer
-            .try_publish(id(1), false, MSG, |slot| slot.fill(round * 2 + 1))
-            .is_ok());
+        assert!(
+            writer
+                .try_publish(id(1), false, MSG, |slot| slot.fill(round * 2 + 1))
+                .is_ok()
+        );
         let first = recv.try_read_slot(0).expect("the first message");
         assert_eq!(first.request_id.get(), round as u32 + 1);
         assert_eq!(first.frame_bytes(), gnitz_wire::framed(&[round * 2; MSG]));

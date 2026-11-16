@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use gnitz_wire::ClampKind;
 
-use crate::repr::{materialize_carrying, with_picks, Batch};
+use crate::repr::{Batch, materialize_carrying, with_picks};
 use crate::stream::History;
 
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −

@@ -40,7 +40,9 @@ pub(crate) fn char_offset(s: &[u8], mut n: usize) -> usize {
     }
     // Character 0 begins at byte 0.
     let mut i = 1;
-    while let Some(w) = s.get(i..i + 8).filter(|_| n >= WORD_SKIP_MIN) {
+    while n >= WORD_SKIP_MIN
+        && let Some(w) = s.get(i..i + 8)
+    {
         let c = starts_in(w.try_into().unwrap());
         if c >= n {
             break;

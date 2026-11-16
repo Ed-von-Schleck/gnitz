@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::rel;
-use crate::{sys_schema, BatchAppender};
+use crate::{BatchAppender, sys_schema};
 use gnitz_wire::{ColumnDef, FkAction, FkRef, ReadBound, SysRow, TableDistribution, TypeCode, ViewBudget};
 use std::num::NonZeroU64;
 

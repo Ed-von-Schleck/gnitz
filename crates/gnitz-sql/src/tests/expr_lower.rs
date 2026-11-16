@@ -1,11 +1,11 @@
 use super::*;
-use crate::test_support::Cell::{self, Int, Null, Str, F64};
+use crate::test_support::Cell::{self, F64, Int, Null, Str};
 use crate::test_support::{
-    assert_rejects, batch_of, bind_sql, holds, holds_exact, two_col, typed_schema, CMP, EXACT_CASES,
+    CMP, EXACT_CASES, assert_rejects, batch_of, bind_sql, holds, holds_exact, two_col, typed_schema,
 };
 use gnitz_expr::{ConstIdx, FloatArithOp, IntUnaryOp, RowFilter, ScalarCell};
-use gnitz_wire::as_le_bytes;
 use gnitz_wire::TypeCode as T;
+use gnitz_wire::as_le_bytes;
 use std::convert::Infallible;
 
 // Every expression here is SQL bound over `typed_schema`: `(pk, c1, c2, …)`, the

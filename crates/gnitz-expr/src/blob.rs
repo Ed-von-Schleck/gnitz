@@ -7,7 +7,7 @@ use crate::{
     CmpOp, ConstIdx, ExprValidateErr, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LogicalInstr, LogicalProgram,
     Reg, Sink, TrimMode,
 };
-use gnitz_wire::{decode_all, FixedInt, TypeCode, Writer};
+use gnitz_wire::{FixedInt, TypeCode, Writer, decode_all};
 
 /// The const pool's entry cap: each of at most [`MAX_REGS`] instructions names
 /// at most one entry, so a larger pool holds an entry no instruction reads.

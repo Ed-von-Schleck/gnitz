@@ -3,8 +3,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Wake;
 
 use super::*;
@@ -74,11 +74,11 @@ fn async_rwlock_multiple_readers() {
         let m = Rc::clone(&max);
         r.spawn(async move {
             let _g = l.read().await;
-            a.set(a.get() + 1);
-            m.set(m.get().max(a.get()));
+            a.update(|v| v + 1);
+            m.update(|v| v.max(a.get()));
             // Yield once to let other tasks acquire too.
             yield_once().await;
-            a.set(a.get() - 1);
+            a.update(|v| v - 1);
         });
     }
     r.block_until_idle();
@@ -209,16 +209,16 @@ fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
                         yield_once().await;
                         let (rd, wr) = h.get();
                         h.set((rd - me.0, wr - me.1));
-                        d.set(d.get() + 1);
+                        d.update(|v| v + 1);
                     }),
                     // Cancel the acquire: the loser's Drop is the whole point.
                     2 => r.spawn(async move {
                         let _ = select2(l.write(), std::future::ready(())).await;
-                        d.set(d.get() + 1);
+                        d.update(|v| v + 1);
                     }),
                     _ => r.spawn(async move {
                         let _ = select2(l.read(), std::future::ready(())).await;
-                        d.set(d.get() + 1);
+                        d.update(|v| v + 1);
                     }),
                 };
             }
@@ -258,7 +258,7 @@ fn async_rwlock_write_release_admits_one_writer() {
         r.spawn(async move {
             let mut acquire = std::pin::pin!(l.write());
             let _g = std::future::poll_fn(|cx| {
-                c.set(c.get() + 1);
+                c.update(|v| v + 1);
                 acquire.as_mut().poll(cx)
             })
             .await;

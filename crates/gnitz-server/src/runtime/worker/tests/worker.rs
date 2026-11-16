@@ -264,9 +264,10 @@ fn a_burst_passes_what_another_lease_owes() {
 
     let out = frames(&rx);
     assert_eq!(reqs(&out), [2, 2]);
-    assert!(out
-        .iter()
-        .all(|f| f.ctrl.hdr.status == WireStatus::Ok && f.ctrl.hdr.flags.scan_last));
+    assert!(
+        out.iter()
+            .all(|f| f.ctrl.hdr.status == WireStatus::Ok && f.ctrl.hdr.flags.scan_last)
+    );
     assert_eq!(owed(&wp.replies), [("parked", 1)]);
 }
 

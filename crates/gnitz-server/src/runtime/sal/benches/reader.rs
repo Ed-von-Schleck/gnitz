@@ -1,7 +1,7 @@
 use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::SalWriter;
 use crate::runtime::sal::fixtures::{scan, test_log};
 use crate::runtime::sal::group::Group;
-use crate::runtime::sal::SalWriter;
 use crate::runtime::w2m::fixtures::id;
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;

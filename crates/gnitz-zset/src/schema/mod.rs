@@ -2,7 +2,7 @@
 //! schema: an operator's output or an index's layout. The descriptor itself is
 //! `gnitz-expr`'s.
 
-use gnitz_expr::{leading_pk, SchemaRefusal};
+use gnitz_expr::{SchemaRefusal, leading_pk};
 use gnitz_wire::MAX_COLUMNS;
 use smallvec::SmallVec;
 
@@ -11,11 +11,11 @@ mod payload_order;
 
 /// The schema descriptor, homed in `gnitz-expr` so the client links the same
 /// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
-pub use gnitz_expr::{decode_schema_block, encode_schema_block, SchemaColumn, SchemaDescriptor};
-pub use key::{group_band, key_above, probe_key, range_band, PROBE_KEY_INJECTIVE_BYTES};
+pub use gnitz_expr::{SchemaColumn, SchemaDescriptor, decode_schema_block, encode_schema_block};
+pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range_band};
 
-pub(crate) use key::{band, compare_pk_ordering, group_floor, pack_pk_be, pk_width_dispatch, PkSortKey};
-pub(crate) use payload_order::{with_payload_cmp, FixedIntNonnull, Generic, PayloadOrder};
+pub(crate) use key::{PkSortKey, band, compare_pk_ordering, group_floor, pack_pk_be, pk_width_dispatch};
+pub(crate) use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
 
 /// Builder for a derived schema: its PK columns, then its payload columns.
 /// Inline up to `MAX_COLUMNS`; a longer list spills and `finish` refuses it.

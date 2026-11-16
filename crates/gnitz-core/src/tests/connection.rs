@@ -3,13 +3,13 @@
 
 use super::*;
 use crate::test_support::{
-    await_reply, decode_wal_block, delta_frame, delta_terminal, encode_frame, kv_rows, kv_schema, pushed_marker,
+    Peer, await_reply, decode_wal_block, delta_frame, delta_terminal, encode_frame, kv_rows, kv_schema, pushed_marker,
     pushed_train, reply_ctrl, reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer,
-    sync_header, sync_held, Peer,
+    sync_header, sync_held,
 };
 use crate::transport::poll_fd;
 use crate::{BatchAppender, PkColumn};
-use gnitz_wire::{framed, ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus, framed};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanReply> {

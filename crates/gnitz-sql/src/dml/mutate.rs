@@ -4,15 +4,15 @@
 //! (UPDATE) or the retraction of their keys (DELETE). Planning reads only the
 //! catalog, so a refused statement issues no request.
 
-use super::set::{apply_set, bind_set_list, SetClause, SetCol};
+use super::set::{SetClause, SetCol, apply_set, bind_set_list};
+use crate::SqlResult;
 use crate::access::bound_and_predicate;
-use crate::ast_util::{classify_from, FromShape};
+use crate::ast_util::{FromShape, classify_from};
 use crate::bind::bind_single_table;
 use crate::catalog::Catalog;
-use crate::error::{reject_if, GnitzSqlError};
-use crate::names::{extract_table_ref, TableRef};
-use crate::rules::{require_class, ClassWant};
-use crate::SqlResult;
+use crate::error::{GnitzSqlError, reject_if};
+use crate::names::{TableRef, extract_table_ref};
+use crate::rules::{ClassWant, require_class};
 use gnitz_core::{GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::ReadBound;
 use sqlparser::ast::{Assignment, Delete, Expr, FromTable, TableWithJoins, Update};
@@ -64,6 +64,8 @@ fn reject_unhonored_update_clauses(
         or,
         order_by,
         limit,
+        on_cluster,
+        settings,
     } = update;
     reject_if(from.is_some(), CTX, "FROM (join-update)")?;
     reject_if(returning.is_some(), CTX, "RETURNING")?;
@@ -71,6 +73,8 @@ fn reject_unhonored_update_clauses(
     reject_if(or.is_some(), CTX, "OR (conflict clause)")?;
     reject_if(!order_by.is_empty(), CTX, "ORDER BY")?;
     reject_if(limit.is_some(), CTX, "LIMIT")?;
+    reject_if(on_cluster.is_some(), CTX, "ON CLUSTER")?;
+    reject_if(settings.is_some(), CTX, "SETTINGS")?;
     Ok((table, selection.as_ref(), assignments))
 }
 
@@ -92,6 +96,8 @@ fn reject_unhonored_delete_clauses(del: &Delete) -> Result<(&[TableWithJoins], O
         output,
         order_by,
         limit,
+        on_cluster,
+        settings,
     } = del;
     reject_if(!tables.is_empty(), CTX, "multi-table delete")?;
     reject_if(using.is_some(), CTX, "USING (join-delete)")?;
@@ -99,6 +105,8 @@ fn reject_unhonored_delete_clauses(del: &Delete) -> Result<(&[TableWithJoins], O
     reject_if(output.is_some(), CTX, "OUTPUT")?;
     reject_if(!order_by.is_empty(), CTX, "ORDER BY")?;
     reject_if(limit.is_some(), CTX, "LIMIT")?;
+    reject_if(on_cluster.is_some(), CTX, "ON CLUSTER")?;
+    reject_if(settings.is_some(), CTX, "SETTINGS")?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
     Ok((from, selection.as_ref()))
 }

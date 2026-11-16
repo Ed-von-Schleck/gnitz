@@ -52,11 +52,14 @@ fn kv_options<'a, const N: usize>(
                         "unsupported {context} option `{opt}` in WITH (…), which takes `key = value` entries"
                     )));
                 };
-                let Some(at) = keys.iter().position(|k| key.value.eq_ignore_ascii_case(k)) else {
+                let name = crate::ast_util::single_part_ident(key);
+                let Some(at) = keys
+                    .iter()
+                    .position(|k| name.is_some_and(|n| n.eq_ignore_ascii_case(k)))
+                else {
                     let listed: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
                     return Err(GnitzSqlError::Rejected(format!(
-                        "unknown {context} option '{}'; the supported options are {}",
-                        key.value,
+                        "unknown {context} option '{key}'; the supported options are {}",
                         listed.join(", ")
                     )));
                 };

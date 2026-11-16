@@ -1,6 +1,6 @@
 use super::*;
-use crate::codec::{decode_all, Writer};
-use crate::{append_frame, peek_control_block, ControlHeader, CTRL_HEADER_SIZE};
+use crate::codec::{Writer, decode_all};
+use crate::{CTRL_HEADER_SIZE, ControlHeader, append_frame, peek_control_block};
 
 /// A `u8`, a section, then a counted list of `u32`s: every integer is a field,
 /// the section and the list are located, and the list's items are its own.

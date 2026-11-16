@@ -3,12 +3,12 @@
 //! refused write, what an applied bundle did, and the zone pin.
 
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{payload_u64, IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault};
+use gnitz_wire::{IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault, payload_u64};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 
-use super::sys_tables::{pk_signatures, DdlBundle, IdSet, PkShape, SysFamily};
 use super::CatalogEngine;
+use super::sys_tables::{DdlBundle, IdSet, PkShape, SysFamily, pk_signatures};
 
 /// Where a catalog write lays each group out, before applying it. An `Err`
 /// refuses the write, which leaves the catalog as it was.

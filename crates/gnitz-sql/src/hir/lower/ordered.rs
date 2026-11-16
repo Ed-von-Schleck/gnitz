@@ -3,8 +3,8 @@
 //! read in place is not stored a second time beside the operator's index.
 
 use super::super::{AggCol, ColId, HirCol, OrderCol, OrderedOp, RelExpr};
-use super::spine::{open, Top};
-use super::{keyed_frame, resolve_reduce_specs, EmitPieces, ViewChain};
+use super::spine::{Top, open};
+use super::{EmitPieces, ViewChain, keyed_frame, resolve_reduce_specs};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{Circuit, OrderKey};
 use std::collections::HashSet;

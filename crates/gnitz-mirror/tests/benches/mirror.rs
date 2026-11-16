@@ -4,7 +4,7 @@ use gnitz_core::block_on;
 use std::hint::black_box;
 
 use gnitz_foundation::perf;
-use gnitz_wire::{key_image, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, key_image};
 
 /// One row of the cost table: `calls` runs of `f` on `client`, as what one of
 /// them costs the calling thread — user-space instructions retired, parks and

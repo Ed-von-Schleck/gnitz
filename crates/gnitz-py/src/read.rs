@@ -8,15 +8,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType};
-use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{write_decimal, write_uuid, ColType, ColumnDef, TypeCode, DECIMAL_TEXT_MAX};
+use gnitz_wire::{ColType, ColumnDef, DECIMAL_TEXT_MAX, TypeCode, write_decimal, write_uuid};
 
 use crate::schema::PySchema;
 

@@ -1,15 +1,15 @@
 //! Statement dispatch: routes a `Statement` to its handler in `ddl` or `dml`,
 //! each planned against the statement's catalog and then run on the client.
 
-use crate::catalog::Catalog;
-use crate::error::reject_if;
-use crate::error::GnitzSqlError;
-use crate::source::StatementText;
 use crate::SqlResult;
+use crate::catalog::Catalog;
+use crate::error::GnitzSqlError;
+use crate::error::reject_if;
+use crate::source::StatementText;
 use crate::{ddl, dml};
 use gnitz_core::{GnitzClient, RelDescriptor, RelName};
 use gnitz_wire::WireStatus;
-use sqlparser::ast::{Query, Statement};
+use sqlparser::ast::{AlterView, AlterViewOperation, Query, Statement};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -55,15 +55,14 @@ impl Catalog for Run<'_> {
         if let Some((_, desc)) = self.resolved.iter().find(|(n, _)| n == name) {
             return Ok(desc.clone());
         }
-        if let Some(desc) = self
-            .descriptors
-            .mirrored
-            .then(|| self.client.mirrored_desc(name))
-            .flatten()
+        if self.descriptors.mirrored
+            && let Some(desc) = self.client.mirrored_desc(name)
         {
             return Ok(Some(desc));
         }
-        if let Some(desc) = self.descriptors.kept.then(|| self.client.kept_desc(name)).flatten() {
+        if self.descriptors.kept
+            && let Some(desc) = self.client.kept_desc(name)
+        {
             self.kept.set(true);
             return Ok(Some(desc));
         }
@@ -274,7 +273,7 @@ pub(crate) async fn execute_statement(
         | Statement::CreateView(_)
         | Statement::CreateIndex(_)
         | Statement::AlterTable(_)
-        | Statement::AlterView { .. } => {
+        | Statement::AlterView(_) => {
             // Refused, not failed: the transaction stays open.
             if client.txn_active() {
                 return Err(GnitzSqlError::Rejected(
@@ -332,6 +331,7 @@ async fn execute_ddl(
         }
         Statement::CreateSchema {
             schema_name: name,
+            or_replace,
             if_not_exists,
             with,
             options,
@@ -339,6 +339,7 @@ async fn execute_ddl(
             clone,
         } => {
             const CTX: &str = "CREATE SCHEMA";
+            reject_if(*or_replace, CTX, "OR REPLACE")?;
             reject_if(with.is_some(), CTX, "WITH options")?;
             reject_if(options.is_some(), CTX, "OPTIONS")?;
             reject_if(default_collate_spec.is_some(), CTX, "DEFAULT COLLATE")?;
@@ -365,7 +366,15 @@ async fn execute_ddl(
             ddl::execute_alter_table(client, schema_name, a).await?;
             Ok("ALTER TABLE")
         }
-        Statement::AlterView { name, query, columns, with_options } => {
+        Statement::AlterView(AlterView { materialized, name, if_exists, operation }) => {
+            const CTX: &str = "ALTER VIEW";
+            reject_if(*materialized, CTX, "MATERIALIZED")?;
+            reject_if(*if_exists, CTX, "IF EXISTS")?;
+            let AlterViewOperation::As { columns, query, with_options } = operation else {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "{CTX}: only `AS <query>` is supported"
+                )));
+            };
             let chain = planned(client, schema_name, Descriptors::SERVER, |cat| {
                 ddl::plan_alter_view(name, columns, query, with_options, text, cat)
             })

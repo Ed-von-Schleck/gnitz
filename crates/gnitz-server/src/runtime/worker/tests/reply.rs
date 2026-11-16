@@ -1,12 +1,12 @@
 use super::*;
-use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::runtime::w2m::W2mReceiver;
+use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::test_support::{
     chunked, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     pk_only_schema, table_engine_with, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::relation::IndexClaim;
-use gnitz_wire::{peek_control_block, DecodedControl, PkColList, TypeCode, WireStatus};
+use gnitz_wire::{DecodedControl, PkColList, TypeCode, WireStatus, peek_control_block};
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 use std::rc::Rc;
@@ -114,11 +114,7 @@ pub(in crate::runtime::worker) fn frame_size(batch: &Batch) -> usize {
 /// A nonzero weight per row, of both signs, so a scrambled or dropped weight
 /// region cannot reassemble to the source.
 fn weight(i: u64) -> i64 {
-    if i.is_multiple_of(2) {
-        i as i64 + 1
-    } else {
-        -(i as i64)
-    }
+    if i.is_multiple_of(2) { i as i64 + 1 } else { -(i as i64) }
 }
 
 // -- the reply queue --------------------------------------------------------
@@ -421,9 +417,10 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
             let rows = f.rows(&span_schema);
             got.extend((0..rows.len()).map(|i| rows.get_pk_bytes(i).to_vec()));
         }
-        assert!(body
-            .iter()
-            .all(|f| !f.ctrl.hdr.flags.scan_last && f.ctrl.data.is_some()));
+        assert!(
+            body.iter()
+                .all(|f| !f.ctrl.hdr.flags.scan_last && f.ctrl.data.is_some())
+        );
         let want: Vec<Vec<u8>> = (0..n)
             .rev()
             .map(|i| span_schema.opk_key_cols(&[-(i as i64) as u128]).pk_bytes().to_vec())

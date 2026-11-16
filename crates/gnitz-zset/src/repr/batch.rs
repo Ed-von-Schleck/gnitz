@@ -6,17 +6,17 @@
 use std::ops::Range;
 
 use super::merge;
-use super::pool::{is_tight, PooledBuf};
+use super::pool::{PooledBuf, is_tight};
 use super::run::StoredRow;
-use super::scatter::{copy_ranges, with_picks, Pick};
+use super::scatter::{Pick, copy_ranges, with_picks};
 use super::seek::ColPtr;
-use super::string_heap::{self, relocated_cell, BlobCache};
+use super::string_heap::{self, BlobCache, relocated_cell};
 use super::writer::DirectWriter;
 use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::{
-    read_i64_le, read_u64_le, Heap, RowSource, TypeCode, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
-    REG_WEIGHT,
+    FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource, TypeCode, read_i64_le,
+    read_u64_le,
 };
 
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
@@ -349,12 +349,12 @@ impl Batch {
     /// Indices of the live rows — those at positive weight, the elements the
     /// batch asserts.
     #[inline(always)]
-    pub fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn live_rows(&self) -> impl Iterator<Item = usize> {
         (0..self.count).filter(move |&i| self.get_weight(i) > 0)
     }
     /// Indices of the retracted rows — those at negative weight.
     #[inline(always)]
-    pub fn retracted_rows(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn retracted_rows(&self) -> impl Iterator<Item = usize> {
         (0..self.count).filter(move |&i| self.get_weight(i) < 0)
     }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
@@ -719,7 +719,7 @@ impl Batch {
     /// this inherits.
     pub fn ascending_subset(&self, indices: &[u32]) -> Self {
         debug_assert!(
-            indices.windows(2).all(|w| w[0] < w[1]),
+            indices.is_sorted_by(|a, b| a < b),
             "ascending_subset requires a strictly ascending index list",
         );
         let mut out = self.indexed_rows(indices);
@@ -1020,7 +1020,7 @@ impl Batch {
         // The data buffer stays allocated, at its capacity.
         self.debug_poison_rows(0..self.count);
         self.count = 0;
-        self.blob.truncate(0);
+        self.blob.clear();
         self.dead_heap = 0;
         self.consolidated = false;
     }

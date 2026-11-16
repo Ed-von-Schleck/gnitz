@@ -1,7 +1,7 @@
 //! SELECT * and its EXCEPT / EXCLUDE / RENAME modifiers, expanded over a scope's columns.
 
 use crate::ast_util::single_part_ident;
-use crate::error::{unsupported_clause, GnitzSqlError};
+use crate::error::{GnitzSqlError, unsupported_clause};
 use crate::rules::has_visible_column;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, ObjectName, RenameSelectItem, SelectItem, WildcardAdditionalOptions};

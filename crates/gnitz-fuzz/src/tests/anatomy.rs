@@ -39,15 +39,12 @@ fn the_fields_of_a_scan_tile_it() {
     for (i, frame) in frames().into_iter().enumerate() {
         let mut a = Anatomy::of(&frame);
         a.fields.sort_by_key(|f| f.at);
+        assert!(a.fields.is_sorted_by(|x, y| x.at + x.width <= y.at), "{:?}", a.fields);
         assert!(
-            a.fields.windows(2).all(|w| w[0].at + w[0].width <= w[1].at),
-            "{:?}",
-            a.fields
+            a.cells
+                .iter()
+                .all(|c| a.blocks.iter().any(|b| holds(&b.range, &c.range())))
         );
-        assert!(a
-            .cells
-            .iter()
-            .all(|c| a.blocks.iter().any(|b| holds(&b.range, &c.range()))));
         let blob = peek_control_block(&frame).unwrap().blob;
         assert!(a.sections.iter().any(|s| s.content == blob), "{:?}", a.sections);
         if i > 0 {

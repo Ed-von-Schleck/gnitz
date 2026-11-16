@@ -48,9 +48,10 @@ pub(crate) unsafe fn fork_child(body: impl FnOnce()) -> libc::pid_t {
 
 /// Reap `pid` and require a clean exit: a panic in a [`fork_child`] body is seen
 /// only here.
-pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
+pub(crate) fn assert_child_exited_ok(pid: libc::pid_t) {
     let mut status = 0i32;
-    gnitz_foundation::posix_io::retry_eintr(|| libc::waitpid(pid, &mut status, 0))
+    // SAFETY: `status` is a live out-parameter for the call.
+    gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, 0) })
         .unwrap_or_else(|e| panic!("waitpid failed on child {pid}: {e}"));
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,

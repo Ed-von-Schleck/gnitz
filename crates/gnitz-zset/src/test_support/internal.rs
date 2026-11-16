@@ -9,9 +9,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::repr::{
-    from_runs, from_runs_in_band, Batch, BatchBuilder, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
+    Batch, BatchBuilder, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts, from_runs, from_runs_in_band,
 };
-use crate::schema::{group_band, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
+use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, group_band};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{PkBuf, TypeCode};
 

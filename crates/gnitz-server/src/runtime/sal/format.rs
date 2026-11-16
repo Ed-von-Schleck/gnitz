@@ -7,9 +7,9 @@ use std::sync::atomic::AtomicU64;
 
 use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::RequestId;
-use gnitz_wire::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, MAX_WORKERS};
+use gnitz_wire::{MAX_WORKERS, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use gnitz_zset::repr::{Batch, MemBatch, WireRows};
-use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaDescriptor, decode_schema_block};
 
 /// The publication prefix in front of every group header, one atomically stored
 /// u64 ([`epoch_word`]); also the alignment of every group base.
@@ -138,11 +138,7 @@ pub(super) const HDR_PREFIX: usize = OFF_DIRECTORY;
 /// How many payloads a group holds: one every addressed worker reads, or one
 /// per addressed worker in ascending worker order.
 const fn payload_count(flags: u8, targets: WorkerSet) -> usize {
-    if flags & FLAG_SHARED != 0 {
-        1
-    } else {
-        targets.len()
-    }
+    if flags & FLAG_SHARED != 0 { 1 } else { targets.len() }
 }
 
 /// Header + directory bytes for a group of `payloads` payloads.
@@ -189,7 +185,7 @@ pub(super) fn group_total_size(hdr_len: usize, sizes: impl Iterator<Item = usize
 }
 
 /// A group's directory bytes read back as payload sizes.
-pub(super) fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = usize> + '_ {
+pub(super) fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = usize> {
     dir.as_chunks::<DIR_ENTRY_BYTES>()
         .0
         .iter()

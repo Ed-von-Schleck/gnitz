@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use gnitz_expr::{order_locators, Lead, OrderLocator, RowFilter, RowRanking};
+use gnitz_expr::{Lead, OrderLocator, RowFilter, RowRanking, order_locators};
 
 use gnitz_wire::{ReadSink, RowsCut, SinkKind};
 

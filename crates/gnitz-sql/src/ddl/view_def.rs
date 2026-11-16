@@ -10,7 +10,7 @@
 
 use std::ops::Range;
 
-use gnitz_wire::{decode_all, Reader, Wire, Writer, MAX_LIST_LEN};
+use gnitz_wire::{MAX_LIST_LEN, Reader, Wire, Writer, decode_all};
 
 /// The version of the layout [`ViewDefinition::encode`] writes, whose bytes a
 /// test pins.

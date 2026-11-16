@@ -1,7 +1,7 @@
 use super::super::*;
 use super::Fold;
-use crate::storage::manifest::{self, StoreDir};
 use crate::storage::Cut;
+use crate::storage::manifest::{self, StoreDir};
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, pk_payload_schema,
 };
@@ -14,7 +14,7 @@ use std::path::Path;
 /// The upkeep's parts, each run to its end, for the tests that drive one alone.
 impl ShardIndex {
     /// Every live shard no published manifest names yet.
-    fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
+    fn unsynced_paths(&self) -> impl Iterator<Item = String> {
         self.all_entries()
             .filter(|e| !self.dir.published(e.seq))
             .map(|e| self.dir.shard_path(e.seq))
@@ -1431,7 +1431,7 @@ fn a_vertical_over_target_writes_its_parts_directly() {
 // Randomized model test
 // ---------------------------------------------------------------------------
 
-use gnitz_zset::repr::{from_runs, Run};
+use gnitz_zset::repr::{Run, from_runs};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Elem = (Vec<u8>, i64);
@@ -1513,7 +1513,7 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     for (li, level) in idx.levels.iter().enumerate() {
         let l = li + 1;
         assert!(
-            level.guards.windows(2).all(|w| w[0].guard_key < w[1].guard_key),
+            level.guards.is_sorted_by(|a, b| a.guard_key < b.guard_key),
             "{what}: L{l} guards not sorted and distinct"
         );
         for (gi, g) in level.guards.iter().enumerate() {

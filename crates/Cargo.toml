@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "gnitz-foundation",
     "gnitz-wire",
@@ -21,7 +21,8 @@ members = [
 
 [workspace.package]
 version = "0.1.8"
-edition = "2021"
+edition = "2024"
+rust-version = "1.100"
 authors = ["Christian Schramm"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Ed-von-Schleck/gnitz"
@@ -35,6 +36,9 @@ categories = ["database-implementations"]
 # not let a crate layer on top of the shared one.
 [workspace.lints.rust]
 warnings = "deny"
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

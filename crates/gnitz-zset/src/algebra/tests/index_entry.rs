@@ -2,9 +2,9 @@ use std::cmp::Ordering;
 
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{range_band, SchemaColumn};
-use crate::test_support::{edge_native, pk_only_schema, random_schema, Rng};
-use gnitz_wire::{cmp_col_window, key_image, KeyRange, PkColList, TypeCode, MAX_PK_COLUMNS};
+use crate::schema::{SchemaColumn, range_band};
+use crate::test_support::{Rng, edge_native, pk_only_schema, random_schema};
+use gnitz_wire::{KeyRange, MAX_PK_COLUMNS, PkColList, TypeCode, cmp_col_window, key_image};
 
 /// Over PKs of every suffix width and a nullable indexed column of every
 /// indexable width: the projection holds exactly the rows `KeySpec::span` admits,
@@ -12,7 +12,7 @@ use gnitz_wire::{cmp_col_window, key_image, KeyRange, PkColList, TypeCode, MAX_P
 /// the positive-weight rows' spans.
 #[test]
 fn index_entries_are_each_admitted_rows_span_and_pk() {
-    use TypeCode::{I128, I16, I64, U128, U32, U64, U8};
+    use TypeCode::{I16, I64, I128, U8, U32, U64, U128};
     let mut rng = Rng::new(0x1dc5);
     let pks: [&[TypeCode]; 6] = [&[U32, I64], &[U32], &[U64], &[U128], &[U64, U128], &[U128, U128]];
     for (pk, tc) in pks
@@ -47,7 +47,9 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                 .unwrap();
             let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
             for row in 0..src.len() {
-                if let Some(span) = spec.span(&mb, row).filter(|_| src.get_weight(row) != 0) {
+                if src.get_weight(row) != 0
+                    && let Some(span) = spec.span(&mb, row)
+                {
                     let mut e = span.pk_bytes().to_vec();
                     e.extend_from_slice(src.get_pk_bytes(row));
                     want.push((e, src.get_weight(row)));

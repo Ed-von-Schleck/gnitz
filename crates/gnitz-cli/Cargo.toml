@@ -3,6 +3,7 @@ name = "gnitz"
 description = "The SQL shell for gnitz, a database whose views are all materialized and incrementally maintained"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -28,7 +29,7 @@ gnitz-expr.workspace = true
 gnitz-sql.workspace = true
 gnitz-dump.workspace = true
 gnitz-wire.workspace = true
-reedline = "0.52"
+reedline = "0.53"
 nu-ansi-term = "0.50"
 comfy-table = { version = "8", features = ["custom_styling"] }
 clap = { version = "4", features = ["derive"] }

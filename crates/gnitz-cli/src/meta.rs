@@ -8,14 +8,14 @@ use std::path::Path;
 use std::process::Command;
 
 use clap::ValueEnum;
-use gnitz_core::{block_on, Catalog, CatalogRelation, RelProps};
+use gnitz_core::{Catalog, CatalogRelation, RelProps, block_on};
 use gnitz_expr::{LikeMatcher, LikePattern};
-use gnitz_wire::{qualified_key, FkAction, RelClass, TypeCode};
+use gnitz_wire::{FkAction, RelClass, TypeCode, qualified_key};
 
-use crate::editor::{editor, editor_command, KEY_HELP};
-use crate::render::{render, Weights};
-use crate::settings::{choose, name_of, Expanded, Format, Setting, Settings};
-use crate::shell::{command_from_env, Failed, Flow, Shell};
+use crate::editor::{KEY_HELP, editor, editor_command};
+use crate::render::{Weights, render};
+use crate::settings::{Expanded, Format, Setting, Settings, choose, name_of};
+use crate::shell::{Failed, Flow, Shell, command_from_env};
 use crate::value::{Rows, Value};
 
 /// What a meta-command's argument is: what completion offers for it, whether

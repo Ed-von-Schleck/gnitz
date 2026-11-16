@@ -82,7 +82,7 @@ pub(crate) fn bind_adhoc_read(
     query: &sqlparser::ast::Query,
     order_exprs: &[&sqlparser::ast::Expr],
 ) -> Result<AdhocRead, GnitzSqlError> {
-    use crate::ast_util::{classify_from, FromShape};
+    use crate::ast_util::{FromShape, classify_from};
     use crate::error::derivation;
     // The top-level body reads through one relation's sink, so a set operation or a
     // FROM that derives is refused before anything is resolved; a CTE may derive,
@@ -652,12 +652,12 @@ impl JoinClass {
 
     /// The key columns this ON names on one side — what that side's reindex reads,
     /// and so what a cut input must keep however narrow the demand above it is.
-    pub(crate) fn key_cols(&self, side: usize) -> impl Iterator<Item = ColId> + '_ {
+    pub(crate) fn key_cols(&self, side: usize) -> impl Iterator<Item = ColId> {
         self.keys().map(move |p| p.cols[side])
     }
 
     /// Each key slot's common type, in [`Self::key_cols`] order.
-    pub(crate) fn key_types(&self) -> impl Iterator<Item = ColType> + '_ {
+    pub(crate) fn key_types(&self) -> impl Iterator<Item = ColType> {
         self.keys().map(|p| p.ty)
     }
 
@@ -676,7 +676,7 @@ impl JoinClass {
                      or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
                      comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
                         .into(),
-                ))
+                ));
             }
             (Some(rel), true) => {
                 let kind = match (kind, kind.exists()) {
@@ -690,7 +690,7 @@ impl JoinClass {
                              witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
                              conjunct to make it a band join."
                                 .into(),
-                        ))
+                        ));
                     }
                 };
                 JoinPlan::PureRange(rel, kind)

@@ -4,7 +4,7 @@
 //! one of those facts, and the descriptor's schema-block codec is here too.
 
 use gnitz_wire::schema_block::SchemaBlockCol;
-use gnitz_wire::{ColType, PkListRole, PkRule, TypeCode, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS};
+use gnitz_wire::{ColType, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PkListRole, PkRule, TypeCode};
 
 use crate::ColumnLocator;
 
@@ -309,11 +309,7 @@ impl SchemaDescriptor {
     #[inline]
     pub const fn arena_rows(&self, rows: usize) -> usize {
         let mask = self.cap_mask as usize;
-        if rows < 8 {
-            rows
-        } else {
-            (rows + mask) & !mask
-        }
+        if rows < 8 { rows } else { (rows + mask) & !mask }
     }
 
     /// The live columns, in column order.
@@ -434,7 +430,7 @@ impl SchemaDescriptor {
     }
 
     /// [`Self::payload_locators`], uncollected.
-    pub(crate) fn payload_locator_iter(&self) -> impl Iterator<Item = ColumnLocator> + '_ {
+    pub(crate) fn payload_locator_iter(&self) -> impl Iterator<Item = ColumnLocator> {
         self.payload_columns().map(|(pi, c)| ColumnLocator::Payload {
             slot: pi as u8,
             size: c.size,
@@ -452,7 +448,7 @@ impl SchemaDescriptor {
 
     /// The types of a batch's regions: the PK columns in PK-list order, then the
     /// payload columns in slot order.
-    fn region_types(&self) -> impl Iterator<Item = TypeCode> + '_ {
+    fn region_types(&self) -> impl Iterator<Item = TypeCode> {
         let pk = self.pk_columns().map(|c| c.type_code);
         pk.chain(self.payload_columns().map(|(_, c)| c.type_code))
     }

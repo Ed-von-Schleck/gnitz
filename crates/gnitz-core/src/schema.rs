@@ -4,7 +4,7 @@
 use gnitz_expr::{SchemaColumn, SchemaDescriptor, SchemaRefusal};
 use std::sync::{Arc, OnceLock};
 
-use gnitz_wire::{ColumnDef, PkListRole, PkRule, PK_LIST_MAX_COLS};
+use gnitz_wire::{ColumnDef, PK_LIST_MAX_COLS, PkListRole, PkRule};
 
 #[derive(Clone)]
 pub struct Schema {
@@ -83,7 +83,7 @@ impl Schema {
 
     /// The PK columns in PK-list order, hidden: the leading key of a reply that
     /// carries this schema's key.
-    pub fn hidden_key_columns(&self) -> impl Iterator<Item = ColumnDef> + '_ {
+    pub fn hidden_key_columns(&self) -> impl Iterator<Item = ColumnDef> {
         self.pk_cols()
             .iter()
             .map(|&c| self.columns[c as usize].clone().hidden())

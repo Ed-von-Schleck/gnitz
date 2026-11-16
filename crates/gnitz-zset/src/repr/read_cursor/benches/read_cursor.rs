@@ -189,7 +189,9 @@ fn advance_to_bench() {
             assert!(c.mode.is_none(), "several sources are live");
             for gap in GAPS {
                 let cost = adv_cost(&mut c, &counters, (gap..TOTAL).step_by(gap));
-                println!("advance_to_bench stride={stride:>2} merge K={k:>2} retract_step={retract_step} gap={gap:>4}: {cost}");
+                println!(
+                    "advance_to_bench stride={stride:>2} merge K={k:>2} retract_step={retract_step} gap={gap:>4}: {cost}"
+                );
             }
             if (k, retract_step) == (16, 0) {
                 // A rewound cursor stands on key 0.

@@ -7,7 +7,7 @@
 //! circuit clears to get one belong to `gnitz-zset`, beside the kernels that
 //! read them.
 
-use super::routing::{node_dist, pk_prefix_routed, Dist};
+use super::routing::{Dist, node_dist, pk_prefix_routed};
 use super::*;
 use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
 use gnitz_zset::algebra::null_extend_output_schema;

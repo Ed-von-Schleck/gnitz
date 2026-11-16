@@ -5,7 +5,7 @@ use super::tests::stride_schema;
 use super::tests::trailing_gk;
 use super::tests::trailing_key_batch;
 use crate::storage::Cut;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, Rng};
+use crate::test_support::{Rng, make_batch_raw, make_schema_u64_i64};
 use gnitz_zset::schema::probe_key;
 
 /// The two read entries over a tree the upkeep built from scattered spills, at
@@ -112,8 +112,8 @@ fn shard_probe_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn compaction_amplification_bench() {
-    use gnitz_foundation::perf::Counter;
     use CompactionKind::*;
+    use gnitz_foundation::perf::Counter;
     const RUN_ROWS: u64 = 8192;
     const KEYSPACE: u64 = 200_000_000;
     const HOT: u64 = 8 * RUN_ROWS;

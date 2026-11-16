@@ -13,7 +13,7 @@
 //! the lanes of every word its rows reach, so the lanes past a morsel's last row
 //! are read and their bits written like any other.
 
-use fearless_simd::{dispatch, f64x8, i64x8, mask64x8, prelude::*, u64x8, u8x64};
+use fearless_simd::{dispatch, f64x8, i64x8, mask64x8, prelude::*, u8x64, u64x8};
 
 pub use fearless_simd::Level;
 

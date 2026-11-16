@@ -12,9 +12,9 @@ use super::{OrderIndex, OrderedEpoch, OrderedPlan};
 use crate::algebra::copy_columns;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::stream_input::{batch, schema, Cells, Row};
-use crate::test_support::{cell, mix, TestTrace};
-use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, ReduceOutSlot};
+use crate::test_support::stream_input::{Cells, Row, batch, schema};
+use crate::test_support::{TestTrace, cell, mix};
+use gnitz_expr::{OrderLocator, ReduceOutSlot, cmp_order_keys, order_locators};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{OrderKey, TypeCode};
 

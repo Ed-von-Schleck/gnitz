@@ -22,7 +22,7 @@ mod setop;
 mod spine;
 
 use super::physical::{self, Frame, Rename, Slot};
-use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::{AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr, col_by_id, split_filter};
 use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;

@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::dirs::{parse_relation_dir_name, relation_dir, relations_dir, subdir_names, ChildAddr, ChildKind};
+use super::dirs::{ChildAddr, ChildKind, parse_relation_dir_name, relation_dir, relations_dir, subdir_names};
 use crate::storage::shard_files;
 use gnitz_zset::repr::ShardDirectory;
 
@@ -169,7 +169,7 @@ impl fmt::Display for DiskUsage {
             regions.sort_by_key(|&(_, &bytes)| std::cmp::Reverse(bytes));
             let shares: Vec<String> = regions
                 .iter()
-                .filter_map(|((role, encoding), &bytes)| {
+                .filter_map(|&((role, encoding), &bytes)| {
                     let pct = bytes * 100 / t.bytes.max(1);
                     (pct > 0).then(|| format!("{role} {encoding} {pct}%"))
                 })

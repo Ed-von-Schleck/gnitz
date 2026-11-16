@@ -4,8 +4,8 @@
 use super::super::physical::{Frame, Rename};
 use super::super::{ColId, HirExpr, ProjEntry, RelExpr};
 use super::{
-    collect_live_cols, cut_segment, filter, lowered_whole, project_front, resolve_in_place, EmitPieces, SegInput,
-    SegSource, ViewChain,
+    EmitPieces, SegInput, SegSource, ViewChain, collect_live_cols, cut_segment, filter, lowered_whole, project_front,
+    resolve_in_place,
 };
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
@@ -177,7 +177,9 @@ impl Spine<'_> {
                 }
                 Level::Project(items) => {
                     let items: Vec<ProjEntry> = items.iter().filter(|it| read.contains(&it.out.id)).cloned().collect();
-                    if let Some(rename) = Rename::of(&items).filter(|_| output_at != Some(i)) {
+                    if output_at != Some(i)
+                        && let Some(rename) = Rename::of(&items)
+                    {
                         frame = frame.renamed(&rename)?;
                         continue;
                     }

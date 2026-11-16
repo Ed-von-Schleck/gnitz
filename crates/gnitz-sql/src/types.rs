@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use gnitz_wire::{ColType, TypeCode, MAX_DECIMAL_SCALE};
+use gnitz_wire::{ColType, MAX_DECIMAL_SCALE, TypeCode};
 use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
 pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
@@ -27,7 +27,7 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
         DataType::Timestamp(..) => {
             return Err(GnitzSqlError::Rejected(
                 "a TIMESTAMP carries no time zone here; write TIMESTAMP without one".to_string(),
-            ))
+            ));
         }
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => return decimal_type(info),
         DataType::Boolean | DataType::Bool => TypeCode::Bool,
@@ -88,7 +88,7 @@ fn decimal_type(info: &ExactNumberInfo) -> Result<ColType, GnitzSqlError> {
         ExactNumberInfo::None => {
             return Err(GnitzSqlError::Rejected(
                 "DECIMAL needs a precision and scale, e.g. DECIMAL(18, 2)".to_string(),
-            ))
+            ));
         }
     };
     if p == 0 || p > MAX_DECIMAL_SCALE as u64 {

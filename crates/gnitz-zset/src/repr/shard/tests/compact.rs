@@ -1,14 +1,14 @@
 use super::super::encoding::Encoding;
 use super::super::file::ShardWriteOpts;
-use super::super::layout::{spans_of, ShardHeader};
+use super::super::layout::{ShardHeader, spans_of};
 use super::*;
-use crate::repr::{merge_consolidated, BatchBuilder};
+use crate::repr::{BatchBuilder, merge_consolidated};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    make_string_batch, map_coded_shard, map_shard, prose, u64_pk_schema, FoldRow,
+    FoldRow, arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, make_string_batch, map_coded_shard, map_shard, prose, u64_pk_schema,
 };
-use gnitz_wire::{PkBuf, TypeCode, REG_NULL_BMP};
+use gnitz_wire::{PkBuf, REG_NULL_BMP, TypeCode};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;

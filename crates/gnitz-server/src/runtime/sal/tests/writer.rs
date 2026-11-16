@@ -1,7 +1,7 @@
 use super::fixtures::{control_push as to, group_at, scan, test_log, unanswered};
 use super::{
-    epoch_word, group_header_size, group_limit, Apply, Routed, SalExcl, SalFull, SalMessageKind, SalScope, SalWriter,
-    WorkerSet, CHECKPOINT_RESERVE, PREFIX_BYTES,
+    Apply, CHECKPOINT_RESERVE, PREFIX_BYTES, Routed, SalExcl, SalFull, SalMessageKind, SalScope, SalWriter, WorkerSet,
+    epoch_word, group_header_size, group_limit,
 };
 use crate::catalog::SysFamily;
 use crate::runtime::reactor::test_support::make_reactor;
@@ -12,8 +12,8 @@ use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_store::relation::PkRule;
 use gnitz_zset::schema::encode_schema_block;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 /// A group that does not fit is refused `SalFull` and leaves the log as it was.

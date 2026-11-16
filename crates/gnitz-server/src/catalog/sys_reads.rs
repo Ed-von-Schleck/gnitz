@@ -3,12 +3,12 @@
 
 use gnitz_store::relation::{Cut, Relation};
 use gnitz_wire::{
-    payload_bytes, payload_str, payload_u64, CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot, TableTabRow,
+    CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot, TableTabRow, payload_bytes, payload_str, payload_u64,
 };
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 
-use super::sys_tables::SysFamily;
 use super::CatalogEngine;
+use super::sys_tables::SysFamily;
 
 impl CatalogEngine {
     // -- System-table reads ---------------------------------------------------
@@ -62,7 +62,7 @@ impl CatalogEngine {
     /// `ids` (strictly ascending): each row for a single-column key, each owner's band
     /// for a pair.
     pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[u64]) -> Batch {
-        debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        debug_assert!(ids.is_sorted_by(|a, b| a < b));
         let mut batch = Batch::empty_with_schema(family.schema());
         for &id in ids {
             self.for_each_row_under(family, id, |c| c.copy_current_row_into(&mut batch, -c.current_weight()));

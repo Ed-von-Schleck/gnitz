@@ -13,7 +13,7 @@
 //! strictly ascending list of keys of one stride.
 
 use crate::codec::{Reader, Wire, Writer};
-use crate::{radix_sort_by_key, zip_cells, RadixKey, TypeCode};
+use crate::{RadixKey, TypeCode, radix_sort_by_key, zip_cells};
 use smallvec::SmallVec;
 
 /// `$body` once per fixed cell width — 1/2/4/8/16 bytes, the widths of a PK

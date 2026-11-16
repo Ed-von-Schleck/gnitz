@@ -3,10 +3,10 @@
 //! lives in `ddl::view` (it recompiles a query). Every rule that reads
 //! the catalog is the engine precheck's.
 
-use super::guard::{read_column, reject_unhonored_unique_fields, ColumnOptionSite};
-use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
+use super::guard::{ColumnOptionSite, read_column, reject_unhonored_unique_fields};
+use crate::error::{GnitzSqlError, missing_relation, reject_if, unsupported_clause};
 use crate::names::extract_object_name;
-use crate::rules::{canonical_user_name, find_unique_column, require_class, require_column, ClassWant};
+use crate::rules::{ClassWant, canonical_user_name, find_unique_column, require_class, require_column};
 use gnitz_core::{ColumnChange, GnitzClient, RelName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, IndexColumn, RenameTableNameKind,
@@ -215,7 +215,7 @@ fn parse<'a>(
                             change: ColumnChange::DropNotNull,
                             if_exists: false,
                         },
-                    ))
+                    ));
                 }
                 Op::SetNotNull => "ALTER COLUMN SET NOT NULL is not supported (needs a full-table validation scan)",
                 Op::SetDataType { .. } => "ALTER COLUMN SET DATA TYPE is not supported",
@@ -224,6 +224,7 @@ fn parse<'a>(
                 Op::AddGenerated { .. } => {
                     "ALTER COLUMN ADD GENERATED is not supported (no generated columns in gnitz)"
                 }
+                Op::GenericOptions { .. } => "ALTER COLUMN OPTIONS is not supported (no foreign tables in gnitz)",
             };
             Err(GnitzSqlError::Rejected(msg.to_string()))
         }

@@ -6,9 +6,9 @@ use std::rc::Rc;
 
 use super::bloom::BloomFilter;
 use super::pk_ranges_overlap;
-use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch, StorageError};
-use gnitz_zset::schema::probe_key;
+use gnitz_zset::repr::{Batch, MemBatch, StorageError, merge_consolidated};
 use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::probe_key;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a
 /// cursor merges and a PK probe walks.
@@ -118,10 +118,7 @@ impl RunSet {
 
     /// The runs whose PK extent meets the inclusive `bound`, newest first;
     /// `None` takes them all.
-    pub(super) fn runs_overlapping<'s, 'b>(
-        &'s self,
-        bound: Option<(&'b [u8], &'b [u8])>,
-    ) -> impl Iterator<Item = &'s Rc<Batch>> + use<'s, 'b> {
+    pub(super) fn runs_overlapping(&self, bound: Option<(&[u8], &[u8])>) -> impl Iterator<Item = &Rc<Batch>> {
         self.runs
             .iter()
             .rev()

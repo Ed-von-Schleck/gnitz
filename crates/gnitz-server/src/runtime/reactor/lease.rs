@@ -327,7 +327,7 @@ impl TrainLease {
     #[cold]
     #[inline(never)]
     fn faulted(&self, w: usize, f: WireFault) -> WireFault {
-        self.left.set(self.left.get().without(w));
+        self.left.update(|v| v.without(w));
         f.in_context(format_args!("worker {w}: {}", self.taking().0))
     }
 
@@ -383,7 +383,7 @@ impl Train<'_> {
             "worker {w}: a reply frame carries a schema block"
         );
         if ctrl.hdr.flags.scan_last {
-            lease.left.set(lease.left.get().without(w));
+            lease.left.update(|v| v.without(w));
         }
         Ok(Some((slot, ctrl.data)))
     }

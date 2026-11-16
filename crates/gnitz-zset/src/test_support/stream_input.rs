@@ -11,7 +11,7 @@ use proptest::prelude::*;
 use super::internal::{FLOATS, STRS};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_wire::{cmp_col_window, AggDescriptor, AggFunc, FixedInt, TypeCode};
+use gnitz_wire::{AggDescriptor, AggFunc, FixedInt, TypeCode, cmp_col_window};
 
 /// `[I64 val NULL, U64 id (pk), STRING s NULL, I64 grp (pk), F64 f, F32 x,
 /// U128 w, I16 n NULL]`, keyed `(id, grp)`.

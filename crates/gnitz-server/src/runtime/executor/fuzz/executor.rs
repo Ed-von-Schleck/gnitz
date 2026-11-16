@@ -21,14 +21,14 @@ use std::collections::{HashMap, HashSet};
 use super::family::TxnFamily;
 use super::write::{admit_push, admit_push_txn};
 use super::*;
-use crate::catalog::{SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use crate::catalog::{PUBLIC_SCHEMA_ID, SysFamily, ZoneError};
 use crate::test_support::{left_join_circuit, left_join_cols, sys_batch, table_blocks, view_blocks, view_tab_row};
 use gnitz_fuzz::input::Input;
-use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
+use gnitz_fuzz::seed::{Frame, SEEDS_ENV, Seed, Seeds};
 use gnitz_store::read::Probe;
 use gnitz_store::relation::{RelationKind, Snapshot};
-use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
-use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
+use gnitz_wire::txn_frame::{FrameItem, ScanItem, decode_scan_multi, encode_items};
+use gnitz_wire::{ControlHeader, PkKeys, ReadSpec, append_frame};
 use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
 use gnitz_zset::schema::encode_schema_block;
 
@@ -136,10 +136,10 @@ impl Session {
                 self.snapshots.insert(self.last_snapshot, self.cat.registry.pin());
             }
             ClientVerb::SnapshotPage => {
-                if let Ok(page) = gnitz_wire::snapshot::PageRequest::decode(&frame[ctrl.blob.clone()]) {
-                    if let Some(pin) = self.snapshots.get(&ctrl.hdr.arg0) {
-                        drop(pin.page(ctrl.hdr.target_id, &page));
-                    }
+                if let Ok(page) = gnitz_wire::snapshot::PageRequest::decode(&frame[ctrl.blob.clone()])
+                    && let Some(pin) = self.snapshots.get(&ctrl.hdr.arg0)
+                {
+                    drop(pin.page(ctrl.hdr.target_id, &page));
                 }
             }
             ClientVerb::SnapshotClose => drop(self.snapshots.remove(&ctrl.hdr.arg0)),
@@ -218,7 +218,7 @@ impl Session {
     /// Answer the scan `s` as a worker does.
     fn scan(&mut self, s: ScanItem<'_>) {
         let readable = target_kind(&self.cat, s.target, Access::Read).is_ok();
-        if let (true, Ok(spec)) = (readable, ReadSpec::decode(s.spec)) {
+        if readable && let Ok(spec) = ReadSpec::decode(s.spec) {
             let _ = self.cat.scan_spec(s.target.tid, spec, s.reply_layout);
         }
     }

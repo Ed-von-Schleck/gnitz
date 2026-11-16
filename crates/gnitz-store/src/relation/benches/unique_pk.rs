@@ -10,8 +10,8 @@ use super::enforce_unique_pk;
 use crate::relation::{PkRule, RelationKind, StoreConfig};
 use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, spec, table_shards,
-    u64_pk_schema, TID,
+    TID, make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, spec, table_shards,
+    u64_pk_schema,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::algebra::Slot;

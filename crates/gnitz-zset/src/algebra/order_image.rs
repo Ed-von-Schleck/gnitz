@@ -7,9 +7,9 @@ use std::cmp::Ordering;
 
 use crate::repr::MemBatch;
 use crate::schema::SchemaColumn;
-use gnitz_expr::{order_bits, ColumnLocator};
-use gnitz_wire::{cmp_col_window, for_each_fixed_int, int_cell, ScalarKind};
+use gnitz_expr::{ColumnLocator, order_bits};
 use gnitz_wire::{RowSource, TypeCode};
+use gnitz_wire::{ScalarKind, cmp_col_window, for_each_fixed_int, int_cell};
 
 /// The column types outside [`ScalarKind`]: the 16-byte integers and the
 /// German-string pair.
@@ -272,11 +272,7 @@ pub(super) fn scalar_image(
     row: usize,
 ) -> u64 {
     let v = order_bits(loc, src, row, kind);
-    if invert {
-        !v
-    } else {
-        v
-    }
+    if invert { !v } else { v }
 }
 
 /// [`scalar_image`]'s inverse: the value's own little-endian bits back out of

@@ -1,7 +1,7 @@
 //! A worker's live drain: the groups addressed to it, in log order, each
 //! decoded to the request it carries.
 
-use super::format::{epoch_word, next_epoch, payload_rows, SalMessageKind};
+use super::format::{SalMessageKind, epoch_word, next_epoch, payload_rows};
 use super::log::{SalLog, SalMessage};
 use super::request::{Apply, Ingest, Read, SalRequest};
 use crate::runtime::w2m::RequestId;

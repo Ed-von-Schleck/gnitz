@@ -2,16 +2,16 @@
 //! poll and a sync, `execute_sql`'s statement dicts, and the converters a verb
 //! hands its driver to turn what the client yields into its Python value.
 
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
-use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{DeltaCursor, PollOutcome, PollResult, Pushed, ScanReply, Synced};
 use gnitz_sql::SqlResult;
 
 use crate::client_err;
-use crate::read::{scan_result, PyScanResult};
+use crate::read::{PyScanResult, scan_result};
 
 /// What one view's poll did. `PollOutcome` flattened for Python, which has no
 /// cheap payload-carrying enum.

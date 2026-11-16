@@ -4,7 +4,7 @@
 
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_zset::algebra::Slot;
-use gnitz_zset::repr::{from_runs, from_runs_in_band, Batch};
+use gnitz_zset::repr::{Batch, from_runs, from_runs_in_band};
 use gnitz_zset::schema::key_above;
 
 use super::{check_layout, check_stride};

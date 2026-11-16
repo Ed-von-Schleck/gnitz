@@ -3,17 +3,17 @@
 //! loop runs a client under, and the one-shot reply cell — a [`Sent`] and its
 //! [`Promise`] — every wait ends on.
 
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{ready, Context, Poll, Waker};
+use std::task::{Context, Poll, Waker, ready};
 
 use crate::client::GnitzClient;
 use crate::error::ClientError;
-use crate::transport::{poll_fd_or_cancel, Interest};
+use crate::transport::{Interest, poll_fd_or_cancel};
 
 /// What [`BlockingHost::with_hook`] runs.
 type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
@@ -113,10 +113,10 @@ impl Host for BlockingHost {
                     return Poll::Ready(Err(ClientError::Interrupted(why.into())));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    if let Some(hook) = self.hook.as_mut() {
-                        if let Err(e) = hook() {
-                            return Poll::Ready(Err(ClientError::Interrupted(e.into())));
-                        }
+                    if let Some(hook) = self.hook.as_mut()
+                        && let Err(e) = hook()
+                    {
+                        return Poll::Ready(Err(ClientError::Interrupted(e.into())));
                     }
                 }
                 Err(e) => return Poll::Ready(Err(e.into())),
@@ -194,26 +194,28 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) {
     let mut more = true;
     loop {
-        let op = poll_fn(|cx| loop {
-            if more {
-                match next(cx) {
-                    Poll::Ready(Some(op)) => return Poll::Ready(Some(op)),
-                    Poll::Ready(None) => more = false,
-                    Poll::Pending => {}
-                }
-            }
-            match client.session.turn(&mut *client.host, cx) {
-                Poll::Ready(Ok(())) => {}
-                // Nothing outstanding and nothing buffered.
-                Poll::Ready(Err(ClientError::Closed)) => {
-                    return match more {
-                        true => Poll::Pending,
-                        false => Poll::Ready(None),
+        let op = poll_fn(|cx| {
+            loop {
+                if more {
+                    match next(cx) {
+                        Poll::Ready(Some(op)) => return Poll::Ready(Some(op)),
+                        Poll::Ready(None) => more = false,
+                        Poll::Pending => {}
                     }
                 }
-                // No call is waiting to hand an interrupt to.
-                Poll::Ready(Err(e)) => client.session.end(e),
-                Poll::Pending => return Poll::Pending,
+                match client.session.turn(&mut *client.host, cx) {
+                    Poll::Ready(Ok(())) => {}
+                    // Nothing outstanding and nothing buffered.
+                    Poll::Ready(Err(ClientError::Closed)) => {
+                        return match more {
+                            true => Poll::Pending,
+                            false => Poll::Ready(None),
+                        };
+                    }
+                    // No call is waiting to hand an interrupt to.
+                    Poll::Ready(Err(e)) => client.session.end(e),
+                    Poll::Pending => return Poll::Pending,
+                }
             }
         })
         .await;

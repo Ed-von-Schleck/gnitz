@@ -15,8 +15,8 @@ mod tests;
 
 use std::cmp::Ordering;
 
-use crate::algebra::{ground_pk, Agg, AggValues, GroupOrdinals, GroupScratch, OutPk, RangeGroups, ReduceShape};
-use crate::repr::{vec_bytes, Batch, CursorRow, DirectWriter, GroupProbe, MemBatch, ReadCursor};
+use crate::algebra::{Agg, AggValues, GroupOrdinals, GroupScratch, OutPk, RangeGroups, ReduceShape, ground_pk};
+use crate::repr::{Batch, CursorRow, DirectWriter, GroupProbe, MemBatch, ReadCursor, vec_bytes};
 use crate::schema::SchemaDescriptor;
 use crate::stream::OpenAt;
 use gnitz_wire::AggDescriptor;

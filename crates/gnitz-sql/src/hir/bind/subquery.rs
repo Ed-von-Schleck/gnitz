@@ -1,19 +1,19 @@
 //! Subquery binding: EXISTS / IN, a scalar aggregate, and ANY / ALL, each bound to
 //! the column its decorrelated join produces.
 
-use super::super::{cross_comparison, hircol_of, side, ColId, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side};
-use super::{resolve_table_ref, BindCx, JoinScope, ScopeLeaf, SubPolicy};
+use super::super::{ColId, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side, cross_comparison, hircol_of, side};
+use super::{BindCx, JoinScope, ScopeLeaf, SubPolicy, resolve_table_ref};
 use crate::agg::{AggArg, AggFunc};
 use crate::ast_util::{
-    body_is_grouped, classify_agg_call, classify_from, col_ref_parts, is_agg_call, peel_nested, FromShape,
+    FromShape, body_is_grouped, classify_agg_call, classify_from, col_ref_parts, is_agg_call, peel_nested,
 };
 use crate::bind::{bind_conjuncts, bind_structural, maybe_negate};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use crate::names::extract_table_ref;
-use crate::validate::{as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses};
+use crate::validate::{HonoredClauses, as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses};
 use gnitz_wire::{ColType, ColumnDef};
-use sqlparser::ast::{BinaryOperator, Expr, Query, Select, SelectItem};
+use sqlparser::ast::{BinaryOperator, Expr, InTarget, Query, Select, SelectItem};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -114,7 +114,7 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
                         "a subquery WHERE conjunct references only the outer relation; \
                          hoist it into the view's own WHERE clause"
                             .into(),
-                    ))
+                    ));
                 }
                 Side::Both => correlation.push(bound),
             }
@@ -149,7 +149,12 @@ pub(super) fn bind_one_subquery(
     let cx = SubCtx { cx, outer, subs };
     match e {
         Expr::Exists { subquery, negated } => bind_exists_sub(cx, subquery, None, *negated),
-        Expr::InSubquery { expr, subquery, negated } => bind_exists_sub(cx, subquery, Some(expr), *negated),
+        Expr::In {
+            expr,
+            target: InTarget::Subquery(subquery),
+            negated,
+            global: false,
+        } => bind_exists_sub(cx, subquery, Some(expr), *negated),
         Expr::Subquery(q) => bind_scalar_sub(cx, q),
         Expr::AnyOp { left, compare_op, right, .. } => bind_quantifier_sub(cx, left, compare_op, right, true),
         Expr::AllOp { left, compare_op, right } => bind_quantifier_sub(cx, left, compare_op, right, false),
@@ -243,10 +248,10 @@ fn bind_quantifier_sub(
         (true, BinaryOperator::NotEq) => {
             return Err(GnitzSqlError::Rejected(
                 "`<> ANY (SELECT …)` is not supported (use NOT (x = ALL …) semantics via a wrapping view)".into(),
-            ))
+            ));
         }
         (false, BinaryOperator::Eq) => {
-            return Err(GnitzSqlError::Rejected("`= ALL (SELECT …)` is not supported".into()))
+            return Err(GnitzSqlError::Rejected("`= ALL (SELECT …)` is not supported".into()));
         }
         (_, BinaryOperator::Lt) => BinOp::Lt,
         (_, BinaryOperator::LtEq) => BinOp::Le,
@@ -255,7 +260,7 @@ fn bind_quantifier_sub(
         _ => {
             return Err(GnitzSqlError::Rejected(
                 "only range (<, <=, >, >=), `= ANY`, and `<> ALL` quantified comparisons are supported".into(),
-            ))
+            ));
         }
     };
     // x < ANY ⟺ < MAX; x > ANY ⟺ > MIN; x < ALL ⟺ < MIN; x > ALL ⟺ > MAX.
@@ -328,14 +333,14 @@ fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]
                     "a scalar/quantifier subquery cannot use a range correlation (only equality \
                      `inner_col = outer_col` conjuncts are supported)"
                         .into(),
-                ))
+                ));
             }
             _ => {
                 return Err(GnitzSqlError::Rejected(
                     "a scalar/quantifier subquery's correlation contains a conjunct that is not an \
                      `inner_col = outer_col` equality; filter inside the subquery or a wrapping view"
                         .into(),
-                ))
+                ));
             }
         }
     }

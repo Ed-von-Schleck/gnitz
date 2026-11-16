@@ -12,7 +12,7 @@ use super::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{guard_slot, Codebook, MappedShard};
+use gnitz_zset::repr::{Codebook, MappedShard, guard_slot};
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod index;

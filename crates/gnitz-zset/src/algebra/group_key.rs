@@ -11,12 +11,12 @@
 //! order, else [`GroupOutKey::numbered_into`] — one ordinal per row, hashed
 //! while the groups are few for the rows, else sorted.
 
-use super::key_pack::{locate_key_col, pk_run, KeyPacker, FOLD_CHUNK_MIN_ROWS};
+use super::key_pack::{FOLD_CHUNK_MIN_ROWS, KeyPacker, locate_key_col, pk_run};
 use super::zeroed;
-use crate::repr::{vec_bytes, Batch, MemBatch};
-use crate::schema::{pk_width_dispatch, DerivedSchema, PkSortKey, SchemaColumn, SchemaDescriptor};
+use crate::repr::{Batch, MemBatch, vec_bytes};
+use crate::schema::{DerivedSchema, PkSortKey, SchemaColumn, SchemaDescriptor, pk_width_dispatch};
 use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
-use gnitz_wire::{TypeCode, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{NARROW_PK_MAX_BYTES, TypeCode};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;

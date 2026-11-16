@@ -1,6 +1,6 @@
 use super::tests::{key_region, pack};
 use super::*;
-use crate::repr::seek::{seek_lower_bound, ColPtr};
+use crate::repr::seek::{ColPtr, seek_lower_bound};
 use crate::test_support::Rng;
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -44,9 +44,9 @@ fn for_decode_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn key_bench() {
+    use TypeCode::*;
     use gnitz_foundation::perf::Counter;
     use std::hint::black_box;
-    use TypeCode::*;
     const N: usize = 1 << 20;
     const PROBES: usize = 200_000;
     type Value = fn(usize, usize) -> u128;

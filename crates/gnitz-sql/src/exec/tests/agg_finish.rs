@@ -1,9 +1,9 @@
 use super::*;
-use crate::hir::{bind_adhoc_read, AdhocShape};
-use crate::test_support::Cell::{self, Int, Null, Str, F64};
+use crate::hir::{AdhocShape, bind_adhoc_read};
+use crate::test_support::Cell::{self, F64, Int, Null, Str};
 use crate::test_support::{catalog, col, keyed_batch, ncol, parse_query, rows_of, table};
 use gnitz_core::RelDescriptor;
-use gnitz_wire::{global_group_key, TypeCode};
+use gnitz_wire::{TypeCode, global_group_key};
 
 /// A long body, spilled to the arena rather than inlined in its German cell.
 const LONG_M: &str = "a string past the inline prefix: m";

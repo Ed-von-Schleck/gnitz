@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, make_string_batch, radix_fold_rows, u64_pk_schema, FoldRow,
+    FoldRow, arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, make_string_batch, radix_fold_rows, u64_pk_schema,
 };
 
 // ── The Z-set fold, over every path that runs it ────────────────────────

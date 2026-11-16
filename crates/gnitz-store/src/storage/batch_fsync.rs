@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use io_uring::types::FsyncFlags;
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 
 use gnitz_zset::repr::StorageError;
 

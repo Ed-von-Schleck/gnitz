@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::row_key;
-use crate::test_support::stream_input::{agg, arb_row, batch, schema, GROUPS};
+use crate::test_support::stream_input::{GROUPS, agg, arb_row, batch, schema};
 use gnitz_wire::AggFunc::{Count, CountNonNull, Max, Min, Sum};
 use proptest::prelude::*;
 

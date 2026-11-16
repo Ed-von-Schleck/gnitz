@@ -1,7 +1,7 @@
 //! The catalog-shape and row reads: RESOLVE, and SCAN_MULTI under one SAL cut.
 
 use super::tick::{fresh_read_lock, read_watermark};
-use super::{cork_ack, cork_msg, cork_train, decode_fault, forward_scan, target_kind, Access, Shared};
+use super::{Access, Shared, cork_ack, cork_msg, cork_train, decode_fault, forward_scan, target_kind};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::reactor::{Peer, TrainLease};
 use crate::runtime::sal::Read;

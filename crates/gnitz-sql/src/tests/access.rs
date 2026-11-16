@@ -1,10 +1,10 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::test_support::{
-    bind_conjunct, bind_where, col, holds_exact, ix, pk_schema, schema, two_col, typed_schema, uq, CMP, EXACT_CASES,
+    CMP, EXACT_CASES, bind_conjunct, bind_where, col, holds_exact, ix, pk_schema, schema, two_col, typed_schema, uq,
 };
-use gnitz_wire::{ColType, ColumnDef, PkBuf};
 use Tier as T;
+use gnitz_wire::{ColType, ColumnDef, PkBuf};
 
 const U64_MAX: u128 = u64::MAX as u128;
 const UUID_LIT: &str = "'550e8400-e29b-41d4-a716-446655440000'";

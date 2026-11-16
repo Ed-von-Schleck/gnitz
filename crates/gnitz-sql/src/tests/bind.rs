@@ -460,7 +460,7 @@ fn each_unsupported_form_is_rejected_by_name() {
         ("CEIL(c, 2)", "CEIL: only the plain CEIL(x) form is supported"),
         ("FLOOR(c TO DAY)", "FLOOR: only the plain FLOOR(x) form is supported"),
         // CAST and typed literals.
-        ("CAST(c AS INT ARRAY)", "CAST: an ARRAY target type is not supported"),
+        ("CAST(c AS INT ARRAY)", "unsupported SQL type: INT ARRAY"),
         ("CAST(c AS INT FORMAT 'x')", "CAST: FORMAT is not supported"),
         ("CAST('2020-13-01' AS DATE)", "invalid DATE literal: '2020-13-01'"),
         ("DATE 5", "must be a single-quoted string"),
@@ -492,10 +492,11 @@ fn each_unsupported_form_is_rejected_by_name() {
         assert!(msg.contains(want), "{src}: {msg}");
     }
     // The parser never produces an empty list; the binder still refuses one.
-    let empty = Expr::InList {
+    let empty = Expr::In {
         expr: Box::new(parse_expr_sql("c")),
-        list: vec![],
+        target: sqlparser::ast::InTarget::List(vec![]),
         negated: false,
+        global: false,
     };
     assert!(rejected(bind_single_table(&empty, &schema(), "t")).contains("empty list"));
 }

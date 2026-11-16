@@ -12,8 +12,8 @@ use super::tests::{base_rows, engine_with_views, register_count};
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, net_weight, push_and_tick, register_identity_view, table_engine, try_register_view, two_term_join_circuit,
-    u64_i64_cols, EchoDrive,
+    EchoDrive, col_def, net_weight, push_and_tick, register_identity_view, table_engine, try_register_view,
+    two_term_join_circuit, u64_i64_cols,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{Circuit, ReadBound, TypeCode};

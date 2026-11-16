@@ -11,7 +11,7 @@
 use std::hint::black_box;
 
 use crate::relation::RelationKind;
-use crate::test_support::{fed_view, relation_fixture, RelationFixture, TID};
+use crate::test_support::{RelationFixture, TID, fed_view, relation_fixture};
 use gnitz_foundation::perf::{Counter, Resident};
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewBudget};
 use gnitz_zset::repr::{Batch, BatchBuilder};

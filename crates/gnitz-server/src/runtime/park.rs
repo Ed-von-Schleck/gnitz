@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gnitz_foundation::posix_io;
-use gnitz_wire::{low_bits_mask, BitIter, MAX_WORKERS};
+use gnitz_wire::{BitIter, MAX_WORKERS, low_bits_mask};
 
 // ---------------------------------------------------------------------------
 // Futex wait/wake
@@ -172,10 +172,11 @@ impl Park {
     pub(crate) fn park(&self, still_waiting: impl FnOnce() -> bool) {
         if let Some((word, at)) = self.arm_for(still_waiting) {
             // A wake, a moved value and a signal all return; anything else aborts.
-            if let Err(e) = futex(word, libc::FUTEX_WAIT, at) {
-                if e != libc::EAGAIN && e != libc::EINTR {
-                    futex_failed(e);
-                }
+            if let Err(e) = futex(word, libc::FUTEX_WAIT, at)
+                && e != libc::EAGAIN
+                && e != libc::EINTR
+            {
+                futex_failed(e);
             }
             self.disarm();
         }

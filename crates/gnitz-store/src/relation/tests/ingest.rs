@@ -1,8 +1,8 @@
 use crate::relation::{ChildKind, PkRule, RelationKind};
 use crate::storage::{read_at, read_intact};
 use crate::test_support::{
-    assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
-    TID,
+    TID, assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture,
+    zset_of,
 };
 use gnitz_wire::{PkColList, ViewBudget};
 

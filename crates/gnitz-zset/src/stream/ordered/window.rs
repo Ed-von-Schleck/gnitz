@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey, TypeCode};
 
-use super::{with_row, At, Element, OrderIndex, OrderedKind, OrderedPlan, Walk};
-use crate::algebra::{resolve_aggs, Agg, AggValues, RangeGroups};
+use super::{At, Element, OrderIndex, OrderedKind, OrderedPlan, Walk, with_row};
+use crate::algebra::{Agg, AggValues, RangeGroups, resolve_aggs};
 use crate::repr::{Batch, Run};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 

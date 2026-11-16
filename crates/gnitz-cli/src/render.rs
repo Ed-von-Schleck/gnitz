@@ -3,14 +3,14 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use comfy_table::{presets, Cell, CellAlignment, ContentArrangement, Table};
+use comfy_table::{Cell, CellAlignment, ContentArrangement, Table, presets};
 use console::measure_text_width;
 use nu_ansi_term::{Color, Style};
 
 use gnitz_wire::TypeCode;
 
 use crate::settings::{Expanded, Format, Settings};
-use crate::value::{json_string, Rows, Value};
+use crate::value::{Rows, Value, json_string};
 
 /// What a render shows of each row's weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

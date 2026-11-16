@@ -13,19 +13,19 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
-use gnitz_wire::{radix_sort_by_key, RadixKey};
+use gnitz_wire::{RadixKey, radix_sort_by_key};
 use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
 use super::scatter::{ColumnarSource, Pick};
 use super::seek::gallop_from;
-use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
+use super::string_heap::{BlobCache, rebase_string_cells, row_long_bytes};
 use super::writer::DirectWriter;
 use crate::schema::{
-    pack_pk_be, pk_width_dispatch, with_payload_cmp, PayloadOrder, PkSortKey, SchemaColumn, SchemaDescriptor,
+    PayloadOrder, PkSortKey, SchemaColumn, SchemaDescriptor, pack_pk_be, pk_width_dispatch, with_payload_cmp,
 };
-use gnitz_wire::{native_key_image, Heap, RowSource, ScalarKind, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
+use gnitz_wire::{Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT, RowSource, ScalarKind, native_key_image};
 
 mod loser_tree;
 pub(crate) use loser_tree::{LoserTree, Player};
@@ -61,7 +61,7 @@ pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -
 pub(crate) fn disjoint_order<K: Ord>(windows: impl Iterator<Item = (K, K, usize)>) -> Option<SmallVec<[usize; 8]>> {
     let mut bounds: SmallVec<[(K, K, usize); 8]> = windows.collect();
     bounds.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let disjoint = bounds.windows(2).all(|pair| pair[0].1 < pair[1].0);
+    let disjoint = bounds.is_sorted_by(|a, b| a.1 < b.0);
     disjoint.then(|| bounds.iter().map(|b| b.2).collect())
 }
 

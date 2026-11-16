@@ -3,6 +3,7 @@ name = "gnitz-tokio"
 description = "Async Rust client for the gnitz database, on tokio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

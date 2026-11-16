@@ -3,6 +3,7 @@ name = "gnitz-sql"
 description = "SQL front end for the gnitz database: parser, binder and query planner"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,7 +15,7 @@ categories.workspace = true
 integration = []
 
 [dependencies]
-sqlparser  = { version = "=0.62.0", features = ["visitor"] }
+sqlparser  = { version = "=0.64.0", features = ["visitor"] }
 gnitz-core.workspace = true
 gnitz-expr.workspace = true
 gnitz-wire.workspace = true

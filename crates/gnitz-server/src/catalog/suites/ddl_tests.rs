@@ -151,10 +151,12 @@ fn test_ddl() {
         count_records(engine.sys_relation(SysFamily::Schema).cursor()),
         init_schemas + 1
     );
-    assert!(engine
-        .create_schema("sales")
-        .unwrap_err()
-        .contains("Schema already exists"));
+    assert!(
+        engine
+            .create_schema("sales")
+            .unwrap_err()
+            .contains("Schema already exists")
+    );
 
     // Table creation
     let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
@@ -183,10 +185,12 @@ fn test_ddl() {
 
     // A system family's TABLE_TAB row sits below the user id floor, so its
     // retraction is refused.
-    assert!(engine
-        .drop_table("_system.columns")
-        .unwrap_err()
-        .contains("cannot DROP a system"));
+    assert!(
+        engine
+            .drop_table("_system.columns")
+            .unwrap_err()
+            .contains("cannot DROP a system")
+    );
 
     // Drop schema
     engine.create_schema("temp").unwrap();
@@ -219,10 +223,12 @@ fn test_edge_cases() {
     assert!(engine.create_table("public.too_many", &many, &[0]).is_err());
 
     // Drop system schema
-    assert!(engine
-        .drop_schema("_system")
-        .unwrap_err()
-        .contains("cannot DROP a system"));
+    assert!(
+        engine
+            .drop_schema("_system")
+            .unwrap_err()
+            .contains("cannot DROP a system")
+    );
 
     // Recreated schema gets new ID
     engine.create_schema("temp").unwrap();

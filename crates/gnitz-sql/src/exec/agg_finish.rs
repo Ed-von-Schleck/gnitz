@@ -10,7 +10,7 @@ use gnitz_wire::ColumnDef;
 
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
-use crate::exec::keys::{firsts, Firsts};
+use crate::exec::keys::{Firsts, firsts};
 use crate::expr_lower::compile_filter_program;
 use crate::ir::BoundExpr;
 

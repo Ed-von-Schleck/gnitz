@@ -5,13 +5,13 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::algebra::zeroed;
-use crate::repr::{vec_bytes, Batch, DirectWriter, MemBatch};
+use crate::repr::{Batch, DirectWriter, MemBatch, vec_bytes};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{for_each_fixed_int, int_cell, AggFunc, FixedInt, ScalarKind};
+use gnitz_wire::{AggFunc, FixedInt, ScalarKind, for_each_fixed_int, int_cell};
 use gnitz_wire::{RowSource, TypeCode};
 
 use crate::algebra::order_image::{
-    scalar_image, scalar_native_of_image, wide_native, wide_native_of_image, ImageCol, ImageKind, WideKind,
+    ImageCol, ImageKind, WideKind, scalar_image, scalar_native_of_image, wide_native, wide_native_of_image,
 };
 
 /// One aggregate: the column it reads, the output column it fills, and what a

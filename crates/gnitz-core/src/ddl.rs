@@ -5,17 +5,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use gnitz_wire::{
-    payload_bytes, payload_u64, Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IdxTabRow,
-    IdxTabSlot, KeyRange, PkColList, ReadBound, ReadSpec, SchemaTabRow, SchemaTabSlot, SysRow, TableProps, TableTabRow,
-    ViewProps, ViewTabRow, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB, TABLE_TAB,
-    VIEW_TAB,
+    CIRCUIT_TAB, COL_TAB, Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IDX_TAB, IdxTabRow,
+    IdxTabSlot, KeyRange, PkColList, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, ReadBound, ReadSpec, SCHEMA_TAB,
+    SchemaTabRow, SchemaTabSlot, SysRow, TABLE_TAB, TableProps, TableTabRow, VIEW_TAB, ViewProps, ViewTabRow,
+    payload_bytes, payload_u64,
 };
 
-use crate::catalog::{idx_rows, Catalog, IndexRow, CATALOG_FAMILIES};
+use crate::catalog::{CATALOG_FAMILIES, Catalog, IndexRow, idx_rows};
 use crate::client::GnitzClient;
 use crate::connection::{RelDescriptor, Request, Target};
-use crate::error::{absent, not_found, ClientError};
-use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, RelName, Schema, ZSetBatch};
+use crate::error::{ClientError, absent, not_found};
+use crate::{BatchAppender, PkColumn, ProtocolError, RelName, Schema, ZSetBatch, sys_schema};
 
 /// The index in `schemas`, SCHEMA_TAB's rows, of the live row named
 /// `schema_name` (already canonical).

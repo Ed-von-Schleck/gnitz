@@ -4,8 +4,8 @@
 
 use std::hint::black_box;
 
-use crate::test_support::{cmp_all, fed_view, make_schema_u64_i64, map_of, relation_fixture, rows_spec};
 use crate::test_support::{RelationFixture, TID};
+use crate::test_support::{cmp_all, fed_view, make_schema_u64_i64, map_of, relation_fixture, rows_spec};
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_wire::{PkKeys, ReadBound, ReadSink, ReadSpec, TypeCode};
 use gnitz_zset::repr::BatchBuilder;

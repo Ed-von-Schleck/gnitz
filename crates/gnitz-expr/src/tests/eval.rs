@@ -5,14 +5,14 @@ use crate::SchemaColumn;
 use crate::{ConstIdx, Reg, Sink};
 use gnitz_wire::{FixedInt, TypeCode};
 
+use crate::SchemaDescriptor;
 use crate::eval::Resolved;
 use crate::morsel::MORSEL;
 use crate::simd::encode_f64;
 use crate::test_support::{
-    filter_prog, i64s, is_not_null_op, is_null_op, make_n_col_view, map_prog, map_rows, passing_rows, result_prog,
-    row_values, scalar_prog, schema_pk, schema_pk_ints, strings, verdicts, view, TestView,
+    TestView, filter_prog, i64s, is_not_null_op, is_null_op, make_n_col_view, map_prog, map_rows, passing_rows,
+    result_prog, row_values, scalar_prog, schema_pk, schema_pk_ints, strings, verdicts, view,
 };
-use crate::SchemaDescriptor;
 use crate::{CmpOp, IntArithOp, LogicalInstr};
 
 /// A map writes each computed slot — zeroing a NULL result's cell — and moves
@@ -553,7 +553,7 @@ fn int_results_widen_by_the_result_registers_signedness() {
 /// A read's filter keeps the rows passing both its predicate and its walk.
 #[test]
 fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
-    use gnitz_wire::{key_image, KeyRange, PkColList};
+    use gnitz_wire::{KeyRange, PkColList, key_image};
     let schema = schema_pk_ints(1, true);
     let v_gt_3 = result_prog(
         vec![

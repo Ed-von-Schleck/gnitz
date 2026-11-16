@@ -6,10 +6,10 @@
 
 use crate::ast_util::{expr_has_aggregate, peel_nested, projection_item_expr};
 use crate::bind::bind_constant;
-use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::ir::BExpr;
 use gnitz_wire::ColumnDef;
-use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Value};
+use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, OrderBySort, Value};
 
 /// Parse `e` as a non-negative integer literal, or error — silently degrading a
 /// LIMIT returns every row. `what` names the clause for the message.
@@ -102,8 +102,12 @@ pub(crate) fn parse_order_key<'a>(obe: &'a OrderByExpr, clause: &str) -> Result<
     // A dropped modifier is a wrong result.
     let OrderByExpr { expr, options, with_fill } = obe;
     reject_if(with_fill.is_some(), clause, "WITH FILL")?;
-    let OrderByOptions { asc, nulls_first } = options;
-    let desc = !asc.unwrap_or(true);
+    let OrderByOptions { sort, nulls_first } = options;
+    let desc = match sort {
+        None | Some(OrderBySort::Asc) => false,
+        Some(OrderBySort::Desc) => true,
+        Some(OrderBySort::Using(_)) => return Err(unsupported_clause(clause, "USING <operator>")),
+    };
     Ok((expr, desc, nulls_first.unwrap_or(desc)))
 }
 

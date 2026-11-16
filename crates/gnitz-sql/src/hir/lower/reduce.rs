@@ -2,10 +2,10 @@
 //! reduce.
 
 use super::super::physical::Frame;
-use super::super::{reduce_reads, AggCol, ColId, RelExpr};
+use super::super::{AggCol, ColId, RelExpr, reduce_reads};
 use super::super::{HirCol, ProjEntry};
-use super::spine::{open, Top};
-use super::{keyed_frame, project_front, resolve_reduce_specs, EmitPieces, ReduceSpecs, ViewChain};
+use super::spine::{Top, open};
+use super::{EmitPieces, ReduceSpecs, ViewChain, keyed_frame, project_front, resolve_reduce_specs};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, Circuit, NodeId};

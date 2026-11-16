@@ -1,11 +1,11 @@
-use super::{SalLog, ANCHOR_BYTES};
+use super::{ANCHOR_BYTES, SalLog};
 use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::SalReader;
 use crate::runtime::sal::fixtures::{group_at, scan, test_log};
 use crate::runtime::sal::format::{
-    epoch_word, group_header_size, payload_rows, SalMessageKind, HDR_PREFIX, PREFIX_BYTES, PRESENT,
+    HDR_PREFIX, PREFIX_BYTES, PRESENT, SalMessageKind, epoch_word, group_header_size, payload_rows,
 };
 use crate::runtime::sal::group::{Group, Routed};
-use crate::runtime::sal::SalReader;
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::relation::PkRule;

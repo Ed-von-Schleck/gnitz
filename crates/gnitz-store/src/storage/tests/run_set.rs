@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    arb_fold_case, fold_batch, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    opk_pk, row_key, u64_pk_schema, weighted_rows, zset_of, zset_sum, RowKey,
+    RowKey, arb_fold_case, fold_batch, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, opk_pk, row_key, u64_pk_schema, weighted_rows, zset_of, zset_sum,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
@@ -178,9 +178,11 @@ fn widening_fills_nulls_and_keeps_the_filter() {
     assert!(holds(&set, &wide, 15));
     assert_eq!(set.bytes, set.batches().map(|r| r.total_bytes()).sum::<usize>());
     for run in set.batches() {
-        assert!(weighted_rows(run)
-            .iter()
-            .all(|((_, v), _)| v.len() == 2 && v[1].is_none()));
+        assert!(
+            weighted_rows(run)
+                .iter()
+                .all(|((_, v), _)| v.len() == 2 && v[1].is_none())
+        );
     }
 }
 

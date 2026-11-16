@@ -7,7 +7,7 @@ use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 use std::borrow::Cow;
 use std::rc::Rc;
 
-use super::{check_layout, check_stride, ReadRows};
+use super::{ReadRows, check_layout, check_stride};
 use crate::relation::RelationRegistry;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::Batch;

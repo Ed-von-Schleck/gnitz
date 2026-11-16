@@ -1,7 +1,7 @@
 use gnitz_wire::MAX_WORKERS;
 use rustls::pki_types::ServerName;
 
-use super::{parse_args, Args, Level};
+use super::{Args, Level, parse_args};
 use crate::runtime::CertSource;
 
 /// `line`, split on whitespace, as argv.

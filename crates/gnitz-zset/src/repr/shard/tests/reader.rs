@@ -1,16 +1,16 @@
 use super::super::file::ShardWriteOpts;
 use super::*;
+use crate::repr::StorageError;
 use crate::repr::codebook::Codebook;
 use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
-use crate::repr::StorageError;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, map_coded_shard, mix,
+    make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64, map_coded_shard, mix,
     payload0_i64, pk_only_schema, prose, string_batch, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::write_u64_le;
-use gnitz_wire::{num_regions, TypeCode, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, TypeCode, num_regions};
 
 /// Write `batch` through the production writer to `dir/name`, its heap coded
 /// under a codebook trained on it where that pays.
@@ -137,7 +137,10 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
             // A whole heap charged dead bounds any slice's.
             let carried = shard.heap().plain().filter(|_| !relocate).map(|h| (h, h.len()));
             let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried, 0);
-            if let Some(heap) = shard.heap().plain().filter(|_| relocate && w.len() == n) {
+            if relocate
+                && w.len() == n
+                && let Some(heap) = shard.heap().plain()
+            {
                 assert!(b.blob().len() <= heap.len(), "{label}: a relocated span copied twice");
             }
             assert_eq!(

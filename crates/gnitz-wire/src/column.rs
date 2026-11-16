@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use crate::schema_block::SchemaBlockCol;
 use crate::ColType;
+use crate::schema_block::SchemaBlockCol;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {

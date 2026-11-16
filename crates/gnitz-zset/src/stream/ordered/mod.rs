@@ -22,13 +22,13 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::algebra::{GroupOutKey, KeyPacker};
-use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor, Run};
-use crate::schema::{compare_pk_ordering, DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
+use crate::repr::{Batch, CursorRow, MemBatch, ReadCursor, Run, pk_group_end};
+use crate::schema::{DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, compare_pk_ordering};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
 use gnitz_wire::{OrderKey, TypeCode};
 
-use crate::algebra::{copy_columns, image_slot_col, ImageCol, IMAGE_COL};
+use crate::algebra::{IMAGE_COL, ImageCol, copy_columns, image_slot_col};
 use gnitz_expr::{ColCopy, ColMoves, ColumnLocator, WeightSlots};
 
 use window::{Running, Window};
@@ -133,9 +133,9 @@ impl OrderSpec {
         let scalar = (self.image).write_slots(mb, &[(0, cells.len() / 16)], cells, 16, OFF + self.nullable as usize, 8);
         debug_assert!(scalar, "a wide image is written a row at a time");
         let len = (8 + self.nullable as u32).to_le_bytes();
-        cells
-            .chunks_exact_mut(16)
-            .for_each(|cell| cell[..4].copy_from_slice(&len));
+        for cell in cells.as_chunks_mut::<16>().0 {
+            cell[..4].copy_from_slice(&len);
+        }
         self.stamp_ranks(mb, cells, 16, OFF, |cell, is_null| {
             if is_null {
                 cell[..4].copy_from_slice(&1u32.to_le_bytes());

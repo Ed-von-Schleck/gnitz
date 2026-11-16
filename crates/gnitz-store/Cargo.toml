@@ -3,6 +3,7 @@ name = "gnitz-store"
 description = "The Z-set store of the gnitz database: LSM storage, relation registry and read executor"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -24,13 +25,5 @@ gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
 tempfile.workspace = true
 proptest.workspace = true
 
-# Spelled out rather than `workspace = true`, which cannot be extended: this
-# crate publishes an API across the engine seam, so it also wants
-# `unreachable_pub` — allow-by-default, so `warnings = "deny"` does not imply it
-# — to make an over-wide `pub` inside a private module a compile error.
-[lints.rust]
-warnings = "deny"
-unreachable_pub = "warn"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

@@ -20,20 +20,20 @@
 //! shape without reaching a server; [`execute_select`] runs the resulting plan and
 //! `dml::explain` formats the same plan instead of dispatching it.
 
+use crate::SqlResult;
 use crate::access::bound_and_predicate;
 use crate::agg::group_pk_def;
 use crate::catalog::Catalog;
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::client_map::ClientMap;
-use crate::exec::order::{order_and_slice, Slice};
+use crate::exec::order::{Slice, order_and_slice};
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::hir::{bind_adhoc_read, AdhocRead, AdhocShape, FoldPieces, RowsReply};
+use crate::hir::{AdhocRead, AdhocShape, FoldPieces, RowsReply, bind_adhoc_read};
 use crate::ir::BoundExpr;
 use crate::project::compute_map;
 use crate::tail::{extract_limit_offset, key_slots, order_exprs, parse_order_by, wire_keys};
-use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
-use crate::SqlResult;
+use crate::validate::{QueryEnvelope, reject_unhonored_query_clauses};
 use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind};
 use sqlparser::ast::Query;

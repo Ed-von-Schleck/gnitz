@@ -1,7 +1,7 @@
 //! The blob of a `SNAPSHOT_PAGE` request.
 
-use crate::codec::{decode_all, Writer};
-use crate::{PkBuf, MAX_WORKERS};
+use crate::codec::{Writer, decode_all};
+use crate::{MAX_WORKERS, PkBuf};
 
 /// The most rows one page holds.
 pub const MAX_PAGE_ROWS: u64 = 1 << 20;

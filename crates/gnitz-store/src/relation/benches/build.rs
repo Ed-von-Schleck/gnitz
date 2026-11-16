@@ -2,7 +2,7 @@
 //!
 //! `cd crates && cargo test -p gnitz-store --release index_fill_bench -- --ignored --nocapture --test-threads=1`
 
-use crate::test_support::{wide_on_disk, TID};
+use crate::test_support::{TID, wide_on_disk};
 use gnitz_wire::PkColList;
 
 use super::*;

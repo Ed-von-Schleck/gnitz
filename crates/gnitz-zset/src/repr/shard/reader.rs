@@ -13,17 +13,17 @@ use super::error::StorageError;
 use super::layout::*;
 use super::mmap::Mmap;
 use super::pk_filter;
+use crate::repr::PooledBuf;
 use crate::repr::batch::Batch;
 use crate::repr::codebook::Codebook;
 use crate::repr::scatter::{ColumnarSource, DecodedColumns};
-use crate::repr::seek::{seek_lower_bound, seek_pk_rows, ColPtr, ZERO_CELL};
-use crate::repr::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap, row_long_bytes, StringDest};
+use crate::repr::seek::{ColPtr, ZERO_CELL, seek_lower_bound, seek_pk_rows};
+use crate::repr::string_heap::{StringDest, carried_dead, long_bytes_outside, prorated_blob_cap, row_long_bytes};
 use crate::repr::writer::DirectWriter;
-use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
-    read_u64_le, FixedInt, Heap, PkBuf, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
-    REG_WEIGHT,
+    FIXED_REGION_BYTES, FixedInt, Heap, PkBuf, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource,
+    read_u64_le,
 };
 use xorf::{BinaryFuse8Ref, Filter};
 

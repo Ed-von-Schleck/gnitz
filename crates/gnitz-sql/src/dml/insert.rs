@@ -10,19 +10,19 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use super::colwrite::{append_value_to_col, check_not_null, native_value};
-use super::set::{apply_set, bind_set_list, SetClause, SetCol};
+use super::set::{SetClause, SetCol, apply_set, bind_set_list};
+use crate::SqlResult;
 use crate::ast_util::single_part_ident;
 use crate::bind::bind_constant;
 use crate::catalog::Catalog;
-use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::exec::client_map::ClientMap;
-use crate::exec::keys::{firsts, Firsts};
+use crate::exec::keys::{Firsts, firsts};
 use crate::hir::RowsReply;
 use crate::ir::BExpr;
 use crate::names::extract_object_name;
-use crate::rules::{require_class, require_column, ClassWant};
-use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
-use crate::SqlResult;
+use crate::rules::{ClassWant, require_class, require_column};
+use crate::validate::{QueryEnvelope, reject_unhonored_query_clauses};
 use gnitz_core::{ClientError, GnitzClient, PkColumn, ProtocolError, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{FixedInt, ReadBound, RelClass, WireConflictMode};
 use rustc_hash::FxHashMap;
@@ -49,7 +49,8 @@ enum ConflictPlan {
 fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) -> Result<(), GnitzSqlError> {
     match target {
         None => Ok(()),
-        Some(ConflictTarget::Columns(cols)) => {
+        Some(ConflictTarget::Columns { columns: cols, predicate }) => {
+            reject_if(predicate.is_some(), "INSERT … ON CONFLICT", "WHERE (index predicate)")?;
             let mut named: Vec<u32> = Vec::with_capacity(cols.len());
             for c in cols {
                 let ci = require_column(schema.columns(), c.value.as_str()).map_err(|e| e.in_clause("ON CONFLICT"))?;
@@ -171,6 +172,8 @@ fn reject_unhonored_insert_clauses(insert: &Insert) -> Result<InsertClauses<'_>,
         multi_table_into_clauses,
         multi_table_when_clauses,
         multi_table_else_clause,
+        by_name,
+        overriding,
     } = insert;
 
     reject_if(or.is_some(), CTX, "OR (conflict clause)")?;
@@ -183,6 +186,8 @@ fn reject_unhonored_insert_clauses(insert: &Insert) -> Result<InsertClauses<'_>,
     reject_if(table_alias.is_some(), CTX, "table alias")?;
     reject_if(!assignments.is_empty(), CTX, "SET")?;
     reject_if(!after_columns.is_empty(), CTX, "AFTER columns")?;
+    reject_if(*by_name, CTX, "BY NAME")?;
+    reject_if(overriding.is_some(), CTX, "OVERRIDING … VALUE")?;
     reject_if(settings.is_some(), CTX, "SETTINGS")?;
     reject_if(format_clause.is_some(), CTX, "FORMAT")?;
     reject_if(output.is_some(), CTX, "OUTPUT")?;

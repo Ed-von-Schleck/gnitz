@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName, ScanReply, Schema, ZSetBatch};
 use gnitz_sql::{GnitzSqlError, SqlResult};
-use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_test_harness::{ServerHandle, unique_schema};
 use gnitz_wire::{FixedInt, TypeCode, WireFault, WireStatus};
 
 /// `schema.name`.

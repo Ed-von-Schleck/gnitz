@@ -1,12 +1,12 @@
 use gnitz_wire::{FixedInt, TypeCode};
 
 use super::{ColKind, FloatUnaryOp, IntUnaryOp, ReadAs};
+use crate::SchemaDescriptor;
 use crate::eval::Resolved;
 use crate::test_support::{
     in_set, is_not_null_op, is_null_op, make_n_col_view, make_string_view, result_prog, row_values, scalar_prog,
     schema_pk, schema_pk_ints, schema_pk_strings, verdicts,
 };
-use crate::SchemaDescriptor;
 use crate::{
     CalendarOp, CmpOp, ConstIdx, ExprValidateErr, IntArithOp, LogicalInstr, LogicalProgram, PoolEntry, Reg, Sink,
     TrimMode,

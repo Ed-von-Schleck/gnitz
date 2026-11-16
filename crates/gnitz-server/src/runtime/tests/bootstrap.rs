@@ -1,8 +1,8 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::master::route::with_routed;
-use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::Apply;
+use crate::runtime::sal::fixtures::test_log;
 use crate::test_support::{
     batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, register_identity_view,
     sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
@@ -269,5 +269,5 @@ fn the_fd_limit_is_raised_to_the_requested_soft_ceiling() {
             assert_eq!(soft().rlim_cur, rl.rlim_max);
         })
     };
-    unsafe { assert_child_exited_ok(pid) };
+    assert_child_exited_ok(pid);
 }

@@ -26,8 +26,8 @@
 use crate::control::frame_size;
 use crate::region::Regions;
 use crate::{
-    append_frame, frame_head_size, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target,
-    WireConflictMode, WireFlags, Writer, CTRL_HEADER_SIZE,
+    CTRL_HEADER_SIZE, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireConflictMode, WireFlags, Writer,
+    append_frame, frame_head_size, peek_control_block,
 };
 use std::fmt;
 use std::num::NonZeroU64;
@@ -306,7 +306,10 @@ pub fn kept_as(first: SubId, item: usize) -> SubId {
 /// The subscription id each of the `items` items of the `DELTA_POLL` under
 /// `prologue` is kept as, in item order; `None` for a poll that keeps none.
 /// A poll whose ids would run past `u64::MAX` is refused.
-pub fn delta_poll_kept(prologue: &ControlHeader, items: usize) -> Result<Option<impl Iterator<Item = SubId>>, String> {
+pub fn delta_poll_kept(
+    prologue: &ControlHeader,
+    items: usize,
+) -> Result<Option<impl Iterator<Item = SubId> + use<>>, String> {
     let Some(first) = SubId::new(prologue.arg0) else {
         return Ok(None);
     };

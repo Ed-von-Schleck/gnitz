@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::SchemaDescriptor;
-use crate::test_support::{mix, opk_pk, pk_only_schema, Rng};
+use crate::test_support::{Rng, mix, opk_pk, pk_only_schema};
 use gnitz_wire::{FixedInt, TypeCode};
 
 /// Pack signed/unsigned values into a raw `fi.width()`-byte-per-cell LE
@@ -50,7 +50,7 @@ fn roundtrip(vals: &[i128], fi: FixedInt) -> Option<usize> {
 /// the image at that width is smaller than the raw region.
 fn expected_bw(vals: &[i128], fi: FixedInt) -> Option<usize> {
     let span = vals.iter().max()? - vals.iter().min()?;
-    let bw = (128 - span.leading_zeros() as usize).div_ceil(8);
+    let bw = (span.cast_unsigned().bit_width() as usize).div_ceil(8);
     (bw > 0 && for_image_len(vals.len(), bw) < vals.len() * fi.width()).then_some(bw)
 }
 

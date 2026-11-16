@@ -16,7 +16,7 @@ use crate::repr::pool::{recycle, take, vec_bytes};
 use crate::repr::scatter::{ColumnarSource, Pick};
 use crate::repr::seek::gallop_by;
 use crate::repr::shard::MappedShard;
-use crate::schema::{compare_pk_ordering, group_floor, with_payload_cmp, PayloadOrder, SchemaDescriptor};
+use crate::schema::{PayloadOrder, SchemaDescriptor, compare_pk_ordering, group_floor, with_payload_cmp};
 
 mod gather;
 mod output;

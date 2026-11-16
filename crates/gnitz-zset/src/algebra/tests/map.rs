@@ -1,5 +1,5 @@
 use gnitz_expr::{ConstIdx, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
-use gnitz_wire::{MapKind, NullKeys, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{MAX_PK_COLUMNS, MapKind, NullKeys, TypeCode};
 
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
@@ -120,7 +120,7 @@ fn a_string_projection_moves_content_and_leaves_a_dead_heap() {
 /// the PK region and the weights carry over unchanged.
 #[test]
 fn a_copied_column_holds_each_rows_value_in_its_slot() {
-    use TypeCode::{I128, I16, I32, I64, I8, U16, U32, U64, U8};
+    use TypeCode::{I8, I16, I32, I64, I128, U8, U16, U32, U64};
     let col = |tc| SchemaColumn::new(tc, false);
     for (src, slot) in [
         (I8, I8),

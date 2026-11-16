@@ -10,13 +10,13 @@ use proptest::prelude::*;
 
 use crate::repr::Batch;
 use crate::test_support::stream_input::{
-    agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, shard, Cells, Row, GROUPS,
+    Cells, GROUPS, Row, agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, shard,
 };
-use crate::test_support::{assert_folds, cell, weighted_rows, TestTrace};
+use crate::test_support::{TestTrace, assert_folds, cell, weighted_rows};
 use gnitz_expr::{CmpOp, ReduceOutKey, RowFilter};
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadSink, SinkKind, TypeCode};
 
-use super::{op_reduce, ReducePlan};
+use super::{ReducePlan, op_reduce};
 use crate::algebra::SinkPlan;
 
 /// The ad-hoc fold of `aggs` by `group_cols` over [`schema`], as a read's sink.

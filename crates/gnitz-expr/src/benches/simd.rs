@@ -2,7 +2,7 @@
 
 use crate::morsel::MORSEL;
 use crate::simd::{self, encode_f64};
-use crate::test_support::{simd_levels, Meter};
+use crate::test_support::{Meter, simd_levels};
 
 /// [`crate::simd`]'s kernels alone, over one morsel that stays in cache, at
 /// each level.

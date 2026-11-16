@@ -28,7 +28,7 @@ use local_server::PyLocalServer;
 use read::{PyRow, PyScanResult};
 use reply::{PyPollResult, PyPushed, PySynced};
 use schema::{PyColumnDef, PySchema};
-use write::{install_append_method, PyZSetBatch};
+use write::{PyZSetBatch, install_append_method};
 
 // ---------------------------------------------------------------------------
 // GnitzError Python exception

@@ -226,7 +226,7 @@ fn commit(dir: &str) -> Result<(), StorageError> {
 /// too, for the entries that reach it. A store directory sits at most two below
 /// the data directory's `_relations` (`relation_dir[/child]`), whose own entry
 /// `lock_data_dir` syncs.
-fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = &Path> + '_ {
+fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = &Path> {
     Path::new(dir)
         .ancestors()
         .take(if first { 3 } else { 1 })

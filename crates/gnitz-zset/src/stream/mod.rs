@@ -37,6 +37,6 @@ pub enum History<'a> {
 }
 
 pub use clamp::op_weight_clamp;
-pub use join::{op_join_delta_trace, JoinPlan};
+pub use join::{JoinPlan, op_join_delta_trace};
 pub use ordered::{OrderedEpoch, OrderedPlan};
-pub use reduce::{op_reduce, ReducePlan};
+pub use reduce::{ReducePlan, op_reduce};

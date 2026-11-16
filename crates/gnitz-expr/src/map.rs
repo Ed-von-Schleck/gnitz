@@ -4,7 +4,7 @@
 use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::morsel::Evaluator;
-use crate::program::{locate_col, ReadAs};
+use crate::program::{ReadAs, locate_col};
 use crate::{
     BatchView, ColCopy, ColKind, ColMoves, ExprValidateErr, LogicalInstr, LogicalProgram, MapTarget, SchemaDescriptor,
     Sink,
@@ -134,7 +134,7 @@ impl LogicalProgram {
                     copies.push(ColCopy { src, slot, width: out_loc.size() });
                 }
                 Sink::Reg(r) if self.is_str(r) != type_code.is_german_string() => {
-                    return Err(E::EmitClassMismatch { out, type_code })
+                    return Err(E::EmitClassMismatch { out, type_code });
                 }
                 Sink::Reg(r) if self.is_str(r) => emits.push(Emit {
                     reg: r.0 as usize,

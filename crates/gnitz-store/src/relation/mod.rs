@@ -6,7 +6,7 @@
 use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
-use gnitz_zset::algebra::{index_entries, KeySpec};
+use gnitz_zset::algebra::{KeySpec, index_entries};
 use gnitz_zset::schema::SchemaDescriptor;
 
 pub use crate::storage::Cut;
@@ -27,11 +27,11 @@ mod store;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
-pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
-pub use disk_usage::{disk_usage, DiskUsage};
+pub use dirs::{ChildAddr, ChildKind, DirLock, lock_data_dir, relation_dir};
+pub use disk_usage::{DiskUsage, disk_usage};
 use feed::Feed;
 pub use snapshot::Snapshot;
-use store::{not_held, Rows};
+use store::{Rows, not_held};
 pub use unique_pk::PkRule;
 
 // ---------------------------------------------------------------------------
@@ -414,7 +414,7 @@ impl Relation {
 
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
-    pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
+    pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> {
         self.indexes.iter().filter(|ic| ic.is_unique() && !ic.covers_pk)
     }
 

@@ -1,8 +1,8 @@
 use super::*;
 use crate::bind::bind_constant;
 use crate::test_support::parse_expr_sql;
-use std::convert::Infallible;
 use Placed::*;
+use std::convert::Infallible;
 
 fn lit(src: &str) -> BExpr<Infallible> {
     bind_constant(&parse_expr_sql(src)).unwrap_or_else(|e| panic!("{src}: {e}"))

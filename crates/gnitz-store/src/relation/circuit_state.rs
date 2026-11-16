@@ -5,7 +5,7 @@ use super::{ChildKind, RelationRegistry};
 use crate::storage::{Cut, RecoverySource, Table};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
-use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaDescriptor, encode_schema_block};
 
 /// An index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].

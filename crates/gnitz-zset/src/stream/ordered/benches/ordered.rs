@@ -1,6 +1,6 @@
-use super::tests::Harness;
 use super::OrderIndex;
 use super::OrderedPlan;
+use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
 use crate::test_support::{mix, u64_pk_schema};

@@ -7,7 +7,7 @@
 //! The dead-byte bound is the writer's claim, which an untrusting reader
 //! recomputes.
 
-use crate::{read_u32_le, write_u32_le, Reader, FIXED_REGION_BYTES, WIRE_VERSION};
+use crate::{FIXED_REGION_BYTES, Reader, WIRE_VERSION, read_u32_le, write_u32_le};
 
 pub const WAL_HEADER_SIZE: usize = 20;
 

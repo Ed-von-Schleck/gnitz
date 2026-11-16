@@ -145,8 +145,8 @@ fn newest_decides(run: &Run, state: &mut Range<usize>, i: usize, key: &[u8]) -> 
 mod tripwire {
     use smallvec::SmallVec;
 
-    use super::{vs_key, CursorRow, Range, Run};
-    use crate::schema::{with_payload_cmp, PayloadOrder, SchemaDescriptor};
+    use super::{CursorRow, Range, Run, vs_key};
+    use crate::schema::{PayloadOrder, SchemaDescriptor, with_payload_cmp};
 
     /// [`fold_pk`]'s answer at PK `key` over every run, each galloped to the PK
     /// from where it stands; the runs' positions do not move.

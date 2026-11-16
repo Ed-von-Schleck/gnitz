@@ -9,7 +9,7 @@
 
 use super::super::*;
 use crate::test_support::{apply_ddl, idx_tab_batch, parse_qualified_name, schema_tab_batch, table_blocks};
-use gnitz_wire::{payload_u64, CatalogColumn, IdxTabSlot, TableProps};
+use gnitz_wire::{CatalogColumn, IdxTabSlot, TableProps, payload_u64};
 use gnitz_zset::repr::Batch;
 
 /// Production index names arrive pre-built over the wire; only `create_index`

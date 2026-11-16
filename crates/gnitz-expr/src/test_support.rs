@@ -10,8 +10,8 @@ use gnitz_wire::TypeCode;
 
 use crate::eval::Resolved;
 use crate::morsel::MORSEL;
-use crate::simd::encode_f64;
 use crate::simd::Level;
+use crate::simd::encode_f64;
 use crate::{
     BatchView, ColumnLocator, ConstIdx, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter, ScalarCell,
     ScalarEval, SchemaColumn, SchemaDescriptor, Sink,
@@ -470,7 +470,7 @@ pub fn filter_verdicts(ev: &mut RowFilter, mb: &dyn BatchView) -> Vec<bool> {
 /// The maximal runs of `true` in `verdicts`, half-open.
 fn runs(verdicts: &[bool]) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
-    for (row, _) in verdicts.iter().enumerate().filter(|(_, &v)| v) {
+    for (row, _) in verdicts.iter().enumerate().filter(|&(_, &v)| v) {
         match out.last_mut() {
             Some((_, e)) if *e == row => *e += 1,
             _ => out.push((row, row + 1)),

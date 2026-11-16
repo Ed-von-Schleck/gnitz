@@ -1,7 +1,7 @@
 //! The per-aggregate rules the binder, both reduce lowerings and the window
 //! desugar share, and the one SQL-name ↔ aggregate map. It reads no SQL text.
 
-use crate::error::{unsupported_clause, GnitzSqlError};
+use crate::error::{GnitzSqlError, unsupported_clause};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 
@@ -126,15 +126,15 @@ pub(crate) fn agg_ops(
         AggFunc::Sum => (sum, (nullable || ungrouped).then_some(count)),
         AggFunc::Avg => (sum, Some(count)),
     };
-    if let Some(c) = arg {
-        if ops.0.output_type(c.ty.tc).is_none() {
-            return Err(GnitzSqlError::Rejected(format!(
-                "{}: not supported on {} column '{}'",
-                agg_func_name(func).to_ascii_uppercase(),
-                c.ty,
-                c.name,
-            )));
-        }
+    if let Some(c) = arg
+        && ops.0.output_type(c.ty.tc).is_none()
+    {
+        return Err(GnitzSqlError::Rejected(format!(
+            "{}: not supported on {} column '{}'",
+            agg_func_name(func).to_ascii_uppercase(),
+            c.ty,
+            c.name,
+        )));
     }
     Ok(ops)
 }

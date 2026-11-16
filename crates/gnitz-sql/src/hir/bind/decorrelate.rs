@@ -2,7 +2,7 @@
 //! Bind reads each subquery through its column ([`SubqueryRef::id`]); its join
 //! produces that column.
 
-use super::super::{split_filter, ColId, HirExpr, JoinType, ProjEntry, RelExpr};
+use super::super::{ColId, HirExpr, JoinType, ProjEntry, RelExpr, split_filter};
 use super::subquery::{SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;

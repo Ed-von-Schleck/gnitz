@@ -3,11 +3,11 @@ use gnitz_wire::{IdxTabRow, TableDistribution, ViewParts};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
 
+use super::CatalogEngine;
 use super::relations::{FkEdge, RelationEntry};
 use super::sys_tables::{
-    build_schema_from_col_defs, pk_signatures, read_rel_row, IdSet, PkShape, RelDetail, RelRow, SysFamily,
+    IdSet, PkShape, RelDetail, RelRow, SysFamily, build_schema_from_col_defs, pk_signatures, read_rel_row,
 };
-use super::CatalogEngine;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------

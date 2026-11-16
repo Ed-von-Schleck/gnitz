@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::*;
-use crate::relation::{relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use crate::storage::{read_intact, shard_files, DEFAULT_RAM_TIER_BYTES};
+use crate::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig, relation_dir};
+use crate::storage::{DEFAULT_RAM_TIER_BYTES, read_intact, shard_files};
 use crate::test_support::{
-    flip_last_byte_in_place, make_batch_opk, make_schema_u64_i64, new_table, opk_pk, pk_payload_schema, spec,
-    table_shards, zset_of, RowKey,
+    RowKey, flip_last_byte_in_place, make_batch_opk, make_schema_u64_i64, new_table, opk_pk, pk_payload_schema, spec,
+    table_shards, zset_of,
 };
 use gnitz_wire::TypeCode;
 

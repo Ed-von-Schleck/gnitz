@@ -4,7 +4,7 @@
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
-use crate::catalog::{CatalogEngine, DdlBundle, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use crate::catalog::{CatalogEngine, DdlBundle, PUBLIC_SCHEMA_ID, SysFamily, ZoneError};
 use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_wire::{

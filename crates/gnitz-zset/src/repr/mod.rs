@@ -45,9 +45,9 @@ pub use batch_wire::WireRows;
 pub use codebook::Codebook;
 pub use merge::merge_consolidated;
 pub use pool::PooledBuf;
-pub use read_cursor::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
+pub use read_cursor::{PkSetGather, ReadCursor, empty_cursor, from_runs, from_runs_at, from_runs_in_band};
 pub use run::{Run, StoredRow};
-pub use shard::{guard_slot, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError};
+pub use shard::{GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError, guard_slot};
 
 pub(crate) use batch::{range_rows, runs_where, runs_where_zip};
 pub(crate) use pool::{vec_bytes, with_scratch};

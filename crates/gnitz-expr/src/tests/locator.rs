@@ -1,7 +1,7 @@
 //! Resolved-addressing reads, driven through a non-engine [`crate::BatchView`].
 
-use crate::test_support::{TestView, PATTERNS};
-use crate::{order_bits, ColumnLocator, SchemaColumn, SchemaDescriptor};
+use crate::test_support::{PATTERNS, TestView};
+use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor, order_bits};
 use gnitz_wire::{FixedInt, ScalarKind, TypeCode};
 
 /// Every locator read of every key type, from a key column and from a payload

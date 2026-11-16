@@ -53,7 +53,7 @@ fn park_wake_bench() {
                 false => word.bump(),
             }
         }
-        unsafe { assert_child_exited_ok(pid) };
+        assert_child_exited_ok(pid);
         assert!(spent >= 1, "{advance}: the first advance found the child armed");
         println!(
             "park_wake_bench {advance:<8} {:>5.1}% of advances spent a FUTEX_WAKE, {} child sleeps",

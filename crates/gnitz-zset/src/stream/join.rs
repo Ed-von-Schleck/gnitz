@@ -11,16 +11,16 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 
 use crate::repr::{
-    copy_runs, pk_group_end, prorated_blob_cap, relocated_cell, row_long_bytes, runs_where, should_relocate_blob,
-    stride, stride_dispatch, with_scratch, Batch, CursorRow, ReadCursor, Run,
+    Batch, CursorRow, ReadCursor, Run, copy_runs, pk_group_end, prorated_blob_cap, relocated_cell, row_long_bytes,
+    runs_where, should_relocate_blob, stride, stride_dispatch, with_scratch,
 };
-use crate::schema::{band, compare_pk_ordering, group_floor, key_above, DerivedSchema, SchemaDescriptor};
+use crate::schema::{DerivedSchema, SchemaDescriptor, band, compare_pk_ordering, group_floor, key_above};
 
 use crate::algebra::MapPlan;
-use crate::stream::clamp::clamp_cap;
 use crate::stream::OpenAt;
+use crate::stream::clamp::clamp_cap;
 use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
-use gnitz_wire::{null_word_at, ClampKind, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode};
+use gnitz_wire::{ClampKind, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode, null_word_at};
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -187,7 +187,7 @@ enum Walked<'a> {
 /// A keyed walk reads one side's PK region as the other's, so the two key
 /// layouts must be identical down to the OPK encoding each column type implies.
 fn same_pk_types(delta: &SchemaDescriptor, trace: &SchemaDescriptor) -> Result<(), String> {
-    fn types(s: &SchemaDescriptor) -> impl Iterator<Item = TypeCode> + '_ {
+    fn types(s: &SchemaDescriptor) -> impl Iterator<Item = TypeCode> {
         s.pk_columns().map(|c| c.type_code)
     }
     if types(delta).eq(types(trace)) {
@@ -337,7 +337,7 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
             Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
         }
         debug_assert!(
-            pairs.windows(2).all(|w| w[0].rs <= w[1].rs),
+            pairs.is_sorted_by(|a, b| a.rs <= b.rs),
             "every walk emits delta runs by ascending start"
         );
         let ordered = match plan.walk {
@@ -556,7 +556,7 @@ fn trace_long_bytes(cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing]) -> 
 /// every walk meets the delta's groups in ascending order, and `Cross` emits
 /// the whole delta each time.
 #[inline(always)]
-fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
+fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> {
     pairs.iter().map(|p| (p.rs as usize, p.re as usize))
 }
 

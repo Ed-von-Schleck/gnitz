@@ -1,7 +1,7 @@
 //! FROM-join binding: one join step folded onto the accumulated left input.
 
 use super::super::{ColId, HirCol, JoinType, RelExpr};
-use super::{resolve_table_factor, BindCx, JoinScope, ScopeLeaf};
+use super::{BindCx, JoinScope, ScopeLeaf, resolve_table_factor};
 use crate::bind::bind_conjuncts;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
@@ -30,7 +30,7 @@ pub(super) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(&JoinCo
                 "JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
                  NATURAL, are supported"
                     .into(),
-            ))
+            ));
         }
     })
 }
@@ -69,6 +69,7 @@ pub(super) fn fold_join_step(
                 "NATURAL",
             )
         }
+        JoinConstraint::UsingAlias(..) => return Err(crate::error::unsupported_clause("JOIN USING", "AS <alias>")),
         JoinConstraint::On(_) | JoinConstraint::None => (Vec::new(), ""),
     };
 

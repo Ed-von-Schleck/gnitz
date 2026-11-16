@@ -11,7 +11,7 @@ use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
 use crate::runtime::reactor::AckWait;
 use crate::runtime::sal::{Apply, SalFull, SalScope};
-use crate::runtime::sync::{oneshot, WriteGuard};
+use crate::runtime::sync::{WriteGuard, oneshot};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::MemBatch;
@@ -134,10 +134,10 @@ impl MasterDispatcher {
     /// repairs that.
     pub(crate) async fn checkpoint_base(&self, alone: &WriteGuard<ApplyLock>) {
         let mut excl = self.sal.lock().await;
-        if self.sal.holds_pushes() {
-            if let Err(e) = self.cat_mut().advance_durable_generation() {
-                gnitz_fatal_abort!("checkpoint generation advance failed: {e}");
-            }
+        if self.sal.holds_pushes()
+            && let Err(e) = self.cat_mut().advance_durable_generation()
+        {
+            gnitz_fatal_abort!("checkpoint generation advance failed: {e}");
         }
         let wait = self
             .write_acked(alone, &mut excl, Apply::Flush)

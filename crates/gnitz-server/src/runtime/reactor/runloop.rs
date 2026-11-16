@@ -31,10 +31,10 @@ impl Reactor {
             // The first pass polls `fut`.
             RUN_QUEUE.with(|q| q.borrow_mut().push(ROOT));
             loop {
-                if self.run_ready() {
-                    if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-                        break v;
-                    }
+                if self.run_ready()
+                    && let Poll::Ready(v) = fut.as_mut().poll(&mut cx)
+                {
+                    break v;
                 }
                 self.submit_or_sleep(true);
             }

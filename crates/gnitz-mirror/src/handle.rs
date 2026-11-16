@@ -7,14 +7,14 @@ use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
-    lock_data_dir, DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig,
+    DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig, lock_data_dir,
 };
 use gnitz_wire::{PkColList, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
-use crate::record::{index_lists, Feed, MirrorRecord};
+use crate::record::{Feed, MirrorRecord, index_lists};
 
 /// What a store is sized by. `Default` is the production value of every field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,10 +121,8 @@ impl Mirror {
             }
         }
         // A failure may be transient, and the sweep would delete that copy.
-        if all_reopened {
-            if let Err(e) = store.registry.reclaim_orphan_relation_dirs() {
-                gnitz_debug!("mirror: orphan directory sweep failed: {}", e);
-            }
+        if all_reopened && let Err(e) = store.registry.reclaim_orphan_relation_dirs() {
+            gnitz_debug!("mirror: orphan directory sweep failed: {}", e);
         }
         Ok(store)
     }
@@ -245,13 +243,13 @@ impl Mirror {
     /// Checkpoint once enough bytes were applied since the last. A failed
     /// auto-checkpoint is logged, and the next one retries.
     fn checkpoint_if_due(&mut self) {
-        if self.applied_bytes >= self.checkpoint_bytes {
-            if let Err(e) = self.checkpoint() {
-                gnitz_error!(
-                    "mirror: auto-checkpoint failed: {} — the copies stand; the next checkpoint retries",
-                    e
-                );
-            }
+        if self.applied_bytes >= self.checkpoint_bytes
+            && let Err(e) = self.checkpoint()
+        {
+            gnitz_error!(
+                "mirror: auto-checkpoint failed: {} — the copies stand; the next checkpoint retries",
+                e
+            );
         }
     }
 
@@ -273,7 +271,7 @@ impl MirrorStore for Mirror {
         let renamed = self
             .records
             .iter()
-            .find(|(&t, r)| t != tid && r.name == *name)
+            .find(|&(&t, r)| t != tid && r.name == *name)
             .map(|(&t, _)| t);
         if let Some(old) = renamed {
             self.forget(old)?;

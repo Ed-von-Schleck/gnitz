@@ -13,14 +13,14 @@ use std::time::Duration;
 use std::future::Future;
 
 use gnitz_core::{
-    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema,
-    SubId, TableDef, ViewBundle, ZSetBatch,
+    BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema, Sent,
+    SubId, TableDef, ViewBundle, ZSetBatch, block_on,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
-use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
+use gnitz_test_harness::{ServerHandle, strace_test, unique_schema};
 use gnitz_tokio::AsyncClient;
 use gnitz_wire::{
-    read_i64_le, Circuit, ColumnDef, ReadBound, ReadSpec, TypeCode, ViewBudget, ViewProps, WireConflictMode,
+    Circuit, ColumnDef, ReadBound, ReadSpec, TypeCode, ViewBudget, ViewProps, WireConflictMode, read_i64_le,
 };
 use support::settled;
 use tokio::runtime::Runtime;
@@ -102,23 +102,13 @@ fn all_rows() -> ReadSpec {
 }
 
 /// Push `batch`, submitted when called.
-fn push(
-    c: &AsyncClient,
-    tid: u64,
-    schema: &Arc<Schema>,
-    batch: ZSetBatch,
-) -> impl Future<Output = Result<u64, ClientError>> {
+fn push(c: &AsyncClient, tid: u64, schema: &Arc<Schema>, batch: ZSetBatch) -> Sent<u64> {
     let schema = Arc::clone(schema);
     c.send(move |c| c.push(tid, &schema, batch, WireConflictMode::Update))
 }
 
 /// Read `tid` under `spec`, submitted when called.
-fn scan(
-    c: &AsyncClient,
-    tid: u64,
-    spec: ReadSpec,
-    schema: &Arc<Schema>,
-) -> impl Future<Output = Result<ScanReply, ClientError>> {
+fn scan(c: &AsyncClient, tid: u64, spec: ReadSpec, schema: &Arc<Schema>) -> Sent<ScanReply> {
     let schema = Arc::clone(schema);
     c.send(move |c| c.scan_spec(tid, &spec, &schema))
 }

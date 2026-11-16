@@ -696,7 +696,7 @@ fn key_ranges_are_the_rows_a_key_set_lists() {
         b.certify_consolidated();
         let mut ranges = vec![(7, 9)];
         b.key_ranges(keys.iter().map(|k| &k[..]), &mut ranges);
-        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "maximal runs: {ranges:?}");
+        assert!(ranges.is_sorted_by(|a, b| a.1 < b.0), "maximal runs: {ranges:?}");
         let got: Vec<usize> = ranges.iter().flat_map(|&(start, end)| start..end).collect();
         assert_eq!(got, want, "n={n}");
     }

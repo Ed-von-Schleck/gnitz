@@ -43,10 +43,10 @@
 //! partition before the changed one, and keeps one index entry per row of `W`.
 
 use super::super::{ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr};
-use super::{bind_projection, place_order_keys, ItemLeaf};
-use crate::agg::{agg_func_from_name, AggArg, AggFunc};
-use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, CallSurface, PlainCall};
-use crate::bind::{bind_conjuncts, bind_structural, LeafBinder};
+use super::{ItemLeaf, bind_projection, place_order_keys};
+use crate::agg::{AggArg, AggFunc, agg_func_from_name};
+use crate::ast_util::{CallSurface, PlainCall, classify_agg_shape, single_part_ident, unknown_function};
+use crate::bind::{LeafBinder, bind_conjuncts, bind_structural};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
 use crate::rules::{find_unique_column, reject_float_key};

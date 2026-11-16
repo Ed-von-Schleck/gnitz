@@ -1,5 +1,5 @@
 use super::*;
-use crate::{cmp_col_window, FixedInt, TypeCode};
+use crate::{FixedInt, TypeCode, cmp_col_window};
 
 /// Bit patterns every width-parameterized sweep below truncates to its type's
 /// width: both sign boundaries, the all-ones edges, and the 2^63 / 2^64 / 2^127
@@ -150,7 +150,7 @@ fn a_key_past_max_pk_bytes_panics() {
 /// one included; a section one byte wider is refused, not truncated.
 #[test]
 fn a_pk_buf_reads_back_as_written_or_is_refused() {
-    use crate::codec::{decode_all, Writer};
+    use crate::codec::{Writer, decode_all};
     for len in [0, crate::MAX_PK_BYTES] {
         let key = PkBuf::from_bytes(&vec![0xcd; len]);
         let mut w = Writer::new();

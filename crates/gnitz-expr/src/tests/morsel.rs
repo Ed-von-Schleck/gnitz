@@ -1,12 +1,12 @@
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{FixedInt, Heap, TypeCode};
 
-use super::{decode_f64, encode_f64, MORSEL};
+use super::{MORSEL, decode_f64, encode_f64};
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp, ResolvedProgram};
 use crate::test_support::{
-    f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values, scalar_prog,
-    schema_pk_strings, text, verdicts, view, Col, TestView, PATTERNS,
+    Col, PATTERNS, TestView, f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values,
+    scalar_prog, schema_pk_strings, text, verdicts, view,
 };
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
 use crate::{SchemaColumn, SchemaDescriptor};
@@ -190,11 +190,7 @@ fn float_bits(rows: &[Option<i64>]) -> Vec<Option<u64>> {
 }
 
 fn canonical_bits(x: f64) -> u64 {
-    if x.is_nan() {
-        f64::NAN.to_bits()
-    } else {
-        x.to_bits()
-    }
+    if x.is_nan() { f64::NAN.to_bits() } else { x.to_bits() }
 }
 
 /// Every integer op is the wrapping Rust op, and `/` `%` NULL a zero divisor.

@@ -2,8 +2,8 @@
 //! more surfaces must agree on it, so its doc states the rule it enforces —
 //! never who calls it, which rots the moment a caller moves.
 
-use crate::agg::{agg_func_from_name, agg_func_name, AggArg, AggFunc};
-use crate::error::{reject_if, GnitzSqlError};
+use crate::agg::{AggArg, AggFunc, agg_func_from_name, agg_func_name};
+use crate::error::{GnitzSqlError, reject_if};
 use sqlparser::ast::{Visit, Visitor};
 use std::ops::ControlFlow;
 
@@ -43,7 +43,7 @@ pub(crate) fn classify_agg_call(
         (true, None) => {
             return Err(GnitzSqlError::Rejected(
                 "COUNT(DISTINCT *): DISTINCT needs a column argument".into(),
-            ))
+            ));
         }
     };
     Ok((func, arg))
@@ -58,12 +58,11 @@ pub(crate) fn classify_agg_shape(
     let base = single_part_ident(&f.name)
         .and_then(agg_func_from_name)
         .ok_or_else(|| unknown_function(f))?;
-    if base == AggFunc::Count {
-        if let FunctionArguments::List(list) = &f.args {
-            if let [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] = &list.args[..] {
-                return Ok((AggFunc::Count, None));
-            }
-        }
+    if base == AggFunc::Count
+        && let FunctionArguments::List(list) = &f.args
+        && let [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] = &list.args[..]
+    {
+        return Ok((AggFunc::Count, None));
     }
     Ok((base, Some(call.args(agg_func_name(base), (1, Some(1)))?[0])))
 }

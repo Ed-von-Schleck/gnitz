@@ -6,7 +6,7 @@
 
 use crate::ir::BExpr;
 use gnitz_expr::CmpOp;
-use gnitz_wire::{parse_decimal_text, ColType, FixedInt, TypeCode, MAX_DECIMAL_TEXT_SCALE, MICROS_PER_DAY};
+use gnitz_wire::{ColType, FixedInt, MAX_DECIMAL_TEXT_SCALE, MICROS_PER_DAY, TypeCode, parse_decimal_text};
 
 /// The text spellings of a BOOLEAN, PostgreSQL's: case and surrounding
 /// whitespace are ignored.

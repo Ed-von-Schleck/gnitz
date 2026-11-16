@@ -22,32 +22,32 @@ mod window;
 pub(crate) use window::ranking_names;
 
 use super::{
-    col_by_id, schema_cols, ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind,
+    ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind, col_by_id, schema_cols,
 };
 use crate::ast_util::{
     body_is_grouped, col_ref_parts, is_agg_call, peel_nested, select_is_distinct, single_part_ident,
 };
-use crate::bind::{bind_conjuncts, bind_structural, unsupported_subquery, LeafBinder};
+use crate::bind::{LeafBinder, bind_conjuncts, bind_structural, unsupported_subquery};
 use crate::catalog::Catalog;
-use crate::error::{derivation, reject_if, unsupported_clause, GnitzSqlError};
-use crate::ir::{BExpr, LeafTyping, BOOL};
-use crate::names::{extract_table_ref, TableRef};
+use crate::error::{GnitzSqlError, derivation, reject_if, unsupported_clause};
+use crate::ir::{BExpr, BOOL, LeafTyping};
+use crate::names::{TableRef, extract_table_ref};
 use crate::rules::{
-    canonical_user_name, find_unique_column, has_visible_column, reject_duplicate_names, require_class,
-    single_relation_col_idx, ClassWant,
+    ClassWant, canonical_user_name, find_unique_column, has_visible_column, reject_duplicate_names, require_class,
+    single_relation_col_idx,
 };
-use crate::tail::{extract_limit_offset, key_slots, order_exprs, parse_order_by, OrderKey};
+use crate::tail::{OrderKey, extract_limit_offset, key_slots, order_exprs, parse_order_by};
 use crate::validate::{
-    reject_query_envelope_body, reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses,
-    QueryEnvelope,
+    HonoredClauses, QueryEnvelope, reject_query_envelope_body, reject_unhonored_query_clauses,
+    reject_unhonored_select_clauses,
 };
 use gnitz_core::Schema;
 use gnitz_wire::{ColType, ColumnDef};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
 use sqlparser::ast::{
-    Expr, Ident, JoinConstraint, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-    SetQuantifier, TableAliasColumnDef, TableFactor,
+    Expr, Ident, InTarget, JoinConstraint, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    SetOperator, SetQuantifier, TableAliasColumnDef, TableFactor,
 };
 use sqlparser::tokenizer::Span;
 use std::borrow::Cow;
@@ -276,7 +276,7 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
         Surface::View(ViewBody { stmt, replacing }) if replacing == Some(rel.tid) => {
             return Err(GnitzSqlError::Rejected(format!(
                 "{stmt} '{name}' AS a query referencing the view itself is not supported"
-            )))
+            )));
         }
         Surface::View(v) => (ClassWant::ViewSource, v.stmt),
     };
@@ -355,7 +355,7 @@ impl<'a> QueryTail<'a> {
                 None => {
                     return Err(GnitzSqlError::Rejected(format!(
                         "{stmt}: ORDER BY over a set operation names an output column or position"
-                    )))
+                    )));
                 }
             }
         }
@@ -469,7 +469,7 @@ pub(super) fn bind_select(
         (None, Surface::View(_)) => {
             return Err(GnitzSqlError::Rejected(format!(
                 "{stmt}: a view body reads at least one relation; this one has no FROM clause"
-            )))
+            )));
         }
     };
 
@@ -534,7 +534,7 @@ pub(super) fn bind_select(
 /// An ad-hoc read reads one relation, and a subquery derives another.
 fn adhoc_subquery(e: &Expr) -> GnitzSqlError {
     derivation(match e {
-        Expr::Exists { .. } | Expr::InSubquery { .. } => "EXISTS/IN subquery",
+        Expr::Exists { .. } | Expr::In { target: InTarget::Subquery(_), .. } => "EXISTS/IN subquery",
         _ => "scalar subquery",
     })
 }
@@ -608,15 +608,15 @@ fn bind_projection<L: ItemLeaf>(
             }
             _ => None,
         };
-        if let Some((qualifier, o)) = star {
-            if let Some(cols) = leaf.wildcard_cols(qualifier)? {
-                let expanded = wildcard::expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?;
-                items.extend(expanded.into_iter().map(|(i, def)| ProjEntry {
-                    expr: BExpr::ColRef(cols[i].id),
-                    out: HirCol::new(ids.next(), def),
-                }));
-                continue;
-            }
+        if let Some((qualifier, o)) = star
+            && let Some(cols) = leaf.wildcard_cols(qualifier)?
+        {
+            let expanded = wildcard::expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?;
+            items.extend(expanded.into_iter().map(|(i, def)| ProjEntry {
+                expr: BExpr::ColRef(cols[i].id),
+                out: HirCol::new(ids.next(), def),
+            }));
+            continue;
         }
         let (expr, alias) = scalar_projection_item(item, ctx)?;
         items.push(bind_scalar_item(expr, alias, idx, leaf, ids).map_err(|e| e.in_clause(ctx))?);

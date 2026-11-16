@@ -5,11 +5,11 @@ use gnitz_wire::{FixedInt, TypeCode};
 use crate::eval::Resolved;
 use crate::morsel::MORSEL;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
-use crate::simd::encode_f64;
 use crate::simd::Level;
+use crate::simd::encode_f64;
 use crate::test_support::{
-    bench_rows, filter_prog, filter_verdicts, in_set, int, make_n_col_view, make_string_view, map_prog, map_rows,
-    passing_rows, result_prog, schema_pk, schema_pk_ints, schema_pk_strings, strings, view, Meter, TestView,
+    Meter, TestView, bench_rows, filter_prog, filter_verdicts, in_set, int, make_n_col_view, make_string_view,
+    map_prog, map_rows, passing_rows, result_prog, schema_pk, schema_pk_ints, schema_pk_strings, strings, view,
 };
 use crate::{
     CalendarOp, CmpOp, ConstIdx, FloatArithOp, IntArithOp, LikePattern, LogicalInstr as L, LogicalInstr,
@@ -359,7 +359,7 @@ fn is_null_arm_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn range_walk_bench() {
-    use gnitz_wire::{key_image, KeyRange, PkColList};
+    use gnitz_wire::{KeyRange, PkColList, key_image};
     let meter = Meter::new();
     let n = bench_rows();
     let schema = schema_pk_ints(1, true);

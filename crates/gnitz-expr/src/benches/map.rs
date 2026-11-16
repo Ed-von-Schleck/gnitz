@@ -1,7 +1,7 @@
 //! Instruction benchmarks for a copy-only map's null words.
 
-use crate::test_support::{bench_rows, make_n_col_view, schema_pk_ints, Meter, TestView};
 use crate::LogicalProgram;
+use crate::test_support::{Meter, TestView, bench_rows, make_n_col_view, schema_pk_ints};
 
 /// The null words of a copy-only map over eight nullable columns: a
 /// column prefix, every column moved one slot down, and the columns reversed.

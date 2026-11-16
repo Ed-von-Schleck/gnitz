@@ -2,7 +2,7 @@
 //! no request of its own.
 
 use super::*;
-use gnitz_core::{block_on, ClientError};
+use gnitz_core::{ClientError, block_on};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::WireFault;
 
@@ -17,7 +17,7 @@ fn reruns(client: &mut GnitzClient, status: WireStatus, refusals: usize) -> (Res
         |_: &dyn Catalog| Ok(()),
         |_: &()| true,
         async |_: &mut GnitzClient, (): ()| {
-            runs.set(runs.get() + 1);
+            runs.update(|v| v + 1);
             match runs.get() <= refusals {
                 true => Err(GnitzSqlError::Client(ClientError::Refused(WireFault {
                     status,

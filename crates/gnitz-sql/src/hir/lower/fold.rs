@@ -6,7 +6,7 @@
 
 use super::super::physical::{self, Frame};
 use super::super::{AggCol, ColId, HirExpr, ProjEntry};
-use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
+use super::{ReduceSpecs, keyed_frame, resolve_reduce_specs};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use gnitz_core::Schema;

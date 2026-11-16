@@ -5,7 +5,7 @@
 use gnitz_wire::{PkBuf, PkListRole, RowSource};
 
 use super::key_pack::KeyPacker;
-use crate::repr::{copy_runs, range_rows, runs_where_zip, stride, Batch, MemBatch};
+use crate::repr::{Batch, MemBatch, copy_runs, range_rows, runs_where_zip, stride};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
 
 /// A key span: columns at their own types, packed tightly in order.

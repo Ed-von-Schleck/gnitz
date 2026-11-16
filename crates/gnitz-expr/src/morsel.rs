@@ -18,11 +18,11 @@ use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
 use crate::map::{Emit, EmitStore};
 use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp, PAYLOAD_SLOTS};
 use crate::search::{fields, find, lit_eq};
-use crate::simd::{self, decode_f64, encode_f64, LanePred, Level};
-use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
+use crate::simd::{self, LanePred, Level, decode_f64, encode_f64};
+use crate::{BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram, calendar};
 use gnitz_wire::{
-    compare_german_strings, german_string_content, german_string_heap, german_string_inline, low_bits_mask,
-    null_word_get, FixedInt, Heap,
+    FixedInt, Heap, compare_german_strings, german_string_content, german_string_heap, german_string_inline,
+    low_bits_mask, null_word_get,
 };
 
 /// Integer-cast bounds for the target type: the signed-source window `[lo, hi]`
@@ -721,11 +721,7 @@ impl IntLane<'_> {
     #[inline]
     fn get(self, i: usize) -> i128 {
         let v = self.rows[i];
-        if self.signed {
-            v as i128
-        } else {
-            v as u64 as i128
-        }
+        if self.signed { v as i128 } else { v as u64 as i128 }
     }
 }
 

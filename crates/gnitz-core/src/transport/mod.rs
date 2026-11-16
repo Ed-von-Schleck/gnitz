@@ -283,12 +283,12 @@ impl ClientTransport {
                     return Err(ClientError::from(format!(
                         "authentication failed: the server requires an access token (`token_file=` or {})",
                         tls::TOKEN_ENV
-                    )))
+                    )));
                 }
                 Ok(AuthStatus::Refused) => {
                     return Err(ClientError::from(
                         "authentication failed: the server does not recognise the access token",
-                    ))
+                    ));
                 }
                 Err(e @ HelloError::Malformed) => return Err(ProtocolError::DecodeError(e.to_string()).into()),
                 Err(e @ HelloError::Version { .. }) => return Err(ClientError::from(e.to_string())),

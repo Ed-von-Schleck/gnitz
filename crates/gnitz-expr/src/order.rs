@@ -215,7 +215,7 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
     }
 
     /// The rows, in no particular order.
-    pub fn rows(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = u32> {
         self.rows.iter().map(|r| r.row)
     }
 

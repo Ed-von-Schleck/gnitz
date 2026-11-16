@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::mem::MaybeUninit;
 
 use gnitz_expr::{BatchView, ColumnLocator};
-use gnitz_wire::{zip_cells, RowSource, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
+use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS, RowSource, TypeCode, zip_cells};
 
 use crate::repr::{range_rows, with_scratch};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -372,7 +372,7 @@ impl KeyPacker {
     }
 
     /// The output PK columns this packer's bytes fill, in key order.
-    pub(super) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
+    pub(super) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> {
         let bitmap = self.has_bitmap.then_some(BITMAP_COL);
         let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
         bitmap.into_iter().chain(self.cols().iter().map(|c| c.out)).chain(fold)
@@ -561,7 +561,9 @@ impl KeyPacker {
                 batch,
                 runs,
             );
-            if let (true, Some(slot)) = (self.has_bitmap, col.loc.payload_slot()) {
+            if self.has_bitmap
+                && let Some(slot) = col.loc.payload_slot()
+            {
                 // A NULL packs as a zeroed slot under its bitmap bit.
                 let nulls = batch.null_bmp().as_chunks::<8>().0;
                 for_rows(dst, stride, runs, |key, row| {

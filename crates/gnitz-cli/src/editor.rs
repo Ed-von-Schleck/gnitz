@@ -8,17 +8,16 @@ use std::process::{Command, ExitCode};
 use gnitz_core::block_on;
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    default_vi_visual_keybindings, DefaultHinter, DescriptionMode, EditCommand, Emacs, FileBackedHistory, IdeMenu,
-    InputMode, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult,
-    Validator, Vi,
+    DefaultHinter, DescriptionMode, EditCommand, Emacs, FileBackedHistory, IdeMenu, InputMode, KeyCode, KeyModifiers,
+    Keybindings, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, PromptViMode,
+    Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator, Vi, default_emacs_keybindings,
+    default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings,
 };
 
 use crate::complete::Context;
 use crate::highlight::SqlHighlighter;
 use crate::lex;
-use crate::shell::{command_from_env, Flow, Shell};
+use crate::shell::{Flow, Shell, command_from_env};
 
 const COMPLETION_MENU: &str = "completion_menu";
 const HISTORY_CAPACITY: usize = 10_000;
@@ -168,10 +167,10 @@ fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
                 DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
             ));
     }
-    if let Some(path) = history_path() {
-        if let Ok(history) = FileBackedHistory::with_file(HISTORY_CAPACITY, path) {
-            line_editor = line_editor.with_history(Box::new(history));
-        }
+    if let Some(path) = history_path()
+        && let Ok(history) = FileBackedHistory::with_file(HISTORY_CAPACITY, path)
+    {
+        line_editor = line_editor.with_history(Box::new(history));
     }
     line_editor
 }

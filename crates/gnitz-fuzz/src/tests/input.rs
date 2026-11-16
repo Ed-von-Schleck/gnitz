@@ -1,5 +1,5 @@
 use super::*;
-use crate::edit::{Kind, KINDS};
+use crate::edit::{KINDS, Kind};
 
 /// Any bytes decode: missing head bytes read as zero, an edit's kind wraps
 /// and a trailing part of an edit is ignored; a seed's unedited input is that

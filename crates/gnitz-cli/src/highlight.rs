@@ -4,7 +4,7 @@ use gnitz_sql::sqlparser::tokenizer::{Token, Whitespace};
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 
-use crate::lex::{is_keyword, lex_prefix, Lexeme};
+use crate::lex::{Lexeme, is_keyword, lex_prefix};
 use crate::meta::{ArgKind, MetaLine};
 
 /// The highlighter: the style of each token class.

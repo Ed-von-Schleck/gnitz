@@ -13,7 +13,7 @@ use proptest::prelude::*;
 use gnitz_wire::MAX_PK_COLUMNS;
 
 use crate::storage::shard_index::L0_COMPACT_THRESHOLD;
-use crate::storage::{flush_barrier, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table, flush_barrier};
 use crate::test_support::{self, arb_schema, row_key, zset_of, zset_sum};
 
 use gnitz_wire::RowSource;

@@ -70,7 +70,7 @@ pub(crate) fn find_lit(h: &[u8], lit: &Finder<'static>) -> Option<usize> {
 
 /// The `(start, end)` byte span of each field of `s` split on the non-empty
 /// `d`, left to right — one field, `s` whole, when `d` never occurs.
-pub(crate) fn fields<'a>(s: &'a [u8], d: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
+pub(crate) fn fields<'a>(s: &'a [u8], d: &'a [u8]) -> impl Iterator<Item = (usize, usize)> {
     debug_assert!(!d.is_empty(), "an empty delimiter splits nothing");
     let mut next = Some(0usize);
     std::iter::from_fn(move || {

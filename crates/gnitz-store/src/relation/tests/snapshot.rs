@@ -1,10 +1,10 @@
 use super::*;
 use crate::relation::StoreConfig;
 use crate::test_support::{
-    batch_rows, make_batch_raw, make_schema_u64_i64, relation_fixture, relation_fixture_with, rows_spec, spec,
-    spilling, TID,
+    TID, batch_rows, make_batch_raw, make_schema_u64_i64, relation_fixture, relation_fixture_with, rows_spec, spec,
+    spilling,
 };
-use gnitz_wire::snapshot::{PageRequest, MAX_PAGE_ROWS};
+use gnitz_wire::snapshot::{MAX_PAGE_ROWS, PageRequest};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::Batch;
 

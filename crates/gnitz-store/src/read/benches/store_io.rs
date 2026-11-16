@@ -8,7 +8,7 @@ use std::num::NonZeroU64;
 use super::Probe;
 use crate::relation::RelationKind;
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, table_shards, RelationFixture, TID,
+    RelationFixture, TID, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, table_shards,
 };
 use gnitz_wire::{PkColList, PkKeys, TypeCode};
 use gnitz_zset::schema::SchemaDescriptor;

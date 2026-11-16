@@ -15,7 +15,7 @@ mod mmap;
 mod pk_filter;
 mod reader;
 
-pub use compact::{guard_slot, GuardMerge, GuardRun};
+pub use compact::{GuardMerge, GuardRun, guard_slot};
 pub(crate) use encoding::symbols_head_len;
 pub use error::StorageError;
 pub use file::ShardWriteOpts;

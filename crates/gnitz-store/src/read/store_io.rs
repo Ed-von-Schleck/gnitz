@@ -10,8 +10,8 @@ use crate::relation::{Cut, Relation, RelationRegistry};
 use crate::storage::Table;
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
-use gnitz_zset::repr::{empty_cursor, Batch, PkSetGather};
-use gnitz_zset::schema::{project_schema, SchemaDescriptor};
+use gnitz_zset::repr::{Batch, PkSetGather, empty_cursor};
+use gnitz_zset::schema::{SchemaDescriptor, project_schema};
 use std::num::NonZeroU64;
 
 /// One `HasPk` probe: the store it reads, and what it answers each matched key

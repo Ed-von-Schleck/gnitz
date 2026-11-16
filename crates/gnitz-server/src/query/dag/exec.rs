@@ -2,8 +2,8 @@
 //! evaluation driver.
 
 use super::*;
-use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 
 // ── Epoch execution ─────────────────────────────────────────────────────
 

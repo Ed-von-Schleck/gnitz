@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_expr_sql, parse_query, rejected, rel, shadowed_cols, table, TestCatalog};
+use crate::test_support::{TestCatalog, col, ncol, parse_expr_sql, parse_query, rejected, rel, shadowed_cols, table};
 use gnitz_wire::{RelClass, TypeCode};
 use std::rc::Rc;
 

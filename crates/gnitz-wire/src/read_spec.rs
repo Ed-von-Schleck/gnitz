@@ -5,11 +5,11 @@
 use std::num::NonZeroU64;
 use std::ops::Range;
 
-use crate::codec::{decode_all, Reader, Wire, Writer};
-use crate::operator::{order_keys, ComputeMap, GroupAggs, OrderKey};
+use crate::MAX_PK_BYTES;
+use crate::codec::{Reader, Wire, Writer, decode_all};
+use crate::operator::{ComputeMap, GroupAggs, OrderKey, order_keys};
 use crate::pk::PkKeys;
 use crate::range::KeyRange;
-use crate::MAX_PK_BYTES;
 
 wire_enum! {
     /// The tag a [`ReadBound`] leads with.

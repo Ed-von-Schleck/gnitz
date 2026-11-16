@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::{push_coded, push_codes, HeapValue, SymbolTable, MAX_SYMBOLS, MAX_SYMBOL_LEN};
+use gnitz_wire::{HeapValue, MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable, push_coded, push_codes};
 
 use super::batch::Batch;
 

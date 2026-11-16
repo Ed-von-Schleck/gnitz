@@ -1,16 +1,16 @@
 use super::*;
-use crate::repr::{merge_consolidated, BatchBuilder};
+use crate::repr::{BatchBuilder, merge_consolidated};
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, map_shard, read_strings,
     string_batch, u64_pk_schema,
 };
-use gnitz_wire::{write_u64_le, Heap, TypeCode};
+use gnitz_wire::{Heap, TypeCode, write_u64_le};
 
 /// Any change to the written bytes, the writer's own or a dependency's, needs a
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (30, 5542345507825367142);
+    const PINNED: (u64, u64) = (31, 2559406928089890759);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let str = SchemaColumn::new(TypeCode::String, false);
     let schema = u64_pk_schema(&[int, int, str, str, SchemaColumn::new(TypeCode::I64, true), int, str]);
@@ -50,7 +50,9 @@ fn shard_bytes_are_pinned() {
     use Encoding::*;
     assert_eq!(
         encodings,
-        [Key, TwoValue, TwoValue, For, Raw, Dict, Seq, Sparse, Constant, Seq, Symbols, Raw],
+        [
+            Key, TwoValue, TwoValue, For, Raw, Dict, Seq, Sparse, Constant, Seq, Symbols, Raw
+        ],
         "the batch covers every encoding"
     );
     assert!(spans.last().unwrap().size > 0, "and a PK filter");
@@ -338,7 +340,7 @@ fn string_images_are_pinned() {
     );
     assert_eq!(
         shard(&rows, true),
-        (vec![Constant, Dict, Seq, Seq, Symbols, Raw], 17156004011245352482),
+        (vec![Constant, Dict, Seq, Seq, Symbols, Raw], 15498601318452023197),
         "coded heap"
     );
     let two = string_batch(&[(1, "the first long value"), (2, "the second long value")]);

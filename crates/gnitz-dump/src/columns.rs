@@ -31,9 +31,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{push_zero_cell, ColType, ColumnDef, FixedInt, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, push_zero_cell};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as Physical, ZstdLevel};
-use parquet::column::reader::{get_typed_column_reader, ColumnReader};
+use parquet::column::reader::{ColumnReader, get_typed_column_reader};
 use parquet::data_type::{
     BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
 };
@@ -503,12 +503,12 @@ fn read_cells<T: DataType>(
     cells.reserve(n * tc.wire_stride());
     let mut values = values.into_iter();
     for row in 0..n {
-        if let (Some(levels), Some((words, bit))) = (&levels, &mut nulls) {
-            if levels[row] == 0 {
-                push_zero_cell(cells, tc);
-                words[row] |= *bit;
-                continue;
-            }
+        if let (Some(levels), Some((words, bit))) = (&levels, &mut nulls)
+            && levels[row] == 0
+        {
+            push_zero_cell(cells, tc);
+            words[row] |= *bit;
+            continue;
         }
         decode(values.next().ok_or("fewer values than rows")?, cells)?;
     }

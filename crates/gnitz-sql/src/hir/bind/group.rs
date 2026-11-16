@@ -1,11 +1,11 @@
 //! GROUP BY / aggregate / HAVING binding: the reduce, the pre-map under it and
 //! the leaf its HAVING and SELECT list bind through.
 
-use super::super::{col_by_id, hircol_of, reduce_reads, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr};
-use super::{bind_select_list, BindCx, ItemLeaf, ScopeLeaf};
+use super::super::{ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, col_by_id, hircol_of, reduce_reads};
+use super::{BindCx, ItemLeaf, ScopeLeaf, bind_select_list};
 use crate::agg::{AggArg, AggFunc};
-use crate::bind::{bind_conjuncts, bind_structural, LeafBinder};
-use crate::error::{unsupported_clause, GnitzSqlError};
+use crate::bind::{LeafBinder, bind_conjuncts, bind_structural};
+use crate::error::{GnitzSqlError, unsupported_clause};
 use crate::ir::{BExpr, LeafTyping};
 use crate::rules::reject_float_keys;
 use crate::tail::group_by_target;

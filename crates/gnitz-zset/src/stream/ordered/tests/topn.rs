@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::repr::Batch;
-use crate::stream::ordered::tests::{arb_keys, ordered_groups, Harness};
+use crate::stream::ordered::tests::{Harness, arb_keys, ordered_groups};
 use crate::test_support::stream_input::{
-    arb_row, arb_ticks, batch, cells, delta_to, schema, shard, Cells, Row, GROUPS,
+    Cells, GROUPS, Row, arb_row, arb_ticks, batch, cells, delta_to, schema, shard,
 };
 use gnitz_wire::OrderKey;
 

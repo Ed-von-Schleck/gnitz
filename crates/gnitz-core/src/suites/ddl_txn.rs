@@ -3,8 +3,8 @@
 //! checks.
 
 use super::*;
-use crate::{sys_schema, ColumnChange};
-use gnitz_wire::{PkColList, SchemaTabRow, SysRow, SCHEMA_TAB, SEQ_TAB};
+use crate::{ColumnChange, sys_schema};
+use gnitz_wire::{PkColList, SCHEMA_TAB, SEQ_TAB, SchemaTabRow, SysRow};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {

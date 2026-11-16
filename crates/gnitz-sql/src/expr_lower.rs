@@ -7,10 +7,10 @@
 
 use crate::error::GnitzSqlError;
 use crate::ir::{
-    bin_types, blended, case_results, check_decimal_scale, operand_ty_pair, range_step, reads_unsigned, BExpr, BinOp,
-    BoundExpr, NumFunc, RangeStep, RegClass, StrArg, StrFunc, BOOL, STRING,
+    BExpr, BOOL, BinOp, BoundExpr, NumFunc, RangeStep, RegClass, STRING, StrArg, StrFunc, bin_types, blended,
+    case_results, check_decimal_scale, operand_ty_pair, range_step, reads_unsigned,
 };
-use crate::literal::{assign, invalid_literal, place, Compared, Placed};
+use crate::literal::{Compared, Placed, assign, invalid_literal, place};
 use gnitz_core::Schema;
 use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
@@ -50,7 +50,7 @@ impl Lowering<'_> {
                     return Err(GnitzSqlError::Rejected(format!(
                         "integer literal {lit} does not fit a 64-bit register; it is usable only in a comparison \
                          or IN list against an integer column, an INSERT value or an UPDATE SET value"
-                    )))
+                    )));
                 }
             },
             BoundExpr::LitNull => self.eb.emit(L::LoadNull),
@@ -104,7 +104,7 @@ impl Lowering<'_> {
                     "column {:?} is {}; blob columns support only =, <>, <, <=, >, >= \
                      against another blob/string column or a string literal",
                     c.name, c.ty,
-                )))
+                )));
             }
             TypeCode::String => self.eb.emit(L::LoadColStr { col }),
             _ => self.eb.emit(L::LoadCol { col }),
@@ -207,7 +207,7 @@ impl Lowering<'_> {
                 return Err(GnitzSqlError::Rejected(format!(
                     "{} is {from}; CAST it to use it as {to}",
                     self.describe(e)
-                )))
+                )));
             }
             (RegClass::Str, _) => return Err(self.not_scalar(e)),
             (_, RegClass::Str) => return Err(GnitzSqlError::Rejected("expected a string value here".to_string())),
@@ -324,7 +324,7 @@ impl Lowering<'_> {
                 return Err(GnitzSqlError::Rejected(format!(
                     "{} is BOOLEAN; a numeric function takes a number",
                     self.describe(arg)
-                )))
+                )));
             }
             _ => {}
         }
@@ -385,7 +385,7 @@ impl Lowering<'_> {
                 return Err(GnitzSqlError::Rejected(format!(
                     "a calendar function takes a DATE or TIMESTAMP; {} is {t}",
                     self.describe(arg)
-                )))
+                )));
             }
         };
         let a = self.lower(arg)?;
@@ -484,7 +484,7 @@ impl Lowering<'_> {
             (RegClass::Bool, _) | (_, RegClass::Bool) => {
                 return Err(GnitzSqlError::Rejected(format!(
                     "CAST of {from} to {to} is not supported"
-                )))
+                )));
             }
             (_, RegClass::Dec(_)) => return self.lower_to(expr, to),
             (_, RegClass::Float) => {

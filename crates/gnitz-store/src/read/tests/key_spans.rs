@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::RelationKind;
 use crate::test_support::{
-    chunked, id_rows, pk_only_schema, relation_fixture_with, spec, u64_pk_schema, RelationFixture, TID,
+    RelationFixture, TID, chunked, id_rows, pk_only_schema, relation_fixture_with, spec, u64_pk_schema,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::algebra::Slot;

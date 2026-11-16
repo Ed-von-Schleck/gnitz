@@ -1,9 +1,9 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    chunked, col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1, scan_all,
-    table_engine_with, try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of,
-    RowKey,
+    RowKey, chunked, col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1,
+    scan_all, table_engine_with, try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols,
+    zset_of,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{Circuit, JoinKind, TypeCode};

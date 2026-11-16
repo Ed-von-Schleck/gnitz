@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{arb_fold_case, fold_batch, make_schema_u64_i64, zset_of, zset_sum, TestTrace};
+use crate::test_support::{TestTrace, arb_fold_case, fold_batch, make_schema_u64_i64, zset_of, zset_sum};
 use gnitz_wire::ClampKind::{Distinct, PositivePart};
 use proptest::prelude::*;
 

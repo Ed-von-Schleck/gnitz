@@ -157,8 +157,8 @@ fn join_key_common_type_is_the_narrowest_faithful_slot() {
 /// floats by `total_cmp` (-0.0 < +0.0, NaN ordered and equal to itself).
 #[test]
 fn cmp_col_window_orders_every_fixed_width_type() {
-    use core::cmp::Ordering::{self, *};
     use TypeCode::*;
+    use core::cmp::Ordering::{self, *};
     let le = |v: i128, n: usize| v.to_le_bytes()[..n].to_vec();
     let f = |v: f64| v.to_le_bytes().to_vec();
     let cases: &[(TypeCode, Vec<u8>, Vec<u8>, Ordering)] = &[

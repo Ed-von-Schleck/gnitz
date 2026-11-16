@@ -3,6 +3,7 @@ name = "gnitz-dump"
 description = "Logical dump and restore for the gnitz database: schema as SQL, rows as Parquet"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -1,6 +1,6 @@
 use super::*;
-use crate::hir::bind::tests::bound;
 use crate::hir::OrderedOp;
+use crate::hir::bind::tests::bound;
 
 /// The `(limit, offset)` of the top-N `sql`'s body cuts, if it cuts one.
 fn cut(sql: &str) -> Option<(u64, u64)> {

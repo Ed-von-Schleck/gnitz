@@ -15,17 +15,17 @@ use std::rc::Rc;
 
 use gnitz_store::relation::Relation;
 use gnitz_wire::{
-    payload_str, payload_u64, CatalogColumn, FkAction, PkColList, RelDescriptorBlob, RelIndex, Target, WireFault,
-    WireStatus, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
+    CatalogColumn, FkAction, PkColList, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, RelDescriptorBlob, RelIndex, Target,
+    WireFault, WireStatus, payload_str, payload_u64,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaDescriptor, encode_schema_block};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::sys_tables::encode_record;
 use super::CatalogEngine;
+use super::sys_tables::encode_record;
 
 /// A set of table ids to lock; a write to one table without FK edges, the
 /// common case, fits inline.

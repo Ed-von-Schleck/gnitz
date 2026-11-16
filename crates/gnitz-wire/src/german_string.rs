@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, Heap, HeapValue};
+use crate::{Heap, HeapValue, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 
 /// Threshold for inline German String storage (bytes).
 pub const SHORT_STRING_THRESHOLD: usize = 12;
@@ -241,11 +241,7 @@ pub fn german_string_lead(cell: &[u8; 16], heap: Heap<'_>) -> u64 {
 #[inline(always)]
 pub fn german_string_long_len(cell: &[u8; 16]) -> usize {
     let n = read_u32_le(cell, 0) as usize;
-    if n > SHORT_STRING_THRESHOLD {
-        n
-    } else {
-        0
-    }
+    if n > SHORT_STRING_THRESHOLD { n } else { 0 }
 }
 
 /// Byte-lexicographic order over two German string cells.

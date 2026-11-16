@@ -8,7 +8,7 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use super::*;
-use gnitz_wire::{ViewTabSlot, VIEW_TAB};
+use gnitz_wire::{VIEW_TAB, ViewTabSlot};
 
 /// Base table `t(pk BIGINT PK, v BIGINT)` in a fresh schema, holding pks 1..=3:
 /// `(schema name, tid, schema)`.

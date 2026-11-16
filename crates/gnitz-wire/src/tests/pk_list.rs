@@ -117,10 +117,14 @@ fn a_pk_rule_names_the_columns_its_caller_can() {
         assert_eq!(rule.for_role(role), positional, "{rule:?}");
     }
     let float = PkRule::NotEligible { col: 1, type_code: TypeCode::F64 };
-    assert!(float
-        .named(role, name)
-        .starts_with("primary key column 'price' has type_code F64;"));
-    assert!(float
-        .for_role(role)
-        .starts_with("primary key column 1 has type_code F64;"));
+    assert!(
+        float
+            .named(role, name)
+            .starts_with("primary key column 'price' has type_code F64;")
+    );
+    assert!(
+        float
+            .for_role(role)
+            .starts_with("primary key column 1 has type_code F64;")
+    );
 }

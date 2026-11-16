@@ -2,8 +2,8 @@
 
 use std::cmp::Ordering;
 
-use super::{cmp_order_keys, order_bits, order_locators, OrderLocator, RowRanking};
-use crate::test_support::{schema_pk_ints, TestView, PATTERNS};
+use super::{OrderLocator, RowRanking, cmp_order_keys, order_bits, order_locators};
+use crate::test_support::{PATTERNS, TestView, schema_pk_ints};
 use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{OrderKey, RowSource, ScalarKind, TypeCode};
 

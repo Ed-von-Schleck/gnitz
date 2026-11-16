@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use crate::schema::{pk_width_dispatch, PkSortKey};
+use crate::schema::{PkSortKey, pk_width_dispatch};
 use gnitz_wire::RowSource;
 
 /// A column as `base + row * stride`. Stride 0 reads one shared element for
@@ -38,7 +38,8 @@ impl ColPtr {
     /// exceed its element width.
     #[inline(always)]
     pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
-        std::slice::from_raw_parts(self.row_ptr(i), len)
+        // SAFETY: the caller's contract above.
+        unsafe { std::slice::from_raw_parts(self.row_ptr(i), len) }
     }
 
     /// Copy rows `start..` of this column of `width`-byte elements onto `dst`,
@@ -48,14 +49,16 @@ impl ColPtr {
     /// Those rows are rows of a live column this addresses.
     pub(crate) unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
         if self.stride != 0 {
-            return dst.copy_from_slice(std::slice::from_raw_parts(self.row_ptr(start), dst.len()));
+            // SAFETY: the caller's contract above.
+            return dst.copy_from_slice(unsafe { std::slice::from_raw_parts(self.row_ptr(start), dst.len()) });
         }
         if dst.is_empty() {
             return;
         }
         // One element repeated: write it once, then double the written prefix,
         // so any element width costs O(log rows) copies.
-        dst[..width].copy_from_slice(self.row(0, width));
+        // SAFETY: the caller's contract above; a zero stride is one element.
+        dst[..width].copy_from_slice(unsafe { self.row(0, width) });
         let mut filled = width;
         while filled < dst.len() {
             let n = filled.min(dst.len() - filled);
@@ -128,7 +131,8 @@ pub(crate) unsafe fn seek_lower_bound(
     debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
     pk_width_dispatch!(width, |K| {
         let p = K::from_opk(key);
-        gallop_by(count, hint, |i| K::from_opk(pk.row(i, width)) < p)
+        // SAFETY: the caller's contract above; `gallop_by` probes rows below `count`.
+        gallop_by(count, hint, |i| K::from_opk(unsafe { pk.row(i, width) }) < p)
     })
 }
 
@@ -146,11 +150,13 @@ pub(crate) unsafe fn seek_pk_rows(
     hint: Option<usize>,
 ) -> Range<usize> {
     debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
+    // SAFETY: the caller's contract above; every row read is below `count`.
+    let row = |i| unsafe { pk.row(i, width) };
     pk_width_dispatch!(width, |K| {
         let p = K::from_opk(key);
-        let lo = gallop_by(count, hint, |i| K::from_opk(pk.row(i, width)) < p);
+        let lo = gallop_by(count, hint, |i| K::from_opk(row(i)) < p);
         let mut hi = lo;
-        while hi < count && K::from_opk(pk.row(hi, width)) == p {
+        while hi < count && K::from_opk(row(hi)) == p {
             hi += 1;
         }
         lo..hi

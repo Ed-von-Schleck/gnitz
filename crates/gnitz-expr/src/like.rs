@@ -180,11 +180,7 @@ impl LikeMatcher {
 /// length of haystack.
 #[inline]
 fn anchored_eq(w: &[u8], l: &[u8], ci: bool) -> bool {
-    if ci {
-        w.eq_ignore_ascii_case(l)
-    } else {
-        lit_eq(w, l)
-    }
+    if ci { w.eq_ignore_ascii_case(l) } else { lit_eq(w, l) }
 }
 
 /// `h`, or under ILIKE its ASCII-lowercased copy in `folded`.

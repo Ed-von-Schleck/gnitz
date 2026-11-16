@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
-use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
-use gnitz_zset_testkit::{make_batch, make_schema_u128_i64, make_schema_u64_i64};
+use gnitz_zset::schema::{SchemaDescriptor, encode_schema_block};
+use gnitz_zset_testkit::{make_batch, make_schema_u64_i64, make_schema_u128_i64};
 use tempfile::TempDir;
 
 #[path = "support/common.rs"]
@@ -111,7 +111,7 @@ fn aside_manifest(base_dir: &str, tid: u64) -> String {
 
 /// The manifest of `tid`'s copy's index on `cols`.
 fn index_manifest_path(base_dir: &str, tid: u64, cols: &[u32]) -> String {
-    use gnitz_store::relation::{relation_dir, ChildAddr, ChildKind};
+    use gnitz_store::relation::{ChildAddr, ChildKind, relation_dir};
     let kind = ChildKind::Index(PkColList::from_slice(cols));
     ChildAddr {
         kind,

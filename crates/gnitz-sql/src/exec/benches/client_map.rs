@@ -2,8 +2,8 @@ use super::tests::map_of;
 use super::*;
 use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
-use gnitz_wire::payload_u64;
 use gnitz_wire::TypeCode;
+use gnitz_wire::payload_u64;
 
 /// Instructions of a client map's `apply` over a large reply and over one row, which is all
 /// call overhead: an I64 PK column decoded beside a payload column moved, computed, or a

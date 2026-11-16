@@ -40,9 +40,9 @@ mod tls;
 mod w2m;
 mod worker;
 
-pub(crate) use bootstrap::{server_main, ServerArgs};
+pub(crate) use bootstrap::{ServerArgs, server_main};
 pub(crate) use fatal::ServerExit;
-pub(crate) use tls::{mint_token, CertSource, TlsArgs};
+pub(crate) use tls::{CertSource, TlsArgs, mint_token};
 
 #[cfg(test)]
 mod test_support;

@@ -17,9 +17,9 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
-use gnitz_core::{serve, BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Sent};
+use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Sent, serve};
 
-use crate::client::{resolve_target, whole, Convert, Mode, PyClient, VerbOp};
+use crate::client::{Convert, Mode, PyClient, VerbOp, resolve_target, whole};
 use crate::reply::{none, synced};
 use crate::{client_err, lock, sql_err};
 
@@ -488,10 +488,10 @@ impl LoopCore {
                 return;
             }
         };
-        if let Some(serving) = actor.as_mut() {
-            if serving.as_mut().poll(&mut Context::from_waker(&self.waker)).is_ready() {
-                self.end(&mut actor);
-            }
+        if let Some(serving) = actor.as_mut()
+            && serving.as_mut().poll(&mut Context::from_waker(&self.waker)).is_ready()
+        {
+            self.end(&mut actor);
         }
         // Readiness nothing used: the `serve` loop is not stepping, and a
         // level-triggered loop would call back again at once.

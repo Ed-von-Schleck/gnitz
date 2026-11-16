@@ -6,9 +6,9 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::{park_until, CatalogLock, Shared};
+use super::{CatalogLock, Shared, park_until};
 use crate::runtime::sal::SalExcl;
-use crate::runtime::sync::{chan, select2, Either, ReadGuard};
+use crate::runtime::sync::{Either, ReadGuard, chan, select2};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;

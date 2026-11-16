@@ -7,10 +7,10 @@
 
 use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
-use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker, FOLD_CHUNK};
-use crate::repr::{copy_runs, Batch, DirectWriter};
+use super::key_pack::{FOLD_CHUNK, FoldCols, KeyPacker, locate_key_col, pk_run};
+use crate::repr::{Batch, DirectWriter, copy_runs};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
-use gnitz_wire::{int_cell, zip_cells, FixedInt, TypeCode};
+use gnitz_wire::{FixedInt, TypeCode, int_cell, zip_cells};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`.

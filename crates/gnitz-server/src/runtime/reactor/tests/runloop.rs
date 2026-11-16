@@ -30,7 +30,7 @@ fn a_task_spawns_during_its_own_poll() {
     r.spawn(async move {
         for _ in 0..64 {
             let ran = Rc::clone(&ran2);
-            r2.spawn(async move { ran.set(ran.get() + 1) });
+            r2.spawn(async move { ran.update(|v| v + 1) });
         }
     });
     r.block_until_idle();
@@ -46,7 +46,7 @@ fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
     let kept: Rc<RefCell<Option<Waker>>> = Rc::default();
     let (p, k) = (Rc::clone(&polls), Rc::clone(&kept));
     r.spawn(std::future::poll_fn(move |cx| {
-        p.set(p.get() + 1);
+        p.update(|v| v + 1);
         k.borrow_mut().get_or_insert_with(|| cx.waker().clone());
         Poll::<()>::Pending
     }));
@@ -86,7 +86,7 @@ fn a_stale_wake_costs_at_most_a_spurious_poll() {
     let polls = Rc::new(Cell::new(0u32));
     let p = Rc::clone(&polls);
     r.spawn(std::future::poll_fn(move |_| {
-        p.set(p.get() + 1);
+        p.update(|v| v + 1);
         Poll::<()>::Pending
     }));
     r.tick(); // the spawn takes the freed key
@@ -320,5 +320,5 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: a lost wake");
     }
-    unsafe { assert_child_exited_ok(pid) };
+    assert_child_exited_ok(pid);
 }
