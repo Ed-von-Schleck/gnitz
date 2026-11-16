@@ -67,8 +67,18 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
         size: 8,
         type_code: TypeCode::I64,
     };
-    let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
-    let own = OrderLocator { loc: c2, desc: true, nulls_first: false };
+    let asc = |loc| OrderLocator {
+        loc,
+        desc: false,
+        nulls_first: true,
+        shift: 0,
+    };
+    let own = OrderLocator {
+        loc: c2,
+        desc: true,
+        nulls_first: false,
+        shift: 0,
+    };
     assert_eq!(order_locators(&[written], &schema, false).unwrap(), vec![own]);
     assert_eq!(
         order_locators(&[written], &schema, true).unwrap(),
@@ -89,7 +99,7 @@ fn null_placement_ignores_the_direction() {
     for nulls_first in [false, true] {
         let want = if nulls_first { Ordering::Less } else { Ordering::Greater };
         for desc in [false, true] {
-            let keys = [OrderLocator { loc, desc, nulls_first }];
+            let keys = [OrderLocator { loc, desc, nulls_first, shift: 0 }];
             assert_eq!(
                 cmp_order_keys(&keys, &v, 0, 1),
                 want,
@@ -117,7 +127,7 @@ fn a_pk_key_never_takes_the_null_arm() {
     }
     let loc = schema.locate(0);
     for desc in [false, true] {
-        let keys = [OrderLocator { loc, desc, nulls_first: true }];
+        let keys = [OrderLocator { loc, desc, nulls_first: true, shift: 0 }];
         let want = if desc { Ordering::Greater } else { Ordering::Less };
         assert_eq!(cmp_order_keys(&keys, &v, 0, 1), want, "desc={desc}");
     }
@@ -219,4 +229,27 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
             }
         }
     }
+}
+
+/// A sort ranks each tie of the leading key by the next, yet the largest lead stays the
+/// leading key's.
+#[test]
+fn max_lead_after_a_sort_is_the_leading_keys() {
+    // `(id, v, w)`: v ties on rows 0 and 1, which w tells apart far above any v.
+    let schema = schema_pk_ints(2, false);
+    let mut v = TestView::for_schema(&schema, 3);
+    for (row, (lead, next)) in [(1, 100), (1, 50), (0, 7)].into_iter().enumerate() {
+        v.set_int(row, 0, lead);
+        v.set_int(row, 1, next);
+    }
+    let order = [
+        OrderKey { col: 1, desc: false, nulls_first: false },
+        OrderKey { col: 2, desc: false, nulls_first: false },
+    ];
+    let keys = order_locators(&order, &schema, false).unwrap();
+    let want = RowRanking::new(&keys, &v).max_lead();
+    let mut ranking = RowRanking::new(&keys, &v);
+    ranking.sort();
+    assert_eq!(ranking.rows().collect::<Vec<_>>(), [2, 1, 0]);
+    assert!(want == ranking.max_lead());
 }

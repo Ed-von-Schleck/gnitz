@@ -13,35 +13,46 @@ pub struct OrderLocator {
     desc: bool,
     /// NULLs sort first, whatever `desc` says.
     nulls_first: bool,
+    /// How far a 16-byte integer's image is shifted down: 64 for its high half, 0 for its
+    /// low half, which [`order_locators`] lists right behind it.
+    shift: u8,
 }
 
 impl OrderLocator {
     /// Whether the 8-byte image is the key's whole order.
     #[inline]
     fn image_is_whole(&self) -> bool {
-        ScalarKind::from_type_code(self.loc.type_code()).is_some()
+        !self.loc.type_code().is_german_string()
     }
 }
 
 /// The keys `order` names over `schema`, then under `total` every column ascending, NULLS
-/// FIRST, PK columns leading: a total order over distinct rows. `Err` on a column `schema`
-/// does not have.
+/// FIRST, PK columns leading: a total order over distinct rows. A 16-byte integer is two
+/// keys, its high half then its low half, so every key but a string's ranks whole on its
+/// 8-byte image. `Err` on a column `schema` does not have.
 pub fn order_locators(order: &[OrderKey], schema: &SchemaDescriptor, total: bool) -> Result<Vec<OrderLocator>, String> {
-    let mut keys = order
-        .iter()
-        .map(|k| {
-            let (_, loc) = schema.wire_col("order key column", u32::from(k.col))?;
-            Ok(OrderLocator {
-                loc,
-                desc: k.desc,
-                nulls_first: k.nulls_first,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut keys = Vec::with_capacity(order.len());
+    let mut push = |loc: ColumnLocator, desc, nulls_first| {
+        let tc = loc.type_code();
+        let wide = ScalarKind::from_type_code(tc).is_none() && !tc.is_german_string();
+        let halves: &[u8] = if wide { &[64, 0] } else { &[0] };
+        keys.extend(
+            halves
+                .iter()
+                .map(|&shift| OrderLocator { loc, desc, nulls_first, shift }),
+        );
+    };
+    for k in order {
+        let (_, loc) = schema.wire_col("order key column", u32::from(k.col))?;
+        push(loc, k.desc, k.nulls_first);
+    }
     if total {
-        let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
-        keys.extend(schema.pk_cols().iter().map(|&c| asc(schema.locate(c as usize))));
-        keys.extend(schema.payload_locators().into_iter().map(asc));
+        for &c in schema.pk_cols() {
+            push(schema.locate(c as usize), false, true);
+        }
+        for loc in schema.payload_locators() {
+            push(loc, false, true);
+        }
     }
     Ok(keys)
 }
@@ -146,8 +157,8 @@ fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>) {
         None if tc.is_german_string() => fill(key, src, rows, |r| {
             gnitz_wire::german_string_lead(loc.german_cell(src, r), src.heap())
         }),
-        // A 16-byte integer's high half.
-        None => fill(key, src, rows, |r| (loc.opk_image(src, r) >> 64) as u64),
+        // One half of a 16-byte integer.
+        None => fill(key, src, rows, |r| (loc.opk_image(src, r) >> key.shift) as u64),
     }
 }
 
@@ -209,8 +220,10 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
         self.rows.retain(|r| r.lead() <= bound);
     }
 
-    /// The largest lead among the rows.
-    pub fn max_lead(&self) -> Option<Lead> {
+    /// The largest lead among the rows. A sort leaves a tie its later keys' images, so the
+    /// leading key ranks the rows again first.
+    pub fn max_lead(&mut self) -> Option<Lead> {
+        rank_rows(&self.keys[0], self.src, Rows::Run(&mut self.rows));
         self.rows.iter().map(Ranked::lead).max()
     }
 
@@ -251,6 +264,15 @@ pub struct WeightSlots {
 }
 
 impl WeightSlots {
+    /// The whole input: no OFFSET, no LIMIT. A SQL LIMIT is at most `i64::MAX`, so a
+    /// `keep` of `u64::MAX` names none.
+    pub const ALL: WeightSlots = WeightSlots { skip: 0, keep: u64::MAX };
+
+    /// The slot the window ends before; `None` when it keeps everything past `skip`.
+    pub fn end(&self) -> Option<u64> {
+        (self.keep != u64::MAX).then(|| self.skip.saturating_add(self.keep))
+    }
+
     /// How many of the next element's `weight` slots are kept.
     #[inline]
     pub fn take(&mut self, weight: i64) -> i64 {
