@@ -19,9 +19,9 @@ fn pk(chain: &ViewBundle) -> Vec<u32> {
     final_view(chain).schema.pk_cols().to_vec()
 }
 
-/// The final view's output type codes.
+/// The final view's output type codes, over [`shown_columns`].
 fn types(chain: &ViewBundle) -> Vec<TypeCode> {
-    final_view(chain).schema.columns().iter().map(|c| c.ty.tc).collect()
+    shown_columns(chain).map(|c| c.ty.tc).collect()
 }
 
 // ── linear projection ────────────────────────────────────────────────────────

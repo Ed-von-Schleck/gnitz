@@ -71,11 +71,14 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
                 "read nothing (constant row)".to_string(),
                 "access: none".to_string(),
                 "predicate: none".to_string(),
-                projection_line(plan.cut.schema(), false),
+                projection_line(plan.cut.schema(), None),
                 order_limit,
             ];
         }
-        ReadCase::Rows { read, .. } => (read, projection_line(plan.cut.schema(), read.spec.sink.map.is_none())),
+        ReadCase::Rows { read, .. } => {
+            let source = read.spec.sink.map.is_none().then_some(&*read.desc.schema);
+            (read, projection_line(plan.cut.schema(), source))
+        }
         ReadCase::Fold { read, finish, reduce_schema, is_distinct } => {
             let SinkKind::Fold(agg) = &read.spec.sink.kind else {
                 unreachable!("a fold read ships a fold sink")
@@ -169,19 +172,26 @@ fn access_line(bound: &ReadBound, schema: &Schema) -> String {
 }
 
 /// How wide the reply is: its visible columns, the hidden ones appended to order it, and
-/// whether it ships no map.
-fn projection_line(schema: &Schema, unprojected: bool) -> String {
+/// whether it ships no map — `source`'s regions as they are, where `Some`.
+fn projection_line(schema: &Schema, source: Option<&Schema>) -> String {
     let visible = schema.visible_columns().count();
-    // A hidden payload column is appended to order the reply; a hidden PK column
-    // carries its key.
-    let extra = schema.payload_columns().filter(|(_, _, d)| d.is_hidden).count();
+    // A hidden payload column is appended to order the reply, unless it is one the
+    // unprojected source hides itself; a hidden PK column carries its key.
+    let hidden = schema.payload_columns().map(|(_, _, d)| d.is_hidden);
+    let extra = match source {
+        Some(source) => hidden
+            .zip(source.payload_columns())
+            .filter(|&(h, (_, _, d))| h && !d.is_hidden)
+            .count(),
+        None => hidden.filter(|&h| h).count(),
+    };
     let noun = if visible == 1 { "column" } else { "columns" };
     let mut line = if extra > 0 {
         format!("projection: {visible} {noun} (+{extra} for ordering)")
     } else {
         format!("projection: {visible} {noun}")
     };
-    if unprojected {
+    if source.is_some() {
         line.push_str(" (unprojected)");
     }
     line

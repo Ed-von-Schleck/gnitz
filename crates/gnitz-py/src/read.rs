@@ -392,7 +392,7 @@ impl PyScanResult {
         self.batch.len()
     }
 
-    /// The same rows presenting every column, hidden key slots included.
+    /// The same rows presenting every column, hidden ones included.
     fn including_hidden(&self, py: Python<'_>) -> PyResult<PyScanResult> {
         present(py, Arc::clone(&self.schema), Arc::clone(&self.batch), true, self.lsn)
     }

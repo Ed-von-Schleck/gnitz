@@ -2,7 +2,7 @@
 //! validates the honored clauses, and produces a logical `RelExpr` tree for any
 //! relational body (linear / join / grouped / DISTINCT / set operation). The CTE
 //! phase (`bind_ctes`) binds each CTE body to a shared subtree ahead of the
-//! main bind and registers it by name, so a reference aliases it; a derived
+//! main bind and registers it by name, so a reference re-reads it; a derived
 //! table binds its subquery recursively to an unshared subtree
 //! (`resolve_table_factor`).
 //!
@@ -60,8 +60,8 @@ use std::sync::Arc;
 use subquery::{SubqueryKind, SubqueryRef};
 
 /// Bind a query's CTEs ahead of its body. Each binds to one subtree registered
-/// under its name, which the body (and later CTEs) read through an
-/// [`RelExpr::Alias`]. Scoping precedence as SQL
+/// under its name, which the body (and later CTEs) read through a
+/// [`RelExpr::alias`]. Scoping precedence as SQL
 /// defines it: a CTE shadows a catalog name, a later CTE sees earlier ones, and
 /// one WITH list names each CTE once.
 /// `WITH RECURSIVE` has no builder, and a CTE's trailing FROM is refused.
@@ -169,7 +169,7 @@ fn output_key<'e, 'c>(
     }
 }
 
-/// A bound CTE: the shared subtree every reference aliases, and the column
+/// A bound CTE: the shared subtree every reference re-reads, and the column
 /// defs a reference carries — the subtree's own, renamed by the SELECT list's
 /// aliases and the CTE's positional ones.
 struct Cte {
@@ -414,7 +414,7 @@ fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlErr
 }
 
 /// Resolve one FROM table factor to `(subtree, alias, output cols)`: a table name
-/// to a `Get`, a CTE name to an `Alias` over its shared subtree, a derived table
+/// to a `Get`, a CTE name to a fresh read of its shared subtree, a derived table
 /// to its bound subquery, unshared — collapsed onto its source when it only
 /// renames, as a CTE is. A column alias list renames the returned cols, keeping
 /// their `ColId`s; the subtree keeps its own names.

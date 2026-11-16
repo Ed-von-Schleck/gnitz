@@ -7,7 +7,9 @@ use super::super::physical::Frame;
 use super::{SegInput, SegSource};
 use gnitz_core::{PlannedView, Schema, segment_id};
 use gnitz_wire::Circuit;
+use rustc_hash::FxHashSet;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// What every view emitter returns: the circuit, whose last node is its output,
@@ -23,16 +25,51 @@ pub(super) struct EmitPieces {
 
 /// The hidden segments one CREATE VIEW body lowers to, in dependency order, and
 /// the subtrees already cut to one of them.
-#[derive(Default)]
 pub(super) struct ViewChain {
     segments: Vec<PlannedView>,
-    /// Each subtree a spine has cut, by `Rc`. One bind shares — a CTE read through
-    /// `Alias`es, a window input read directly and through `Alias`es — is cut once,
-    /// with all its columns.
+    /// Each subtree a spine has cut, by `Rc`. A subtree the body reads more than
+    /// once — a CTE named twice, a window input read directly and again — is cut
+    /// once, with all its columns.
     pub(super) cuts: HashMap<*const RelExpr, SegInput>,
+    /// The nodes of the body more than one node reads.
+    shared: FxHashSet<*const RelExpr>,
 }
 
 impl ViewChain {
+    /// The chain of the body `root`, which outlives it.
+    pub(super) fn new(root: &RelExpr) -> ViewChain {
+        fn walk(rel: &RelExpr, seen: &mut FxHashSet<*const RelExpr>, shared: &mut FxHashSet<*const RelExpr>) {
+            let (a, b) = match rel {
+                RelExpr::Unit | RelExpr::Get { .. } => return,
+                RelExpr::Filter { input, .. }
+                | RelExpr::Project { input, .. }
+                | RelExpr::Reduce { input, .. }
+                | RelExpr::Distinct { input }
+                | RelExpr::Ordered { input, .. } => (input, None),
+                RelExpr::Join { left, right, .. } | RelExpr::SetOp { left, right, .. } => (left, Some(right)),
+            };
+            for input in std::iter::once(a).chain(b) {
+                if seen.insert(Rc::as_ptr(input)) {
+                    walk(input, seen, shared);
+                } else {
+                    shared.insert(Rc::as_ptr(input));
+                }
+            }
+        }
+        let mut shared = FxHashSet::default();
+        walk(root, &mut FxHashSet::default(), &mut shared);
+        ViewChain {
+            segments: Vec::new(),
+            cuts: HashMap::new(),
+            shared,
+        }
+    }
+
+    /// Whether more than one node of the body reads `rel`.
+    pub(super) fn is_shared(&self, rel: &Rc<RelExpr>) -> bool {
+        self.shared.contains(&Rc::as_ptr(rel))
+    }
+
     /// Push a hidden segment and return it as a source. Its id exists only once
     /// it is pushed, so a circuit names only segments before it.
     pub(super) fn add_segment(&mut self, p: EmitPieces) -> SegInput {

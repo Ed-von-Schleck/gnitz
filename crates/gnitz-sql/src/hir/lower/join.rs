@@ -118,9 +118,9 @@ pub(super) fn lower_join_view(
                 let levels: Vec<_> = (above.levels.iter())
                     .map(|(level, read)| (level.rebuilt(&mut |c| mark_lit(c, id, val)), read.clone()))
                     .collect();
-                spine::emit_over(&mut cb, &levels, node, frame.clone())?
+                spine::emit_over(&mut cb, &levels, node, frame.clone(), Top::Output)?
             }
-            _ => spine::emit_over(&mut cb, &above.levels, node, frame.clone())?,
+            _ => spine::emit_over(&mut cb, &above.levels, node, frame.clone(), Top::Output)?,
         };
         acc = Some(match acc {
             None => (node, out),
@@ -155,11 +155,24 @@ fn emit_join_inputs(
         spine::open(chain, rels[0], &live[0])?,
         spine::open(chain, rels[1], &live[1])?,
     ];
-    // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
-    // column of the scanned relation, so nothing over that relation can state
+    // Each outer row is decided on the worker owning its PK, the output key.
+    let pk_placed = [matches!(out_key, OutKey::OuterPk { owned: true }), false];
+    // The key each side's delta is co-located by ahead of the circuit: its source
+    // PK, or the equality slots the sides meet on — broadcast by none.
+    let scatter = |spine: &Spine<'_>, i: usize| match pk_placed[i] {
+        true => Some(spine.pk_key()),
+        false => spine.source_cols(class.key_cols(i).take(class.eq.len())).map(|cols| {
+            cols.into_iter()
+                .zip(class.key_types())
+                .map(|(c, ty)| (c, ty.tc))
+                .collect()
+        }),
+    };
+    // A scatter key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`)
+    // is no column of the scanned relation, so nothing over that relation can state
     // where its delta scatters. Cut to a segment, the computed column is one.
     for i in 0..2 {
-        if spines[i].source_cols(class.key_cols(i)).is_none() {
+        if scatter(&spines[i], i).is_none() {
             spines[i] = Spine::segment(materialize(chain, rels[i], &live[i])?);
         }
     }
@@ -169,24 +182,8 @@ fn emit_join_inputs(
     if spines[0].tid() == spines[1].tid() {
         spines[1] = Spine::segment(materialize(chain, rels[1], &live[1])?);
     }
-    // Each outer row is decided on the worker owning its PK, the output key.
-    let pk_placed = [matches!(out_key, OutKey::OuterPk { owned: true }), false];
     for (i, spine) in spines.iter_mut().enumerate() {
-        let key = match pk_placed[i] {
-            true => spine.pk_key(),
-            // The equality slots the sides meet on; with none, the delta is broadcast.
-            false => {
-                let cols = spine
-                    .source_cols(class.key_cols(i).take(class.eq.len()))
-                    .ok_or_else(|| {
-                        GnitzSqlError::Internal("a join key column is not a column of the relation it scatters".into())
-                    })?;
-                cols.into_iter()
-                    .zip(class.key_types())
-                    .map(|(c, ty)| (c, ty.tc))
-                    .collect()
-            }
-        };
+        let key = scatter(spine, i).ok_or_else(|| GnitzSqlError::Internal("a segment states no scatter key".into()))?;
         spine.scatter(key);
     }
     let pk_repeats = spines.each_ref().map(Spine::pk_repeats);

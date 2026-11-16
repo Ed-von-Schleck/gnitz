@@ -125,14 +125,20 @@ fn view(cat: &dyn Catalog, body: &str) -> ViewBundle {
     plan(cat, &format!("CREATE VIEW v AS {body}")).unwrap_or_else(|e| panic!("`{body}`: {e:?}"))
 }
 
-/// The final view's output columns as `(name, hidden, nullable)`.
+/// The final view's output columns over [`shown_columns`], as `(name, hidden, nullable)`.
 fn output_shape(chain: &ViewBundle) -> Vec<(String, bool, bool)> {
-    final_view(chain)
-        .schema
-        .columns()
-        .iter()
+    shown_columns(chain)
         .map(|c| (c.name.to_string(), c.is_hidden, c.is_nullable))
         .collect()
+}
+
+/// The final view's key columns and visible columns, in schema order: a hidden
+/// payload column is state the view's operators keep beside them.
+fn shown_columns(chain: &ViewBundle) -> impl Iterator<Item = &gnitz_wire::ColumnDef> {
+    let schema = &final_view(chain).schema;
+    (schema.columns().iter().enumerate())
+        .filter(|&(ci, c)| !c.is_hidden || schema.layout().is_pk_col(ci))
+        .map(|(_, c)| c)
 }
 
 /// Plan against `known`, recording the names the plan asks for, each once, in

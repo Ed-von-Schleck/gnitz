@@ -30,6 +30,7 @@ use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_expr::ReduceOutSlot;
 use gnitz_wire::{AggDescriptor, ColumnDef, GroupAggs};
+use spine::{Level, Top};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -154,13 +155,13 @@ fn project_front(
 /// `names` order, each under the name its column of `names` gives it: the final
 /// frame's regions under the SELECT list's numbering.
 pub(crate) fn lower(rel: Rc<RelExpr>, names: &[HirCol]) -> Result<(Vec<PlannedView>, PlannedView), GnitzSqlError> {
-    let mut chain = ViewChain::default();
     // A top-N carries its input's columns key first: the SELECT list is a
     // projection over it. A window body always ends in a projection.
     let rel = match rel.as_ref() {
         RelExpr::Ordered { .. } => RelExpr::project(Rc::clone(&rel), ProjEntry::passthroughs(rel.cols().into_owned())),
         _ => rel,
     };
+    let mut chain = ViewChain::new(&rel);
     let top = lower_body(&mut chain, &rel)?;
     let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
     let (schema, moved_to) = top.out.schema_in_order(visible)?;
@@ -180,7 +181,7 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
         RelExpr::Project { items, .. } => items.iter().map(|it| it.out.id).collect(),
         _ => rel.cols().iter().map(|c| c.id).collect(),
     };
-    let peeled = spine::peel(rel, &live);
+    let peeled = spine::peel(chain, rel, &live);
     let core = peeled.bottom;
     let mut pieces = match (peeled.owns_bottom(), core.as_ref()) {
         (true, RelExpr::Join { left, right, kind, on }) => {
@@ -193,9 +194,16 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
         (true, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => setop::lower_setop(chain, core)?,
         _ => return spine::lower_linear(peeled.open(chain)?),
     };
-    // The body's circuit ends in its core node, which the levels read.
+    // The body's circuit ends in its core node, which the levels read. A reduce
+    // read only through renames stays the circuit's output, whose store holds its
+    // history, so its rows are not copied into a second one: the columns no level
+    // names are stored hidden beside the others.
     let node = pieces.circuit.out();
-    pieces.out = spine::emit_over(&mut pieces.circuit, &peeled.levels, node, pieces.out)?.1;
+    let top = match core.as_ref() {
+        RelExpr::Reduce { .. } if peeled.levels.iter().all(|(l, _)| matches!(l, Level::Project(_))) => Top::Store,
+        _ => Top::Output,
+    };
+    pieces.out = spine::emit_over(&mut pieces.circuit, &peeled.levels, node, pieces.out, top)?.1;
     Ok(pieces)
 }
 
@@ -209,6 +217,15 @@ fn materialize(chain: &mut ViewChain, rel: &Rc<RelExpr>, live: &ColSet) -> Resul
 
 /// Cut a subtree to a hidden segment pruned to `live`, once per subtree.
 fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &ColSet) -> Result<SegInput, GnitzSqlError> {
+    // Every reader of a shared subtree reads all of it: its segment is one.
+    let whole: ColSet;
+    let live = match chain.is_shared(subtree) {
+        true => {
+            whole = subtree.cols().iter().map(|c| c.id).collect();
+            &whole
+        }
+        false => live,
+    };
     let key = Rc::as_ptr(subtree);
     if let Some(cached) = chain.cuts.get(&key) {
         debug_assert!(
@@ -223,9 +240,9 @@ fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &ColSet) -> R
 }
 
 /// `subtree` as a complete, lowerable body pruned to `live`: a `Project` keeps its
-/// live items, a clamp, set operation, top-N or window is cut with every column
-/// and no map over it, and anything else is wrapped in a projection of its live
-/// columns.
+/// live items, a clamp, set operation, top-N or window — or anything read whole —
+/// is cut with every column and no map over it, and anything else is wrapped in a
+/// projection of its live columns.
 fn as_body(subtree: &Rc<RelExpr>, live: &ColSet) -> Rc<RelExpr> {
     match subtree.as_ref() {
         RelExpr::Project { input, items } => {
@@ -237,6 +254,7 @@ fn as_body(subtree: &Rc<RelExpr>, live: &ColSet) -> Rc<RelExpr> {
             }
         }
         RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Ordered { .. } => Rc::clone(subtree),
+        _ if subtree.cols().iter().all(|c| live.contains(c.id)) => Rc::clone(subtree),
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
             let items = ProjEntry::passthroughs(subtree.cols().iter().filter(|c| live.contains(c.id)).cloned());

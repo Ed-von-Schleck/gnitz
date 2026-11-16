@@ -1,14 +1,14 @@
 //! The input spine every consumer opens its inputs with: the linear levels —
-//! filters, projections and aliases — over a relation read in place fuse into
-//! the consumer's circuit, and a node below them that no relation is read in
-//! place for is cut to a hidden segment.
+//! filters and projections — over a relation read in place fuse into the
+//! consumer's circuit, and a node below them that no relation is read in place
+//! for is cut to a hidden segment: whole where the body reads it more than once,
+//! else pruned to what its one reader reads.
 
 use super::super::physical::Frame;
 use super::super::{ColId, ColSet, HirExpr, ProjEntry, RelExpr};
 use super::{EmitPieces, SegInput, SegSource, ViewChain, collect_live_cols, cut_segment, filter, project_front};
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
-use crate::ir::BExpr;
 use crate::ir::BoundExpr;
 use gnitz_core::Schema;
 use gnitz_wire::ReadBound;
@@ -28,8 +28,7 @@ pub(super) struct Spine<'a> {
     scatter: Option<Vec<ReindexSlot>>,
 }
 
-/// One linear level: a `Filter`, or a `Project` — an `Alias` is the projection
-/// of each input column under its new identity.
+/// One linear level: a `Filter` or a `Project`.
 pub(super) enum Level<'a> {
     Where(Cow<'a, [HirExpr]>),
     Project(Cow<'a, [ProjEntry]>),
@@ -81,13 +80,14 @@ pub(super) struct Peeled<'a> {
     /// What is read of `rel`.
     live: ColSet,
     /// The node a reader not reading `bottom` in place cuts, with the number of
-    /// levels above it: `rel` itself, or the input of the deepest `Alias` — a
-    /// subtree every `Alias` of it shares, so nothing above it is cut with it.
+    /// levels above it: `rel` itself, or the deepest level's input the body reads
+    /// more than once — a subtree its readers share, so nothing above it is cut
+    /// with it.
     cut: (usize, &'a Rc<RelExpr>),
 }
 
 impl<'a> Peeled<'a> {
-    /// Whether the bottom node is this body's own, under no `Alias`.
+    /// Whether the bottom node is this body's own, under no shared subtree.
     pub(super) fn owns_bottom(&self) -> bool {
         self.cut.0 == 0
     }
@@ -108,13 +108,9 @@ impl<'a> Peeled<'a> {
                 src: SegSource::Catalog(Arc::clone(desc)),
                 frame: Frame::scan(desc, cols),
             },
-            // Every reader of a shared subtree reads all of it: its segment is one.
-            _ if above > 0 => {
-                levels.truncate(above);
-                cut_segment(chain, node, &node.cols().iter().map(|c| c.id).collect())?
-            }
+            // `live` prunes only `rel` itself: a shared node is cut whole.
             _ => {
-                levels.clear();
+                levels.truncate(above);
                 cut_segment(chain, node, &live)?
             }
         };
@@ -122,8 +118,9 @@ impl<'a> Peeled<'a> {
     }
 }
 
-/// `rel`'s linear levels, for a reader of `live` of it.
-pub(super) fn peel<'a>(rel: &'a Rc<RelExpr>, live: &ColSet) -> Peeled<'a> {
+/// `rel`'s linear levels, for a reader of `live` of it. The cut is the deepest
+/// node below `rel` more than one node reads.
+pub(super) fn peel<'a>(chain: &ViewChain, rel: &'a Rc<RelExpr>, live: &ColSet) -> Peeled<'a> {
     let mut bottom = rel;
     let mut levels: Vec<(Level<'a>, ColSet)> = Vec::new();
     let mut read = live.clone();
@@ -132,22 +129,18 @@ pub(super) fn peel<'a>(rel: &'a Rc<RelExpr>, live: &ColSet) -> Peeled<'a> {
         let (level, input) = match bottom.as_ref() {
             RelExpr::Filter { input, preds } => (Level::Where(Cow::Borrowed(preds)), input),
             RelExpr::Project { input, items } => (Level::Project(Cow::Borrowed(items)), input),
-            RelExpr::Alias { input, cols } => {
-                cut = (levels.len() + 1, input);
-                let items = (input.cols().iter())
-                    .zip(cols)
-                    .map(|(i, out)| ProjEntry {
-                        expr: BExpr::ColRef(i.id),
-                        out: out.clone(),
-                    })
-                    .collect();
-                (Level::Project(Cow::Owned(items)), input)
-            }
             _ => break,
         };
         let below = level.reads(&read);
         levels.push((level, std::mem::replace(&mut read, below)));
         bottom = input;
+        if chain.is_shared(input) {
+            cut = (levels.len(), input);
+        }
+    }
+    // Only a node no relation is read in place for is cut.
+    if matches!(bottom.as_ref(), RelExpr::Get { .. }) {
+        cut = (0, rel);
     }
     Peeled {
         levels,
@@ -159,12 +152,14 @@ pub(super) fn peel<'a>(rel: &'a Rc<RelExpr>, live: &ColSet) -> Peeled<'a> {
 }
 
 /// What the consumer needs of the top projection: its exact columns (a view's
-/// output, a top-N or window carrying every input column), or only a slot per column it
-/// reads (a reduce, a set operation's leaves).
+/// output, a top-N or window carrying every input column), only a slot per column it
+/// reads (a reduce, a set operation's leaves), or its columns in their written order
+/// beside whatever else the node below holds (a reduce's output the view stores).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Top {
     Output,
     Slots,
+    Store,
 }
 
 /// `schema`'s PK as a reindex key: each column at its key slot's type.
@@ -176,7 +171,7 @@ pub(super) fn pk_slots(schema: &Schema) -> Vec<ReindexSlot> {
 
 /// Open `rel` for a consumer reading `live` of it.
 pub(super) fn open<'a>(chain: &mut ViewChain, rel: &'a Rc<RelExpr>, live: &ColSet) -> Result<Spine<'a>, GnitzSqlError> {
-    peel(rel, live).open(chain)
+    peel(chain, rel, live).open(chain)
 }
 
 impl Spine<'_> {
@@ -225,7 +220,7 @@ impl Spine<'_> {
 
     /// Emit the source and the levels into `cb`. A rename-only projection
     /// relabels the frame instead of emitting a node, except the outermost one
-    /// under `Top::Output`.
+    /// under `Top::Output`, and under `Top::Store` one that would move a column.
     pub(super) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels, scatter } = self;
         let SegInput { src, frame } = seg;
@@ -240,9 +235,10 @@ pub(super) fn emit_over(
     levels: &[(Level<'_>, ColSet)],
     node: NodeId,
     frame: Frame,
+    top: Top,
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
     let start = |cb: &mut Circuit, frame: &Frame, preds: Vec<BoundExpr>| filter(cb, node, &preds, &frame.schema);
-    emit_levels(cb, levels, Top::Output, frame, start)
+    emit_levels(cb, levels, top, frame, start)
 }
 
 /// Emit `levels`, innermost first, over the node `start` emits filtered by the
@@ -256,7 +252,7 @@ fn emit_levels(
     start: impl FnOnce(&mut Circuit, &Frame, Vec<BoundExpr>) -> Result<NodeId, GnitzSqlError>,
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
     let output_at = match top {
-        Top::Output => levels.iter().position(|(l, _)| !matches!(l, Level::Where(_))),
+        Top::Output | Top::Store => levels.iter().position(|(l, _)| !matches!(l, Level::Where(_))),
         Top::Slots => None,
     };
     let mut start = Some(start);
@@ -277,9 +273,12 @@ fn emit_levels(
                     true => Cow::Borrowed(items),
                     false => items.iter().filter(|it| read.contains(it.out.id)).cloned().collect(),
                 };
-                if output_at != Some(i)
-                    && let Some(relabeled) = frame.relabeled(&items)?
-                {
+                let relabeled = match (output_at == Some(i), top) {
+                    (false, _) => frame.relabeled(&items)?,
+                    (true, Top::Store) => frame.relabeled_in_order(&items)?,
+                    (true, _) => None,
+                };
+                if let Some(relabeled) = relabeled {
                     frame = relabeled;
                     continue;
                 }

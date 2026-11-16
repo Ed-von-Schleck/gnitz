@@ -1,17 +1,17 @@
 //! HIR → ad-hoc read lowering: a bound query that reads one relation, as the
-//! bound, predicate and reply of one read of it. The filters, projections and
-//! CTE references over the relation compose by substitution into the tree the
-//! flat query binds to, which the rows reply and [`super::fold`] then lower.
+//! bound, predicate and reply of one read of it. The filters and projections over
+//! the relation — a CTE reference is one — compose by substitution into the tree
+//! the flat query binds to, which the rows reply and [`super::fold`] then lower.
 
 use super::super::physical::{self, Frame};
 use super::super::{AggCol, BoundRef, ColId, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, hircol_of, reduce_reads};
-use super::fold::{FoldPieces, distinct_fold, fold};
+use super::fold::{FoldPieces, fold};
 use crate::error::{GnitzSqlError, derivation};
 use crate::ir::{BExpr, BoundExpr};
 use crate::project::payload_program;
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::OrderKey;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -67,6 +67,15 @@ impl Linear<'_> {
         })
     }
 
+    /// AND `preds`, over this level's columns, into the read's predicate.
+    fn filter(&mut self, preds: &[HirExpr]) -> Result<(), GnitzSqlError> {
+        for p in preds {
+            let p = self.subst(p)?;
+            self.preds.push(p);
+        }
+        Ok(())
+    }
+
     fn items(&self, items: &[ProjEntry]) -> Result<Vec<ProjEntry>, GnitzSqlError> {
         items
             .iter()
@@ -83,7 +92,11 @@ impl Linear<'_> {
     fn source(&self) -> Result<(&Arc<RelDescriptor>, &[HirCol]), GnitzSqlError> {
         match self.base.as_ref() {
             RelExpr::Get { desc, cols } => Ok((desc, cols)),
-            RelExpr::Reduce { .. } => Err(derivation("an aggregate over a grouped CTE")),
+            // What the CTE derives under its grouping is named first.
+            RelExpr::Reduce { input, .. } | RelExpr::Distinct { input } => {
+                linear(input)?;
+                Err(derivation("an aggregate over a grouped CTE"))
+            }
             // A DISTINCT over no relation is a set already, so only an aggregate meets it.
             _ => Err(GnitzSqlError::Rejected(
                 "an aggregate over a SELECT without FROM is not supported".into(),
@@ -92,26 +105,23 @@ impl Linear<'_> {
     }
 }
 
-/// `rel` down to the first node that is no filter, projection or CTE reference.
+/// `rel` down to the first node that is no filter or projection.
 fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
     match rel.as_ref() {
-        RelExpr::Get { .. } | RelExpr::Unit | RelExpr::Reduce { .. } => Ok(Linear {
+        RelExpr::Get { .. } | RelExpr::Unit | RelExpr::Reduce { .. } | RelExpr::Distinct { .. } => Ok(Linear {
             base: rel,
             preds: Vec::new(),
             map: rel.cols().iter().map(|c| (c.id, BExpr::ColRef(c.id))).collect(),
         }),
         RelExpr::Filter { input, preds } => {
             let mut l = linear(input)?;
-            for p in preds {
-                let p = l.subst(p)?;
-                l.preds.push(p);
-            }
+            l.filter(preds)?;
             Ok(l)
         }
         RelExpr::Project { input, items } => {
             let l = linear(input)?;
             let mut refs = 0usize;
-            let mut map = HashMap::with_capacity(items.len());
+            let mut map = HashMap::with_capacity_and_hasher(items.len(), Default::default());
             for it in items {
                 let e = l.subst(&it.expr)?;
                 e.for_each_ref(&mut |_| refs += 1);
@@ -125,21 +135,7 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
             }
             Ok(Linear { map, ..l })
         }
-        RelExpr::Alias { input, cols } => {
-            let l = linear(input)?;
-            let map = input
-                .cols()
-                .iter()
-                .zip(cols)
-                .map(|(i, o)| (o.id, l.map[&i.id].clone()))
-                .collect();
-            Ok(Linear { map, ..l })
-        }
         RelExpr::Join { .. } => Err(derivation("JOIN")),
-        RelExpr::Distinct { input } => {
-            linear(input)?;
-            Err(derivation("DISTINCT CTE"))
-        }
         RelExpr::SetOp { .. } => Err(derivation("set operation")),
         RelExpr::Ordered { .. } => Err(GnitzSqlError::Internal(
             "an ad-hoc read bound an ordered operator".into(),
@@ -154,43 +150,44 @@ pub(crate) fn lower_read(
     order: Vec<OrderCol>,
     refs: Vec<BoundRef>,
 ) -> Result<AdhocRead, GnitzSqlError> {
-    let internal = || GnitzSqlError::Internal("an ad-hoc read body is not a projection".into());
-    let (lin, shape) = match rel.as_ref() {
-        RelExpr::Distinct { input } => {
-            let RelExpr::Project { input: base, items } = input.as_ref() else {
-                return Err(internal());
-            };
-            let lin = linear(base)?;
-            let (desc, source) = lin.source()?;
-            let pieces = distinct_fold(Frame::scan(desc, source), lin.items(items)?, order)?;
-            let shape = AdhocShape::Fold {
-                pieces: Box::new(pieces),
-                is_distinct: true,
-            };
-            (lin, shape)
-        }
+    let (top, items) = match rel.as_ref() {
         RelExpr::Project { input, items } => {
             let top = linear(input)?;
-            match top.base.as_ref() {
-                RelExpr::Unit => return constant(&top, items, order),
-                // Everything over the reduce is its HAVING and its finalize projection.
-                RelExpr::Reduce { input, group_cols, aggs } => {
-                    let lin = linear(input)?;
-                    let pieces = flat_reduce(&lin, input, group_cols, aggs, &top.preds, top.items(items)?, order)?;
-                    let shape = AdhocShape::Fold {
-                        pieces: Box::new(pieces),
-                        is_distinct: false,
-                    };
-                    (lin, shape)
-                }
-                _ => {
-                    let (desc, source) = top.source()?;
-                    let rows = reply_rows(Frame::scan(desc, source), top.items(items)?, order)?;
-                    (top, AdhocShape::Rows(rows))
-                }
-            }
+            let items = top.items(items)?;
+            (top, items)
         }
-        _ => return Err(internal()),
+        // A DISTINCT body is read whole, each column as itself.
+        RelExpr::Distinct { .. } => (linear(rel)?, ProjEntry::passthroughs(rel.cols().into_owned())),
+        _ => {
+            return Err(GnitzSqlError::Internal(
+                "an ad-hoc read body is not a projection".into(),
+            ));
+        }
+    };
+    let folded = |pieces, is_distinct| AdhocShape::Fold { pieces: Box::new(pieces), is_distinct };
+    let (lin, shape) = match top.base.as_ref() {
+        RelExpr::Unit => return constant(&top, items, order),
+        // Everything over the reduce is its HAVING and its finalize projection.
+        RelExpr::Reduce { input, group_cols, aggs } => {
+            let lin = linear(input)?;
+            let pieces = flat_reduce(&lin, &input.cols(), group_cols, aggs, &top.preds, items, order)?;
+            (lin, folded(pieces, false))
+        }
+        // A DISTINCT is the reduce grouping every column of its input, with no
+        // aggregate, so a filter over it reads only group columns and is one under it.
+        RelExpr::Distinct { input } => {
+            let mut lin = linear(input)?;
+            lin.filter(&top.preds)?;
+            let in_cols = input.cols();
+            let group_cols: Vec<ColId> = in_cols.iter().map(|c| c.id).collect();
+            let pieces = flat_reduce(&lin, &in_cols, &group_cols, &[], &[], items, order)?;
+            (lin, folded(pieces, true))
+        }
+        _ => {
+            let (desc, source) = top.source()?;
+            let rows = reply_rows(Frame::scan(desc, source), items, order, desc.class.is_view())?;
+            (top, AdhocShape::Rows(rows))
+        }
     };
     let (desc, source) = lin.source()?;
     let conjuncts = Frame::scan(desc, source).resolve_preds(&lin.preds)?;
@@ -209,21 +206,22 @@ pub(crate) fn lower_read(
 
 /// The constant row `items` compute over the global ground row: one hidden
 /// `_group_pk`, keyed by the global group key.
-fn constant(lin: &Linear<'_>, items: &[ProjEntry], order: Vec<OrderCol>) -> Result<AdhocRead, GnitzSqlError> {
+fn constant(lin: &Linear<'_>, items: Vec<ProjEntry>, order: Vec<OrderCol>) -> Result<AdhocRead, GnitzSqlError> {
     if !lin.preds.is_empty() {
         return Err(GnitzSqlError::Rejected(
             "a WHERE over a SELECT without FROM is not supported".into(),
         ));
     }
     let ground = Frame::keyed(vec![crate::agg::group_pk_def()], [])?;
-    Ok(AdhocRead::Constant(reply_rows(ground, lin.items(items)?, order)?))
+    Ok(AdhocRead::Constant(reply_rows(ground, items, order, false)?))
 }
 
 /// `Project(having?(Reduce))` over `lin`'s relation, as the flat query binds it:
-/// each column the reduce reads, as `lin` composes it over the relation.
+/// each column the reduce reads — one of `in_cols`, its input's — as `lin`
+/// composes it over the relation.
 fn flat_reduce(
     lin: &Linear<'_>,
-    input: &Rc<RelExpr>,
+    in_cols: &[HirCol],
     group_cols: &[ColId],
     aggs: &[AggCol],
     having: &[HirExpr],
@@ -231,14 +229,25 @@ fn flat_reduce(
     order: Vec<OrderCol>,
 ) -> Result<FoldPieces, GnitzSqlError> {
     let (desc, source) = lin.source()?;
-    let in_cols = input.cols();
     let pre: Vec<ProjEntry> = (reduce_reads(group_cols, aggs).into_iter())
         .map(|r| ProjEntry {
             expr: lin.map[&r].clone(),
-            out: hircol_of(&in_cols, r).clone(),
+            out: hircol_of(in_cols, r).clone(),
         })
         .collect();
     fold(Frame::scan(desc, source), pre, group_cols, aggs, having, items, order)
+}
+
+/// `items` over `src` as a relabel of its regions, where every column no item names
+/// is a key column or a hidden payload column of `src`: the reply hides both.
+fn ride(src: &Frame, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
+    let Some(out) = src.relabeled_in_order(items)? else {
+        return Ok(None);
+    };
+    let schema = &src.schema;
+    let drops_visible = (0..out.layout.len())
+        .any(|s| out.layout[s].is_none() && !schema.columns()[s].is_hidden && !schema.layout().is_pk_col(s));
+    Ok((!drops_visible).then_some(out))
 }
 
 /// The rows reply a projection over a source produces.
@@ -248,7 +257,8 @@ pub(crate) struct RowsReply {
     pub(crate) src: Arc<Schema>,
     /// The reply's regions under the SELECT list's numbering: the key columns no
     /// item names, hidden, then the items — a key column at the first item that
-    /// copies it, every other item a payload column.
+    /// copies it, every other item a payload column — with, where the reply ships a
+    /// view's regions as they are, the view's own hidden columns beside them.
     pub(crate) schema: Arc<Schema>,
     /// The program filling the reply's payload from a source row; `None` when the
     /// reply's regions are the source's own.
@@ -267,10 +277,13 @@ pub(crate) struct RowsReply {
 }
 
 /// The reply items of `written` over `src`, ordered by `order` over `written`'s columns.
+/// `rides_hidden` where `src` is a view, whose hidden payload columns are its own
+/// operators' state rather than a table's dropped columns.
 pub(crate) fn reply_rows(
     src: Frame,
     written: Vec<ProjEntry>,
     mut order: Vec<OrderCol>,
+    rides_hidden: bool,
 ) -> Result<RowsReply, GnitzSqlError> {
     // A hidden item is an ORDER BY key; one an earlier item already computes sorts on it.
     let mut items: Vec<ProjEntry> = Vec::with_capacity(written.len());
@@ -287,16 +300,30 @@ pub(crate) fn reply_rows(
             None => items.push(it),
         }
     }
-    let (proj, out) = physical::physicalize_projection(&items, &src)?;
+    // A reply moving no column carries a view's hidden columns along hidden, so the
+    // view's stored regions ship as they are instead of the others being copied out
+    // from beside them.
+    let ridden = match rides_hidden {
+        true => ride(&src, &items)?,
+        false => None,
+    };
+    let (proj, out, unmapped) = match ridden {
+        Some(out) => ((0..out.layout.len()).map(BoundExpr::ColRef).collect(), out, true),
+        None => {
+            let (proj, out) = physical::physicalize_projection(&items, &src)?;
+            let k = src.schema.pk_cols().len();
+            // The relation's payload columns, each copied in place at its own type: the
+            // reply's regions are the relation's.
+            let payload = proj[k..]
+                .iter()
+                .zip(&out.schema.columns()[k..])
+                .map(|(item, def)| (item.as_col(), def.ty));
+            let unmapped = payload.eq(src.schema.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
+            (proj, out, unmapped)
+        }
+    };
     let src = src.schema;
     let k = src.pk_cols().len();
-    // The relation's payload columns, each copied in place at its own type: the reply's
-    // regions are the relation's.
-    let payload = proj[k..]
-        .iter()
-        .zip(&out.schema.columns()[k..])
-        .map(|(item, def)| (item.as_col(), def.ty));
-    let unmapped = payload.eq(src.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
     let program = (!unmapped)
         .then(|| payload_program(&proj, &out.schema, &src))
         .transpose()?;

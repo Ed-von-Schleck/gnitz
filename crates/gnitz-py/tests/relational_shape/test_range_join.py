@@ -50,16 +50,21 @@ _CHURN = [
 def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client):
     """`ON a.x OP b.y` is the cross product filtered by the operator, each pair
     once, for every operator; a band matches only inside an equality group, on
-    every equality column (`band2` is `n_eq = 2`); and a GROUP BY over a range
-    join reads its output deltas like any other. Checked after each epoch of a
-    churn on both sides."""
+    every equality column (`band2` is `n_eq = 2`); a range column the side
+    computes (`x1`, inner and LEFT) is the stored column's join over its value;
+    and a GROUP BY over a range join reads its output deltas like any other.
+    Checked after each epoch of a churn on both sides."""
     pair = "SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON"
+    x1 = "SELECT d.id AS aid, b.id AS bid FROM (SELECT id, k, x + 1 AS x1 FROM a) d"
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, k2 BIGINT NOT NULL, x BIGINT); "
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, k2 BIGINT NOT NULL, y BIGINT); "
         + "; ".join(f"CREATE VIEW pure_{n} AS {pair} a.x {op} b.y" for n, (op, _) in _PURE.items())
         + f"; CREATE VIEW band AS {pair} a.k = b.k AND a.x <= b.y; "
         f"CREATE VIEW band2 AS {pair} a.k = b.k AND a.k2 = b.k2 AND a.x <= b.y; "
+        f"CREATE VIEW band_x1 AS {x1} JOIN b ON d.k = b.k AND d.x1 <= b.y; "
+        f"CREATE VIEW left_x1 AS {x1} LEFT JOIN b ON d.k = b.k AND d.x1 <= b.y; "
+        f"CREATE VIEW pure_x1 AS {x1} JOIN b ON d.x1 < b.y; "
         "CREATE VIEW per_a AS SELECT aid, COUNT(*) AS n FROM pure_lt GROUP BY aid")
 
     state = {"a": {}, "b": {}}
@@ -76,6 +81,16 @@ def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client):
             pairs(lambda ar, br: _EQ(ar[0], br[0]) and _LE(ar[2], br[2])), 1), sql
         assert bag(scanned(client, "band2"), "aid", "bid") == dict.fromkeys(
             pairs(lambda ar, br: _EQ(ar[0], br[0]) and ar[1] == br[1] and _LE(ar[2], br[2])), 1), sql
+        def x1(ar):
+            return None if ar[2] is None else ar[2] + 1
+
+        band_x1 = pairs(lambda ar, br: _EQ(ar[0], br[0]) and _LE(x1(ar), br[2]))
+        assert bag(scanned(client, "band_x1"), "aid", "bid") == dict.fromkeys(band_x1, 1), sql
+        matched = {ai for ai, _ in band_x1}
+        assert bag(scanned(client, "left_x1"), "aid", "bid") == dict.fromkeys(
+            band_x1 + [(ai, None) for ai in state["a"] if ai not in matched], 1), sql
+        assert bag(scanned(client, "pure_x1"), "aid", "bid") == dict.fromkeys(
+            pairs(lambda ar, br: _PURE["lt"][1](x1(ar), br[2])), 1), sql
         assert bag(scanned(client, "per_a"), "aid", "n") == dict.fromkeys(
             Counter(ai for ai, _ in pairs(lambda ar, br: _PURE["lt"][1](ar[2], br[2]))).items(), 1), sql
 

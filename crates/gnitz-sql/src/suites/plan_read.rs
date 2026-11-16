@@ -711,7 +711,15 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT * FROM st", "is a stream"),
         ("WITH c AS (SELECT id FROM st) SELECT id FROM c", "is a stream"),
         ("SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5", "128-bit"),
-        ("WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x", "(DISTINCT CTE)"),
+        // What a grouped or DISTINCT CTE derives under its grouping is named first.
+        (
+            "WITH x AS (SELECT v FROM t UNION SELECT w FROM t) SELECT COUNT(*) FROM x",
+            "(set operation)",
+        ),
+        (
+            "WITH x AS (SELECT DISTINCT v, w FROM t) SELECT DISTINCT v FROM x",
+            "(an aggregate over a grouped CTE)",
+        ),
         (
             "WITH x AS (SELECT v FROM t UNION SELECT w FROM t) SELECT v FROM x",
             "(set operation)",
@@ -1223,8 +1231,9 @@ fn a_plan_resolves_only_the_relations_it_reads() {
     }
 }
 
-/// A grouped CTE is the fold its body is: what the query filters and projects
-/// over it is that fold's HAVING and finalize.
+/// A grouped or DISTINCT CTE is the fold its body is: what the query filters and
+/// projects over it is that fold's HAVING and finalize — a filter over a DISTINCT,
+/// which reads only group columns, the read's own predicate.
 #[test]
 fn a_grouped_cte_reads_as_its_fold() {
     let cat = base();
@@ -1241,6 +1250,14 @@ fn a_grouped_cte_reads_as_its_fold() {
         (
             "WITH x AS (SELECT g AS a, g AS b FROM t) SELECT a, SUM(b) AS s FROM x GROUP BY a",
             "SELECT g AS a, SUM(g) AS s FROM t GROUP BY g",
+        ),
+        (
+            "WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x",
+            "SELECT DISTINCT v FROM t",
+        ),
+        (
+            "WITH x AS (SELECT DISTINCT g, v FROM t WHERE id > 3) SELECT g, v FROM x WHERE v > 3 ORDER BY v",
+            "SELECT DISTINCT g, v FROM t WHERE id > 3 AND v > 3 ORDER BY v",
         ),
     ] {
         let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));

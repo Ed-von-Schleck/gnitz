@@ -1,16 +1,12 @@
-"""A view whose last operator is a GROUP BY keeps that operator's output once,
-and a top-N keeps no copy of its output at all.
+"""Views ending in a GROUP BY, an extremum and a top-N, whose operators read their
+own history, kept exact through churn. A reduce the view reads only through
+renames keeps its output once, as the view's store, and a top-N keeps no copy of
+its output at all.
 
-A reduce needs the integral of its own output, which is what the view's store
-holds: the view's directory carries no second copy of it. The store is
-driven into the disk regime, so the operator reads its history off shards the
-view's readers also read, and each step is checked at its weights: a group
-whose aggregate moved must be there once, at the new value. A crash and a
-graceful restart are both followed by more churn, which reads the history the
-boot left.
-
-An aggregate the view projects a column out of — a MIN or MAX carries one — is
-not the view's output, and keeps its trace.
+The stores are driven into the disk regime, so each operator reads its history
+off shards, and each step is checked at its weights: a group whose aggregate
+moved must be there once, at the new value. A crash and a graceful restart are
+both followed by more churn, which reads the history the boot left.
 """
 
 import random
@@ -90,7 +86,8 @@ def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(sweeping):
     assert kinds == {
         "t": {"rows"},
         "by_g": {"rows"},
-        "ext": {"rows", "scratch_reduce", "scratch_avidx"},
+        # The extremum's value index is the one store it keeps beside the view's rows.
+        "ext": {"rows", "scratch_avidx"},
         # The top-N's index of every input row is the one store it keeps
         # beside the view's rows.
         "top": {"rows", "scratch_topnidx"},

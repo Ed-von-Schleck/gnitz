@@ -1,8 +1,8 @@
 //! HIR → fold lowering: the ad-hoc read's reduce — or `SELECT DISTINCT`, a fold
 //! with no aggregate — as layout for a stateless fold the client finishes. It
 //! shares `lower::reduce`'s rules, output key included, and builds no evaluator.
-//! Its input is the pieces of the flat body [`super::read`] composes: the reduce, or
-//! the DISTINCT's projection, directly over the relation read.
+//! Its input is the pieces of the flat body [`super::read`] composes: the reduce —
+//! a DISTINCT's groups every column it reads — directly over the relation read.
 
 use super::super::physical::{self, Frame};
 use super::super::{AggCol, ColId, HirExpr, OrderCol, ProjEntry};
@@ -36,18 +36,6 @@ pub(crate) struct FoldPieces {
     /// gate) is *in* its item, exactly as it is in the view path's finalize map — so
     /// the client finisher has no per-aggregate shape switch to keep in step.
     pub(crate) finalize: super::read::RowsReply,
-}
-
-/// `SELECT DISTINCT items` over `src`: the items are the pre-map, and the fold
-/// groups every column it produces.
-pub(super) fn distinct_fold(
-    src: Frame,
-    items: Vec<ProjEntry>,
-    order: Vec<OrderCol>,
-) -> Result<FoldPieces, GnitzSqlError> {
-    let group_cols: Vec<ColId> = items.iter().map(|e| e.out.id).collect();
-    let finalize = ProjEntry::passthroughs(items.iter().map(|e| e.out.clone()));
-    fold(src, items, &group_cols, &[], &[], finalize, order)
 }
 
 /// The fold of `group_cols` / `aggs` over `pre` applied to
@@ -85,12 +73,7 @@ pub(super) fn fold(
     }
     let at = |id: ColId| same.iter().find(|(dup, _)| *dup == id).map_or(id, |&(_, k)| k);
     let read = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(at(*id)));
-    let mut groups: Vec<ColId> = Vec::with_capacity(group_cols.len());
-    for g in group_cols.iter().map(|&g| at(g)) {
-        if !groups.contains(&g) {
-            groups.push(g);
-        }
-    }
+    let groups: Vec<ColId> = group_cols.iter().map(|&g| at(g)).collect();
     let aggs: Vec<AggCol> = (aggs.iter())
         .map(|c| AggCol { arg: c.arg.map(at), ..c.clone() })
         .collect();
@@ -108,7 +91,7 @@ pub(super) fn fold(
     let ReduceSpecs { agg, cols } = resolve_reduce_specs(&groups, &aggs, &reduce_in)?;
     let partial = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;
     let having = partial.resolve_preds(&having)?;
-    let finalize = super::read::reply_rows(partial, finalize, order)?;
+    let finalize = super::read::reply_rows(partial, finalize, order, false)?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
         agg,

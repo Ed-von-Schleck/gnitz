@@ -25,7 +25,7 @@ pub(super) struct SubqueryRef {
     /// or its finalized aggregate.
     pub(super) id: ColId,
     pub(super) kind: SubqueryKind,
-    /// EXISTS/IN: the inner relation (a `Get`, or a CTE's `Alias`) under an
+    /// EXISTS/IN: the inner relation (a `Get`, or a read of a CTE) under an
     /// optional `Filter` of its local WHERE. Scalar: `Project(Reduce)` passing
     /// the group columns through and computing the finalized aggregate as `id`.
     pub(super) rel: Rc<RelExpr>,
@@ -63,7 +63,7 @@ impl SubCtx<'_> {
     }
 }
 
-/// The resolved inner relation of a subquery: a `Get` or a CTE's `Alias`, under an
+/// The resolved inner relation of a subquery: a `Get` or a read of a CTE, under an
 /// optional `Filter` of its local WHERE, plus the mixed-scope correlation conjuncts
 /// (over the outer ∪ inner `ColId` space) that become the decorrelated join's ON.
 struct InnerResolved<'e> {

@@ -128,7 +128,10 @@ def test_a_view_missing_one_ranks_trace_rebuilds_instead_of_refusing_the_boot(ow
     _checkpoint_cut(own_server)
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
-        conn.execute_sql("CREATE VIEW g AS SELECT val % 3 AS k, SUM(val) AS s FROM t GROUP BY val % 3")
+        # The HAVING filters the reduce's output, so the reduce keeps a trace of its own.
+        conn.execute_sql(
+            "CREATE VIEW g AS SELECT val % 3 AS k, SUM(val) AS s FROM t GROUP BY val % 3 HAVING SUM(val) > 0"
+        )
         view_id = conn.resolve_table("g")[0]
     own_server.stop_graceful()
     traces = sorted(glob.glob(os.path.join(own_server.data_dir, "_relations", str(view_id), "scratch_*")))

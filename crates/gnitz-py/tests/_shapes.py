@@ -332,16 +332,18 @@ SHAPES = {
                 ("category", "cnt", "total"),
                 grouped([r for r in _FT if r[2] > 1000], lambda r: r[1], lambda r: 1, lambda r: r[2]))}),
     # A linear final whose delta source is an in-bundle hidden segment that
-    # exchanges — grouped, joined, or a linear segment between two grouped ones —
-    # so the segment must be filled before the final reads it.
+    # exchanges — a grouped or joined CTE read twice, or a linear segment between
+    # two grouped ones — so the segment must be filled before the final reads it.
     "grouped_cte": (
         *_over(_table("t", ("v",), [(1, 20), (2, 5), (3, 30)])),
-        {"v": ("WITH c AS (SELECT id, SUM(v) AS sv FROM t GROUP BY id) SELECT id FROM c WHERE sv > 10",
-               ("id",), {(1,): 1, (3,): 1})}),
+        {"v": ("WITH c AS (SELECT id, SUM(v) AS sv FROM t GROUP BY id) "
+               "SELECT id FROM c WHERE sv > 10 UNION ALL SELECT id FROM c WHERE sv < 10",
+               ("id",), {(1,): 1, (2,): 1, (3,): 1})}),
     "join_cte": (
         *_over(_table("ja", ("k",), [(1, 10), (2, 20), (3, 10)]), _table("jb", ("x",), [(10, 5), (20, 0)])),
         {"v": ("WITH c AS (SELECT ja.id AS id, jb.x AS x FROM ja JOIN jb ON ja.k = jb.id) "
-               "SELECT id FROM c WHERE x > 0", ("id",), {(1,): 1, (3,): 1})}),
+               "SELECT id FROM c WHERE x > 0 UNION ALL SELECT id FROM c WHERE x = 0",
+               ("id",), {(1,): 1, (2,): 1, (3,): 1})}),
     "linear_between": (
         *_over(_table("t", ("v",), [(1, 20), (2, 5), (3, 20), (4, 30)])),
         {"v": ("WITH g AS (SELECT id, SUM(v) AS sv FROM t GROUP BY id), "

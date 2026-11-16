@@ -74,10 +74,15 @@ impl Frame {
     }
 
     /// The group list to send a reduce, top-N or window grouped by `ids`' slots: SQL's
-    /// GROUP BY is unordered, so a permutation of leading PK columns is sent in PK
-    /// order.
+    /// GROUP BY is a set, so a slot named twice is sent once and a permutation of
+    /// leading PK columns is sent in PK order.
     pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
-        let group: Vec<u32> = self.slots(ids.iter().copied())?.into_iter().map(|c| c as u32).collect();
+        let mut group: Vec<u32> = Vec::with_capacity(ids.len());
+        for slot in self.slots(ids.iter().copied())? {
+            if !group.contains(&(slot as u32)) {
+                group.push(slot as u32);
+            }
+        }
         let lead = self.schema.pk_cols().get(..group.len());
         Ok(match lead {
             Some(lead) if lead.iter().all(|p| group.contains(p)) => lead.to_vec(),
@@ -170,6 +175,34 @@ impl Frame {
             ),
         };
         Ok(Some(Frame { layout, schema }))
+    }
+
+    /// [`Self::relabeled`] as stored under `items`' written order, or `None` where
+    /// [`Self::schema_in_order`] would move a column: the visible items must name
+    /// payload columns in payload order. Every slot no item names is hidden.
+    pub(crate) fn relabeled_in_order(&self, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
+        let Some(Frame { layout, schema }) = self.relabeled(items)? else {
+            return Ok(None);
+        };
+        let payload = (items.iter())
+            .filter(|it| !it.out.def.is_hidden)
+            .filter_map(|it| it.expr.as_col())
+            .map(|c| self.slot(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !payload.iter().filter(|&&s| !schema.layout().is_pk_col(s)).is_sorted() {
+            return Ok(None);
+        }
+        let unnamed = |s: &usize| layout[*s].is_none() && !schema.columns()[*s].is_hidden;
+        if !(0..layout.len()).any(|s| unnamed(&s)) {
+            return Ok(Some(Frame { layout, schema }));
+        }
+        let mut columns = schema.columns().to_vec();
+        for s in (0..layout.len()).filter(unnamed) {
+            columns[s].is_hidden = true;
+        }
+        let schema = Schema::from_parts(columns, schema.pk_cols())
+            .map_err(|e| GnitzSqlError::Internal(format!("relabeled schema: {e}")))?;
+        Ok(Some(Frame { layout, schema: Arc::new(schema) }))
     }
 }
 

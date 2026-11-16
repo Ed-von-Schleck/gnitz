@@ -33,9 +33,9 @@
 //! so outside the cut its input must be a set with a unique key. The cut needs
 //! neither: over a bag each copy of a row fills its own weight slot.
 //!
-//! The desugar is purely logical: `W` is a shared subtree read through aliases,
-//! and the lowering's cut memo and collision rule decide what is read in place
-//! and what is cut once to a hidden segment.
+//! The desugar is purely logical: `W` is one subtree every read of it shares, and
+//! the lowering's cut memo and collision rule decide what is read in place and
+//! what is cut once to a hidden segment.
 //!
 //! Cost under incremental maintenance: a changed row re-emits the rows of its
 //! partition at or after it (the whole partition for an unordered
@@ -528,31 +528,10 @@ struct Spec {
     calls: Vec<Call>,
 }
 
-/// A fresh read of a relation: the alias, its columns, and its column for each
-/// of the relation's.
-struct Read {
-    rel: Rc<RelExpr>,
-    cols: Vec<HirCol>,
-    at: HashMap<ColId, ColId>,
-}
-
-impl Read {
-    fn of(ids: &ColIdGen, input: &Rc<RelExpr>) -> Read {
-        let in_cols = input.cols();
-        let rel = RelExpr::alias(ids, Rc::clone(input), in_cols.iter().map(|c| c.def.clone()));
-        let cols = rel.cols().into_owned();
-        let at = in_cols.iter().map(|c| c.id).zip(cols.iter().map(|c| c.id)).collect();
-        Read { rel, cols, at }
-    }
-    fn col(&self, src: ColId) -> HirExpr {
-        BExpr::ColRef(self.at[&src])
-    }
-}
-
 /// Rewrite a windowed body: widen `W` by every ordered specification's running
 /// values, cut it by the QUALIFY-bounded ROW_NUMBER if there is one, join every
-/// unordered specification's value relation onto an outer read of that, filter
-/// by what is left of QUALIFY and project the SELECT list.
+/// unordered specification's value relation onto that, filter by what is left of
+/// QUALIFY and project the SELECT list.
 fn desugar<L: ItemLeaf>(
     ids: &ColIdGen,
     input: Rc<RelExpr>,
@@ -628,7 +607,7 @@ fn desugar<L: ItemLeaf>(
         .map(|q| win.over_w(ids, leaf, &placeholders, q))
         .collect();
 
-    // W: the narrowing projection every read of the input aliases.
+    // W: the narrowing projection every read of the input reads.
     let w = leaf.project(input, win.w)?;
     // A call's value is an expression over columns its specification adds.
     let mut values: HashMap<ColId, HirExpr> = HashMap::new();
@@ -642,33 +621,21 @@ fn desugar<L: ItemLeaf>(
     if let Some((call, (limit, offset))) = cut {
         rows = RelExpr::top_n(rows, call.partition, call.order, limit, offset);
     }
-    // Every unordered specification's `γ_P(W)`, joined onto an outer read of the
-    // rows. One with no partition key is a keyless (cross) join against the one
-    // global row.
-    let outer = (!unordered.is_empty()).then(|| Read::of(ids, &rows));
-    if let Some(outer) = &outer {
-        rows = Rc::clone(&outer.rel);
-        for spec in &unordered {
-            let (rel, keys) = partition_values(ids, &w, spec, &mut values)?;
-            let on = spec
-                .partition
-                .iter()
-                .zip(keys)
-                .map(|(&k, r)| BExpr::bin(outer.col(k), BinOp::Eq, BExpr::ColRef(r)))
-                .collect();
-            rows = RelExpr::join(rows, rel, JoinType::Inner, on)?;
-        }
+    // Every unordered specification's `γ_P(W)`, joined onto the rows. One with no
+    // partition key is a keyless (cross) join against the one global row.
+    for spec in &unordered {
+        let (rel, keys) = partition_values(ids, &w, spec, &mut values)?;
+        let on = spec
+            .partition
+            .iter()
+            .zip(keys)
+            .map(|(&k, r)| BExpr::bin(BExpr::ColRef(k), BinOp::Eq, BExpr::ColRef(r)))
+            .collect();
+        rows = RelExpr::join(rows, rel, JoinType::Inner, on)?;
     }
 
-    // A placeholder reads its value; a column of the rows reads the outer side,
-    // where there is one.
-    let rewrite = |e: &HirExpr| {
-        let valued = e.rebuild(&mut |id| values.get(id).cloned().unwrap_or(BExpr::ColRef(*id)));
-        match &outer {
-            Some(outer) => valued.rebuild(&mut |id| BExpr::ColRef(outer.at.get(id).copied().unwrap_or(*id))),
-            None => valued,
-        }
-    };
+    // A placeholder reads its value.
+    let rewrite = |e: &HirExpr| e.rebuild(&mut |id| values.get(id).cloned().unwrap_or(BExpr::ColRef(*id)));
     let qualify = qualify.iter().map(rewrite).collect();
     let items = items
         .into_iter()
@@ -738,21 +705,25 @@ fn partition_values(
     spec: &Spec,
     values: &mut HashMap<ColId, HirExpr>,
 ) -> Result<(Rc<RelExpr>, Vec<ColId>), GnitzSqlError> {
-    let wf = Read::of(ids, w);
-    let keys: Vec<ColId> = spec.partition.iter().map(|k| wf.at[k]).collect();
+    // A fresh read of `w`, and its column for each of `w`'s.
+    let in_cols = w.cols();
+    let wf = RelExpr::alias(ids, Rc::clone(w), in_cols.iter().map(|c| c.def.clone()));
+    let cols = wf.cols();
+    let at: HashMap<ColId, ColId> = in_cols.iter().map(|c| c.id).zip(cols.iter().map(|c| c.id)).collect();
+    let keys: Vec<ColId> = spec.partition.iter().map(|k| at[k]).collect();
     let mut aggs = Vec::new();
     for c in &spec.calls {
         let value = match c.func {
             WinFunc::Agg(func) => {
-                let arg = c.arg.map(|a| wf.at[&a]);
-                agg_value(ids, &wf.cols, keys.is_empty(), &mut aggs, func, arg)?
+                let arg = c.arg.map(|a| at[&a]);
+                agg_value(ids, &cols, keys.is_empty(), &mut aggs, func, arg)?
             }
             // Nothing orders the partition, so every row of it is first.
             _ => BExpr::LitInt(1),
         };
         values.insert(c.out.id, value);
     }
-    let reduce = RelExpr::reduce(Rc::clone(&wf.rel), keys.clone(), HirAgg::physical(&aggs));
+    let reduce = RelExpr::reduce(Rc::clone(&wf), keys.clone(), HirAgg::physical(&aggs));
     Ok((reduce, keys))
 }
 

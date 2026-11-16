@@ -40,7 +40,7 @@ pub(crate) struct LoweredView {
 
 /// The one compiler core: bind a query — its envelope, its CTEs, then its body — to one
 /// `RelExpr` tree, and lower it to its segments and view. A CTE is a subtree of that
-/// tree shared by every `Alias` naming it, so nothing compiles before the tree is
+/// tree shared by every reference naming it, so nothing compiles before the tree is
 /// whole.
 pub(crate) fn bind_and_lower<'a>(
     cat: &dyn crate::catalog::Catalog,
@@ -109,7 +109,7 @@ pub(crate) fn bind_returning(
 ) -> Result<RowsReply, GnitzSqlError> {
     let ids = ColIdGen::new();
     let (source, items) = bind::bind_returning(&ids, projection, &desc.schema, alias)?;
-    lower::read::reply_rows(physical::Frame::scan(desc, &source), items, Vec::new())
+    lower::read::reply_rows(physical::Frame::scan(desc, &source), items, Vec::new(), false)
 }
 
 /// Opaque column identity, unique within one bind (one [`ColIdGen`]), never
@@ -274,11 +274,14 @@ impl ProjEntry {
     }
 }
 
-/// The logical relational IR. `Get`, `Alias` and `SetOp` store their whole
-/// output column list; `Reduce`, a window `Ordered` and a Mark join store only
-/// the columns they add (aggregate, rank and mark columns). Every other column
-/// is derived on demand by [`RelExpr::cols`] from the node's inputs. Ids are
-/// minted once at bind and stay stable.
+/// The logical relational IR. `Get` and `SetOp` store their whole output column
+/// list; `Reduce`, a window `Ordered` and a Mark join store only the columns they
+/// add (aggregate, rank and mark columns). Every other column is derived on demand
+/// by [`RelExpr::cols`] from the node's inputs. Ids are minted once at bind and
+/// stay stable.
+///
+/// A body is a DAG: a node more than one parent holds by `Rc` — a CTE named twice,
+/// a window input read again — is one subtree, which the lowering computes once.
 pub(crate) enum RelExpr {
     /// The one row of no columns a FROM-less SELECT reads. Only an ad-hoc read
     /// binds one.
@@ -315,20 +318,6 @@ pub(crate) enum RelExpr {
     /// its columns, hidden ones included.
     Distinct {
         input: Rc<RelExpr>,
-    },
-    /// The same relation read again under fresh column identities — the HIR of
-    /// a second reference to one *subtree*, as a second mention of a CTE or the
-    /// window desugar's repeated reads of its own input are. (A second `FROM`
-    /// mention of a base table mints a fresh `Get` instead; there is no subtree
-    /// to share.) `cols` is parallel to `input.cols()` and carries the same defs
-    /// under new ids, so two aliases of one shared `input` are distinguishable
-    /// by id wherever they meet (a self-join's two sides).
-    /// The lowering fuses it into its reader as a rename of its input: over the
-    /// relation its input reads in place, or else over the one segment its input
-    /// is cut to.
-    Alias {
-        input: Rc<RelExpr>,
-        cols: Vec<HirCol>,
     },
     /// A set operation over weights: UNION sums them, EXCEPT is
     /// `positive_part(A − B)`, INTERSECT is `min(A, B)`. `out[i]` is the promoted
@@ -828,10 +817,18 @@ impl RelExpr {
     }
 
     /// A fresh read of `input` under `defs`, one per input column in order, each
-    /// under a newly minted id.
+    /// under a newly minted id: a projection renaming every column, so two reads of
+    /// one shared `input` are distinguishable by id wherever they meet (a
+    /// self-join's two sides).
     pub(crate) fn alias(ids: &ColIdGen, input: Rc<RelExpr>, defs: impl IntoIterator<Item = ColumnDef>) -> Rc<RelExpr> {
-        let cols = defs.into_iter().map(|def| HirCol::new(ids.next(), def)).collect();
-        Rc::new(RelExpr::Alias { input, cols })
+        let items = (input.cols().iter())
+            .zip(defs)
+            .map(|(c, def)| ProjEntry {
+                expr: BExpr::ColRef(c.id),
+                out: HirCol::new(ids.next(), def),
+            })
+            .collect();
+        RelExpr::project(input, items)
     }
 
     /// Columns no two live rows share a value of, each row at weight 1; `None` where
@@ -851,7 +848,6 @@ impl RelExpr {
                 .iter()
                 .map(|k| items.iter().find(|it| it.expr.as_col() == Some(*k)).map(|it| it.out.id))
                 .collect(),
-            RelExpr::Alias { input, cols } => rename_key(input.unique_key()?, &input.cols(), cols),
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             // positive_part(A − B) ≤ A and min(A, B) ≤ A, B; a widened key stays a key.
@@ -933,7 +929,7 @@ impl RelExpr {
     pub(crate) fn cols(&self) -> Cow<'_, [HirCol]> {
         match self {
             RelExpr::Unit => Cow::Borrowed(&[]),
-            RelExpr::Get { cols, .. } | RelExpr::Alias { cols, .. } => Cow::Borrowed(cols),
+            RelExpr::Get { cols, .. } => Cow::Borrowed(cols),
             RelExpr::Filter { input, .. } | RelExpr::Distinct { input } => input.cols(),
             RelExpr::Project { items, .. } => Cow::Owned(items.iter().map(|e| e.out.clone()).collect()),
             RelExpr::Join { left, right, kind, .. } => match kind {
