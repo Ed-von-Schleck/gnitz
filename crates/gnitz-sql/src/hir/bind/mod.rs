@@ -200,6 +200,8 @@ pub(crate) struct ViewBody {
     pub stmt: &'static str,
     /// The id of the view this statement supersedes, which the body may not read.
     pub replacing: Option<u64>,
+    /// Whether the view's options, stated or standing, give it a capacity.
+    pub bounded: bool,
 }
 
 /// One statement's bind state (its CTEs and body), shared by the whole recursion.
@@ -273,7 +275,7 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
     let (want, op) = match cx.surface {
         Surface::Adhoc => (ClassWant::Readable, cx.surface.stmt()),
         // The replaced view is retracted in the same bundle, taking the body's input with it.
-        Surface::View(ViewBody { stmt, replacing }) if replacing == Some(rel.tid) => {
+        Surface::View(ViewBody { stmt, replacing, .. }) if replacing == Some(rel.tid) => {
             return Err(GnitzSqlError::Rejected(format!(
                 "{stmt} '{name}' AS a query referencing the view itself is not supported"
             )));

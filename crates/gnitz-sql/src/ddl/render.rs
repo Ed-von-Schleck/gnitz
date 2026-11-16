@@ -120,7 +120,7 @@ pub fn create_view_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result
     let def = ViewDefinition::decode(&rel.definition).map_err(|e| format!("{}: {e}", rel.qualified()))?;
     let mut out = format!("CREATE VIEW {}", qualified_name(rel));
     let names: Vec<&str> = rel.visible_columns().map(|c| &*c.name).collect();
-    if !same_names(&def.body_columns, &names) {
+    if def.body_columns != names {
         out.push_str(&format!(" ({})", column_list(names.iter().copied())));
     }
     out.push_str(&with_clause(&rel.props));
@@ -144,7 +144,7 @@ pub(crate) fn view_body(catalog: &Catalog, def: &ViewDefinition) -> Result<Strin
             .ok_or_else(|| format!("the view reads relation {}, which the catalog no longer holds", r.tid))?;
         out.push_str(&qualified_name(rel));
         let now: Vec<&str> = rel.visible_columns().map(|c| &*c.name).collect();
-        let old_columns = r.columns.as_ref().filter(|old| !same_names(old, &now));
+        let old_columns = r.columns.as_ref().filter(|old| **old != now);
         let renames = old_columns.map(|old| format!("({})", column_list(old.iter().map(String::as_str))));
         match r.alias_end {
             // The written alias follows; only a column list is owed after it.
@@ -165,13 +165,6 @@ pub(crate) fn view_body(catalog: &Catalog, def: &ViewDefinition) -> Result<Strin
     }
     out.push_str(&q[at..]);
     Ok(out)
-}
-
-fn same_names<A: AsRef<str>, B: AsRef<str>>(a: &[A], b: &[B]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(a, b)| a.as_ref().eq_ignore_ascii_case(b.as_ref()))
 }
 
 fn column_list<'a>(names: impl IntoIterator<Item = &'a str>) -> String {

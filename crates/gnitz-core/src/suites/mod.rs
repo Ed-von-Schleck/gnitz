@@ -60,7 +60,7 @@ fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
 fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewBundle {
     ViewBundle {
         name,
-        props: ViewProps::default(),
+        props: Some(ViewProps::default()),
         replacing: None,
         segments,
         view,

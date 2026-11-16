@@ -148,25 +148,6 @@ fn reject_index_constraint_extras(
     reject_constraint_characteristics(characteristics, context)
 }
 
-/// Which site is reading a column definition, and so which constraint-bearing
-/// options are acted on: CREATE TABLE consumes NOT NULL / PRIMARY KEY / UNIQUE /
-/// REFERENCES, ADD COLUMN none of them.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ColumnOptionSite {
-    CreateTable,
-    AddColumn,
-}
-
-impl ColumnOptionSite {
-    /// How the site names itself in a rejection.
-    fn context(self) -> &'static str {
-        match self {
-            ColumnOptionSite::CreateTable => "column definition",
-            ColumnOptionSite::AddColumn => "ADD COLUMN",
-        }
-    }
-}
-
 /// A constraint one column option declares on its own column.
 pub(super) enum ColumnConstraint<'a> {
     PrimaryKey,
@@ -179,26 +160,24 @@ pub(super) enum ColumnConstraint<'a> {
 }
 
 /// One column definition, read: the column, whether it was spelled SERIAL, and
-/// the constraints its options declare, in the order written. Only
-/// [`ColumnOptionSite::CreateTable`] yields a constraint.
+/// every constraint its options declare, in the order written; the caller
+/// decides which it honours.
 pub(super) struct ColumnDecl<'a> {
     pub(super) def: ColumnDef,
     pub(super) serial: bool,
     pub(super) constraints: Vec<ColumnConstraint<'a>>,
 }
 
-/// Read `col`, rejecting every column option `site` does not honor; pure
-/// metadata (COMMENT/OPTIONS/POLICY/TAGS) is accepted. A constraint option is
-/// descended into, so a field gnitz does not implement (an `ON UPDATE` action,
-/// DEFERRABLE, NULLS NOT DISTINCT, …) is rejected with it. A SERIAL column is its
-/// signed integer, NOT NULL.
-pub(super) fn read_column(
-    col: &sqlparser::ast::ColumnDef,
-    site: ColumnOptionSite,
-) -> Result<ColumnDecl<'_>, GnitzSqlError> {
+/// Read `col`, rejecting every column option no site honours; pure metadata
+/// (COMMENT/OPTIONS/POLICY/TAGS) is accepted. A constraint option is descended
+/// into, so a field gnitz does not implement (an `ON UPDATE` action, DEFERRABLE,
+/// NULLS NOT DISTINCT, …) is rejected with it. A SERIAL column is its signed
+/// integer, NOT NULL. `context` names the site in a rejection.
+pub(super) fn read_column<'a>(
+    col: &'a sqlparser::ast::ColumnDef,
+    context: &str,
+) -> Result<ColumnDecl<'a>, GnitzSqlError> {
     use sqlparser::ast::ColumnOption as O;
-    let context = site.context();
-    let honored = |clause: &str| reject_if(site == ColumnOptionSite::AddColumn, context, clause);
     let sqlparser::ast::ColumnDef { name, data_type, options } = col;
     // `Some(true)` once NOT NULL is written, `Some(false)` once NULL is.
     let mut not_null: Option<bool> = None;
@@ -214,30 +193,22 @@ pub(super) fn read_column(
         // column constraint.
         let sqlparser::ast::ColumnOptionDef { name: constraint_name, option } = opt;
         match option {
-            // A new column over existing rows is nullable either way, so bare
-            // NULL is honored at both sites.
             O::Null | O::NotNull => {
                 let written = matches!(option, O::NotNull);
-                if written {
-                    honored("NOT NULL (a new column over existing rows is nullable)")?;
-                }
                 if not_null.is_some_and(|prev| prev != written) {
                     return Err(conflicting());
                 }
                 not_null = Some(written);
             }
             O::Unique(u) => {
-                honored("UNIQUE (add the column, then CREATE UNIQUE INDEX)")?;
                 reject_unhonored_unique_fields(u, context)?;
                 constraints.push(ColumnConstraint::Unique(constraint_name.as_ref()));
             }
             O::PrimaryKey(pk) => {
-                honored("PRIMARY KEY (a new column cannot join the primary key)")?;
                 reject_unhonored_pk_fields(pk, context)?;
                 constraints.push(ColumnConstraint::PrimaryKey);
             }
             O::ForeignKey(fk) => {
-                honored("REFERENCES (a foreign key is declared only at CREATE TABLE)")?;
                 let on_delete = fk_on_delete(fk, context)?;
                 constraints.push(ColumnConstraint::ForeignKey { fk, on_delete });
             }

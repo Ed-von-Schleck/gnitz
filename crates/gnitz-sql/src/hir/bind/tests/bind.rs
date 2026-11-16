@@ -37,7 +37,11 @@ pub(in crate::hir) fn bound(sql: &str) -> Rc<RelExpr> {
     let mut cx = BindCx::new(
         &cat,
         &ids,
-        Surface::View(ViewBody { stmt: "CREATE VIEW", replacing: None }),
+        Surface::View(ViewBody {
+            stmt: "CREATE VIEW",
+            replacing: None,
+            bounded: false,
+        }),
     );
     bind_query(&mut cx, &parse_query(sql)).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
 }
@@ -217,7 +221,11 @@ fn a_view_body_records_its_references_column_names() {
     let mut cx = BindCx::new(
         &cat,
         &ids,
-        Surface::View(ViewBody { stmt: "CREATE VIEW", replacing: None }),
+        Surface::View(ViewBody {
+            stmt: "CREATE VIEW",
+            replacing: None,
+            bounded: false,
+        }),
     );
     let sql = "SELECT t.id FROM t JOIN u AS x(p, q) ON t.a = x.q";
     bind_query(&mut cx, &parse_query(sql)).unwrap_or_else(|e| panic!("{sql}: {e:?}"));

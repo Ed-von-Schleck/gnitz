@@ -2,8 +2,8 @@
 //! and CREATE INDEX.
 
 use super::guard::{
-    ColumnConstraint, ColumnDecl, ColumnOptionSite, fk_on_delete, read_column, reject_index_type_and_options,
-    reject_unhonored_pk_fields, reject_unhonored_unique_fields,
+    ColumnConstraint, ColumnDecl, fk_on_delete, read_column, reject_index_type_and_options, reject_unhonored_pk_fields,
+    reject_unhonored_unique_fields,
 };
 use super::options::parse_table_options;
 use crate::catalog::Catalog;
@@ -12,50 +12,12 @@ use crate::names::{extract_index_name, extract_object_name};
 use crate::rules::{ClassWant, canonical_user_name, reject_duplicate_names, require_class, require_column};
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
-use sqlparser::ast::{Expr, ForeignKeyConstraint, IndexColumn, ObjectType, TableConstraint, WrappedCollection};
+use sqlparser::ast::{
+    Expr, ForeignKeyConstraint, IndexColumn, ObjectType, OrderByExpr, OrderByOptions, TableConstraint,
+    WrappedCollection,
+};
+use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashSet};
-
-/// The canonical catalog name of an unnamed index:
-/// `{schema}__{table}__idx_{col1}_{col2}…`.
-fn default_index_name(table: &RelName, col_names: &[&str]) -> String {
-    let name = format!("{}__{}__idx_{}", table.schema(), table.name(), col_names.join("_"));
-    // A quoted column name holds any byte; an index name holds identifier bytes.
-    name.bytes()
-        .map(|b| {
-            if gnitz_wire::is_valid_ident_char(b) {
-                b.to_ascii_lowercase() as char
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// `base` if free, else the first `{base}_{n}` (n ≥ 2) not in `taken`.
-fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
-    if !taken.contains(&base) {
-        return base;
-    }
-    for n in 2u32.. {
-        let candidate = format!("{base}_{n}");
-        if !taken.contains(&candidate) {
-            return candidate;
-        }
-    }
-    unreachable!("u32 range exhausted")
-}
-
-/// Whether [`disambiguate_index_name`] can have named an index `name` from `base`.
-fn is_auto_name(name: &str, base: &str) -> bool {
-    match name.strip_prefix(base) {
-        Some("") => true,
-        Some(rest) => rest
-            .strip_prefix('_')
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
-        None => false,
-    }
-}
 
 /// The column list of an index over `key`, or why no index can be built on it.
 fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
@@ -93,23 +55,16 @@ struct FkSite<'a> {
 /// Resolve a PRIMARY KEY / UNIQUE / CREATE INDEX column list against `cols`, in
 /// declared order — order drives the composite index's leading-key span and its
 /// prefix seeks. `ctx` names the surface in both messages.
-fn resolve_index_columns<'c>(
-    columns: &'c [IndexColumn],
-    cols: &[ColumnDef],
-    ctx: &str,
-) -> Result<(Vec<&'c str>, Vec<u32>), GnitzSqlError> {
-    let mut names: Vec<&str> = Vec::with_capacity(columns.len());
-    let mut indices: Vec<u32> = Vec::with_capacity(columns.len());
-    for c in columns {
-        let name = index_column_ident(c, ctx)?;
+fn resolve_index_columns(names: &[&str], cols: &[ColumnDef], ctx: &str) -> Result<Vec<u32>, GnitzSqlError> {
+    let mut indices: Vec<u32> = Vec::with_capacity(names.len());
+    for &name in names {
         let idx = require_column(cols, name).map_err(|e| e.in_clause(ctx))? as u32;
         if indices.contains(&idx) {
             return Err(GnitzSqlError::Rejected(format!("{ctx}: duplicate column '{name}'")));
         }
-        names.push(name);
         indices.push(idx);
     }
-    Ok((names, indices))
+    Ok(indices)
 }
 
 /// Resolve a `REFERENCES` clause's column list to the parent column it names.
@@ -176,7 +131,7 @@ fn resolve_fk_target(
 }
 
 /// A strictly simple identifier expression's name, or the shared
-/// "column must be a simple identifier" rejection. Backs [`index_column_ident`]
+/// "column must be a simple identifier" rejection. Backs [`index_column_names`]
 /// and the CLUSTER BY column list (a `Vec<Expr>` in sqlparser).
 fn simple_ident_expr<'a>(e: &'a Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
     match e {
@@ -187,23 +142,37 @@ fn simple_ident_expr<'a>(e: &'a Expr, context: &str) -> Result<&'a str, GnitzSql
     }
 }
 
-/// The bare column name of an `IndexColumn` (a PRIMARY KEY / UNIQUE constraint
-/// column or a CREATE INDEX column), which gnitz requires to be a simple
+/// The bare column names of an index column list — a PRIMARY KEY or UNIQUE
+/// constraint's, or CREATE INDEX's — each of which gnitz requires to be a simple
 /// identifier. Any expression, operator class, or ordering qualifier is rejected
 /// — gnitz indexes are ordered ascending by key bytes and carry no per-column
-/// ordering. Shared by the CREATE INDEX loop and the table-level PK/UNIQUE loops.
-fn index_column_ident<'a>(c: &'a IndexColumn, context: &str) -> Result<&'a str, GnitzSqlError> {
-    reject_if(
-        c.operator_class.is_some(),
-        context,
-        "an operator class on an index column",
-    )?;
-    reject_if(
-        c.column.options.sort.is_some() || c.column.options.nulls_first.is_some() || c.column.with_fill.is_some(),
-        context,
-        "per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL)",
-    )?;
-    simple_ident_expr(&c.column.expr, context)
+/// ordering. Needs no catalog, so every surface reads its list here first.
+pub(super) fn index_column_names<'a>(columns: &'a [IndexColumn], context: &str) -> Result<Vec<&'a str>, GnitzSqlError> {
+    columns
+        .iter()
+        .map(|c| {
+            let IndexColumn {
+                column:
+                    OrderByExpr {
+                        expr,
+                        options: OrderByOptions { sort, nulls_first },
+                        with_fill,
+                    },
+                operator_class,
+            } = c;
+            reject_if(
+                operator_class.is_some(),
+                context,
+                "an operator class on an index column",
+            )?;
+            reject_if(
+                sort.is_some() || nulls_first.is_some() || with_fill.is_some(),
+                context,
+                "per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL)",
+            )?;
+            simple_ident_expr(expr, context)
+        })
+        .collect()
 }
 
 /// One UNIQUE constraint as written: the column list — one element for a
@@ -214,22 +183,32 @@ struct UniqueDecl {
     name: Option<String>,
 }
 
-/// Record a UNIQUE constraint, refusing a column set already recorded:
-/// `a INT UNIQUE UNIQUE` and `UNIQUE(a), UNIQUE(a)` are one constraint written
-/// twice, and one index is all either could create.
+/// Record a UNIQUE constraint, holding it to the rule CREATE INDEX holds an
+/// unnamed index to: an unnamed one may not repeat a column set another
+/// declares. `a INT UNIQUE UNIQUE` is one constraint written twice; two written
+/// names on one column list are two indexes, as two CREATE INDEX statements make.
+/// No two may share a written name.
 fn push_unique(
     unique: &mut Vec<UniqueDecl>,
     cols: Vec<u32>,
     col_names: &[&str],
     name: Option<&sqlparser::ast::Ident>,
 ) -> Result<(), GnitzSqlError> {
-    if unique.iter().any(|u| u.cols == cols) {
+    if unique
+        .iter()
+        .any(|u| u.cols == cols && (u.name.is_none() || name.is_none()))
+    {
         return Err(GnitzSqlError::Rejected(format!(
             "duplicate UNIQUE constraint on column(s) ({})",
             col_names.join(", ")
         )));
     }
     let name = name.map(|n| canonical_user_name(&n.value)).transpose()?;
+    if let Some(name) = &name
+        && unique.iter().any(|u| u.name.as_ref() == Some(name))
+    {
+        return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{name}'")));
+    }
     unique.push(UniqueDecl { cols, name });
     Ok(())
 }
@@ -246,7 +225,7 @@ struct Declared<'a> {
 
 /// Read `create` into a [`Declared`]. Takes neither a catalog nor a schema name,
 /// so nothing here can resolve to a relation: a name is a column of the in-flight
-/// list, or it is rejected.
+/// list, or it is rejected — and so it runs before any catalog read.
 fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared<'_>, GnitzSqlError> {
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(create.columns.len());
     let mut inline_pk: Vec<u32> = Vec::new();
@@ -256,7 +235,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
 
     // The column defs and every site a column option declares.
     for (i, col) in create.columns.iter().enumerate() {
-        let ColumnDecl { def, serial: is_serial, constraints } = read_column(col, ColumnOptionSite::CreateTable)?;
+        let ColumnDecl { def, serial: is_serial, constraints } = read_column(col, "column definition")?;
         cols.push(def);
         if is_serial {
             serial.push(i as u32);
@@ -295,7 +274,8 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                 reject_unhonored_pk_fields(pk, CTX)?;
                 // Resolved before the conflict is reported, so an unknown column
                 // name is named rather than eclipsed by it.
-                let resolved = resolve_index_columns(&pk.columns, &cols, "PRIMARY KEY")?.1;
+                let names = index_column_names(&pk.columns, "PRIMARY KEY")?;
+                let resolved = resolve_index_columns(&names, &cols, "PRIMARY KEY")?;
                 if table_pk.is_some() || !inline_pk.is_empty() {
                     return Err(GnitzSqlError::Rejected("Multiple PRIMARY KEYs defined".into()));
                 }
@@ -322,10 +302,8 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
             }
             TableConstraint::Unique(u) => {
                 reject_unhonored_unique_fields(u, CTX)?;
-                if u.columns.is_empty() {
-                    return Err(GnitzSqlError::Rejected("UNIQUE constraint cannot be empty".into()));
-                }
-                let (col_names, col_indices) = resolve_index_columns(&u.columns, &cols, "UNIQUE")?;
+                let col_names = index_column_names(&u.columns, "UNIQUE")?;
+                let col_indices = resolve_index_columns(&col_names, &cols, "UNIQUE")?;
                 push_unique(&mut unique, col_indices, &col_names, u.name.as_ref())?;
             }
             TableConstraint::Check(_) => return Err(unsupported_clause(CTX, "CHECK constraint")),
@@ -344,126 +322,6 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
         fk_sites,
         unique,
     })
-}
-
-/// Drop a UNIQUE the PK already covers: a second index on a lone single-column PK
-/// would only duplicate the PK region. A *named* one is rejected instead —
-/// nothing would be left to carry the name for `DROP CONSTRAINT` to resolve.
-fn drop_unique_covered_by_pk(
-    unique: &mut Vec<UniqueDecl>,
-    cols: &[ColumnDef],
-    pk: &[u32],
-) -> Result<(), GnitzSqlError> {
-    let &[pk_col] = pk else {
-        return Ok(());
-    };
-    if let Some(name) = unique
-        .iter()
-        .find(|u| u.cols == [pk_col])
-        .and_then(|u| u.name.as_deref())
-    {
-        return Err(GnitzSqlError::Rejected(format!(
-            "UNIQUE constraint '{name}' on the primary-key column '{}' names no index: the primary \
-             key already provides the constraint",
-            cols[pk_col as usize].name
-        )));
-    }
-    unique.retain(|u| u.cols != [pk_col]);
-    Ok(())
-}
-
-/// The catalog name a UNIQUE constraint's index will carry.
-enum IndexName {
-    /// The written `CONSTRAINT <name>`.
-    Written(String),
-    /// The auto-name base, which [`PlannedTable::named`] frees of live names.
-    Auto(String),
-}
-
-/// Key each UNIQUE constraint and settle its name: the written one, which no two
-/// may share, or the auto-name base. `pk_count` is the table's PK arity.
-fn name_unique_indexes(
-    unique: Vec<UniqueDecl>,
-    cols: &[ColumnDef],
-    pk_count: usize,
-    table: &RelName,
-) -> Result<Vec<(PkColList, IndexName)>, GnitzSqlError> {
-    let mut written: HashSet<&str> = HashSet::new();
-    for u in &unique {
-        if let Some(name) = &u.name
-            && !written.insert(name)
-        {
-            return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{name}'")));
-        }
-    }
-    unique
-        .into_iter()
-        .map(|u| {
-            let key = index_key(cols, &u.cols, pk_count, "UNIQUE")?;
-            let name = match u.name {
-                Some(name) => IndexName::Written(name),
-                None => {
-                    let col_names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
-                    IndexName::Auto(default_index_name(table, &col_names))
-                }
-            };
-            Ok((key, name))
-        })
-        .collect()
-}
-
-/// A planned `CREATE TABLE` whose unnamed UNIQUE indexes still hold their base
-/// auto-name: index names are global, so only the live catalog says which suffix
-/// is free.
-pub(crate) struct PlannedTable {
-    /// The bundle, its `unique_indexes` empty until [`PlannedTable::named`].
-    def: TableDef,
-    unique: Vec<(PkColList, IndexName)>,
-}
-
-impl PlannedTable {
-    /// The bundle with each auto-name moved to the first `{base}` / `{base}_{n}`
-    /// free of `live` and of every other name in the bundle. A written name is
-    /// left as written: a live collision with one is the engine's refusal.
-    pub(crate) fn named(self, live: impl IntoIterator<Item = String>) -> TableDef {
-        let mut taken: HashSet<String> = live.into_iter().collect();
-        taken.extend(self.unique.iter().filter_map(|(_, name)| match name {
-            IndexName::Written(name) => Some(name.clone()),
-            IndexName::Auto(_) => None,
-        }));
-        let unique_indexes = self
-            .unique
-            .into_iter()
-            .map(|(cols, name)| {
-                let name = match name {
-                    IndexName::Written(name) => name,
-                    IndexName::Auto(base) => {
-                        let name = disambiguate_index_name(base, &taken);
-                        taken.insert(name.clone());
-                        name
-                    }
-                };
-                InlineUniqueIndex { cols, name }
-            })
-            .collect();
-        TableDef { unique_indexes, ..self.def }
-    }
-
-    fn has_auto_name(&self) -> bool {
-        self.unique.iter().any(|(_, name)| matches!(name, IndexName::Auto(_)))
-    }
-}
-
-/// Write a planned `CREATE TABLE`, reading the live index names only when an
-/// unnamed UNIQUE needs one.
-pub(crate) async fn create_planned_table(client: &mut GnitzClient, plan: PlannedTable) -> Result<(), GnitzSqlError> {
-    let live: Vec<String> = if plan.has_auto_name() {
-        client.index_rows().await?.into_iter().map(|r| r.name).collect()
-    } else {
-        Vec::new()
-    };
-    client.create_table(&plan.named(live)).await?;
-    Ok(())
 }
 
 /// Reject every `CREATE TABLE` clause the planner does not consume.
@@ -491,7 +349,8 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
         partition_of,
         for_values,
         multiset,
-        // No gnitz-honorable semantics — storage/engine/vendor metadata accepted as no-ops.
+        // No gnitz-honorable semantics — storage/engine/vendor metadata accepted as
+        // no-ops. `with_data` is read only by CTAS, rejected below.
         external: _,
         dynamic: _,
         transient: _,
@@ -507,7 +366,6 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
         unlogged: _,
         with_connection: _,
         fallback: _,
-        // Read only by CTAS, rejected below.
         with_data: _,
         comment: _,
         on_cluster: _,
@@ -582,14 +440,14 @@ fn dist_prefix_len(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Result<u8
     Ok(u8::try_from(cluster.len()).expect("a PRIMARY KEY prefix fits a u8"))
 }
 
-/// Plan a `CREATE TABLE` into the bundle its commit writes, its UNIQUE auto-names
-/// settled at write time; `None` when `IF NOT EXISTS` finds the name taken.
-/// [`collect_declarations`] reads the statement; everything below it resolves,
-/// admits and names.
+/// Plan a `CREATE TABLE` into the bundle its commit writes, an unnamed UNIQUE
+/// left for the writer to name; `None` when `IF NOT EXISTS` finds the name taken.
+/// [`collect_declarations`] and the checks after it read the statement alone;
+/// everything past the `IF NOT EXISTS` probe resolves against the catalog.
 pub(crate) fn plan_create_table(
     create: &sqlparser::ast::CreateTable,
     cat: &dyn Catalog,
-) -> Result<Option<PlannedTable>, GnitzSqlError> {
+) -> Result<Option<TableDef>, GnitzSqlError> {
     reject_unhonored_create_table_clauses(create)?;
     let schema_name = cat.schema_name();
     let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
@@ -598,13 +456,6 @@ pub(crate) fn plan_create_table(
     // A `Keyed` distribution's prefix is the other half of `props`, and needs
     // CLUSTER BY.
     let mut props = parse_table_options(&create.table_options)?;
-
-    // `IF NOT EXISTS` tests the NAME, not the definition — no dialect compares the
-    // two — so any relation standing under it ends the statement, whatever its
-    // kind. Probed only under the clause, so a plain CREATE TABLE resolves nothing.
-    if create.if_not_exists && cat.probe(&table_name)?.is_some() {
-        return Ok(None);
-    }
 
     // Before any column list is resolved: a repeat would otherwise surface as an
     // ambiguous *reference*, when it is the definition that is wrong.
@@ -615,8 +466,57 @@ pub(crate) fn plan_create_table(
         pk: pk_indices,
         serial,
         fk_sites,
-        mut unique,
+        unique,
     } = collect_declarations(create)?;
+
+    // The generated id has no compound form: a column spelled SERIAL is the table's
+    // whole primary key.
+    if let Some(&c) = serial.iter().find(|&&c| pk_indices != [c]) {
+        return Err(GnitzSqlError::Rejected(format!(
+            "SERIAL column '{}' must be the table's only SERIAL column and its single-column PRIMARY KEY",
+            cols[c as usize].name
+        )));
+    }
+    props.serial = !serial.is_empty();
+
+    // A stream holds no rows to index.
+    if props.stream
+        && let Some(u) = unique.first()
+    {
+        let names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
+        return Err(GnitzSqlError::Rejected(format!(
+            "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
+            names.join(", ")
+        )));
+    }
+
+    // CLUSTER BY (hash distribution key). The named columns must be the PK's
+    // leading prefix in PK order; the prefix length `k` is persisted in
+    // `TABLE_TAB.flags` and drives write-side routing and co-partition detection.
+    // No clause ⇒ `k = 0` ⇒ default full-PK distribution.
+    if let Some(cluster) = &create.cluster_by {
+        let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;
+        let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
+            let idx = require_column(&cols, col_name).map_err(|e| e.in_clause("CLUSTER BY"))?;
+            cluster_indices.push(idx as u32);
+        }
+        let prefix_len = dist_prefix_len(&cols, &pk_indices, &cluster_indices)?;
+        props.distribution = props
+            .distribution
+            .cluster_by(prefix_len)
+            .map_err(GnitzSqlError::Rejected)?;
+    }
+    props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
+
+    // `IF NOT EXISTS` tests the NAME, not the definition — no dialect compares the
+    // two — so any relation standing under it ends the statement, whatever its
+    // kind. Probed only under the clause, so a plain CREATE TABLE resolves nothing;
+    // probed after every rejection the statement's text earns, which outrank it.
+    if create.if_not_exists && cat.probe(&table_name)?.is_some() {
+        return Ok(None);
+    }
 
     // A self-FK resolves against the whole PK, and each resolve REWRITES its child
     // column's type to the parent's — so this runs after collection, not inside it.
@@ -653,66 +553,22 @@ pub(crate) fn plan_create_table(
     }
 
     let schema = Schema::from_parts(cols, &pk_indices).map_err(GnitzSqlError::Rejected)?;
-    let (cols, pk_indices) = (schema.columns(), schema.pk_cols());
+    // Keyed after FK resolution: an index key's admissibility reads the adopted
+    // column types.
+    let unique_indexes = unique
+        .into_iter()
+        .map(|u| {
+            let cols = index_key(schema.columns(), &u.cols, pk_indices.len(), "UNIQUE")?;
+            Ok(InlineUniqueIndex { cols, name: u.name })
+        })
+        .collect::<Result<_, GnitzSqlError>>()?;
 
-    // The generated id has no compound form: a column spelled SERIAL is the table's
-    // whole primary key.
-    if let Some(&c) = serial.iter().find(|&&c| pk_indices != [c]) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "SERIAL column '{}' must be the table's only SERIAL column and its single-column PRIMARY KEY",
-            cols[c as usize].name
-        )));
-    }
-    props.serial = !serial.is_empty();
-
-    drop_unique_covered_by_pk(&mut unique, cols, pk_indices)?;
-    // A stream holds no rows to index. A UNIQUE the PK covers was dropped above,
-    // so it is no more refused here than it is on a table.
-    if props.stream
-        && let Some(u) = unique.first()
-    {
-        let names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
-        return Err(GnitzSqlError::Rejected(format!(
-            "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
-            names.join(", ")
-        )));
-    }
-
-    let unique = name_unique_indexes(unique, cols, pk_indices.len(), &table_name)?;
-    // Every FK column carries an index of its own.
-    for &i in fks.keys() {
-        index_key(cols, &[i as u32], pk_indices.len(), "FOREIGN KEY")?;
-    }
-
-    // CLUSTER BY (hash distribution key). The named columns must be the PK's
-    // leading prefix in PK order; the prefix length `k` is persisted in
-    // `TABLE_TAB.flags` and drives write-side routing and co-partition detection.
-    // No clause ⇒ `k = 0` ⇒ default full-PK distribution.
-    if let Some(cluster) = &create.cluster_by {
-        let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;
-        let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
-            let idx = require_column(cols, col_name).map_err(|e| e.in_clause("CLUSTER BY"))?;
-            cluster_indices.push(idx as u32);
-        }
-        let prefix_len = dist_prefix_len(cols, pk_indices, &cluster_indices)?;
-        props.distribution = props
-            .distribution
-            .cluster_by(prefix_len)
-            .map_err(GnitzSqlError::Rejected)?;
-    }
-    props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
-
-    Ok(Some(PlannedTable {
-        def: TableDef {
-            name: table_name,
-            schema,
-            fks,
-            props,
-            unique_indexes: Vec::new(),
-        },
-        unique,
+    Ok(Some(TableDef {
+        name: table_name,
+        schema,
+        fks,
+        props,
+        unique_indexes,
     }))
 }
 
@@ -756,31 +612,6 @@ pub(crate) async fn execute_drop(
     }
 }
 
-/// Which surface asked for the index. `ADD CONSTRAINT` is always unique, so
-/// uniqueness is representable only on `CreateIndex`.
-#[derive(Clone, Copy)]
-pub(super) enum IndexSite {
-    CreateIndex { unique: bool },
-    AddConstraint,
-}
-
-impl IndexSite {
-    /// How the site names itself in a rejection.
-    fn context(self) -> &'static str {
-        match self {
-            IndexSite::CreateIndex { .. } => "CREATE INDEX",
-            IndexSite::AddConstraint => "ADD CONSTRAINT",
-        }
-    }
-
-    fn is_unique(self) -> bool {
-        match self {
-            IndexSite::CreateIndex { unique } => unique,
-            IndexSite::AddConstraint => true,
-        }
-    }
-}
-
 /// Reject every `CreateIndex` field `execute_create_index` does not consume (`name`, `table_name`,
 /// `columns`, `unique`). `using` is accepted only for the BTree default (gnitz's index is ordered /
 /// range-scannable); any other type, plus `predicate` (partial index → full index), `concurrently`/`async`
@@ -819,13 +650,11 @@ pub(crate) async fn execute_create_index(
     schema_name: &str,
     ci: &sqlparser::ast::CreateIndex,
 ) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "CREATE INDEX";
     reject_unhonored_create_index_clauses(ci)?;
-    let owner_name = extract_object_name(&ci.table_name, schema_name, "CREATE INDEX")?;
-    let explicit_name = ci
-        .name
-        .as_ref()
-        .map(|n| extract_index_name(n, "CREATE INDEX"))
-        .transpose()?;
+    let columns = index_column_names(&ci.columns, CTX)?;
+    let owner_name = extract_object_name(&ci.table_name, schema_name, CTX)?;
+    let explicit_name = ci.name.as_ref().map(|n| extract_index_name(n, CTX)).transpose()?;
     // `IF NOT EXISTS` tests the name alone: a standing index under it ends the
     // statement before the owner or the column list is resolved. Index
     // names are global, so the index may stand on any relation. sqlparser
@@ -836,69 +665,21 @@ pub(crate) async fn execute_create_index(
     {
         return Ok(());
     }
-    // The one resolve on this path: `create_index_core` takes the descriptor.
+    // The one resolve on this path: `create_index` takes the descriptor.
     let target = client.resolve_relation(&owner_name).await?;
-    require_class(&target, &owner_name, ClassWant::Indexable, "CREATE INDEX")?;
-    create_index_core(
-        client,
-        &target,
-        &owner_name,
-        &ci.columns,
-        explicit_name,
-        IndexSite::CreateIndex { unique: ci.unique },
-    )
-    .await
-}
-
-/// The shared CREATE INDEX / `ALTER TABLE … ADD CONSTRAINT UNIQUE` core over the
-/// index `columns` of `owner_name` asks for. `target` is the caller's
-/// already-resolved owner, so a statement resolves its name and asserts the owner
-/// class exactly once. `explicit_name` is the written index or constraint name,
-/// canonical.
-pub(super) async fn create_index_core(
-    client: &mut GnitzClient,
-    target: &gnitz_core::RelDescriptor,
-    owner_name: &RelName,
-    columns: &[sqlparser::ast::IndexColumn],
-    explicit_name: Option<String>,
-    site: IndexSite,
-) -> Result<(), GnitzSqlError> {
-    let ctx = site.context();
-    if columns.is_empty() {
-        return Err(GnitzSqlError::Rejected(format!("{ctx}: at least one column required")));
-    }
-
-    let (owner_id, schema) = (target.tid, &target.schema);
-    let (col_names, col_indices) = resolve_index_columns(columns, schema.columns(), ctx)?;
-
-    let cols = index_key(schema.columns(), &col_indices, schema.pk_cols().len(), ctx)?;
-
-    let index_name = match explicit_name {
-        // A collision with a standing index errors in `create_index`.
-        Some(name) => name,
-        None => {
-            let base = default_index_name(owner_name, &col_names);
-            let existing = client.index_rows().await?;
-            let serves_request =
-                |r: &gnitz_core::IndexRow| r.owner == owner_id && r.cols == cols && (r.is_unique || !site.is_unique());
-            if let Some(same) = existing
-                .iter()
-                .find(|r| is_auto_name(&r.name, &base) && serves_request(r))
-            {
-                return Err(GnitzSqlError::Rejected(format!(
-                    "an index on these columns already exists as '{}'",
-                    same.name
-                )));
-            }
-            let taken: HashSet<String> = existing.into_iter().map(|r| r.name).collect();
-            disambiguate_index_name(base, &taken)
-        }
-    };
-
+    require_class(&target, &owner_name, ClassWant::Indexable, CTX)?;
+    let key = index_cols(&target.schema, &columns, CTX)?;
     client
-        .create_index(owner_id, cols, &index_name, site.is_unique())
+        .create_index(&owner_name, &target, key, explicit_name.as_deref(), ci.unique)
         .await?;
     Ok(())
+}
+
+/// The key of an index on `columns` of `schema`, in that order, as CREATE INDEX
+/// and `ALTER TABLE … ADD CONSTRAINT UNIQUE` (which `ctx` names) ask for it.
+pub(super) fn index_cols(schema: &Schema, columns: &[&str], ctx: &str) -> Result<PkColList, GnitzSqlError> {
+    let col_indices = resolve_index_columns(columns, schema.columns(), ctx)?;
+    index_key(schema.columns(), &col_indices, schema.pk_cols().len(), ctx)
 }
 
 #[cfg(test)]

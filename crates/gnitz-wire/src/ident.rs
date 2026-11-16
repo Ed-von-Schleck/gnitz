@@ -3,7 +3,7 @@
 //! schema names.
 
 /// The character set every stored catalog name is drawn from; the engine checks a
-/// chain segment's name against it, and the planner builds generated index names
+/// chain segment's name against it, and the client builds generated index names
 /// from it.
 pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'

@@ -106,9 +106,9 @@ fn cat() -> TestCatalog {
         cat.insert(&in_sn(name), desc);
     }
     let jv = view(&cat, "SELECT * FROM t JOIN u ON t.v = u.v");
-    register(&cat, "jv", 47, jv.props.budget.into(), final_view(&jv));
+    register(&cat, "jv", 47, jv.props.unwrap().budget.into(), final_view(&jv));
     let ju = view(&cat, "SELECT * FROM t JOIN c ON t.v = c.v");
-    register(&cat, "ju", 48, ju.props.budget.into(), final_view(&ju));
+    register(&cat, "ju", 48, ju.props.unwrap().budget.into(), final_view(&ju));
     cat
 }
 
@@ -790,7 +790,7 @@ fn ambiguous_and_hidden_column_rules() {
     // A merged name is one column, so a third step can pair with it.
     view(&cat, "SELECT t.id AS x FROM t JOIN u USING (v) JOIN a USING (v)");
     let sv = view(&cat, "SELECT v FROM t");
-    register(&cat, "sv", 50, sv.props.budget.into(), final_view(&sv));
+    register(&cat, "sv", 50, sv.props.unwrap().budget.into(), final_view(&sv));
     rejects(
         &cat,
         &[
@@ -870,20 +870,15 @@ fn capacity_rules() {
             ("WITH x AS (SELECT id, v FROM bv) SELECT id FROM x", "capacity-bounded"),
         ],
     );
-    let sql = "ALTER VIEW bv AS SELECT id, v FROM t WHERE v > 0";
-    assert_rejects(
-        sql,
-        plan(&cat, sql),
-        "'bv' is a capacity-bounded view; ALTER VIEW requires a view created without WITH options \
-         (DROP and CREATE the view instead)",
-    );
-    // A fed view cannot be retargeted either: its feed would be silently dropped.
-    let sql = "ALTER VIEW fv AS SELECT id, v FROM t WHERE v > 0";
-    assert_rejects(
-        sql,
-        plan(&cat, sql),
-        "'fv' is a view with a delta feed; ALTER VIEW requires a view created without WITH options",
-    );
+    // `ALTER VIEW` restates the body alone and keeps the options standing, so a
+    // bounded view's new body is lowered under its capacity.
+    for target in ["bv", "fv"] {
+        let sql = format!("ALTER VIEW {target} AS SELECT id, v FROM t WHERE v > 0");
+        let chain = plan(&cat, &sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+        assert!(chain.props.is_none(), "`{sql}` states no options");
+    }
+    let sql = "ALTER VIEW bv AS SELECT x.id, y.v FROM t x JOIN t y ON x.id = y.g";
+    assert_rejects(sql, plan(&cat, sql), "ALTER VIEW: a capacity-bounded view's body");
 }
 
 /// Both retarget spellings: never onto a body that reads the view itself, and
@@ -935,6 +930,8 @@ fn view_statement_rejected_clause_matrix() {
             "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT id FROM t",
             "opposite outcomes",
         ),
+        ("ALTER VIEW tv RENAME TO x", "only `AS <query>`"),
+        ("ALTER VIEW tv SET (a = 1)", "only `AS <query>`"),
         // `CREATE TABLE` honours CLUSTER BY, so a view silently dropping it would
         // be built unclustered.
         ("CREATE VIEW v CLUSTER BY (id) AS SELECT id FROM t", "CLUSTER BY"),
@@ -944,6 +941,17 @@ fn view_statement_rejected_clause_matrix() {
     }
     // Every gnitz view is incrementally materialized, so the keyword is accepted.
     assert!(plan(&cat, "CREATE MATERIALIZED VIEW v AS SELECT id FROM t").is_ok());
+    assert!(plan(&cat, "ALTER MATERIALIZED VIEW tv AS SELECT id, v FROM t").is_ok());
+    // `IF EXISTS` over a free name plans nothing; without it, the name is missed.
+    let err = plan(&cat, "ALTER VIEW nosuch AS SELECT id FROM t")
+        .err()
+        .expect("a miss");
+    assert!(err.to_string().contains("relation 'nosuch' not found"), "{err}");
+    let (stmt, text) = split_statements("ALTER VIEW IF EXISTS nosuch AS SELECT id FROM t")
+        .expect("parses")
+        .remove(0);
+    let Statement::AlterView(av) = stmt else { unreachable!() };
+    assert!(matches!(plan_alter_view(&av, text, &cat), Ok(None)));
     // The column list is consumed as positional output aliases on both.
     assert!(plan(&cat, "ALTER VIEW tv (x, y) AS SELECT id, v FROM t").is_ok());
 }

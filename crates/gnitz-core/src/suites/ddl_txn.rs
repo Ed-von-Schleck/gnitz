@@ -64,19 +64,20 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     app.add_row(2, 1).int_val(5);
     block_on(client.push(tid, &schema, &dup, WireConflictMode::Update)).unwrap();
 
-    let unique_on_v = |client: &mut GnitzClient, owner_id: u64| {
-        block_on(client.create_index(owner_id, PkColList::from_slice(&[1]), "ix", true))
+    let unique_on_v = |client: &mut GnitzClient, owner: &RelName| {
+        let desc = block_on(client.resolve_relation(owner)).unwrap();
+        block_on(client.create_index(owner, &desc, PkColList::from_slice(&[1]), Some("ix"), true))
             .unwrap_err()
             .to_string()
     };
 
     // The backfill copies both rows into the view.
-    let vid = block_on(client.create_view_chain(bundle(rel(&sn, "v"), Vec::new(), segment(tid, &schema)))).unwrap();
-    let err = unique_on_v(&mut client, vid);
+    block_on(client.create_view_chain(bundle(rel(&sn, "v"), Vec::new(), segment(tid, &schema)))).unwrap();
+    let err = unique_on_v(&mut client, &rel(&sn, "v"));
     assert!(err.contains("cannot carry a UNIQUE index"), "{err}");
 
     block_on(client.drop_view(&[rel(&sn, "v")], false)).unwrap();
     block_on(client.alter_column(tid, 1, ColumnChange::Drop)).unwrap();
-    let err = unique_on_v(&mut client, tid);
+    let err = unique_on_v(&mut client, &rel(&sn, "t"));
     assert!(err.contains("is dropped"), "{err}");
 }

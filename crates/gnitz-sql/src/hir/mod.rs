@@ -46,7 +46,6 @@ pub(crate) fn bind_and_lower<'a>(
     cat: &dyn crate::catalog::Catalog,
     query: &sqlparser::ast::Query,
     view: bind::ViewBody,
-    bounded: bool,
     aliases: impl ExactSizeIterator<Item = &'a sqlparser::ast::Ident>,
 ) -> Result<LoweredView, GnitzSqlError> {
     let ids = ColIdGen::new();
@@ -60,7 +59,7 @@ pub(crate) fn bind_and_lower<'a>(
         .map(|c| c.def.name.to_string())
         .collect();
     bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
-    let (segments, view) = lower::lower(rel, bounded, &names)?;
+    let (segments, view) = lower::lower(rel, &names)?;
     Ok(LoweredView {
         segments,
         view,

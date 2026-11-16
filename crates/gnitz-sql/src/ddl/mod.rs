@@ -16,5 +16,5 @@ pub(crate) mod view_def;
 
 pub(crate) use alter::execute_alter_table;
 pub(crate) use schema::execute_create_schema;
-pub(crate) use table::{create_planned_table, execute_create_index, execute_drop, plan_create_table};
+pub(crate) use table::{execute_create_index, execute_drop, plan_create_table};
 pub(crate) use view::{plan_alter_view, plan_create_view};

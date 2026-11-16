@@ -76,7 +76,7 @@ fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
     circuit.input_delta(tid, ReadBound::None);
     let bundle = ViewBundle {
         name: rel(&sn, "v"),
-        props: fed,
+        props: Some(fed),
         replacing: None,
         segments: Vec::new(),
         view: PlannedView {

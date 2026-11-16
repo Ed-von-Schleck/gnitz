@@ -10,21 +10,12 @@ use super::*;
 use crate::ddl::plan_create_table;
 use gnitz_core::TableDef;
 
-/// Plan `sql` against `cat`, its auto-names freed of the index names `live`. The
-/// statement must parse as a `CREATE TABLE`.
-fn plan_table_live(cat: &dyn Catalog, sql: &str, live: &[String]) -> Result<Option<TableDef>, GnitzSqlError> {
+/// Plan `sql` against `cat`. The statement must parse as a `CREATE TABLE`.
+fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TableDef>, GnitzSqlError> {
     match parse_stmt(sql) {
-        sqlparser::ast::Statement::CreateTable(c) => {
-            plan_create_table(&c, cat).map(|p| p.map(|p| p.named(live.iter().cloned())))
-        }
+        sqlparser::ast::Statement::CreateTable(c) => plan_create_table(&c, cat),
         other => panic!("`{sql}` is not a CREATE TABLE: {other}"),
     }
-}
-
-/// Plan `sql` against `cat` with no index standing. The statement must parse as
-/// a `CREATE TABLE`.
-fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TableDef>, GnitzSqlError> {
-    plan_table_live(cat, sql, &[])
 }
 
 /// The bundle of a plan expected to create.
@@ -34,11 +25,12 @@ fn created(cat: &dyn Catalog, sql: &str) -> TableDef {
         .unwrap_or_else(|| panic!("`{sql}` planned nothing"))
 }
 
-/// An inline UNIQUE index on `cols`, named `name`.
-fn unique(cols: &[u32], name: &str) -> InlineUniqueIndex {
+/// An inline UNIQUE index on `cols`, named `name`; `None` leaves the name to
+/// the writer.
+fn unique(cols: &[u32], name: Option<&str>) -> InlineUniqueIndex {
     InlineUniqueIndex {
         cols: PkColList::from_slice(cols),
-        name: name.to_string(),
+        name: name.map(str::to_string),
     }
 }
 
@@ -196,18 +188,27 @@ fn primary_key_precedence() {
 
 // ── the constraint spellings that are rejected ───────────────────────────────
 
-/// A repeated UNIQUE is one constraint written twice, whichever spelling it is
-/// written in — the column-option form is not silently deduped.
+/// An unnamed UNIQUE repeating a column set the statement declares again is
+/// one constraint written twice, whichever spelling it is written in — the
+/// column-option form is not silently deduped. Two written names on one column
+/// list are two indexes, as two `CREATE UNIQUE INDEX` statements make.
 #[test]
-fn a_repeated_unique_is_rejected_in_both_spellings() {
+fn a_repeated_unique_is_rejected_unless_both_are_named() {
     let cat = catalog(vec![]);
     for sql in [
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT UNIQUE UNIQUE)",
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a), UNIQUE(a))",
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT UNIQUE, UNIQUE(a))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT x UNIQUE(a), UNIQUE(a))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a), CONSTRAINT x UNIQUE(a))",
     ] {
         assert_rejects(sql, plan_table(&cat, sql), "duplicate UNIQUE constraint");
     }
+    let c = created(
+        &cat,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT x UNIQUE(a), CONSTRAINT y UNIQUE(a))",
+    );
+    assert_eq!(c.unique_indexes, vec![unique(&[1], Some("x")), unique(&[1], Some("y"))]);
 }
 
 /// An inline UNIQUE builds an index, so it takes only what an index takes: a
@@ -240,28 +241,31 @@ fn a_second_foreign_key_on_one_column_is_rejected() {
     assert_rejects(sql, plan_table(&cat, sql), "more than one FOREIGN KEY");
 }
 
-/// A UNIQUE equal to the lone PK creates no index, so a name written on it would
-/// name nothing and `DROP CONSTRAINT` would fail. The unnamed spelling keeps the
-/// silent drop — nothing the user wrote is lost.
+/// A UNIQUE equal to the lone PK is an index like any other — as `CREATE UNIQUE
+/// INDEX` on the PK makes one — so every spelling of it plans one, and a table
+/// rendered with it replays.
 #[test]
-fn a_named_unique_equal_to_the_lone_pk_is_rejected() {
+fn a_unique_equal_to_the_lone_pk_plans_an_index() {
     let cat = catalog(vec![]);
-    for sql in [
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, CONSTRAINT uq UNIQUE(id))",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY CONSTRAINT uq UNIQUE)",
+    for (sql, name) in [
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, CONSTRAINT uq UNIQUE(id))",
+            Some("uq"),
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY CONSTRAINT uq UNIQUE)",
+            Some("uq"),
+        ),
+        ("CREATE TABLE t (id BIGINT PRIMARY KEY UNIQUE)", None),
     ] {
-        assert_rejects(sql, plan_table(&cat, sql), "uq");
+        assert_eq!(created(&cat, sql).unique_indexes, vec![unique(&[0], name)], "{sql}");
     }
-    // Unnamed: accepted, and no index is planned.
-    let c = created(&cat, "CREATE TABLE t (id BIGINT PRIMARY KEY UNIQUE)");
-    assert!(c.unique_indexes.is_empty(), "the lone PK already provides it");
-    // A compound-PK member declared UNIQUE is not individually unique, so its
-    // index survives — named or not.
+    // A compound-PK member declared UNIQUE is not individually unique either.
     let c = created(
         &cat,
         "CREATE TABLE c (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, b), CONSTRAINT uq UNIQUE(a))",
     );
-    assert_eq!(c.unique_indexes, vec![unique(&[0], "uq")]);
+    assert_eq!(c.unique_indexes, vec![unique(&[0], Some("uq"))]);
 }
 
 #[test]
@@ -300,10 +304,15 @@ fn a_stream_refuses_serial_and_a_unique() {
             "CREATE TABLE s (a BIGINT, b BIGINT, PRIMARY KEY (a, b), UNIQUE(a, b)) WITH (stream = true)",
             "UNIQUE",
         ),
-        // Named, the PK-covered UNIQUE is refused as naming no index, stream or not.
+        // A stream's PK is not unique, so a UNIQUE on it asserts what nothing
+        // enforces.
         (
             "CREATE TABLE s (id BIGINT, CONSTRAINT u1 UNIQUE(id), PRIMARY KEY (id)) WITH (stream = true)",
-            "names no index",
+            "UNIQUE",
+        ),
+        (
+            "CREATE TABLE s (id BIGINT PRIMARY KEY UNIQUE) WITH (stream = true)",
+            "UNIQUE",
         ),
         // A stream holds no rows, so it has no store to compress.
         (
@@ -313,12 +322,6 @@ fn a_stream_refuses_serial_and_a_unique() {
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);
     }
-    // The lone-PK-equal spelling plans no index, so it reaches no owner check.
-    let c = created(
-        &cat,
-        "CREATE TABLE s (id BIGINT PRIMARY KEY UNIQUE) WITH (stream = true)",
-    );
-    assert!(c.props.stream && c.unique_indexes.is_empty());
 }
 
 /// A clause `CREATE TABLE` does not honour is named rather than dropped — a
@@ -486,7 +489,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         on_delete: FkAction::Restrict,
     });
     assert_eq!(c.fks, [(1, want)].into());
-    assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
+    assert_eq!(c.unique_indexes, vec![unique(&[1], None)]);
 
     // A non-PK parent column resolves by name; the engine holds it to a
     // single-column UNIQUE index.
@@ -614,77 +617,18 @@ fn a_repeated_column_name_is_rejected_before_it_is_resolved() {
     );
 }
 
-/// Index names are global: an auto-name routes around a live index of any owner,
-/// and a written name is left for the engine to refuse.
+/// Two constraint names folding to one canonical name would write two IDX_TAB
+/// rows the catalog cannot both reach.
 #[test]
-fn auto_names_route_around_live_index_names() {
+fn two_written_constraint_names_may_not_fold_together() {
     let cat = catalog(vec![]);
-    let live = [
-        format!("{SN}__t__idx_a"),
-        format!("{SN}__t__idx_a_2"),
-        "keep".to_string(),
-    ];
-    let c = plan_table_live(
-        &cat,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT UNIQUE, b BIGINT, CONSTRAINT keep UNIQUE(b))",
-        &live,
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        c.unique_indexes,
-        vec![unique(&[1], &format!("{SN}__t__idx_a_3")), unique(&[2], "keep")]
-    );
-    // A written name equal to a base auto-name is still a written name.
-    let sql = format!("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT {SN}__t__idx_a UNIQUE(a))");
-    let c = plan_table_live(&cat, &sql, &live).unwrap().unwrap();
-    assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__t__idx_a"))]);
-}
-
-/// Distinct column sets can render the same auto-name base when a column name
-/// contains `_`; the second takes the `_2` suffix, within the bundle.
-#[test]
-fn colliding_auto_names_are_disambiguated_within_the_bundle() {
-    let cat = catalog(vec![]);
-    let c = created(
-        &cat,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, d BIGINT, e_f BIGINT, d_e BIGINT, f BIGINT, \
-         UNIQUE(d, e_f), UNIQUE(d_e, f))",
-    );
-    assert_eq!(
-        c.unique_indexes,
-        vec![
-            unique(&[1, 2], &format!("{SN}__t__idx_d_e_f")),
-            unique(&[3, 4], &format!("{SN}__t__idx_d_e_f_2")),
-        ]
-    );
-    // Two constraint names folding to one canonical name would write two IDX_TAB
-    // rows the catalog cannot both reach.
     let sql = "CREATE TABLE u (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, \
                CONSTRAINT MyIdx UNIQUE(a), CONSTRAINT myidx UNIQUE(b))";
     assert_rejects(sql, plan_table(&cat, sql), "'myidx'");
 }
 
-/// A quoted column name is any string, and the index name built from it is an
-/// identifier: each byte outside the identifier charset becomes `_`.
-#[test]
-fn an_auto_name_over_a_quoted_column_is_an_identifier() {
-    let cat = catalog(vec![]);
-    let c = created(
-        &cat,
-        r#"CREATE TABLE t (id BIGINT PRIMARY KEY, "a b" INT UNIQUE, "c-d" INT, e INT, UNIQUE("c-d", e))"#,
-    );
-    assert_eq!(
-        c.unique_indexes,
-        vec![
-            unique(&[1], &format!("{SN}__t__idx_a_b")),
-            unique(&[2, 3], &format!("{SN}__t__idx_c_d_e")),
-        ]
-    );
-}
-
-/// `IF NOT EXISTS` tests the name, whatever kind stands under it — and the
-/// AST-only clause rejections outrank it.
+/// `IF NOT EXISTS` tests the name, whatever kind stands under it — and every
+/// rejection the statement's text alone earns outranks it.
 #[test]
 fn if_not_exists_plans_a_skip_but_a_bad_with_key_still_errors() {
     let cat = base();
@@ -692,8 +636,38 @@ fn if_not_exists_plans_a_skip_but_a_bad_with_key_still_errors() {
         Ok(None) => {}
         other => panic!("expected nothing planned, got {:?}", other.map(|_| "a create")),
     }
-    let sql = "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY) WITH (bogus = true)";
-    assert_rejects(sql, plan_table(&cat, sql), "bogus");
+    for (sql, needle) in [
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY) WITH (bogus = true)",
+            "bogus",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, id BIGINT)",
+            "'id'",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, a BIGINT DEFAULT 1)",
+            "DEFAULT",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT, PRIMARY KEY (id DESC))",
+            "ASC/DESC",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, a BIGINT) CLUSTER BY a",
+            "not a PRIMARY KEY column",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, a BIGINT UNIQUE) WITH (stream = true)",
+            "stream",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT, a SERIAL, PRIMARY KEY (id))",
+            "SERIAL",
+        ),
+    ] {
+        assert_rejects(sql, plan_table(&cat, sql), needle);
+    }
 }
 
 /// The planner asks for exactly the names it needs.
@@ -727,7 +701,7 @@ fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
 
     let c = created(&cat, "CREATE TABLE Other.t2 (id BIGINT PRIMARY KEY, u BIGINT UNIQUE)");
     assert_eq!(c.name, other("t2"));
-    assert_eq!(c.unique_indexes, [unique(&[1], "other__t2__idx_u")]);
+    assert_eq!(c.unique_indexes, [unique(&[1], None)]);
     // The session schema, spelled out, is the session schema.
     let c = created(&cat, &format!("CREATE TABLE {SN}.t (id BIGINT PRIMARY KEY)"));
     assert_eq!(c.name, in_sn("t"));

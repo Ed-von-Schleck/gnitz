@@ -4,8 +4,8 @@
 Both retarget the name onto a fresh view id in one DDL zone, unless the
 definition they state is the one standing, which keeps the view. What separates
 them is the `WITH (...)` clause: `CREATE OR REPLACE VIEW` restates the whole
-definition, budgets included, while `ALTER VIEW ... AS` has nowhere to say one
-and so refuses to retarget a view that carries one. The statement-level
+definition, budgets included, while `ALTER VIEW ... AS` restates the body alone
+and keeps the options the view stands with. The statement-level
 refusals are planned without a server in `crates/gnitz-sql/src/suites`; the
 RESTRICT a dependent view imposes is `test_alter.py`'s; the output column
 aliases are `relational_shape/test_view_column_order.py`'s.
@@ -23,6 +23,12 @@ def _replaces(client, sql, name):
     before = client.resolve_table(name)[0]
     client.execute_sql(sql)
     return client.resolve_table(name)[0] != before
+
+
+def _budgets(client):
+    """Each view of the schema's (name, capacity_bytes, delta_bytes)."""
+    return family(client, "views", "name", "capacity_bytes", "delta_bytes",
+                  where=f"schema_id = {schema_id(client)}")
 
 
 _DEFINITIONS = [  # (first, second, replaced)
@@ -67,20 +73,30 @@ def test_the_with_clause_is_part_of_the_definition(client, base):
         sql = f"CREATE OR REPLACE VIEW fed WITH (delta = '{budget}') AS {body}"
         assert _replaces(client, sql, "fed") == replaced, budget
 
-    def budgets():
-        return family(client, "views", "name", "capacity_bytes", "delta_bytes",
-                      where=f"schema_id = {schema_id(client)}")
-
     client.execute_sql(
         "CREATE OR REPLACE VIEW bounded WITH (capacity = '4 MB') AS SELECT id, b FROM t; "
         "CREATE OR REPLACE VIEW fed WITH (delta = '4 MB') AS SELECT id, b FROM t")
-    assert budgets() == {("bounded", 4 << 20, 0): 1, ("fed", 0, 4 << 20): 1}
+    assert _budgets(client) == {("bounded", 4 << 20, 0): 1, ("fed", 0, 4 << 20): 1}
     for name in ("bounded", "fed"):
         assert bag(scanned(client, name)) == {(1, 100): 1, (2, 200): 1}, name
 
     for name in ("bounded", "fed"):
         assert _replaces(client, f"CREATE OR REPLACE VIEW {name} AS {body}", name)
-    assert budgets() == {("bounded", 0, 0): 1, ("fed", 0, 0): 1}
+    assert _budgets(client) == {("bounded", 0, 0): 1, ("fed", 0, 0): 1}
+
+
+def test_alter_view_keeps_the_standing_budget(client, base):
+    """`ALTER VIEW ... AS` has nowhere to state a budget, so a bounded or fed view
+    keeps its own on the new body, and holds what that body selects."""
+    body = "SELECT id, a FROM t"
+    client.execute_sql(
+        f"CREATE VIEW bounded WITH (capacity = '4 MB') AS {body}; "
+        f"CREATE VIEW fed WITH (delta = '1 MB') AS {body}")
+    for name in ("bounded", "fed"):
+        assert not _replaces(client, f"ALTER VIEW {name} AS {body}", name)
+        assert _replaces(client, f"ALTER VIEW {name} AS SELECT id, b FROM t", name)
+        assert bag(scanned(client, name)) == {(1, 100): 1, (2, 200): 1}, name
+    assert _budgets(client) == {("bounded", 4 << 20, 0): 1, ("fed", 0, 1 << 20): 1}
 
 
 _FED = "VIEW v WITH (delta = '1 MB') AS SELECT id, a FROM t"

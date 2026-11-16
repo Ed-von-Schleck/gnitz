@@ -171,6 +171,24 @@ fn a_body_written_back_unrenamed_is_its_text_with_qualified_names() {
     }
 }
 
+/// A source column renamed in case alone is renamed: the body reads it under
+/// its old name, which the written-back body restores with a column alias list.
+#[test]
+fn a_body_written_back_over_a_recased_column_restores_its_old_name() {
+    let cat = base();
+    let names: Vec<String> = SOURCES.iter().map(|n| n.to_string()).collect();
+    let mut catalog = client_catalog(&cat, &names);
+    let t = catalog.relations.iter_mut().find(|r| r.name == "t").unwrap();
+    let old: Vec<String> = t.columns.iter().map(|c| c.def.name.to_string()).collect();
+    let v = t.columns.iter_mut().find(|c| &*c.def.name == "v").unwrap();
+    v.def.name = "V".into();
+    let chain = view(&cat, "SELECT id, v FROM t");
+    assert_eq!(
+        view_body(&catalog, &definition(&chain)).unwrap(),
+        format!("SELECT id, v FROM s.t AS t({})", old.join(", "))
+    );
+}
+
 #[test]
 fn a_definition_keeps_the_body_verbatim_and_names_each_source_once() {
     let sql =
@@ -205,7 +223,10 @@ fn a_view_column_list_survives_only_where_the_body_names_differ() {
     )
     .unwrap();
     let plain = plan(&cat, "CREATE VIEW w AS SELECT g FROM t").unwrap();
-    for (name, chain) in [("v", &renaming), ("w", &plain)] {
+    // A name differing in case alone is a different name: the catalog keeps it
+    // as written.
+    let recased = plan(&cat, "CREATE VIEW x (G) AS SELECT g FROM t").unwrap();
+    for (name, chain) in [("v", &renaming), ("w", &plain), ("x", &recased)] {
         let pv = final_view(chain);
         catalog.relations.push(CatalogRelation {
             id: 100 + catalog.relations.len() as u64,
@@ -233,6 +254,7 @@ fn a_view_column_list_survives_only_where_the_body_names_differ() {
         "CREATE VIEW s.v (k, total) AS\nSELECT g, SUM(v) AS s FROM s.t GROUP BY g"
     );
     assert_eq!(statement("w"), "CREATE VIEW s.w AS\nSELECT g FROM s.t");
+    assert_eq!(statement("x"), "CREATE VIEW s.x (G) AS\nSELECT g FROM s.t");
 }
 
 #[test]

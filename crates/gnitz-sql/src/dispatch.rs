@@ -9,7 +9,7 @@ use crate::source::StatementText;
 use crate::{ddl, dml};
 use gnitz_core::{GnitzClient, RelDescriptor, RelName};
 use gnitz_wire::WireStatus;
-use sqlparser::ast::{AlterView, AlterViewOperation, Query, Statement};
+use sqlparser::ast::{Query, Statement};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -304,7 +304,7 @@ async fn execute_ddl(
             .await
             .0?
             {
-                ddl::create_planned_table(client, plan).await?;
+                client.create_table(&plan).await?;
             }
             Ok("CREATE TABLE")
         }
@@ -366,21 +366,15 @@ async fn execute_ddl(
             ddl::execute_alter_table(client, schema_name, a).await?;
             Ok("ALTER TABLE")
         }
-        Statement::AlterView(AlterView { materialized, name, if_exists, operation }) => {
-            const CTX: &str = "ALTER VIEW";
-            reject_if(*materialized, CTX, "MATERIALIZED")?;
-            reject_if(*if_exists, CTX, "IF EXISTS")?;
-            let AlterViewOperation::As { columns, query, with_options } = operation else {
-                return Err(GnitzSqlError::Rejected(format!(
-                    "{CTX}: only `AS <query>` is supported"
-                )));
-            };
-            let chain = planned(client, schema_name, Descriptors::SERVER, |cat| {
-                ddl::plan_alter_view(name, columns, query, with_options, text, cat)
+        Statement::AlterView(av) => {
+            if let Some(chain) = planned(client, schema_name, Descriptors::SERVER, |cat| {
+                ddl::plan_alter_view(av, text, cat)
             })
             .await
-            .0?;
-            client.create_view_chain(chain).await?;
+            .0?
+            {
+                client.create_view_chain(chain).await?;
+            }
             Ok("ALTER VIEW")
         }
         _ => unreachable!("execute_statement routes only DDL here"),

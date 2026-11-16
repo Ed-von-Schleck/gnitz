@@ -190,11 +190,7 @@ fn project_front(
 /// Lower a bound view body to its segments and the user-named view. The view lists its visible columns in
 /// `names` order, each under the name its column of `names` gives it: the final
 /// frame's regions under the SELECT list's numbering.
-pub(crate) fn lower(
-    rel: Rc<RelExpr>,
-    bounded: bool,
-    names: &[HirCol],
-) -> Result<(Vec<PlannedView>, PlannedView), GnitzSqlError> {
+pub(crate) fn lower(rel: Rc<RelExpr>, names: &[HirCol]) -> Result<(Vec<PlannedView>, PlannedView), GnitzSqlError> {
     let mut chain = ViewChain::default();
     // A top-N carries its input's columns key first: the SELECT list is a
     // projection over it. A window body always ends in a projection.
@@ -210,12 +206,6 @@ pub(crate) fn lower(
         if let Some(c) = id.and_then(|id| col_by_id(names, id)) {
             schema.rename_column(moved_to[slot] as usize, c.def.name.clone());
         }
-    }
-    // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
-    if bounded && chain.has_segments() {
-        return Err(GnitzSqlError::Rejected(
-            "CREATE VIEW WITH (capacity …): a body that compiles to more than one view is not supported".into(),
-        ));
     }
     Ok(chain.finish(top, Arc::new(schema)))
 }

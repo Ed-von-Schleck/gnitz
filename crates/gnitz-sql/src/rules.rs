@@ -59,9 +59,6 @@ pub(crate) enum ClassWant {
     BaseTableOrStream,
     /// Any view, bounded or fed included.
     View,
-    /// What `ALTER VIEW` may retarget: a view with no options, since the statement
-    /// states none and would drop them.
-    PlainView,
     /// What an ad-hoc read may name: anything holding rows, so not a stream.
     Readable,
     /// What a view body may read: anything but a capacity-bounded view, whose
@@ -88,11 +85,7 @@ impl ClassWant {
             RelClass::Stream => matches!(self, ClassWant::BaseTableOrStream | ClassWant::ViewSource),
             RelClass::View => matches!(
                 self,
-                ClassWant::View
-                    | ClassWant::PlainView
-                    | ClassWant::Readable
-                    | ClassWant::ViewSource
-                    | ClassWant::Indexable
+                ClassWant::View | ClassWant::Readable | ClassWant::ViewSource | ClassWant::Indexable
             ),
             RelClass::FedView => matches!(
                 self,
@@ -109,7 +102,6 @@ impl ClassWant {
             ClassWant::BaseTable => "a base table",
             ClassWant::BaseTableOrStream => "a base table or a stream",
             ClassWant::View => "a view",
-            ClassWant::PlainView => "a view created without WITH options (DROP and CREATE the view instead)",
             ClassWant::Readable => "a table or a view (a stream is read only inside a view body)",
             ClassWant::ViewSource => "a relation a view can be created over (a capacity-bounded view is a leaf)",
             ClassWant::Indexable => "a base table or a view without a capacity",

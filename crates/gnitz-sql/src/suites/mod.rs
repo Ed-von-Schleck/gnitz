@@ -21,7 +21,7 @@ use crate::source::split_statements;
 use crate::test_support::*;
 use gnitz_core::{PlannedView, ViewBundle};
 use gnitz_wire::{OpNode, RelClass, TypeCode};
-use sqlparser::ast::{AlterView, AlterViewOperation, Statement};
+use sqlparser::ast::Statement;
 
 /// The fixture every pure file plans against. Every `BIGINT` column is `I64`.
 ///
@@ -85,20 +85,16 @@ fn base() -> TestCatalog {
 }
 
 /// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`. None of the statements
-/// here carry `IF NOT EXISTS`, the one clause that plans nothing.
+/// here plan nothing: no `CREATE VIEW IF NOT EXISTS` over a taken name, no
+/// `ALTER VIEW IF EXISTS` over a free one.
 fn plan(cat: &dyn Catalog, sql: &str) -> Result<ViewBundle, GnitzSqlError> {
     let (stmt, text) = split_statements(sql).expect("parses").remove(0);
-    match stmt {
-        Statement::CreateView(cv) => {
-            plan_create_view(&cv, text, cat).map(|p| p.unwrap_or_else(|| panic!("`{sql}` planned nothing")))
-        }
-        Statement::AlterView(AlterView {
-            name,
-            operation: AlterViewOperation::As { columns, query, with_options },
-            ..
-        }) => plan_alter_view(&name, &columns, &query, &with_options, text, cat),
+    let planned = match stmt {
+        Statement::CreateView(cv) => plan_create_view(&cv, text, cat),
+        Statement::AlterView(av) => plan_alter_view(&av, text, cat),
         _ => panic!("`{sql}` is not a view statement"),
-    }
+    };
+    planned.map(|p| p.unwrap_or_else(|| panic!("`{sql}` planned nothing")))
 }
 
 /// Plan a read (`SELECT` / `EXPLAIN`) against `cat`, as dispatch does.

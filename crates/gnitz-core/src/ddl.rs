@@ -25,12 +25,72 @@ fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Option<usize> {
         .find(|&i| payload_bytes(schemas, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
 }
 
+/// The id of the live schema `schema_name` (already canonical) in `schemas`.
+fn live_schema_id(schemas: &ZSetBatch, schema_name: &str) -> Option<u64> {
+    schema_row(schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at)))
+}
+
+/// The catalog name of an unnamed index on `cols` of `table`, whose columns are
+/// `columns`: `{schema}__{table}__idx_{col1}_{col2}…`, suffixed `_{n}` (n ≥ 2)
+/// where `taken` holds it.
+fn auto_index_name(table: &RelName, columns: &[ColumnDef], cols: &[u32], taken: &HashSet<String>) -> String {
+    let col_names: Vec<&str> = cols.iter().map(|&c| &*columns[c as usize].name).collect();
+    let name = format!("{}__{}__idx_{}", table.schema(), table.name(), col_names.join("_"));
+    // A quoted column name holds any byte; an index name holds identifier bytes.
+    let base: String = name
+        .bytes()
+        .map(|b| {
+            if gnitz_wire::is_valid_ident_char(b) {
+                b.to_ascii_lowercase() as char
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2u32..)
+        .map(|n| format!("{base}_{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .expect("u32 range exhausted")
+}
+
 /// One inline `UNIQUE` constraint of a `CREATE TABLE`. `name` is the catalog
-/// index name `DROP INDEX` matches.
+/// index name `DROP INDEX` matches; `None` takes an [`auto_index_name`] free of
+/// every live index name and every other name in the bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineUniqueIndex {
     pub cols: PkColList,
-    pub name: String,
+    pub name: Option<String>,
+}
+
+/// Each of `specs`' catalog names: its written one, canonical, else an
+/// [`auto_index_name`] free of `taken` — the live names and every written one —
+/// and of each auto-name handed out before it. A written name is left as
+/// written: a live collision with one is the engine's refusal.
+fn inline_index_names(
+    table: &RelName,
+    columns: &[ColumnDef],
+    specs: &[InlineUniqueIndex],
+    mut taken: HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let written: Vec<Option<String>> = specs
+        .iter()
+        .map(|spec| spec.name.as_deref().map(gnitz_wire::canonical_identifier).transpose())
+        .collect::<Result<_, _>>()?;
+    taken.extend(written.iter().flatten().cloned());
+    Ok(specs
+        .iter()
+        .zip(written)
+        .map(|(spec, written)| {
+            written.unwrap_or_else(|| {
+                let name = auto_index_name(table, columns, spec.cols.as_slice(), &taken);
+                taken.insert(name.clone());
+                name
+            })
+        })
+        .collect())
 }
 
 /// A `CREATE TABLE`: the table, its FOREIGN KEY columns and its inline UNIQUE
@@ -42,7 +102,7 @@ pub struct TableDef {
     pub fks: BTreeMap<usize, FkTarget>,
     pub props: TableProps,
     /// Each inline UNIQUE constraint's columns and the catalog name its index
-    /// takes.
+    /// takes, if written.
     pub unique_indexes: Vec<InlineUniqueIndex>,
 }
 
@@ -162,9 +222,10 @@ pub struct PlannedView {
 /// hidden segments it owns, in dependency order. [`segment_id`]`(j)` names
 /// `segments[j]`.
 pub struct ViewBundle {
-    /// The user-named view's name and options.
     pub name: RelName,
-    pub props: ViewProps,
+    /// The user-named view's options; `None` where the statement states none:
+    /// the standing view's when replacing, the defaults for a new view.
+    pub props: Option<ViewProps>,
     /// The id of the view the chain supersedes in the same zone.
     pub replacing: Option<u64>,
     pub segments: Vec<PlannedView>,
@@ -193,7 +254,12 @@ impl ViewBundle {
             // spell it because gnitz_wire::validate_user_identifier rejects a leading
             // `_`; the owner_view_id column records its ownership.
             let (name, owner_view_id, props, definition) = if vid == owner_vid {
-                (self.name.name().to_string(), 0, self.props, definition)
+                (
+                    self.name.name().to_string(),
+                    0,
+                    self.props.unwrap_or_default(),
+                    definition,
+                )
             } else {
                 (format!("_seg{vid}"), owner_vid, ViewProps::default(), &[][..])
             };
@@ -232,22 +298,40 @@ impl ViewBundle {
 impl GnitzClient {
     // ── Indexes and the catalog ────────────────────────────────────────────
 
-    /// Index `cols` of relation `owner_id`, in that order, under the catalog name
-    /// `index_name`.
+    /// Index `cols` of `owner`, named `owner_name`, in that order, under the
+    /// catalog name `name`. With no name it takes the first free
+    /// [`auto_index_name`], and is refused where an index of `owner` on `cols`
+    /// already serves it, whatever that index is named: unique where `is_unique`.
     pub async fn create_index(
         &mut self,
-        owner_id: u64,
+        owner_name: &RelName,
+        owner: &RelDescriptor,
         cols: PkColList,
-        index_name: &str,
+        name: Option<&str>,
         is_unique: bool,
     ) -> Result<u64, ClientError> {
-        let index_name = gnitz_wire::canonical_identifier(index_name)?;
-        let index_id = self.alloc_ids(1).await?;
+        let (index_name, index_id) = match name {
+            Some(name) => (gnitz_wire::canonical_identifier(name)?, self.alloc_ids(1).await?),
+            None => {
+                let ([indexes], index_id) = self.cut_and_ids([IDX_TAB], 1).await?;
+                let live = idx_rows(&indexes)?;
+                let serves = |r: &IndexRow| r.owner == owner.tid && r.cols == cols && (r.is_unique || !is_unique);
+                if let Some((_, same)) = live.iter().find(|(_, r)| serves(r)) {
+                    return Err(ClientError::from(format!(
+                        "an index on these columns already exists as '{}'",
+                        same.name
+                    )));
+                }
+                let taken: HashSet<String> = live.into_iter().map(|(_, r)| r.name).collect();
+                let name = auto_index_name(owner_name, owner.schema.columns(), cols.as_slice(), &taken);
+                (name, index_id)
+            }
+        };
         let mut b = DdlBundle::default();
         b.put(
             &IdxTabRow {
                 index_id,
-                owner_id,
+                owner_id: owner.tid,
                 source_col_idx: cols,
                 name: index_name.as_str().into(),
                 is_unique,
@@ -339,10 +423,11 @@ impl GnitzClient {
         // and illegal characters.
         let name = gnitz_wire::canonical_identifier(name)?;
         let schema_id = if if_not_exists {
-            match self.schema_and_ids(&name, 1).await? {
-                (Some(standing), _) => return Ok(standing),
-                (None, fresh) => fresh,
+            let ([schemas], fresh) = self.cut_and_ids([SCHEMA_TAB], 1).await?;
+            if let Some(standing) = live_schema_id(&schemas, &name) {
+                return Ok(standing);
             }
+            fresh
         } else {
             self.alloc_ids(1).await?
         };
@@ -383,10 +468,6 @@ impl GnitzClient {
             props,
             unique_indexes,
         } = def;
-        let index_names: Vec<String> = unique_indexes
-            .iter()
-            .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
-            .collect::<Result<Vec<_>, String>>()?;
         let pk = PkColList::from_slice(schema.pk_cols());
         if let Some(&col) = fks.keys().find(|&&col| col >= schema.columns().len()) {
             return Err(ClientError::from(format!(
@@ -395,11 +476,19 @@ impl GnitzClient {
             )));
         }
 
-        // The table's id, then one per inline UNIQUE index.
-        let (schema_id, new_tid) = self
-            .schema_and_ids(table.schema(), 1 + unique_indexes.len() as u64)
-            .await?;
-        let schema_id = schema_id.ok_or_else(|| not_found("schema", table.schema()))?;
+        // The table's id, then one per inline UNIQUE index; the live index
+        // names only where one is unnamed, which a replayed dump never is.
+        let n = 1 + unique_indexes.len() as u64;
+        let (schemas, live, new_tid) = if unique_indexes.iter().any(|spec| spec.name.is_none()) {
+            let ([schemas, indexes], new_tid) = self.cut_and_ids([SCHEMA_TAB, IDX_TAB], n).await?;
+            let live = idx_rows(&indexes)?.into_iter().map(|(_, r)| r.name).collect();
+            (schemas, live, new_tid)
+        } else {
+            let ([schemas], new_tid) = self.cut_and_ids([SCHEMA_TAB], n).await?;
+            (schemas, HashSet::new(), new_tid)
+        };
+        let schema_id = live_schema_id(&schemas, table.schema()).ok_or_else(|| not_found("schema", table.schema()))?;
+        let index_names = inline_index_names(table, schema.columns(), unique_indexes, live)?;
 
         let mut b = DdlBundle::default();
         append_col_rows(&mut b, new_tid, schema.columns(), fks);
@@ -439,7 +528,7 @@ impl GnitzClient {
     /// Create `bundle` in one atomic `DDL_TXN` and return its id. A view it
     /// replaces that already is `bundle` stays under its id, and nothing is
     /// written.
-    pub async fn create_view_chain(&mut self, bundle: ViewBundle) -> Result<u64, ClientError> {
+    pub async fn create_view_chain(&mut self, mut bundle: ViewBundle) -> Result<u64, ClientError> {
         let view = &bundle.name;
         let n_segments = bundle.segments.len() as u64;
         let n_views = n_segments + 1;
@@ -464,9 +553,12 @@ impl GnitzClient {
                     .live_rows()
                     .find(|&i| gnitz_wire::sys_leading_id(views.pks.get_bytes(i)) == vid)
                     .ok_or_else(|| not_found("view", view))?;
-                let row =
-                    ViewTabRow::read(views, i).map_err(|e| ProtocolError::DecodeError(format!("view {vid}: {e}")))?;
+                let decode_err = |e| ProtocolError::DecodeError(format!("view {vid}: {e}"));
+                let row = ViewTabRow::read(views, i).map_err(decode_err)?;
                 let schema_id = row.schema_id;
+                if bundle.props.is_none() {
+                    bundle.props = Some(row.parts().map_err(decode_err)?.props);
+                }
 
                 // The definition says how the body was spelled, which is no
                 // part of what the view is: another spelling of the same body
@@ -482,8 +574,10 @@ impl GnitzClient {
                 (schema_id, self.alloc_ids(n_views).await?)
             }
             None => {
-                let (schema_id, base) = self.schema_and_ids(view.schema(), n_views).await?;
-                (schema_id.ok_or_else(|| not_found("schema", view.schema()))?, base)
+                let ([schemas], base) = self.cut_and_ids([SCHEMA_TAB], n_views).await?;
+                let schema_id =
+                    live_schema_id(&schemas, view.schema()).ok_or_else(|| not_found("schema", view.schema()))?;
+                (schema_id, base)
             }
         };
 
@@ -623,20 +717,17 @@ impl GnitzClient {
 
     // ── System-family reads ────────────────────────────────────────────────
 
-    /// The id of the live schema `schema_name` (already canonical), `None` where
-    /// there is none, and the first of `n` fresh catalog ids, asked for in one
-    /// round trip. Ids a caller leaves untaken are a gap in the id sequence and
-    /// nothing more.
-    async fn schema_and_ids(&mut self, schema_name: &str, n: u64) -> Result<(Option<u64>, u64), ClientError> {
-        let all = ReadSpec::all_rows(ReadBound::None);
-        let schemas = self
-            .session
-            .submit_scan(SCHEMA_TAB.into(), &all, sys_schema(SCHEMA_TAB));
+    /// `families`' rows at one cut, in that order, and the first of `n` fresh
+    /// catalog ids, asked for in one round trip. Ids a caller leaves untaken are
+    /// a gap in the id sequence and nothing more.
+    async fn cut_and_ids<const N: usize>(
+        &mut self,
+        families: [u64; N],
+        n: u64,
+    ) -> Result<([ZSetBatch; N], u64), ClientError> {
         let ids = self.session.submit(Request::AllocIds(n));
-        let schemas = self.wait(schemas).await?.batch;
-        let schema_id =
-            schema_row(&schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at)));
-        Ok((schema_id, self.wait(ids).await?))
+        let cut = self.sys_cut(families, &ReadSpec::all_rows(ReadBound::None)).await?;
+        Ok((cut, self.wait(ids).await?))
     }
 
     /// `families`' rows under `spec`, with no DDL between them.

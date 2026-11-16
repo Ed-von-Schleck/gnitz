@@ -49,10 +49,6 @@ impl ViewChain {
         SegInput { src, frame }
     }
 
-    pub(super) fn has_segments(&self) -> bool {
-        !self.segments.is_empty()
-    }
-
     /// The segments, and the user-named view `p` under its final `schema`, which
     /// comes after every one.
     pub(super) fn finish(self, p: EmitPieces, schema: Arc<Schema>) -> (Vec<PlannedView>, PlannedView) {

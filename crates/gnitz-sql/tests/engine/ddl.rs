@@ -20,9 +20,9 @@ fn a_foreign_key_refuses_an_orphan_until_its_parent_lands() {
     assert_eq!(db.rows("SELECT cid, p_id FROM child", &["cid", "p_id"]), [[1, 99, 1]]);
 }
 
-/// Every honored UNIQUE spelling lands as exactly one unique index: none for the
-/// lone PK, and the FK's own index promoted rather than a second one added. Each
-/// is droppable by the name that was written or minted.
+/// Every honored UNIQUE spelling lands as exactly one unique index — the lone
+/// PK's as any other — and the FK's own index promoted rather than a second one
+/// added. Each is droppable by the name that was written or minted.
 #[test]
 fn inline_uniques_land_as_one_index_each() {
     let mut db = Db::boot(1);
@@ -44,6 +44,7 @@ fn inline_uniques_land_as_one_index_each() {
             unique(&["d", "e_f"]),
             unique(&["d_e", "f"]),
             unique(&["g"]),
+            unique(&["id"]),
             unique(&["refc"]),
         ]
     );
@@ -53,7 +54,60 @@ fn inline_uniques_land_as_one_index_each() {
     db.exec(&format!(
         "DROP INDEX u_c; DROP INDEX uq_g; DROP INDEX {sn}__u__idx_d_e_f; DROP INDEX {sn}__u__idx_d_e_f_2"
     ));
-    assert_eq!(db.indexes("u"), [unique(&["a"]), unique(&["b"]), unique(&["refc"])]);
+    assert_eq!(
+        db.indexes("u"),
+        [unique(&["a"]), unique(&["b"]), unique(&["id"]), unique(&["refc"])]
+    );
+}
+
+/// A table's every unique index renders inside its `CREATE TABLE`, so that
+/// statement accepts whatever unique index CREATE INDEX and ADD CONSTRAINT made:
+/// one on the lone PK, and two named ones on one column list.
+#[test]
+fn a_rendered_create_table_replays_every_unique_index() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY UNIQUE, a BIGINT);
+         CREATE UNIQUE INDEX ix_id ON t(id);
+         ALTER TABLE t ADD CONSTRAINT k UNIQUE (id);
+         CREATE UNIQUE INDEX ix1 ON t(a);
+         CREATE UNIQUE INDEX ix2 ON t(a)",
+    );
+    let before = db.indexes("t");
+    let catalog = block_on(db.client.catalog()).unwrap();
+    let rendered = gnitz_sql::create_table_statement(&catalog, catalog.get(&rel(&db.sn, "t")).unwrap()).unwrap();
+    db.exec("DROP TABLE t");
+    db.exec(&rendered);
+    assert_eq!(db.indexes("t"), before);
+    let catalog = block_on(db.client.catalog()).unwrap();
+    let again = gnitz_sql::create_table_statement(&catalog, catalog.get(&rel(&db.sn, "t")).unwrap()).unwrap();
+    assert_eq!(again, rendered);
+}
+
+/// `ALTER VIEW … AS` restates the body alone, so the view keeps every option it
+/// was created with — a budget and compression alike — on a new body, and a
+/// same-body ALTER keeps the view itself.
+#[test]
+fn alter_view_keeps_the_standing_options() {
+    let mut db = Db::boot(1);
+    let sn = db.sn.clone();
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT);
+         CREATE VIEW v WITH (delta = '1 MB', compress = true) AS SELECT id, a FROM t",
+    );
+    let rendered = |db: &mut Db| {
+        let catalog = block_on(db.client.catalog()).unwrap();
+        gnitz_sql::create_view_statement(&catalog, catalog.get(&rel(&sn, "v")).unwrap()).unwrap()
+    };
+    let with = "WITH (delta = '1 MB', compress = true) AS";
+    assert!(rendered(&mut db).contains(with));
+    let vid = db.rel("v").tid;
+    db.exec("ALTER VIEW v AS SELECT id, a FROM t");
+    assert_eq!(db.rel("v").tid, vid);
+    db.exec("ALTER VIEW v AS SELECT id, b FROM t");
+    assert_ne!(db.rel("v").tid, vid);
+    let now = rendered(&mut db);
+    assert!(now.contains(with) && now.contains("SELECT id, b FROM"), "{now}");
 }
 
 /// An inline UNIQUE's auto-name avoids every live index name: one a renamed
@@ -141,21 +195,17 @@ fn create_index_naming_and_rejections() {
          CREATE VIEW vw AS SELECT * FROM t;
          CREATE INDEX my_idx ON t(a)",
     );
-    // A named index does not carry the auto-name, so the auto-named one on the
-    // same column coexists with it.
+    // An unnamed request is refused by whatever index already serves it,
+    // whatever that index is named.
     db.refuses(&format!("DROP INDEX {sn}__t__idx_a"), Refused(NotFound), "not found");
-    db.exec("CREATE INDEX ON t(a)");
-    db.refuses("CREATE INDEX ON t(a)", Rejected, "already exists");
+    db.refuses("CREATE INDEX ON t(a)", Refused(Error), "already exists as 'my_idx'");
     db.refuses("CREATE INDEX my_idx ON t(c)", Refused(Error), "already exists");
     // `(a, b_c)` and `(a_b, c)` render the same base; the second gets `_2`, and
-    // is recognized under it when it is asked for again.
-    db.exec(&format!(
-        "DROP INDEX my_idx; DROP INDEX {sn}__t__idx_a;
-         CREATE INDEX ON t(a, b_c); CREATE INDEX ON t(a_b, c)"
-    ));
+    // is found under it when it is asked for again.
+    db.exec("DROP INDEX my_idx; CREATE INDEX ON t(a, b_c); CREATE INDEX ON t(a_b, c)");
     db.refuses(
         "CREATE INDEX ON t(a_b, c)",
-        Rejected,
+        Refused(Error),
         &format!("already exists as '{sn}__t__idx_a_b_c_2'"),
     );
     db.exec(&format!(
@@ -163,16 +213,32 @@ fn create_index_naming_and_rejections() {
     ));
     assert!(db.indexes("t").is_empty());
 
-    // A plain auto-named index does not stand in for a unique one on its column,
-    // while the unique one stands in for both. The two share one circuit.
+    // A plain index does not stand in for a unique one on its column, while the
+    // unique one stands in for both. The two share one circuit.
     db.exec("CREATE INDEX ON t(c)");
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
     db.exec("ALTER TABLE t ADD UNIQUE (c)");
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], true)]);
-    db.refuses("ALTER TABLE t ADD UNIQUE (c)", Rejected, &format!("'{sn}__t__idx_c_2'"));
-    db.refuses("CREATE INDEX ON t(c)", Rejected, &format!("'{sn}__t__idx_c'"));
+    db.refuses(
+        "ALTER TABLE t ADD UNIQUE (c)",
+        Refused(Error),
+        &format!("'{sn}__t__idx_c_2'"),
+    );
+    db.refuses("CREATE INDEX ON t(c)", Refused(Error), &format!("'{sn}__t__idx_c'"));
     db.exec(&format!("DROP INDEX {sn}__t__idx_c; DROP INDEX {sn}__t__idx_c_2"));
     assert!(db.indexes("t").is_empty());
+
+    // Renaming the owner or the column leaves the index serving the request.
+    db.exec(
+        "CREATE TABLE r (id BIGINT PRIMARY KEY, a BIGINT);
+         CREATE INDEX ON r(a); ALTER TABLE r RENAME COLUMN a TO e; ALTER TABLE r RENAME TO r2",
+    );
+    db.refuses(
+        "CREATE INDEX ON r2(e)",
+        Refused(Error),
+        &format!("already exists as '{sn}__r__idx_a'"),
+    );
+    db.exec("DROP TABLE r2");
 
     // A quoted column name is not an identifier; the index name built from it is.
     db.exec(&format!(

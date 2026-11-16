@@ -1,16 +1,18 @@
 //! `ALTER TABLE`: rename table/view/column, ADD/DROP COLUMN, DROP NOT NULL,
 //! ADD/DROP CONSTRAINT (mapped to the CREATE/DROP INDEX paths). `ALTER VIEW … AS`
-//! lives in `ddl::view` (it recompiles a query). Every rule that reads
-//! the catalog is the engine precheck's.
+//! lives in `ddl::view` (it recompiles a query). The statement is read whole
+//! before the catalog is; the catalog is read to resolve the relation and its
+//! columns, to decide IF [NOT] EXISTS and the class gate. Whether the change is
+//! admissible is the engine precheck's.
 
-use super::guard::{ColumnOptionSite, read_column, reject_unhonored_unique_fields};
+use super::guard::{ColumnConstraint, read_column, reject_unhonored_unique_fields};
+use super::table::{index_cols, index_column_names};
 use crate::error::{GnitzSqlError, missing_relation, reject_if, unsupported_clause};
 use crate::names::extract_object_name;
 use crate::rules::{ClassWant, canonical_user_name, find_unique_column, require_class, require_column};
 use gnitz_core::{ColumnChange, GnitzClient, RelName};
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, IndexColumn, RenameTableNameKind,
-    TableConstraint,
+    AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, RenameTableNameKind, TableConstraint,
 };
 
 /// One ALTER TABLE operation with every check that needs no catalog already run,
@@ -31,7 +33,7 @@ enum Action<'a> {
         if_not_exists: bool,
     },
     AddUnique {
-        columns: &'a [IndexColumn],
+        columns: Vec<&'a str>,
         explicit_name: Option<String>,
     },
     DropConstraint {
@@ -110,15 +112,10 @@ pub(crate) async fn execute_alter_table(
                 .await?
         }
         Action::AddUnique { columns, explicit_name } => {
-            return super::table::create_index_core(
-                client,
-                &rel,
-                &source_name,
-                columns,
-                explicit_name,
-                super::table::IndexSite::AddConstraint,
-            )
-            .await;
+            let key = index_cols(&rel.schema, &columns, "ADD CONSTRAINT")?;
+            client
+                .create_index(&source_name, &rel, key, explicit_name.as_deref(), true)
+                .await?;
         }
         Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, &name, if_exists).await?,
     }
@@ -169,8 +166,26 @@ fn parse<'a>(
                 CTX,
                 "FIRST/AFTER (a column is always appended last)",
             )?;
-            let decl = read_column(col, ColumnOptionSite::AddColumn)?;
+            let decl = read_column(col, CTX)?;
             reject_if(decl.serial, CTX, "SERIAL")?;
+            // Past SERIAL, only a written NOT NULL makes a column non-nullable.
+            reject_if(
+                !decl.def.is_nullable,
+                CTX,
+                "NOT NULL (a new column over existing rows is nullable)",
+            )?;
+            if let Some(constraint) = decl.constraints.first() {
+                return Err(unsupported_clause(
+                    CTX,
+                    match constraint {
+                        ColumnConstraint::PrimaryKey => "PRIMARY KEY (a new column cannot join the primary key)",
+                        ColumnConstraint::Unique(_) => "UNIQUE (add the column, then CREATE UNIQUE INDEX)",
+                        ColumnConstraint::ForeignKey { .. } => {
+                            "REFERENCES (a foreign key is declared only at CREATE TABLE)"
+                        }
+                    },
+                ));
+            }
             Ok((
                 CTX,
                 Action::AddColumn {
@@ -242,7 +257,7 @@ fn parse<'a>(
             Ok((
                 CTX,
                 Action::AddUnique {
-                    columns: &u.columns,
+                    columns: index_column_names(&u.columns, "ADD CONSTRAINT")?,
                     explicit_name: u.name.as_ref().map(|n| canonical_user_name(&n.value)).transpose()?,
                 },
             ))

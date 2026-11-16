@@ -5,20 +5,20 @@
 use super::options::decode_view_options;
 use super::view_def::{RelationRef, ViewDefinition};
 use crate::catalog::Catalog;
-use crate::error::{GnitzSqlError, reject_if};
+use crate::error::{GnitzSqlError, missing_relation, reject_if};
 use crate::hir::{BoundRef, LoweredView, ViewBody};
 use crate::names::extract_object_name;
 use crate::rules::{ClassWant, require_class};
 use crate::source::StatementText;
 use gnitz_core::{RelName, ViewBundle};
-use gnitz_wire::{ViewBudget, ViewProps};
-use sqlparser::ast::{CreateView, Ident, ObjectName, Query};
+use gnitz_wire::{RelClass, ViewBudget, ViewProps};
+use sqlparser::ast::{AlterView, AlterViewOperation, CreateView, Ident, Query};
 use sqlparser::tokenizer::Location;
 
 /// Reject every `CREATE VIEW` clause the planner does not consume.
-fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), GnitzSqlError> {
+fn reject_unhonored_create_view_clauses(cv: &CreateView) -> Result<(), GnitzSqlError> {
     const CTX: &str = "CREATE VIEW";
-    let sqlparser::ast::CreateView {
+    let CreateView {
         name: _,
         query: _,
         options: _,
@@ -72,59 +72,75 @@ pub(crate) fn plan_create_view(
 ) -> Result<Option<ViewBundle>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let view_name = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
+    let props = decode_view_options(&cv.options)?;
 
-    // Each clause tests the name alone.
-    let replacing = if cv.if_not_exists {
-        // Any relation under the name ends the statement, whatever its kind.
-        if cat.probe(&view_name)?.is_some() {
-            return Ok(None);
+    // Each clause tests the name alone; a plain create leaves a taken name to
+    // the engine's refusal.
+    let standing = match cv.or_replace || cv.if_not_exists {
+        true => cat.probe(&view_name)?,
+        false => None,
+    };
+    let replacing = match standing {
+        // A free name: `OR REPLACE` degenerates to a plain create.
+        None => None,
+        // `IF NOT EXISTS`: any relation under the name ends the statement,
+        // whatever its kind.
+        Some(_) if cv.if_not_exists => return Ok(None),
+        Some(rel) => {
+            require_class(&rel, &view_name, ClassWant::View, "CREATE OR REPLACE VIEW")?;
+            Some(rel.tid)
         }
-        None
-    } else if cv.or_replace {
-        match cat.probe(&view_name)? {
-            Some(rel) => {
-                require_class(&rel, &view_name, ClassWant::View, "CREATE OR REPLACE VIEW")?;
-                Some(rel.tid)
-            }
-            // A free name: `OR REPLACE` degenerates to a plain create.
-            None => None,
-        }
-    } else {
-        None
     };
 
-    let props = decode_view_options(&cv.options)?;
-    let view = ViewBody { stmt: "CREATE VIEW", replacing };
+    let view = ViewBody {
+        stmt: "CREATE VIEW",
+        replacing,
+        bounded: matches!(props.budget, ViewBudget::Bounded { .. }),
+    };
     let aliases = cv.columns.iter().map(|c| &c.name);
-    plan_segments(cat, view_name, view, &cv.query, text, aliases, props).map(Some)
+    plan_segments(cat, view_name, view, &cv.query, text, aliases, Some(props)).map(Some)
 }
 
-/// Plan an `ALTER VIEW <name> [(columns)] AS <query>`: the chain that supersedes
-/// the view.
+/// Plan an `ALTER VIEW [IF EXISTS] <name> [(columns)] AS <query>`: the chain that
+/// supersedes the view, under the options it already has; `None` when `IF
+/// EXISTS` finds no relation under the name.
 pub(crate) fn plan_alter_view(
-    name: &ObjectName,
-    columns: &[Ident],
-    query: &Query,
-    with_options: &[sqlparser::ast::SqlOption],
+    av: &AlterView,
     text: StatementText<'_>,
     cat: &dyn Catalog,
-) -> Result<ViewBundle, GnitzSqlError> {
-    // Only `CREATE OR REPLACE VIEW` states a view's options.
-    reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
-    let named = extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
-    let old = cat.probe_relation(&named)?;
-    require_class(&old, &named, ClassWant::PlainView, "ALTER VIEW")?;
-    let old_vid = old.tid;
-    let view = ViewBody {
-        stmt: "ALTER VIEW",
-        replacing: Some(old_vid),
+) -> Result<Option<ViewBundle>, GnitzSqlError> {
+    const CTX: &str = "ALTER VIEW";
+    let AlterView {
+        name,
+        materialized: _, // accepted: names gnitz's real behavior
+        if_exists,
+        operation,
+    } = av;
+    let AlterViewOperation::As { columns, query, with_options } = operation else {
+        return Err(GnitzSqlError::Rejected(format!(
+            "{CTX}: only `AS <query>` is supported"
+        )));
     };
-    plan_segments(cat, named, view, query, text, columns.iter(), ViewProps::default())
+    // Only `CREATE OR REPLACE VIEW` states a view's options.
+    reject_if(!with_options.is_empty(), CTX, "WITH options")?;
+    let named = extract_object_name(name, cat.schema_name(), CTX)?;
+    let old = match cat.probe(&named)? {
+        Some(old) => old,
+        None if *if_exists => return Ok(None),
+        None => return Err(missing_relation(&named)),
+    };
+    require_class(&old, &named, ClassWant::View, CTX)?;
+    let view = ViewBody {
+        stmt: CTX,
+        replacing: Some(old.tid),
+        bounded: old.class == RelClass::BoundedView,
+    };
+    plan_segments(cat, named, view, query, text, columns.iter(), None).map(Some)
 }
 
 /// Compile a view body to its segment bundle under `name`, the user-named view's
 /// visible output columns renamed by `aliases`, carrying the definition `text`
-/// declares.
+/// declares and the options `props`.
 fn plan_segments<'a>(
     cat: &dyn Catalog,
     name: RelName,
@@ -132,12 +148,16 @@ fn plan_segments<'a>(
     query: &Query,
     text: StatementText<'_>,
     aliases: impl ExactSizeIterator<Item = &'a Ident>,
-    props: ViewProps,
+    props: Option<ViewProps>,
 ) -> Result<ViewBundle, GnitzSqlError> {
-    let bounded = matches!(props.budget, ViewBudget::Bounded { .. });
-    let replacing = view.replacing;
-    let LoweredView { segments, view, refs, body_columns } =
-        crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
+    let ViewBody { stmt, replacing, bounded } = view;
+    let LoweredView { segments, view, refs, body_columns } = crate::hir::bind_and_lower(cat, query, view, aliases)?;
+    // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
+    if bounded && !segments.is_empty() {
+        return Err(GnitzSqlError::Rejected(format!(
+            "{stmt}: a capacity-bounded view's body that compiles to more than one view is not supported"
+        )));
+    }
     let definition = record_definition(text, refs, body_columns)?;
     Ok(ViewBundle {
         name,
