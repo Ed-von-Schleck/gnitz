@@ -5,12 +5,13 @@
 //! half that can be pulled in — as a dev-dependency.
 
 use crate::catalog::sys_tables::encode_record;
+use crate::catalog::{SysFamily, SysFamilyExt};
 use crate::test_support::{arb_schema, cols_of};
 
-use gnitz_wire::schema_block::check_same_types;
+use gnitz_wire::schema_record::check_same_types;
 use gnitz_wire::{ColumnDef, MAX_PK_COLUMNS};
 use gnitz_zset::repr::{Batch, MemBatch};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, decode_schema_block};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, decode_schema_record};
 use proptest::prelude::*;
 
 proptest! {
@@ -18,7 +19,7 @@ proptest! {
     #[test]
     fn schema_roundtrip_catalog_codec(schema in arb_schema(MAX_PK_COLUMNS)) {
         let record = encode_record(schema.pk_cols(), &cols_of(&schema));
-        prop_assert_eq!(decode_schema_block(&record).unwrap(), schema);
+        prop_assert_eq!(decode_schema_record(&record).unwrap(), schema);
     }
 
     /// A record the catalog admits for a relation — names and hidden flags free
@@ -30,12 +31,12 @@ proptest! {
             c.name = format!("renamed_{}", c.name).into();
             c.is_hidden = hidden;
         }
-        let frame = gnitz_wire::schema_block::encode(defs.iter().map(ColumnDef::block_col), schema.pk_cols());
+        let frame = gnitz_wire::schema_record::encode(defs.iter().map(ColumnDef::record_col), schema.pk_cols());
         prop_assert_eq!(
             check_same_types(&frame, &encode_record(schema.pk_cols(), &cols_of(&schema))),
             Ok(())
         );
-        prop_assert_eq!(decode_schema_block(&frame).unwrap(), schema);
+        prop_assert_eq!(decode_schema_record(&frame).unwrap(), schema);
     }
 }
 
@@ -66,15 +67,15 @@ proptest! {
 /// BLOB cells past the inline bytes, an empty BLOB and the pair-keyed family's
 /// two key words among them.
 ///
-/// The frame layout itself is `gnitz_wire::txn_frame`'s, round-tripped in that
+/// The frame layout itself is `gnitz_wire::multi_frame`'s, round-tripped in that
 /// crate.
 #[test]
 fn a_client_bundle_decodes_to_the_rows_it_wrote() {
     use gnitz_core::{BatchAppender, ZSetBatch};
-    use gnitz_wire::txn_frame::decode_items;
+    use gnitz_wire::multi_frame::decode_items;
     use gnitz_wire::{CircuitRow, ColTabRow, IdxTabRow, SchemaTabRow, SeqTabRow, SysRow, TableTabRow, ViewTabRow};
 
-    fn block<R: SysRow>(rows: &[(R, i64)]) -> (u64, ZSetBatch) {
+    fn block<R: SysRow>(rows: &[(R, i64)]) -> (SysFamily, ZSetBatch) {
         let mut b = ZSetBatch::new(gnitz_core::sys_schema(R::FAMILY));
         let mut sink = BatchAppender::new(&mut b);
         for (row, weight) in rows {
@@ -99,17 +100,17 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
         1,
     )];
     let tables = [(
-        TableTabRow {
-            table_id: 9,
-            schema_id: 7,
-            name: "a_long_table_name_past_twelve".into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(&[1, 3]),
-            flags: gnitz_wire::TableProps {
+        TableTabRow::of(
+            9,
+            7,
+            "a_long_table_name_past_twelve",
+            gnitz_wire::PkColList::from_slice(&[1, 3]),
+            gnitz_wire::TableProps {
                 serial: true,
                 distribution: gnitz_wire::TableDistribution::Replicated,
                 ..Default::default()
             },
-        },
+        ),
         -1,
     )];
     let views = [(
@@ -179,11 +180,11 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
     let ctrl = gnitz_wire::peek_control_block(&payload).expect("control header");
     let items = decode_items(&payload, ctrl.body, gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
     let ids: Vec<u64> = items.iter().map(|item| item.hdr.target_id).collect();
-    assert_eq!(ids, bundle.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+    assert_eq!(ids, bundle.iter().map(|(f, _)| f.id()).collect::<Vec<_>>());
     let b: Vec<Batch> = items
         .iter()
         .map(|item| {
-            let schema = crate::catalog::SysFamily::from_id(item.hdr.target_id).unwrap().schema();
+            let schema = SysFamily::from_id(item.hdr.target_id).unwrap().schema();
             MemBatch::of_wal_block(&payload[item.data.clone().unwrap()], schema)
                 .unwrap()
                 .to_batch()

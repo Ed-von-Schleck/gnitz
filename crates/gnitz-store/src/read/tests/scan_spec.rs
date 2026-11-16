@@ -384,7 +384,7 @@ fn an_index_walk_returns_exactly_its_range() {
         // Both walks yield in id order, so an unordered LIMIT keeps the first two ids;
         // both columns rise with the id, so a descending one keeps the last two.
         assert_eq!(ids(spec(cut(2, vec![]))), want[..want.len().min(2)], "{bound:?}");
-        let top = ids(spec(cut(2, order_by(col as u16, true))));
+        let top = ids(spec(cut(2, order_by(col, true))));
         assert_eq!(top, want[want.len().saturating_sub(2)..], "{bound:?}");
     }
 }

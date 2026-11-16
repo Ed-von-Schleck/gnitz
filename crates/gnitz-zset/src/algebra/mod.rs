@@ -45,6 +45,16 @@ pub(crate) use key_pack::KeyPacker;
 pub(crate) use map::copy_columns;
 pub(crate) use order_image::{IMAGE_COL, ImageCol, image_slot_col};
 
+/// An integer column's cell as its value: under `OPK` a PK column's OPK image,
+/// else a payload column's native bytes.
+#[inline(always)]
+fn int_cell<const OPK: bool>(fi: gnitz_wire::FixedInt, cell: &[u8]) -> i64 {
+    match OPK {
+        true => gnitz_wire::decode_opk_i64(cell, fi),
+        false => fi.decode_le_i64(cell),
+    }
+}
+
 /// `v` as `n` zeros: freshly allocated zeroed where it lacks the room, else
 /// overwritten in place.
 pub(crate) fn zeroed<T: Copy + Default>(v: &mut Vec<T>, n: usize) {

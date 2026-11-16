@@ -1,7 +1,8 @@
-//! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
+//! The relation-descriptor blob a RESOLVE reply carries: the relation's class,
+//! keys and indexes, and its schema record.
 
 use crate::codec::{MAX_LIST_LEN, Reader, Wire, Writer, decode_all};
-use crate::{PkColList, ViewBudget};
+use crate::{PkColList, SysFamily, ViewBudget};
 
 wire_enum! {
     /// What a relation is, as the client sees it.
@@ -44,6 +45,15 @@ impl RelClass {
     pub fn is_view(self) -> bool {
         matches!(self, RelClass::View | RelClass::BoundedView | RelClass::FedView)
     }
+
+    /// The system family this relation's row lives in.
+    pub fn family(self) -> SysFamily {
+        if self.is_view() {
+            SysFamily::View
+        } else {
+            SysFamily::Table
+        }
+    }
 }
 
 impl From<ViewBudget> for RelClass {
@@ -80,6 +90,8 @@ pub struct RelDescriptorBlob {
     /// [`crate::TableProps::serial`].
     pub serial: bool,
     pub indexes: Vec<RelIndex>,
+    /// The relation's [`crate::schema_record`], names included.
+    pub schema: Box<[u8]>,
 }
 
 impl RelDescriptorBlob {
@@ -88,7 +100,8 @@ impl RelDescriptorBlob {
         w.put(&self.class)
             .bool(self.pk_repeats)
             .bool(self.serial)
-            .list(&self.indexes);
+            .list(&self.indexes)
+            .bytes32(&self.schema);
         w.into_vec()
     }
 
@@ -98,7 +111,14 @@ impl RelDescriptorBlob {
             let pk_repeats = r.bool()?;
             let serial = r.bool()?;
             let indexes = r.list("index list", MAX_LIST_LEN)?;
-            Ok(RelDescriptorBlob { class, pk_repeats, serial, indexes })
+            let schema = r.bytes32()?.into();
+            Ok(RelDescriptorBlob {
+                class,
+                pk_repeats,
+                serial,
+                indexes,
+                schema,
+            })
         })
     }
 }

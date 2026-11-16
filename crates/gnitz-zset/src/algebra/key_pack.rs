@@ -524,7 +524,7 @@ impl KeyPacker {
                 slot.fill(0);
             } else {
                 let image = promote_image(key_value(col.loc, batch, row), col.loc.type_code(), col.out.type_code);
-                gnitz_wire::store_opk(slot, image, false);
+                gnitz_wire::store_opk(slot, image);
             }
         }
         if self.has_bitmap {

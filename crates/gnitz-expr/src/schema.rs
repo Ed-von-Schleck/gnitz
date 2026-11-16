@@ -530,7 +530,7 @@ impl SchemaDescriptor {
                 gnitz_wire::native_fits(v, w),
                 "opk_key_cols: {v:#x} does not fit a {tc:?} column"
             );
-            key.push(w, v, tc.is_signed_int());
+            key.push(w, gnitz_wire::key_image(tc, v));
         }
         key
     }

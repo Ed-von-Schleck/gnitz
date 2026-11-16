@@ -47,7 +47,7 @@ use relations::CatalogCacheSet;
 pub(crate) use relations::{FkEdge, LockSet, RowConstraints};
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
-pub(crate) use sys_tables::{DdlBundle, SysFamily};
+pub(crate) use sys_tables::{DdlBundle, SysFamily, SysFamilyExt};
 pub(crate) use write_path::{AppliedDdl, ZoneError, ZoneSink};
 
 // ---------------------------------------------------------------------------

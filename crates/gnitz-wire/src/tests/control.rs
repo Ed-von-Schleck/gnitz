@@ -6,7 +6,7 @@ fn probe_header() -> ControlHeader {
     ControlHeader {
         target_id: 0x1111_2222_3333_4444,
         flags: WireFlags {
-            verb: ClientVerb::ScanMulti,
+            verb: Some(ClientVerb::ScanMulti),
             conflict_mode: WireConflictMode::Error,
             continuation: true,
             scan_last: true,
@@ -22,11 +22,11 @@ fn probe_header() -> ControlHeader {
 const ROW: [&[u8]; 4] = [b"a data region", &[1, 0, 0, 0, 0, 0, 0, 0], &[0; 8], &[]];
 
 /// A whole frame, sized exactly by `frame_size`.
-fn frame(hdr: &ControlHeader, blob: &[u8], schema: Option<&[u8]>, data: bool) -> Vec<u8> {
+fn frame(hdr: &ControlHeader, blob: &[u8], data: bool) -> Vec<u8> {
     let data = data.then_some(&ROW[..]);
     let mut out = Vec::new();
-    append_frame(&mut out, hdr, blob, schema, data);
-    assert_eq!(out.len(), frame_size(blob, schema, data));
+    append_frame(&mut out, hdr, blob, data);
+    assert_eq!(out.len(), frame_size(blob, data));
     out
 }
 
@@ -44,48 +44,33 @@ fn encode_roundtrips() {
             Some("full \u{FFFD}"),
         ),
     ] {
-        let buf = frame(&hdr, blob, None, false);
+        let buf = frame(&hdr, blob, false);
         let dec = peek_control_block(&buf).expect("decode");
         assert_eq!(dec.hdr, hdr);
         assert_eq!(&buf[dec.blob.clone()], blob);
         assert_eq!(dec.body, buf.len()..buf.len(), "nothing follows the blob");
-        assert_eq!((dec.schema.clone(), dec.data.clone()), (None, None));
+        assert_eq!(dec.data, None);
         let want = fault.map(|text| WireFault { status: hdr.status, text: text.into() });
         assert_eq!(dec.fault(&buf), want);
     }
 }
 
-/// The section bits are set from what the head writes and the peek locates each
-/// section from them, in order: the length-prefixed schema record, then the
-/// self-sizing data block. A frame cut anywhere short of its announced sections
-/// is refused.
+/// The data bit is set from what the head writes and the peek locates the
+/// self-sizing data block from it. A frame cut anywhere short of its announced
+/// block is refused.
 #[test]
-fn peek_locates_the_sections_the_head_announced() {
+fn peek_locates_the_data_block_the_head_announced() {
     let hdr = probe_header();
-    // Arbitrary bytes: the frame sizes the record from its prefix, never parses it.
-    let sb = b"schema record bytes";
     let db = crate::wal::block_size(&ROW);
     let head = CTRL_HEADER_SIZE + 3;
-    let schema_at = head + 4..head + 4 + sb.len();
-    let cases = [
-        (Some(&sb[..]), false, Some(schema_at.clone()), None),
-        (None, true, None, Some(head..head + db)),
-        (
-            Some(&sb[..]),
-            true,
-            Some(schema_at.clone()),
-            Some(schema_at.end..schema_at.end + db),
-        ),
-    ];
-    for (schema, data, want_schema, want_data) in cases {
-        let buf = frame(&hdr, b"abc", schema, data);
+    for (data, want_data) in [(false, None), (true, Some(head..head + db))] {
+        let buf = frame(&hdr, b"abc", data);
         let dec = peek_control_block(&buf).expect("decode");
-        assert_eq!(dec.hdr, hdr, "the section bits are not a flags field");
-        assert_eq!(dec.schema, want_schema);
+        assert_eq!(dec.hdr, hdr, "the data bit is not a flags field");
         assert_eq!(dec.data, want_data);
         assert_eq!(dec.body, buf.len()..buf.len(), "the body starts past the last section");
     }
-    let mut buf = frame(&hdr, b"abc", Some(sb), true);
+    let mut buf = frame(&hdr, b"abc", true);
     for cut in 0..buf.len() {
         assert!(peek_control_block(&buf[..cut]).is_err(), "cut at {cut}");
     }
@@ -93,84 +78,78 @@ fn peek_locates_the_sections_the_head_announced() {
     let end = buf.len();
     buf.extend_from_slice(b"items");
     assert_eq!(peek_control_block(&buf).unwrap().body, end..end + 5);
-    // An empty record is a present one: the prefix distinguishes it from absent.
-    let empty = frame(&hdr, b"abc", Some(&[]), false);
-    assert_eq!(peek_control_block(&empty).unwrap().schema, Some(head + 4..head + 4));
 }
 
-/// A data block is malformed on every verb but PUSH — a read above all, which
-/// would otherwise be answered with a streamed table dump. A multi-item frame
-/// carries its items and nothing else — no blob, no schema, no `target_id` —
-/// and every other frame ends at its last section.
+/// A single-item frame carries the sections its verb's shape allows and
+/// requires, and ends at its last one: a data block on a read above all, which
+/// would otherwise be answered with a streamed table dump, is refused. A
+/// multi-item frame carries its items and nothing else — no blob, no data
+/// block, no `target_id`.
 #[test]
 fn client_verb_refuses_sections_the_verb_does_not_carry() {
-    let accepts = |verb, target_id, blob: &[u8], schema: Option<&[u8]>, data, tail: &[u8]| {
+    let accepts = |verb, target_id, blob: &[u8], data, tail: &[u8]| {
         let hdr = ControlHeader {
             target_id,
-            flags: WireFlags { verb, ..Default::default() },
+            flags: WireFlags { verb: Some(verb), ..Default::default() },
             ..Default::default()
         };
-        let mut buf = frame(&hdr, blob, schema, data);
+        let mut buf = frame(&hdr, blob, data);
         buf.extend_from_slice(tail);
         let got = peek_control_block(&buf).unwrap().client_verb();
         assert!(got.is_err() || got == Ok(verb));
         got.is_ok()
     };
     for &verb in ClientVerb::ALL {
-        let multi = crate::txn_frame::item_shape(verb).is_some();
-        assert!(accepts(verb, 0, b"", None, false, b""), "{verb:?} bare");
-        assert_eq!(
-            accepts(verb, 0, b"", None, true, b""),
-            verb == ClientVerb::Push,
-            "{verb:?} data"
-        );
-        assert_eq!(accepts(verb, 0, b"", None, false, b"items"), multi, "{verb:?} tail");
-        assert_eq!(
-            accepts(verb, 7, b"blob", Some(b"sch"), false, b""),
-            !multi,
-            "{verb:?} sections"
-        );
-        if multi {
-            assert!(
-                !accepts(verb, 0, b"blob", None, false, b"items"),
-                "{verb:?} with a blob"
-            );
-            assert!(
-                !accepts(verb, 0, b"", Some(b"sch"), false, b"items"),
-                "{verb:?} with a schema"
-            );
-            assert!(
-                !accepts(verb, 7, b"", None, false, b"items"),
-                "{verb:?} naming a target"
+        let VerbShape { sections, items } = VerbShape::of(verb);
+        if items.is_some() {
+            assert!(accepts(verb, 0, b"", false, b"items"), "{verb:?} items");
+            assert!(!accepts(verb, 0, b"blob", false, b"items"), "{verb:?} with a blob");
+            assert!(!accepts(verb, 0, b"", true, b"items"), "{verb:?} with a data block");
+            assert!(!accepts(verb, 7, b"", false, b"items"), "{verb:?} naming a target");
+            continue;
+        }
+        for (blob, data) in [(&b""[..], false), (b"blob", false), (b"", true), (b"blob", true)] {
+            let fits = |rule: Section, present: bool| match rule {
+                Section::Never => !present,
+                Section::May => true,
+                Section::Must => present,
+            };
+            assert_eq!(
+                accepts(verb, 7, blob, data, b""),
+                fits(sections.blob, !blob.is_empty()) && fits(sections.data, data),
+                "{verb:?} blob {blob:?} data {data}"
             );
         }
+        let blob: &[u8] = if sections.blob == Section::Must { b"blob" } else { b"" };
+        assert!(!accepts(verb, 0, blob, false, b"items"), "{verb:?} tail");
     }
+    // A request naming no verb is a reply's header.
+    let buf = frame(&ControlHeader::default(), b"", false);
+    assert!(peek_control_block(&buf).unwrap().client_verb().is_err());
 }
 
 /// A client frame carries no status and no reply flag, and sets a conflict mode
-/// on a PUSH alone; a multi-item prologue sets no argument but a `DELTA_POLL`'s
+/// only where its verb's shape reads one, never on a multi-item prologue; a multi-item prologue sets no argument but a `DELTA_POLL`'s
 /// `arg0`.
 #[test]
 fn client_verb_refuses_a_header_word_the_verb_does_not_carry() {
     let verdict = |hdr: ControlHeader| {
-        let tail: &[u8] = if crate::txn_frame::item_shape(hdr.flags.verb).is_some() {
-            b"items"
-        } else {
-            b""
+        let shape = VerbShape::of(hdr.flags.verb.unwrap());
+        let tail: &[u8] = if shape.items.is_some() { b"items" } else { b"" };
+        // A multi-item prologue carries no blob, whatever its items carry.
+        let blob: &[u8] = match (hdr.status, shape.sections.blob) {
+            (WireStatus::Ok, Section::Must) if shape.items.is_none() => b"blob",
+            (WireStatus::Ok, _) => b"",
+            _ => b"why",
         };
-        let mut buf = frame(
-            &hdr,
-            if hdr.status == WireStatus::Ok { b"" } else { b"why" },
-            None,
-            false,
-        );
+        let mut buf = frame(&hdr, blob, false);
         buf.extend_from_slice(tail);
         peek_control_block(&buf).unwrap().client_verb()
     };
     for &verb in ClientVerb::ALL {
-        let multi = crate::txn_frame::item_shape(verb).is_some();
+        let multi = VerbShape::of(verb).items.is_some();
         let hdr = ControlHeader {
-            flags: WireFlags { verb, ..Default::default() },
+            flags: WireFlags { verb: Some(verb), ..Default::default() },
             ..Default::default()
         };
         assert_eq!(verdict(hdr), Ok(verb), "{verb:?}");
@@ -191,7 +170,7 @@ fn client_verb_refuses_a_header_word_the_verb_does_not_carry() {
         };
         assert_eq!(
             verdict(ControlHeader { flags, ..hdr }).is_ok(),
-            verb == ClientVerb::Push,
+            !multi && VerbShape::of(verb).sections.conflict_mode,
             "{verb:?} conflict mode"
         );
         assert_eq!(
@@ -210,7 +189,7 @@ fn client_verb_refuses_a_header_word_the_verb_does_not_carry() {
 /// A header word the codec cannot read is refused, never read past or coerced.
 #[test]
 fn peek_rejects_an_unreadable_header_word() {
-    let clean = frame(&probe_header(), b"gone", None, false);
+    let clean = frame(&probe_header(), b"gone", false);
     let forged = |off: usize, word: &[u8]| {
         let mut buf = clean.clone();
         buf[off..off + word.len()].copy_from_slice(word);
@@ -237,7 +216,7 @@ fn peek_rejects_an_unreadable_header_word() {
 /// bleeding into a neighbour's bits shows up as a wrong neighbour.
 #[test]
 fn wire_flags_roundtrip_every_combination() {
-    for &verb in ClientVerb::ALL {
+    for verb in ClientVerb::ALL.iter().copied().map(Some).chain([None]) {
         for &conflict_mode in WireConflictMode::ALL {
             for (bits, &lane) in (0..4u8).flat_map(|bits| WireLane::ALL.iter().map(move |l| (bits, l))) {
                 let f = WireFlags {
@@ -260,22 +239,31 @@ fn wire_flags_roundtrip_every_combination() {
 fn wire_flags_reject_unknown() {
     // Every word but the unknown verb's names a defined verb, so the field
     // under test is the one refused.
-    let verb = WireFlags::default().pack();
-    for bit in (16..32).chain(36..38).chain(40..64) {
+    let verb = WireFlags {
+        verb: Some(ClientVerb::Push),
+        ..Default::default()
+    }
+    .pack();
+    for bit in (16..33).chain(36..38).chain(40..64) {
         assert_eq!(
             WireFlags::unpack(verb | 1 << bit),
             Err("flags: reserved bits set"),
             "bit {bit}"
         );
     }
-    // Bits 32/33 are the frame codec's, so the flags word neither refuses nor
-    // carries them.
-    assert_eq!(WireFlags::unpack(3 << 32 | verb), Ok(WireFlags::default()));
+    // Bit 33 is the frame codec's, so the flags word neither refuses nor
+    // carries it.
+    assert_eq!(WireFlags::unpack(1 << 33), Ok(WireFlags::default()));
+    // A verb of 0 is none: a reply's.
+    assert_eq!(WireFlags::unpack(0).map(|f| f.verb), Ok(None));
     // The two-bit lane leaves one value unused.
     let lane = u64::from(crate::outside(WireLane::from_wire));
     assert!(lane < 4, "a two-bit field holds no unknown value");
     for (w, want) in [
-        (u64::from(crate::outside(ClientVerb::from_wire)), "unknown request verb"),
+        (
+            u64::from((1..=u8::MAX).find(|&v| ClientVerb::from_wire(v).is_none()).unwrap()),
+            "unknown request verb",
+        ),
         (
             verb | u64::from(crate::outside(WireConflictMode::from_wire)) << 8,
             "unknown conflict mode",

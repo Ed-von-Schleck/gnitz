@@ -29,7 +29,7 @@ fn top_n_of(
         .iter()
         .flat_map(|(r, &w)| std::iter::repeat_n((*r, 1), w as usize))
         .collect();
-    let tie_break = (0..schema().num_columns() as u16).map(|col| OrderKey { col, desc: false, nulls_first: true });
+    let tie_break = (0..schema().num_columns() as u32).map(|col| OrderKey { col, desc: false, nulls_first: true });
     let order_keys: Vec<OrderKey> = keys.iter().copied().chain(tie_break).collect();
     let (_, _, groups) = ordered_groups(&slots, group_cols, &order_keys);
     let mut want = BTreeMap::new();

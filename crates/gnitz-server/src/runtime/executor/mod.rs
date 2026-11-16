@@ -343,7 +343,7 @@ async fn dispatch_request(
         ClientVerb::DdlTxn => handle_ddl_txn(shared, &data[ctrl.body]).await?,
         ClientVerb::PushTxn => handle_push_txn(shared, buf, ctrl).await?,
         ClientVerb::ScanMulti => {
-            let scans = gnitz_wire::txn_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
+            let scans = gnitz_wire::multi_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
             return read::handle_scan(shared, peer, &scans).await;
         }
         ClientVerb::DeltaPoll => return handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
@@ -360,7 +360,7 @@ async fn dispatch_request(
 
         ClientVerb::SyncPushed => {
             // Refused or not, it is answered as a sync is: out of the order of replies.
-            let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()]).map_err(decode_fault);
+            let held = gnitz_wire::multi_frame::decode_held(&data[ctrl.blob.clone()]).map_err(decode_fault);
             subs.ask_sync(shared, held, ctrl.hdr.arg0);
             return Ok(());
         }
@@ -502,7 +502,6 @@ fn cork_ack(peer: &mut Peer, target_id: u64, value: u64) {
 }
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.
-/// A failure describes no rows, so it carries no schema block.
 fn cork_fault(peer: &mut Peer, target_id: u64, fault: &WireFault) {
     cork_msg(peer, WireMsg { target_id, ..WireMsg::fault(fault) })
 }

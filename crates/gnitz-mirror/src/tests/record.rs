@@ -1,6 +1,6 @@
 //! The record codec: what a round trip preserves, and what bytes it refuses.
 
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 use gnitz_zset_testkit::make_schema_u64_i64;
 
 use super::*;
@@ -8,7 +8,7 @@ use super::*;
 fn record(feed: Feed) -> MirrorRecord {
     MirrorRecord {
         name: RelName::new("public", "recent").unwrap(),
-        block: encode_schema_block(&make_schema_u64_i64()),
+        schema: encode_schema_record(&make_schema_u64_i64()),
         pk_repeats: false,
         indexes: vec![PkColList::from_slice(&[1]), PkColList::from_slice(&[1, 0])],
         feed,
@@ -20,7 +20,7 @@ fn one_cursor() -> Feed {
 }
 
 /// A registration round-trips with its cursor and decodes to the layout its
-/// block describes; one with no feed position comes back with none, as does
+/// schema record describes; one with no feed position comes back with none, as does
 /// one being refilled.
 #[test]
 fn a_record_round_trips() {
@@ -46,10 +46,10 @@ fn bytes_that_are_no_record_are_refused() {
     name[at] = 0xFF;
     refused.push(("a name that is not UTF-8".into(), name));
     let no_layout = MirrorRecord {
-        block: vec![0xAB; 20],
+        schema: vec![0xAB; 20],
         ..record(one_cursor())
     };
-    refused.push(("a block describing no layout".into(), no_layout.encode()));
+    refused.push(("a schema record describing no layout".into(), no_layout.encode()));
     let descending = MirrorRecord {
         indexes: vec![PkColList::from_slice(&[1, 0]), PkColList::from_slice(&[1])],
         ..record(one_cursor())

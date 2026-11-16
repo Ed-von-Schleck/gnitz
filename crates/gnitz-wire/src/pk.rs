@@ -48,24 +48,21 @@ macro_rules! by_cell_width {
     };
 }
 
-/// Write the low `dst.len()` bytes of `v` big-endian into `dst`, the top bit of that
-/// width flipped when `flip`. With `v` a native value and `flip = tc.is_signed_int()`
-/// that is the column's OPK bytes; with `flip = false` it stores a key image as it is.
+/// Write the low `dst.len()` bytes of the key image `image` big-endian into `dst`: the
+/// column's OPK bytes. A native value's image is [`key_image`].
 #[inline(always)]
-pub fn store_opk(dst: &mut [u8], v: u128, flip: bool) {
+pub fn store_opk(dst: &mut [u8], image: u128) {
     by_cell_width!(dst.len(), |T| {
         let d: &mut [u8; std::mem::size_of::<T>()] = dst.try_into().unwrap();
-        *d = ((v as T) ^ ((flip as T) << (T::BITS - 1))).to_be_bytes();
+        *d = (image as T).to_be_bytes();
     })
 }
 
 /// [`store_opk`] appended to `buf` as one `width`-byte column.
 #[inline(always)]
-pub fn push_opk(buf: &mut Vec<u8>, width: usize, v: u128, flip: bool) {
+pub fn push_opk(buf: &mut Vec<u8>, width: usize, image: u128) {
     by_cell_width!(width, |T| {
-        let mut cell = [0u8; std::mem::size_of::<T>()];
-        store_opk(&mut cell, v, flip);
-        buf.extend_from_slice(&cell);
+        buf.extend_from_slice(&(image as T).to_be_bytes());
     })
 }
 
@@ -102,10 +99,24 @@ pub fn decode_opk_u128(opk: &[u8], tc: TypeCode) -> u128 {
 }
 
 /// The image of zero in a column of type `tc`: its sign bit if signed, else 0.
+/// Read from a table, so a client encoding a native value pays a load rather
+/// than a variable-width `u128` shift.
 #[inline(always)]
 pub fn opk_bias(tc: TypeCode) -> u128 {
-    (tc.is_signed_int() as u128) << (tc.wire_stride() * 8 - 1)
+    OPK_BIAS[tc.as_wire() as usize]
 }
+
+/// [`opk_bias`] by wire type code; a code past the table's end fails the build.
+const OPK_BIAS: [u128; 32] = {
+    let mut t = [0u128; 32];
+    let mut i = 0;
+    while i < TypeCode::ALL.len() {
+        let tc = TypeCode::ALL[i];
+        t[tc.as_wire() as usize] = (tc.is_signed_int() as u128) << (tc.wire_stride() * 8 - 1);
+        i += 1;
+    }
+    t
+};
 
 /// [`key_image`] of a `W`-byte native little-endian integer cell, `signed` its
 /// column's signedness: zero-extended, the sign bit of its width flipped.
@@ -131,9 +142,11 @@ pub fn decode_pk_cell(src: &[u8], signed: bool, dst: &mut [u8]) {
     })
 }
 
-/// Decode the `width`-byte PK column at byte `off` of each `stride`-byte row of `pk`
-/// into `dst`'s native little-endian cells, `width` bytes each.
-pub fn decode_pk_cells(pk: &[u8], stride: usize, off: usize, width: usize, signed: bool, dst: &mut [u8]) {
+/// Decode the PK column of type `tc` at byte `off` of each `stride`-byte row of `pk`
+/// into `dst`'s native little-endian cells, `tc.wire_stride()` bytes each.
+pub fn decode_pk_cells(pk: &[u8], stride: usize, off: usize, tc: TypeCode, dst: &mut [u8]) {
+    let (width, signed) = (tc.wire_stride(), tc.is_signed_int());
+    debug_assert_eq!(dst.len() % width, 0, "decode_pk_cells: whole cells");
     by_cell_width!(width, |T| {
         const W: usize = std::mem::size_of::<T>();
         zip_cells::<W, _>(pk, stride, off, dst.as_chunks_mut::<W>().0.iter_mut(), |s, d| {
@@ -142,21 +155,25 @@ pub fn decode_pk_cells(pk: &[u8], stride: usize, off: usize, width: usize, signe
     })
 }
 
-/// Encode `src`'s native little-endian cells, `width` bytes each, as the OPK column at
-/// byte `off` of each `stride`-byte row of `pk`: the inverse of [`decode_pk_cells`].
-#[allow(clippy::unnecessary_cast)] // `as u128` is the identity in the 16-byte arm
-pub fn encode_pk_cells(src: &[u8], width: usize, signed: bool, pk: &mut [u8], stride: usize, off: usize) {
+/// Encode `src`'s native little-endian cells of type `tc`, `tc.wire_stride()` bytes
+/// each, as the OPK column at byte `off` of each `stride`-byte row of `pk`: the inverse
+/// of [`decode_pk_cells`].
+pub fn encode_pk_cells(src: &[u8], tc: TypeCode, pk: &mut [u8], stride: usize, off: usize) {
+    let width = tc.wire_stride();
+    debug_assert_eq!(src.len() % width, 0, "encode_pk_cells: whole cells");
     by_cell_width!(width, |T| {
         const W: usize = std::mem::size_of::<T>();
         assert!(off + W <= stride, "a cell lies inside its row");
+        let bias = opk_bias(tc) as T;
         let cells = src.as_chunks::<W>().0;
         if stride == W {
             for (cell, dst) in cells.iter().zip(pk.as_chunks_mut::<W>().0) {
-                store_opk(dst, T::from_le_bytes(*cell) as u128, signed);
+                *dst = (T::from_le_bytes(*cell) ^ bias).to_be_bytes();
             }
         } else {
             for (cell, row) in cells.iter().zip(pk.chunks_exact_mut(stride)) {
-                store_opk(&mut row[off..off + W], T::from_le_bytes(*cell) as u128, signed);
+                let d: &mut [u8; W] = (&mut row[off..off + W]).try_into().unwrap();
+                *d = (T::from_le_bytes(*cell) ^ bias).to_be_bytes();
             }
         }
     })
@@ -407,16 +424,6 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     }
 }
 
-/// An integer column's cell as its value: under `OPK` a PK column's OPK image,
-/// else a payload column's native bytes.
-#[inline(always)]
-pub fn int_cell<const OPK: bool>(fi: crate::FixedInt, cell: &[u8]) -> i64 {
-    match OPK {
-        true => decode_opk_i64(cell, fi),
-        false => fi.decode_le_i64(cell),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Width-tagged PK byte buffer
 // ---------------------------------------------------------------------------
@@ -533,11 +540,12 @@ impl PkBuf {
         PkBuf { bytes, len: slice.len() as u8 }
     }
 
-    /// Extend the key by one `width`-byte column, written as [`store_opk`] writes it.
+    /// Extend the key by one `width`-byte column holding `image`, written as
+    /// [`store_opk`] writes it.
     #[inline(always)]
-    pub fn push(&mut self, width: usize, v: u128, flip: bool) {
+    pub fn push(&mut self, width: usize, image: u128) {
         let at = self.len as usize;
-        store_opk(&mut self.bytes[at..at + width], v, flip);
+        store_opk(&mut self.bytes[at..at + width], image);
         self.len = (at + width) as u8;
     }
 

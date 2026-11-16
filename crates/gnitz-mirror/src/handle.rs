@@ -265,7 +265,7 @@ impl MirrorStore for Mirror {
     /// entered empty otherwise.
     fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         let tid = desc.tid;
-        let block = desc.schema.to_block();
+        let record = desc.schema.to_record();
         let indexes = index_lists(desc);
         // This name at another id was renamed or recreated upstream.
         let renamed = self
@@ -276,7 +276,7 @@ impl MirrorStore for Mirror {
         if let Some(old) = renamed {
             self.forget(old)?;
         }
-        let same = |r: &&mut MirrorRecord| *r.block == *block && r.pk_repeats == desc.pk_repeats;
+        let same = |r: &&mut MirrorRecord| *r.schema == *record && r.pk_repeats == desc.pk_repeats;
         match self.records.get_mut(&tid).filter(same) {
             // A rename upstream keeps the id; a stale name here would match a
             // later view created under it.
@@ -297,7 +297,7 @@ impl MirrorStore for Mirror {
                     pk_repeats: desc.pk_repeats,
                     indexes,
                     feed: Feed::Empty,
-                    block: block.to_vec(),
+                    schema: record.to_vec(),
                 };
                 self.enter(tid, rec, *desc.schema.layout(), None)?;
             }

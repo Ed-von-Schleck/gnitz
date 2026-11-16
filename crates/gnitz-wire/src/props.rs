@@ -1,39 +1,6 @@
-//! The `TABLE_TAB.flags` word and a view's `WITH` options.
+//! A table's non-column properties and a view's `WITH` options.
 
 use std::num::NonZeroU64;
-
-// ---------------------------------------------------------------------------
-// TABLE_TAB.flags layout. Every bit outside the constants below is refused on
-// decode. `replicated` and a non-default prefix length are mutually exclusive (a
-// CLUSTER BY prefix is meaningless when every worker holds the full copy):
-// [`TableDistribution`] cannot represent both, and
-// [`TableDistribution::cluster_by`] refuses the pair for `TableProps::from_flags`
-// and the SQL planner alike.
-// ---------------------------------------------------------------------------
-
-/// Bit 0: the table is **replicated** — every worker holds an identical full
-/// copy (writes broadcast, reads single-source).
-const TABLE_FLAG_REPLICATED: u64 = 1;
-/// Bit 1: the table is a **stream** — a storeless, append-only ingestion point.
-/// Independent of the distribution: a stream may be replicated or CLUSTER BY'd.
-const TABLE_FLAG_STREAM: u64 = 1 << 1;
-/// Bit 2: the table's single PK column is **SERIAL** — INSERT draws it from the
-/// table's sequence.
-const TABLE_FLAG_SERIAL: u64 = 1 << 2;
-/// Bit 3: the table's store **compresses** its heaps — `WITH (compress = true)`.
-const TABLE_FLAG_COMPRESS: u64 = 1 << 3;
-/// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`;
-/// `0` there is the default, the full PK.
-const TABLE_FLAG_DIST_SHIFT: u32 = 8;
-/// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
-/// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte.
-const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
-/// Every bit a `TABLE_TAB.flags` word may carry.
-const TABLE_FLAGS_DEFINED: u64 = TABLE_FLAG_REPLICATED
-    | TABLE_FLAG_STREAM
-    | TABLE_FLAG_SERIAL
-    | TABLE_FLAG_COMPRESS
-    | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
 /// How a table's rows are spread over the workers.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -66,8 +33,8 @@ impl Default for TableDistribution {
     }
 }
 
-/// The logical content of `TABLE_TAB.flags`: the non-column properties of a
-/// `CREATE TABLE`.
+/// The non-column properties of a `CREATE TABLE`, as its `TABLE_TAB` row states
+/// them.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub struct TableProps {
     /// A storeless, append-only ingestion point rather than a table: it holds no
@@ -76,7 +43,7 @@ pub struct TableProps {
     /// INSERT draws the table's single PK column from a sequence.
     pub serial: bool,
     /// Where the rows live. A `Keyed` prefix is `CLUSTER BY` the PK's leading
-    /// prefix; the SQL planner validates it against the PK before packing.
+    /// prefix; the SQL planner validates it against the PK.
     pub distribution: TableDistribution,
     /// The table's store codes its shards' heaps under a symbol table where
     /// that pays.
@@ -84,42 +51,8 @@ pub struct TableProps {
 }
 
 impl TableProps {
-    /// Pack the persisted `TABLE_TAB.flags` u64. Inverse of `from_flags`.
-    #[inline]
-    pub fn pack(self) -> u64 {
-        let dist = match self.distribution {
-            TableDistribution::Keyed { prefix_len } => (prefix_len as u64) << TABLE_FLAG_DIST_SHIFT,
-            TableDistribution::Replicated => TABLE_FLAG_REPLICATED,
-        };
-        let bit = |set: bool, flag: u64| if set { flag } else { 0 };
-        dist | bit(self.stream, TABLE_FLAG_STREAM)
-            | bit(self.serial, TABLE_FLAG_SERIAL)
-            | bit(self.compress, TABLE_FLAG_COMPRESS)
-    }
-
-    /// Decode a persisted `TABLE_TAB.flags` u64, refusing a bit outside the
-    /// defined set and a replicated table that also carries a prefix.
-    pub(crate) fn from_flags(flags: u64) -> Result<TableProps, String> {
-        if flags & !TABLE_FLAGS_DEFINED != 0 {
-            return Err(format!("table flags {flags:#x} carry unknown bits"));
-        }
-        let prefix_len = ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as u8;
-        let distribution = if flags & TABLE_FLAG_REPLICATED == 0 {
-            TableDistribution::default()
-        } else {
-            TableDistribution::Replicated
-        }
-        .cluster_by(prefix_len)?;
-        Ok(TableProps {
-            stream: flags & TABLE_FLAG_STREAM != 0,
-            serial: flags & TABLE_FLAG_SERIAL != 0,
-            distribution,
-            compress: flags & TABLE_FLAG_COMPRESS != 0,
-        })
-    }
-
-    /// The rules against a PK of `pk_len` columns that the flags word cannot
-    /// encode.
+    /// The rules these properties must meet against a PK of `pk_len` columns,
+    /// and between each other.
     pub fn validate(&self, pk_len: usize) -> Result<(), String> {
         if let TableDistribution::Keyed { prefix_len } = self.distribution
             && prefix_len as usize > pk_len

@@ -73,7 +73,7 @@ fn assert_self_description(engine: &CatalogEngine) {
             .unwrap_or_else(|| panic!("family {} describes no columns", family.name()));
         rows.sort_by_key(|(idx, _)| *idx);
         let names: Vec<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
-        let expected: Vec<&str> = family.wire().cols.iter().map(|c| c.name).collect();
+        let expected: Vec<&str> = family.def().cols.iter().map(|c| c.name).collect();
         assert_eq!(names, expected, "family {} self-description", family.name());
     }
     // A fresh server holds no user tables, so the system families are the whole
@@ -105,7 +105,7 @@ fn an_unpublished_tables_family_is_reseeded_alone() {
     let dir = tmp.path().to_str().unwrap();
     let engine = CatalogEngine::open(dir, 1).unwrap();
 
-    let col_rows: usize = SysFamily::ALL.iter().map(|f| f.wire().cols.len()).sum();
+    let col_rows: usize = SysFamily::ALL.iter().map(|f| f.def().cols.len()).sum();
     for (family, rows) in [
         (SysFamily::Schema, 2),
         (SysFamily::Column, col_rows),
@@ -730,7 +730,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     let (_dir, mut engine) = empty_catalog(1);
 
     let stream = gnitz_wire::TableProps { stream: true, ..Default::default() };
-    for (name, flags) in [("dup_table", gnitz_wire::TableProps::default()), ("dup_stream", stream)] {
+    for (name, props) in [("dup_table", gnitz_wire::TableProps::default()), ("dup_stream", stream)] {
         let col_defs = vec![
             col_def("id", TypeCode::U64),
             col_def("a", TypeCode::I64),
@@ -742,7 +742,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
             (SysFamily::Column, col_tab_batch(tid, &col_defs, 1)),
             (
                 SysFamily::Table,
-                table_tab_row_words(tid, name, PkColList::from_slice(&[0]).pack(), flags),
+                table_tab_row_words(tid, name, PkColList::from_slice(&[0]).pack(), props),
             ),
         ];
         let err = apply_ddl(&mut engine, blocks).expect_err("a duplicate visible column name must be refused");
@@ -823,7 +823,7 @@ fn applied_ddl_reports_the_cascade_and_what_it_created() {
     let no_log = &mut |_: SysFamily, _: &Batch| Ok(());
 
     // A view over `views`: a CREATE VIEW writes a family a view scans.
-    let watcher = register_identity_view(&mut engine, gnitz_wire::VIEW_TAB, "w", &SysFamily::View.column_defs());
+    let watcher = register_identity_view(&mut engine, SysFamily::View.id(), "w", &SysFamily::View.column_defs());
     let base = engine
         .create_table("public.src", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
@@ -835,7 +835,7 @@ fn applied_ddl_reports_the_cascade_and_what_it_created() {
         .apply_bundle(bundle(view_blocks([(vid, &identity, &cols[..])], rows)), no_log)
         .unwrap();
     assert_eq!(created.created_views, [vid]);
-    assert_eq!(created.held_above, [gnitz_wire::VIEW_TAB]);
+    assert_eq!(created.held_above, [SysFamily::View.id()]);
     assert!(created.dropped_relations.is_empty() && created.dropped_indexes.is_empty());
     engine.drop_view("public.w").unwrap();
     assert!(engine.registry.relation(watcher).is_none());

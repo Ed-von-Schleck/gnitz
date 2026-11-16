@@ -19,10 +19,10 @@ use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
 use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch, sys_schema};
-use gnitz_wire::txn_frame::{self, FrameItem, encode_items, kept_as};
+use gnitz_wire::multi_frame::{self, FrameItem, encode_items, kept_as};
 use gnitz_wire::{
     CONNECT_TIMEOUT, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob, RelIndex,
-    WireConflictMode, WireLane, WireStatus, append_frame, peek_control_block,
+    SysFamily, WireConflictMode, WireLane, WireStatus, append_frame, peek_control_block,
 };
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
@@ -97,7 +97,7 @@ impl RawBlock {
     }
 }
 
-pub use gnitz_wire::txn_frame::{DeltaCursor, SubId};
+pub use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 
 // ── The request vocabulary ───────────────────────────────────────────────────
 
@@ -108,13 +108,13 @@ pub(crate) enum Request<'a> {
     AllocIds(u64),
     /// A run of `count` ids from the SERIAL sequence of `table`.
     AllocSerial { table: Target, count: u64 },
-    /// An atomic DDL transaction: system-table batches, each named by its table
-    /// id, under one durable SAL zone.
-    DdlTxn(&'a [(u64, ZSetBatch)]),
+    /// An atomic DDL transaction: system-family batches under one durable SAL
+    /// zone.
+    DdlTxn(&'a [(SysFamily, ZSetBatch)]),
     /// An atomic user-table push transaction: the server refuses it if some
     /// family's relation was written after that family's `basis`.
     PushTxn(&'a [PushFamily]),
-    /// PUSH. The frame always carries `schema`'s record.
+    /// PUSH. Its blob is always `schema`'s record.
     Push {
         target: Target,
         schema: &'a Schema,
@@ -135,11 +135,8 @@ impl Request<'_> {
         match *self {
             Request::AllocSerial { table, .. } => Ok(table.tid),
             Request::DdlTxn(families) => {
-                for (tid, batch) in families {
-                    if gnitz_wire::sys_family_index(*tid).is_none() {
-                        return Err(ClientError::from(format!("DDL family {tid} is not a system table")));
-                    }
-                    batch.check_shape(sys_schema(*tid))?;
+                for (family, batch) in families {
+                    batch.check_shape(sys_schema(*family))?;
                 }
                 Ok(0)
             }
@@ -173,27 +170,20 @@ impl Request<'_> {
             Request::Push { target, schema, batch, mode } => {
                 let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
                 hdr.flags.conflict_mode = mode;
-                return append_payload(out, hdr, &[], Some(schema.to_block()), Some(batch));
+                return append_payload(out, hdr, schema.to_record(), Some(batch));
             }
         };
-        append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None, None)
+        append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None)
     }
 }
 
 /// Append one frame payload, without the 4-byte length prefix, to `out`. An
-/// empty batch ships no data block, and still ships the schema record.
-pub(crate) fn append_payload(
-    out: &mut Vec<u8>,
-    hdr: ControlHeader,
-    blob: &[u8],
-    schema: Option<&[u8]>,
-    data: Option<&ZSetBatch>,
-) {
+/// empty batch ships no data block, and still ships the blob.
+pub(crate) fn append_payload(out: &mut Vec<u8>, hdr: ControlHeader, blob: &[u8], data: Option<&ZSetBatch>) {
     append_frame(
         out,
         &hdr,
         blob,
-        schema,
         data.filter(|b| !b.is_empty()).map(|b| b.wire_regions()).as_deref(),
     );
 }
@@ -225,7 +215,7 @@ pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
             target: f.target,
             conflict_mode: f.mode,
             basis: f.basis,
-            schema: Some(f.schema.to_block()),
+            blob: f.schema.to_record(),
             data: f.batch.wire_regions(),
         })
         .collect();
@@ -235,22 +225,22 @@ pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
 /// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes
 /// (without the 4-byte frame header). Each family is named by its system table id
 /// alone; its batch carries its own layout, which `Session::submit` validates
-/// against that id's system schema.
-pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
+/// against that family's schema.
+pub fn encode_ddl_txn(families: &[(SysFamily, ZSetBatch)]) -> Vec<u8> {
     let mut out = Vec::new();
     append_ddl_txn(&mut out, families);
     out
 }
 
 /// Append the frame [`encode_ddl_txn`] encodes to `out`.
-fn append_ddl_txn(out: &mut Vec<u8>, families: &[(u64, ZSetBatch)]) {
+fn append_ddl_txn(out: &mut Vec<u8>, families: &[(SysFamily, ZSetBatch)]) {
     let items: Vec<FrameItem> = families
         .iter()
-        .map(|(tid, b)| FrameItem {
-            target: Target::from(*tid),
+        .map(|(family, b)| FrameItem {
+            target: Target::from(*family),
             conflict_mode: WireConflictMode::default(),
             basis: 0,
-            schema: None,
+            blob: &[],
             data: b.wire_regions(),
         })
         .collect();
@@ -468,7 +458,6 @@ impl Inbox {
                 if h.flags.continuation
                     || h.status != WireStatus::Ok
                     || ctrl.data.is_some()
-                    || ctrl.schema.is_some()
                     || !ctrl.blob.is_empty()
                     || !ctrl.body.is_empty()
                 {
@@ -490,7 +479,7 @@ impl Inbox {
             }
             WireLane::SyncAnswer => {
                 let h = &ctrl.hdr;
-                if h.target_id != 0 || h.flags.continuation || ctrl.data.is_some() || ctrl.schema.is_some() {
+                if h.target_id != 0 || h.flags.continuation || ctrl.data.is_some() {
                     return Err(ProtocolError::DecodeError(
                         "a sync answer is one empty frame naming 0".into(),
                     ));
@@ -604,7 +593,7 @@ impl Session {
         let hdr = ControlHeader::naming(ClientVerb::Resolve, Target::from(0), 0);
         let (to, sent) = promise();
         self.enqueue(
-            |out| append_payload(out, hdr, qname.as_bytes(), None, None),
+            |out| append_payload(out, hdr, qname.as_bytes(), None),
             Slot::Resolve { to },
         );
         sent
@@ -645,7 +634,7 @@ impl Session {
             to,
         };
         let request = request.encode();
-        self.enqueue(|out| append_payload(out, hdr, &request, None, None), slot);
+        self.enqueue(|out| append_payload(out, hdr, &request, None), slot);
         sent
     }
 
@@ -659,10 +648,10 @@ impl Session {
             return Sent::ready(Err(ClientError::from("a multi-read names no relation")));
         }
         let specs: Vec<Vec<u8>> = scans.iter().map(|(_, spec, _)| spec.encode()).collect();
-        let items: Vec<txn_frame::ScanItem> = scans
+        let items: Vec<multi_frame::ScanItem> = scans
             .iter()
             .zip(&specs)
-            .map(|(&(target, _, schema), spec)| txn_frame::ScanItem {
+            .map(|(&(target, _, schema), spec)| multi_frame::ScanItem {
                 target,
                 reply_layout: schema.layout().layout_digest(),
                 spec,
@@ -677,7 +666,7 @@ impl Session {
             replies: Vec::with_capacity(scans.len()),
             to,
         };
-        self.enqueue(|out| txn_frame::encode_scan_multi(out, &items), slot);
+        self.enqueue(|out| multi_frame::encode_scan_multi(out, &items), slot);
         sent
     }
 
@@ -698,13 +687,13 @@ impl Session {
             keep,
             to,
         };
-        let item = txn_frame::DeltaPollItem {
+        let item = multi_frame::DeltaPollItem {
             view,
             from,
             reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
-        self.enqueue(|out| txn_frame::encode_delta_poll(out, &[item], keep), slot);
+        self.enqueue(|out| multi_frame::encode_delta_poll(out, &[item], keep), slot);
         sent
     }
 
@@ -725,9 +714,9 @@ impl Session {
             u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
         };
         let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms);
-        let named = txn_frame::encode_held(polls.subs.keys().copied());
+        let named = multi_frame::encode_held(polls.subs.keys().copied());
         let (mut to, sent) = promise();
-        match self.admit(|out| append_payload(out, hdr, &named, None, None)) {
+        match self.admit(|out| append_payload(out, hdr, &named, None)) {
             Ok(()) => {
                 self.inbox.syncing.push_back(to);
                 self.inbox.polls.server_holds = !self.inbox.polls.subs.is_empty();
@@ -764,7 +753,7 @@ impl Session {
     /// queues for [`Self::next_polled`], in order, and a request the session
     /// refuses ends each with the refusal. A view answered with a cursor stays
     /// subscribed from it, item `i` as [`kept_as`]`(first, i)`.
-    pub(crate) fn submit_delta_poll(&mut self, first: SubId, views: &[txn_frame::DeltaPollItem]) {
+    pub(crate) fn submit_delta_poll(&mut self, first: SubId, views: &[multi_frame::DeltaPollItem]) {
         if views.is_empty() {
             return;
         }
@@ -774,7 +763,7 @@ impl Session {
             poll: self.inbox.polls.live,
             first,
         };
-        self.enqueue(|out| txn_frame::encode_delta_poll(out, views, Some(first)), slot);
+        self.enqueue(|out| multi_frame::encode_delta_poll(out, views, Some(first)), slot);
     }
 
     /// Queue the frame `encode` appends, whose reply `slot` reads. A request
@@ -993,14 +982,6 @@ impl Slot {
         if let Some(want) = want.filter(|&want| want != named) {
             return Err(out_of_order(want, named));
         }
-        // Only a RESOLVE is answered in the server's schema; every read decodes
-        // under the schema its request named.
-        if ctrl.schema.is_some() && !matches!(self, Slot::Resolve { .. }) {
-            return Err(ProtocolError::DecodeError(
-                "a schema block on a reply whose request named its schema".into(),
-            ));
-        }
-
         match (&mut *self, ctrl.data.clone()) {
             (_, None) => {}
             (Slot::DeltaPoll { poll, .. }, Some(block)) => {
@@ -1037,7 +1018,7 @@ impl Slot {
         // The train terminated; a train slot's last block is still in `buf`.
         let last = || ctrl.data.clone().map(|block| &buf[block]);
         let cursor = || {
-            DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
+            DeltaCursor::from_pair(ctrl.hdr.arg0, ctrl.hdr.arg1)
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))
         };
         match self {
@@ -1120,12 +1101,8 @@ fn resolve_descriptor(ctrl: &DecodedControl, frame: &[u8]) -> Result<Option<Arc<
     if ctrl.hdr.target_id == 0 {
         return Ok(None);
     }
-    let schema = ctrl
-        .schema
-        .clone()
-        .ok_or_else(|| ProtocolError::DecodeError("RESOLVE reply carries no schema".into()))?;
-    let schema = Arc::new(Schema::from_block(&frame[schema]).map_err(ProtocolError::DecodeError)?);
     let desc = RelDescriptorBlob::decode(&frame[ctrl.blob.clone()]).map_err(ProtocolError::DecodeError)?;
+    let schema = Arc::new(Schema::from_record(&desc.schema).map_err(ProtocolError::DecodeError)?);
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
         class: desc.class,

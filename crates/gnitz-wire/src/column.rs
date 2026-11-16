@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::ColType;
-use crate::schema_block::SchemaBlockCol;
+use crate::schema_record::RecordCol;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -39,8 +39,8 @@ impl ColumnDef {
     }
 
     /// This column's entry in a schema record.
-    pub fn block_col(&self) -> SchemaBlockCol<'_> {
-        SchemaBlockCol {
+    pub fn record_col(&self) -> RecordCol<'_> {
+        RecordCol {
             ty: self.ty,
             nullable: self.is_nullable,
             hidden: self.is_hidden,

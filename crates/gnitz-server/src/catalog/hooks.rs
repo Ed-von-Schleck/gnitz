@@ -6,7 +6,7 @@ use gnitz_zset::repr::Batch;
 use super::CatalogEngine;
 use super::relations::{FkEdge, RelationEntry};
 use super::sys_tables::{
-    IdSet, PkShape, RelDetail, RelRow, SysFamily, build_schema_from_col_defs, pk_signatures, read_rel_row,
+    IdSet, PkShape, RelDetail, RelRow, SysFamily, SysFamilyExt, build_schema_from_col_defs, pk_signatures, read_rel_row,
 };
 
 impl CatalogEngine {
@@ -48,7 +48,7 @@ impl CatalogEngine {
                 let circuit = self.read_circuit(rel.id)?;
                 let chain = owner.unwrap_or(rel.id);
                 for src in circuit.sources() {
-                    if SysFamily::from_id(src).is_some_and(SysFamily::master_only) {
+                    if SysFamily::from_id(src).is_some_and(SysFamilyExt::master_only) {
                         return Err(format!(
                             "reads '{}', which holds no set a view can scan",
                             self.qualified_name(src)

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gnitz_wire::snapshot::PageRequest;
-use gnitz_wire::{PkBuf, SeqTabRow};
+use gnitz_wire::{PkBuf, SeqTabRow, SysFamily};
 
 use crate::catalog::CATALOG_FAMILIES;
 use crate::connection::{Request, SnapshotPage};
@@ -93,10 +93,11 @@ impl GnitzClient {
         }
     }
 
-    /// Every row of relation `tid` as snapshot `id` holds it, in one batch.
-    async fn snapshot_rows(&mut self, id: u64, tid: u64, schema: &Arc<Schema>) -> Result<ZSetBatch, ClientError> {
+    /// Every row of `family` as snapshot `id` holds it, in one batch.
+    async fn snapshot_rows(&mut self, id: u64, family: SysFamily) -> Result<ZSetBatch, ClientError> {
+        let schema = sys_schema(family);
         let mut all = ZSetBatch::new(schema);
-        self.snapshot_read(id, tid, schema, DEFAULT_PAGE_ROWS, |batch| {
+        self.snapshot_read(id, family.id(), schema, DEFAULT_PAGE_ROWS, |batch| {
             all.extend_from_owned(batch);
             Ok::<_, ClientError>(())
         })
@@ -108,7 +109,7 @@ impl GnitzClient {
     pub async fn snapshot_catalog(&mut self, id: u64) -> Result<Catalog, ClientError> {
         let mut families = Vec::with_capacity(CATALOG_FAMILIES.len());
         for family in CATALOG_FAMILIES {
-            families.push(self.snapshot_rows(id, family, sys_schema(family)).await?);
+            families.push(self.snapshot_rows(id, family).await?);
         }
         let families: [ZSetBatch; CATALOG_FAMILIES.len()] = families.try_into().expect("one batch per family");
         Ok(Catalog::decode(&families)?)
@@ -117,9 +118,7 @@ impl GnitzClient {
     /// Each SERIAL table's id and the last id its sequence has handed out, as
     /// snapshot `id` holds them.
     pub async fn snapshot_serials(&mut self, id: u64) -> Result<HashMap<u64, u64>, ClientError> {
-        let rows = self
-            .snapshot_rows(id, gnitz_wire::SEQ_TAB, sys_schema(gnitz_wire::SEQ_TAB))
-            .await?;
+        let rows = self.snapshot_rows(id, SysFamily::Sequence).await?;
         Ok(rows
             .live_rows()
             .map(|i| {

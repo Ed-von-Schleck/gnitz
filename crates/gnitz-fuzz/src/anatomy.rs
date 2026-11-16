@@ -15,8 +15,8 @@ use gnitz_core::{Schema, sys_schema};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::fields::{self, Field, List, Section};
 use gnitz_wire::{
-    Circuit, ClientVerb, DecodedControl, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, ReadSpec,
-    peek_control_block, txn_frame, wal,
+    Circuit, ClientVerb, DecodedControl, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, ReadSpec, multi_frame,
+    peek_control_block, wal,
 };
 
 /// One data block, and the schema its rows decode under.
@@ -165,17 +165,27 @@ fn offset(root: &[u8], part: &[u8]) -> usize {
 /// Map `frame`, a slice of `root` whose control block is `ctrl`, and the
 /// structures nested in it.
 fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Anatomy) {
-    let verb = ctrl.hdr.flags.verb;
+    // A frame naming no verb is a reply's, and nests nothing a client sends.
+    let Some(verb) = ctrl.hdr.flags.verb else { return };
     let blob = &frame[ctrl.blob.clone()];
-    match verb {
-        ClientVerb::SyncPushed => drop(attempt(root, anatomy, || txn_frame::decode_held(blob))),
-        ClientVerb::SnapshotPage => drop(attempt(root, anatomy, || {
-            gnitz_wire::snapshot::PageRequest::decode(blob)
-        })),
+    // The schema of the frame's data block, decoding its blob on the way.
+    let schema = match verb {
+        ClientVerb::SyncPushed => attempt(root, anatomy, || multi_frame::decode_held(blob)).and(None),
+        ClientVerb::SnapshotPage => {
+            attempt(root, anatomy, || gnitz_wire::snapshot::PageRequest::decode(blob)).and(None)
+        }
+        // A push's blob is its rows' schema record. A multi-item prologue's blob
+        // is empty; its items carry the records.
+        ClientVerb::Push | ClientVerb::PushTxn if !blob.is_empty() => {
+            attempt(root, anatomy, || Schema::from_record(blob)).map(Arc::new)
+        }
+        // A DDL_TXN item's rows are its system family's, which the item names.
+        ClientVerb::DdlTxn => {
+            gnitz_wire::SysFamily::from_id(ctrl.hdr.target_id).map(|family| Arc::clone(sys_schema(family)))
+        }
         // Their blob is untyped bytes or empty.
         ClientVerb::Push
         | ClientVerb::PushTxn
-        | ClientVerb::DdlTxn
         | ClientVerb::Resolve
         | ClientVerb::AllocSerialRange
         | ClientVerb::AllocIds
@@ -183,15 +193,7 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
         | ClientVerb::SnapshotClose
         | ClientVerb::Backup
         | ClientVerb::DeltaPoll
-        | ClientVerb::ScanMulti => {}
-    }
-    let schema = match &ctrl.schema {
-        Some(s) => attempt(root, anatomy, || Schema::from_block(&frame[s.clone()])).map(Arc::new),
-        // A DDL_TXN item's rows are its system family's, which the item names.
-        None if verb == ClientVerb::DdlTxn => gnitz_wire::sys_family_index(ctrl.hdr.target_id)
-            .is_some()
-            .then(|| Arc::clone(sys_schema(ctrl.hdr.target_id))),
-        None => None,
+        | ClientVerb::ScanMulti => None,
     };
     if let (Some(data), Some(schema)) = (ctrl.data.clone(), schema) {
         walk_block(root, &frame[data], schema, anatomy);
@@ -201,21 +203,21 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
         return;
     }
     // ScanMulti and DeltaPoll items nest a ReadSpec; every other multi-item
-    // verb's items are frames, as `txn_frame::item_shape` decides.
+    // verb's items are frames.
     match verb {
         ClientVerb::ScanMulti => {
-            for s in attempt(root, anatomy, || txn_frame::decode_scan_multi(body)).unwrap_or_default() {
+            for s in attempt(root, anatomy, || multi_frame::decode_scan_multi(body)).unwrap_or_default() {
                 attempt(root, anatomy, || ReadSpec::decode(s.spec));
             }
         }
         ClientVerb::DeltaPoll => {
-            for p in attempt(root, anatomy, || txn_frame::decode_delta_items(body)).unwrap_or_default() {
+            for p in attempt(root, anatomy, || multi_frame::decode_delta_items(body)).unwrap_or_default() {
                 attempt(root, anatomy, || ReadSpec::decode(p.spec));
             }
         }
         _ => {
             if let Some(items) = attempt(root, anatomy, || {
-                txn_frame::decode_items(frame, ctrl.body.clone(), verb)
+                multi_frame::decode_items(frame, ctrl.body.clone(), verb)
             }) {
                 for item in items {
                     walk_frame(root, frame, item, anatomy);

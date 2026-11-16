@@ -10,20 +10,20 @@ use std::fmt;
 
 use gnitz_wire::{
     CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkRef, IdxTabRow, PkColList, RelClass, SYSTEM_SCHEMA,
-    SchemaTabRow, TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, qualified_key,
+    SchemaTabRow, SysFamily, TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, qualified_key,
 };
 
 use crate::{ProtocolError, RelName, ZSetBatch};
 
 /// The families a [`Catalog`] is decoded from, in the order
 /// [`Catalog::decode`] takes their rows.
-pub(crate) const CATALOG_FAMILIES: [u64; 6] = [
-    gnitz_wire::SCHEMA_TAB,
-    gnitz_wire::TABLE_TAB,
-    gnitz_wire::VIEW_TAB,
-    gnitz_wire::COL_TAB,
-    gnitz_wire::IDX_TAB,
-    gnitz_wire::CIRCUIT_TAB,
+pub(crate) const CATALOG_FAMILIES: [SysFamily; 6] = [
+    SysFamily::Schema,
+    SysFamily::Table,
+    SysFamily::View,
+    SysFamily::Column,
+    SysFamily::Index,
+    SysFamily::Circuit,
 ];
 
 /// One live secondary index, as its IDX_TAB row states it.

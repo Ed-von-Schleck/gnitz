@@ -5,8 +5,8 @@
 //! joins, the reduce / clamp / null-fill / filter node counts. Projection lists, map counts, union
 //! counts and node numbering are free to change.
 
-use gnitz_wire::{Circuit, OpNode, TypeCode};
 use gnitz_wire::{ClampKind, JoinKind, ReadBound};
+use gnitz_wire::{OpNode, TypeCode};
 
 use super::*;
 
@@ -54,14 +54,13 @@ impl Node {
         Window,
     ];
 
-    fn matches(self, circuit: &Circuit, nid: gnitz_wire::NodeId) -> bool {
-        let op = circuit.op(nid);
+    fn matches(self, op: &OpNode) -> bool {
         match self {
             EquiJoin => matches!(op, OpNode::Join(JoinKind::Equi)),
             RangeJoin => matches!(op, OpNode::Join(JoinKind::Range { .. })),
             CrossJoin => matches!(op, OpNode::Join(JoinKind::Cross)),
             Reduce => matches!(op, OpNode::Reduce { .. }),
-            GlobalGround => circuit.owes_ground_row(nid),
+            GlobalGround => op.owes_ground_row(),
             Distinct => matches!(op, OpNode::WeightClamp(ClampKind::Distinct)),
             PositivePart => matches!(op, OpNode::WeightClamp(ClampKind::PositivePart)),
             NullExtend => matches!(op, OpNode::NullExtend { .. }),
@@ -89,13 +88,17 @@ fn cat() -> TestCatalog {
 /// How many nodes of every segment are a `kind`.
 fn total(chain: &ViewBundle, kind: Node) -> usize {
     all_views(chain)
-        .map(|pv| {
-            pv.circuit
-                .ops()
-                .filter(|&(nid, _)| kind.matches(&pv.circuit, nid))
-                .count()
-        })
+        .map(|pv| pv.circuit.ops().filter(|&(_, op)| kind.matches(op)).count())
         .sum()
+}
+
+/// The columns of its input `op` groups by, for an operator that groups.
+fn group_cols(op: &OpNode) -> Option<&[u32]> {
+    match op {
+        OpNode::Reduce { group, .. } | OpNode::Window { group, .. } => Some(&group.group_cols),
+        OpNode::TopN { group_cols, .. } => Some(group_cols),
+        _ => None,
+    }
 }
 
 /// Every exchange of every segment, by the group columns of the reduce, top-N
@@ -104,7 +107,7 @@ fn exchanges(chain: &ViewBundle) -> Vec<Option<Vec<u32>>> {
     let mut out: Vec<Option<Vec<u32>>> = all_views(chain)
         .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
         .filter(|op| op.exchanges())
-        .map(|op| op.group_cols().map(<[u32]>::to_vec))
+        .map(|op| group_cols(op).map(<[u32]>::to_vec))
         .collect();
     out.sort();
     out
@@ -414,12 +417,12 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     // carries a user aggregate.
     let chain = view(&cat, BODY);
     let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = all_views(&chain)
-        .flat_map(|pv| pv.circuit.ops().map(|(nid, op)| (&pv.circuit, nid, op)))
-        .filter_map(|(circuit, nid, op)| match op {
+        .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
+        .filter_map(|op| match op {
             OpNode::Reduce { group: g, .. } => Some((
                 g.group_cols.clone(),
                 g.aggs.iter().map(|d| d.agg_op).collect(),
-                circuit.owes_ground_row(nid),
+                op.owes_ground_row(),
             )),
             _ => None,
         })
@@ -481,7 +484,7 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
         let chain = view(&cat, body);
         let groups: Vec<&[u32]> = all_views(&chain)
             .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
-            .filter_map(|op| op.group_cols())
+            .filter_map(group_cols)
             .collect();
         assert!(!groups.is_empty(), "{body}: no reduce or top-N");
         assert!(groups.iter().all(|g| *g == want), "{body}: {groups:?}");

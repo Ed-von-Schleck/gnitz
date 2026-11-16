@@ -132,7 +132,7 @@ impl RowFilter {
             return &mut self.runs;
         }
         self.mark(mb, rows);
-        gnitz_wire::set_bit_runs(&self.words, n, &mut self.runs);
+        gnitz_wire::set_bit_runs(self.words.iter().copied(), n, &mut self.runs);
         for run in &mut self.runs {
             *run = (run.0 + start, run.1 + start);
         }

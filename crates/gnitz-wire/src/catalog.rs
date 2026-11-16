@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use crate::{ColType, ColumnDef, PkColList, PkListRole, RowSource, TableProps, TypeCode, ViewBudget, ViewProps};
+use crate::{
+    ColType, ColumnDef, PkColList, PkListRole, RowSource, TableDistribution, TableProps, TypeCode, ViewBudget,
+    ViewProps,
+};
 
 /// Where a row writer emits a row. Both sides already build batches this way —
 /// begin a row with its key and weight, push one value per payload column in
@@ -31,7 +34,7 @@ pub trait SysRowSink {
 /// engine's seed rows write them.
 pub trait SysRow {
     /// The family the row belongs to.
-    const FAMILY: u64;
+    const FAMILY: SysFamily;
     fn write(&self, sink: &mut (impl SysRowSink + ?Sized), weight: i64);
 }
 
@@ -61,20 +64,19 @@ impl WireSysFamily {
     }
 }
 
-/// Declare one system family from one field list: its table id const, its
-/// [`WireSysFamily`], the struct holding the cells a row stores, its payload-slot
-/// enum, and the writer and the reader, which decodes every typed cell.
+/// Declare one system family from one field list: the
+/// [`WireSysFamily`] its [`SysFamily`] variant's [`SysFamily::def`] returns, the
+/// struct holding the cells a row stores, its payload-slot enum, and the writer
+/// and the reader, which decodes every typed cell.
 macro_rules! sys_row {
     (
         $(#[$meta:meta])*
-        $FAMILY:ident = $id:literal, $name:literal, $fam:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
+        $id:literal, $name:literal, $Variant:ident / $fam:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
         key { $($k:ident),+ $(,)? }
         payload { $($(#[$pmeta:meta])* $p:ident: $tc:ident),+ $(,)? }
     ) => {
-        pub const $FAMILY: u64 = $id;
-
-        pub(crate) const $fam: WireSysFamily = WireSysFamily {
-            id: $FAMILY,
+        const $fam: WireSysFamily = WireSysFamily {
+            id: $id,
             name: $name,
             cols: &[
                 $(WireSysCol { name: stringify!($k), type_code: TypeCode::U64 },)+
@@ -82,6 +84,10 @@ macro_rules! sys_row {
             ],
             pk_cols: SYS_KEY_COLS.split_at([$(stringify!($k)),+].len()).0,
         };
+        const _: () = assert!(
+            SysFamily::$Variant.def().id == $id,
+            concat!("SysFamily::", stringify!($Variant), " names another family's definition")
+        );
 
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +97,7 @@ macro_rules! sys_row {
         }
 
         impl $(<$lt>)? SysRow for $Row $(<$lt>)? {
-            const FAMILY: u64 = $FAMILY;
+            const FAMILY: SysFamily = SysFamily::$Variant;
             fn write(&self, sink: &mut (impl SysRowSink + ?Sized), weight: i64) {
                 sink.begin_row(&[$(self.$k as u128),+], weight);
                 $(sys_row!(@put sink, self.$p, $tc);)+
@@ -122,9 +128,8 @@ macro_rules! sys_row {
             }
         }
     };
-    // `Bool`, `Key`, `Cols` and `Props` are stored as `U64` words: a boolean, a
-    // [`PkColList::pack`] read as a primary key or as an index's column list,
-    // and a [`TableProps::pack`].
+    // `Bool`, `Key` and `Cols` are stored as `U64` words: a boolean, and a
+    // [`PkColList::pack`] read as a primary key or as an index's column list.
     (@tc String) => { TypeCode::String };
     (@tc Blob) => { TypeCode::Blob };
     (@tc $other:ident) => { TypeCode::U64 };
@@ -132,7 +137,6 @@ macro_rules! sys_row {
     (@ty Bool) => { bool };
     (@ty Key) => { PkColList };
     (@ty Cols) => { PkColList };
-    (@ty Props) => { TableProps };
     (@ty String) => { std::borrow::Cow<'a, str> };
     (@ty Blob) => { std::borrow::Cow<'a, [u8]> };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, U64) => { crate::payload_u64($s, $r, $pi) };
@@ -145,9 +149,6 @@ macro_rules! sys_row {
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, Cols) => {
         PkColList::unpack_as(crate::payload_u64($s, $r, $pi), PkListRole::ColumnList)?
     };
-    (@get $s:ident, $r:ident, $pi:expr, $p:ident, Props) => {
-        TableProps::from_flags(crate::payload_u64($s, $r, $pi)).map_err(|e| format!("{}: {e}", stringify!($p)))?
-    };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, Blob) => { crate::payload_bytes($s, $r, $pi) };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, String) => {
         crate::payload_str($s, $r, $pi).map_err(|_| format!("{} is not UTF-8", stringify!($p)))?
@@ -156,34 +157,42 @@ macro_rules! sys_row {
     (@put $s:ident, $v:expr, Bool) => { $s.put_u64($v as u64) };
     (@put $s:ident, $v:expr, Key) => { $s.put_u64($v.pack()) };
     (@put $s:ident, $v:expr, Cols) => { $s.put_u64($v.pack()) };
-    (@put $s:ident, $v:expr, Props) => { $s.put_u64($v.pack()) };
     (@put $s:ident, $v:expr, String) => { $s.put_string(&$v) };
     (@put $s:ident, $v:expr, Blob) => { $s.put_bytes(&$v) };
 }
 
 sys_row! {
     /// One `SCHEMA_TAB` row: the schema `schema_id`, named `name`.
-    SCHEMA_TAB = 1, "schemas", SCHEMA_TAB_FAMILY, SchemaTabRow<'a>, SchemaTabSlot -> String,
+    1, "schemas", Schema / SCHEMA_TAB_FAMILY, SchemaTabRow<'a>, SchemaTabSlot -> String,
     key { schema_id }
     payload { name: String }
 }
 
 sys_row! {
     /// One `TABLE_TAB` row.
-    TABLE_TAB = 2, "tables", TABLE_TAB_FAMILY, TableTabRow<'a>, TableTabSlot -> String,
+    2, "tables", Table / TABLE_TAB_FAMILY, TableTabRow<'a>, TableTabSlot -> String,
     key { table_id }
     payload {
         schema_id: U64,
         name: String,
         pk_col_idx: Key,
-        /// The table's non-column properties, packed by [`TableProps::pack`].
-        flags: Props,
+        /// [`TableProps::stream`].
+        stream: Bool,
+        /// [`TableProps::serial`].
+        serial: Bool,
+        /// The table is [`TableDistribution::Replicated`].
+        replicated: Bool,
+        /// A keyed table's [`TableDistribution::Keyed`] prefix length, `0` for
+        /// the full PK; `0` for a replicated table.
+        dist_prefix: U64,
+        /// [`TableProps::compress`].
+        compress: Bool,
     }
 }
 
 sys_row! {
     /// One `VIEW_TAB` row.
-    VIEW_TAB = 3, "views", VIEW_TAB_FAMILY, ViewTabRow<'a>, ViewTabSlot -> String,
+    3, "views", View / VIEW_TAB_FAMILY, ViewTabRow<'a>, ViewTabSlot -> String,
     key { view_id }
     payload {
         schema_id: U64,
@@ -214,7 +223,7 @@ sys_row! {
 sys_row! {
     /// One `COL_TAB` row: column `col_idx` of the table or view `owner_id`. The
     /// pair is a column record's identity.
-    COL_TAB = 4, "columns", COL_TAB_FAMILY, ColTabRow<'a>, ColTabSlot -> String,
+    4, "columns", Column / COL_TAB_FAMILY, ColTabRow<'a>, ColTabSlot -> String,
     key { owner_id, col_idx }
     payload {
         name: String,
@@ -238,7 +247,7 @@ sys_row! {
 
 sys_row! {
     /// One `IDX_TAB` row: the index `index_id` on columns of `owner_id`.
-    IDX_TAB = 5, "indices", IDX_TAB_FAMILY, IdxTabRow<'a>, IdxTabSlot -> String,
+    5, "indices", Index / IDX_TAB_FAMILY, IdxTabRow<'a>, IdxTabSlot -> String,
     key { index_id }
     payload {
         owner_id: U64,
@@ -252,14 +261,14 @@ sys_row! {
 
 sys_row! {
     /// One `SEQ_TAB` row.
-    SEQ_TAB = 7, "sequences", SEQ_TAB_FAMILY, SeqTabRow, SeqTabSlot -> std::convert::Infallible,
+    7, "sequences", Sequence / SEQ_TAB_FAMILY, SeqTabRow, SeqTabSlot -> std::convert::Infallible,
     key { seq_id }
     payload { next_val: U64 }
 }
 
 sys_row! {
     /// `view_id`'s one `CIRCUIT_TAB` row.
-    CIRCUIT_TAB = 11, "circuits", CIRCUIT_TAB_FAMILY, CircuitRow<'a>, CircuitSlot -> std::convert::Infallible,
+    11, "circuits", Circuit / CIRCUIT_TAB_FAMILY, CircuitRow<'a>, CircuitSlot -> std::convert::Infallible,
     key { view_id }
     payload {
         /// The view's whole circuit, as [`crate::Circuit::encode`] lays it out.
@@ -267,33 +276,110 @@ sys_row! {
     }
 }
 
-/// Every system family, in the order both sides index them by. The engine
-/// applies a bundle's families in this order.
-pub const SYS_FAMILIES: &[WireSysFamily] = &[
-    SCHEMA_TAB_FAMILY,
-    COL_TAB_FAMILY,
-    CIRCUIT_TAB_FAMILY,
-    TABLE_TAB_FAMILY,
-    VIEW_TAB_FAMILY,
-    IDX_TAB_FAMILY,
-    SEQ_TAB_FAMILY,
-];
+/// Declare [`SysFamily`] from one list in apply order: each variant and the
+/// [`WireSysFamily`] its [`SysFamily::def`] returns.
+macro_rules! sys_families {
+    ($(#[$meta:meta])* $($Variant:ident => $fam:ident,)+) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SysFamily {
+            $($Variant,)+
+        }
+
+        impl SysFamily {
+            pub const COUNT: usize = [$(SysFamily::$Variant),+].len();
+
+            /// Every family, in apply order.
+            pub const ALL: [SysFamily; Self::COUNT] = [$(SysFamily::$Variant),+];
+
+            /// This family's wire identity: its table id, its name and its column
+            /// shape.
+            pub const fn def(self) -> &'static WireSysFamily {
+                match self {
+                    $(SysFamily::$Variant => &$fam,)+
+                }
+            }
+        }
+    };
+}
+
+sys_families! {
+    /// A system family. Declared in apply order — the engine applies a bundle's
+    /// families, and a boot's replay, in this order — and the discriminant is the
+    /// position, the index every per-family array on either side is laid out by.
+    Schema => SCHEMA_TAB_FAMILY,
+    Column => COL_TAB_FAMILY,
+    Circuit => CIRCUIT_TAB_FAMILY,
+    Table => TABLE_TAB_FAMILY,
+    View => VIEW_TAB_FAMILY,
+    Index => IDX_TAB_FAMILY,
+    Sequence => SEQ_TAB_FAMILY,
+}
+
+impl SysFamily {
+    /// This family's position in [`Self::ALL`].
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// This family's table id.
+    #[inline]
+    pub const fn id(self) -> u64 {
+        self.def().id
+    }
+
+    /// This family's name in `TABLE_TAB`.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        self.def().name
+    }
+
+    /// What one of this family's rows is called in a message.
+    pub const fn row_noun(self) -> &'static str {
+        match self {
+            SysFamily::Schema => "schema",
+            SysFamily::Table => "table",
+            SysFamily::View => "view",
+            SysFamily::Column => "column",
+            SysFamily::Index => "index",
+            SysFamily::Sequence => "sequence",
+            SysFamily::Circuit => "circuit",
+        }
+    }
+
+    /// The family whose table id is `id`; `None` for any other id.
+    pub const fn from_id(id: u64) -> Option<Self> {
+        let mut i = 0;
+        while i < Self::COUNT {
+            if Self::ALL[i].id() == id {
+                return Some(Self::ALL[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+// No two families share an id.
+const _: () = {
+    let mut i = 0;
+    while i < SysFamily::COUNT {
+        let mut j = 0;
+        while j < i {
+            assert!(
+                SysFamily::ALL[j].id() != SysFamily::ALL[i].id(),
+                "two system families share an id"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// A system family's key columns are a prefix of these: its leading one or two,
 /// each a `U64`.
 const SYS_KEY_COLS: &[u32] = &[0, 1];
-
-/// Position of family `id` in [`SYS_FAMILIES`], or `None` for a non-family id.
-pub const fn sys_family_index(id: u64) -> Option<usize> {
-    let mut i = 0;
-    while i < SYS_FAMILIES.len() {
-        if SYS_FAMILIES[i].id == id {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
 
 /// The OPK of system id `id`: a single-column family's whole key, and the
 /// leading-column prefix of a pair-keyed one's. Every system key column is a U64.
@@ -434,12 +520,57 @@ impl<'a> ColTabRow<'a> {
     }
 }
 
-impl TableTabRow<'_> {
-    /// The row's `flags`, held to the rules the word cannot encode against its
-    /// key.
+impl<'a> TableTabRow<'a> {
+    /// Table `table_id` of schema `schema_id`, named `name`, keyed `pk_col_idx`,
+    /// with `props`.
+    pub fn of(
+        table_id: u64,
+        schema_id: u64,
+        name: impl Into<std::borrow::Cow<'a, str>>,
+        pk_col_idx: PkColList,
+        props: TableProps,
+    ) -> Self {
+        let (replicated, dist_prefix) = match props.distribution {
+            TableDistribution::Keyed { prefix_len } => (false, prefix_len as u64),
+            TableDistribution::Replicated => (true, 0),
+        };
+        TableTabRow {
+            table_id,
+            schema_id,
+            name: name.into(),
+            pk_col_idx,
+            stream: props.stream,
+            serial: props.serial,
+            replicated,
+            dist_prefix,
+            compress: props.compress,
+        }
+    }
+
+    /// The row's properties: [`Self::of`]'s inverse, held to the rules they must
+    /// meet against the row's key.
     pub fn props(&self) -> Result<TableProps, String> {
-        self.flags.validate(self.pk_col_idx.as_slice().len())?;
-        Ok(self.flags)
+        let prefix_len = u8::try_from(self.dist_prefix).map_err(|_| {
+            format!(
+                "table record carries dist_prefix = {}, past {}",
+                self.dist_prefix,
+                u8::MAX
+            )
+        })?;
+        let distribution = if self.replicated {
+            TableDistribution::Replicated
+        } else {
+            TableDistribution::default()
+        }
+        .cluster_by(prefix_len)?;
+        let props = TableProps {
+            stream: self.stream,
+            serial: self.serial,
+            distribution,
+            compress: self.compress,
+        };
+        props.validate(self.pk_col_idx.as_slice().len())?;
+        Ok(props)
     }
 }
 
@@ -517,15 +648,15 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
 /// [`crate::WIRE_VERSION`] each XOR this in, so each moves when a family's shape
 /// does, with no hand bump.
 ///
-/// The family half is folded straight over [`SYS_FAMILIES`], so a family added
+/// The family half is folded straight over [`SysFamily::ALL`], so a family added
 /// there is covered without a second edit. The version consts cover what that
 /// fold cannot see: a `Blob` column's bytes are as durable as its neighbours',
 /// but its internal layout is invisible to a fold over names and types.
 pub const SYS_SCHEMA_DIGEST: u64 = {
     let mut h = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
-    while i < SYS_FAMILIES.len() {
-        h = fold_family(h, &SYS_FAMILIES[i]);
+    while i < SysFamily::COUNT {
+        h = fold_family(h, SysFamily::ALL[i].def());
         i += 1;
     }
     h = (h ^ crate::circuit::CIRCUIT_VERSION as u64).wrapping_mul(FNV_PRIME);

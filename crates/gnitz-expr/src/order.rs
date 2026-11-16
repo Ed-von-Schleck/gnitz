@@ -43,7 +43,7 @@ pub fn order_locators(order: &[OrderKey], schema: &SchemaDescriptor, total: bool
         );
     };
     for k in order {
-        let (_, loc) = schema.wire_col("order key column", u32::from(k.col))?;
+        let (_, loc) = schema.wire_col("order key column", k.col)?;
         push(loc, k.desc, k.nulls_first);
     }
     if total {

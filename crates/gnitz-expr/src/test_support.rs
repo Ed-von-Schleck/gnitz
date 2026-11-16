@@ -68,7 +68,10 @@ impl TestView {
         match (self.schema.locate(ci), cell) {
             (ColumnLocator::Pk { byte_off, size, type_code }, Cell::Int(v)) => {
                 let at = row * self.schema.pk_stride() + byte_off as usize;
-                gnitz_wire::store_opk(&mut self.pk[at..at + size as usize], v, type_code.is_signed_int());
+                gnitz_wire::store_opk(
+                    &mut self.pk[at..at + size as usize],
+                    gnitz_wire::key_image(type_code, v),
+                );
             }
             (ColumnLocator::Payload { slot, size, .. }, Cell::Int(v)) => {
                 self.write(row, slot as usize, &v.to_le_bytes()[..size as usize])

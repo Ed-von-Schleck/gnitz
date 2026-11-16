@@ -59,7 +59,7 @@ fn a_peeked_control_header_maps_its_six_words() {
         arg1: 2,
         ..Default::default()
     };
-    append_frame(&mut bytes, &hdr, b"blob", None, None);
+    append_frame(&mut bytes, &hdr, b"blob", None);
     let (peeked, map) = map(&bytes, || peek_control_block(&bytes[3..]));
     assert_eq!(peeked.unwrap().hdr.target_id, 9);
     let fields: Vec<(usize, usize)> = map.fields.iter().map(|f| (f.at, f.width)).collect();

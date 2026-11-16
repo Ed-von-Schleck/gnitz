@@ -27,10 +27,10 @@ use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, SEEDS_ENV, Seed, Seeds};
 use gnitz_store::read::Probe;
 use gnitz_store::relation::{RelationKind, Snapshot};
-use gnitz_wire::txn_frame::{FrameItem, ScanItem, decode_scan_multi, encode_items};
+use gnitz_wire::multi_frame::{FrameItem, ScanItem, decode_scan_multi, encode_items};
 use gnitz_wire::{ControlHeader, PkKeys, ReadSpec, append_frame};
 use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 
 #[test]
 fn traffic_fuzz() {
@@ -257,7 +257,6 @@ fn builtin() -> Seed {
         &ControlHeader::naming(ClientVerb::AllocIds, Target::from(0), ids),
         &[],
         None,
-        None,
     );
     let (a_cols, b_cols, view_cols) = left_join_cols();
     let (circuit, _) = left_join_circuit(a, b, 1);
@@ -275,8 +274,8 @@ fn builtin() -> Seed {
         let rows = eight_rows(&session, tid);
         let mut frame = Vec::new();
         let hdr = ControlHeader::naming(ClientVerb::Push, Target::from(tid), 0);
-        let schema_block = encode_schema_block(rows.schema());
-        append_frame(&mut frame, &hdr, &[], Some(&schema_block), Some(&rows.wire_regions()));
+        let record = encode_schema_record(rows.schema());
+        append_frame(&mut frame, &hdr, &record, Some(&rows.wire_regions()));
         frame
     };
     let pushes = [rows(a), rows(b)];
@@ -307,10 +306,10 @@ fn ddl_frame(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> Vec<u8> {
     let items: Vec<FrameItem> = blocks
         .iter()
         .map(|(family, batch)| FrameItem {
-            target: family.id().into(),
+            target: (*family).into(),
             conflict_mode: Default::default(),
             basis: 0,
-            schema: None,
+            blob: &[],
             data: batch.wire_regions(),
         })
         .collect();
@@ -346,13 +345,13 @@ fn a_push_txn_reads_each_family_where_it_lies() {
     let base = gnitz_wire::FIRST_USER_TABLE_ID;
     let tables = [base, base + 1];
     let batches = tables.map(|tid| eight_rows(&session, tid));
-    let records = batches.each_ref().map(|b| encode_schema_block(b.schema()));
+    let records = batches.each_ref().map(|b| encode_schema_record(b.schema()));
     let items: Vec<FrameItem> = (0..2)
         .map(|i| FrameItem {
             target: Target::from(tables[i]),
             conflict_mode: Default::default(),
             basis: 0,
-            schema: Some(&records[i]),
+            blob: &records[i],
             data: batches[i].wire_regions(),
         })
         .collect();

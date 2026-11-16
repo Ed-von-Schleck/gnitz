@@ -59,7 +59,7 @@ const ID: u64 = 20;
 /// Every row carries the same payload, except that a row's named column holds
 /// another value.
 fn assert_shape(family: SysFamily, rows: &[(u64, i64, &str)], want: &str) {
-    let wire = family.wire();
+    let wire = family.def();
     let payload = &wire.cols[wire.pk_cols.len()..];
     let mut bb = BatchBuilder::new(family.schema());
     for &(id, weight, differing) in rows {
@@ -134,7 +134,7 @@ fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
             ""
         };
         assert_shape(family, &[(ID, -1, ""), (ID, 1, "")], no_pair);
-        let wire = family.wire();
+        let wire = family.def();
         for col in &wire.cols[wire.pk_cols.len()..] {
             let want = match may_change {
                 [] => "admits no rewrite pair",

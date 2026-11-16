@@ -378,10 +378,6 @@ impl Train<'_> {
         if let Some(f) = ctrl.fault(slot.bytes()) {
             return Err(lease.faulted(w, f));
         }
-        debug_assert!(
-            ctrl.schema.is_none(),
-            "worker {w}: a reply frame carries a schema block"
-        );
         if ctrl.hdr.flags.scan_last {
             lease.left.update(|v| v.without(w));
         }

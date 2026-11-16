@@ -16,7 +16,7 @@ use crate::catalog::{CatalogEngine, LockSet};
 use crate::runtime::reactor::RecvBuf;
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::txn_frame::BLIND;
+use gnitz_wire::multi_frame::BLIND;
 use gnitz_wire::{ClientVerb, DecodedControl, WireConflictMode, WireFault, WireStatus};
 use gnitz_zset::repr::MemBatch;
 
@@ -162,10 +162,11 @@ impl AdmittedPush {
 }
 
 /// Judge the push frame `data` against the catalog, as `access`: its token must
-/// name a target that serves it, and its record must lay out the target's
-/// columns. Its data block is certified where it lies, and the answer holds the
-/// block's range in `data`; `None` for an empty delta. A push to a stream must
-/// also pass the stream rule ([`check_stream_push`]), an empty one included.
+/// name a target that serves it, and the schema record in its blob must lay out
+/// the target's columns. Its data block is certified where it lies, and the
+/// answer holds the block's range in `data`; `None` for an empty delta. A push
+/// to a stream must also pass the stream rule ([`check_stream_push`]), an empty
+/// one included.
 ///
 /// A handler calls this under the catalog read guard and holds the guard
 /// through its commit, so no DDL lands between the judgement and the write.
@@ -179,11 +180,7 @@ pub(super) fn admit_push(
     let (tid, mode) = (target.tid, ctrl.hdr.flags.conflict_mode);
     let kind = target_kind(cat, target, access)?;
     let (rel, record) = cat.wire_target(tid).expect("target_kind found the target");
-    match &ctrl.schema {
-        Some(r) => gnitz_wire::schema_block::check_same_types(&data[r.clone()], record).map_err(decode_fault)?,
-        None if ctrl.data.is_some() => return Err(decode_fault("a data block without a schema block")),
-        None => {}
-    }
+    gnitz_wire::schema_record::check_same_types(&data[ctrl.blob.clone()], record).map_err(decode_fault)?;
     let block = ctrl
         .data
         .map(|r| PushedBlock::certify(data, r, rel.schema()))
@@ -303,7 +300,7 @@ pub(super) fn admit_push_txn(
     frame: &mut [u8],
     body: Range<usize>,
 ) -> Result<Vec<(u64, AdmittedPush)>, WireFault> {
-    let items = gnitz_wire::txn_frame::decode_items(frame, body, ClientVerb::PushTxn).map_err(decode_fault)?;
+    let items = gnitz_wire::multi_frame::decode_items(frame, body, ClientVerb::PushTxn).map_err(decode_fault)?;
     items
         .into_iter()
         .map(|ctrl| {

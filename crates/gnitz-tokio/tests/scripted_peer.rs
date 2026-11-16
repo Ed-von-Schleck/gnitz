@@ -136,7 +136,7 @@ fn request(s: &mut UnixStream) -> u64 {
     let frame = read_frame(s);
     let ctrl = peek_control_block(&frame).expect("a control header");
     match ctrl.hdr.flags.verb {
-        ClientVerb::ScanMulti => match gnitz_wire::txn_frame::decode_scan_multi(&frame[ctrl.body]).as_deref() {
+        Some(ClientVerb::ScanMulti) => match gnitz_wire::multi_frame::decode_scan_multi(&frame[ctrl.body]).as_deref() {
             Ok([item]) => item.target.tid,
             other => panic!("a scan names one relation: {other:?}"),
         },
@@ -152,7 +152,7 @@ fn reply(s: &mut UnixStream, tid: u64, lsn: u64) {
         ..Default::default()
     };
     let mut frame = Vec::new();
-    append_frame(&mut frame, &hdr, &[], None, None);
+    append_frame(&mut frame, &hdr, &[], None);
     write_frame(s, &frame);
 }
 
@@ -396,7 +396,7 @@ fn frame(hdr: ControlHeader, rows: &[(u64, i64)]) -> Vec<u8> {
     let nulls = vec![0u8; rows.len() * 8];
     let regions: [&[u8]; 4] = [&pks, &weights, &nulls, &[]];
     let mut out = Vec::new();
-    append_frame(&mut out, &hdr, &[], None, (!rows.is_empty()).then_some(&regions[..]));
+    append_frame(&mut out, &hdr, &[], (!rows.is_empty()).then_some(&regions[..]));
     out
 }
 
@@ -420,8 +420,8 @@ fn push_train_and_answer(s: &mut UnixStream, sub: u64, rows: &[(u64, i64)], tick
     write_frame(s, &frame(data, rows));
     let terminal = ControlHeader {
         target_id: 40,
-        arg0: tick,
-        arg1: TAG,
+        arg0: TAG,
+        arg1: tick,
         ..Default::default()
     };
     write_frame(s, &frame(terminal, &[]));
@@ -435,7 +435,7 @@ fn push_train_and_answer(s: &mut UnixStream, sub: u64, rows: &[(u64, i64)], tick
 /// The header of the next request, which must be a SYNC_PUSHED.
 fn expect_sync(s: &mut UnixStream) -> ControlHeader {
     let hdr = peek_control_block(&read_frame(s)).expect("a control header").hdr;
-    assert_eq!(hdr.flags.verb, ClientVerb::SyncPushed);
+    assert_eq!(hdr.flags.verb, Some(ClientVerb::SyncPushed));
     hdr
 }
 
@@ -475,12 +475,12 @@ fn cancel_after_the_answer(delivered: bool) {
         let poll = peek_control_block(&read_frame(&mut peer))
             .expect("a control header")
             .hdr;
-        assert_eq!(poll.flags.verb, ClientVerb::DeltaPoll);
+        assert_eq!(poll.flags.verb, Some(ClientVerb::DeltaPoll));
         let sub = poll.arg0;
         let terminal = ControlHeader {
             target_id: 40,
-            arg0: 9,
-            arg1: TAG,
+            arg0: TAG,
+            arg1: 9,
             ..Default::default()
         };
         write_frame(&mut peer, &frame(terminal, &[]));

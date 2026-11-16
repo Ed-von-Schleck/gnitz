@@ -9,14 +9,14 @@ use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::num::NonZeroU64;
 
 /// Write `batch` to `log` as the master's push of it to relation 16, placed by
 /// `placement`, handing `inspect` the layout the scatter picked.
 fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOnce(&Routed)) {
-    let record = encode_schema_block(batch.schema());
+    let record = encode_schema_record(batch.schema());
     let mut excl = log.excl();
     let mut scope = excl.begin();
     with_routed(batch.as_mem_batch(), placement, log.num_workers(), |rows| {
@@ -29,7 +29,7 @@ fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOn
 
 /// A keyed push addresses exactly the workers that own its rows, each sent its
 /// own; a replicated push sends every worker its live rows as one payload; and
-/// only a payload with rows carries a schema block.
+/// only a payload with rows carries a schema record.
 #[test]
 fn a_push_group_decodes_to_each_workers_rows() {
     let nw = 4;

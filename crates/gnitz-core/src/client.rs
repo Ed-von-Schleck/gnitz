@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use gnitz_wire::txn_frame::BLIND;
+use gnitz_wire::multi_frame::BLIND;
 use gnitz_wire::{ReadSpec, WireConflictMode};
 
 use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session, SubId, Target};

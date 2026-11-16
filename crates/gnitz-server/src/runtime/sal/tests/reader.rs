@@ -9,7 +9,7 @@ use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::RequestId;
 use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::test_support::{make_batch, make_schema_u64_i64};
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 
 /// A reader steps past a `Flush` into the next epoch on its own: what follows
 /// in the old epoch is never read, and the next epoch's first group is. A
@@ -333,7 +333,7 @@ fn rows_on_a_group_that_carries_none_abort_internal() {
         return;
     }
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
-    let record = encode_schema_block(batch.schema());
+    let record = encode_schema_record(batch.schema());
     let sent = Some((&record[..], batch.wire_whole().unwrap()));
     let mut rows = vec![0; payload_size(&[], sent)];
     payload_encode(&mut rows, &[], sent);

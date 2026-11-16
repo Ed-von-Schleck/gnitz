@@ -6,18 +6,21 @@
 //! an upper bound on the heap bytes no string cell references.
 //! The dead-byte bound is the writer's claim, which an untrusting reader
 //! recomputes.
+//!
+//! A block carries no format version: its container does. A connection's HELLO,
+//! a frame recording's header and the SAL's anchor page each carry
+//! [`crate::WIRE_VERSION`], and each is refused when written under another.
 
-use crate::{FIXED_REGION_BYTES, Reader, WIRE_VERSION, read_u32_le, write_u32_le};
+use crate::{FIXED_REGION_BYTES, Reader, read_u32_le, write_u32_le};
 
-pub const WAL_HEADER_SIZE: usize = 20;
+pub const WAL_HEADER_SIZE: usize = 16;
 
 /// Total block size: header, fixed regions and heap.
 const WAL_OFF_SIZE: usize = 0;
-const WAL_OFF_VERSION: usize = 4;
-const WAL_OFF_ROWS: usize = 8;
-const WAL_OFF_HEAP_LEN: usize = 12;
+const WAL_OFF_ROWS: usize = 4;
+const WAL_OFF_HEAP_LEN: usize = 8;
 /// An upper bound on the heap bytes no string cell of the block references.
-const WAL_OFF_HEAP_DEAD: usize = 16;
+const WAL_OFF_HEAP_DEAD: usize = 12;
 const _: () = assert!(WAL_OFF_HEAP_DEAD + 4 == WAL_HEADER_SIZE);
 
 /// The framed size of a block over the canonical region list `regions`.
@@ -33,7 +36,6 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
     debug_assert!(heap_dead <= heap_len, "a heap holds at most its own length dead");
     let total = WAL_HEADER_SIZE + fixed_len + heap_len;
     write_u32_le(dst, WAL_OFF_SIZE, total as u32);
-    write_u32_le(dst, WAL_OFF_VERSION, WIRE_VERSION);
     write_u32_le(dst, WAL_OFF_ROWS, rows as u32);
     write_u32_le(dst, WAL_OFF_HEAP_LEN, heap_len as u32);
     write_u32_le(dst, WAL_OFF_HEAP_DEAD, heap_dead as u32);
@@ -124,13 +126,10 @@ pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'
     }
     let mut r = Reader::new(block);
     // The header's words in layout order; the length check has seen it whole.
-    let [size, version, rows, heap_len, heap_dead] = [(); 5].map(|()| r.u32().expect("a whole header") as usize);
+    let [size, rows, heap_len, heap_dead] = [(); 4].map(|()| r.u32().expect("a whole header") as usize);
     debug_assert_eq!(r.pos(), WAL_HEADER_SIZE);
     if size != block.len() {
         return Err("declared size is not the block's length");
-    }
-    if version as u32 != WIRE_VERSION {
-        return Err("unknown block version");
     }
     if rows == 0 {
         return Err("block holds no rows");

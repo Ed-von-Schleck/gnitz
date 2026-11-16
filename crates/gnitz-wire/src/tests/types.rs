@@ -217,18 +217,6 @@ fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     }
 }
 
-#[test]
-fn narrow_f32_refuses_only_a_finite_overflow() {
-    assert_eq!(narrow_f32(0.1), Some(0.1f64 as f32));
-    assert_eq!(narrow_f32(1e-300), Some(0.0));
-    assert_eq!(narrow_f32(1e39), None);
-    assert_eq!(narrow_f32(-1e39), None);
-    assert_eq!(narrow_f32(f64::INFINITY), Some(f32::INFINITY));
-    assert!(narrow_f32(f64::NAN).is_some_and(f32::is_nan));
-    // Just above `f32::MAX` rounds down onto it rather than overflowing.
-    assert_eq!(narrow_f32(f32::MAX as f64 + 2.0f64.powi(102)), Some(f32::MAX));
-}
-
 /// An integer's order image is its OPK key in an 8-byte slot of its own sign, and
 /// the inverse recovers the value.
 #[test]
@@ -248,7 +236,7 @@ fn an_integers_order_image_is_its_opk_key_promoted() {
         for x in vals {
             let widened = fi.decode_le_i64(&x.to_le_bytes()[..w]);
             let mut key = [0u8; 8];
-            crate::store_opk(&mut key, widened as u128, fi.is_signed());
+            crate::store_opk(&mut key, widened as u128 ^ ((fi.is_signed() as u128) << 63));
             let image = kind.order_image(widened as u64);
             assert_eq!(image, u64::from_be_bytes(key), "{fi:?} value {x:#x}");
             assert_eq!(

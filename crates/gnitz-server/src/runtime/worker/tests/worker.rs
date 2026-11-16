@@ -1,6 +1,6 @@
 use super::reply::tests::{drain, frame_size, frames, owed, reqs, route};
 use super::*;
-use crate::catalog::SysFamily;
+use crate::catalog::{SysFamily, SysFamilyExt};
 use crate::query::{DriveHost, Lane};
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;

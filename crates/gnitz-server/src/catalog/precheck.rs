@@ -17,8 +17,8 @@ use rustc_hash::FxHashSet;
 
 use super::CatalogEngine;
 use super::sys_tables::{
-    DdlBundle, IdSet, PkShape, PkSignature, RelDetail, RelRow, SYSTEM_SCHEMA_ID, SysFamily, build_schema_from_col_defs,
-    pk_signatures, read_rel_row,
+    DdlBundle, IdSet, PkShape, PkSignature, RelDetail, RelRow, SYSTEM_SCHEMA_ID, SysFamily, SysFamilyExt,
+    build_schema_from_col_defs, pk_signatures, read_rel_row,
 };
 
 /// The name rule a schema, relation or index row must satisfy to be stored: a
@@ -61,7 +61,7 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
     if sig.repeats_a_sign {
         return Err(format!(
             "system-catalog write carries more than one row for {}",
-            family.pk_label(sig)
+            sig.label(family)
         ));
     }
     Ok(())
@@ -77,7 +77,7 @@ fn check_bootstrap_id(family: SysFamily, sig: &PkSignature) -> Result<(), String
             "cannot {} a system {} ({})",
             sig.verb(),
             family.row_noun(),
-            family.pk_label(sig)
+            sig.label(family)
         ));
     }
     Ok(())
@@ -107,13 +107,13 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
         return Err(format!(
             "a {} admits no rewrite pair ({})",
             family.row_noun(),
-            family.pk_label(sig)
+            sig.label(family)
         ));
     };
     if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
         return Err(format!(
             "a system-catalog rewrite pair on {} changes a field it may not",
-            family.pk_label(sig)
+            sig.label(family)
         ));
     }
     Ok(())
@@ -129,7 +129,7 @@ fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature
             return Err(format!(
                 "a {} is retracted only with its owner ({})",
                 family.row_noun(),
-                family.pk_label(sig)
+                sig.label(family)
             ));
         }
         check_bootstrap_id(family, sig)?;
@@ -313,7 +313,7 @@ impl CatalogEngine {
         if !(0..=1).contains(&net) {
             return Err(format!(
                 "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
-                family.pk_label(sig)
+                sig.label(family)
             ));
         }
         Ok(())

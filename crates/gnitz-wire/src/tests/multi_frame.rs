@@ -39,7 +39,7 @@ const NULLS: &[u8] = &[0u8; 8];
 const WIDE_TID: u64 = (1 << 40) | 16;
 
 /// A minimal one-row canonical region list.
-fn regions() -> Regions<'static> {
+fn regions<'a>() -> Regions<'a> {
     let mut r = Regions::new();
     for region in [PK, WEIGHT, NULLS, &[]] {
         r.push(region);
@@ -54,12 +54,12 @@ fn block() -> Vec<u8> {
     buf
 }
 
-fn ddl_item(tid: u64) -> FrameItem<'static> {
+fn ddl_item<'a>(tid: u64) -> FrameItem<'a> {
     FrameItem {
         target: tid.into(),
         conflict_mode: WireConflictMode::default(),
         basis: 0,
-        schema: None,
+        blob: &[],
         data: regions(),
     }
 }
@@ -69,7 +69,7 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
         target: Target { tid, token: !tid },
         conflict_mode,
         basis,
-        schema: Some(schema),
+        blob: schema,
         data: regions(),
     }
 }
@@ -117,7 +117,7 @@ fn txn_frames_roundtrip_every_item_in_order() {
         let mut at = ctrl.body.start;
         for (c, it) in got.iter().zip(&items) {
             let flags = WireFlags {
-                verb,
+                verb: Some(verb),
                 conflict_mode: it.conflict_mode,
                 ..Default::default()
             };
@@ -129,7 +129,7 @@ fn txn_frames_roundtrip_every_item_in_order() {
                 }
             );
             assert_eq!(c.blob.start, at + CTRL_HEADER_SIZE, "each item follows the one before");
-            assert_eq!(c.schema.clone().map(|s| &frame[s]), it.schema);
+            assert_eq!(&frame[c.blob.clone()], it.blob);
             assert_eq!(&frame[c.data.clone().unwrap()], &d[..]);
             assert!(c.body.is_empty());
             at = c.body.end;
@@ -172,15 +172,15 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
             arg0,
             ..ControlHeader::naming(verb, 0.into(), 0)
         };
-        append_frame(&mut out, &hdr, &[], None, None);
+        append_frame(&mut out, &hdr, &[], None);
         for item in items {
             out.extend_from_slice(&item);
         }
         out
     }
-    fn one(hdr: ControlHeader, blob: &[u8], schema: Option<&[u8]>, data: Option<&[&[u8]]>) -> Vec<u8> {
+    fn one(hdr: ControlHeader, blob: &[u8], data: Option<&[&[u8]]>) -> Vec<u8> {
         let mut out = Vec::new();
-        append_frame(&mut out, &hdr, blob, schema, data);
+        append_frame(&mut out, &hdr, blob, data);
         out
     }
 
@@ -195,7 +195,7 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
         items.iter().map(|it| {
             let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, it.target, it.basis);
             hdr.flags.conflict_mode = it.conflict_mode;
-            one(hdr, &[], it.schema, Some(&it.data[..]))
+            one(hdr, it.blob, Some(&it.data[..]))
         }),
     );
     assert_eq!(encoded(|out| encode_items(out, ClientVerb::PushTxn, &items)), want);
@@ -208,7 +208,6 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
             one(
                 ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout),
                 s.spec,
-                None,
                 None,
             )
         }),
@@ -236,7 +235,6 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
             one(
                 ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout),
                 &blob,
-                None,
                 None,
             )
         }),
@@ -304,11 +302,13 @@ fn a_delta_poll_refuses_view_id_zero() {
 #[test]
 fn a_delta_poll_refuses_a_blob_shorter_than_a_cursor() {
     let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, Target { tid: 7, token: 3 }, 9);
-    for len in [0, 1, 15] {
-        let err = decode_delta_items(&one_item(hdr, &[0u8; 15][..len], false, false)).expect_err("a short blob");
+    let err = decode_delta_items(&one_item(hdr, b"", false)).expect_err("no blob");
+    assert!(err.contains("lacks the blob"), "{err:?}");
+    for len in [1, 15] {
+        let err = decode_delta_items(&one_item(hdr, &[0u8; 15][..len], false)).expect_err("a short blob");
         assert!(err.contains("carries no cursor"), "{len}: {err:?}");
     }
-    let body = one_item(hdr, &[0u8; 16], false, false);
+    let body = one_item(hdr, &[0u8; 16], false);
     assert_eq!(
         decode_delta_items(&body).unwrap(),
         [DeltaPollItem {
@@ -321,17 +321,11 @@ fn a_delta_poll_refuses_a_blob_shorter_than_a_cursor() {
 }
 
 /// A body of one hand-built item: `hdr` (status and verb as given), `blob`,
-/// and the sections named.
-fn one_item(hdr: ControlHeader, blob: &[u8], schema: bool, data: bool) -> Vec<u8> {
+/// and a data block where `data` says.
+fn one_item(hdr: ControlHeader, blob: &[u8], data: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let r = regions();
-    crate::append_frame(
-        &mut out,
-        &hdr,
-        blob,
-        schema.then_some(&b"s"[..]),
-        data.then_some(&r[..]),
-    );
+    crate::append_frame(&mut out, &hdr, blob, data.then_some(&r[..]));
     out
 }
 
@@ -340,24 +334,31 @@ fn one_item(hdr: ControlHeader, blob: &[u8], schema: bool, data: bool) -> Vec<u8
 /// short list (a cut on an item boundary is a shorter well-formed body, since
 /// items run to the end); and an item is refused whose sections differ from the
 /// verb's shape, that names another verb, that carries a non-`Ok` status or a
-/// reply's flag, that sets a conflict mode outside a `PUSH_TXN`, or that
-/// carries a blob its verb's items do not.
+/// reply's flag, or that sets a conflict mode its verb does not read.
 #[test]
 fn decode_items_enforces_each_verbs_item_rules() {
     let multi: Vec<ClientVerb> = ClientVerb::ALL
         .iter()
         .copied()
-        .filter(|&v| item_shape(v).is_some())
+        .filter(|&v| VerbShape::of(v).items.is_some())
         .collect();
     assert_eq!(multi.len(), 4);
+    let fits = |rule: Section, present: bool| match rule {
+        Section::Never => !present,
+        Section::May => true,
+        Section::Must => present,
+    };
     for verb in multi {
-        let ItemShape { blob, schema, data, cap } = item_shape(verb).unwrap();
+        let VerbShape { sections, items: shape } = VerbShape::of(verb);
+        let cap = shape.unwrap().cap;
         let hdr = ControlHeader::naming(verb, 7.into(), 0);
         let refused = |body: &[u8], want: &str| {
             let err = items(body, verb).expect_err(want);
             assert!(err.contains(want), "{verb:?}: {err:?} does not name {want:?}");
         };
-        let one = one_item(hdr, b"", schema, data);
+        let blob: &[u8] = if sections.blob == Section::Must { b"blob" } else { b"" };
+        let data = sections.data == Section::Must;
+        let one = one_item(hdr, blob, data);
 
         let n = cap.min(3);
         assert_eq!(items(&one.repeat(n), verb).unwrap().len(), n, "{verb:?}");
@@ -371,24 +372,21 @@ fn decode_items_enforces_each_verbs_item_rules() {
             assert!(items(&two[..cut], verb).is_err(), "{verb:?} cut at {cut}");
         }
 
-        for (s, d) in [(false, false), (true, false), (false, true), (true, true)] {
-            if (s, d) != (schema, data) {
-                let err = items(&one_item(hdr, b"", s, d), verb).unwrap_err();
-                assert!(
-                    err.contains("schema record") || err.contains("data block"),
-                    "{verb:?}: {err}"
-                );
+        for (b, d) in [(&b""[..], false), (b"blob", false), (b"", true), (b"blob", true)] {
+            let got = items(&one_item(hdr, b, d), verb);
+            assert_eq!(
+                got.is_ok(),
+                fits(sections.blob, !b.is_empty()) && fits(sections.data, d),
+                "{verb:?} blob {b:?} data {d}: {got:?}"
+            );
+            if let Err(err) = got {
+                assert!(err.contains("blob") || err.contains("data block"), "{verb:?}: {err}");
             }
         }
         let other = ControlHeader::naming(ClientVerb::Push, 7.into(), 0);
-        refused(&one_item(other, b"", schema, data), "names verb");
+        refused(&one_item(other, blob, data), "names verb");
         refused(
-            &one_item(
-                ControlHeader { status: WireStatus::Error, ..hdr },
-                b"boom",
-                schema,
-                data,
-            ),
+            &one_item(ControlHeader { status: WireStatus::Error, ..hdr }, b"boom", data),
             "status",
         );
         for flags in [
@@ -396,7 +394,7 @@ fn decode_items_enforces_each_verbs_item_rules() {
             WireFlags { scan_last: true, ..hdr.flags },
             WireFlags { lane: WireLane::PushedTrain, ..hdr.flags },
         ] {
-            refused(&one_item(ControlHeader { flags, ..hdr }, b"", schema, data), "flag");
+            refused(&one_item(ControlHeader { flags, ..hdr }, blob, data), "flag");
         }
         let error_mode = ControlHeader {
             flags: WireFlags {
@@ -405,16 +403,13 @@ fn decode_items_enforces_each_verbs_item_rules() {
             },
             ..hdr
         };
-        match verb {
-            ClientVerb::PushTxn => assert!(items(&one_item(error_mode, b"", schema, data), verb).is_ok()),
-            _ => refused(&one_item(error_mode, b"", schema, data), "conflict mode"),
-        }
-        match blob {
-            true => assert_eq!(items(&one_item(hdr, b"blob", schema, data), verb).unwrap().len(), 1),
-            false => refused(&one_item(hdr, b"blob", schema, data), "blob"),
+        if sections.conflict_mode {
+            assert!(items(&one_item(error_mode, blob, data), verb).is_ok());
+        } else {
+            refused(&one_item(error_mode, blob, data), "conflict mode");
         }
     }
-    let err = items(&one_item(ControlHeader::default(), b"", false, false), ClientVerb::Push).unwrap_err();
+    let err = items(&one_item(ControlHeader::default(), b"", false), ClientVerb::Push).unwrap_err();
     assert!(err.contains("not a multi-item verb"), "{err}");
 }
 

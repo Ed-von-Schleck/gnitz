@@ -1,8 +1,8 @@
 use super::*;
 use crate::{ColType, TypeCode};
 
-fn col(tc: TypeCode, name: &str, nullable: bool) -> SchemaBlockCol<'_> {
-    SchemaBlockCol {
+fn col(tc: TypeCode, name: &str, nullable: bool) -> RecordCol<'_> {
+    RecordCol {
         ty: ColType::of(tc),
         nullable,
         hidden: false,
@@ -11,7 +11,7 @@ fn col(tc: TypeCode, name: &str, nullable: bool) -> SchemaBlockCol<'_> {
 }
 
 /// Every column `record` holds, and its PK indices.
-fn decode_cols(record: &[u8]) -> Result<(Vec<SchemaBlockCol<'_>>, PkIndices), String> {
+fn decode_cols(record: &[u8]) -> Result<(Vec<RecordCol<'_>>, PkIndices), String> {
     let mut cols = Vec::new();
     let pk = decode(record, |c| {
         cols.push(c);
@@ -21,7 +21,7 @@ fn decode_cols(record: &[u8]) -> Result<(Vec<SchemaBlockCol<'_>>, PkIndices), St
 }
 
 /// `n` U64 key columns, all of them in the PK, in column order.
-fn all_key_cols(n: usize) -> Vec<SchemaBlockCol<'static>> {
+fn all_key_cols(n: usize) -> Vec<RecordCol<'static>> {
     (0..n).map(|_| col(TypeCode::U64, "k", false)).collect()
 }
 
@@ -46,7 +46,7 @@ fn column_meta_and_the_widest_pk_survive_the_record() {
             // widest a DECIMAL admits — so neither edge may bleed into a
             // neighbour.
             for scale in [0u8, 7, crate::MAX_DECIMAL_SCALE] {
-                cols.push(SchemaBlockCol {
+                cols.push(RecordCol {
                     ty: ColType::decimal(scale),
                     nullable,
                     hidden,
@@ -126,7 +126,7 @@ fn the_record_layout_is_fixed() {
     let cols = [
         col(TypeCode::U64, "b", false),
         col(TypeCode::I32, "a", false),
-        SchemaBlockCol {
+        RecordCol {
             ty: ColType::decimal(9),
             nullable: true,
             hidden: true,
@@ -156,12 +156,11 @@ fn the_record_layout_is_fixed() {
 /// truncated one is a decode error, not a match.
 #[test]
 fn check_same_types_names_each_mismatch_distinctly() {
-    let two_cols =
-        |second: SchemaBlockCol<'static>| encode([col(TypeCode::U64, "id", false), second].into_iter(), &[0]);
+    let two_cols = |second: RecordCol<'static>| encode([col(TypeCode::U64, "id", false), second].into_iter(), &[0]);
     let want = two_cols(col(TypeCode::I64, "v", false));
     assert_eq!(check_same_types(&want, &want), Ok(()), "a record matches itself");
 
-    let renamed_and_hidden = two_cols(SchemaBlockCol {
+    let renamed_and_hidden = two_cols(RecordCol {
         hidden: true,
         ..col(TypeCode::I64, "renamed", false)
     });
@@ -193,7 +192,7 @@ fn check_same_types_names_each_mismatch_distinctly() {
         encode(
             [
                 col(TypeCode::U64, "id", false),
-                SchemaBlockCol {
+                RecordCol {
                     ty: ColType::decimal(scale),
                     ..col(TypeCode::U64, "d", false)
                 },

@@ -20,7 +20,7 @@ use gnitz_wire::{
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaDescriptor, encode_schema_block};
+use gnitz_zset::schema::{SchemaDescriptor, encode_schema_record};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -37,7 +37,7 @@ pub(in crate::catalog) struct RelationEntry {
     /// The relation's [`encode_record`]: what a RESOLVE answers, and what a
     /// client's push is checked against.
     record: Rc<[u8]>,
-    /// The relation's [`encode_schema_block`]: what every SAL group of it
+    /// The relation's [`encode_schema_record`]: what every SAL group of it
     /// carries, and what a worker checks one against.
     sal_record: Rc<[u8]>,
     /// The FK edges this relation declares as a child.
@@ -63,7 +63,7 @@ impl RelationEntry {
     /// Re-encode both records for `schema`, whose columns `defs` describe.
     pub(in crate::catalog) fn set_records(&mut self, schema: &SchemaDescriptor, defs: &[CatalogColumn]) {
         self.record = Rc::from(encode_record(schema.pk_cols(), defs));
-        self.sal_record = Rc::from(encode_schema_block(schema));
+        self.sal_record = Rc::from(encode_schema_record(schema));
     }
 }
 
@@ -102,11 +102,11 @@ impl CatalogEngine {
     }
 
     /// What a RESOLVE of `tid` answers: its encoded descriptor, its named record
-    /// and its descriptor token. `None` for an unregistered id.
+    /// included, and its descriptor token. `None` for an unregistered id.
     ///
-    /// The token digests the relation's qualified name and the other two, so it
+    /// The token digests the relation's qualified name and the descriptor, so it
     /// changes exactly when a RESOLVE of that name would answer differently.
-    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(Vec<u8>, Rc<[u8]>, u64)> {
+    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(Vec<u8>, u64)> {
         let rel = self.registry.relation(tid)?;
         let entry = self.relation_entry(tid);
         let desc = RelDescriptorBlob {
@@ -121,19 +121,19 @@ impl CatalogEngine {
                     is_unique: ic.is_unique(),
                 })
                 .collect(),
+            schema: entry.record.as_ref().into(),
         };
         let desc = desc.encode();
         let token = entry.token.get().unwrap_or_else(|| {
             let mut h = gnitz_wire::ChecksumStream::default();
             h.update(self.qualified_name(tid).as_bytes());
             h.update(&desc);
-            h.update(&entry.record);
             // The wire reserves `0` for a request built from no RESOLVE.
             let token = NonZeroU64::MIN | h.digest();
             entry.token.set(Some(token));
             token
         });
-        Some((desc, entry.record.clone(), token.get()))
+        Some((desc, token.get()))
     }
 
     /// Refuse a request built under `token` once `tid` answers a RESOLVE
@@ -144,7 +144,7 @@ impl CatalogEngine {
         }
         let current = match self.caches.relations.get(&tid).map(|e| e.token.get()) {
             Some(Some(t)) => Some(t.get()),
-            Some(None) => self.resolve_answer(tid).map(|(_, _, t)| t),
+            Some(None) => self.resolve_answer(tid).map(|(_, t)| t),
             None => None,
         };
         if current == Some(token) {

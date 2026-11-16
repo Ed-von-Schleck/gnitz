@@ -238,8 +238,7 @@ fn write_column(
                 batch.pks.region(),
                 batch.pks.stride(),
                 byte_off as usize,
-                size as usize,
-                type_code.is_signed_int(),
+                type_code,
                 &mut cells,
             );
             Cow::Owned(cells)

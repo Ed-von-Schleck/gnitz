@@ -4,18 +4,18 @@
 
 use super::*;
 use crate::{ColumnChange, sys_schema};
-use gnitz_wire::{PkColList, SCHEMA_TAB, SEQ_TAB, SchemaTabRow, SysRow};
+use gnitz_wire::{PkColList, SchemaTabRow, SysFamily, SysRow};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
-    let s = sys_schema(SCHEMA_TAB);
+    let s = sys_schema(SysFamily::Schema);
     let mut b = ZSetBatch::new(s);
     SchemaTabRow { schema_id, name: name.into() }.write(&mut BatchAppender::new(&mut b), 1);
     b
 }
 
 /// The refusal of `families` sent as one DDL bundle.
-fn refusal(s: &mut Session, families: &[(u64, ZSetBatch)]) -> String {
+fn refusal(s: &mut Session, families: &[(SysFamily, ZSetBatch)]) -> String {
     let sent = s.submit(Request::DdlTxn(families));
     drive(s, sent).0.unwrap_err().to_string()
 }
@@ -36,14 +36,17 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     );
     let err = refusal(
         &mut s,
-        &[(SCHEMA_TAB, schema_row(a, "one")), (SCHEMA_TAB, schema_row(b, "two"))],
+        &[
+            (SysFamily::Schema, schema_row(a, "one")),
+            (SysFamily::Schema, schema_row(b, "two")),
+        ],
     );
     assert!(err.contains("two blocks"), "{err}");
 
-    let seq = sys_schema(SEQ_TAB);
+    let seq = sys_schema(SysFamily::Sequence);
     let mut forged = ZSetBatch::new(seq);
     BatchAppender::new(&mut forged).add_row(2, 1).int_val(1u64 << 40);
-    let err = refusal(&mut s, &[(SEQ_TAB, forged)]);
+    let err = refusal(&mut s, &[(SysFamily::Sequence, forged)]);
     assert!(err.contains("not writable from the wire"), "{err}");
 
     // Neither wrote anything: both names are still free.

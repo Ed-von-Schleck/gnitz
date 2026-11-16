@@ -1,5 +1,6 @@
-//! The bytes of the log: the publication prefix and anchor words, the kind
-//! ordinals, the group header with its directory, and the payloads behind it.
+//! The bytes of the log: the publication prefix, anchor and format words, the
+//! kind ordinals, the group header with its directory, and the payloads behind
+//! it.
 //! Every encode and decode of a group's bytes is here; the header's field
 //! offsets and flag bits are named nowhere else.
 
@@ -7,9 +8,9 @@ use std::sync::atomic::AtomicU64;
 
 use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::RequestId;
-use gnitz_wire::{MAX_WORKERS, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
+use gnitz_wire::{MAX_WORKERS, WIRE_VERSION, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use gnitz_zset::repr::{Batch, MemBatch, WireRows};
-use gnitz_zset::schema::{SchemaDescriptor, decode_schema_block};
+use gnitz_zset::schema::{SchemaDescriptor, decode_schema_record};
 
 /// The publication prefix in front of every group header, one atomically stored
 /// u64 ([`epoch_word`]); also the alignment of every group base.
@@ -36,6 +37,15 @@ pub(super) const fn word_epoch(word: u64) -> u32 {
 pub(super) const fn anchor_word(epoch: u32) -> u64 {
     epoch_word(epoch, !epoch as u64)
 }
+
+/// The epoch of the log's own layout: the group header, its directory and the
+/// payload codec. The header's byte-pin test fails until it moves with one.
+const SAL_LAYOUT: u32 = 1;
+
+/// The format word beside the anchor: the log's layout, and the
+/// [`WIRE_VERSION`] of the schema records and data blocks its payloads hold.
+/// Never 0, which is a fresh file's.
+pub(super) const SAL_FORMAT: u64 = (SAL_LAYOUT as u64) << 32 | WIRE_VERSION as u64;
 
 /// The epoch after `epoch`: what a checkpoint's base round moves the writer and
 /// every reader to, and what a boot starts at above the recovered tail's epoch.
@@ -442,7 +452,7 @@ pub(super) fn payload_rows(
     };
     let schema = match known(record) {
         Some(s) => s,
-        None => decode_schema_block(record)?,
+        None => decode_schema_record(record)?,
     };
     let batch = MemBatch::of_wal_block(block, &schema)?.to_batch();
     batch.debug_verify_null_bits();

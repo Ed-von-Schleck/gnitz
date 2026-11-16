@@ -22,7 +22,7 @@ use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Peer, PeerGone, SendBody, Train, TrainLease};
 use crate::runtime::sal::Read;
 use crate::runtime::sync::{ReadGuard, chan, oneshot, select2};
-use gnitz_wire::txn_frame::{DeltaPollItem, SubId, decode_delta_items, delta_poll_kept};
+use gnitz_wire::multi_frame::{DeltaPollItem, SubId, decode_delta_items, delta_poll_kept};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
 /// Delta reads at one SAL cut: the ceiling on the trains a DELTA_POLL or a
@@ -232,8 +232,8 @@ pub(super) async fn handle_delta_poll(
 fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
     let msg = WireMsg {
         target_id: view,
-        arg0: round,
-        arg1: tag,
+        arg0: tag,
+        arg1: round,
         ..Default::default()
     };
     debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + msg.size(), HEAD_FRAME_BYTES);
@@ -241,8 +241,8 @@ fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
 }
 
 /// The framed size of every [`terminal`] and [`pushed_marker`]: a head with no
-/// blob, schema or data.
-const HEAD_FRAME_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::frame_head_size(0, None);
+/// blob or data.
+const HEAD_FRAME_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::CTRL_HEADER_SIZE;
 
 // ---------------------------------------------------------------------------
 // Pushed feeds

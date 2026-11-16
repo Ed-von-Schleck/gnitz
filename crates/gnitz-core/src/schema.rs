@@ -4,7 +4,7 @@
 use gnitz_expr::{SchemaColumn, SchemaDescriptor, SchemaRefusal};
 use std::sync::{Arc, OnceLock};
 
-use gnitz_wire::{ColumnDef, PK_LIST_MAX_COLS, PkListRole, PkRule};
+use gnitz_wire::{ColumnDef, PkColList, PkListRole, PkRule, SysFamily};
 
 #[derive(Clone)]
 pub struct Schema {
@@ -36,8 +36,8 @@ impl std::fmt::Debug for Schema {
 
 impl Schema {
     /// The constructor every other one goes through. `Err` for a column list over `MAX_COLUMNS`, an
-    /// inadmissible column type, or a PK list that breaks the PK rules at
-    /// `PK_LIST_MAX_COLS`, the capacity of a persisted PK list.
+    /// inadmissible column type, or a PK list that is no [`PkColList`] over these
+    /// columns or breaks the PK rules.
     pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: &[u32]) -> Result<Schema, String> {
         if let Some(cd) = columns.iter().find(|cd| !cd.ty.is_admissible()) {
             return Err(format!(
@@ -47,12 +47,7 @@ impl Schema {
         }
         let pk_refusal =
             |rule: PkRule| rule.named(PkListRole::PrimaryKey, |c| columns.get(c as usize).map(|cd| &*cd.name));
-        if pk_cols.len() > PK_LIST_MAX_COLS {
-            return Err(pk_refusal(PkRule::TooManyColumns {
-                count: pk_cols.len(),
-                max: PK_LIST_MAX_COLS,
-            }));
-        }
+        PkColList::checked(pk_cols, columns.len()).map_err(pk_refusal)?;
         let layout = SchemaDescriptor::try_new(&columns.iter().map(SchemaColumn::of_def).collect::<Vec<_>>(), pk_cols)
             .map_err(|refusal| match refusal {
                 SchemaRefusal::Pk(rule) => pk_refusal(rule),
@@ -109,16 +104,16 @@ impl Schema {
 
     /// This schema's meta-schema record — the bytes a schema-bearing push
     /// embeds. Encoded once per schema; a clone shares it.
-    pub fn to_block(&self) -> &[u8] {
+    pub fn to_record(&self) -> &[u8] {
         self.record.get_or_init(|| {
-            gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), self.pk_cols()).into()
+            gnitz_wire::schema_record::encode(self.columns.iter().map(ColumnDef::record_col), self.pk_cols()).into()
         })
     }
 
     /// The schema a meta-schema record describes.
-    pub fn from_block(block: &[u8]) -> Result<Schema, String> {
+    pub fn from_record(record: &[u8]) -> Result<Schema, String> {
         let mut columns = Vec::new();
-        let pk = gnitz_wire::schema_block::decode(block, |c| {
+        let pk = gnitz_wire::schema_record::decode(record, |c| {
             let name = std::str::from_utf8(c.name).map_err(|e| format!("utf8 in column name: {e}"))?;
             columns.push(ColumnDef {
                 name: Arc::from(name),
@@ -128,26 +123,24 @@ impl Schema {
             });
             Ok(())
         })?;
-        Schema::from_parts(columns, pk.as_slice())
+        // The encoding is a bijection, so `record` is the bytes `to_record` would
+        // encode.
+        let schema = Schema::from_parts(columns, pk.as_slice())?;
+        let _ = schema.record.set(record.into());
+        Ok(schema)
     }
 }
 
-/// The client `Schema` of system table `tid`, built from `gnitz_wire::SYS_FAMILIES`.
-///
-/// Panics on an id that is not a system table.
-pub fn sys_schema(tid: u64) -> &'static Arc<Schema> {
-    static INSTANCE: OnceLock<Vec<Arc<Schema>>> = OnceLock::new();
+/// The client `Schema` of system family `family`.
+pub fn sys_schema(family: SysFamily) -> &'static Arc<Schema> {
+    static INSTANCE: OnceLock<[Arc<Schema>; SysFamily::COUNT]> = OnceLock::new();
     let schemas = INSTANCE.get_or_init(|| {
-        gnitz_wire::SYS_FAMILIES
-            .iter()
-            .map(|f| {
-                let columns = f.column_defs().collect();
-                Arc::new(Schema::from_parts(columns, f.pk_cols).expect("a system family is an admissible schema"))
-            })
-            .collect()
+        SysFamily::ALL.map(|f| {
+            let (columns, pk) = (f.def().column_defs().collect(), f.def().pk_cols);
+            Arc::new(Schema::from_parts(columns, pk).expect("a system family is an admissible schema"))
+        })
     });
-    let idx = gnitz_wire::sys_family_index(tid).unwrap_or_else(|| panic!("not a system table id: {tid}"));
-    &schemas[idx]
+    &schemas[family.index()]
 }
 
 #[cfg(test)]

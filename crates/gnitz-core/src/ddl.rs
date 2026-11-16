@@ -5,10 +5,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use gnitz_wire::{
-    CIRCUIT_TAB, COL_TAB, Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IDX_TAB, IdxTabRow,
-    IdxTabSlot, KeyRange, PkColList, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, ReadBound, ReadSpec, SCHEMA_TAB,
-    SchemaTabRow, SchemaTabSlot, SysRow, TABLE_TAB, TableProps, TableTabRow, VIEW_TAB, ViewProps, ViewTabRow,
-    payload_bytes, payload_u64,
+    Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IdxTabRow, IdxTabSlot, KeyRange, PkColList,
+    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, ReadBound, ReadSpec, SchemaTabRow, SchemaTabSlot, SysFamily, SysRow,
+    TableProps, TableTabRow, ViewProps, ViewTabRow, payload_bytes, payload_u64,
 };
 
 use crate::catalog::{CATALOG_FAMILIES, Catalog, IndexRow, idx_rows};
@@ -143,12 +142,12 @@ pub enum ColumnChange<'a> {
 
 /// The rows of one DDL transaction: one batch per system family it writes.
 #[derive(Default)]
-struct DdlBundle(Vec<(u64, ZSetBatch)>);
+struct DdlBundle(Vec<(SysFamily, ZSetBatch)>);
 
 impl DdlBundle {
     /// `family`'s batch, opened on first use — so a family nothing wrote to has
     /// no entry, and no family has two.
-    fn batch(&mut self, family: u64) -> &mut ZSetBatch {
+    fn batch(&mut self, family: SysFamily) -> &mut ZSetBatch {
         let at = match self.0.iter().position(|(f, _)| *f == family) {
             Some(at) => at,
             None => {
@@ -160,7 +159,7 @@ impl DdlBundle {
     }
 
     /// `scanned`'s row `i`, a stored `family` row, at `-1`.
-    fn retract(&mut self, family: u64, scanned: &ZSetBatch, i: usize) {
+    fn retract(&mut self, family: SysFamily, scanned: &ZSetBatch, i: usize) {
         self.batch(family).copy_row_at(scanned, i, -1);
     }
 
@@ -176,7 +175,7 @@ impl DdlBundle {
         for (family, rows) in &self.0 {
             for i in 0..rows.len() {
                 ids.insert(match *family {
-                    IDX_TAB => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
+                    SysFamily::Index => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
                     _ => gnitz_wire::sys_leading_id(rows.pks.get_bytes(i)),
                 });
             }
@@ -313,7 +312,7 @@ impl GnitzClient {
         let (index_name, index_id) = match name {
             Some(name) => (gnitz_wire::canonical_identifier(name)?, self.alloc_ids(1).await?),
             None => {
-                let ([indexes], index_id) = self.cut_and_ids([IDX_TAB], 1).await?;
+                let ([indexes], index_id) = self.cut_and_ids([SysFamily::Index], 1).await?;
                 let live = idx_rows(&indexes)?;
                 let serves = |r: &IndexRow| r.owner == owner.tid && r.cols == cols && (r.is_unique || !is_unique);
                 if let Some((_, same)) = live.iter().find(|(_, r)| serves(r)) {
@@ -364,7 +363,7 @@ impl GnitzClient {
         if_exists: bool,
         matches: impl Fn(&IndexRow) -> bool,
     ) -> Result<(), ClientError> {
-        let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
+        let scanned = self.sys_rows(SysFamily::Index, ReadBound::None).await?;
         let rows = idx_rows(&scanned)?;
         let mut b = DdlBundle::default();
         let mut retracted = Vec::new();
@@ -374,7 +373,7 @@ impl GnitzClient {
                 Some(&(i, _)) if retracted.contains(&i) => {}
                 Some(&(i, _)) => {
                     retracted.push(i);
-                    b.retract(IDX_TAB, &scanned, i);
+                    b.retract(SysFamily::Index, &scanned, i);
                 }
                 None if if_exists => {}
                 None => return Err(not_found(noun, name)),
@@ -386,7 +385,7 @@ impl GnitzClient {
     /// Every live secondary index. Names come back canonical (lowercase): every
     /// writer folds them at store time.
     pub async fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
-        let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
+        let scanned = self.sys_rows(SysFamily::Index, ReadBound::None).await?;
         Ok(idx_rows(&scanned)?.into_iter().map(|(_, r)| r).collect())
     }
 
@@ -423,7 +422,7 @@ impl GnitzClient {
         // and illegal characters.
         let name = gnitz_wire::canonical_identifier(name)?;
         let schema_id = if if_not_exists {
-            let ([schemas], fresh) = self.cut_and_ids([SCHEMA_TAB], 1).await?;
+            let ([schemas], fresh) = self.cut_and_ids([SysFamily::Schema], 1).await?;
             if let Some(standing) = live_schema_id(&schemas, &name) {
                 return Ok(standing);
             }
@@ -443,19 +442,21 @@ impl GnitzClient {
     pub async fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let name = gnitz_wire::canonical_identifier(name)?;
         let all = ReadSpec::all_rows(ReadBound::None);
-        let [schemas, views, tables] = self.sys_cut([SCHEMA_TAB, VIEW_TAB, TABLE_TAB], &all).await?;
+        let [schemas, views, tables] = self
+            .sys_cut([SysFamily::Schema, SysFamily::View, SysFamily::Table], &all)
+            .await?;
         let at = schema_row(&schemas, &name).ok_or_else(|| not_found("schema", &name))?;
         let schema_id = gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at));
 
         let mut b = DdlBundle::default();
-        for (family, scanned) in [(VIEW_TAB, views), (TABLE_TAB, tables)] {
+        for (family, scanned) in [(SysFamily::View, views), (SysFamily::Table, tables)] {
             for i in scanned.live_rows() {
                 if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
                     b.retract(family, &scanned, i);
                 }
             }
         }
-        b.retract(SCHEMA_TAB, &schemas, at);
+        b.retract(SysFamily::Schema, &schemas, at);
         self.commit_ddl(b).await
     }
 
@@ -480,11 +481,11 @@ impl GnitzClient {
         // names only where one is unnamed, which a replayed dump never is.
         let n = 1 + unique_indexes.len() as u64;
         let (schemas, live, new_tid) = if unique_indexes.iter().any(|spec| spec.name.is_none()) {
-            let ([schemas, indexes], new_tid) = self.cut_and_ids([SCHEMA_TAB, IDX_TAB], n).await?;
+            let ([schemas, indexes], new_tid) = self.cut_and_ids([SysFamily::Schema, SysFamily::Index], n).await?;
             let live = idx_rows(&indexes)?.into_iter().map(|(_, r)| r.name).collect();
             (schemas, live, new_tid)
         } else {
-            let ([schemas], new_tid) = self.cut_and_ids([SCHEMA_TAB], n).await?;
+            let ([schemas], new_tid) = self.cut_and_ids([SysFamily::Schema], n).await?;
             (schemas, HashSet::new(), new_tid)
         };
         let schema_id = live_schema_id(&schemas, table.schema()).ok_or_else(|| not_found("schema", table.schema()))?;
@@ -492,16 +493,7 @@ impl GnitzClient {
 
         let mut b = DdlBundle::default();
         append_col_rows(&mut b, new_tid, schema.columns(), fks);
-        b.put(
-            &TableTabRow {
-                table_id: new_tid,
-                schema_id,
-                name: table.name().into(),
-                pk_col_idx: pk,
-                flags: *props,
-            },
-            1,
-        );
+        b.put(&TableTabRow::of(new_tid, schema_id, table.name(), pk, *props), 1);
         for (k, spec) in unique_indexes.iter().enumerate() {
             b.put(
                 &IdxTabRow {
@@ -522,7 +514,7 @@ impl GnitzClient {
     /// Drop tables as one DDL zone; the engine cascades each one's indexes off
     /// their owner. See `drop_relations` for the batch rules.
     pub async fn drop_table(&mut self, tables: &[RelName], if_exists: bool) -> Result<(), ClientError> {
-        self.drop_relations(TABLE_TAB, "table", tables, if_exists).await
+        self.drop_relations(SysFamily::Table, tables, if_exists).await
     }
 
     /// Create `bundle` in one atomic `DDL_TXN` and return its id. A view it
@@ -545,7 +537,7 @@ impl GnitzClient {
                     base as u128,
                     vid as u128,
                 )));
-                let families = [VIEW_TAB, COL_TAB, CIRCUIT_TAB];
+                let families = [SysFamily::View, SysFamily::Column, SysFamily::Circuit];
                 let rows = self.sys_cut(families, &members).await?;
                 let standing = DdlBundle(families.into_iter().zip(rows).collect());
                 let views = &standing.0[0].1;
@@ -570,11 +562,11 @@ impl GnitzClient {
                 }
                 // Only the user-named view, ahead of the new chain's `+1`s: the
                 // engine cascades its segments.
-                b.retract(VIEW_TAB, views, i);
+                b.retract(SysFamily::View, views, i);
                 (schema_id, self.alloc_ids(n_views).await?)
             }
             None => {
-                let ([schemas], base) = self.cut_and_ids([SCHEMA_TAB], n_views).await?;
+                let ([schemas], base) = self.cut_and_ids([SysFamily::Schema], n_views).await?;
                 let schema_id =
                     live_schema_id(&schemas, view.schema()).ok_or_else(|| not_found("schema", view.schema()))?;
                 (schema_id, base)
@@ -590,7 +582,7 @@ impl GnitzClient {
     /// off `owner_view_id`, so the client never names a segment. See
     /// `drop_relations` for the batch rules.
     pub async fn drop_view(&mut self, views: &[RelName], if_exists: bool) -> Result<(), ClientError> {
-        self.drop_relations(VIEW_TAB, "view", views, if_exists).await
+        self.drop_relations(SysFamily::View, views, if_exists).await
     }
 
     /// Retire every named relation of `family` in **one** DDL zone: the whole set
@@ -601,8 +593,7 @@ impl GnitzClient {
     /// the batch all still fail the statement.
     async fn drop_relations(
         &mut self,
-        family: u64,
-        noun: &'static str,
+        family: SysFamily,
         names: &[RelName],
         if_exists: bool,
     ) -> Result<(), ClientError> {
@@ -613,10 +604,10 @@ impl GnitzClient {
             if names[..k].contains(name) {
                 continue;
             }
-            match self.relation_retraction(family, noun, name).await? {
+            match self.relation_retraction(family, name).await? {
                 Some((scanned, i)) => b.retract(family, &scanned, i),
                 None if if_exists => {}
-                None => return Err(not_found(noun, name)),
+                None => return Err(not_found(family.row_noun(), name)),
             }
         }
         self.commit_ddl(b).await
@@ -627,14 +618,14 @@ impl GnitzClient {
     /// is refused as such, never as a `not_found` a caller may read as "already gone".
     async fn relation_retraction(
         &mut self,
-        family: u64,
-        noun: &'static str,
+        family: SysFamily,
         name: &RelName,
     ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
+        let noun = family.row_noun();
         let Some(desc) = self.resolve(name).await? else {
             return Ok(None);
         };
-        if desc.class.is_view() != (family == VIEW_TAB) {
+        if desc.class.family() != family {
             return Err(format!(
                 "'{name}' is a {}; DROP {} requires a {noun}",
                 desc.class.describe(),
@@ -656,9 +647,8 @@ impl GnitzClient {
     pub async fn alter_rename_relation(&mut self, rel: &RelDescriptor, new_name: &str) -> Result<(), ClientError> {
         let new_name = gnitz_wire::canonical_identifier(new_name)?;
         let tid = rel.tid;
-        let family = if rel.class.is_view() { VIEW_TAB } else { TABLE_TAB };
         self.rewrite_sys_row(
-            family,
+            rel.class.family(),
             &[tid as u128],
             || absent(format!("relation {tid} not found")),
             |b, row| b.set_string_cell(row, RELTAB_PAY_NAME, &new_name),
@@ -675,7 +665,7 @@ impl GnitzClient {
         change: ColumnChange<'_>,
     ) -> Result<(), ClientError> {
         self.rewrite_sys_row(
-            COL_TAB,
+            SysFamily::Column,
             &[tid as u128, col_idx as u128],
             || absent(format!("column index {col_idx} not found on table {tid}")),
             |b, row| match change {
@@ -701,7 +691,7 @@ impl GnitzClient {
     /// stored row at `-1`, and a copy of it at `+1` that `patch` edits in place.
     async fn rewrite_sys_row(
         &mut self,
-        family: u64,
+        family: SysFamily,
         key: &[u128],
         missing: impl FnOnce() -> ClientError,
         patch: impl FnOnce(&mut ZSetBatch, usize),
@@ -722,7 +712,7 @@ impl GnitzClient {
     /// a gap in the id sequence and nothing more.
     async fn cut_and_ids<const N: usize>(
         &mut self,
-        families: [u64; N],
+        families: [SysFamily; N],
         n: u64,
     ) -> Result<([ZSetBatch; N], u64), ClientError> {
         let ids = self.session.submit(Request::AllocIds(n));
@@ -733,7 +723,7 @@ impl GnitzClient {
     /// `families`' rows under `spec`, with no DDL between them.
     async fn sys_cut<const N: usize>(
         &mut self,
-        families: [u64; N],
+        families: [SysFamily; N],
         spec: &ReadSpec,
     ) -> Result<[ZSetBatch; N], ClientError> {
         let scans = families.map(|family| (Target::from(family), spec, sys_schema(family)));
@@ -745,7 +735,7 @@ impl GnitzClient {
 
     /// System family `family`'s rows under `bound`, decoded under its own schema;
     /// the server checks the reply against that schema's layout.
-    async fn sys_rows(&mut self, family: u64, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
+    async fn sys_rows(&mut self, family: SysFamily, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
         Ok(self
             .scan_spec(family, &ReadSpec::all_rows(bound), sys_schema(family))
             .await?
@@ -759,7 +749,7 @@ impl GnitzClient {
     /// `missing()`.
     async fn seek_sys_row(
         &mut self,
-        family: u64,
+        family: SysFamily,
         key: &[u128],
         missing: impl FnOnce() -> ClientError,
     ) -> Result<(ZSetBatch, usize), ClientError> {

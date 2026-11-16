@@ -8,7 +8,7 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use super::*;
-use gnitz_wire::{VIEW_TAB, ViewTabSlot};
+use gnitz_wire::{SysFamily, ViewTabSlot};
 
 /// Base table `t(pk BIGINT PK, v BIGINT)` in a fresh schema, holding pks 1..=3:
 /// `(schema name, tid, schema)`.
@@ -32,8 +32,8 @@ fn chain(name: RelName, base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
 /// `(vid, owner_view_id)` of every VIEW_TAB row, sorted; each row is held at
 /// weight 1.
 fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
-    let view_tab = crate::sys_schema(VIEW_TAB);
-    let b = block_on(client.scan_spec(VIEW_TAB, &ReadSpec::all_rows(ReadBound::None), view_tab))
+    let view_tab = crate::sys_schema(SysFamily::View);
+    let b = block_on(client.scan_spec(SysFamily::View, &ReadSpec::all_rows(ReadBound::None), view_tab))
         .unwrap()
         .batch;
     let owners = &b.payload[ViewTabSlot::owner_view_id as usize].bytes;
@@ -184,11 +184,11 @@ fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     let alone = bundle(rel(&sn, "f"), Vec::new(), segment(base_tid, &schema));
     let vid = block_on(client.create_view_chain(alone)).unwrap();
 
-    let view_tab = crate::sys_schema(VIEW_TAB);
+    let view_tab = crate::sys_schema(SysFamily::View);
     let all = ReadSpec::all_rows(ReadBound::None);
     let scans = [
         (base_tid.into(), &all, &schema),
-        (VIEW_TAB.into(), &all, view_tab),
+        (SysFamily::View.into(), &all, view_tab),
         (vid.into(), &all, &schema),
     ];
     let replies = block_on(client.scan_many(&scans)).unwrap();

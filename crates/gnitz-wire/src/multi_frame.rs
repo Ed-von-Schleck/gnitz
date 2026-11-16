@@ -4,12 +4,13 @@
 //! A frame is a prologue header naming the verb (`target_id = 0`), then items to
 //! the end of the frame, each a control frame of that verb. A `DELTA_POLL`'s
 //! prologue `arg0` is [`delta_poll_kept`]; every other prologue field is zero,
-//! which [`DecodedControl::client_verb`] checks.
+//! which [`DecodedControl::client_verb`] checks. The sections each verb's items
+//! carry are [`decode_items`]'s to check.
 //!
 //! | Verb         | Item header                                              | Sections                  |
 //! |--------------|----------------------------------------------------------|---------------------------|
 //! | `DDL_TXN`    | `target_id` = system family                              | data block                |
-//! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis; `arg1` = descriptor token | schema record, data block |
+//! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis; `arg1` = descriptor token | blob = schema record; data block |
 //! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest; `arg1` = descriptor token | blob = `ReadSpec` |
 //! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = descriptor token | blob = cursor tag, after_tick, `ReadSpec` |
 //!
@@ -17,39 +18,34 @@
 //! ends that position alone; every other fault ends the request.
 //!
 //! **A `DELTA_POLL` reply** is one train per view, ended by a terminal whose
-//! `target_id` is the view, `arg0` the tick of the [`DeltaCursor`] to read from
-//! next and `arg1` its tag. Tick 0 is never sent.
+//! `target_id` is the view and whose `arg0`/`arg1` carry the tag and tick of the
+//! [`DeltaCursor`] to read from next. Tick 0 is never sent.
 //!
 //! The module also holds the [`DeltaCursor`] a `DELTA_POLL` item and terminal
 //! carry, and the held-ids blob of a `SYNC_PUSHED` reply ([`encode_held`]).
 
-use crate::control::frame_size;
+use crate::control::{Section, VerbShape, frame_size};
 use crate::region::Regions;
 use crate::{
     CTRL_HEADER_SIZE, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireConflictMode, WireFlags, Writer,
-    append_frame, frame_head_size, peek_control_block,
+    append_frame, peek_control_block,
 };
 use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
-
-/// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
-/// one reply train of bookkeeping per relation; a handful of related tables
-/// covers a realistic consistent snapshot.
-const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 
 /// The basis of a `PUSH_TXN` family built from no read. No read reports it, and
 /// no commit exceeds it.
 pub const BLIND: u64 = u64::MAX;
 
 /// One family of a `PUSH_TXN` or `DDL_TXN`: the relation it writes, a
-/// `PUSH_TXN` family's conflict mode and basis, its schema record where the
-/// verb carries one, and its rows.
+/// `PUSH_TXN` family's conflict mode, basis and schema record, and its rows.
 pub struct FrameItem<'a> {
     pub target: Target,
     pub conflict_mode: WireConflictMode,
     pub basis: u64,
-    pub schema: Option<&'a [u8]>,
+    /// A `PUSH_TXN` family's schema record; empty for a `DDL_TXN` family.
+    pub blob: &'a [u8],
     pub data: Regions<'a>,
 }
 
@@ -60,11 +56,11 @@ fn multi_frame(out: &mut Vec<u8>, verb: ClientVerb, arg0: u64, body: usize, item
     let at = out.len();
     out.reserve(CTRL_HEADER_SIZE + body);
     let hdr = ControlHeader {
-        flags: WireFlags { verb, ..Default::default() },
+        flags: WireFlags { verb: Some(verb), ..Default::default() },
         arg0,
         ..Default::default()
     };
-    append_frame(out, &hdr, &[], None, None);
+    append_frame(out, &hdr, &[], None);
     items(out);
     debug_assert_eq!(out.len() - at, CTRL_HEADER_SIZE + body, "{verb:?} frame missized");
 }
@@ -72,74 +68,36 @@ fn multi_frame(out: &mut Vec<u8>, verb: ClientVerb, arg0: u64, body: usize, item
 /// Append a `PUSH_TXN` or `DDL_TXN` frame to `out`, without the 4-byte frame
 /// length prefix.
 pub fn encode_items(out: &mut Vec<u8>, verb: ClientVerb, items: &[FrameItem<'_>]) {
+    let shape = VerbShape::of(verb);
     debug_assert!(
-        item_shape(verb).is_some_and(|s| s.data),
+        shape.items.is_some() && shape.sections.data == Section::Must,
         "{verb:?} items carry no data block"
     );
-    let body = items
-        .iter()
-        .map(|it| frame_size(&[], it.schema, Some(&it.data[..])))
-        .sum();
+    let body = items.iter().map(|it| frame_size(it.blob, Some(&it.data[..]))).sum();
     multi_frame(out, verb, 0, body, |out| {
         for it in items {
             let mut hdr = ControlHeader::naming(verb, it.target, it.basis);
             hdr.flags.conflict_mode = it.conflict_mode;
-            append_frame(out, &hdr, &[], it.schema, Some(&it.data[..]));
+            append_frame(out, &hdr, it.blob, Some(&it.data[..]));
         }
     })
-}
-
-/// The sections an item of a multi-item verb carries, and how many items one
-/// frame may hold.
-pub(crate) struct ItemShape {
-    /// Whether a decoded item may carry a blob; an item carrying one where
-    /// this is false is refused.
-    pub(crate) blob: bool,
-    pub(crate) schema: bool,
-    pub(crate) data: bool,
-    pub(crate) cap: usize,
-}
-
-/// A multi-item verb's item shape; `None` for a single-item verb.
-pub(crate) const fn item_shape(verb: ClientVerb) -> Option<ItemShape> {
-    let (blob, schema, data, cap) = match verb {
-        ClientVerb::DdlTxn => (false, false, true, usize::MAX),
-        ClientVerb::PushTxn => (false, true, true, usize::MAX),
-        ClientVerb::ScanMulti => (true, false, false, SCAN_MULTI_MAX_RELATIONS),
-        ClientVerb::DeltaPoll => (true, false, false, usize::MAX),
-        _ => return None,
-    };
-    Some(ItemShape { blob, schema, data, cap })
 }
 
 /// Split the item list at `body` of the multi-item `verb` frame `frame` into
 /// its items, in send order: each item's peeked control, its ranges indexing
 /// `frame`. An item's `body` is the empty range at its end.
 pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Result<Vec<DecodedControl>, String> {
-    let Some(ItemShape { blob, schema, data, cap }) = item_shape(verb) else {
+    let shape = VerbShape::of(verb);
+    let Some(items) = shape.items else {
         return Err(format!("{verb:?} is not a multi-item verb"));
     };
     let item = |rest: &[u8]| -> Result<DecodedControl, String> {
         let ctrl = peek_control_block(rest)?;
-        ctrl.hdr.check_client_authored(verb == ClientVerb::PushTxn)?;
-        if ctrl.hdr.flags.verb != verb {
+        ctrl.hdr.check_client_authored()?;
+        if ctrl.hdr.flags.verb != Some(verb) {
             return Err(format!("an item names verb {:?}", ctrl.hdr.flags.verb));
         }
-        if !ctrl.blob.is_empty() && !blob {
-            return Err("an item carries a blob".into());
-        }
-        if ctrl.schema.is_some() != schema {
-            return Err(format!(
-                "an item {} a schema record",
-                if schema { "lacks" } else { "carries" }
-            ));
-        }
-        if ctrl.data.is_some() != data {
-            return Err(format!(
-                "an item {} a data block",
-                if data { "lacks" } else { "carries" }
-            ));
-        }
+        shape.sections.check(&ctrl)?;
         Ok(ctrl)
     };
     if body.is_empty() {
@@ -148,8 +106,8 @@ pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Resul
     let mut at = body.start;
     let mut out = Vec::new();
     while at < body.end {
-        if out.len() == cap {
-            return Err(format!("{verb:?}: too many items (max {cap})"));
+        if out.len() == items.cap {
+            return Err(format!("{verb:?}: too many items (max {})", items.cap));
         }
         let mut ctrl =
             (item(&frame[at..body.end]).map_err(|e| format!("{verb:?} item {}: {e}", out.len())))?.placed_at(at);
@@ -173,11 +131,11 @@ pub struct ScanItem<'a> {
 /// Append a `SCAN_MULTI` frame to `out`, without the 4-byte frame length
 /// prefix.
 pub fn encode_scan_multi(out: &mut Vec<u8>, scans: &[ScanItem<'_>]) {
-    let body = scans.iter().map(|s| frame_head_size(s.spec.len(), None)).sum();
+    let body = scans.iter().map(|s| frame_size(s.spec, None)).sum();
     multi_frame(out, ClientVerb::ScanMulti, 0, body, |out| {
         for s in scans {
             let hdr = ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout);
-            append_frame(out, &hdr, s.spec, None, None);
+            append_frame(out, &hdr, s.spec, None);
         }
     })
 }
@@ -207,8 +165,7 @@ pub struct DeltaCursor {
 }
 
 impl DeltaCursor {
-    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none. A
-    /// `DELTA_POLL` terminal carries the pair as `(arg1, arg0)`.
+    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none.
     pub fn from_pair(tag: u64, tick: u64) -> Option<DeltaCursor> {
         NonZeroU64::new(tick).map(|tick| DeltaCursor { tag, tick })
     }
@@ -281,7 +238,7 @@ impl fmt::Display for SubId {
 pub fn encode_delta_poll(out: &mut Vec<u8>, views: &[DeltaPollItem<'_>], keep: Option<SubId>) {
     let body = views
         .iter()
-        .map(|v| frame_head_size(DELTA_CURSOR_BYTES + v.spec.len(), None))
+        .map(|v| CTRL_HEADER_SIZE + DELTA_CURSOR_BYTES + v.spec.len())
         .sum();
     let widest = views.iter().map(|v| v.spec.len()).max().unwrap_or(0);
     let mut blob = Writer::with_capacity(DELTA_CURSOR_BYTES + widest);
@@ -291,7 +248,7 @@ pub fn encode_delta_poll(out: &mut Vec<u8>, views: &[DeltaPollItem<'_>], keep: O
             DeltaCursor::write_opt(&mut blob, v.from);
             blob.raw(v.spec);
             let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout);
-            append_frame(out, &hdr, blob.as_slice(), None, None);
+            append_frame(out, &hdr, blob.as_slice(), None);
         }
     })
 }
@@ -358,5 +315,5 @@ pub fn decode_delta_items(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String>
 }
 
 #[cfg(test)]
-#[path = "tests/txn_frame.rs"]
+#[path = "tests/multi_frame.rs"]
 mod tests;

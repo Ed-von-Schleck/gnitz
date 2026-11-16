@@ -9,7 +9,7 @@ use std::sync::Arc;
 use gnitz_core::{RelDescriptor, RelName, Schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 use gnitz_zset_testkit::{encode_to_wire_vec, make_batch, make_schema_u64_i64};
 
 use super::*;
@@ -35,7 +35,7 @@ fn scatter(seq: u64) -> u64 {
 fn copy_index_bench() {
     const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
     let layout = make_schema_u64_i64();
-    let schema = Schema::from_block(&encode_schema_block(&layout)).unwrap();
+    let schema = Schema::from_record(&encode_schema_record(&layout)).unwrap();
     let block = |rows: &[(u64, i64, i64)]| encode_to_wire_vec(&make_batch(&layout, rows));
     let cursor = |tick| DeltaCursor::from_pair(7, tick).unwrap();
     let counter = Counter::instructions();

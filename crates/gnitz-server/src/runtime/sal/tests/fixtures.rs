@@ -15,7 +15,7 @@ use crate::runtime::sal::reader::SalReader;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_schema_u64_i64};
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 use std::fs::File;
 use std::ops::Range;
 
@@ -78,6 +78,12 @@ impl SalWriter {
         // SAFETY: the anchor page is mapped ahead of the ring; `&mut self` as
         // `ring_mut`.
         unsafe { std::slice::from_raw_parts_mut(self.log.ring.sub(ANCHOR_BYTES), PREFIX_BYTES) }
+    }
+
+    /// The format word behind the anchor, as bytes.
+    pub(crate) fn format_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `anchor_mut`, the next word of the same page.
+        unsafe { std::slice::from_raw_parts_mut(self.log.ring.sub(ANCHOR_BYTES - PREFIX_BYTES), PREFIX_BYTES) }
     }
 
     /// Worker `w`'s live drain from cursor 0 of the epoch groups are written at.
@@ -198,7 +204,7 @@ impl SalWriter {
     pub(crate) fn push_zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
         let batch = zone_rows();
         let each = vec![batch.wire_whole(); self.num_workers()];
-        let record = encode_schema_block(batch.schema());
+        let record = encode_schema_record(batch.schema());
         let groups: Vec<Group> = targets
             .iter()
             .map(|&t| Group::push(t, PkRule::Enforce, &record, Routed::Each(&each)))

@@ -5,7 +5,7 @@ use gnitz_core::BatchAppender;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 /// A wire key over column `col`.
-const fn key(col: u16, desc: bool, nulls_first: bool) -> OrderKey {
+const fn key(col: u32, desc: bool, nulls_first: bool) -> OrderKey {
     OrderKey { col, desc, nulls_first }
 }
 

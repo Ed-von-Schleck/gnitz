@@ -20,7 +20,7 @@ fn extended(tc: TypeCode, native: u128) -> u128 {
 /// The OPK bytes of `tc`'s value `native` in a slot of type `target`.
 fn slot_bytes(tc: TypeCode, native: u128, target: TypeCode) -> Vec<u8> {
     let mut slot = vec![0u8; target.wire_stride()];
-    gnitz_wire::store_opk(&mut slot, extended(tc, native), target.is_signed_int());
+    gnitz_wire::store_opk(&mut slot, extended(tc, native) ^ gnitz_wire::opk_bias(target));
     slot
 }
 

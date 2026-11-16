@@ -271,14 +271,9 @@ pub(crate) fn step_until_idle(s: &mut Session) {
 
 /// One frame payload, without the 4-byte length prefix, as
 /// `append_payload` writes it.
-pub(crate) fn encode_frame(
-    hdr: ControlHeader,
-    blob: &[u8],
-    schema: Option<&[u8]>,
-    data: Option<&ZSetBatch>,
-) -> Vec<u8> {
+pub(crate) fn encode_frame(hdr: ControlHeader, blob: &[u8], data: Option<&ZSetBatch>) -> Vec<u8> {
     let mut out = Vec::new();
-    crate::connection::append_payload(&mut out, hdr, blob, schema, data);
+    crate::connection::append_payload(&mut out, hdr, blob, data);
     out
 }
 
@@ -289,10 +284,10 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
         arg0: lsn,
         ..Default::default()
     };
-    encode_frame(hdr, &[], None, None)
+    encode_frame(hdr, &[], None)
 }
 
-/// A reply frame carrying `batch` and `lsn` in `arg0`, and no schema block;
+/// A reply frame carrying `batch` and `lsn` in `arg0`;
 /// `cont` sets `continuation`.
 pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
     let hdr = ControlHeader {
@@ -301,7 +296,7 @@ pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> V
         arg0: lsn,
         ..Default::default()
     };
-    encode_frame(hdr, &[], None, Some(batch))
+    encode_frame(hdr, &[], Some(batch))
 }
 
 /// A frame of `view`'s delta train carrying `rows`, if any: a continuation, or
@@ -314,11 +309,11 @@ pub(crate) fn delta_frame(view: u64, rows: Option<&ZSetBatch>, end: Option<(u64,
             continuation: end.is_none(),
             ..Default::default()
         },
-        arg0: tick,
-        arg1: tag,
+        arg0: tag,
+        arg1: tick,
         ..Default::default()
     };
-    encode_frame(hdr, &[], None, rows)
+    encode_frame(hdr, &[], rows)
 }
 
 /// `view`'s terminal of a delta read or poll: control-only, carrying the cursor
@@ -338,7 +333,7 @@ pub(crate) fn pushed_marker(view: u64, sub: SubId) -> Vec<u8> {
         },
         ..Default::default()
     };
-    encode_frame(hdr, &[], None, None)
+    encode_frame(hdr, &[], None)
 }
 
 /// One pushed train of subscription `sub` to `view`, framed: its opening frame,
@@ -368,15 +363,15 @@ pub(crate) fn sub_id(id: u64) -> SubId {
 /// The control header of `request`, which must be a SYNC_PUSHED.
 pub(crate) fn sync_header(request: &[u8]) -> ControlHeader {
     let hdr = peek_control_block(request).expect("a control header").hdr;
-    assert_eq!(hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    assert_eq!(hdr.flags.verb, Some(gnitz_wire::ClientVerb::SyncPushed));
     hdr
 }
 
 /// The subscription ids `request`, a SYNC_PUSHED, names as held, ascending.
 pub(crate) fn sync_held(request: &[u8]) -> Vec<SubId> {
     let ctrl = peek_control_block(request).expect("a control header");
-    assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
-    let mut held = gnitz_wire::txn_frame::decode_held(&request[ctrl.blob]).expect("held ids");
+    assert_eq!(ctrl.hdr.flags.verb, Some(gnitz_wire::ClientVerb::SyncPushed));
+    let mut held = gnitz_wire::multi_frame::decode_held(&request[ctrl.blob]).expect("held ids");
     held.sort_unstable();
     held
 }
@@ -391,7 +386,7 @@ pub(crate) fn sync_answer(refusal: Option<&str>) -> Vec<u8> {
         },
         ..Default::default()
     };
-    encode_frame(hdr, refusal.unwrap_or_default().as_bytes(), None, None)
+    encode_frame(hdr, refusal.unwrap_or_default().as_bytes(), None)
 }
 
 /// A fault frame naming `tid`, with `text` as its body.
@@ -401,7 +396,7 @@ pub(crate) fn reply_status(tid: u64, status: WireStatus, text: &str) -> Vec<u8> 
         status,
         ..Default::default()
     };
-    encode_frame(hdr, text.as_bytes(), None, None)
+    encode_frame(hdr, text.as_bytes(), None)
 }
 
 /// Deliver `SIGUSR1` to the calling thread until `stop` is set, with a no-op

@@ -9,8 +9,8 @@ use std::sync::atomic::Ordering;
 
 use super::durable::Durable;
 use super::format::{
-    GroupHead, Header, PAYLOAD_HEAD, PREFIX_BYTES, PRESENT, SalMessageKind, anchor_word, dir_sizes, directory,
-    epoch_word, group_header_size, group_total_size, next_epoch, payload_encode, payload_spans,
+    GroupHead, Header, PAYLOAD_HEAD, PREFIX_BYTES, PRESENT, SAL_FORMAT, SalMessageKind, anchor_word, dir_sizes,
+    directory, epoch_word, group_header_size, group_total_size, next_epoch, payload_encode, payload_spans,
 };
 use super::group::{Group, Routed};
 use super::log::{ANCHOR_BYTES, MIN_SAL_BYTES, SalLog};
@@ -378,6 +378,8 @@ impl SalWriter {
         // The anchor is synced before any group of `epoch` exists, so no epoch
         // is ever written twice. The ring's first prefix is zeroed only after
         // that sync: a power loss that keeps the old anchor keeps the old tail.
+        // The format word shares the anchor's page and sync.
+        self.log.format_atomic().store(SAL_FORMAT, Ordering::Relaxed);
         self.log.anchor_atomic().store(anchor_word(epoch), Ordering::Relaxed);
         if let Err(e) = self.log.file.sync_data() {
             gnitz_fatal_abort!("SAL fdatasync (rewind to epoch {epoch}) failed: {e}");

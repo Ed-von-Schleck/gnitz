@@ -4,8 +4,7 @@
 //! reader over them, and the walk over one fixed-width cell of each strided row.
 //! `wal` frames a list into a block; nothing here knows what a block looks like.
 
-use std::mem::MaybeUninit;
-use std::ops::Deref;
+use smallvec::SmallVec;
 
 use crate::TypeCode;
 
@@ -34,39 +33,7 @@ pub const MAX_COLUMNS: usize = 65;
 pub const MAX_WIRE_REGIONS: usize = num_regions(MAX_COLUMNS);
 
 /// A block's canonical region list, held inline.
-pub struct Regions<'a> {
-    slots: [MaybeUninit<&'a [u8]>; MAX_WIRE_REGIONS],
-    len: usize,
-}
-
-impl<'a> Regions<'a> {
-    pub const fn new() -> Self {
-        Regions {
-            slots: [const { MaybeUninit::uninit() }; MAX_WIRE_REGIONS],
-            len: 0,
-        }
-    }
-
-    pub fn push(&mut self, region: &'a [u8]) {
-        self.slots[self.len].write(region);
-        self.len += 1;
-    }
-}
-
-impl Default for Regions<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'a> Deref for Regions<'a> {
-    type Target = [&'a [u8]];
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: `push` initialised every slot below `len`, and `MaybeUninit<T>` has `T`'s layout.
-        unsafe { std::slice::from_raw_parts(self.slots.as_ptr().cast(), self.len) }
-    }
-}
+pub type Regions<'a> = SmallVec<[&'a [u8]; MAX_WIRE_REGIONS]>;
 
 /// True iff payload null-bit `pi` is set (the column is NULL). Bit `pi` is the
 /// `pi`-th non-PK column in schema order.
@@ -245,3 +212,7 @@ pub fn zip_cells<const W: usize, D>(
 #[cfg(test)]
 #[path = "tests/region.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/region.rs"]
+mod benches;

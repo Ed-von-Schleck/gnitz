@@ -95,7 +95,7 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     s.step(Interest::WRITE);
     let req = peer.recv();
     let ctrl = peek_control_block(&req).unwrap();
-    let items = gnitz_wire::txn_frame::decode_scan_multi(&req[ctrl.body]).unwrap();
+    let items = gnitz_wire::multi_frame::decode_scan_multi(&req[ctrl.body]).unwrap();
     let named: Vec<(Target, u64, Vec<u8>)> = items
         .iter()
         .map(|i| (i.target, i.reply_layout, i.spec.to_vec()))
@@ -122,28 +122,6 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     assert!(Arc::ptr_eq(&replies[0].schema, &sa));
     assert!(Arc::ptr_eq(&replies[1].schema, &sb));
     assert_eq!(s.interest(), Interest::NONE);
-}
-
-/// A schema block on a read's reply fails the slot and ends the session.
-#[test]
-fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
-    let (mut s, peer) = pair();
-    let sa = schema_a();
-    let sent = submit_scan(&mut s, 7, &sa);
-    s.step(Interest::WRITE);
-    peer.recv();
-    peer.send(&encode_frame(
-        ControlHeader { target_id: 7, ..Default::default() },
-        &[],
-        Some(sa.to_block()),
-        Some(&batch_a(&[5])),
-    ));
-    let e = await_reply(&mut s, sent).expect_err("a schema block on a read is a decode error");
-    assert!(
-        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
-        "{e:?}"
-    );
-    assert!(s.is_closed());
 }
 
 /// A status frame completes the slot at the head as that status's refusal —
@@ -199,7 +177,7 @@ fn a_status_frame_fails_its_slot_alone() {
 fn a_refused_submit_leaves_the_session_as_it_was() {
     let (mut s, _peer) = pair();
     let sa = schema_a();
-    let ddl = [(12345, ZSetBatch::new(&sa))];
+    let ddl = [(gnitz_wire::SysFamily::Schema, ZSetBatch::new(&sa))];
     let wrong_layout = batch_b(&[1]);
     // One cell alone past the server's ingress cap, refused before it is sent.
     let sb = schema_b();
@@ -216,7 +194,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     assert!(matches!(s.submit_scan_multi(&[]).try_take(), Some(Err(_))));
     untouched(&s, "an empty multi-read");
     for (what, req) in [
-        ("a DDL family that is no system table", Request::DdlTxn(&ddl)),
+        ("a DDL batch not in its family's layout", Request::DdlTxn(&ddl)),
         (
             "a push whose batch is not in its schema's layout",
             Request::Push {
@@ -424,8 +402,8 @@ fn in_flight_cap_raises_rather_than_hanging() {
 }
 
 /// A DELTA_POLL item: `view` after `(tag 1, tick 4)`, replied as `schema_a`.
-fn delta_item(view: u64) -> txn_frame::DeltaPollItem<'static> {
-    txn_frame::DeltaPollItem {
+fn delta_item(view: u64) -> multi_frame::DeltaPollItem<'static> {
+    multi_frame::DeltaPollItem {
         view: view.into(),
         from: DeltaCursor::from_pair(1, 4),
         reply_layout: schema_a().layout().layout_digest(),
@@ -552,18 +530,30 @@ fn a_delta_read_terminal_at_round_0_ends_the_session() {
     assert!(s.is_closed());
 }
 
-/// A RESOLVE reply that does not decode ends the session, whichever of its
-/// sections is the malformed one.
+/// A RESOLVE reply that does not decode ends the session, whichever part of
+/// its descriptor is the malformed one.
 #[test]
 fn a_resolve_reply_that_does_not_decode_ends_the_session() {
-    let schema = schema_a().to_block().to_vec();
+    let schema = schema_a();
+    let record = schema.to_record();
+    let desc = |schema: &[u8]| {
+        RelDescriptorBlob {
+            schema: schema.into(),
+            ..Default::default()
+        }
+        .encode()
+    };
+    let whole = desc(record);
     let named = ControlHeader { target_id: 7, ..Default::default() };
     for (what, frame) in [
-        ("no schema block", encode_frame(named, &[], None, None)),
-        ("a truncated descriptor", encode_frame(named, &[], Some(&schema), None)),
+        ("no descriptor", encode_frame(named, &[], None)),
         (
-            "a truncated schema block",
-            encode_frame(named, &[], Some(&schema[..2]), None),
+            "a truncated descriptor",
+            encode_frame(named, &whole[..whole.len() - 1], None),
+        ),
+        (
+            "a truncated schema record",
+            encode_frame(named, &desc(&record[..2]), None),
         ),
     ] {
         let (mut s, peer) = pair();
@@ -594,13 +584,13 @@ fn a_snapshot_page_naming_no_worker_ends_the_session() {
     let sent = s.submit_snapshot_page(1, 7, &[], 10, &schema_a());
     s.step(Interest::WRITE);
     peer.recv();
-    peer.send(&encode_frame(named(true), &[], None, None));
+    peer.send(&encode_frame(named(true), &[], None));
     assert_eq!(await_reply(&mut s, sent).unwrap().worker_ends, [0]);
 
     let sent = s.submit_snapshot_page(1, 7, &[], 10, &schema_a());
     s.step(Interest::WRITE);
     peer.recv();
-    peer.send(&encode_frame(named(false), &[], None, None));
+    peer.send(&encode_frame(named(false), &[], None));
     let e = await_reply(&mut s, sent).expect_err("a page naming no worker");
     assert!(
         matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
@@ -635,7 +625,7 @@ fn a_multi_frame_page_decodes_in_arrival_order() {
             },
             ..Default::default()
         };
-        encode_frame(hdr, &[], None, Some(batch))
+        encode_frame(hdr, &[], Some(batch))
     };
     let (mut s, peer) = pair();
     let mut sent = s.submit_snapshot_page(1, 7, &[], 10, &schema);
@@ -678,7 +668,7 @@ fn a_malformed_block_mid_train_ends_the_session_at_once() {
     peer.recv();
     let mut bad = reply_rows(7, &batch_a(&[2]), 0, true);
     let data = peek_control_block(&bad).unwrap().data.unwrap();
-    // The header's second word, the block version.
+    // The header's second word, the row count.
     bad[data.start + 4] ^= 0xff;
     peer.send(&reply_rows(7, &batch_a(&[1]), 0, true));
     peer.send(&bad);
@@ -686,7 +676,7 @@ fn a_malformed_block_mid_train_ends_the_session_at_once() {
     assert!(s.is_closed());
     let e = await_reply(&mut s, sent).expect_err("a malformed block");
     assert!(
-        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(m)) if m.contains("version")),
+        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(m)) if m.contains("does not match its rows")),
         "{e:?}"
     );
 }
@@ -759,7 +749,7 @@ fn a_released_subscription_parks_no_pushed_train() {
     s.step(Interest::WRITE);
     let (_read, _commit, request) = (peer.recv(), peer.recv(), peer.recv());
     let hdr = peek_control_block(&request).unwrap().hdr;
-    assert_eq!(hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    assert_eq!(hdr.flags.verb, Some(gnitz_wire::ClientVerb::SyncPushed));
     assert_eq!(hdr.arg0, 60_000, "the sync waits");
 }
 
@@ -846,7 +836,7 @@ fn a_sync_names_what_is_held_and_ends_the_rest() {
         s.step(Interest::WRITE);
         let request = loop {
             let request = peer.recv();
-            if peek_control_block(&request).unwrap().hdr.flags.verb == gnitz_wire::ClientVerb::SyncPushed {
+            if peek_control_block(&request).unwrap().hdr.flags.verb == Some(gnitz_wire::ClientVerb::SyncPushed) {
                 break request;
             }
         };
@@ -1021,21 +1011,17 @@ fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
     for (what, frame) in [
         (
             "a data block",
-            encode_frame(marker(bare, ok), &[], None, Some(&batch_a(&[1]))),
+            encode_frame(marker(bare, ok), &[], Some(&batch_a(&[1]))),
         ),
-        (
-            "a schema block",
-            encode_frame(marker(bare, ok), &[], Some(schema_a().to_block()), None),
-        ),
-        ("a blob", encode_frame(marker(bare, ok), b"why", None, None)),
-        ("a continuation", encode_frame(marker(continued, ok), &[], None, None)),
+        ("a blob", encode_frame(marker(bare, ok), b"why", None)),
+        ("a continuation", encode_frame(marker(continued, ok), &[], None)),
         (
             "a fault",
-            encode_frame(marker(bare, WireStatus::Error), b"lagged", None, None),
+            encode_frame(marker(bare, WireStatus::Error), b"lagged", None),
         ),
         (
             "no subscription",
-            encode_frame(ControlHeader { arg0: 0, ..marker(bare, ok) }, &[], None, None),
+            encode_frame(ControlHeader { arg0: 0, ..marker(bare, ok) }, &[], None),
         ),
     ] {
         let (mut s, peer) = pair();
@@ -1052,11 +1038,9 @@ fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
 
 // ── Request frames ───────────────────────────────────────────────────────────
 
-/// A frame's schema block, decoded.
-fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Option<Schema> {
-    ctrl.schema
-        .clone()
-        .map(|r| Schema::from_block(&buf[r]).expect("a schema block decodes"))
+/// A frame's blob, decoded as a schema record.
+fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Schema {
+    Schema::from_record(&buf[ctrl.blob.clone()]).expect("a schema record decodes")
 }
 
 /// A frame's data block, decoded under `schema`.
@@ -1067,7 +1051,7 @@ fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Schema) -> Option<ZSet
 }
 
 /// A multi-family `PUSH_TXN` frame (both modes, a repeated tid, a delete
-/// family). The frame layout is `gnitz_wire::txn_frame`'s and is tested there;
+/// family). The frame layout is `gnitz_wire::multi_frame`'s and is tested there;
 /// what this pins is the adapter above it: each family's two blocks are built
 /// from *that* family's schema, batch, tid and basis, in that order.
 #[test]
@@ -1084,7 +1068,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         mode,
         basis,
     };
-    let blind = gnitz_wire::txn_frame::BLIND;
+    let blind = gnitz_wire::multi_frame::BLIND;
     let families = [
         family(16, b0, WireConflictMode::Update, 42),
         family(17, b1, WireConflictMode::Error, blind),
@@ -1094,19 +1078,19 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     append_push_txn(&mut payload, &families);
 
     let ctrl = peek_control_block(&payload).unwrap();
-    let decoded = gnitz_wire::txn_frame::decode_items(&payload, ctrl.body, ClientVerb::PushTxn).unwrap();
+    let decoded = gnitz_wire::multi_frame::decode_items(&payload, ctrl.body, ClientVerb::PushTxn).unwrap();
     assert_eq!(decoded.len(), families.len());
     for (fam, want) in decoded.iter().zip(&families) {
         let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
         assert_eq!(got, (want.target.tid, want.mode, want.basis));
-        let block_schema = frame_schema(&payload, fam).unwrap();
+        let block_schema = frame_schema(&payload, fam);
         assert_eq!(block_schema, *schema);
         assert_eq!(frame_data(&payload, fam, &block_schema).as_ref(), Some(&*want.batch));
     }
 }
 
-/// A frame carries its schema record and its rows; an empty batch still ships
-/// the schema, but no data block.
+/// A push frame carries its schema record as its blob, and its rows; an empty
+/// batch still ships the record, but no data block.
 #[test]
 fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
     let schema = kv_schema(TypeCode::I64);
@@ -1115,10 +1099,10 @@ fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
         kv_rows(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)]),
         ZSetBatch::new(&schema),
     ] {
-        let buf = encode_frame(hdr, &[], Some(schema.to_block()), Some(&batch));
+        let buf = encode_frame(hdr, schema.to_record(), Some(&batch));
         let ctrl = peek_control_block(&buf).unwrap();
         assert_eq!(ctrl.hdr, hdr);
-        assert_eq!(frame_schema(&buf, &ctrl).as_ref(), Some(&schema));
+        assert_eq!(frame_schema(&buf, &ctrl), schema);
         let want = (!batch.is_empty()).then_some(&batch);
         assert_eq!(frame_data(&buf, &ctrl, &schema).as_ref(), want);
     }

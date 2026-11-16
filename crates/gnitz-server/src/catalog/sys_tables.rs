@@ -17,7 +17,7 @@ use gnitz_wire::{
     ViewParts, ViewTabRow,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_block};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_record};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -127,6 +127,15 @@ impl PkSignature {
             PkShape::Create => "CREATE",
         }
     }
+
+    /// How a guard message names the `family` row this key addresses.
+    pub(super) fn label(&self, family: SysFamily) -> String {
+        match self.member {
+            // COL_TAB's key is (owner_id, col_idx).
+            Some(col_idx) => format!("{} {col_idx} of owner {}", family.row_noun(), self.leading),
+            None => format!("{} {}", family.row_noun(), self.leading),
+        }
+    }
 }
 
 /// One [`PkSignature`] per distinct PK, in first-appearance order, over a batch in
@@ -165,7 +174,7 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
 }
 
 /// One `DDL_TXN` bundle: at most one block per system family, and none for a
-/// family only the master writes (see [`SysFamily::master_only`]).
+/// family only the master writes (see [`SysFamilyExt::master_only`]).
 #[derive(Default)]
 pub(crate) struct DdlBundle([Option<Batch>; SysFamily::COUNT]);
 
@@ -245,9 +254,9 @@ impl DdlBundle {
 /// family carries.
 static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = LazyLock::new(|| {
     SysFamily::ALL.map(|family| {
-        let (defs, pk) = (family.column_defs(), family.wire().pk_cols);
+        let (defs, pk) = (family.column_defs(), family.def().pk_cols);
         let schema = build_schema_from_col_defs(&defs, pk).expect("a system family is an admissible schema");
-        let record = encode_schema_block(&schema).into();
+        let record = encode_schema_record(&schema).into();
         (schema, record)
     })
 });
@@ -255,7 +264,7 @@ static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = La
 /// The named record of a relation keyed `pk` over `defs`: the one a RESOLVE
 /// reply carries.
 pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> Box<[u8]> {
-    gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), pk).into()
+    gnitz_wire::schema_record::encode(defs.iter().map(|c| c.def.record_col()), pk).into()
 }
 
 /// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
@@ -277,97 +286,65 @@ pub(super) fn build_schema_from_col_defs(
 }
 
 // ---------------------------------------------------------------------------
-// Typed system family
+// Engine policy per system family
 // ---------------------------------------------------------------------------
 
-/// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
-/// at the applier's mutation API in place of a bare `u64`, so the `fire_hooks`
-/// dispatch is an exhaustive `match` a newly-added family cannot silently skip.
-///
-/// **The discriminant is the wire table id**, so `SysFamily::Table` *is*
-/// `TABLE_TAB` and no mapping can disagree. Declaration order here carries
-/// nothing; the per-family arrays are indexed by [`Self::index`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u64)]
-pub(crate) enum SysFamily {
-    Schema = gnitz_wire::SCHEMA_TAB,
-    Table = gnitz_wire::TABLE_TAB,
-    View = gnitz_wire::VIEW_TAB,
-    Column = gnitz_wire::COL_TAB,
-    Index = gnitz_wire::IDX_TAB,
-    Sequence = gnitz_wire::SEQ_TAB,
-    Circuit = gnitz_wire::CIRCUIT_TAB,
-}
+pub(crate) use gnitz_wire::SysFamily;
 
-impl SysFamily {
-    pub(in crate::catalog) const COUNT: usize = gnitz_wire::SYS_FAMILIES.len();
-
-    /// Every family in `gnitz_wire::SYS_FAMILIES` order: the index the
-    /// per-family arrays share, and the order a bundle's families and a boot's
-    /// replay are applied in.
-    pub(crate) const ALL: [SysFamily; Self::COUNT] = [
-        SysFamily::Schema,
-        SysFamily::Column,
-        SysFamily::Circuit,
-        SysFamily::Table,
-        SysFamily::View,
-        SysFamily::Index,
-        SysFamily::Sequence,
-    ];
-
-    /// This family's position in `gnitz_wire::SYS_FAMILIES` — the index every
-    /// per-family array here is laid out by. A seven-entry scan, at DDL-bundle
-    /// or boot rate.
-    #[inline]
-    pub(in crate::catalog) const fn index(self) -> usize {
-        match gnitz_wire::sys_family_index(self as u64) {
-            Some(i) => i,
-            None => panic!("SysFamily variant is not a wire family"),
-        }
-    }
-
-    /// This family's shared wire identity: its table id, its name, and the column
-    /// shape its schema, COL_TAB self-description rows and the client's `Schema`
-    /// derive from. Held in `gnitz-wire`, so the engine restates none of it.
-    #[inline]
-    pub(in crate::catalog) fn wire(self) -> &'static gnitz_wire::WireSysFamily {
-        &gnitz_wire::SYS_FAMILIES[self.index()]
-    }
-
-    /// This family's table id — the discriminant itself.
-    #[inline]
-    pub(crate) const fn id(self) -> u64 {
-        self as u64
-    }
-
-    /// This family's name.
-    #[inline]
-    pub(in crate::catalog) fn name(self) -> &'static str {
-        self.wire().name
-    }
-
+/// What the engine does with each system family: its schema, its seed rows, and
+/// the rules its guards hold a bundle's rows to. Each `match` is exhaustive, so a
+/// newly-added family cannot silently skip one.
+pub(crate) trait SysFamilyExt: Copy {
     /// This family's fixed schema.
-    #[inline]
-    pub(crate) fn schema(self) -> &'static SchemaDescriptor {
-        &SCHEMAS[self.index()].0
-    }
+    fn schema(self) -> &'static SchemaDescriptor;
 
-    /// This family's [`encode_schema_block`]: the record its DdlSync groups carry.
-    pub(crate) fn sal_record(self) -> &'static [u8] {
-        &SCHEMAS[self.index()].1
-    }
+    /// This family's [`encode_schema_record`]: the record its DdlSync groups carry.
+    fn sal_record(self) -> &'static [u8];
 
     /// This family's column definitions, from the same wire slice its schema is
     /// built from — compile-time data, never read back from COL_TAB.
-    pub(in crate::catalog) fn column_defs(self) -> Vec<CatalogColumn> {
-        self.wire()
+    fn column_defs(self) -> Vec<CatalogColumn>;
+
+    /// The rows a fresh database's store of this family starts with.
+    fn write_seed_rows(self, bb: &mut BatchBuilder);
+
+    /// Does this family's PK draw from the catalog object-id counter?
+    fn allocates_ids(self) -> bool;
+
+    /// The payload columns a rewrite pair (`-1` + `+1` on one PK) may change, as
+    /// a payload-index bit mask; `None` where no emitter produces a pair —
+    /// there is no schema-rename or index-rename surface.
+    fn pair_change_mask(self) -> Option<u64>;
+
+    /// Are this family's rows retracted only with the relation that owns them — as a band,
+    /// by the drop cascade? A client delta may then carry no unpaired `-1` for it.
+    fn retracts_with_owner(self) -> bool;
+
+    /// Does this family hold the master's positions rather than a set? `true`
+    /// for Sequence alone: its rows move with every id allocation, SERIAL
+    /// reservation and checkpoint, and are the id counters and the checkpoint
+    /// generation the resume verdict reads at boot. So no
+    /// client bundle may carry one, no worker is sent one, and no view scans it.
+    fn master_only(self) -> bool;
+}
+
+impl SysFamilyExt for SysFamily {
+    fn schema(self) -> &'static SchemaDescriptor {
+        &SCHEMAS[self.index()].0
+    }
+
+    fn sal_record(self) -> &'static [u8] {
+        &SCHEMAS[self.index()].1
+    }
+
+    fn column_defs(self) -> Vec<CatalogColumn> {
+        self.def()
             .column_defs()
             .map(|def| CatalogColumn { def, fk: None })
             .collect()
     }
 
-    /// The rows a fresh database's store of this family starts with.
-    pub(in crate::catalog) fn write_seed_rows(self, bb: &mut BatchBuilder) {
+    fn write_seed_rows(self, bb: &mut BatchBuilder) {
         match self {
             SysFamily::Schema => {
                 for (schema_id, name) in [
@@ -379,23 +356,19 @@ impl SysFamily {
             }
             SysFamily::Table => {
                 for family in SysFamily::ALL {
-                    let row = TableTabRow {
-                        table_id: family.id(),
-                        schema_id: SYSTEM_SCHEMA_ID,
-                        name: family.name().into(),
-                        pk_col_idx: PkColList::from_slice(family.wire().pk_cols),
-                        // As registered at open.
-                        flags: gnitz_wire::TableProps {
-                            distribution: gnitz_wire::TableDistribution::Replicated,
-                            ..Default::default()
-                        },
+                    // Replicated, as registered at open.
+                    let props = TableProps {
+                        distribution: gnitz_wire::TableDistribution::Replicated,
+                        ..Default::default()
                     };
+                    let pk = PkColList::from_slice(family.def().pk_cols);
+                    let row = TableTabRow::of(family.id(), SYSTEM_SCHEMA_ID, family.name(), pk, props);
                     row.write(bb, 1);
                 }
             }
             SysFamily::Column => {
                 for family in SysFamily::ALL {
-                    for (i, def) in family.wire().column_defs().enumerate() {
+                    for (i, def) in family.def().column_defs().enumerate() {
                         ColTabRow::of(family.id(), i as u64, &def, None).write(bb, 1);
                     }
                 }
@@ -404,31 +377,14 @@ impl SysFamily {
         }
     }
 
-    /// The families applied before this one: those whose rows its register hook
-    /// reads from the store (COL_TAB, CIRCUIT_TAB), whose registrations it reads
-    /// (an index's owner), or whose rows its precheck reads (a relation's
-    /// schema, which only a live bundle needs applied).
-    const fn applies_after(self) -> &'static [SysFamily] {
-        match self {
-            SysFamily::Schema | SysFamily::Column | SysFamily::Circuit | SysFamily::Sequence => &[],
-            SysFamily::Table => &[SysFamily::Schema, SysFamily::Column],
-            SysFamily::View => &[SysFamily::Schema, SysFamily::Column, SysFamily::Circuit],
-            SysFamily::Index => &[SysFamily::Table, SysFamily::View],
-        }
-    }
-
-    /// Does this family's PK draw from the catalog object-id counter?
-    pub(super) fn allocates_ids(self) -> bool {
+    fn allocates_ids(self) -> bool {
         match self {
             SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index => true,
             SysFamily::Column | SysFamily::Sequence | SysFamily::Circuit => false,
         }
     }
 
-    /// The payload columns a rewrite pair (`-1` + `+1` on one PK) may change, as
-    /// a payload-index bit mask; `None` where no emitter produces a pair —
-    /// there is no schema-rename or index-rename surface.
-    pub(super) fn pair_change_mask(self) -> Option<u64> {
+    fn pair_change_mask(self) -> Option<u64> {
         match self {
             SysFamily::Table | SysFamily::View => Some(1 << gnitz_wire::RELTAB_PAY_NAME),
             SysFamily::Column => Some(
@@ -440,21 +396,14 @@ impl SysFamily {
         }
     }
 
-    /// Are this family's rows retracted only with the relation that owns them — as a band,
-    /// by the drop cascade? A client delta may then carry no unpaired `-1` for it.
-    pub(super) fn retracts_with_owner(self) -> bool {
+    fn retracts_with_owner(self) -> bool {
         match self {
             SysFamily::Column | SysFamily::Circuit => true,
             SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index | SysFamily::Sequence => false,
         }
     }
 
-    /// Does this family hold the master's positions rather than a set? `true`
-    /// for Sequence alone: its rows move with every id allocation, SERIAL
-    /// reservation and checkpoint, and are the id counters and the checkpoint
-    /// generation the resume verdict reads at boot. So no
-    /// client bundle may carry one, no worker is sent one, and no view scans it.
-    pub(crate) fn master_only(self) -> bool {
+    fn master_only(self) -> bool {
         match self {
             SysFamily::Sequence => true,
             SysFamily::Schema
@@ -465,55 +414,32 @@ impl SysFamily {
             | SysFamily::Circuit => false,
         }
     }
+}
 
-    /// How a guard message names the row `sig` keys.
-    pub(in crate::catalog) fn pk_label(self, sig: &PkSignature) -> String {
-        match sig.member {
-            // COL_TAB's key is (owner_id, col_idx).
-            Some(col_idx) => format!("{} {col_idx} of owner {}", self.row_noun(), sig.leading),
-            None => format!("{} {}", self.row_noun(), sig.leading),
-        }
-    }
-
-    /// What one of this family's rows is called in a guard message.
-    pub(in crate::catalog) fn row_noun(self) -> &'static str {
-        match self {
-            SysFamily::Schema => "schema",
-            SysFamily::Table => "table",
-            SysFamily::View => "view",
-            SysFamily::Column => "column",
-            SysFamily::Index => "index",
-            SysFamily::Sequence => "sequence",
-            SysFamily::Circuit => "circuit",
-        }
-    }
-
-    /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
-    pub(crate) const fn from_id(id: u64) -> Option<Self> {
-        match gnitz_wire::sys_family_index(id) {
-            Some(i) => Some(Self::ALL[i]),
-            None => None,
-        }
+/// The families applied before `family`: those whose rows its register hook
+/// reads from the store (COL_TAB, CIRCUIT_TAB), whose registrations it reads
+/// (an index's owner), or whose rows its precheck reads (a relation's schema,
+/// which only a live bundle needs applied).
+const fn applies_after(family: SysFamily) -> &'static [SysFamily] {
+    match family {
+        SysFamily::Schema | SysFamily::Column | SysFamily::Circuit | SysFamily::Sequence => &[],
+        SysFamily::Table => &[SysFamily::Schema, SysFamily::Column],
+        SysFamily::View => &[SysFamily::Schema, SysFamily::Column, SysFamily::Circuit],
+        SysFamily::Index => &[SysFamily::Table, SysFamily::View],
     }
 }
 
-// `ALL` indexes the per-family arrays, so it must be in `SYS_FAMILIES` order.
-// `index()` also panics for an id absent from `SYS_FAMILIES`, so this fails the
-// build on a variant naming no wire family, and on two sharing an id.
+// `SysFamily::ALL` is the apply order, so it must order a family after every
+// family it applies after.
 const _: () = {
     let mut i = 0;
     while i < SysFamily::COUNT {
-        let family = SysFamily::ALL[i];
-        assert!(
-            family.index() == i,
-            "SysFamily::ALL must be in gnitz_wire::SYS_FAMILIES order"
-        );
-        let deps = family.applies_after();
+        let deps = applies_after(SysFamily::ALL[i]);
         let mut d = 0;
         while d < deps.len() {
             assert!(
                 deps[d].index() < i,
-                "gnitz_wire::SYS_FAMILIES must order a family after every family it applies after"
+                "SysFamily::ALL must order a family after every family it applies after"
             );
             d += 1;
         }

@@ -8,7 +8,7 @@ use gnitz_zset::repr::{Batch, WireRows};
 // WireMsg
 // ---------------------------------------------------------------------------
 
-/// One frame: its control header fields, blob, schema record and data block.
+/// One frame: its control header fields, blob and data block.
 /// Build it once, then [`size`](WireMsg::size) it and encode it: both read the
 /// same value, so the byte count a caller reserves and the bytes the encoder
 /// writes cannot disagree.
@@ -29,9 +29,6 @@ pub struct WireMsg<'a> {
     pub status: WireStatus,
     /// The frame's data block; an empty delta ships none.
     pub data: Option<WireRows<'a>>,
-    /// The frame's schema record, written behind its length prefix; `None` writes
-    /// none and leaves the schema bit clear.
-    pub schema_block: Option<&'a [u8]>,
     pub blob: &'a [u8],
 }
 
@@ -83,8 +80,7 @@ impl<'a> WireMsg<'a> {
 
     /// Total encoded size, without allocating.
     pub fn size(&self) -> usize {
-        gnitz_wire::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len))
-            + self.data.map_or(0, |d| d.byte_size())
+        gnitz_wire::CTRL_HEADER_SIZE + self.blob.len() + self.data.map_or(0, |d| d.byte_size())
     }
 
     /// Refuse a frame past [`gnitz_wire::MAX_FRAME_PAYLOAD`], with the fault the
@@ -114,8 +110,7 @@ impl<'a> WireMsg<'a> {
 
     /// Encode into `out`, which must be exactly [`size`](WireMsg::size) bytes.
     pub fn encode(&self, out: &mut [u8]) {
-        let mut pos =
-            gnitz_wire::encode_frame_head(out, &self.header(), self.blob, self.schema_block, self.data.is_some());
+        let mut pos = gnitz_wire::encode_frame_head(out, &self.header(), self.blob, self.data.is_some());
 
         if let Some(d) = self.data {
             pos += d.encode(&mut out[pos..]);
@@ -133,10 +128,10 @@ impl<'a> WireMsg<'a> {
         let total = base + PFX + sz;
         out.reserve(PFX + sz);
         // SAFETY: `encode` writes every payload byte. The control header's fields
-        // tile it, the blob and schema record follow it end to end, and a data
-        // block is its header, then its regions and heap end to end, each row of
-        // which its writer fills whole (gnitz-zset's `DirectWriter`). The length
-        // prefix is written immediately below.
+        // tile it, the blob follows it, and a data block is its header, then its
+        // regions and heap end to end, each row of which its writer fills whole
+        // (gnitz-zset's `DirectWriter`). The length prefix is written immediately
+        // below.
         #[allow(clippy::uninit_vec)]
         unsafe {
             out.set_len(total);

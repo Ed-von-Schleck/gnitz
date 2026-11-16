@@ -1,5 +1,5 @@
 //! The frame control header: a fixed-width, little-endian header followed by the
-//! frame's blob, its optional schema record and its optional data block. Both
+//! frame's blob and its optional data block. Both
 //! `gnitz-server` and `gnitz-core` build and parse it through this one codec.
 //!
 //! The header carries a reply status ([`WireStatus`]; a refusal is a
@@ -21,8 +21,7 @@ use crate::{write_u32_le, write_u64_le};
 //   [24,32) ARG0       u64
 //   [32,40) ARG1       u64
 //   [40, 40+BLOB_LEN)  blob; under a non-`Ok` STATUS, the UTF-8 error text
-//   then a `u32`-length-prefixed schema record (FLAGS bit 32) and a self-sizing
-//   data block (bit 33), each present iff its bit is set
+//   then a self-sizing data block, present iff FLAGS bit 33 is set
 const OFF_STATUS: usize = 0;
 const OFF_BLOB_LEN: usize = 4;
 const OFF_FLAGS: usize = 8;
@@ -30,8 +29,7 @@ const OFF_TARGET_ID: usize = 16;
 const OFF_ARG0: usize = 24;
 const OFF_ARG1: usize = 32;
 
-/// FLAGS bits the codec owns: which sections follow the blob.
-const FLAG_HAS_SCHEMA: u64 = 1 << 32;
+/// The FLAGS bit the codec owns: a data block follows the blob.
 const FLAG_HAS_DATA: u64 = 1 << 33;
 
 pub const CTRL_HEADER_SIZE: usize = 40;
@@ -62,11 +60,17 @@ impl From<u64> for Target {
     }
 }
 
+impl From<crate::SysFamily> for Target {
+    fn from(family: crate::SysFamily) -> Self {
+        Target::from(family.id())
+    }
+}
+
 impl ControlHeader {
     /// A `verb` request naming `target`, whose token rides `arg1`.
     pub fn naming(verb: ClientVerb, target: Target, arg0: u64) -> Self {
         ControlHeader {
-            flags: WireFlags { verb, ..Default::default() },
+            flags: WireFlags { verb: Some(verb), ..Default::default() },
             target_id: target.tid,
             arg0,
             arg1: target.token,
@@ -79,24 +83,15 @@ impl ControlHeader {
         Target { tid: self.target_id, token: self.arg1 }
     }
 
-    /// Refuses a header no client writes: a status other than `Ok`, a flag
-    /// only the engine sets, or a conflict mode where `pushes` is false.
-    pub(crate) fn check_client_authored(&self, pushes: bool) -> Result<(), &'static str> {
-        let WireFlags {
-            conflict_mode,
-            continuation,
-            scan_last,
-            lane,
-            ..
-        } = self.flags;
+    /// Refuses a header no client writes: a status other than `Ok`, or a flag
+    /// only the engine sets.
+    pub(crate) fn check_client_authored(&self) -> Result<(), &'static str> {
+        let WireFlags { continuation, scan_last, lane, .. } = self.flags;
         if self.status != WireStatus::Ok {
             return Err("a request carries a status");
         }
         if continuation || scan_last || lane != WireLane::Reply {
             return Err("a request sets a flag only a reply carries");
-        }
-        if !pushes && conflict_mode != WireConflictMode::default() {
-            return Err("a conflict mode on a request that pushes nothing");
         }
         Ok(())
     }
@@ -107,11 +102,9 @@ pub struct DecodedControl {
     pub hdr: ControlHeader,
     /// Where the frame's blob sits in the peeked buffer.
     pub blob: Range<usize>,
-    /// The bytes after the last declared section — blob, schema record, data
-    /// block — to the end of the frame: a multi-item frame's items.
+    /// The bytes after the last declared section — blob, data block — to the
+    /// end of the frame: a multi-item frame's items.
     pub body: Range<usize>,
-    /// Where the frame's schema record sits in the peeked buffer.
-    pub schema: Option<Range<usize>>,
     /// Where the frame's data block sits in the peeked buffer.
     pub data: Option<Range<usize>>,
 }
@@ -125,7 +118,6 @@ impl DecodedControl {
             hdr: self.hdr,
             blob: shift(self.blob),
             body: shift(self.body),
-            schema: self.schema.map(shift),
             data: self.data.map(shift),
         }
     }
@@ -135,20 +127,28 @@ impl DecodedControl {
     /// frame's items are checked as they are decoded.
     pub fn client_verb(&self) -> Result<ClientVerb, &'static str> {
         let hdr = &self.hdr;
-        let verb = hdr.flags.verb;
-        hdr.check_client_authored(verb == ClientVerb::Push)?;
-        if self.data.is_some() && verb != ClientVerb::Push {
-            return Err("frame carries a data block on a verb other than PUSH");
-        }
-        let items = crate::txn_frame::item_shape(verb).is_some();
-        if items && (!self.blob.is_empty() || self.schema.is_some() || hdr.target_id != 0) {
-            return Err("a multi-item frame carries nothing but its items");
-        }
-        if items && (hdr.arg1 != 0 || hdr.arg0 != 0 && verb != ClientVerb::DeltaPoll) {
-            return Err("a multi-item prologue sets an argument its verb does not read");
-        }
-        if !items && !self.body.is_empty() {
-            return Err("frame carries bytes past its last section");
+        let verb = hdr.flags.verb.ok_or("a request names no verb")?;
+        hdr.check_client_authored()?;
+        let shape = VerbShape::of(verb);
+        match shape.items {
+            None => {
+                shape.sections.check(self)?;
+                if !self.body.is_empty() {
+                    return Err("frame carries bytes past its last section");
+                }
+            }
+            Some(items) => {
+                if !self.blob.is_empty()
+                    || self.data.is_some()
+                    || hdr.target_id != 0
+                    || hdr.flags.conflict_mode != WireConflictMode::default()
+                {
+                    return Err("a multi-item frame carries nothing but its items");
+                }
+                if hdr.arg1 != 0 || hdr.arg0 != 0 && !items.reads_arg0 {
+                    return Err("a multi-item prologue sets an argument its verb does not read");
+                }
+            }
         }
         Ok(verb)
     }
@@ -163,35 +163,18 @@ impl DecodedControl {
     }
 }
 
-/// Bytes of the control header, its blob and an optional length-prefixed schema
-/// record.
-pub const fn frame_head_size(blob_len: usize, schema_len: Option<usize>) -> usize {
-    CTRL_HEADER_SIZE
-        + blob_len
-        + match schema_len {
-            Some(n) => 4 + n,
-            None => 0,
-        }
-}
-
 /// Bytes of one frame with these sections.
-pub(crate) fn frame_size(blob: &[u8], schema: Option<&[u8]>, data: Option<&[&[u8]]>) -> usize {
-    frame_head_size(blob.len(), schema.map(<[u8]>::len)) + data.map_or(0, crate::wal::block_size)
+pub(crate) fn frame_size(blob: &[u8], data: Option<&[&[u8]]>) -> usize {
+    CTRL_HEADER_SIZE + blob.len() + data.map_or(0, crate::wal::block_size)
 }
 
-/// Append one frame — header, blob, optional schema record, optional data block
-/// over a canonical region list — to `out`.
-pub fn append_frame(
-    out: &mut Vec<u8>,
-    hdr: &ControlHeader,
-    blob: &[u8],
-    schema: Option<&[u8]>,
-    data: Option<&[&[u8]]>,
-) {
-    out.reserve(frame_size(blob, schema, data));
+/// Append one frame — header, blob, optional data block over a canonical region
+/// list — to `out`.
+pub fn append_frame(out: &mut Vec<u8>, hdr: &ControlHeader, blob: &[u8], data: Option<&[&[u8]]>) {
+    out.reserve(frame_size(blob, data));
     let at = out.len();
-    out.resize(at + frame_head_size(blob.len(), schema.map(<[u8]>::len)), 0);
-    encode_frame_head(&mut out[at..], hdr, blob, schema, data.is_some());
+    out.resize(at + CTRL_HEADER_SIZE + blob.len(), 0);
+    encode_frame_head(&mut out[at..], hdr, blob, data.is_some());
     if let Some(regions) = data {
         // A client sends 0 as its dead-heap bound whatever its arena holds; every reader of a
         // client block recomputes it.
@@ -199,26 +182,18 @@ pub fn append_frame(
     }
 }
 
-/// Write the control header, `blob` and the length-prefixed `schema_record` into
-/// the front of `out`, returning the offset a data block follows at.
+/// Write the control header and `blob` into the front of `out`, returning the
+/// offset a data block follows at.
 #[inline]
-pub fn encode_frame_head(
-    out: &mut [u8],
-    hdr: &ControlHeader,
-    blob: &[u8],
-    schema_record: Option<&[u8]>,
-    has_data: bool,
-) -> usize {
+pub fn encode_frame_head(out: &mut [u8], hdr: &ControlHeader, blob: &[u8], has_data: bool) -> usize {
     let (head, tail) = out
         .split_first_chunk_mut::<CTRL_HEADER_SIZE>()
-        .expect("the caller sized `out` with frame_head_size");
+        .expect("the caller sized `out` for the header and blob");
     debug_assert!(
         hdr.status == WireStatus::Ok || !blob.is_empty(),
         "a fault frame names its cause"
     );
-    let flags = hdr.flags.pack()
-        | if schema_record.is_some() { FLAG_HAS_SCHEMA } else { 0 }
-        | if has_data { FLAG_HAS_DATA } else { 0 };
+    let flags = hdr.flags.pack() | if has_data { FLAG_HAS_DATA } else { 0 };
     write_u32_le(head, OFF_STATUS, hdr.status.as_wire());
     write_u32_le(head, OFF_BLOB_LEN, blob.len() as u32);
     write_u64_le(head, OFF_FLAGS, flags);
@@ -226,14 +201,7 @@ pub fn encode_frame_head(
     write_u64_le(head, OFF_ARG0, hdr.arg0);
     write_u64_le(head, OFF_ARG1, hdr.arg1);
     tail[..blob.len()].copy_from_slice(blob);
-    let mut pos = CTRL_HEADER_SIZE + blob.len();
-    if let Some(record) = schema_record {
-        write_u32_le(out, pos, record.len() as u32);
-        pos += 4;
-        out[pos..pos + record.len()].copy_from_slice(record);
-        pos += record.len();
-    }
-    pos
+    CTRL_HEADER_SIZE + blob.len()
 }
 
 /// Decode the control header at the front of the whole frame `data`, and locate
@@ -254,12 +222,6 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
     crate::fields::note_section(&data[OFF_BLOB_LEN..OFF_FLAGS], &data[blob.clone()]);
     let status = WireStatus::from_wire(status).ok_or("control header names no status")?;
     let flags = WireFlags::unpack(word)?;
-    let schema = if word & FLAG_HAS_SCHEMA != 0 {
-        let s = r.bytes32().map_err(|e| format!("schema record: {e}"))?;
-        Some(r.pos() - s.len()..r.pos())
-    } else {
-        None
-    };
     let data_block = if word & FLAG_HAS_DATA != 0 {
         let at = r.pos();
         r.take(crate::wal::block_slice(&data[at..])?.len())?;
@@ -271,7 +233,6 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
         hdr: ControlHeader { status, flags, target_id, arg0, arg1 },
         blob,
         body: r.pos()..data.len(),
-        schema,
         data: data_block,
     })
 }
@@ -282,10 +243,10 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
 
 wire_enum! {
     /// The verb a client request frame names.
-    #[derive(Default)]
     pub enum ClientVerb: u8 {
         /// A data push under the descriptor token `arg1`, ACKed with its LSN in
-        /// `arg0`. An empty batch is still a push, ACKed at LSN 0.
+        /// `arg0`. Its blob is the schema record of its rows. An empty batch is
+        /// still a push, ACKed at LSN 0.
         Push = 1,
         /// A delta read of N views: one frame naming N fed views, each with its
         /// own cursor and client-authored reply schema. Each view's terminal
@@ -296,8 +257,9 @@ wire_enum! {
         /// terminal's cursor. The rounds reaching it afterwards are sent as
         /// pushed trains ([`WireLane::PushedTrain`]); a fault ends it.
         DeltaPoll = 4,
-        /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
-        /// name in the blob; the reply's `arg0` is its descriptor token.
+        /// A relation's `RelDescriptorBlob`, its schema record included, named by
+        /// the qualified name in the blob; the reply's `arg0` is its descriptor
+        /// token.
         ///
         /// A descriptor token names one answer to a RESOLVE. A request built
         /// from that answer carries it, and is refused
@@ -312,7 +274,6 @@ wire_enum! {
         /// N relations read at one SAL cut, one item each: a parameterized
         /// bounded read (`ReadSpec`) in the blob, replied in the layout whose
         /// digest is the item's `arg0`, under the descriptor token `arg1`.
-        #[default]
         ScanMulti = 8,
         /// `arg0` SERIAL ids of table `target_id`, under the descriptor token
         /// `arg1`; the reply's `arg0` is the run's base.
@@ -320,7 +281,7 @@ wire_enum! {
         /// `arg0` catalog object ids (schema, relation or index); the reply's
         /// `arg0` is the run's base.
         AllocIds = 10,
-        /// Send every subscription the blob names ([`crate::txn_frame::encode_held`])
+        /// Send every subscription the blob names ([`crate::multi_frame::encode_held`])
         /// the pushes acknowledged before this request, and end the others. The
         /// [`WireLane::SyncAnswer`] is held up to `arg0` ms while none was sent a row.
         SyncPushed = 13,
@@ -343,6 +304,98 @@ wire_enum! {
     }
 }
 
+/// Whether a frame of a verb carries a section. A blob is present when it is
+/// not empty.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Section {
+    Never,
+    May,
+    Must,
+}
+
+/// What a single-item verb's frame, or each item of a multi-item verb, carries.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sections {
+    pub(crate) blob: Section,
+    pub(crate) data: Section,
+    /// Whether `flags.conflict_mode` is read: the frame pushes rows to a user
+    /// relation.
+    pub(crate) conflict_mode: bool,
+}
+
+impl Sections {
+    /// Refuse a frame carrying a section or a conflict mode its verb never
+    /// reads, or lacking a section its verb requires.
+    pub(crate) fn check(self, ctrl: &DecodedControl) -> Result<(), &'static str> {
+        if !self.conflict_mode && ctrl.hdr.flags.conflict_mode != WireConflictMode::default() {
+            return Err("a conflict mode on a request that pushes nothing");
+        }
+        match (self.blob, !ctrl.blob.is_empty()) {
+            (Section::Never, true) => return Err("frame carries a blob its verb does not read"),
+            (Section::Must, false) => return Err("frame lacks the blob its verb requires"),
+            _ => {}
+        }
+        match (self.data, ctrl.data.is_some()) {
+            (Section::Never, true) => Err("frame carries a data block its verb does not read"),
+            (Section::Must, false) => Err("frame lacks the data block its verb requires"),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A multi-item verb's frame: a bare prologue, then its items.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Items {
+    /// The most items one frame holds.
+    pub(crate) cap: usize,
+    /// Whether the prologue's `arg0` is read; every other prologue word is zero.
+    pub(crate) reads_arg0: bool,
+}
+
+/// What a frame of a verb carries.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerbShape {
+    pub(crate) sections: Sections,
+    /// `None` for a single-item verb.
+    pub(crate) items: Option<Items>,
+}
+
+/// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
+/// one reply train of bookkeeping per relation; a handful of related tables
+/// covers a realistic consistent snapshot.
+const SCAN_MULTI_MAX_RELATIONS: usize = 16;
+
+impl VerbShape {
+    pub(crate) const fn of(verb: ClientVerb) -> VerbShape {
+        use Section::*;
+        const fn items(cap: usize, reads_arg0: bool) -> Option<Items> {
+            Some(Items { cap, reads_arg0 })
+        }
+        // (blob, data block, conflict mode read, items)
+        let (blob, data, conflict_mode, items) = match verb {
+            // The blob is the schema record of the rows.
+            ClientVerb::Push => (Must, May, true, None),
+            ClientVerb::Resolve | ClientVerb::SyncPushed | ClientVerb::SnapshotPage | ClientVerb::Backup => {
+                (May, Never, false, None)
+            }
+            ClientVerb::AllocIds
+            | ClientVerb::AllocSerialRange
+            | ClientVerb::SnapshotOpen
+            | ClientVerb::SnapshotClose => (Never, Never, false, None),
+            ClientVerb::DdlTxn => (Never, Must, false, items(usize::MAX, false)),
+            // The blob is the schema record of the family's rows.
+            ClientVerb::PushTxn => (Must, Must, true, items(usize::MAX, false)),
+            ClientVerb::ScanMulti => (May, Never, false, items(SCAN_MULTI_MAX_RELATIONS, false)),
+            // The blob is the item's cursor, then its `ReadSpec`.
+            ClientVerb::DeltaPoll => (Must, Never, false, items(usize::MAX, true)),
+        };
+        VerbShape {
+            sections: Sections { blob, data, conflict_mode },
+            items,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The flags word
 // ---------------------------------------------------------------------------
@@ -350,15 +403,15 @@ wire_enum! {
 /// The control header's `flags` word. `pack`/`unpack` are the only code that knows
 /// the bit layout, so no two fields can overlap and no consumer re-derives one.
 ///
-/// Bits 32/33 say which sections follow the blob; the frame codec sets and reads
-/// them, so `pack` leaves them clear and `unpack` ignores them.
+/// Bit 33 says a data block follows the blob; the frame codec sets and reads it,
+/// so `pack` leaves it clear and `unpack` ignores it.
 ///
 /// A request sets `verb` and, on a push, `conflict_mode`; the other fields are
 /// a reply's, and [`DecodedControl::client_verb`] refuses a request setting one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireFlags {
-    /// Bits 0-7.
-    pub verb: ClientVerb,
+    /// Bits 0-7: a request's verb; `0`, which no verb is, on a reply.
+    pub verb: Option<ClientVerb>,
     /// Bits 8-15: a push's conflict mode.
     pub conflict_mode: WireConflictMode,
     /// Bit 34: more frames of this reply follow. Set on every per-worker reply
@@ -375,14 +428,10 @@ const CONTINUATION_SHIFT: u32 = 34;
 const SCAN_LAST_SHIFT: u32 = 35;
 const LANE_SHIFT: u32 = 38;
 
-/// The bits a field occupies: `verb` and `conflict_mode` (0-15), the section
-/// bits (32-33), `continuation`, `scan_last` and the two `lane` bits.
-const DEFINED_BITS: u64 = crate::low_bits_mask(16)
-    | FLAG_HAS_SCHEMA
-    | FLAG_HAS_DATA
-    | 1 << CONTINUATION_SHIFT
-    | 1 << SCAN_LAST_SHIFT
-    | 3 << LANE_SHIFT;
+/// The bits a field occupies: `verb` and `conflict_mode` (0-15), the data
+/// block bit (33), `continuation`, `scan_last` and the two `lane` bits.
+const DEFINED_BITS: u64 =
+    crate::low_bits_mask(16) | FLAG_HAS_DATA | 1 << CONTINUATION_SHIFT | 1 << SCAN_LAST_SHIFT | 3 << LANE_SHIFT;
 /// Every bit no field occupies.
 const RESERVED_BITS: u64 = !DEFINED_BITS;
 
@@ -391,7 +440,7 @@ impl WireFlags {
     /// frame ends the client's reply; `scan_last` on the train's last frame.
     pub const fn train_frame(last: bool) -> Self {
         WireFlags {
-            verb: ClientVerb::ScanMulti,
+            verb: None,
             conflict_mode: WireConflictMode::Update,
             continuation: true,
             scan_last: last,
@@ -400,7 +449,11 @@ impl WireFlags {
     }
 
     pub(crate) const fn pack(self) -> u64 {
-        self.verb as u64
+        let verb = match self.verb {
+            Some(v) => v.as_wire(),
+            None => 0,
+        };
+        verb as u64
             | (self.conflict_mode as u64) << CONFLICT_MODE_SHIFT
             | (self.continuation as u64) << CONTINUATION_SHIFT
             | (self.scan_last as u64) << SCAN_LAST_SHIFT
@@ -415,7 +468,10 @@ impl WireFlags {
         }
         let bit = |b: u32| (w >> b) & 1 != 0;
         Ok(WireFlags {
-            verb: ClientVerb::from_wire(w as u8).ok_or("flags: unknown request verb")?,
+            verb: match w as u8 {
+                0 => None,
+                v => Some(ClientVerb::from_wire(v).ok_or("flags: unknown request verb")?),
+            },
             conflict_mode: WireConflictMode::from_wire((w >> CONFLICT_MODE_SHIFT) as u8)
                 .ok_or("flags: unknown conflict mode")?,
             continuation: bit(CONTINUATION_SHIFT),

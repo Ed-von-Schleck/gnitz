@@ -8,7 +8,7 @@ use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 
 use super::CatalogEngine;
-use super::sys_tables::{DdlBundle, IdSet, PkShape, SysFamily, pk_signatures};
+use super::sys_tables::{DdlBundle, IdSet, PkShape, SysFamily, SysFamilyExt, pk_signatures};
 
 /// Where a catalog write lays each group out, before applying it. An `Err`
 /// refuses the write, which leaves the catalog as it was.

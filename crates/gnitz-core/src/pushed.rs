@@ -12,7 +12,7 @@ use crate::connection::{DeltaCursor, RawBlock, ScanReply, SubId, Target};
 use crate::error::ClientError;
 use crate::host::Sent;
 use crate::mirror::PollOutcome;
-use gnitz_wire::txn_frame::kept_as;
+use gnitz_wire::multi_frame::kept_as;
 
 /// What a sync hands a reader for one of its subscriptions.
 pub struct Pushed {

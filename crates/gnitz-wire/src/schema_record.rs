@@ -1,6 +1,6 @@
 //! The **meta-schema record**: the one encoding that carries a relation's column
-//! shape across the wire — engine → client on every schema-bearing reply, client
-//! → engine on every schema-bearing push and per-family `PUSH_TXN` record.
+//! shape across the wire — engine → client in a RESOLVE's descriptor, client →
+//! engine as the blob of a `PUSH` and of each `PUSH_TXN` family.
 //!
 //! ```text
 //! u32              column_count
@@ -15,6 +15,8 @@
 //!
 //! The record carries no length of its own; every carrier length-prefixes it.
 
+use smallvec::SmallVec;
+
 use crate::codec::{Reader, Writer, decode_all};
 use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 
@@ -22,7 +24,7 @@ use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 /// decode; on encode it is whatever the caller has (an empty slice for the
 /// anonymous records that describe physical shape only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SchemaBlockCol<'a> {
+pub struct RecordCol<'a> {
     pub ty: ColType,
     pub nullable: bool,
     /// A physical column no name the user writes reaches — a hidden key slot or
@@ -53,13 +55,13 @@ const _: () = assert!(
 );
 
 /// One column, read forward.
-fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
+fn take_col<'a>(r: &mut Reader<'a>) -> Result<RecordCol<'a>, String> {
     let code = r.u8()?;
     let flags = r.flags(DEFINED_FLAGS)?;
     let scale = r.u8()?;
     let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("invalid column type {code}/{scale}"))?;
     let name = r.bytes32()?;
-    Ok(SchemaBlockCol {
+    Ok(RecordCol {
         ty,
         nullable: flags & NULLABLE != 0,
         hidden: flags & HIDDEN != 0,
@@ -69,7 +71,7 @@ fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
 
 /// The record for `cols` keyed by `pk_cols`, in declared PK-tuple order. `cols`
 /// is walked twice: a clone sizes the record, the original writes it.
-pub fn encode<'a>(cols: impl Iterator<Item = SchemaBlockCol<'a>> + Clone, pk_cols: &[u32]) -> Vec<u8> {
+pub fn encode<'a>(cols: impl Iterator<Item = RecordCol<'a>> + Clone, pk_cols: &[u32]) -> Vec<u8> {
     let (count, columns) = cols.clone().fold((0usize, 0usize), |(n, b), c| {
         (n + 1, b + COL_FIXED_BYTES + c.name.len())
     });
@@ -89,26 +91,16 @@ pub fn encode<'a>(cols: impl Iterator<Item = SchemaBlockCol<'a>> + Clone, pk_col
     w.into_vec()
 }
 
-/// A record's PK column indices, in declared PK-tuple order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PkIndices {
-    idx: [u32; MAX_PK_COLUMNS],
-    len: usize,
-}
-
-impl PkIndices {
-    /// Not yet checked against the columns.
-    #[inline]
-    pub fn as_slice(&self) -> &[u32] {
-        &self.idx[..self.len]
-    }
-}
+/// A record's PK column indices, in declared PK-tuple order, not yet checked
+/// against the columns.
+type PkIndices = SmallVec<[u32; MAX_PK_COLUMNS]>;
 
 /// Decode and validate `buf`, handing each column to `on_col` in physical order
-/// once the column count is known to lie within [`MAX_COLUMNS`].
+/// once the column count is known to lie within [`MAX_COLUMNS`]; returns the PK
+/// column indices.
 pub fn decode<'a>(
     buf: &'a [u8],
-    mut on_col: impl FnMut(SchemaBlockCol<'a>) -> Result<(), String>,
+    mut on_col: impl FnMut(RecordCol<'a>) -> Result<(), String>,
 ) -> Result<PkIndices, String> {
     decode_all(buf, "schema record", |r| {
         let (count, pk) = take_header(r)?;
@@ -129,11 +121,8 @@ fn take_header(r: &mut Reader<'_>) -> Result<(usize, PkIndices), String> {
     if len > MAX_PK_COLUMNS {
         return Err(format!("pk column count {len} exceeds {MAX_PK_COLUMNS}"));
     }
-    let mut idx = [0u32; MAX_PK_COLUMNS];
-    for slot in &mut idx[..len] {
-        *slot = r.u8()? as u32;
-    }
-    Ok((count, PkIndices { idx, len }))
+    let pk = (0..len).map(|_| r.u8().map(u32::from)).collect::<Result<_, _>>()?;
+    Ok((count, pk))
 }
 
 /// `Err` naming the first difference unless `got` lays out the same columns as
@@ -168,5 +157,5 @@ pub fn check_same_types(got: &[u8], want: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[path = "tests/schema_block.rs"]
+#[path = "tests/schema_record.rs"]
 mod tests;

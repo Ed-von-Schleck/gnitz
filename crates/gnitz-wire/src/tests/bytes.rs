@@ -33,7 +33,7 @@ fn bit_iter_yields_set_bits_lowest_first() {
     assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
 }
 
-/// `set_bit_runs` and `set_bit_runs_iter` against a bit-by-bit run collector:
+/// `set_bit_runs` against a bit-by-bit run collector:
 /// every maximal run of set bits below `n`, over single bits at both ends of a
 /// word, whole words set and clear, runs crossing and ending on word
 /// boundaries, and set bits of the last word at or past `n`.
@@ -67,11 +67,8 @@ fn set_bit_runs_reports_every_maximal_run() {
                         let bits = &bits[..n.div_ceil(64)];
                         let want = naive(bits, n);
                         let mut got = Vec::new();
-                        set_bit_runs(bits, n, &mut got);
+                        set_bit_runs(bits.iter().copied(), n, &mut got);
                         assert_eq!(got, want, "{bits:x?} n={n}");
-                        got.clear();
-                        set_bit_runs_iter(bits.iter().copied(), n, &mut got);
-                        assert_eq!(got, want, "iter {bits:x?} n={n}");
                     }
                 }
             }
@@ -81,8 +78,8 @@ fn set_bit_runs_reports_every_maximal_run() {
 
 /// Runs are appended after what `out` already holds.
 #[test]
-fn set_bit_runs_iter_appends() {
+fn set_bit_runs_appends() {
     let mut out = vec![(0, 1)];
-    set_bit_runs_iter([0b110u64], 3, &mut out);
+    set_bit_runs([0b110u64], 3, &mut out);
     assert_eq!(out, [(0, 1), (1, 3)]);
 }

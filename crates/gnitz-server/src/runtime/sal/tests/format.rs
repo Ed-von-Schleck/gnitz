@@ -12,7 +12,7 @@ use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, make_
 use gnitz_wire::TypeCode;
 use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_zset::repr::{Batch, BatchBuilder, WireRows};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_block};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_record};
 
 // ---------------------------------------------------------------------------
 // The header codec: every field round-trips, the bytes are pinned, and a value
@@ -131,7 +131,11 @@ fn a_header_is_these_bytes() {
         9, 0, 0, 0, 0, 0, 0, 0,                         // directory: 9 bytes,
         0x2C, 0x01, 0, 0, 0, 0, 0, 0,                   // then 300
     ];
-    assert_eq!(hdr[8..], behind_the_digest);
+    assert_eq!(
+        hdr[8..],
+        behind_the_digest,
+        "the header layout moved: bump `SAL_LAYOUT`"
+    );
     assert_eq!(
         hdr[..8],
         gnitz_wire::checksum(&behind_the_digest).to_le_bytes(),
@@ -320,9 +324,9 @@ fn every_payload_shape_round_trips_and_no_prefix_decodes() {
     assert_eq!(range.rows(), 3, "a budget of three rows frames three");
     let whole = |b: &Batch| (0..b.len()).collect::<Vec<_>>();
 
-    let fixed_rel = encode_schema_block(&fixed);
-    let string_rel = encode_schema_block(strings.schema());
-    let padded_rel = encode_schema_block(padded.schema());
+    let fixed_rel = encode_schema_record(&fixed);
+    let string_rel = encode_schema_record(strings.schema());
+    let padded_rel = encode_schema_record(padded.schema());
     /// A payload's blob, schema record and rows, beside the source batch and the
     /// rows of it the payload sends, in the order it sends them.
     type Shape<'a> = (
@@ -400,7 +404,7 @@ fn every_payload_shape_round_trips_and_no_prefix_decodes() {
 fn a_payload_with_bytes_it_does_not_declare_is_refused() {
     let sd = make_schema_u64_i64();
     let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
-    let record = encode_schema_block(&sd);
+    let record = encode_schema_record(&sd);
 
     let mut no_rows = payload(b"blob", None);
     assert_eq!(sal_rows(&no_rows).map(|rows| rows.is_some()), Ok(false));
@@ -439,7 +443,7 @@ fn a_payload_lays_its_rows_out_under_the_known_schema_or_its_record() {
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
     assert!(sal_rows(&wire).is_err(), "the junk record itself does not decode");
 
-    let record = encode_schema_block(&sd);
+    let record = encode_schema_record(&sd);
     let wire = payload(&[], Some((&record, batch.wire_whole().unwrap())));
     let got = sal_rows(&wire).expect("the record decodes").expect("rows");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));

@@ -172,7 +172,7 @@ fn refuse_exchange_behind_ground(circuit: &Circuit) -> Result<(), String> {
         if op.exchanges() && behind_ground {
             return Err("an exchange behind a global aggregate".into());
         }
-        grounded.push(behind_ground || circuit.owes_ground_row(nid));
+        grounded.push(behind_ground || op.owes_ground_row());
     }
     Ok(())
 }

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
-use gnitz_zset::schema::{SchemaDescriptor, encode_schema_block};
+use gnitz_zset::schema::{SchemaDescriptor, encode_schema_record};
 use gnitz_zset_testkit::{make_batch, make_schema_u64_i64, make_schema_u128_i64};
 use tempfile::TempDir;
 
@@ -34,7 +34,7 @@ const FIRST_GENERATION: u64 = 1;
 
 /// The client-side schema whose record denotes `layout`.
 fn schema_of(layout: &SchemaDescriptor) -> Schema {
-    Schema::from_block(&encode_schema_block(layout)).unwrap()
+    Schema::from_record(&encode_schema_record(layout)).unwrap()
 }
 
 /// The shape every copy here is registered under: [`make_schema_u64_i64`]'s, so

@@ -44,7 +44,7 @@ fn a_control_only_frame_round_trips_and_no_prefix_decodes() {
         WireMsg {
             target_id: 0xDEAD,
             flags: WireFlags {
-                verb: ClientVerb::PushTxn,
+                verb: Some(ClientVerb::PushTxn),
                 continuation: true,
                 ..Default::default()
             },
@@ -64,7 +64,7 @@ fn a_control_only_frame_round_trips_and_no_prefix_decodes() {
         let control = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         assert_eq!(control.hdr, msg.header(), "shape {shape}");
         assert_eq!(&wire[control.blob], msg.blob, "shape {shape}");
-        assert!(control.schema.is_none() && control.data.is_none(), "shape {shape}");
+        assert!(control.data.is_none(), "shape {shape}");
         for cut in 0..wire.len() {
             assert!(
                 peek_control_block(&wire[..cut]).is_err(),

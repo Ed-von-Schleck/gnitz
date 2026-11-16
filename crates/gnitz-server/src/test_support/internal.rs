@@ -4,7 +4,7 @@
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
-use crate::catalog::{CatalogEngine, DdlBundle, PUBLIC_SCHEMA_ID, SysFamily, ZoneError};
+use crate::catalog::{CatalogEngine, DdlBundle, PUBLIC_SCHEMA_ID, SysFamily, SysFamilyExt, ZoneError};
 use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_wire::{
@@ -467,12 +467,7 @@ pub fn table_blocks(
     pk: &[u32],
     props: TableProps,
 ) -> [(SysFamily, Batch); 2] {
-    let row = TableTabRow {
-        schema_id: sid,
-        pk_col_idx: PkColList::from_slice(pk),
-        flags: props,
-        ..table_tab_row(tid, name)
-    };
+    let row = TableTabRow::of(tid, sid, name, PkColList::from_slice(pk), props);
     [
         (SysFamily::Column, col_tab_batch(tid, cols, 1)),
         (SysFamily::Table, sys_batch([(row, 1)])),
@@ -571,8 +566,7 @@ pub fn view_blocks<'a>(
 
 /// `rows` as one batch of their family, each at its weight.
 pub fn sys_batch<R: SysRow>(rows: impl IntoIterator<Item = (R, i64)>) -> Batch {
-    let family = SysFamily::from_id(R::FAMILY).expect("a SysRow names a system family");
-    let mut bb = BatchBuilder::new(family.schema());
+    let mut bb = BatchBuilder::new(R::FAMILY.schema());
     for (row, weight) in rows {
         row.write(&mut bb, weight);
     }
@@ -610,7 +604,7 @@ pub fn forged_sys_batch<R: SysRow>(row: R, slot: usize, word: u64) -> Batch {
             self.bb.end_row();
         }
     }
-    let family = SysFamily::from_id(R::FAMILY).expect("a SysRow names a system family");
+    let family = R::FAMILY;
     let mut forge = Forge {
         bb: BatchBuilder::new(family.schema()),
         col: 0,
@@ -639,13 +633,13 @@ pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], wei
 
 /// A `public` TABLE_TAB row keyed on column 0, under default props.
 pub fn table_tab_row(table_id: u64, name: &str) -> TableTabRow<'_> {
-    TableTabRow {
+    TableTabRow::of(
         table_id,
-        schema_id: PUBLIC_SCHEMA_ID,
-        name: name.into(),
-        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
-        flags: gnitz_wire::TableProps::default(),
-    }
+        PUBLIC_SCHEMA_ID,
+        name,
+        gnitz_wire::PkColList::from_slice(&[0]),
+        gnitz_wire::TableProps::default(),
+    )
 }
 
 /// A TABLE_TAB batch of `(table_id, name, weight)` rows, each a [`table_tab_row`].

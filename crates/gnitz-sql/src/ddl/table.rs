@@ -492,7 +492,7 @@ pub(crate) fn plan_create_table(
 
     // CLUSTER BY (hash distribution key). The named columns must be the PK's
     // leading prefix in PK order; the prefix length `k` is persisted in
-    // `TABLE_TAB.flags` and drives write-side routing and co-partition detection.
+    // `TABLE_TAB.dist_prefix` and drives write-side routing and co-partition detection.
     // No clause ⇒ `k = 0` ⇒ default full-PK distribution.
     if let Some(cluster) = &create.cluster_by {
         let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;

@@ -9,7 +9,7 @@ use crate::runtime::sal::format::payload_rows;
 use crate::runtime::sal::group::{Group, Payloads, Routed};
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_schema_u64_i64, schema_tab_batch};
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 
 /// Every request, each field a value no other field of it holds, so a swapped
 /// argument decodes to a different request.
@@ -73,7 +73,7 @@ fn every_request() -> Vec<SalRequest<'static>> {
 #[test]
 fn every_request_decodes_from_its_written_group() {
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
-    let record = encode_schema_block(batch.schema());
+    let record = encode_schema_record(batch.schema());
     let requests = every_request();
     let schemas = schema_tab_batch(&[(100, "s", 1)]);
     let groups: Vec<(&SalRequest, Group)> = (requests.iter())

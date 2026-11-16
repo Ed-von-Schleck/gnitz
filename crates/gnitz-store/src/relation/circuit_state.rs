@@ -5,7 +5,7 @@ use super::{ChildKind, RelationRegistry};
 use crate::storage::{Cut, RecoverySource, Table};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
-use gnitz_zset::schema::{SchemaDescriptor, encode_schema_block};
+use gnitz_zset::schema::{SchemaDescriptor, encode_schema_record};
 
 /// An index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
@@ -23,7 +23,7 @@ impl StateLayout {
     /// each child opens the store it names. The store's name carries a digest of
     /// `schema`, so a checkpoint taken under another schema is not resumed.
     pub fn declare(&mut self, child: String, schema: SchemaDescriptor) -> StateIdx {
-        let digest = gnitz_wire::checksum(&encode_schema_block(&schema));
+        let digest = gnitz_wire::checksum(&encode_schema_record(&schema));
         let name = format!("{child}_{digest:016x}");
         debug_assert!(
             self.children

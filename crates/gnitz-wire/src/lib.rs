@@ -115,6 +115,7 @@ mod column;
 mod control;
 mod decimal;
 mod deframe;
+mod float;
 mod german_string;
 mod handshake;
 mod heap;
@@ -135,9 +136,9 @@ mod xxh;
 
 #[cfg(feature = "field-map")]
 pub mod fields;
-pub mod schema_block;
+pub mod multi_frame;
+pub mod schema_record;
 pub mod snapshot;
-pub mod txn_frame;
 pub mod wal;
 
 pub use bytes::*;
@@ -148,6 +149,7 @@ pub use column::*;
 pub use control::*;
 pub use decimal::*;
 pub use deframe::*;
+pub use float::*;
 pub use german_string::*;
 pub use handshake::*;
 pub use heap::*;

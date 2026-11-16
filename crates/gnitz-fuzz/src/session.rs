@@ -203,7 +203,6 @@ fn barrier(id: u64) -> Vec<u8> {
         &ControlHeader::naming(ClientVerb::SnapshotPage, Target::from(id), 0),
         &[],
         None,
-        None,
     );
     out
 }
@@ -212,8 +211,8 @@ fn barrier(id: u64) -> Vec<u8> {
 fn describe(frame: &[u8]) -> String {
     match peek_control_block(frame) {
         Ok(c) => format!(
-            "{:?} target {} ({} bytes)",
-            c.hdr.flags.verb,
+            "{} target {} ({} bytes)",
+            c.hdr.flags.verb.map_or("no verb", ClientVerb::variant_name),
             c.hdr.target_id,
             frame.len()
         ),

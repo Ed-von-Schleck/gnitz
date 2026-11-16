@@ -22,7 +22,7 @@ use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 /// One to three order keys, over any column of [`schema`].
 pub(super) fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
     prop::collection::vec(
-        (0..schema().num_columns() as u16, any::<bool>(), any::<bool>())
+        (0..schema().num_columns() as u32, any::<bool>(), any::<bool>())
             .prop_map(|(col, desc, nulls_first)| OrderKey { col, desc, nulls_first }),
         1..=3,
     )
@@ -253,10 +253,10 @@ fn entries_are_the_row_at_a_time_entries() {
         b.end_row();
     }
     let delta = b.finish();
-    let n = cols.len() as u16;
+    let n = cols.len() as u32;
     for c in 0..n {
         for (desc, nulls_first) in [(false, false), (false, true), (true, false), (true, true)] {
-            let key = |col: u16| OrderKey { col, desc, nulls_first };
+            let key = |col: u32| OrderKey { col, desc, nulls_first };
             for keys in [
                 vec![key(c)],
                 vec![key((c + 1) % n), key(c)],

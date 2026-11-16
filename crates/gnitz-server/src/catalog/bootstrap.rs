@@ -5,7 +5,7 @@ use rustc_hash::FxHashSet;
 
 use super::CatalogEngine;
 use super::relations::{CatalogCacheSet, RelationEntry};
-use super::sys_tables::SysFamily;
+use super::sys_tables::{SysFamily, SysFamilyExt};
 use crate::query::DagEngine;
 
 impl CatalogEngine {

@@ -8,7 +8,7 @@ use gnitz_wire::{
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 
 use super::CatalogEngine;
-use super::sys_tables::SysFamily;
+use super::sys_tables::{SysFamily, SysFamilyExt};
 
 impl CatalogEngine {
     // -- System-table reads ---------------------------------------------------
@@ -38,7 +38,7 @@ impl CatalogEngine {
     pub(in crate::catalog) fn is_serial(&self, tid: u64) -> bool {
         self.live_sys_row(SysFamily::Table, tid).is_some_and(|row| {
             let (src, ri) = row.source();
-            TableTabRow::read(src, ri).is_ok_and(|r| r.props().is_ok_and(|p| p.serial))
+            TableTabRow::read(src, ri).is_ok_and(|r| r.serial)
         })
     }
 

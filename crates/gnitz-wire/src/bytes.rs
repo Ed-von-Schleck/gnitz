@@ -1,6 +1,5 @@
 //! Little-endian field I/O, typed views of LE regions, and bit-mask helpers.
-//! `*_le(buf, off)` accesses a fixed-width field at `off`; `*_exact(cell)` reads
-//! a cell whose width is the slice's length.
+//! `*_le(buf, off)` accesses a fixed-width field at `off`.
 
 #[inline(always)]
 pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
@@ -114,26 +113,19 @@ impl Iterator for BitIter {
 }
 
 /// Append every maximal run of set bits below `n` to `out` as `[start, end)`,
-/// one step per run. `bits` holds `n.div_ceil(64)` words; the bits of the last
-/// one at or past `n` are ignored.
-pub fn set_bit_runs(bits: &[u64], n: usize, out: &mut Vec<(usize, usize)>) {
-    debug_assert_eq!(bits.len(), n.div_ceil(64), "set_bit_runs: one bit per row");
-    set_bit_runs_iter(bits.iter().copied(), n, out);
-}
-
-/// [`set_bit_runs`] over words produced one at a time, so a caller that computes
-/// them need not collect them first. `words` yields `n.div_ceil(64)` words; the
-/// bits of the last one at or past `n` are ignored.
-pub fn set_bit_runs_iter(words: impl IntoIterator<Item = u64>, n: usize, out: &mut Vec<(usize, usize)>) {
+/// one step per run. `words` yields `n.div_ceil(64)` words, so a caller that
+/// computes them need not collect them first; the bits of the last one at or
+/// past `n` are ignored.
+pub fn set_bit_runs(words: impl IntoIterator<Item = u64>, n: usize, out: &mut Vec<(usize, usize)>) {
     let mut open: Option<usize> = None;
     let mut base = 0;
     for word in words {
-        debug_assert!(base < n, "set_bit_runs_iter: one bit per row");
+        debug_assert!(base < n, "set_bit_runs: one bit per row");
         // Only the last word has bits at or past `n`; every other mask is all ones.
         scan_bit_runs(&mut open, base, word & low_bits_mask(n - base), out);
         base += 64;
     }
-    debug_assert!(base >= n, "set_bit_runs_iter: one bit per row");
+    debug_assert!(base >= n, "set_bit_runs: one bit per row");
     // A run still open reached the top of the last word, which is `n`.
     if let Some(s) = open {
         out.push((s, n));

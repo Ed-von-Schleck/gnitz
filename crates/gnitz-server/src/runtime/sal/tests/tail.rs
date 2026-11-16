@@ -1,12 +1,12 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::sal::fixtures::{scan, test_log, unanswered, zone_rows};
-use crate::runtime::sal::format::{PREFIX_BYTES, RequestHead, anchor_word};
+use crate::runtime::sal::format::{PREFIX_BYTES, RequestHead, SAL_FORMAT, anchor_word};
 use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Routed, SalWriter};
 use crate::test_support::sweep_bit_flips;
 use gnitz_store::relation::PkRule;
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 
 const SIZE: usize = 1 << 20;
 const NW: usize = 4;
@@ -95,6 +95,46 @@ fn a_flipped_anchor_bit_fails_the_boot() {
             "anchor byte {byte} bit {bit} must fail the read"
         );
     });
+}
+
+/// A log anchored under another format word is another build's, and fails the
+/// boot whatever its groups carry: a zero word (a log written before the word
+/// existed), any flipped bit, and another build's whole word alike.
+#[test]
+fn a_log_of_another_format_fails_the_boot() {
+    let mut log = test_log(SIZE, 1, 3);
+    log.zone(&[11]);
+    let view = *log.log();
+    assert_eq!(view.anchor(), Ok(3));
+
+    let refused = |view: SalLog, what: &str| {
+        let err = CommittedTail::read(view).err();
+        assert!(
+            err.is_some_and(|e| e.contains("SAL format word")),
+            "{what} must fail the read"
+        );
+    };
+    sweep_bit_flips(log.format_mut(), 0..PREFIX_BYTES, |byte, bit, _| {
+        refused(view, &format!("format byte {byte} bit {bit}"));
+    });
+    for word in [0, SAL_FORMAT ^ 1 << 32] {
+        log.format_mut().copy_from_slice(&word.to_ne_bytes());
+        refused(view, &format!("format word {word:#x}"));
+    }
+
+    // A fresh file has written no group, so its format word is not read.
+    log.anchor_mut().fill(0);
+    assert_eq!(view.anchor(), Ok(0));
+}
+
+/// A rewind stores this build's format word beside the anchor it moves.
+#[test]
+fn a_rewind_stamps_the_format_word() {
+    let mut log = test_log(SIZE, 1, 1);
+    log.format_mut().fill(0);
+    log.excl().checkpoint_reset();
+    assert_eq!(log.log().anchor(), Ok(2));
+    assert_eq!(log.format_mut(), SAL_FORMAT.to_ne_bytes());
 }
 
 /// A rewind anchors the next epoch before it empties the ring, so a kill
@@ -234,7 +274,7 @@ fn the_tail_and_its_writer_agree_on_holding_pushes() {
             "a stream push outside every zone",
             |log| {
                 let batch = zone_rows();
-                let record = encode_schema_block(batch.schema());
+                let record = encode_schema_record(batch.schema());
                 let mut excl = log.excl();
                 let mut scope = excl.begin();
                 scope
@@ -302,7 +342,7 @@ fn the_demotion_is_global_across_slots() {
 fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
     let mut log = test_log(SIZE, NW, 1);
     let batch = zone_rows();
-    let record = encode_schema_block(batch.schema());
+    let record = encode_schema_record(batch.schema());
     let rows = Routed::Same(batch.wire_whole());
     let mut excl = log.excl();
     let mut scope = excl.begin();

@@ -52,7 +52,7 @@ pub(crate) fn runs_where_zip<A, B>(a: &[A], b: &[B], keep: impl Fn(&A, &B) -> bo
         .map(|(ca, cb)| fold(ca, cb))
         .chain((!at.is_empty()).then(|| fold(at, bt)));
     let mut runs = Vec::new();
-    gnitz_wire::set_bit_runs_iter(words, a.len(), &mut runs);
+    gnitz_wire::set_bit_runs(words, a.len(), &mut runs);
     runs
 }
 

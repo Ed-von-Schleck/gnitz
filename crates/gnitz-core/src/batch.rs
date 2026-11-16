@@ -43,9 +43,9 @@ impl PkColumn {
     pub fn from_natives(schema: &Schema, vals: impl IntoIterator<Item = u128>) -> Self {
         let mut c = Self::empty_for_schema(schema);
         assert_eq!(c.n, 1, "PkColumn::from_natives: a compound key takes push_natives");
-        let (width, signed) = (c.stride(), c.types[0].is_signed_int());
+        let (width, bias) = (c.stride(), gnitz_wire::opk_bias(c.types[0]));
         for v in vals {
-            gnitz_wire::push_opk(&mut c.buf, width, v, signed);
+            gnitz_wire::push_opk(&mut c.buf, width, v ^ bias);
         }
         c
     }
@@ -73,7 +73,7 @@ impl PkColumn {
                 n * w,
                 "from_native_columns: key columns of different lengths"
             );
-            gnitz_wire::encode_pk_cells(cells, w, tc.is_signed_int(), &mut c.buf, stride, off);
+            gnitz_wire::encode_pk_cells(cells, *tc, &mut c.buf, stride, off);
             off += w;
         }
         c
@@ -139,7 +139,7 @@ impl PkColumn {
             "push_natives: one native value per key column"
         );
         for (&tc, &v) in self.types.iter().zip(natives) {
-            gnitz_wire::push_opk(&mut self.buf, tc.wire_stride(), v, tc.is_signed_int());
+            gnitz_wire::push_opk(&mut self.buf, tc.wire_stride(), gnitz_wire::key_image(tc, v));
         }
     }
 }

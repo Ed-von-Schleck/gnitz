@@ -7,10 +7,11 @@
 
 use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
+use super::int_cell;
 use super::key_pack::{FOLD_CHUNK, FoldCols, KeyPacker, locate_key_col, pk_run};
 use crate::repr::{Batch, DirectWriter, copy_runs};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
-use gnitz_wire::{FixedInt, TypeCode, int_cell, zip_cells};
+use gnitz_wire::{FixedInt, TypeCode, zip_cells};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`.
@@ -103,7 +104,7 @@ fn copy_column(
             let pk = &in_batch.pk()[src_start * pk_stride..(src_start + n) * pk_stride];
             let (off, src_stride) = (byte_off as usize, size as usize);
             if src_stride == dw {
-                gnitz_wire::decode_pk_cells(pk, pk_stride, off, dw, type_code.is_signed_int(), dst);
+                gnitz_wire::decode_pk_cells(pk, pk_stride, off, type_code, dst);
             } else {
                 widen_column::<true>(pk, pk_stride, off, type_code, dw, dst);
             }

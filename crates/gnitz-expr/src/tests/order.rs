@@ -194,7 +194,7 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
             }
             v.set(row, 2, rng.gen_range(3) as i64);
         }
-        let mut cases = vec![(schema, v, 1u16)];
+        let mut cases = vec![(schema, v, 1u32)];
         if tc.is_pk_eligible() {
             // The leading key the first of two key columns, the second telling its ties apart.
             let schema = SchemaDescriptor::new(

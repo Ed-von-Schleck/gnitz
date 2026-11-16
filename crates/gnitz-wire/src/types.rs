@@ -1,6 +1,5 @@
 //! Column types: the typed `TypeCode` enum, the scale-carrying `ColType`, and the
-//! register forms a narrow column's value decodes to (`FixedInt`, `ScalarKind`),
-//! and a float's narrowing and text (`narrow_f32`, `FloatText`).
+//! register forms a narrow column's value decodes to (`FixedInt`, `ScalarKind`).
 
 use core::cmp::Ordering;
 
@@ -79,11 +78,9 @@ impl TypeCode {
     /// and the type itself otherwise.
     #[inline(always)]
     pub(crate) const fn storage_type(self) -> TypeCode {
-        match self {
-            TypeCode::Date => TypeCode::I32,
-            TypeCode::Timestamp | TypeCode::Decimal => TypeCode::I64,
-            TypeCode::Bool => TypeCode::U8,
-            t => t,
+        match FixedInt::from_type_code(self) {
+            Some(fi) => fi.type_code(),
+            None => self,
         }
     }
 
@@ -594,35 +591,6 @@ macro_rules! for_each_fixed_int {
     };
 }
 
-/// `v` rounded to F32; `None` when a finite `v` rounds past F32's range. The
-/// rounded value is what is tested, so a double just above `f32::MAX` that
-/// rounds down onto it is that value.
-pub fn narrow_f32(v: f64) -> Option<f32> {
-    let f = v as f32;
-    (f.is_finite() || !v.is_finite()).then_some(f)
-}
-
-/// A float's decimal text: shortest round-trip, scientific outside
-/// `[1e-4, 1e15)` so the text stays short, non-finite values as PostgreSQL
-/// spells them. An `f32` keeps its own shortest form. The engine's float-to-text
-/// cast writes this spelling, and a client prints a float with it.
-pub struct FloatText<T>(pub T);
-
-impl<T: Copy + Into<f64> + core::fmt::Display + core::fmt::LowerExp> core::fmt::Display for FloatText<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let v: f64 = self.0.into();
-        if v.is_nan() {
-            f.write_str("NaN")
-        } else if v.is_infinite() {
-            f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" })
-        } else if v == 0.0 || (1e-4..1e15).contains(&v.abs()) {
-            core::fmt::Display::fmt(&self.0, f)
-        } else {
-            core::fmt::LowerExp::fmt(&self.0, f)
-        }
-    }
-}
-
 /// The ≤8-byte scalar register image of a column type: the domain on which
 /// "read these native-LE bytes as a number" is total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,8 +645,8 @@ impl ScalarKind {
 }
 
 // A new `TypeCode` is classified by `FixedInt::from_type_code`'s exhaustive
-// match; these hold the scalar/wide split, and `FixedInt::type_code` to an
-// inverse of `from_type_code`.
+// match; these hold the scalar/wide split and every type to its storage type's
+// width.
 const _: () = {
     let mut i = 0;
     while i < TypeCode::ALL.len() {
@@ -695,12 +663,6 @@ const _: () = {
             tc.wire_stride() == tc.storage_type().wire_stride(),
             "a type must have its storage type's width"
         );
-        if let Some(fi) = FixedInt::from_type_code(tc) {
-            assert!(
-                fi.type_code().as_wire() == tc.storage_type().as_wire(),
-                "FixedInt::type_code must invert from_type_code up to the storage type"
-            );
-        }
         i += 1;
     }
 };

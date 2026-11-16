@@ -122,10 +122,9 @@ fn weight(i: u64) -> i64 {
 /// Every reply shape through one budget. A reply that fits leaves at once
 /// unless its own lease still owes something; every other reply queues, and the
 /// queue drains front first, train by train, one lease's trains split at their
-/// terminals. Each train's frames carry `continuation`, no schema block, and
-/// `scan_last` on the terminal frame alone, and reassemble to the source —
-/// PKs, payloads and **weights**, since in a Z-set engine a row-set comparison
-/// would test nothing.
+/// terminals. Each train's frames carry `continuation`, and `scan_last` on the
+/// terminal frame alone, and reassemble to the source — PKs, payloads and
+/// **weights**, since in a Z-set engine a row-set comparison would test nothing.
 #[test]
 fn reply_trains_drain_in_order_and_reassemble_exactly() {
     let fixed = make_schema_u64_i64();
@@ -191,7 +190,6 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
             let hdr = &f.ctrl.hdr;
             assert_eq!(hdr.status, WireStatus::Ok);
             assert!(hdr.flags.continuation);
-            assert!(f.ctrl.schema.is_none(), "a reply frame carries no schema block");
             assert_eq!(
                 hdr.flags.scan_last,
                 i + 1 == train.len(),
@@ -413,7 +411,6 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         for f in &out {
             assert_eq!((f.req, f.ctrl.hdr.status), (9, WireStatus::Ok));
             assert!(f.ctrl.hdr.flags.continuation, "every span frame carries continuation");
-            assert!(f.ctrl.schema.is_none(), "the master builds the frame schema itself");
             let rows = f.rows(&span_schema);
             got.extend((0..rows.len()).map(|i| rows.get_pk_bytes(i).to_vec()));
         }

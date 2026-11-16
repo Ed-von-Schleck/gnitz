@@ -260,7 +260,7 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<PkKeySet> {
         }
         for (&c, &image) in schema.pk_cols().iter().zip(&tuple[..pk_count]) {
             let width = schema.columns()[c as usize].ty.tc.wire_stride();
-            gnitz_wire::push_opk(&mut bytes, width, image, false);
+            gnitz_wire::push_opk(&mut bytes, width, image);
         }
         for k in (0..pk_count).rev() {
             at[k] += 1;

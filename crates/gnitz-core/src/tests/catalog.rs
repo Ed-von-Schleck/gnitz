@@ -31,13 +31,7 @@ impl Rows {
     }
 
     fn table(&mut self, table_id: u64, schema_id: u64, name: &str, props: TableProps) -> &mut Self {
-        let row = TableTabRow {
-            table_id,
-            schema_id,
-            name: name.into(),
-            pk_col_idx: PkColList::from_slice(&[0]),
-            flags: props,
-        };
+        let row = TableTabRow::of(table_id, schema_id, name, PkColList::from_slice(&[0]), props);
         self.put(&row, 1)
     }
 
@@ -209,12 +203,8 @@ fn a_column_gap_fails_the_read() {
 /// or a zero-weight row in the cut names neither.
 #[test]
 fn a_row_of_no_positive_weight_is_no_relation() {
-    let table = |table_id: u64, name: &'static str| TableTabRow {
-        table_id,
-        schema_id: 16,
-        name: name.into(),
-        pk_col_idx: PkColList::from_slice(&[0]),
-        flags: TableProps::default(),
+    let table = |table_id: u64, name: &'static str| {
+        TableTabRow::of(table_id, 16, name, PkColList::from_slice(&[0]), TableProps::default())
     };
     let mut rows = Rows::new();
     rows.schema(16, "app")

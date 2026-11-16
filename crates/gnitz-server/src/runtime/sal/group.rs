@@ -3,7 +3,7 @@
 
 use super::format::{PayloadRows, RequestHead, payload_size};
 use super::request::{Apply, Ingest, Read};
-use crate::catalog::SysFamily;
+use crate::catalog::{SysFamily, SysFamilyExt};
 use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::RequestId;
 use gnitz_store::relation::PkRule;

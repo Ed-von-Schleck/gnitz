@@ -307,11 +307,11 @@ fn point_read_resolves_system_table_row() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     assert_eq!(
-        pk_group_native(&mut engine, gnitz_wire::TABLE_TAB, tid as u128).len(),
+        pk_group_native(&mut engine, SysFamily::Table.id(), tid as u128).len(),
         1,
         "the TABLE_TAB row of the created table"
     );
-    assert!(pk_group_native(&mut engine, gnitz_wire::TABLE_TAB, 9_999_999).is_empty());
+    assert!(pk_group_native(&mut engine, SysFamily::Table.id(), 9_999_999).is_empty());
 
     engine.close();
 }
@@ -579,12 +579,12 @@ fn test_circuit_table_surface_introspectable() {
 
     // The family is SQL-introspectable — `SELECT * FROM _system.circuits` must return
     // what we just inserted (full-scan path, used by SQL planner).
-    let scan = scan_all(&mut engine, gnitz_wire::CIRCUIT_TAB);
+    let scan = scan_all(&mut engine, SysFamily::Circuit.id());
     assert_eq!(scan.len(), 1, "scan must expose the circuit row");
 
     // A point read by the view id.
     let pk_bytes = opk_pk(SysFamily::Circuit.schema(), &[107]);
-    let found = pk_group(&mut engine, gnitz_wire::CIRCUIT_TAB, &pk_bytes);
+    let found = pk_group(&mut engine, SysFamily::Circuit.id(), &pk_bytes);
     assert_eq!(found.len(), 1, "the circuit row by PK");
 
     engine.close();
@@ -624,7 +624,7 @@ fn a_descriptor_token_follows_the_resolve_answer() {
     let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let resolve_token = |engine: &CatalogEngine, tid| engine.resolve_answer(tid).map(|(_, _, t)| t);
+    let resolve_token = |engine: &CatalogEngine, tid| engine.resolve_answer(tid).map(|(_, t)| t);
     let token = resolve_token(&engine, tid).unwrap();
     assert_ne!(token, 0);
     engine.check_token(Target { tid, token }).unwrap();

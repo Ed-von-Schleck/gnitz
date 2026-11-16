@@ -29,7 +29,7 @@ fn order_index_entries_bench() {
         &'static str,
         &'static [SchemaColumn],
         &'static [u32],
-        &'static [u16],
+        &'static [u32],
         u64,
         u64,
     );
@@ -128,7 +128,7 @@ fn order_index_entries_bench() {
             for i in salt * N..(salt + 1) * N {
                 b.begin_row(i as u128, 1);
                 for (c, col) in (1u32..).zip(tail) {
-                    let v = match c as u16 == order[0] {
+                    let v = match c == order[0] {
                         true => mix(i) % leads,
                         false if groups == 16 => i + c as u64,
                         false => mix(i + c as u64),

@@ -48,7 +48,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 19;
+pub(crate) const CIRCUIT_VERSION: u8 = 20;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation
@@ -218,30 +218,18 @@ pub enum OpNode {
 }
 
 impl OpNode {
-    /// The columns of its input this operator groups by, for one that groups.
-    pub fn group_cols(&self) -> Option<&[u32]> {
-        match self {
-            OpNode::Reduce { group: GroupAggs { group_cols, .. }, .. }
-            | OpNode::TopN { group_cols, .. }
-            | OpNode::Window { group: GroupAggs { group_cols, .. }, .. } => Some(group_cols),
-            OpNode::ScanDelta { .. }
-            | OpNode::Filter(_)
-            | OpNode::Map(_)
-            | OpNode::Negate
-            | OpNode::Union
-            | OpNode::WeightClamp(_)
-            | OpNode::Join(_)
-            | OpNode::ExchangeShard
-            | OpNode::NullExtend { .. } => None,
-        }
-    }
-
     /// The operator moves its input's rows between workers before it reads them.
     pub fn exchanges(&self) -> bool {
         matches!(
             self,
             OpNode::ExchangeShard | OpNode::Reduce { local: false, .. } | OpNode::TopN { .. } | OpNode::Window { .. }
         )
+    }
+
+    /// A reduce that owes a row over an empty input: one over no group columns
+    /// that is not `local`.
+    pub fn owes_ground_row(&self) -> bool {
+        matches!(self, OpNode::Reduce { group, local: false } if group.group_cols.is_empty())
     }
 
     /// How many input slots this operator is wired on.
@@ -489,12 +477,6 @@ impl Circuit {
     /// Every node reading `nid`, in topological order.
     pub fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> {
         (nid + 1..self.nodes.len()).filter(move |&n| self.inputs(n).contains(&nid))
-    }
-
-    /// `nid` is a reduce that owes a row over an empty input: one over no group
-    /// columns that is not `local`.
-    pub fn owes_ground_row(&self, nid: NodeId) -> bool {
-        matches!(self.op(nid), OpNode::Reduce { group, local: false } if group.group_cols.is_empty())
     }
 
     /// Every relation the circuit scans, once per scan.

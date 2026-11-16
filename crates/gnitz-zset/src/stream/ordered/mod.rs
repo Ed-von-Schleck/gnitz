@@ -455,7 +455,7 @@ impl OrderIndex {
         also: impl IntoIterator<Item = u32>,
     ) -> Result<(Self, DerivedSchema), String> {
         let mut order = order.iter().map(|key| {
-            let (col, loc) = input.wire_col("order index: order column", key.col as u32)?;
+            let (col, loc) = input.wire_col("order index: order column", key.col)?;
             Ok(OrderSpec {
                 image: ImageCol::new(loc, key.desc),
                 nulls_first: key.nulls_first,

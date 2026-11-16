@@ -177,9 +177,9 @@ impl Peer {
     fn expect_kept(&self, what: &str) -> Vec<(u64, SubId)> {
         let frame = self.expect_frame(what);
         let ctrl = peek_control_block(&frame).expect("a control header");
-        assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::DeltaPoll, "{what}");
-        let items = gnitz_wire::txn_frame::decode_delta_items(&frame[ctrl.body.clone()]).expect("a delta poll");
-        let kept = gnitz_wire::txn_frame::delta_poll_kept(&ctrl.hdr, items.len()).expect("ids in range");
+        assert_eq!(ctrl.hdr.flags.verb, Some(gnitz_wire::ClientVerb::DeltaPoll), "{what}");
+        let items = gnitz_wire::multi_frame::decode_delta_items(&frame[ctrl.body.clone()]).expect("a delta poll");
+        let kept = gnitz_wire::multi_frame::delta_poll_kept(&ctrl.hdr, items.len()).expect("ids in range");
         let kept = kept.unwrap_or_else(|| panic!("{what}: a poll keeping its views"));
         items.iter().zip(kept).map(|(item, id)| (item.view.tid, id)).collect()
     }
@@ -207,21 +207,15 @@ impl Peer {
         self.send_bytes(&pushed_train(view, sub, &kv_rows(rows), end));
     }
 
-    /// A RESOLVE answering with `tid`: the schema block plus a view descriptor
-    /// carrying a feed.
+    /// A RESOLVE answering with `tid`: a view descriptor carrying a feed.
     fn reply_resolved(&self, tid: u64) {
-        let schema = kv_schema(TypeCode::I64);
         let blob = RelDescriptorBlob {
             class: RelClass::FedView,
+            schema: kv_schema(TypeCode::I64).to_record().into(),
             ..Default::default()
         };
         let hdr = ControlHeader { target_id: tid, ..Default::default() };
-        self.send(&encode_frame(
-            hdr,
-            &blob.encode(),
-            Some(schema.to_block()),
-            Some(&ZSetBatch::new(&schema)),
-        ));
+        self.send(&encode_frame(hdr, &blob.encode(), None));
     }
 }
 

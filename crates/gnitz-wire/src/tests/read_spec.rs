@@ -105,7 +105,7 @@ fn the_encoded_bytes_are_pinned() {
         0,                      // sink: rows
         5, 0, 0, 0, 0, 0, 0, 0, // cut k
         1, 0,                   // order keys
-        3, 0, 0b11,             // column, desc | nulls first
+        3, 0, 0, 0, 0b11,       // column, desc | nulls first
     ];
     assert_eq!(rows.encode(), want);
 

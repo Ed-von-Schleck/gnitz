@@ -491,7 +491,7 @@ fn emit_reduce(ctx: &mut EmitCtx, nid: NodeId, group: &GroupAggs) -> Result<Delt
     let in_reg = ctx.unary_delta_in(nid);
     let in_schema = ctx.prog.schema_of(in_reg);
     // Minted by the view's backfill, in an epoch of its own.
-    let seeds_ground = ctx.circuit.owes_ground_row(nid);
+    let seeds_ground = ctx.circuit.op(nid).owes_ground_row();
     // `None` where the partials do not combine: the exchange carries the raw rows.
     let partial = match ctx.pre_aggregates(nid, group_cols) {
         true => ReducePlan::partial(&in_schema, aggs)?.map(|plan| push_reduce(ctx, nid, in_reg, plan, true)),

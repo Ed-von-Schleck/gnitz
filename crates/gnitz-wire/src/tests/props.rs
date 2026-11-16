@@ -1,58 +1,6 @@
 use super::*;
 
-/// The `TABLE_TAB` flags word round-trips, pins its persisted bits as literals —
-/// comparing against the constants the packer is written from would hold for any
-/// value it gave them — and accepts exactly the single bits its layout defines.
-#[test]
-fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
-    let dists = (0..=crate::PK_LIST_MAX_COLS as u8)
-        .map(|prefix_len| TableDistribution::Keyed { prefix_len })
-        .chain([TableDistribution::Replicated]);
-    for distribution in dists {
-        for stream in [false, true] {
-            for serial in [false, true] {
-                for compress in [false, true] {
-                    let p = TableProps { stream, serial, distribution, compress };
-                    assert_eq!(TableProps::from_flags(p.pack()), Ok(p));
-                }
-            }
-        }
-    }
-
-    let t = |stream, serial, distribution| {
-        TableProps {
-            stream,
-            serial,
-            distribution,
-            compress: false,
-        }
-        .pack()
-    };
-    assert_eq!(TableProps::default().pack(), 0);
-    assert_eq!(t(false, false, TableDistribution::Replicated), 0b001);
-    assert_eq!(t(true, false, TableDistribution::default()), 0b010);
-    assert_eq!(t(false, true, TableDistribution::default()), 0b100);
-    let compressed = TableProps { compress: true, ..TableProps::default() };
-    assert_eq!(compressed.pack(), 0b1000);
-    assert_eq!(t(false, false, TableDistribution::Keyed { prefix_len: 2 }), 2 << 8);
-
-    for bit in 0..64u32 {
-        let w = 1u64 << bit;
-        assert_eq!(
-            TableProps::from_flags(w).is_ok(),
-            bit <= 3 || (8..16).contains(&bit),
-            "table bit {bit}"
-        );
-    }
-    // The one state the packing can hold and `TableProps` cannot.
-    assert!(
-        TableProps::from_flags(0b01 | 2 << 8)
-            .unwrap_err()
-            .contains("mutually exclusive")
-    );
-}
-
-/// `validate` refuses what the flags word can hold but the table cannot: a
+/// `validate` refuses what a `TABLE_TAB` row can hold but the table cannot: a
 /// distribution prefix longer than the PK, a compressed stream, and a SERIAL
 /// table that is a stream or whose PK is not its one generated column.
 #[test]

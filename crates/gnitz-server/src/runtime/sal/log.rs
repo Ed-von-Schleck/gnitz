@@ -9,8 +9,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::format::{
-    GroupHead, HDR_PREFIX, Header, PREFIX_BYTES, anchor_word, dir_sizes, directory, group_total_size, header_len,
-    payload_rows, payload_spans, word_epoch,
+    GroupHead, HDR_PREFIX, Header, PREFIX_BYTES, SAL_FORMAT, anchor_word, dir_sizes, directory, group_total_size,
+    header_len, payload_rows, payload_spans, word_epoch,
 };
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
@@ -19,8 +19,8 @@ use gnitz_zset::schema::SchemaDescriptor;
 
 const SAL_MMAP_SIZE: usize = 1 << 30;
 
-/// The page holding the anchor, at the head of `wal.sal` so it does not move
-/// when `GNITZ_SAL_BYTES` does.
+/// The page holding the anchor and the format word, at the head of `wal.sal`
+/// so it does not move when `GNITZ_SAL_BYTES` does.
 pub(super) const ANCHOR_BYTES: usize = 4096;
 
 const _: () = assert!(
@@ -44,15 +44,16 @@ fn sal_mmap_size() -> usize {
     size
 }
 
-/// The word at `offset` as an atomic: a publication prefix, or the anchor.
+/// The word at `offset` as an atomic: a publication prefix, or the anchor or
+/// format word.
 ///
 /// # Safety
 /// `offset + PREFIX_BYTES` must lie within the mapping, and `sal_ptr + offset`
 /// must be aligned for an `AtomicU64`. The mapping is page-aligned and the
-/// ring starts one page into it, so the anchor is aligned, and so is the word
-/// at every ring offset that is a multiple of `PREFIX_BYTES` — which every
-/// group base is: 0, or the end of a group, whose size
-/// `group_total_size` keeps a multiple of it.
+/// ring starts one page into it, so the anchor and format words are aligned,
+/// and so is the word at every ring offset that is a multiple of
+/// `PREFIX_BYTES` — which every group base is: 0, or the end of a group, whose
+/// size `group_total_size` keeps a multiple of it.
 #[inline]
 unsafe fn word_atomic<'a>(sal_ptr: *const u8, offset: usize) -> &'a AtomicU64 {
     // SAFETY: the caller's contract above — in bounds and aligned.
@@ -254,12 +255,27 @@ impl SalLog {
         unsafe { word_atomic(self.ring.wrapping_sub(ANCHOR_BYTES), 0) }
     }
 
-    /// The walk epoch.
+    /// The format word, the one behind the anchor on its page.
+    pub(super) fn format_atomic(&self) -> &'static AtomicU64 {
+        // SAFETY: as `anchor_atomic`, one aligned word further into the page.
+        unsafe { word_atomic(self.ring.wrapping_sub(ANCHOR_BYTES), PREFIX_BYTES) }
+    }
+
+    /// The walk epoch. A log anchored under another format word than this
+    /// build's is refused: every group in it, a control-only one included, is
+    /// another build's.
     pub(super) fn anchor(&self) -> Result<u32, String> {
-        match self.anchor_atomic().load(Ordering::Relaxed) {
-            0 => Ok(0), // The fresh file.
-            w if w == anchor_word(word_epoch(w)) => Ok(word_epoch(w)),
-            _ => Err("SAL anchor fails its check: the head of wal.sal is damaged".into()),
+        let epoch = match self.anchor_atomic().load(Ordering::Relaxed) {
+            0 => return Ok(0), // The fresh file.
+            w if w == anchor_word(word_epoch(w)) => word_epoch(w),
+            _ => return Err("SAL anchor fails its check: the head of wal.sal is damaged".into()),
+        };
+        match self.format_atomic().load(Ordering::Relaxed) {
+            SAL_FORMAT => Ok(epoch),
+            found => Err(format!(
+                "SAL format word {found:#x} is not this build's {SAL_FORMAT:#x}: wal.sal was written by \
+                 another build"
+            )),
         }
     }
 

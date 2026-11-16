@@ -203,7 +203,7 @@ pub(crate) fn col_range(col: u32, first: u128, last: u128) -> ReadBound {
 }
 
 /// One cut key: column `col`, NULLs last.
-pub(crate) fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
+pub(crate) fn order_by(col: u32, desc: bool) -> Vec<OrderKey> {
     vec![OrderKey { col, desc, nulls_first: false }]
 }
 

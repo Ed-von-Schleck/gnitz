@@ -99,8 +99,7 @@ impl ClientMap {
                     src.pks.region(),
                     src.pks.stride(),
                     byte_off as usize,
-                    c.width,
-                    type_code.is_signed_int(),
+                    type_code,
                     &mut out.payload[c.slot].bytes,
                 );
             }

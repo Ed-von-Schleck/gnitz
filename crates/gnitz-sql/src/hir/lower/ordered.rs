@@ -41,7 +41,7 @@ pub(super) fn lower_ordered(
         .iter()
         .map(|k| {
             Ok(OrderKey {
-                col: frame.slot(k.col)? as u16,
+                col: frame.slot(k.col)? as u32,
                 desc: k.desc,
                 nulls_first: k.nulls_first,
             })

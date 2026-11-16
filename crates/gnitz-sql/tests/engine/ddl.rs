@@ -692,7 +692,7 @@ fn a_qualified_name_reaches_another_schema() {
             "is a system table",
         ),
         (
-            "ALTER TABLE _system.tables DROP COLUMN flags",
+            "ALTER TABLE _system.tables DROP COLUMN stream",
             Rejected,
             "is a system table",
         ),

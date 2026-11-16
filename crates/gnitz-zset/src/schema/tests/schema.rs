@@ -44,11 +44,11 @@ fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
         SchemaColumn::new(F64, true),
     ];
     let reference = SchemaDescriptor::new(&cols, &[0]);
-    let mut buf = encode_schema_block(&reference);
+    let mut buf = encode_schema_record(&reference);
     for byte in 0..4 + 1 + reference.pk_cols().len() {
         for bit in 0..8 {
             buf[byte] ^= 1 << bit;
-            if let Ok(decoded) = decode_schema_block(&buf) {
+            if let Ok(decoded) = decode_schema_record(&buf) {
                 assert_ne!(decoded, reference, "prefix byte {byte} bit {bit} changed nothing");
             }
             buf[byte] ^= 1 << bit;
@@ -59,7 +59,7 @@ fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
 /// The decode of a schema record refuses what the descriptor refuses: a
 /// nullable PK column, and a column count past `MAX_COLUMNS`.
 #[test]
-fn decode_schema_block_refuses_what_the_descriptor_refuses() {
+fn decode_schema_record_refuses_what_the_descriptor_refuses() {
     use gnitz_wire::TypeCode::U64;
     let cases = [
         ("nullable PK column", vec![SchemaColumn::new(U64, true)]),
@@ -69,8 +69,8 @@ fn decode_schema_block_refuses_what_the_descriptor_refuses() {
         ),
     ];
     for (what, cols) in &cases {
-        let record = gnitz_wire::schema_block::encode(
-            cols.iter().map(|c| SchemaBlockCol {
+        let record = gnitz_wire::schema_record::encode(
+            cols.iter().map(|c| RecordCol {
                 ty: ColType::of(c.type_code),
                 nullable: c.nullable,
                 hidden: false,
@@ -78,6 +78,6 @@ fn decode_schema_block_refuses_what_the_descriptor_refuses() {
             }),
             &[0],
         );
-        assert!(decode_schema_block(&record).is_err(), "{what}");
+        assert!(decode_schema_record(&record).is_err(), "{what}");
     }
 }

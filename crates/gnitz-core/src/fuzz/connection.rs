@@ -23,7 +23,7 @@ fn reply_fuzz() {
         let mut page = s.submit_snapshot_page(1, 8, &[], 16, &schema);
         s.submit_delta_poll(
             sub_id(100),
-            &[txn_frame::DeltaPollItem {
+            &[multi_frame::DeltaPollItem {
                 view: Target::from(9),
                 from: None,
                 reply_layout: schema.layout().layout_digest(),

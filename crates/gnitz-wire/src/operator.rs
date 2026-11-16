@@ -169,7 +169,7 @@ pub const MAX_ORDER_KEYS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderKey {
     /// A full reply-schema column index (not a dense payload index).
-    pub col: u16,
+    pub col: u32,
     pub desc: bool,
     pub nulls_first: bool,
 }
@@ -187,11 +187,11 @@ impl Wire for OrderKey {
         if self.nulls_first {
             flags |= ORDER_NULLS_FIRST;
         }
-        w.u16(self.col).u8(flags);
+        w.u32(self.col).u8(flags);
     }
 
     fn read(r: &mut Reader) -> Result<Self, String> {
-        let col = r.u16()?;
+        let col = r.u32()?;
         let flags = r.flags(ORDER_DESC | ORDER_NULLS_FIRST)?;
         Ok(OrderKey {
             col,

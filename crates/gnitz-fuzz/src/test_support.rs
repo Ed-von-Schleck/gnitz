@@ -4,9 +4,9 @@ use std::num::NonZeroU64;
 
 use gnitz_core::{BatchAppender, ZSetBatch, encode_ddl_txn, sys_schema};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, Sink};
-use gnitz_wire::txn_frame::{ScanItem, encode_scan_multi};
+use gnitz_wire::multi_frame::{ScanItem, encode_scan_multi};
 use gnitz_wire::{
-    CIRCUIT_TAB, Circuit, CircuitRow, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind,
+    Circuit, CircuitRow, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, SysFamily,
     SysRow, Target,
 };
 
@@ -35,9 +35,9 @@ pub(crate) fn circuit(predicate: &[u8]) -> Vec<u8> {
 
 /// A `DDL_TXN` of one `circuits` row: view 100's `circuit`.
 pub(crate) fn ddl_frame(circuit: &[u8]) -> Vec<u8> {
-    let mut batch = ZSetBatch::new(sys_schema(CIRCUIT_TAB));
+    let mut batch = ZSetBatch::new(sys_schema(SysFamily::Circuit));
     CircuitRow { view_id: 100, circuit: circuit.into() }.write(&mut BatchAppender::new(&mut batch), 1);
-    encode_ddl_txn(&[(CIRCUIT_TAB, batch)])
+    encode_ddl_txn(&[(SysFamily::Circuit, batch)])
 }
 
 /// A `SCAN_MULTI` of relation 9 under `spec`.
@@ -56,7 +56,7 @@ pub(crate) fn scan_frame(spec: &ReadSpec) -> Vec<u8> {
 }
 
 /// The first five rows passing [`predicate`], ordered by the columns `order`.
-pub(crate) fn cut(order: &[u16]) -> ReadSpec {
+pub(crate) fn cut(order: &[u32]) -> ReadSpec {
     let order = order
         .iter()
         .map(|&col| OrderKey { col, desc: false, nulls_first: false });

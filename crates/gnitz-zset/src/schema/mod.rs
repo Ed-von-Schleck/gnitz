@@ -1,10 +1,10 @@
 //! The key and payload-order kernels over a schema, the shaping of a derived
 //! schema (an operator's output or an index's layout), and the nameless
-//! schema-block codec a descriptor is stored and shipped as. The descriptor
+//! schema-record codec a descriptor is stored and shipped as. The descriptor
 //! itself is `gnitz-expr`'s.
 
 use gnitz_expr::{SchemaRefusal, leading_pk};
-use gnitz_wire::schema_block::SchemaBlockCol;
+use gnitz_wire::schema_record::RecordCol;
 use gnitz_wire::{ColType, MAX_COLUMNS};
 use smallvec::SmallVec;
 
@@ -21,9 +21,9 @@ pub(crate) use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payl
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
 /// carried on the wire but nothing engine-side reads one.
-pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
+pub fn decode_schema_record(data: &[u8]) -> Result<SchemaDescriptor, String> {
     let mut cols: SmallVec<[SchemaColumn; MAX_COLUMNS]> = SmallVec::new();
-    let pk = gnitz_wire::schema_block::decode(data, |c| {
+    let pk = gnitz_wire::schema_record::decode(data, |c| {
         cols.push(SchemaColumn::new(c.ty.tc, c.nullable));
         Ok(())
     })?;
@@ -31,15 +31,15 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
 }
 
 /// Encode `schema`'s physical column shape — the inverse of
-/// [`decode_schema_block`]: no names, no hidden flag, every scale zero.
-pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
-    let cols = schema.columns().iter().map(|c| SchemaBlockCol {
+/// [`decode_schema_record`]: no names, no hidden flag, every scale zero.
+pub fn encode_schema_record(schema: &SchemaDescriptor) -> Vec<u8> {
+    let cols = schema.columns().iter().map(|c| RecordCol {
         ty: ColType::of(c.type_code),
         nullable: c.nullable,
         hidden: false,
         name: b"",
     });
-    gnitz_wire::schema_block::encode(cols, schema.pk_cols())
+    gnitz_wire::schema_record::encode(cols, schema.pk_cols())
 }
 
 /// Builder for a derived schema: its PK columns, then its payload columns.

@@ -73,16 +73,16 @@ fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
 /// that carry [`WIRE_VERSION`] itself. A data block's layout is pinned by the
 /// block's own test.
 fn wire_layout_samples() -> Vec<u8> {
-    use crate::txn_frame::{self, DeltaCursor, DeltaPollItem, ScanItem, SubId};
+    use crate::multi_frame::{self, DeltaCursor, DeltaPollItem, ScanItem, SubId};
     use crate::*;
 
     let mut out = Vec::new();
-    // A header with every field set, a blob and a schema record.
+    // A header with every field set, and a blob.
     let hdr = ControlHeader {
         status: WireStatus::StaleCatalog,
         target_id: 0x1111_2222_3333_4444,
         flags: WireFlags {
-            verb: ClientVerb::SnapshotPage,
+            verb: Some(ClientVerb::SnapshotPage),
             conflict_mode: WireConflictMode::Error,
             continuation: true,
             scan_last: true,
@@ -91,18 +91,18 @@ fn wire_layout_samples() -> Vec<u8> {
         arg0: 0x5555_6666_7777_8888,
         arg1: 0x9999_AAAA_BBBB_CCCC,
     };
-    append_frame(&mut out, &hdr, b"blob", Some(b"schema"), None);
+    append_frame(&mut out, &hdr, b"blob", None);
 
     let target = Target { tid: 7, token: 9 };
-    txn_frame::encode_scan_multi(&mut out, &[ScanItem { target, reply_layout: 3, spec: b"spec" }]);
+    multi_frame::encode_scan_multi(&mut out, &[ScanItem { target, reply_layout: 3, spec: b"spec" }]);
     let poll = DeltaPollItem {
         view: target,
         from: DeltaCursor::from_pair(5, 6),
         reply_layout: 3,
         spec: b"spec",
     };
-    txn_frame::encode_delta_poll(&mut out, &[poll, DeltaPollItem { from: None, ..poll }], SubId::new(4));
-    out.extend(txn_frame::encode_held(
+    multi_frame::encode_delta_poll(&mut out, &[poll, DeltaPollItem { from: None, ..poll }], SubId::new(4));
+    out.extend(multi_frame::encode_held(
         [SubId::new(4), SubId::new(u64::MAX)].map(Option::unwrap),
     ));
 
@@ -138,25 +138,25 @@ fn wire_layout_samples() -> Vec<u8> {
     out.extend(fold.encode());
 
     let schema = [
-        schema_block::SchemaBlockCol {
+        schema_record::RecordCol {
             ty: TypeCode::U64.into(),
             nullable: false,
             hidden: false,
             name: b"k",
         },
-        schema_block::SchemaBlockCol {
+        schema_record::RecordCol {
             ty: ColType::decimal(9),
             nullable: true,
             hidden: true,
             name: b"v",
         },
     ];
-    out.extend(schema_block::encode(schema.iter().copied(), &[0]));
     let desc = RelDescriptorBlob {
         class: RelClass::FedView,
         pk_repeats: true,
         serial: true,
         indexes: vec![RelIndex { cols, is_unique: true }],
+        schema: schema_record::encode(schema.iter().copied(), &[0]).into(),
     };
     out.extend(desc.encode());
     let page = snapshot::PageRequest {
@@ -178,7 +178,7 @@ fn wire_layout_samples() -> Vec<u8> {
 fn the_wire_layouts_are_pinned_to_the_epoch() {
     assert_eq!(
         (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
-        (37, 0xf724_9517_346b_fbe4),
+        (38, 0xec39_ad9a_f680_9ddb),
         "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
     );
 }

@@ -336,7 +336,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     // The columns a push group's record lays out, each name checked empty.
     let sal_width = |engine: &CatalogEngine| {
         let mut n = 0;
-        gnitz_wire::schema_block::decode(engine.sal_target(tid).unwrap().1, |c| {
+        gnitz_wire::schema_record::decode(engine.sal_target(tid).unwrap().1, |c| {
             assert!(c.name.is_empty(), "a push group's record carries no name");
             n += 1;
             Ok(())
@@ -452,7 +452,7 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     {
         let mut excl = disp.sal().excl();
         let mut scope = excl.begin();
-        // No rows, so no schema block is framed; no worker is launched to read it.
+        // No rows, so no schema record is framed; no worker is launched to read it.
         scope.push(1, PkRule::Enforce, &[], Routed::Same(None), true).unwrap();
         assert!(scope.commit().is_some(), "the push is a zone member");
     }

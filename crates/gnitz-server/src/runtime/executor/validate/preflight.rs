@@ -453,7 +453,7 @@ fn plan_fk_existence<'a>(
             let cache = caches.fk_presence_of(parent_tid);
             let mut key = [0u8; 16];
             values.retain(|&v, _| {
-                gnitz_wire::store_opk(&mut key[..span], v, false);
+                gnitz_wire::store_opk(&mut key[..span], v);
                 match fold.and_then(|f| f.get(&key[..span])).map(|e| e.last) {
                     // The parent's delta adds it.
                     Some(FoldOp::Inserted(..)) => false,

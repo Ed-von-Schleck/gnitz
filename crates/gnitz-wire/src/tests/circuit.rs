@@ -212,7 +212,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (19, 0x46dc_49ec_c771_df88));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (20, 0xf099_177f_e3fb_8ae4));
 }
 
 /// Every framing guard, against the forgery that trips it.
@@ -424,7 +424,7 @@ fn the_reduce_builders_differ_in_the_exchange() {
     let grouped = c.reduce(input, agg(vec![1]));
     let local = c.reduce_local(input, agg(vec![]));
     assert_eq!(
-        [global, grouped, local].map(|id| c.owes_ground_row(id)),
+        [global, grouped, local].map(|id| c.op(id).owes_ground_row()),
         [true, false, false]
     );
     assert_eq!(

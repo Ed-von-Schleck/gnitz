@@ -4,7 +4,7 @@
 
 use super::*;
 
-const TABLES: u64 = gnitz_wire::TABLE_TAB;
+const TABLES: u64 = SysFamily::Table.id();
 
 /// An identity view over the `tables` family.
 fn tables_view(engine: &mut CatalogEngine, name: &str) -> u64 {
@@ -59,7 +59,7 @@ fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
     let tid = engine.allocate_ids(1).unwrap();
     engine.register_table(tid, PUBLIC_SCHEMA_ID, "t", &cols, &[0]).unwrap();
 
-    assert!(engine.registry.seal(gnitz_wire::COL_TAB).unwrap().is_none());
+    assert!(engine.registry.seal(SysFamily::Column.id()).unwrap().is_none());
     assert_eq!(engine.registry.seal(TABLES).unwrap().map(|d| d.len()), Some(1));
 }
 

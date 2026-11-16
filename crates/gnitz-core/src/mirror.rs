@@ -40,8 +40,8 @@ use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, ScanReply,
 use crate::error::ClientError;
 use crate::host::{BoxFut, Host, Pending, Sent, offload};
 use crate::{RelName, Schema, ZSetBatch};
-use gnitz_wire::txn_frame::{DeltaPollItem, SubId, kept_as};
-use gnitz_wire::{RELTAB_PAY_NAME, RelClass, VIEW_TAB, WireStatus, payload_str};
+use gnitz_wire::multi_frame::{DeltaPollItem, SubId, kept_as};
+use gnitz_wire::{RELTAB_PAY_NAME, RelClass, SysFamily, WireStatus, payload_str};
 
 // ---------------------------------------------------------------------------
 // The store
@@ -804,11 +804,11 @@ impl GnitzClient {
     /// After this client's own DDL `families` committed: drop the copy of every
     /// view it retracted, except a mirrored view it also wrote back — a rename —
     /// which is rebound under its new name.
-    pub(crate) async fn ddl_committed(&mut self, families: &[(u64, ZSetBatch)]) {
+    pub(crate) async fn ddl_committed(&mut self, families: &[(SysFamily, ZSetBatch)]) {
         let Some(m) = self.mirror.as_deref() else {
             return;
         };
-        let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
+        let Some((_, b)) = families.iter().find(|(family, _)| *family == SysFamily::View) else {
             return;
         };
         let vid = |i| gnitz_wire::sys_leading_id(b.pks.get_bytes(i));

@@ -10,7 +10,7 @@ use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::relation::PkRule;
 use gnitz_wire::MAX_WORKERS;
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 use std::fs::File;
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ fn a_per_worker_group_gives_each_addressed_worker_its_own_bytes() {
 fn a_shared_group_gives_every_addressed_worker_the_same_bytes() {
     let log = test_log(1 << 20, 4, 1);
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)]);
-    let record = encode_schema_block(batch.schema());
+    let record = encode_schema_record(batch.schema());
     let push = |to| Group {
         to,
         ..Group::push(16, PkRule::Enforce, &record, Routed::Same(batch.wire_whole()))

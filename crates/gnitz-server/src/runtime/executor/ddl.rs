@@ -10,7 +10,7 @@
 
 use super::validate::{self, UniqueFilter};
 use super::{CatalogLock, Shared, decode_fault, park_until};
-use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
+use crate::catalog::{AppliedDdl, DdlBundle, SysFamily, SysFamilyExt};
 use crate::runtime::master::ApplyLock;
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
@@ -66,7 +66,7 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// [`decode_sys_family`]. One slot per family: every list derived from a bundle
 /// reads one block of each.
 pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
-    let items = gnitz_wire::txn_frame::decode_items(body, 0..body.len(), ClientVerb::DdlTxn).map_err(decode_fault)?;
+    let items = gnitz_wire::multi_frame::decode_items(body, 0..body.len(), ClientVerb::DdlTxn).map_err(decode_fault)?;
     let mut families = DdlBundle::default();
     for ctrl in items {
         decode_sys_family(body, ctrl)

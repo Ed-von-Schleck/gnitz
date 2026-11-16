@@ -339,7 +339,7 @@ pub(crate) fn reply_rows(
         slots
             .iter()
             .map(|&(slot, key)| OrderKey {
-                col: col(slot) as u16,
+                col: col(slot) as u32,
                 desc: key.desc,
                 nulls_first: key.nulls_first,
             })

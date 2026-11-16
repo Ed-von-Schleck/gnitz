@@ -107,11 +107,6 @@ fn each_guard_rejects_its_forgery() {
     for bit in 0..32 {
         let flip = |off| forged(off, &|v| v ^ (1 << bit));
         cases.push((format!("SIZE bit {bit}"), flip(WAL_OFF_SIZE), Some(not_its_length)));
-        cases.push((
-            format!("VERSION bit {bit}"),
-            flip(WAL_OFF_VERSION),
-            Some("unknown block version"),
-        ));
         let rows_err = if ROWS ^ (1 << bit) == 0 {
             "block holds no rows"
         } else {
@@ -130,7 +125,7 @@ fn each_guard_rejects_its_forgery() {
 
 /// The block layout, byte for byte: what a change to the header's words, a
 /// German cell's fields, the OPK byte order or a region's place would move
-/// without moving [`WIRE_VERSION`].
+/// without moving [`crate::WIRE_VERSION`].
 #[test]
 fn the_block_layout_is_pinned_byte_for_byte() {
     // A compound (I16, U8) PK, an I32 column and a STRING column.
@@ -142,8 +137,8 @@ fn the_block_layout_is_pinned_byte_for_byte() {
     let long = crate::encode_german_string(LONG, &mut blob);
     let mut pk = Vec::new();
     for (k, u) in [(-2i16, 3u8), (258, 6)] {
-        crate::push_opk(&mut pk, 2, k as u16 as u128, true);
-        crate::push_opk(&mut pk, 1, u as u128, false);
+        crate::push_opk(&mut pk, 2, k as u16 as u128 ^ 0x8000);
+        crate::push_opk(&mut pk, 1, u as u128);
     }
     let regions: [&[u8]; 6] = [
         &pk,
@@ -156,12 +151,10 @@ fn the_block_layout_is_pinned_byte_for_byte() {
     ];
     let block = encode_dead(&regions, 0);
 
-    let version = WIRE_VERSION.to_le_bytes();
     #[rustfmt::skip]
     let want: &[u8] = &[
-        // Header: SIZE, VERSION, ROWS, HEAP_LEN, HEAP_DEAD, each u32 LE.
-        (20 + 2 * ROW + LONG.len()) as u8, 0, 0, 0,
-        version[0], version[1], version[2], version[3],
+        // Header: SIZE, ROWS, HEAP_LEN, HEAP_DEAD, each u32 LE.
+        (16 + 2 * ROW + LONG.len()) as u8, 0, 0, 0,
         2, 0, 0, 0,
         LONG.len() as u8, 0, 0, 0,
         0, 0, 0, 0,

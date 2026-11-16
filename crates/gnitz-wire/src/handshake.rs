@@ -1,6 +1,6 @@
 //! The HELLO both ends of a connection open with — the client's carrying its
 //! access token, the server's its verdict on it — the TLS ALPN they pin, and
-//! the wire version the HELLO and every data block carry.
+//! the wire version the HELLO carries.
 
 use std::fmt;
 use std::time::Duration;
@@ -9,11 +9,11 @@ use crate::SYS_SCHEMA_DIGEST;
 
 /// The epoch of every client↔engine layout; the epoch-pin tests fail until it
 /// moves with one.
-const WIRE_EPOCH: u32 = 37;
+const WIRE_EPOCH: u32 = 38;
 
-/// The wire version: every data block's version word, the HELLO's, and a frame
-/// recording's. [`SYS_SCHEMA_DIGEST`] folds in, so a system-family shape change
-/// moves it too.
+/// The wire version: the HELLO's, a frame recording's, and part of the format
+/// word on the server's log. [`SYS_SCHEMA_DIGEST`] folds in, so a system-family
+/// shape change moves it too.
 pub const WIRE_VERSION: u32 = WIRE_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEMA_DIGEST >> 32)) as u32);
 
 /// A client's deadline over its connect, TLS handshake and HELLO exchange together.

@@ -986,7 +986,7 @@ fn a_round_of_another_view_moves_no_cursor() {
 /// answered in the order they were sent, outside the order of replies.
 #[test]
 fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
-    use gnitz_wire::txn_frame::{DeltaPollItem, encode_delta_poll};
+    use gnitz_wire::multi_frame::{DeltaPollItem, encode_delta_poll};
     use gnitz_wire::{ControlHeader, append_frame};
     use std::io::{Read, Write};
 
@@ -1011,8 +1011,7 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         append_frame(
             &mut frame,
             &hdr,
-            &gnitz_wire::txn_frame::encode_held([SubId::FIRST]),
-            None,
+            &gnitz_wire::multi_frame::encode_held([SubId::FIRST]),
             None,
         );
         frame

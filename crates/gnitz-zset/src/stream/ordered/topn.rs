@@ -49,7 +49,7 @@ impl OrderedPlan {
         let shifted: Vec<OrderKey> = order
             .iter()
             .map(|k| OrderKey {
-                col: k.col.saturating_add(key.len() as u16),
+                col: k.col.saturating_add(key.len() as u32),
                 ..*k
             })
             .collect();

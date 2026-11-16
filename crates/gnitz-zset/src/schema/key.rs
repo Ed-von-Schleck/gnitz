@@ -210,14 +210,14 @@ pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf,
     let mut widths = schema.pk_columns().map(|c| c.size());
     let mut first = PkBuf::zeroed(0);
     for (&image, w) in range.eq_vals().iter().zip(&mut widths) {
-        first.push(w, image, false);
+        first.push(w, image);
     }
     let w = widths
         .next()
         .expect("range_band: the range lists more columns than the PK");
     let mut last = first;
-    first.push(w, range.first, false);
-    last.push(w, range.last, false);
+    first.push(w, range.first);
+    last.push(w, range.last);
     group_band(first.pk_bytes(), last.pk_bytes(), schema.pk_stride())
 }
 

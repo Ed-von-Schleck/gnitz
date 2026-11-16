@@ -2,11 +2,11 @@ use super::*;
 
 /// Every system table's key must be admissible for its own column list. The
 /// pair is the thing both crates build from, so it is validated here rather
-/// than trusted at each derivation site. Swept over `SYS_FAMILIES`, so a newly
+/// than trusted at each derivation site. Swept over `SysFamily::ALL`, so a newly
 /// added family is covered without editing this test.
 #[test]
 fn system_table_keys_are_valid_for_their_columns() {
-    for f in SYS_FAMILIES {
+    for f in SysFamily::ALL.map(SysFamily::def) {
         let (name, cols, pk) = (f.name, f.cols, f.pk_cols);
         assert!(cols.len() <= crate::MAX_COLUMNS, "{name}: too many columns");
         crate::validate_pk_tuple(pk, cols.len(), crate::PK_LIST_MAX_COLS, |c| {
@@ -148,33 +148,59 @@ fn a_column_row_column_accepts_is_the_row_of_writes() {
     assert!(accepted > 0);
 }
 
-/// A relation row's properties read back what its writer packed, and refuse a
-/// word no writer emits.
+/// A relation row's properties read back what its writer wrote, and refuse a
+/// row no writer emits.
 #[test]
-fn a_relation_rows_parts_invert_its_packed_words() {
+fn a_relation_rows_parts_invert_its_written_words() {
     let pk = crate::PkColList::from_slice(&[1, 0]);
-    let props = crate::TableProps {
-        serial: false,
-        distribution: crate::TableDistribution::Keyed { prefix_len: 1 },
-        ..Default::default()
-    };
-    let table = TableTabRow {
-        table_id: 17,
-        schema_id: 2,
-        name: "t".into(),
-        pk_col_idx: pk,
-        flags: props,
-    };
-    assert_eq!(table.props(), Ok(props));
-    let stream_serial = crate::TableProps {
-        stream: true,
-        serial: true,
-        ..Default::default()
-    };
-    let err = TableTabRow { flags: stream_serial, ..table.clone() }
-        .props()
-        .unwrap_err();
-    assert!(err.contains("SERIAL"), "{err}");
+    let dists = (0..=2).map(|prefix_len| crate::TableDistribution::Keyed { prefix_len });
+    for distribution in dists.chain([crate::TableDistribution::Replicated]) {
+        for (stream, serial, compress) in [(false, false, false), (true, false, false), (false, false, true)] {
+            let props = crate::TableProps { stream, serial, distribution, compress };
+            assert_eq!(TableTabRow::of(17, 2, "t", pk, props).props(), Ok(props));
+        }
+    }
+    let table = TableTabRow::of(17, 2, "t", pk, crate::TableProps::default());
+    for (r, expect) in [
+        (
+            TableTabRow {
+                stream: true,
+                serial: true,
+                ..table.clone()
+            },
+            "SERIAL",
+        ),
+        (
+            TableTabRow {
+                stream: true,
+                compress: true,
+                ..table.clone()
+            },
+            "compressed",
+        ),
+        (
+            TableTabRow { dist_prefix: 3, ..table.clone() },
+            "exceeds PK column count",
+        ),
+        (
+            TableTabRow {
+                dist_prefix: u8::MAX as u64 + 1,
+                ..table.clone()
+            },
+            "dist_prefix",
+        ),
+        (
+            TableTabRow {
+                replicated: true,
+                dist_prefix: 1,
+                ..table.clone()
+            },
+            "mutually exclusive",
+        ),
+    ] {
+        let err = r.props().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
+    }
 
     let props = crate::ViewProps {
         budget: crate::ViewBudget::Fed {

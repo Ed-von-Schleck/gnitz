@@ -4,10 +4,10 @@ use std::cmp::Ordering;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::algebra::zeroed;
+use crate::algebra::{int_cell, zeroed};
 use crate::repr::{Batch, DirectWriter, MemBatch, vec_bytes};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{AggFunc, FixedInt, ScalarKind, for_each_fixed_int, int_cell};
+use gnitz_wire::{AggFunc, FixedInt, ScalarKind, for_each_fixed_int};
 use gnitz_wire::{RowSource, TypeCode};
 
 use crate::algebra::order_image::{

@@ -7,10 +7,11 @@ use crate::runtime::reactor::{Peer, TrainLease};
 use crate::runtime::sal::Read;
 use gnitz_store::read::ReadRows;
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::txn_frame::ScanItem;
+use gnitz_wire::multi_frame::ScanItem;
 use gnitz_wire::{ReadSpec, WireFault, WireStatus};
 
-/// RESOLVE: answer with the relation's schema block, descriptor and token.
+/// RESOLVE: answer with the relation's descriptor, its schema record included,
+/// and its token.
 ///
 /// Under a plain read guard, not `fresh_read_lock`: a resolve answers catalog
 /// shape, and a view tick moves a view's rows, never its shape, so the tick
@@ -32,10 +33,9 @@ pub(super) async fn handle_resolve(shared: &Shared, peer: &mut Peer, name_blob: 
     let msg = match &answer {
         // No such relation: a successful reply naming none.
         None => WireMsg::default(),
-        Some((tid, (desc, schema_block, token))) => WireMsg {
+        Some((tid, (desc, token))) => WireMsg {
             target_id: *tid,
             arg0: *token,
-            schema_block: Some(schema_block),
             blob: desc,
             ..Default::default()
         },

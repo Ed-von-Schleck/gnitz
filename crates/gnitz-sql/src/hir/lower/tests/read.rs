@@ -24,7 +24,7 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
 }
 
 /// Column `c`'s region: its place in the key region, then in the payload.
-fn region(s: &SchemaDescriptor, c: u16) -> usize {
+fn region(s: &SchemaDescriptor, c: u32) -> usize {
     let c = c as usize;
     s.payload_slot(c).map_or_else(
         || s.pk_cols().iter().position(|&p| p as usize == c).unwrap(),
@@ -116,7 +116,7 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
         if !mapped {
             assert_eq!(r.copied.len(), relation.num_columns(), "`{sql}`");
             for &(c, to) in &r.copied {
-                assert_eq!(region(relation, c as u16), region(reply, to as u16), "`{sql}`");
+                assert_eq!(region(relation, c), region(reply, to), "`{sql}`");
             }
         }
         assert_eq!(r.pk_ordered, pk_ordered, "`{sql}`");

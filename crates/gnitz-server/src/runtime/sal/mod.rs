@@ -9,10 +9,10 @@
 //!
 //! One file per concern, each importing only from the ones listed before it.
 //!
-//! - `format` — the bytes: the publication prefix and anchor words, the group
-//!   header and its codec, the directory, the payload codec, the kind ordinals
-//!   and the scalars of a request the header carries. The header's field
-//!   offsets and flag bits are private to it.
+//! - `format` — the bytes: the publication prefix, anchor and format words,
+//!   the group header and its codec, the directory, the payload codec, the
+//!   kind ordinals and the scalars of a request the header carries. The
+//!   header's field offsets and flag bits are private to it.
 //! - `request` — what a group asks of a worker, typed: [`Read`], [`Apply`], and
 //!   the one mapping between a request and those scalars and its blob.
 //! - `log` — [`SalLog`], the mapping of the file: a verified group read at an

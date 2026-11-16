@@ -54,7 +54,8 @@ def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target)
         row = {"pk": 999, "val": 999}
     else:
         tid, schema = client.resolve_table("_system.tables")
-        row = {"table_id": 999999, "schema_id": 1, "name": "forged", "pk_col_idx": 0, "flags": 0}
+        row = {"table_id": 999999, "schema_id": 1, "name": "forged", "pk_col_idx": 0,
+               "stream": 0, "serial": 0, "replicated": 0, "dist_prefix": 0, "compress": 0}
     before = bag(client.scan(tid, schema))
     assert before
 

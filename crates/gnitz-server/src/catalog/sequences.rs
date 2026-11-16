@@ -5,7 +5,7 @@ use gnitz_wire::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::CatalogEngine;
-use super::sys_tables::SysFamily;
+use super::sys_tables::{SysFamily, SysFamilyExt};
 use super::write_path::{ZoneError, ZoneSink};
 
 /// The next catalog object id to allocate.

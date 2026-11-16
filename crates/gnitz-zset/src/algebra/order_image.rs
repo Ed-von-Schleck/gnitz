@@ -5,11 +5,12 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
+use super::int_cell;
 use crate::repr::MemBatch;
 use crate::schema::SchemaColumn;
 use gnitz_expr::{ColumnLocator, order_bits};
 use gnitz_wire::{RowSource, TypeCode};
-use gnitz_wire::{ScalarKind, cmp_col_window, for_each_fixed_int, int_cell};
+use gnitz_wire::{ScalarKind, cmp_col_window, for_each_fixed_int};
 
 /// The column types outside [`ScalarKind`]: the 16-byte integers and the
 /// German-string pair.

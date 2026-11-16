@@ -7,7 +7,7 @@ use gnitz_store::relation::PkRule;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset::schema::encode_schema_record;
 
 #[derive(Clone, Copy, Debug)]
 enum Cell {
@@ -59,7 +59,7 @@ fn push_group_layout_bench() {
         } else {
             Placement::Replicated
         };
-        let record = encode_schema_block(&schema);
+        let record = encode_schema_record(&schema);
         let log = test_log(16 << 20, nw, 1);
         // One group on an empty SAL; the workers sent rows of their own.
         let push = || {

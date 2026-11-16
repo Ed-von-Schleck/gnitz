@@ -33,9 +33,9 @@ fn opk_codec_over_every_pk_type() {
             .iter()
             .map(|&p| {
                 let mut o = vec![0u8; sz];
-                store_opk(&mut o, p, tc.is_signed_int());
+                store_opk(&mut o, p ^ opk_bias(tc));
                 let mut pushed = vec![0xEE];
-                push_opk(&mut pushed, sz, p, tc.is_signed_int());
+                push_opk(&mut pushed, sz, p ^ opk_bias(tc));
                 assert_eq!(pushed[1..], o[..], "tc={tc} p={p:#x}: push_opk");
                 o
             })
@@ -56,9 +56,6 @@ fn opk_codec_over_every_pk_type() {
                 PATTERNS[i] & image_mask(sz),
                 "tc={tc} p={i}: inverse"
             );
-            let mut stored = vec![0u8; sz];
-            store_opk(&mut stored, image, false);
-            assert_eq!(&stored, opk, "tc={tc} p={i}: an image stores as it is");
             if let Some(fi) = FixedInt::from_type_code(tc) {
                 assert_eq!(decode_opk_i64(opk, fi), fi.decode_le_i64(&le[..sz]), "tc={tc} p={i}");
             }
@@ -80,26 +77,25 @@ fn opk_codec_over_every_pk_type() {
 #[test]
 fn the_column_codec_is_the_cell_codec_per_row() {
     let rows = 37usize;
-    for width in [1usize, 2, 4, 8, 16] {
+    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let (width, signed) = (tc.wire_stride(), tc.is_signed_int());
         for (stride, off) in [(width, 0), (width + 11, 3)] {
             let src: Vec<u8> = (0..rows * width)
                 .map(|i| (i as u8).wrapping_mul(151).wrapping_add(7))
                 .collect();
-            for signed in [false, true] {
-                let at = format!("width {width} stride {stride} signed {signed}");
-                let before = vec![0xA5u8; rows * stride];
-                let mut pk = before.clone();
-                encode_pk_cells(&src, width, signed, &mut pk, stride, off);
-                let mut back = vec![0u8; rows * width];
-                decode_pk_cells(&pk, stride, off, width, signed, &mut back);
-                assert_eq!(back, src, "{at}");
-                for (r, (row, was)) in pk.chunks_exact(stride).zip(before.chunks_exact(stride)).enumerate() {
-                    let mut cell = vec![0u8; width];
-                    decode_pk_cell(&row[off..off + width], signed, &mut cell);
-                    assert_eq!(cell, src[r * width..(r + 1) * width], "{at}: row {r}");
-                    assert_eq!(row[..off], was[..off], "{at}: row {r} before the cell");
-                    assert_eq!(row[off + width..], was[off + width..], "{at}: row {r} after the cell");
-                }
+            let at = format!("{tc} stride {stride}");
+            let before = vec![0xA5u8; rows * stride];
+            let mut pk = before.clone();
+            encode_pk_cells(&src, tc, &mut pk, stride, off);
+            let mut back = vec![0u8; rows * width];
+            decode_pk_cells(&pk, stride, off, tc, &mut back);
+            assert_eq!(back, src, "{at}");
+            for (r, (row, was)) in pk.chunks_exact(stride).zip(before.chunks_exact(stride)).enumerate() {
+                let mut cell = vec![0u8; width];
+                decode_pk_cell(&row[off..off + width], signed, &mut cell);
+                assert_eq!(cell, src[r * width..(r + 1) * width], "{at}: row {r}");
+                assert_eq!(row[..off], was[..off], "{at}: row {r} before the cell");
+                assert_eq!(row[off + width..], was[off + width..], "{at}: row {r} after the cell");
             }
         }
     }
@@ -132,8 +128,8 @@ fn a_pk_buf_holds_max_pk_bytes_and_widens() {
     let full = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
     assert_eq!(full.pk_bytes().len(), crate::MAX_PK_BYTES);
     let mut t = PkBuf::zeroed(0);
-    t.push(2, 0x0101, false);
-    t.push(2, 0x0101, false);
+    t.push(2, 0x0101);
+    t.push(2, 0x0101);
     assert_eq!(t.widened(8).pk_bytes(), [1, 1, 1, 1, 0, 0, 0, 0]);
     let fresh = PkBuf::from_bytes(&[1; 4]);
     assert_eq!(t, fresh);

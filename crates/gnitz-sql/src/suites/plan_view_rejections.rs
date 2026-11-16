@@ -773,7 +773,7 @@ fn top_n_rules() {
         table(60, vec![col("a", i), col("b", i), col("c", i)], vec![0, 1]),
     )]);
     let chain = view(&cab, "SELECT c FROM cab ORDER BY c LIMIT 2");
-    let orders: Vec<Vec<u16>> = final_view(&chain)
+    let orders: Vec<Vec<u32>> = final_view(&chain)
         .circuit
         .ops()
         .filter_map(|(_, op)| match op {
@@ -781,7 +781,7 @@ fn top_n_rules() {
             _ => None,
         })
         .collect();
-    assert_eq!(orders, [vec![2u16]]);
+    assert_eq!(orders, [vec![2u32]]);
 }
 
 #[test]

@@ -316,9 +316,9 @@ fn ingest_fixture<const N: usize>(
 }
 
 /// A one-row `public` TABLE_TAB `+1` under an explicit packed `pk_col_idx`
-/// word and `flags` — the shapes `create_table` cannot make.
-fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: gnitz_wire::TableProps) -> Batch {
-    let row = TableTabRow { flags, ..table_tab_row(tid, table_name) };
+/// word and `props` — the shapes `create_table` cannot make.
+fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, props: gnitz_wire::TableProps) -> Batch {
+    let row = TableTabRow::of(tid, PUBLIC_SCHEMA_ID, table_name, PkColList::from_slice(&[0]), props);
     crate::test_support::forged_sys_batch(row, gnitz_wire::TableTabSlot::pk_col_idx as usize, pk_col_idx)
 }
 
