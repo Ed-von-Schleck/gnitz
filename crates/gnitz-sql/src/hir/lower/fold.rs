@@ -5,12 +5,11 @@
 //! the DISTINCT's projection, directly over the relation read.
 
 use super::super::physical::{self, Frame};
-use super::super::{AggCol, ColId, HirExpr, ProjEntry};
+use super::super::{AggCol, ColId, HirExpr, OrderCol, ProjEntry};
 use super::{ReduceSpecs, keyed_frame, resolve_reduce_specs};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use gnitz_core::Schema;
-use gnitz_wire::ColumnDef;
 use gnitz_wire::{ComputeMap, GroupAggs};
 use std::sync::Arc;
 
@@ -25,26 +24,27 @@ pub(crate) struct FoldPieces {
     /// What the workers fold. It carries no cardinality COUNT: nothing stateless
     /// gates on one.
     pub(crate) agg: GroupAggs,
-    /// The workers' partial reply, laid out as a view's reduce output over the
-    /// same group set; every `BoundExpr` below is written against it.
-    pub(crate) partial_schema: Arc<Schema>,
     /// The fold sink's pre-map over the source schema, `None` when the reduce
     /// groups and aggregates source columns directly.
     pub(crate) pre: Option<ComputeMap>,
-    /// HAVING over the raw reduce output; empty when the body has none or it
+    /// HAVING over the workers' partial reply, laid out as a view's reduce output over
+    /// the same group set — `finalize`'s source; empty when the body has none or it
     /// folded to true.
     pub(crate) having: Vec<BoundExpr>,
-    /// The finalize projection in SELECT order: an expression over
-    /// `partial_schema` and the output column it lands in. An aggregate's
-    /// finalize composite (AVG's divide, a SUM's null gate) is *in* the
-    /// expression, exactly as it is in the view path's finalize map — so the
-    /// client finisher has no per-aggregate shape switch to keep in step.
-    pub(crate) finalize: Vec<(BoundExpr, ColumnDef)>,
+    /// The finalize projection over the partial reply: the rows reply a read of it
+    /// would answer. An aggregate's finalize composite (AVG's divide, a SUM's null
+    /// gate) is *in* its item, exactly as it is in the view path's finalize map — so
+    /// the client finisher has no per-aggregate shape switch to keep in step.
+    pub(crate) finalize: super::read::AdhocRows,
 }
 
 /// `SELECT DISTINCT items` over `src`. Bare items group the source columns where they lie; any
 /// computed item makes the projection the pre-map and groups its columns.
-pub(super) fn distinct_fold(src: Frame, items: &[ProjEntry]) -> Result<FoldPieces, GnitzSqlError> {
+pub(super) fn distinct_fold(
+    src: Frame,
+    items: &[ProjEntry],
+    order: Vec<OrderCol>,
+) -> Result<FoldPieces, GnitzSqlError> {
     let (pre, group_cols) = match items.iter().map(|e| e.expr.as_col()).collect::<Option<Vec<_>>>() {
         Some(ids) => (None, ids),
         None => (Some(items), items.iter().map(|e| e.out.id).collect()),
@@ -59,18 +59,20 @@ pub(super) fn distinct_fold(src: Frame, items: &[ProjEntry]) -> Result<FoldPiece
             out: e.out.clone(),
         })
         .collect();
-    fold(src, pre, &group_cols, &[], &[], &finalize)
+    fold(src, pre, &group_cols, &[], &[], finalize, order)
 }
 
 /// The fold of `group_cols` / `aggs` over `pre` (or the source itself) applied to
-/// `src`, then `having` and `finalize` over the partial reply.
+/// `src`, then `having` and `finalize` over the partial reply, the result ordered by
+/// `order` over `finalize`'s columns.
 pub(super) fn fold(
     src: Frame,
     pre: Option<&[ProjEntry]>,
     group_cols: &[ColId],
     aggs: &[AggCol],
     having: &[HirExpr],
-    finalize: &[ProjEntry],
+    finalize: Vec<ProjEntry>,
+    order: Vec<OrderCol>,
 ) -> Result<FoldPieces, GnitzSqlError> {
     // The pre-map, physicalized over the source — the same projection `lower_reduce`
     // fuses, so the reduce input's column order is identical on both paths.
@@ -81,14 +83,10 @@ pub(super) fn fold(
     let ReduceSpecs { agg, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
     let partial = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;
     let having = partial.resolve_preds(having)?;
-    let finalize = finalize
-        .iter()
-        .map(|e| Ok((partial.resolve(&e.expr)?, e.out.def.clone())))
-        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+    let finalize = super::read::reply_rows(partial, finalize, order)?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
         agg,
-        partial_schema: partial.schema,
         pre: map,
         having,
         finalize,

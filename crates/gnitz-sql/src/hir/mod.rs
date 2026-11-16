@@ -79,10 +79,10 @@ pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape, RowsReply};
 pub(crate) fn bind_adhoc_read(
     cat: &dyn crate::catalog::Catalog,
     query: &sqlparser::ast::Query,
-    order_exprs: &[&sqlparser::ast::Expr],
 ) -> Result<AdhocRead, GnitzSqlError> {
     use crate::ast_util::{FromShape, classify_from};
     use crate::error::derivation;
+    let keys = crate::tail::parse_order_by(query.order_by.as_ref())?;
     // The top-level body reads through one relation's sink, so a set operation or a
     // FROM that derives is refused before anything is resolved; a CTE may derive,
     // and the read lowering refuses what it cannot compose to one read.
@@ -97,8 +97,9 @@ pub(crate) fn bind_adhoc_read(
     let ids = ColIdGen::new();
     let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc);
     bind::bind_ctes(&mut cx, query)?;
-    let (rel, placed) = bind::bind_select(&cx, select, order_exprs)?;
-    lower::read::lower_read(&rel, placed, cx.refs.into_inner())
+    let (rel, placed) = bind::bind_select(&cx, select, &crate::tail::order_exprs(&keys))?;
+    let order = bind::order_cols(&keys, &rel.cols(), &placed)?;
+    lower::read::lower_read(&rel, order, cx.refs.into_inner())
 }
 
 /// An `INSERT … RETURNING` list as the reply items of a read of `desc`.
@@ -109,7 +110,7 @@ pub(crate) fn bind_returning(
 ) -> Result<AdhocRows, GnitzSqlError> {
     let ids = ColIdGen::new();
     let (source, items) = bind::bind_returning(&ids, projection, &desc.schema, alias)?;
-    lower::read::reply_rows(desc, &source, items, Vec::new())
+    lower::read::reply_rows(physical::Frame::scan(desc, &source), items, Vec::new())
 }
 
 /// Opaque column identity, unique within one bind (one [`ColIdGen`]), never

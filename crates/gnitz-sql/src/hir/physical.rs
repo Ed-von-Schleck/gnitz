@@ -8,7 +8,7 @@
 use super::{ColId, HirCol, HirExpr, ProjEntry};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
-use crate::project::{compute_map, leading_schema, payload_program};
+use crate::project::{compute_map, payload_program};
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColumnDef, ComputeMap};
 use std::collections::HashSet;
@@ -39,10 +39,9 @@ impl Frame {
     /// engine can hold.
     pub(crate) fn new(slots: impl IntoIterator<Item = Slot>, npk: usize) -> Result<Frame, GnitzSqlError> {
         let (layout, columns): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
-        Ok(Frame {
-            layout,
-            schema: Arc::new(leading_schema(columns, npk)?),
-        })
+        let schema = Schema::from_parts(columns, gnitz_expr::leading_pk(npk))
+            .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
+        Ok(Frame { layout, schema: Arc::new(schema) })
     }
 
     /// `pk_cols` as an identity-free leading key region, then `payload`.

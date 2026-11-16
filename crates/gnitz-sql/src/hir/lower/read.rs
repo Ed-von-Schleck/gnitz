@@ -4,12 +4,11 @@
 //! flat query binds to, which the rows reply and [`super::fold`] then lower.
 
 use super::super::physical::{self, Frame};
-use super::super::{AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr, hircol_of, reduce_reads};
+use super::super::{AggCol, BoundRef, ColId, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, hircol_of, reduce_reads};
 use super::fold::{FoldPieces, distinct_fold, fold};
 use crate::error::{GnitzSqlError, derivation};
 use crate::ir::{BExpr, BoundExpr};
 use crate::project::payload_program;
-use crate::tail::wire_keys;
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColumnDef, OrderKey};
 use std::collections::HashMap;
@@ -18,9 +17,9 @@ use std::sync::Arc;
 
 /// What an ad-hoc SELECT reads.
 pub(crate) enum AdhocRead {
-    /// Nothing: the one row these constant items compute, a hidden one being an
-    /// ORDER BY key.
-    Constant(Vec<(BoundExpr, ColumnDef)>),
+    /// Nothing: the one row these items compute over the ground row, a hidden one
+    /// being an ORDER BY key.
+    Constant(AdhocRows),
     /// One relation.
     Relation {
         desc: Arc<RelDescriptor>,
@@ -36,8 +35,6 @@ pub(crate) enum AdhocShape {
     Rows(AdhocRows),
     Fold {
         pieces: Box<FoldPieces>,
-        /// The finalize item each ORDER BY expression key sorts on.
-        order_cols: Vec<usize>,
         /// Nothing in the fold's layout tells a DISTINCT from a zero-aggregate GROUP BY.
         is_distinct: bool,
     },
@@ -150,11 +147,11 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
     }
 }
 
-/// Lower a bound ad-hoc body; `placed` is the item each ORDER BY expression key
-/// sorts on, and `refs` the catalog relations the bind read.
+/// Lower a bound ad-hoc body ordered by `order`, over its output columns; `refs` are
+/// the catalog relations the bind read.
 pub(crate) fn lower_read(
     rel: &Rc<RelExpr>,
-    placed: Vec<usize>,
+    order: Vec<OrderCol>,
     refs: Vec<BoundRef>,
 ) -> Result<AdhocRead, GnitzSqlError> {
     let internal = || GnitzSqlError::Internal("an ad-hoc read body is not a projection".into());
@@ -165,10 +162,9 @@ pub(crate) fn lower_read(
             };
             let lin = linear(base)?;
             let (desc, source) = lin.source()?;
-            let pieces = distinct_fold(Frame::scan(desc, source), &lin.items(items)?)?;
+            let pieces = distinct_fold(Frame::scan(desc, source), &lin.items(items)?, order)?;
             let shape = AdhocShape::Fold {
                 pieces: Box::new(pieces),
-                order_cols: placed,
                 is_distinct: true,
             };
             (lin, shape)
@@ -176,21 +172,20 @@ pub(crate) fn lower_read(
         RelExpr::Project { input, items } => {
             let top = linear(input)?;
             match top.base.as_ref() {
-                RelExpr::Unit => return constant(&top, items),
+                RelExpr::Unit => return constant(&top, items, order),
                 // Everything over the reduce is its HAVING and its finalize projection.
                 RelExpr::Reduce { input, group_cols, aggs } => {
                     let lin = linear(input)?;
-                    let pieces = flat_reduce(&lin, input, group_cols, aggs, &top.preds, &top.items(items)?)?;
+                    let pieces = flat_reduce(&lin, input, group_cols, aggs, &top.preds, &top.items(items)?, order)?;
                     let shape = AdhocShape::Fold {
                         pieces: Box::new(pieces),
-                        order_cols: placed,
                         is_distinct: false,
                     };
                     (lin, shape)
                 }
                 _ => {
                     let (desc, source) = top.source()?;
-                    let rows = reply_rows(desc, source, top.items(items)?, placed)?;
+                    let rows = reply_rows(Frame::scan(desc, source), top.items(items)?, order)?;
                     (top, AdhocShape::Rows(rows))
                 }
             }
@@ -212,20 +207,16 @@ pub(crate) fn lower_read(
     })
 }
 
-/// The constant row `items` compute over no relation.
-fn constant(lin: &Linear<'_>, items: &[ProjEntry]) -> Result<AdhocRead, GnitzSqlError> {
+/// The constant row `items` compute over the global ground row: one hidden
+/// `_group_pk`, keyed by the global group key.
+fn constant(lin: &Linear<'_>, items: &[ProjEntry], order: Vec<OrderCol>) -> Result<AdhocRead, GnitzSqlError> {
     if !lin.preds.is_empty() {
         return Err(GnitzSqlError::Rejected(
             "a WHERE over a SELECT without FROM is not supported".into(),
         ));
     }
-    let mut no_column = |_: &ColId| Err(GnitzSqlError::Internal("a constant item references a column".into()));
-    let items = lin
-        .items(items)?
-        .into_iter()
-        .map(|it| Ok((it.expr.try_rebuild(&mut no_column)?, it.out.def)))
-        .collect::<Result<_, GnitzSqlError>>()?;
-    Ok(AdhocRead::Constant(items))
+    let ground = Frame::keyed(vec![crate::agg::group_pk_def()], [])?;
+    Ok(AdhocRead::Constant(reply_rows(ground, lin.items(items)?, order)?))
 }
 
 /// `Project(having?(Reduce))` over `lin`'s relation, as the flat query binds it:
@@ -238,6 +229,7 @@ fn flat_reduce(
     aggs: &[AggCol],
     having: &[HirExpr],
     items: &[ProjEntry],
+    order: Vec<OrderCol>,
 ) -> Result<FoldPieces, GnitzSqlError> {
     let (desc, source) = lin.source()?;
     let in_cols = input.cols();
@@ -286,13 +278,14 @@ fn flat_reduce(
         &group,
         &aggs,
         &having,
-        &items,
+        items,
+        order,
     )
 }
 
 /// A rows read's reply items, placed: what [`AdhocRows::reply`] numbers.
 pub(crate) struct AdhocRows {
-    /// The schema of the relation read.
+    /// The schema of the source the items read.
     src: Arc<Schema>,
     /// The items' output columns, in item order: the SELECT list, then a hidden column per
     /// ORDER BY expression no item already computes.
@@ -301,18 +294,18 @@ pub(crate) struct AdhocRows {
     /// frame they produce.
     proj: Vec<BoundExpr>,
     out: Frame,
-    /// The item each ORDER BY expression key sorts on.
-    placed: Vec<usize>,
+    /// The ORDER BY, over `cols`.
+    order: Vec<OrderCol>,
 }
 
-/// The rows reply a projection over a relation produces.
+/// The rows reply a projection over a source produces.
 pub(crate) struct RowsReply {
     /// The reply's regions under the SELECT list's numbering: the key columns no
     /// item names, hidden, then the items — a key column at the first item that
     /// copies it, every other item a payload column.
     pub(crate) schema: Arc<gnitz_core::Schema>,
     /// The program filling the reply's payload from a source row; `None` when the
-    /// reply's regions are the relation's own.
+    /// reply's regions are the source's own.
     pub(crate) program: Option<gnitz_expr::LogicalProgram>,
     /// The ORDER BY keys over `schema`.
     pub(crate) order: Vec<OrderKey>,
@@ -325,48 +318,48 @@ pub(crate) struct RowsReply {
     pub(crate) copied: Vec<(u32, u32)>,
 }
 
-/// The reply items of `written` over a read of `desc`, whose `Get` columns are `source`;
-/// `placed` is the item each ORDER BY expression key sorts on.
+/// The reply items of `written` over `src`, ordered by `order` over `written`'s columns.
 pub(crate) fn reply_rows(
-    desc: &Arc<RelDescriptor>,
-    source: &[HirCol],
+    src: Frame,
     written: Vec<ProjEntry>,
-    placed: Vec<usize>,
+    mut order: Vec<OrderCol>,
 ) -> Result<AdhocRows, GnitzSqlError> {
     // A hidden item is an ORDER BY key; one an earlier item already computes sorts on it.
     let mut items: Vec<ProjEntry> = Vec::with_capacity(written.len());
-    let mut at = Vec::with_capacity(written.len());
     for it in written {
         let twin = match it.out.def.is_hidden {
-            true => items.iter().position(|p| p.expr == it.expr),
+            true => items.iter().find(|p| p.expr == it.expr),
             false => None,
         };
-        at.push(twin.unwrap_or(items.len()));
-        if twin.is_none() {
-            items.push(it);
+        match twin {
+            Some(twin) => order
+                .iter_mut()
+                .filter(|k| k.col == it.out.id)
+                .for_each(|k| k.col = twin.out.id),
+            None => items.push(it),
         }
     }
-    let src = Frame::scan(desc, source);
     let (proj, out) = physical::physicalize_projection(&items, &src)?;
     Ok(AdhocRows {
         src: src.schema,
         cols: items.into_iter().map(|it| it.out).collect(),
         proj,
         out,
-        placed: placed.into_iter().map(|p| at[p]).collect(),
+        order,
     })
 }
 
 impl AdhocRows {
-    /// The reply, ordered by `keys`, for a worker whose walk yields rows in the
-    /// relation's PK order when `walks_in_pk_order`.
-    pub(crate) fn reply(
-        self,
-        keys: &[crate::tail::OrderKey<'_>],
-        walks_in_pk_order: bool,
-    ) -> Result<RowsReply, GnitzSqlError> {
-        let AdhocRows { src, cols, proj, out, placed } = self;
-        let item_order = wire_keys(keys, cols.iter().map(|c| &c.def), placed)?;
+    /// The schema of the source the items read: a relation, a fold's partials, or the
+    /// ground row.
+    pub(crate) fn src(&self) -> &Arc<Schema> {
+        &self.src
+    }
+
+    /// The reply, for a worker whose walk yields rows in the relation's PK order when
+    /// `walks_in_pk_order`.
+    pub(crate) fn reply(self, walks_in_pk_order: bool) -> Result<RowsReply, GnitzSqlError> {
+        let AdhocRows { src, cols, proj, out, order } = self;
         let k = src.pk_cols().len();
         // The relation's payload columns, each copied in place at its own type: the reply's
         // regions are the relation's.
@@ -381,15 +374,19 @@ impl AdhocRows {
         let visible = cols.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
         let (schema, column_of) = out.schema_in_order(visible)?;
         // Each key with its slot of the projection's output.
-        let slots = item_order
+        let slots = order
             .into_iter()
-            .map(|key| Ok((out.slot(cols[key.col as usize].id)?, key)))
+            .map(|key| Ok((out.slot(key.col)?, key)))
             .collect::<Result<Vec<_>, GnitzSqlError>>()?;
         let source_col = |slot: usize| proj[slot].as_col();
         let numbered = |col: &dyn Fn(usize) -> usize| -> Vec<OrderKey> {
             slots
                 .iter()
-                .map(|&(slot, key)| OrderKey { col: col(slot) as u16, ..key })
+                .map(|&(slot, key)| OrderKey {
+                    col: col(slot) as u16,
+                    desc: key.desc,
+                    nulls_first: key.nulls_first,
+                })
                 .collect()
         };
         let mut copied: Vec<(u32, u32)> = Vec::with_capacity(proj.len());

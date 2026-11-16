@@ -211,7 +211,7 @@ impl ZSetBatch {
     }
 
     /// One region per payload slot, zero-filled for `count` rows.
-    pub fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
+    fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
         schema
             .payload_columns()
             .map(|(_, _, c)| PayloadColumn {

@@ -190,23 +190,6 @@ pub(crate) fn key_slots<'c>(
         .collect()
 }
 
-/// [`key_slots`] as wire keys, each carrying its key's direction.
-pub(crate) fn wire_keys<'c>(
-    keys: &[OrderKey<'_>],
-    cols: impl IntoIterator<Item = &'c ColumnDef>,
-    placed: impl IntoIterator<Item = usize>,
-) -> Result<Vec<gnitz_wire::OrderKey>, GnitzSqlError> {
-    Ok(key_slots(keys, cols, placed)?
-        .into_iter()
-        .zip(keys)
-        .map(|(col, k)| gnitz_wire::OrderKey {
-            col: col as u16,
-            desc: k.desc,
-            nulls_first: k.nulls_first,
-        })
-        .collect())
-}
-
 /// The `LIMIT n` count and the `OFFSET m` skip, each `None` when absent, in both
 /// the `LIMIT … OFFSET m` and the MySQL `LIMIT m, n` forms. A non-integer-literal
 /// value (`LIMIT 1+1`, `OFFSET 'x'`) is a clean error: degrading it would return

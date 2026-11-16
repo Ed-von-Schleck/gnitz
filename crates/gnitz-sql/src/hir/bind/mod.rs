@@ -333,16 +333,7 @@ impl<'a> QueryTail<'a> {
     /// each *expression* key, parallel to [`order_exprs`] of its keys; a positional key
     /// names a visible output column.
     fn wrap(&self, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        let cols = rel.cols();
-        let order = key_slots(&self.keys, cols.iter().map(|c| &c.def), placed.iter().copied())?
-            .into_iter()
-            .zip(&self.keys)
-            .map(|(at, key)| OrderCol {
-                col: cols[at].id,
-                desc: key.desc,
-                nulls_first: key.nulls_first,
-            })
-            .collect();
+        let order = order_cols(&self.keys, &rel.cols(), placed)?;
         Ok(RelExpr::top_n(rel, Vec::new(), order, self.limit, self.offset))
     }
 
@@ -363,6 +354,25 @@ impl<'a> QueryTail<'a> {
         }
         self.wrap(rel, &placed)
     }
+}
+
+/// The output column each of `keys` sorts on, over a body whose columns are `cols`;
+/// `placed` is the column of each *expression* key, parallel to [`order_exprs`] of
+/// `keys`, and a positional key names a visible column.
+pub(super) fn order_cols(
+    keys: &[OrderKey<'_>],
+    cols: &[HirCol],
+    placed: &[usize],
+) -> Result<Vec<OrderCol>, GnitzSqlError> {
+    Ok(key_slots(keys, cols.iter().map(|c| &c.def), placed.iter().copied())?
+        .into_iter()
+        .zip(keys)
+        .map(|(at, key)| OrderCol {
+            col: cols[at].id,
+            desc: key.desc,
+            nulls_first: key.nulls_first,
+        })
+        .collect())
 }
 
 /// Bind a whole view query: its envelope checked, its CTEs, its body, then the

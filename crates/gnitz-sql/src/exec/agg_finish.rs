@@ -6,7 +6,6 @@ use std::sync::Arc;
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, RowFilter};
 use gnitz_wire::AggFunc as WireAggFunc;
-use gnitz_wire::ColumnDef;
 
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
@@ -17,23 +16,22 @@ use crate::ir::BoundExpr;
 /// An ad-hoc fold's reply to its result: combine the partials, then the HAVING filter and
 /// finalize map a grouped view runs over its reduce output.
 pub(crate) struct FoldFinish {
-    /// The partial reply layout; the combined groups keep it, HAVING and finalize read it.
-    partial_schema: Arc<Schema>,
-    /// Per aggregate column, in partial order: its payload slot and locator, and the
-    /// ordering by which an extreme's later partial replaces the kept one, `None` for a
-    /// linear aggregate, whose partials add.
-    aggs: Vec<(usize, ColumnLocator, Option<Ordering>)>,
+    /// Per aggregate column, in partial order: its locator, and the ordering by which an
+    /// extreme's later partial replaces the kept one, `None` for a linear aggregate, whose
+    /// partials add.
+    aggs: Vec<(ColumnLocator, Option<Ordering>)>,
     having: Option<RowFilter>,
+    /// Over the partial reply layout, which the combined groups keep and HAVING reads.
     finalize: ClientMap,
 }
 
 impl FoldFinish {
     pub(crate) fn new(
-        partial_schema: Arc<Schema>,
         aggs: &[gnitz_wire::AggDescriptor],
         having: &[BoundExpr],
-        finalize: Vec<(BoundExpr, ColumnDef)>,
+        finalize: ClientMap,
     ) -> Result<FoldFinish, GnitzSqlError> {
+        let partial_schema = finalize.src();
         // The aggregate columns trail the group columns.
         let layout = partial_schema.layout();
         let n_group = layout.num_payload_cols() - aggs.len();
@@ -44,7 +42,6 @@ impl FoldFinish {
             .zip(&locs[n_group..])
             .enumerate()
             .map(|(k, (d, &loc))| {
-                let pi = n_group + k;
                 let extreme = match d.agg_op.merge_op() {
                     WireAggFunc::Min => Some(Ordering::Less),
                     WireAggFunc::Max => Some(Ordering::Greater),
@@ -52,25 +49,25 @@ impl FoldFinish {
                 };
                 // `combine` adds a linear partial as one 8-byte register image.
                 debug_assert!(
-                    extreme.is_some() || (!gnitz_wire::null_word_get(nullable, pi) && loc.size() == 8),
+                    extreme.is_some() || (!gnitz_wire::null_word_get(nullable, n_group + k) && loc.size() == 8),
                     "a linear partial is a non-NULL 8-byte cell"
                 );
-                (pi, loc, extreme)
+                (loc, extreme)
             })
             .collect();
         let having = compile_filter_program(having, partial_schema.columns())?
-            .map(|p| p.resolve_filter(partial_schema.as_ref().layout()))
+            .map(|p| p.resolve_filter(partial_schema.layout()))
             .transpose()?;
-        let finalize = ClientMap::projecting(finalize, &partial_schema)?;
-        Ok(FoldFinish { partial_schema, aggs, having, finalize })
+        Ok(FoldFinish { aggs, having, finalize })
     }
 
     /// The layout of the partial reply the fold's read is decoded into.
     pub(crate) fn partial_schema(&self) -> &Arc<Schema> {
-        &self.partial_schema
+        self.finalize.src()
     }
 
     /// The finalized result, keyed by the output key.
+    #[cfg(test)]
     pub(crate) fn out_schema(&self) -> &Arc<Schema> {
         self.finalize.out_schema()
     }
@@ -98,17 +95,18 @@ impl FoldFinish {
             "a fold partial is one reduce row"
         );
         let Firsts { absorbed, keep } = firsts(&partial.pks);
-        for &(pi, loc, extreme) in &self.aggs {
+        for &(loc, extreme) in &self.aggs {
             match extreme {
                 Some(wins) => {
                     for &(row, first) in &absorbed {
-                        take_extreme(&mut partial, first as usize, row as usize, pi, wins, loc);
+                        take_extreme(&mut partial, first as usize, row as usize, wins, loc);
                     }
                 }
                 // An integer wraps mod 2^64 as the engine accumulator does; a float adds in
                 // reply order, so its low bits follow the worker count.
                 None => {
                     let float = loc.type_code().is_float();
+                    let pi = loc.payload_slot().expect("an aggregate is a payload column");
                     let cells = partial.payload[pi].bytes.as_chunks_mut::<8>().0;
                     for &(row, first) in &absorbed {
                         let (acc, add) = (
@@ -129,15 +127,18 @@ impl FoldFinish {
     }
 }
 
-/// Row `row`'s cell at payload slot `pi` replaces row `first`'s when it compares `wins`
-/// against it; a NULL cell loses to any value.
-fn take_extreme(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, wins: Ordering, loc: ColumnLocator) {
+/// Row `row`'s cell at payload `loc` replaces row `first`'s when it compares `wins` against
+/// it; a NULL cell loses to any value.
+fn take_extreme(b: &mut ZSetBatch, first: usize, row: usize, wins: Ordering, loc: ColumnLocator) {
     if loc.is_null_word(b.nulls[row]) {
         return;
     }
     if loc.is_null_word(b.nulls[first]) || loc.cmp_non_null(&*b, row, &*b, first) == wins {
         // Both rows are in one batch, so one arena: a string cell moves verbatim.
-        let w = loc.size();
+        let (pi, w) = (
+            loc.payload_slot().expect("an aggregate is a payload column"),
+            loc.size(),
+        );
         b.payload[pi].bytes.copy_within(row * w..(row + 1) * w, first * w);
         b.nulls[first] &= !loc.null_bit();
     }

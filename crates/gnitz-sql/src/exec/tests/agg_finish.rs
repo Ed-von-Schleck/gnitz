@@ -44,14 +44,15 @@ pub(super) fn wide() -> Arc<RelDescriptor> {
 pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     let query = parse_query(sql);
     let cat = catalog(vec![("t", Arc::clone(rel))]);
-    let read = bind_adhoc_read(&cat, &query, &[]).unwrap();
+    let read = bind_adhoc_read(&cat, &query).unwrap();
     let crate::hir::AdhocRead::Relation {
         shape: AdhocShape::Fold { pieces, .. }, ..
     } = read
     else {
         panic!("{sql}: not a fold");
     };
-    FoldFinish::new(pieces.partial_schema, &pieces.agg.aggs, &pieces.having, pieces.finalize).unwrap()
+    let (finalize, _) = ClientMap::over(pieces.finalize).unwrap();
+    FoldFinish::new(&pieces.agg.aggs, &pieces.having, finalize).unwrap()
 }
 
 type Rows<'a> = &'a [(&'a [u128], &'a [Cell<'a>])];
@@ -105,8 +106,8 @@ fn partials_finish_to_one_row_per_group() {
     let float = "SELECT SUM(f), AVG(f) FROM t";
     let neg = -1i32 as u128;
     let neg3 = -3i64 as u64 as u128;
-    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 13] = [
-        // A lone non-NULL group column is the partial's key, decoded back out by finalize.
+    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 15] = [
+        // A lone non-NULL group column is the partial's key, and the result's.
         (
             "SELECT n, COUNT(*), SUM(x) FROM t GROUP BY n",
             &nat,
@@ -115,7 +116,7 @@ fn partials_finish_to_one_row_per_group() {
                 (&[5], &[Int(2), Int(7), Int(2)]),
                 (&[neg3], &[Int(3), Int(-1), Int(3)]),
             ],
-            &[(&[neg3], &[Int(-3), Int(4), Int(3)]), (&[5], &[Int(5), Int(2), Int(7)])],
+            &[(&[neg3], &[Int(4), Int(3)]), (&[5], &[Int(2), Int(7)])],
         ),
         // An inline string against spilled ones.
         (
@@ -235,6 +236,27 @@ fn partials_finish_to_one_row_per_group() {
             ],
             &[(v0, &[F64(f64::INFINITY), F64(f64::INFINITY)])],
         ),
+        // A finite sum's combine may overflow to +inf, as the engine accumulator's own add does.
+        (
+            float,
+            &t,
+            &[
+                (v0, &[F64(1.7e308), Int(1), Int(0), Int(0)]),
+                (v0, &[F64(1.7e308), Int(1), Int(0), Int(0)]),
+            ],
+            &[(v0, &[F64(f64::INFINITY), F64(f64::INFINITY)])],
+        ),
+        // An unsigned extreme compares unsigned past i64::MAX.
+        (
+            "SELECT MIN(u), MAX(u) FROM t",
+            &t,
+            &[
+                (v0, &[Int(u64::MAX as i128), Int(u64::MAX as i128)]),
+                (v0, &[Int(1), Int(1)]),
+                (v0, &[Null, Null]),
+            ],
+            &[(v0, &[Int(1), Int(u64::MAX as i128)])],
+        ),
         // Group 0x2 passes HAVING only once its two partials merge.
         (
             "SELECT COUNT(*) AS c, s, COUNT(*) + 1 AS c1 FROM t GROUP BY s HAVING COUNT(*) > 1",
@@ -272,8 +294,8 @@ fn partials_finish_to_one_row_per_group() {
                 (&[7, neg], &[Int(3), Int(20), Int(3), Int(-4)]),
             ],
             &[
-                (&[7, neg], &[Int(7), Int(-1), Int(4), Int(30), Int(-4)]),
-                (&[7, 2], &[Int(7), Int(2), Int(2), Int(5), Int(1)]),
+                (&[7, neg], &[Int(4), Int(30), Int(-4)]),
+                (&[7, 2], &[Int(2), Int(5), Int(1)]),
             ],
         ),
         (
@@ -285,27 +307,21 @@ fn partials_finish_to_one_row_per_group() {
                 (&[1, 2, 3], &[Int(3), Int(-4)]),
                 (&[1, 2, 3], &[Int(1), Int(-6)]),
             ],
-            &[
-                (&[1, 2, 3], &[Int(1), Int(2), Int(3), Int(5), Int(-4)]),
-                (&[1, 2, 4], &[Int(1), Int(2), Int(4), Int(2), Int(9)]),
-            ],
+            &[(&[1, 2, 3], &[Int(5), Int(-4)]), (&[1, 2, 4], &[Int(2), Int(9)])],
         ),
         // Every row its own group: the reply comes back as it went in.
         (
             "SELECT a, b, c, COUNT(*), MAX(x) FROM t GROUP BY a, b, c",
             &wide,
             &[(&[1, 2, 3], &[Int(1), Null]), (&[1, 2, 4], &[Int(2), Int(9)])],
-            &[
-                (&[1, 2, 3], &[Int(1), Int(2), Int(3), Int(1), Null]),
-                (&[1, 2, 4], &[Int(1), Int(2), Int(4), Int(2), Int(9)]),
-            ],
+            &[(&[1, 2, 3], &[Int(1), Null]), (&[1, 2, 4], &[Int(2), Int(9)])],
         ),
     ];
     let batch =
         |schema: &Schema, rows: Rows| keyed_batch(schema, &rows.iter().map(|&(k, c)| (k, 1, c)).collect::<Vec<_>>());
     for (sql, rel, partials, want) in cases {
         let mut f = plan(sql, rel);
-        let got = f.finish(batch(&f.partial_schema, partials));
+        let got = f.finish(batch(f.partial_schema(), partials));
         let want = batch(f.out_schema(), want);
         got.validate(f.out_schema()).unwrap();
         assert_eq!(got.pks, want.pks, "{sql}");

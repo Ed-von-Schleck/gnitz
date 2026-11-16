@@ -40,15 +40,16 @@ fn each_key_sorts_on_its_slot_in_its_direction() {
     let q = parse_query("SELECT * FROM t ORDER BY a + 1, 2, b + 1 DESC, c ASC NULLS FIRST, 1 DESC NULLS LAST");
     let keys = keys_of(&q);
     assert_eq!(order_exprs(&keys).len(), 3);
-    let k = |col, desc, nulls_first| gnitz_wire::OrderKey { col, desc, nulls_first };
+    assert_eq!(key_slots(&keys, &cols, [7, 5, 6]).unwrap(), [7, 2, 5, 6, 1]);
+    let dirs: Vec<_> = keys.iter().map(|k| (k.desc, k.nulls_first)).collect();
     assert_eq!(
-        wire_keys(&keys, &cols, [7, 5, 6]).unwrap(),
+        dirs,
         [
-            k(7, false, false),
-            k(2, false, false),
-            k(5, true, true),
-            k(6, false, true),
-            k(1, true, false)
+            (false, false),
+            (false, false),
+            (true, true),
+            (false, true),
+            (true, false)
         ]
     );
     assert!(matches!(key_slots(&keys, &cols, [7]), Err(GnitzSqlError::Internal(_))));

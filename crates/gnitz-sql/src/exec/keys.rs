@@ -1,5 +1,5 @@
-//! A client batch grouped by its key, in row order: what the fold combine merges and
-//! what an ON CONFLICT resolves against.
+//! A client batch grouped by its key, in row order: what the fold combine merges, and
+//! which VALUES row of a key an ON CONFLICT resolves.
 
 use std::collections::hash_map::Entry;
 use std::hash::Hash;

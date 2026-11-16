@@ -13,9 +13,7 @@ fn u64_table(cols: &[&str], pk: &[u32]) -> Arc<RelDescriptor> {
 fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>, walks_in_pk_order: bool) -> RowsReply {
     let q = crate::test_support::parse_query(sql);
     let cat = crate::test_support::catalog(vec![("t", Arc::clone(desc))]);
-    let keys = crate::tail::parse_order_by(q.order_by.as_ref()).unwrap();
-    let exprs = crate::tail::order_exprs(&keys);
-    let read = crate::hir::bind_adhoc_read(&cat, &q, &exprs).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    let read = crate::hir::bind_adhoc_read(&cat, &q).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
     let crate::hir::AdhocRead::Relation {
         shape: crate::hir::AdhocShape::Rows(rows),
         ..
@@ -23,7 +21,7 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>, walks_in_pk_order: bool) 
     else {
         panic!("`{sql}` is not a rows read");
     };
-    rows.reply(&keys, walks_in_pk_order)
+    rows.reply(walks_in_pk_order)
         .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
 }
 

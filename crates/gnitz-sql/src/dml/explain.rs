@@ -66,18 +66,16 @@ pub(crate) fn execute_explain(client: &GnitzClient, plan: &ReadPlan) -> SqlResul
 pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
     let order_limit = order_limit_line(plan, local);
     let (read, shape) = match &plan.case {
-        ReadCase::Constant { schema, .. } => {
+        ReadCase::Constant { .. } => {
             return vec![
                 "read nothing (constant row)".to_string(),
                 "access: none".to_string(),
                 "predicate: none".to_string(),
-                projection_line(schema, false),
+                projection_line(plan.cut.schema(), false),
                 order_limit,
             ];
         }
-        ReadCase::Rows { read, reply_schema, .. } => {
-            (read, projection_line(reply_schema, read.spec.sink.map.is_none()))
-        }
+        ReadCase::Rows { read, .. } => (read, projection_line(plan.cut.schema(), read.spec.sink.map.is_none())),
         ReadCase::Fold { read, finish, reduce_schema, is_distinct } => {
             let SinkKind::Fold(agg) = &read.spec.sink.kind else {
                 unreachable!("a fold read ships a fold sink")
@@ -117,10 +115,10 @@ fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
             format!("{at} top-{k}")
         });
     }
-    if !plan.order.is_empty() {
+    if plan.cut.is_ordered() {
         facts.push("client sort".to_string());
     }
-    if plan.slice.cuts() {
+    if plan.cut.cuts() {
         facts.push("client slice".to_string());
     }
     if facts.is_empty() {

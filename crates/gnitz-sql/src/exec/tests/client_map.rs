@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::BoundExpr;
 use crate::test_support::Cell::{Int, Null, Str};
 use crate::test_support::{col, keyed_batch, ncol, rows_of, schema};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -19,25 +20,30 @@ fn source() -> Schema {
     )
 }
 
-/// The reply map of the SELECT list `sql` over [`source`]: the hidden key, then the items.
+/// The map of the SELECT list `sql` over `src`: the hidden key, then the items.
 pub(super) fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
-    let payload: Vec<_> = sql
+    let key = src
+        .pk_cols()
         .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let bound = crate::test_support::bind_sql(e, src);
-            let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(src.columns()).tc, true);
-            (bound, def)
-        })
-        .collect();
-    ClientMap::projecting(payload, src).unwrap()
+        .map(|&c| BoundExpr::ColRef(c as usize))
+        .zip(src.hidden_key_columns());
+    let items = sql.iter().enumerate().map(|(i, e)| {
+        let bound = crate::test_support::bind_sql(e, src);
+        let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(src.columns()).tc, true);
+        (bound, def)
+    });
+    let (items, cols): (Vec<_>, Vec<_>) = key.chain(items).unzip();
+    let out = Schema::from_parts(cols, gnitz_expr::leading_pk(src.pk_cols().len())).unwrap();
+    let program = crate::project::payload_program(&items, &out, src).unwrap();
+    ClientMap::new(Some(program), Arc::new(src.clone()), Arc::new(out)).unwrap()
 }
 
 /// Every row keeps its key and weight. A PK copy is the key's native value — the OPK sign
 /// flip undone — and never NULL. A payload copy moves its source region, cloned only while
 /// a later slot still reads it. A computed string spills into the output arena while a
 /// copied one keeps its offset into the source's, so both read back from one batch; with
-/// no copied string the output arena holds only what the map computes.
+/// no copied string the output arena holds only what the map computes, and none at all
+/// when nothing is.
 #[test]
 fn a_map_keeps_key_and_weight_and_fills_each_slot() {
     let src = source();
@@ -49,7 +55,7 @@ fn a_map_keeps_key_and_weight_and_fills_each_slot() {
             &["v", "k"][..],
             [true, false],
             [[Int(7), Int(-5)], [Null, Int(3)]],
-            None,
+            Some(0),
         ),
         (&["v", "v"], [false, true], [[Int(7), Int(7)], [Null, Null]], None),
         (

@@ -724,9 +724,13 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT * FROM t AS d(x BIGINT, y, z)", "a type on a column alias"),
         // ORDER BY parses before the SELECT list binds, on every surface.
         ("SELECT nope FROM t ORDER BY 1.5", "ORDER BY position"),
-        // The reply is numbered after the WHERE compiles, so a statement wrong in both
-        // reports the WHERE.
-        ("SELECT v FROM t WHERE v ORDER BY 2", "a condition must be BOOLEAN"),
+        // ORDER BY resolves with the body, as a view's does, before the WHERE compiles,
+        // so a statement wrong in both reports the ORDER BY.
+        (
+            "SELECT v FROM t WHERE v ORDER BY 2",
+            "ORDER BY position 2 is out of range",
+        ),
+        ("SELECT v FROM t WHERE v", "a condition must be BOOLEAN"),
         ("SELECT id FROM jv", "is ambiguous"),
         ("SELECT * FROM jv WHERE id = 5", "is ambiguous"),
         ("SELECT _join_pk FROM jv", "not found"),
@@ -1113,7 +1117,7 @@ fn a_from_less_select_plans_a_constant_row() {
             "read nothing (constant row)",
             "access: none",
             "predicate: none",
-            "projection: 1 column",
+            "projection: 1 column (+1 for ordering)",
             "order/limit: client slice",
         ]
     );

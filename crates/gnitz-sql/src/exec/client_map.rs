@@ -6,47 +6,54 @@ use std::sync::Arc;
 
 use gnitz_core::{PayloadColumn, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, LogicalProgram, MapEval};
-use gnitz_wire::ColumnDef;
 
 use crate::error::GnitzSqlError;
-use crate::ir::BoundExpr;
-use crate::project::reply_program;
+use crate::hir::{AdhocRows, RowsReply};
 
-/// A projection program resolved over a source schema, and the output schema it fills:
-/// the source's key, then what the program writes.
+/// A projection program resolved over a source schema, and the output schema it fills.
+/// The output keeps its source's key region; its column list may name those key columns
+/// anywhere.
 pub(crate) struct ClientMap {
+    src: Arc<Schema>,
     out_schema: Arc<Schema>,
-    /// `None` when the output is the source's own layout: no program, or one that
-    /// reproduces its input.
+    /// `None` when the plan shipped no program: the output is the source's own regions.
     ev: Option<MapEval>,
 }
 
 impl ClientMap {
+    /// `rows` as the client runs them over their source, and their ORDER BY over the
+    /// output.
+    pub(crate) fn over(rows: AdhocRows) -> Result<(Self, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
+        let src = Arc::clone(rows.src());
+        // No worker walks the source, so no walk yields the order.
+        let RowsReply { schema, program, order, .. } = rows.reply(false)?;
+        Ok((ClientMap::new(program, src, schema)?, order))
+    }
+
     pub(crate) fn new(
         program: Option<LogicalProgram>,
-        src: &Schema,
+        src: Arc<Schema>,
         out_schema: Arc<Schema>,
     ) -> Result<Self, GnitzSqlError> {
         let key = |s: &Schema| s.layout().pk_columns().map(|c| c.type_code).collect::<Vec<_>>();
-        debug_assert_eq!(key(src), key(&out_schema), "a client map keeps its source's key");
+        debug_assert_eq!(key(&src), key(&out_schema), "a client map keeps its source's key");
         let ev = program
             .map(|p| p.resolve_map(src.layout(), out_schema.layout()))
-            .transpose()?
-            .filter(|ev| !ev.is_identity());
-        if ev
-            .iter()
-            .flat_map(|ev| ev.moves().copies())
-            .any(|c| c.src.size() != c.width)
-        {
-            return Err(GnitzSqlError::Internal("a projection copies a promoted column".into()));
-        }
-        Ok(ClientMap { out_schema, ev })
+            .transpose()?;
+        // Each copy keeps its source's width: only a set operation's common type widens a
+        // column, and an ad-hoc read has none.
+        debug_assert!(
+            ev.iter()
+                .flat_map(|ev| ev.moves().copies())
+                .all(|c| c.src.size() == c.width),
+            "a client map copies each column at its own width"
+        );
+        Ok(ClientMap { src, out_schema, ev })
     }
 
-    /// The projection of `items` over `src`: `src`'s key, hidden, then one column per item.
-    pub(crate) fn projecting(items: Vec<(BoundExpr, ColumnDef)>, src: &Schema) -> Result<Self, GnitzSqlError> {
-        let (out_schema, program) = reply_program(items, src)?;
-        ClientMap::new(Some(program), src, Arc::new(out_schema))
+    /// The schema of the batches the map reads.
+    pub(crate) fn src(&self) -> &Arc<Schema> {
+        &self.src
     }
 
     pub(crate) fn out_schema(&self) -> &Arc<Schema> {
@@ -61,34 +68,49 @@ impl ClientMap {
         let n = src.len();
         let mut out = ZSetBatch::new(&self.out_schema);
         out.nulls = vec![0; n];
-        out.payload = ZSetBatch::filler_columns(&self.out_schema, n);
-        let computes_a_string = ev.emits_a_string();
-        // A computed string is re-encoded into the output arena. A copied German cell keeps
-        // its offset into the source's, so the output arena starts as a copy of it only
-        // when the map does both.
-        if computes_a_string && ev.moves().string_slots() != 0 {
+        // A slot copied from a source payload region takes that region whole in
+        // `move_payload`; every other slot is zero-filled for the evaluator or the key
+        // decode to write into.
+        let moves: Vec<(usize, usize)> = ev
+            .moves()
+            .copies()
+            .iter()
+            .filter_map(|c| match c.src {
+                ColumnLocator::Payload { slot, .. } => Some((c.slot, slot as usize)),
+                ColumnLocator::Pk { .. } => None,
+            })
+            .collect();
+        let slots = out.payload.iter_mut().zip(self.out_schema.payload_columns());
+        for (slot, (col, (_, _, def))) in slots.enumerate() {
+            if moves.iter().all(|&(to, _)| to != slot) {
+                col.bytes = vec![0; n * def.ty.tc.wire_stride()];
+            }
+        }
+        // A copied German cell keeps its offset into the source arena, and a computed
+        // string is re-encoded into the output's: the source arena survives only when a
+        // copy reads it, and is cloned to start the output's when computed strings follow.
+        let (computes_a_string, copies_a_string) = (ev.emits_a_string(), ev.moves().string_slots() != 0);
+        if computes_a_string && copies_a_string {
             out.blob = src.blob.clone();
         }
         ev.write_computed(&src, 0, n, &mut out, 0);
         // A key column's copy decodes it out of the key region; a key is never NULL.
-        let mut moves = Vec::new();
         for c in ev.moves().copies() {
-            match c.src {
-                ColumnLocator::Payload { slot, .. } => moves.push((c.slot, slot as usize)),
-                ColumnLocator::Pk { byte_off, type_code, .. } => gnitz_wire::decode_pk_cells(
+            if let ColumnLocator::Pk { byte_off, type_code, .. } = c.src {
+                gnitz_wire::decode_pk_cells(
                     src.pks.region(),
                     src.pks.stride(),
                     byte_off as usize,
                     c.width,
                     type_code.is_signed_int(),
                     &mut out.payload[c.slot].bytes,
-                ),
+                );
             }
         }
-        // The evaluator is done with `src`; its parts move into the output.
+        // The evaluator is done with `src`; the parts the output reads move into it.
         let ZSetBatch { pks, weights, mut payload, blob, .. } = src;
         move_payload(&mut out.payload, &mut payload, &moves);
-        if !computes_a_string {
+        if copies_a_string && !computes_a_string {
             out.blob = blob;
         }
         out.pks = pks;

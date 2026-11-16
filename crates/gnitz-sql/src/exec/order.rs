@@ -1,85 +1,108 @@
 //! The ad-hoc SELECT finish: ORDER BY / OFFSET / LIMIT applied as one client-side
 //! pass over the result the client holds.
 
+use std::sync::Arc;
+
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{RowRanking, WeightSlots, order_locators};
+use gnitz_expr::{OrderLocator, RowRanking, WeightSlots, order_locators};
+use gnitz_wire::OrderKey;
 
-/// The OFFSET / LIMIT slice of a result, cut exactly by the client after any worker's
-/// superset cut. `limit: None` is unbounded.
-#[derive(Clone, Copy)]
-pub(crate) struct Slice {
-    pub(crate) offset: usize,
-    pub(crate) limit: Option<usize>,
+use crate::error::GnitzSqlError;
+
+/// ORDER BY / OFFSET / LIMIT over a finished result, resolved against its schema at plan
+/// time. The schema is the result's, carried for the reply; [`ResultCut::apply`] reads
+/// only the keys and the slice.
+pub(crate) struct ResultCut {
+    schema: Arc<Schema>,
+    /// The written keys, hidden appended ones included; under a cut, extended to a total
+    /// order. Empty when unordered.
+    keys: Vec<OrderLocator>,
+    /// The OFFSET / LIMIT window, cut exactly here after any worker's superset cut.
+    slice: WeightSlots,
 }
 
-impl Slice {
-    /// Whether this slice skips or bounds anything.
-    pub(crate) fn cuts(&self) -> bool {
-        self.offset > 0 || self.limit.is_some()
-    }
-
-    /// The logical row the cut ends before; `None` when unbounded.
-    pub(crate) fn end(&self) -> Option<usize> {
-        self.limit.map(|l| self.offset.saturating_add(l))
-    }
-}
-
-/// Sort `batch` by `order` — wire keys over `schema`, hidden appended keys included —
-/// and cut it to `slice`, counting logical rows by weight.
-pub(crate) fn order_and_slice(
-    schema: &Schema,
-    batch: ZSetBatch,
-    order: &[gnitz_wire::OrderKey],
-    slice: Slice,
-) -> ZSetBatch {
-    let cut = slice.cuts();
-    if order.is_empty() && !cut {
-        return batch;
-    }
-    debug_assert!(
-        batch.weights.iter().all(|&w| w > 0),
-        "client cut: non-positive weight violates the bag invariant"
-    );
-    let end = slice.end().unwrap_or(usize::MAX);
-    let mut rows: Vec<u32> = if order.is_empty() {
-        // Every entry holds at least one logical row, so the first `end` entries cover the slice.
-        (0..batch.len().min(end) as u32).collect()
-    } else {
+impl ResultCut {
+    /// `order`, wire keys over `schema`, then `slice`.
+    pub(crate) fn new(schema: Arc<Schema>, order: &[OrderKey], slice: WeightSlots) -> Result<Self, GnitzSqlError> {
         // A cut breaks ties by identity, so which tied rows it keeps is a function of the
         // rows alone. Uncut ties stay in input order.
-        let keys =
-            order_locators(order, schema.layout(), cut).expect("the planner orders by columns of its own schema");
-        let mut ranking = RowRanking::new(&keys, &batch);
-        ranking.keep_smallest(end);
-        ranking.sorted()
-    };
-    if !cut {
-        return batch.gather(&rows);
+        let keys = match order.is_empty() {
+            true => Vec::new(),
+            false => {
+                order_locators(order, schema.layout(), slice != WeightSlots::ALL).map_err(GnitzSqlError::Internal)?
+            }
+        };
+        Ok(ResultCut { schema, keys, slice })
     }
-    let mut slots = WeightSlots {
-        skip: slice.offset as u64,
-        keep: slice.limit.map_or(u64::MAX, |l| l as u64),
-    };
-    // Kept rows compact to the front of `rows`: the write slot never passes the read.
-    // Every kept row takes at least one of the `keep` slots.
-    let mut takes = Vec::with_capacity(rows.len().min(slice.limit.unwrap_or(usize::MAX)));
-    let mut n = 0;
-    for i in 0..rows.len() {
-        let r = rows[i];
-        let take = slots.take(batch.weights[r as usize]);
-        if take > 0 {
-            rows[n] = r;
-            n += 1;
-            takes.push(take);
-        }
-        if slots.keep == 0 {
-            break;
-        }
+
+    /// The schema of the result this cut applies to.
+    pub(crate) fn schema(&self) -> &Arc<Schema> {
+        &self.schema
     }
-    rows.truncate(n);
-    let mut out = batch.gather(&rows);
-    out.weights = takes;
-    out
+
+    pub(crate) fn is_ordered(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// Whether the slice skips or bounds anything.
+    pub(crate) fn cuts(&self) -> bool {
+        self.slice != WeightSlots::ALL
+    }
+
+    /// Whether [`Self::apply`] returns its input as it is.
+    pub(crate) fn is_identity(&self) -> bool {
+        !self.is_ordered() && !self.cuts()
+    }
+
+    /// Whether the result is empty whatever the input: `LIMIT 0`.
+    pub(crate) fn keeps_nothing(&self) -> bool {
+        self.slice.keep == 0
+    }
+
+    /// `batch` sorted and cut to the slice, counting logical rows by weight.
+    pub(crate) fn apply(&self, batch: ZSetBatch) -> ZSetBatch {
+        if self.is_identity() {
+            return batch;
+        }
+        debug_assert!(
+            batch.weights.iter().all(|&w| w > 0),
+            "client cut: non-positive weight violates the bag invariant"
+        );
+        let as_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        let end = self.slice.end().map_or(usize::MAX, as_usize);
+        let mut rows: Vec<u32> = if self.keys.is_empty() {
+            // Every entry holds at least one logical row, so the first `end` entries cover the slice.
+            (0..batch.len().min(end) as u32).collect()
+        } else {
+            let mut ranking = RowRanking::new(&self.keys, &batch);
+            ranking.keep_smallest(end);
+            ranking.sorted()
+        };
+        if !self.cuts() {
+            return batch.gather(&rows);
+        }
+        let mut slots = self.slice;
+        // Kept rows compact to the front of `rows`: the write slot never passes the read.
+        // Every kept row takes at least one of the `keep` slots.
+        let mut takes = Vec::with_capacity(rows.len().min(as_usize(slots.keep)));
+        let mut n = 0;
+        for i in 0..rows.len() {
+            let r = rows[i];
+            let take = slots.take(batch.weights[r as usize]);
+            if take > 0 {
+                rows[n] = r;
+                n += 1;
+                takes.push(take);
+            }
+            if slots.keep == 0 {
+                break;
+            }
+        }
+        rows.truncate(n);
+        let mut out = batch.gather(&rows);
+        out.weights = takes;
+        out
+    }
 }
 
 #[cfg(test)]
