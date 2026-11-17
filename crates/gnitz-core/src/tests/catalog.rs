@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::rel;
 use crate::{BatchAppender, sys_schema};
-use gnitz_wire::{ColumnDef, FkAction, FkRef, ReadBound, SysRow, TableDistribution, TypeCode, ViewBudget};
+use gnitz_wire::{ColumnDef, FkAction, FkRef, ReadBound, SysRow, TableDistribution, TypeCode, ViewBudget, ViewParts};
 use std::num::NonZeroU64;
 
 /// The [`CATALOG_FAMILIES`]' rows, as a cut reads them back.
@@ -37,19 +37,12 @@ impl Rows {
 
     /// View `view_id`, a segment of `owner` when there is one, scanning `sources`.
     fn view(&mut self, view_id: u64, name: &str, owner: u64, props: ViewProps, sources: &[u64]) -> &mut Self {
-        let (capacity_bytes, delta_bytes) = props.budget.row_words();
-        let row = ViewTabRow {
-            view_id,
-            schema_id: 16,
-            name: name.into(),
-            pk_col_idx: PkColList::from_slice(&[0]),
-            capacity_bytes,
-            delta_bytes,
-            owner_view_id: owner,
+        let parts = ViewParts {
+            props,
+            owner: (owner != 0).then_some(owner),
             pk_repeats: false,
-            compress: props.compress,
-            definition: Default::default(),
         };
+        let row = ViewTabRow::of(view_id, 16, name, PkColList::from_slice(&[0]), parts, &[][..]);
         let mut circuit = Circuit::default();
         for &source in sources {
             circuit.input_delta(source, ReadBound::None);

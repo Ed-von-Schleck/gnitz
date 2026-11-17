@@ -89,7 +89,7 @@ fn an_index_row_repeating_a_column_is_refused() {
         name: "ix".into(),
         is_unique: false,
     };
-    let word = PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11;
+    let word = 2 | 1 << 4 | 1 << 11;
     let batch = crate::test_support::forged_sys_batch(row, gnitz_wire::IdxTabSlot::source_col_idx as usize, word);
     let err = engine.precheck_family(SysFamily::Index, &batch).unwrap_err();
     assert!(err.contains("names column 1 twice"), "{err}");

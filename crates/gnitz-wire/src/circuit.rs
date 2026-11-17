@@ -48,7 +48,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 20;
+pub(crate) const CIRCUIT_VERSION: u8 = 21;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation
@@ -151,13 +151,11 @@ pub enum MapKind {
 /// framing here only frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpNode {
-    /// Delta input for `source`, whose backfill scan `bound` narrows. `scatter`
-    /// is the key the delta is co-located by before it enters the circuit: the
-    /// source's own columns, each at the type its slot is packed as. An empty
-    /// one hands every worker the whole delta. The key is the source's, not the
-    /// scan's: every scan of one source that states a key states the same one,
-    /// and a scan stating none enters under it too — where the source's store
-    /// places it only when no scan states one.
+    /// The source's one delta input: a circuit holds one per scanned `source`,
+    /// whose backfill scan `bound` narrows. `scatter` is the key the delta is
+    /// co-located by before it enters the circuit: the source's own columns,
+    /// each at the type its slot is packed as. An empty one hands every worker
+    /// the whole delta; none enters it where the source's store places it.
     ScanDelta {
         source: u64,
         bound: crate::ReadBound,
@@ -395,7 +393,8 @@ impl Node {
 
 /// A node's id is its index and every input names an earlier node: every builder
 /// method and [`Self::decode`] append through one private `push`, so index order is
-/// a topological order. Its last node is its output.
+/// a topological order. It holds one [`OpNode::ScanDelta`] per scanned source. Its
+/// last node is its output.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Circuit {
     nodes: Vec<Node>,
@@ -450,6 +449,13 @@ impl Circuit {
             if circuit.nodes.is_empty() {
                 return Err("a circuit has no nodes".into());
             }
+            // The builders answer a repeated source with its first scan, so only
+            // a forged cell names one twice: one sort, not a lookup per scan.
+            let mut sources: Vec<u64> = circuit.sources().collect();
+            sources.sort_unstable();
+            if let Some(w) = sources.windows(2).find(|w| w[0] == w[1]) {
+                return Err(format!("source {} is scanned by more than one node", w[0]));
+            }
             Ok(circuit)
         })
     }
@@ -479,7 +485,7 @@ impl Circuit {
         (nid + 1..self.nodes.len()).filter(move |&n| self.inputs(n).contains(&nid))
     }
 
-    /// Every relation the circuit scans, once per scan.
+    /// Each relation the circuit scans, once, in node order.
     pub fn sources(&self) -> impl Iterator<Item = u64> {
         self.nodes.iter().filter_map(|n| match n.op {
             OpNode::ScanDelta { source, .. } => Some(source),
@@ -487,7 +493,8 @@ impl Circuit {
         })
     }
 
-    /// Every relation id the circuit names, for the client's segment substitution.
+    /// Each relation id the circuit scans, once, for the client's segment
+    /// substitution.
     pub fn sources_mut(&mut self) -> impl Iterator<Item = &mut u64> {
         self.nodes.iter_mut().filter_map(|n| match &mut n.op {
             OpNode::ScanDelta { source, .. } => Some(source),
@@ -500,21 +507,50 @@ impl Circuit {
             .expect("a builder wires a well-formed operator on its arity to earlier nodes")
     }
 
+    /// The node scanning `source`, if any.
+    fn scan_of(&self, source: u64) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .position(|n| matches!(n.op, OpNode::ScanDelta { source: s, .. } if s == source))
+    }
+
     /// A source's delta input. `bound` narrows only the source's backfill scan,
     /// never the rows the view holds, so the caller still emits the full `Filter`.
     pub fn input_delta(&mut self, source: u64, bound: crate::ReadBound) -> NodeId {
         self.input_scattered(source, bound, None)
+            .expect("a scan stating no scatter key conflicts with none")
     }
 
     /// [`Self::input_delta`], the delta co-located by `scatter` — see
-    /// [`OpNode::ScanDelta`].
+    /// [`OpNode::ScanDelta`]. A source already scanned answers its existing node:
+    /// an equal bound is kept, since each caller's own `Filter` still applies and
+    /// the union of the rows they read stays inside it; differing bounds widen to
+    /// [`crate::ReadBound::None`]. A stated key is taken over a scan stating none,
+    /// and a key other than one already stated is refused.
     pub fn input_scattered(
         &mut self,
         source: u64,
         bound: crate::ReadBound,
         scatter: Option<Vec<ReindexSlot>>,
-    ) -> NodeId {
-        self.add(OpNode::ScanDelta { source, bound, scatter }, &[])
+    ) -> Result<NodeId, String> {
+        let Some(nid) = self.scan_of(source) else {
+            return Ok(self.add(OpNode::ScanDelta { source, bound, scatter }, &[]));
+        };
+        let OpNode::ScanDelta { bound: held, scatter: stated, .. } = &mut self.nodes[nid].op else {
+            unreachable!("scan_of answers a ScanDelta node")
+        };
+        if let Some(key) = scatter {
+            if stated.as_ref().is_some_and(|s| *s != key) {
+                return Err(format!(
+                    "source {source} is scanned under several distinct scatter keys"
+                ));
+            }
+            *stated = Some(key);
+        }
+        if *held != bound {
+            *held = crate::ReadBound::None;
+        }
+        Ok(nid)
     }
 
     /// [`OpNode::Filter`] over an encoded predicate program.

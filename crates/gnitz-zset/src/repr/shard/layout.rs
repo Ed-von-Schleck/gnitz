@@ -11,7 +11,7 @@ use StorageError::Corrupt;
 const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
-pub(crate) const SHARD_EPOCH: u64 = 31;
+pub(crate) const SHARD_EPOCH: u64 = 32;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.

@@ -24,14 +24,14 @@ pub(super) struct ViewMeta<'a> {
     /// absent from it does not scatter. Derived as beside other workers, whatever
     /// the worker count, so that a key no relay could route by is refused at any.
     source_routes: FxHashMap<u64, Relay>,
-    /// source table id → where its scans' rows sit, as beside other workers.
+    /// source table id → where its scan's rows sit, as beside other workers.
     scan_dists: BTreeMap<u64, Dist>,
 }
 
 impl<'a> ViewMeta<'a> {
     /// Derive `circuit`'s routing metadata.
     pub(super) fn derive(circuit: &Circuit, registry: &'a RelationRegistry) -> Result<ViewMeta<'a>, String> {
-        let uses = source_uses(circuit)?;
+        let uses = source_uses(circuit);
         let sources: BTreeMap<u64, &Relation> = uses
             .keys()
             .map(|&tid| Ok((tid, registry.relation_or_err(tid)?)))
@@ -43,7 +43,7 @@ impl<'a> ViewMeta<'a> {
         let self_contained = all_replicated || registry.slot().of <= 1;
 
         let replicated = |tid: u64| sources[&tid].placement().is_replicated();
-        let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key.as_deref()?)));
+        let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key?)));
         // A replicated partner holds every row on every worker, so each match is
         // made once, on the other side's own worker — unless that side's delta is
         // broadcast, or the circuit also reads the replicated delta outside its
@@ -120,7 +120,7 @@ impl<'a> ViewMeta<'a> {
         self.source_routes.get(&source_id).filter(|_| !self.self_contained)
     }
 
-    /// Where the rows of `source_id`'s scans sit beside other workers. Panics
+    /// Where the rows of `source_id`'s scan sit beside other workers. Panics
     /// unless the circuit scans it.
     pub(super) fn scan_dist(&self, source_id: u64) -> Dist {
         self.scan_dists[&source_id].clone()
@@ -467,16 +467,12 @@ fn join_dist(
 // Circuit walks
 // ---------------------------------------------------------------------------
 
-/// A scatter key: a `(source column, slot type)` slot list, in the order
-/// the source's scan states it.
-type ScatterKey = Vec<gnitz_wire::ReindexSlot>;
-
 /// What the circuit does with one scanned source's delta.
 #[derive(Default)]
-struct SourceUse {
-    /// The scatter key it states, in the source relation's own column indices;
-    /// empty for a broadcast.
-    key: Option<ScatterKey>,
+struct SourceUse<'c> {
+    /// The scatter key its scan states: `(source column, slot type)` slots in
+    /// the source relation's own column indices; empty for a broadcast.
+    key: Option<&'c [gnitz_wire::ReindexSlot]>,
     /// The scan's rows reach something other than a join operand.
     outside_join: bool,
     /// They cross a `Distinct`.
@@ -487,8 +483,8 @@ struct SourceUse {
 
 /// One forward pass over the circuit: what it does with each source's delta, by
 /// source in ascending order — so every process reports the same offender.
-fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
-    let mut uses: BTreeMap<u64, SourceUse> = BTreeMap::new();
+fn source_uses(circuit: &Circuit) -> BTreeMap<u64, SourceUse<'_>> {
+    let mut uses: BTreeMap<u64, SourceUse<'_>> = BTreeMap::new();
     // Whose scan's delta flows into each node, propagated along the way.
     let mut owner: Vec<Option<u64>> = vec![None; circuit.ops().len()];
 
@@ -503,14 +499,7 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
         }
         match op {
             OpNode::ScanDelta { source, scatter, .. } => {
-                let use_ = uses.entry(*source).or_default();
-                if let Some(stated) = scatter
-                    && use_.key.get_or_insert_with(|| stated.clone()) != stated
-                {
-                    return Err(format!(
-                        "source {source} is scanned under several distinct scatter keys"
-                    ));
-                }
+                uses.entry(*source).or_default().key = scatter.as_deref();
                 owner[nid] = Some(*source);
             }
             OpNode::WeightClamp(ClampKind::Distinct) => {
@@ -524,7 +513,7 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
     if let Some(tid) = owner[circuit.out()] {
         note_read(uses.entry(tid).or_default(), None);
     }
-    Ok(uses)
+    uses
 }
 
 /// `op` hands its input's rows on as that input's source's delta.
@@ -537,7 +526,7 @@ fn propagates(op: &OpNode) -> bool {
 
 /// Record in `use_` that `reader` — `None` for the view's output — reads a
 /// node carrying the source's delta.
-fn note_read(use_: &mut SourceUse, reader: Option<&OpNode>) {
+fn note_read(use_: &mut SourceUse<'_>, reader: Option<&OpNode>) {
     match reader {
         Some(OpNode::Join(_)) => use_.reaches_join = true,
         Some(op) if propagates(op) => {}

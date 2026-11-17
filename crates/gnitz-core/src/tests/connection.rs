@@ -676,7 +676,7 @@ fn a_malformed_block_mid_train_ends_the_session_at_once() {
     assert!(s.is_closed());
     let e = await_reply(&mut s, sent).expect_err("a malformed block");
     assert!(
-        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(m)) if m.contains("does not match its rows")),
+        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(m)) if m.contains("too short for its rows")),
         "{e:?}"
     );
 }

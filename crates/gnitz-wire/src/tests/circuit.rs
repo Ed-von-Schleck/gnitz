@@ -212,7 +212,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (20, 0xf099_177f_e3fb_8ae4));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (21, 0x7707_331a_f205_255d));
 }
 
 /// Every framing guard, against the forgery that trips it.
@@ -393,21 +393,81 @@ fn range_rel_predicates_and_converse() {
     }
 }
 
-/// A circuit's sources are its scans', one per scan: the client's id substitution
-/// moves each, and a source scanned twice is named twice.
+/// A circuit's sources are its scans', each once: a source scanned again
+/// answers its first node, and the client's id substitution moves each.
 #[test]
 fn sources_are_the_scans_sources() {
     let mut c = Circuit::default();
     let a = c.input_delta(7, crate::ReadBound::None);
     let b = c.input_delta(9, crate::ReadBound::None);
     let again = c.input_delta(7, crate::ReadBound::None);
-    let ab = c.union(a, b);
-    c.union(ab, again);
-    assert_eq!(c.sources().collect::<Vec<_>>(), [7, 9, 7]);
+    assert_eq!(again, a);
+    c.union(a, b);
+    assert_eq!(c.sources().collect::<Vec<_>>(), [7, 9]);
     for source in c.sources_mut() {
         *source += 100;
     }
-    assert_eq!(c.sources().collect::<Vec<_>>(), [107, 109, 107]);
+    assert_eq!(c.sources().collect::<Vec<_>>(), [107, 109]);
+}
+
+/// A source scanned again keeps an equal bound and widens differing ones to a
+/// full scan; whichever order the scans arrive in.
+#[test]
+fn a_source_scanned_again_keeps_an_equal_bound_and_widens_others() {
+    let range =
+        |first| crate::ReadBound::Range(crate::KeyRange::new(crate::PkColList::from_slice(&[0]), &[], first, 89));
+    let cases = [
+        ([range(5), range(5)], range(5)),
+        ([range(5), range(6)], crate::ReadBound::None),
+        ([range(5), crate::ReadBound::None], crate::ReadBound::None),
+        ([crate::ReadBound::None, range(5)], crate::ReadBound::None),
+    ];
+    for (scans, want) in cases {
+        let mut c = Circuit::default();
+        let [a, b] = scans.clone().map(|bound| c.input_delta(7, bound));
+        assert_eq!(a, b, "{scans:?}");
+        assert_eq!(c.nodes.len(), 1);
+        let OpNode::ScanDelta { bound, .. } = c.op(a) else {
+            panic!("{scans:?}: not a scan")
+        };
+        assert_eq!(*bound, want, "{scans:?}");
+    }
+}
+
+/// A source's scatter key is one: a scan stating none enters under one stated
+/// before or after it, one stating the same key shares the node, and one stating
+/// another key is refused and changes nothing.
+#[test]
+fn a_source_states_one_scatter_key() {
+    let key = |col| Some(vec![(col, TypeCode::I64)]);
+    let scatter_of = |c: &Circuit, nid| match c.op(nid) {
+        OpNode::ScanDelta { scatter, .. } => scatter.clone(),
+        op => panic!("{op:?} is not a scan"),
+    };
+    for first in [None, key(3)] {
+        let mut c = Circuit::default();
+        let a = c.input_scattered(7, crate::ReadBound::None, first).unwrap();
+        assert_eq!(c.input_scattered(7, crate::ReadBound::None, key(3)), Ok(a));
+        assert_eq!(c.input_scattered(7, crate::ReadBound::None, None), Ok(a));
+        assert_eq!(scatter_of(&c, a), key(3));
+        assert_eq!(
+            c.input_scattered(7, crate::ReadBound::None, key(4)),
+            Err("source 7 is scanned under several distinct scatter keys".into())
+        );
+        assert_eq!(scatter_of(&c, a), key(3));
+        assert_eq!(c.nodes.len(), 1);
+    }
+}
+
+/// A cell scanning one source in two nodes is refused, never merged: a builder
+/// cannot write one.
+#[test]
+fn decode_refuses_a_source_scanned_twice() {
+    let bytes = cell(&[(scan(7), &[]), (scan(9), &[]), (scan(7), &[]), (OpNode::Union, &[0, 2])]);
+    assert_eq!(
+        Circuit::decode(&bytes).unwrap_err(),
+        "circuit: source 7 is scanned by more than one node"
+    );
 }
 
 /// A reduce is exchanged or each worker's local fold by its builder, and a

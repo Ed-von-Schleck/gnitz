@@ -503,6 +503,24 @@ fn operand_class_is_enforced_in_both_directions() {
     assert_eq!(refused(vec![text, text, substr(Reg(1))]), mismatch(1));
 }
 
+/// The DECIMAL text writer asserts its scale, so resolve refuses a scale past
+/// the largest a column may declare instead of letting a forged one reach eval.
+#[test]
+fn int_to_text_refuses_a_scale_past_the_decimal_maximum() {
+    use LogicalInstr as L;
+    let schema = schema_pk_ints(1, true);
+    let to_text = |scale| result_prog(vec![L::LoadCol { col: 1 }, L::IntToStr { a: Reg(0), scale }], vec![]);
+    let max = gnitz_wire::MAX_DECIMAL_SCALE;
+    assert!(to_text(max).resolve_scalar(&schema).is_ok());
+    assert_eq!(
+        to_text(max + 1).resolve_scalar(&schema).err(),
+        Some(ExprValidateErr::BadSelector {
+            op: super::ExprOp::IntToStr.as_wire(),
+            selector: u32::from(max) + 1,
+        })
+    );
+}
+
 /// The result register's class splits the two resolvers: a filter reads its
 /// verdict out of the scalar file, while a SET right-hand side wants exactly a
 /// string back.

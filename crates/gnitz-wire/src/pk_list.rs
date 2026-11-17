@@ -6,9 +6,7 @@ use crate::{MAX_COLUMNS, TypeCode};
 /// Which rule a candidate primary key broke, worded by [`PkRule::named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
-    /// The word carries no [`PK_LIST_PACKED_FLAG`].
-    NotPacked,
-    /// The word sets a bit outside its flag, its count and its columns.
+    /// The word sets a bit outside its count and its columns.
     NonCanonical,
     /// No PK columns at all. Every base table has an enforced primary key.
     Empty,
@@ -54,7 +52,6 @@ impl PkRule {
             None => c.to_string(),
         };
         match *self {
-            PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
             PkRule::NonCanonical => format!("{what} word carries bits outside its columns"),
             PkRule::Empty => format!("{what} must name at least one column"),
             PkRule::TooManyColumns { count, max } => {
@@ -149,7 +146,6 @@ pub const MAX_PK_COLUMNS: usize = PK_LIST_MAX_COLS + 1;
 // a mirror record.
 //
 // Layout:
-//        bit 63        : PK_LIST_PACKED_FLAG
 //        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid)
 //        bits [4+7i..) : i-th column index, 7 bits each
 // Every other bit is zero: the decode refuses a word that does not re-pack to
@@ -179,16 +175,13 @@ const _: () = assert!(
     "PK_LIST_MAX_COLS overflows the packed count field"
 );
 const _: () = assert!(
-    PK_LIST_COUNT_BITS as usize + PK_LIST_COL_BITS as usize * PK_LIST_MAX_COLS <= 63,
-    "PK_LIST_MAX_COLS overflows the packed u64 column region" // bit 63 is the flag
+    PK_LIST_COUNT_BITS as usize + PK_LIST_COL_BITS as usize * PK_LIST_MAX_COLS <= 64,
+    "PK_LIST_MAX_COLS overflows the packed u64 column region"
 );
 const _: () = assert!(
     MAX_COLUMNS <= 1 << PK_LIST_COL_BITS,
     "a schema column index no longer fits the packed 7-bit field"
 );
-
-/// Bit 63: set on every packed list, so a zero word is never one.
-pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
 /// A column list — a PK's or an index's: `1..=PK_LIST_MAX_COLS` distinct columns,
 /// each below `MAX_COLUMNS`, inline. [`Self::checked`] is the one way to build
@@ -230,7 +223,7 @@ impl PkColList {
 
     /// The persisted `u64` form.
     pub fn pack(self) -> u64 {
-        let mut w = PK_LIST_PACKED_FLAG | self.len as u64;
+        let mut w = self.len as u64;
         for (i, &c) in self.as_slice().iter().enumerate() {
             w |= (c as u64) << (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32);
         }
@@ -240,9 +233,6 @@ impl PkColList {
     /// Decode the persisted `u64` form: the one word [`Self::pack`] writes for
     /// the list it names.
     fn unpack(word: u64) -> Result<Self, PkRule> {
-        if word & PK_LIST_PACKED_FLAG == 0 {
-            return Err(PkRule::NotPacked);
-        }
         let n = (word & ((1 << PK_LIST_COUNT_BITS) - 1)) as usize;
         if n > PK_LIST_MAX_COLS {
             return Err(PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS });

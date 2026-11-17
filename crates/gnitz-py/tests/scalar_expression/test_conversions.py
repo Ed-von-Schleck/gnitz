@@ -2,12 +2,12 @@
 
 A scalar value lives in one of four register classes — Int, Dec, Float, Str —
 and the class picks the opcode family. This file is the boundary between them:
-the eight crossing opcodes (`IntCast`, `IntToFloat`, `FloatToInt`, `FloatToF32`,
-`IntToStr`, `FloatToStr`, `StrToInt`, `StrToFloat`), plus the per-register
-unsignedness verdict that decides `signed:` on every compare, divide, extremum,
-cast and print downstream of it.
+the nine crossing opcodes (`IntCast`, `IntToFloat`, `FloatToInt`, `FloatToF32`,
+`IntToStr`, `TemporalToStr`, `FloatToStr`, `StrToInt`, `StrToFloat`), plus the
+per-register unsignedness verdict that decides `signed:` on every compare,
+divide, extremum, cast and print downstream of it.
 
-One rule binds all eight, and no per-class file can state it: **a conversion
+One rule binds all nine, and no per-class file can state it: **a conversion
 that cannot represent its value is a per-row NULL — never an error, never a
 dropped row.** The distinction is observable only in weights: a dropped row
 changes the view's Z-set, a NULL does not.
@@ -72,6 +72,19 @@ _CONVERSIONS = {
     # than the column: a U64 above 2^63 must not print negative.
     "CAST(u AS TEXT)": (STR, ["5", str(U64_HIGH), "0", str(U64_MAX), "3"]),
     "CAST(CAST(i AS TEXT) AS BIGINT)": (I64, [100, 300, -1, I64_MIN, I64_MAX]),
+    # A DECIMAL prints exactly its scale's digits, as a client prints the
+    # column, never through a float that drops a trailing zero.
+    "CAST(CAST(w AS DECIMAL(12, 2)) AS TEXT)": (
+        STR, ["3000000000.00", "0.00", "1.00", "4.00", "7.00"]),
+    "CAST(CAST(1.1 AS DECIMAL(10, 2)) AS TEXT)": (STR, ["1.10"] * 5),
+    # A DATE or TIMESTAMP prints its calendar value, not its storage integer;
+    # a TIMESTAMP's fraction is as long as it needs to be, none on a whole
+    # second.
+    "CAST(DATE '2024-01-01' AS TEXT)": (STR, ["2024-01-01"] * 5),
+    "CAST(TIMESTAMP '2024-01-01 12:00:00.5' AS TEXT)": (
+        STR, ["2024-01-01 12:00:00.5"] * 5),
+    "CAST(TIMESTAMP '2024-01-01 12:00:00' AS TEXT)": (
+        STR, ["2024-01-01 12:00:00"] * 5),
 }
 
 

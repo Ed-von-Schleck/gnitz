@@ -16,7 +16,7 @@ use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{ColType, ColumnDef, DECIMAL_TEXT_MAX, TypeCode, write_decimal, write_uuid};
+use gnitz_wire::{ColType, ColumnDef, TypeCode, VALUE_TEXT_MAX, write_decimal, write_uuid};
 
 use crate::schema::PySchema;
 
@@ -293,9 +293,12 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         TypeCode::F64 => f64::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::U128 => u128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::I128 => i128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
-        TypeCode::UUID => PyString::new(py, write_uuid(u128::from_le_bytes(b.try_into().unwrap()), &mut [0; 36]))
-            .into_any()
-            .unbind(),
+        TypeCode::UUID => PyString::new(
+            py,
+            write_uuid(u128::from_le_bytes(b.try_into().unwrap()), &mut [0; VALUE_TEXT_MAX]),
+        )
+        .into_any()
+        .unbind(),
         TypeCode::Date => {
             let days = int();
             let (y, m, d) = gnitz_wire::civil_from_days(days);
@@ -318,7 +321,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
             }
         }
         TypeCode::Decimal => py_decimal(py)?
-            .call1((write_decimal(int(), ty.scale, &mut [0; DECIMAL_TEXT_MAX]),))?
+            .call1((write_decimal(int(), ty.scale, &mut [0; VALUE_TEXT_MAX]),))?
             .unbind(),
         // CPython validates the UTF-8 and raises `UnicodeDecodeError`.
         TypeCode::String => PyString::from_bytes(py, &loc.content(batch, row))?.into_any().unbind(),

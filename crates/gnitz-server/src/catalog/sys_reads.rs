@@ -138,4 +138,14 @@ impl CatalogEngine {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// `table_id`'s column scales at `col_indices`: a DECIMAL's, else `0`, and
+    /// `0` for one the catalog does not hold.
+    pub(crate) fn column_scales(&self, table_id: u64, col_indices: &[u32]) -> Vec<u8> {
+        let defs = self.read_column_defs(table_id).unwrap_or_default();
+        col_indices
+            .iter()
+            .map(|&ci| defs.get(ci as usize).map_or(0, |d| d.def.ty.scale))
+            .collect()
+    }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::VALUE_TEXT_MAX;
 
 /// 2024-02-29.
 const LEAP_DAY: i64 = 19_782;
@@ -66,15 +67,48 @@ fn a_timestamp_parses_as_a_date_and_an_optional_time_of_day() {
 
 #[test]
 fn formatted_dates_and_timestamps_parse_back() {
-    for days in [-719_528, -1, 0, 1, 19_000, 2_932_896] {
-        let text = format_date(days);
-        assert_eq!(parse_date(&text).map(i64::from), Some(days), "{text}");
+    let buf = &mut [0; VALUE_TEXT_MAX];
+    for days in [-719_528, -1, 0, 1, 19_000, 2_932_896, i32::MIN, i32::MAX] {
+        let text = write_date(days.into(), buf);
+        assert_eq!(parse_date(text), Some(days), "{text}");
     }
     for micros in [0, 1, -1, 1_500_000, 86_399_999_999, 1_700_000_000_123_400] {
-        let text = format_timestamp(micros);
-        assert_eq!(parse_timestamp(&text), Some(micros), "{text}");
+        let text = write_timestamp(micros, buf);
+        assert_eq!(parse_timestamp(text), Some(micros), "{text}");
     }
-    assert_eq!(format_timestamp(1_500_000), "1970-01-01 00:00:01.5");
+}
+
+/// The year is at least four characters wide with its sign, so year -1 is
+/// `-001`; a fraction is as long as it needs to be and absent on a whole second.
+#[test]
+fn dates_and_timestamps_print_their_fixed_spelling() {
+    let buf = &mut [0; VALUE_TEXT_MAX];
+    let day = |y, m, d| i32::try_from(days_from_civil(y, m, d)).unwrap();
+    for (days, want) in [
+        (0, "1970-01-01"),
+        (day(7, 6, 7), "0007-06-07"),
+        (day(-1, 1, 1), "-001-01-01"),
+        (day(-12_345, 6, 7), "-12345-06-07"),
+        (day(12_345, 6, 7), "12345-06-07"),
+        (i32::MIN, "-5877641-06-23"),
+        (i32::MAX, "5881580-07-11"),
+    ] {
+        assert_eq!(write_date(days.into(), buf), want, "{days}");
+    }
+    for (micros, want) in [
+        (0, "1970-01-01 00:00:00"),
+        (5 * MICROS_PER_SEC, "1970-01-01 00:00:05"),
+        (1_500_000, "1970-01-01 00:00:01.5"),
+        (-1, "1969-12-31 23:59:59.999999"),
+        (
+            days_from_civil(-1, 3, 4) * MICROS_PER_DAY + 7 * MICROS_PER_SEC + 120,
+            "-001-03-04 00:00:07.00012",
+        ),
+        (i64::MIN, "-290308-12-21 19:59:05.224192"),
+        (i64::MAX, "294247-01-10 04:00:54.775807"),
+    ] {
+        assert_eq!(write_timestamp(micros, buf), want, "{micros}");
+    }
 }
 
 #[test]

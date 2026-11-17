@@ -251,7 +251,8 @@ impl Lowering<'_> {
         if matches!(e, BoundExpr::LitNull) {
             return Ok(self.eb.emit(L::LoadNullStr));
         }
-        Ok(match RegClass::of(self.ty(e)) {
+        let ty = self.ty(e);
+        Ok(match RegClass::of(ty) {
             RegClass::Str => self.lower(e)?,
             // `true` / `false`, and NULL for a NULL: neither test takes one.
             RegClass::Bool => {
@@ -259,12 +260,21 @@ impl Lowering<'_> {
                 let not = BoundExpr::Not(Box::new(e.clone()));
                 self.case(&[(e.clone(), text("true")), (not, text("false"))], &BoundExpr::LitNull)?
             }
-            RegClass::Int => {
+            // A DATE or TIMESTAMP computes in the integer class, but spells its
+            // calendar value, not its storage integer.
+            RegClass::Int if ty.tc.is_temporal() => {
                 let a = self.lower(e)?;
-                self.eb.emit(L::IntToStr { a })
+                let micros = ty.tc == TypeCode::Timestamp;
+                self.eb.emit(L::TemporalToStr { a, micros })
             }
-            RegClass::Float | RegClass::Dec(_) => {
-                let f32 = self.ty(e).tc == TypeCode::F32;
+            // Every digit of the scaled integer, at exactly its scale: 0 for
+            // any type but DECIMAL.
+            RegClass::Int | RegClass::Dec(_) => {
+                let a = self.lower(e)?;
+                self.eb.emit(L::IntToStr { a, scale: ty.scale })
+            }
+            RegClass::Float => {
+                let f32 = ty.tc == TypeCode::F32;
                 let a = self.lower_to(e, ColType::of(TypeCode::F64))?;
                 self.eb.emit(L::FloatToStr { a, f32 })
             }

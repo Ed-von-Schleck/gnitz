@@ -1,7 +1,9 @@
 use std::convert::Infallible;
 
 use gnitz_expr::CalendarOp;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, MAX_DECIMAL_SCALE, TypeCode};
+use gnitz_wire::{
+    ColType, ColumnDef, FixedInt, FloatText, MAX_DECIMAL_SCALE, TypeCode, VALUE_TEXT_MAX, write_date, write_timestamp,
+};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -318,6 +320,20 @@ impl std::fmt::Display for NumLit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let sign = if self.is_negative() { "-" } else { "" };
         write!(f, "{sign}{}", self.mag)
+    }
+}
+
+/// `unscaled · 10^-scale` as plain decimal text with exactly `scale` fractional
+/// digits. Unlike [`gnitz_wire::write_decimal`], it takes an `i128` and a scale
+/// past [`MAX_DECIMAL_SCALE`], as a literal's decimal may have.
+fn scaled_text(unscaled: i128, scale: u8) -> String {
+    let scale = usize::from(scale);
+    let digits = format!("{:0>width$}", unscaled.unsigned_abs(), width = scale + 1);
+    let (int, frac) = digits.split_at(digits.len() - scale);
+    let sign = if unscaled < 0 { "-" } else { "" };
+    match scale {
+        0 => format!("{sign}{int}"),
+        _ => format!("{sign}{int}.{frac}"),
     }
 }
 
@@ -699,13 +715,17 @@ impl<R> BExpr<R> {
         )
     }
 
-    /// A literal as an error message quotes it.
+    /// A literal as an error message quotes it: a fractional one as the exact
+    /// decimal it spells while it has one, a DATE/TIMESTAMP as its typed string.
     pub(crate) fn literal_text(&self) -> String {
+        let buf = &mut [0; VALUE_TEXT_MAX];
         match self {
             BExpr::LitInt(v) => v.to_string(),
-            BExpr::LitFloat { v, .. } => v.to_string(),
+            BExpr::LitFloat { dec: Some((u, scale)), .. } => scaled_text(*u, *scale),
+            BExpr::LitFloat { v, dec: None } => FloatText(*v).to_string(),
             BExpr::LitWide(n) => n.to_string(),
-            BExpr::LitTemporal { v, .. } => v.to_string(),
+            BExpr::LitTemporal { tc: TypeCode::Date, v } => format!("DATE '{}'", write_date(*v, buf)),
+            BExpr::LitTemporal { v, .. } => format!("TIMESTAMP '{}'", write_timestamp(*v, buf)),
             BExpr::LitStr(s) => format!("'{s}'"),
             BExpr::LitBool(true) => "TRUE".to_string(),
             BExpr::LitBool(false) => "FALSE".to_string(),

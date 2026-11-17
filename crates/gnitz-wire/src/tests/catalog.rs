@@ -208,20 +208,8 @@ fn a_relation_rows_parts_invert_its_written_words() {
         },
         compress: true,
     };
-    let (capacity_bytes, delta_bytes) = props.budget.row_words();
-    let view = ViewTabRow {
-        view_id: 18,
-        schema_id: 2,
-        name: "v".into(),
-        pk_col_idx: pk,
-        capacity_bytes,
-        delta_bytes,
-        owner_view_id: 0,
-        pk_repeats: true,
-        compress: true,
-        definition: Default::default(),
-    };
     let parts = ViewParts { props, owner: None, pk_repeats: true };
+    let view = ViewTabRow::of(18, 2, "v", pk, parts, &[][..]);
     assert_eq!(view.parts(), Ok(parts));
     let segment = ViewTabRow {
         name: "_seg19".into(),

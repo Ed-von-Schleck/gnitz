@@ -45,12 +45,16 @@ slab = "0.4"
 # schema-codec suite).
 gnitz-core = { path = "../gnitz-core" }
 gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
-# The in-process fuzz targets: inputs and seeds are the session fuzzer's, and
-# `cargo bolero` runs a target under libFuzzer.
-gnitz-fuzz = { path = "../gnitz-fuzz" }
-bolero = "0.13"
 proptest.workspace = true
 tempfile.workspace = true
+
+# The in-process fuzz targets, built only under `cargo bolero`, which sets
+# `--cfg fuzzing`: inputs and seeds are the session fuzzer's, whose field map
+# hooks every `gnitz_wire::Reader` read, so a test or bench build without it
+# decodes through the Reader the shipped server runs.
+[target.'cfg(fuzzing)'.dev-dependencies]
+gnitz-fuzz = { path = "../gnitz-fuzz" }
+bolero = "0.13"
 
 [lints]
 workspace = true

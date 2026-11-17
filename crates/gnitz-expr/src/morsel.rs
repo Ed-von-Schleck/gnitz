@@ -18,8 +18,8 @@ use crate::search::{fields, find, lit_eq};
 use crate::simd::{self, LanePred, Level, decode_f64, encode_f64};
 use crate::{BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram, calendar};
 use gnitz_wire::{
-    FixedInt, FloatText, Heap, compare_german_strings, german_string_content, german_string_heap, german_string_inline,
-    low_bits_mask, null_word_get,
+    FixedInt, FloatText, Heap, compare_german_strings, date_bytes, german_string_content, german_string_heap,
+    german_string_inline, low_bits_mask, null_word_get, scaled_bytes, timestamp_bytes,
 };
 
 /// Integer-cast bounds for the target type: the signed-source window `[lo, hi]`
@@ -765,11 +765,11 @@ fn parse_decimal_i128(s: &[u8]) -> Option<i128> {
     Some(if neg { -(v as i128) } else { v as i128 })
 }
 
-/// An integer's decimal text, written into the arena.
-fn arena_push_int(arena: &mut Vec<u8>, magnitude: u64, neg: bool) -> StrView {
+/// The text a value-text writer spells, written into the arena.
+fn arena_push_text(arena: &mut Vec<u8>, write: impl FnOnce(&mut [u8; gnitz_wire::VALUE_TEXT_MAX]) -> &[u8]) -> StrView {
     let off = arena.len();
-    let mut buf = [0; gnitz_wire::DECIMAL_TEXT_MAX];
-    arena.extend_from_slice(gnitz_wire::write_scaled(magnitude, neg, 0, &mut buf).as_bytes());
+    let mut buf = [0; gnitz_wire::VALUE_TEXT_MAX];
+    arena.extend_from_slice(write(&mut buf));
     StrView::at(SRC_ARENA, off, arena.len() - off)
 }
 
@@ -1789,16 +1789,36 @@ fn eval_morsel(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
 
             Instr::StrConcat { a, b, skip_null } => eval_str_concat(scratch, mo, dst, a, b, skip_null),
 
-            // One loop per signedness, so neither tests it per row.
-            Instr::IntToStr { a } => match a.signed {
-                true => str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
+            // One loop per signedness and per integer-or-DECIMAL, so none tests
+            // either per row. A DECIMAL is signed; resolve admits its scale only
+            // up to `MAX_DECIMAL_SCALE`.
+            Instr::IntToStr { a, scale } => match (a.signed, scale) {
+                (true, 0) => str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
                     let v = v as i64;
-                    Some(arena_push_int(arena, v.unsigned_abs(), v < 0))
+                    Some(arena_push_text(arena, |b| scaled_bytes(v.unsigned_abs(), v < 0, 0, b)))
                 }),
-                false => str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
-                    Some(arena_push_int(arena, v as u64, false))
+                (false, 0) => str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
+                    Some(arena_push_text(arena, |b| scaled_bytes(v as u64, false, 0, b)))
                 }),
+                (_, s) => {
+                    let a = IntReg { signed: true, ..a };
+                    str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
+                        let v = v as i64;
+                        Some(arena_push_text(arena, |b| scaled_bytes(v.unsigned_abs(), v < 0, s, b)))
+                    })
+                }
             },
+            Instr::TemporalToStr { a, micros } => {
+                let a = IntReg { reg: a, signed: true };
+                match micros {
+                    true => str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
+                        Some(arena_push_text(arena, |b| timestamp_bytes(v as i64, b)))
+                    }),
+                    false => str_kernel(scratch, mo, dst, [], [a], |arena, [], [v]| {
+                        Some(arena_push_text(arena, |b| date_bytes(v as i64, b)))
+                    }),
+                }
+            }
             Instr::FloatToStr { a, f32 } => {
                 let bits = IntReg { reg: a, signed: true };
                 // The narrowing is exact: an `f32` register holds a widened f32.

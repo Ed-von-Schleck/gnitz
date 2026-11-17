@@ -2,6 +2,8 @@
 //! value times `10^s`; everything here converts between that integer and the
 //! text of the number it means, in both directions.
 
+use crate::VALUE_TEXT_MAX;
+
 /// The largest scale a column may declare: `i64` holds 18 full decimal digits.
 pub const MAX_DECIMAL_SCALE: u8 = 18;
 
@@ -30,30 +32,26 @@ pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
     Some((if neg { -v } else { v }, frac.len() as u8))
 }
 
-/// The longest text [`write_scaled`] produces: a sign, 20 digits (all of a
-/// `u64`, or the `scale + 1` padded digits of a scale up to
-/// [`MAX_DECIMAL_SCALE`]) and a point.
-pub const DECIMAL_TEXT_MAX: usize = 22;
-
 /// The text a value at scale `scale` prints as — exactly `scale` fractional
 /// digits, so a column's values line up and read back through
-/// [`parse_decimal_text`] at that scale.
-pub fn format_decimal(v: i64, scale: u8) -> String {
-    write_decimal(v, scale, &mut [0; DECIMAL_TEXT_MAX]).to_owned()
+/// [`parse_decimal_text`] at that scale — written into the tail of `buf` and
+/// borrowed from it. Panics on a `scale` past [`MAX_DECIMAL_SCALE`], which no
+/// admissible column type has.
+pub fn write_decimal(v: i64, scale: u8, buf: &mut [u8; VALUE_TEXT_MAX]) -> &str {
+    std::str::from_utf8(scaled_bytes(v.unsigned_abs(), v < 0, scale, buf)).expect("digits, point and sign")
 }
 
-/// [`format_decimal`]'s text, written into the tail of `buf` and borrowed from
-/// it. Panics on a `scale` past [`MAX_DECIMAL_SCALE`], which no admissible
-/// column type has.
-pub fn write_decimal(v: i64, scale: u8, buf: &mut [u8; DECIMAL_TEXT_MAX]) -> &str {
-    write_scaled(v.unsigned_abs(), v < 0, scale, buf)
-}
+/// The longest text [`scaled_bytes`] produces: a sign, 20 digits (all of a
+/// `u64`, or the `scale + 1` padded digits of a scale up to
+/// [`MAX_DECIMAL_SCALE`]) and a point.
+pub const SCALED_TEXT_MAX: usize = 22;
 
-/// The text of `magnitude`, negated where `neg`, at scale `scale` — an integer's
-/// at scale 0 — written into the tail of `buf` and borrowed from it. Several
-/// times cheaper than `core::fmt` (`int_to_str` of `expr_kernel_bench`).
-/// Panics on a `scale` past [`MAX_DECIMAL_SCALE`].
-pub fn write_scaled(magnitude: u64, neg: bool, scale: u8, buf: &mut [u8; DECIMAL_TEXT_MAX]) -> &str {
+/// The ASCII text of `magnitude`, negated where `neg`, at scale `scale` — an
+/// integer's at scale 0 — written into the tail of `buf` and borrowed from it:
+/// [`write_decimal`]'s bytes, unvalidated for a per-row caller that stores
+/// bytes. Several times cheaper than `core::fmt` (`int_to_str` of
+/// `expr_kernel_bench`). Panics on a `scale` past [`MAX_DECIMAL_SCALE`].
+pub fn scaled_bytes(magnitude: u64, neg: bool, scale: u8, buf: &mut [u8; VALUE_TEXT_MAX]) -> &[u8] {
     assert!(
         scale <= MAX_DECIMAL_SCALE,
         "DECIMAL scale {scale} past {MAX_DECIMAL_SCALE}"
@@ -75,7 +73,7 @@ pub fn write_scaled(magnitude: u64, neg: bool, scale: u8, buf: &mut [u8; DECIMAL
         i -= 1;
         buf[i] = b'-';
     }
-    std::str::from_utf8(&buf[i..]).expect("digits, point and sign")
+    &buf[i..]
 }
 
 #[cfg(test)]

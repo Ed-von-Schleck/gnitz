@@ -299,6 +299,12 @@ fn the_temporal_forms_compute_their_values() {
             ("CAST(c1 + 1 AS DATE) = 2147483648", &[Int(2147483647)], Null),
             ("CAST(c1 + 1 AS DATE) = 2147483648", &[Int(5)], Int(0)),
             ("COALESCE(c1, 3000000000) = 3000000000", &[Null], Int(1)),
+            // A DATE's text is its calendar date, never its day count.
+            ("CAST(c1 AS TEXT)", &[Int(19723)], Str("2024-01-01")),
+            ("CAST(c1 + 1 AS VARCHAR)", &[Int(19723)], Str("2024-01-02")),
+            ("CONCAT('d=', c1)", &[Int(19723)], Str("d=2024-01-01")),
+            ("CAST(DATE '2024-01-01' AS TEXT)", &[Null], Str("2024-01-01")),
+            ("CAST(DATE '-0001-01-01' AS TEXT)", &[Null], Str("-001-01-01")),
         ],
     );
     check(
@@ -307,6 +313,24 @@ fn the_temporal_forms_compute_their_values() {
             ("EXTRACT(YEAR FROM c1)", &[Int(18262 * day)], Int(2020)),
             ("CAST(c1 AS DATE)", &[Int(18262 * day + 5)], Int(18262)),
             ("DATE_TRUNC('day', c1)", &[Int(18262 * day + 5)], Int(18262 * day)),
+            // The fraction is as long as it needs to be, and absent on a whole
+            // second.
+            (
+                "CAST(c1 AS TEXT)",
+                &[Int(19723 * day + day / 2 + 500_000)],
+                Str("2024-01-01 12:00:00.5"),
+            ),
+            (
+                "CAST(c1 AS TEXT)",
+                &[Int(19723 * day + day / 2)],
+                Str("2024-01-01 12:00:00"),
+            ),
+            ("CAST(c1 AS TEXT)", &[Int(-1)], Str("1969-12-31 23:59:59.999999")),
+            (
+                "CAST(TIMESTAMP '2024-01-01 12:00:00.5' AS TEXT)",
+                &[Null],
+                Str("2024-01-01 12:00:00.5"),
+            ),
         ],
     );
     // d = day 10; ts = day 10 at midnight, and at noon.
@@ -360,6 +384,18 @@ fn the_decimal_forms_compute_their_values() {
             ("CAST(c1 AS TINYINT)", &[Int(30000), Null, Null], Null),
             ("CAST(c1 AS DOUBLE)", row, F64(1.25)),
             ("CAST(c1 AS VARCHAR)", row, Str("1.25")),
+            // The text keeps exactly the scale's digits, and every digit past
+            // what an f64 holds.
+            ("CAST(c1 AS TEXT)", &[Int(110), Null, Null], Str("1.10")),
+            ("CAST(c1 AS TEXT)", &[Int(-5), Null, Null], Str("-0.05")),
+            (
+                "CAST(c1 AS TEXT)",
+                &[Int(9_007_199_254_740_993), Null, Null],
+                Str("90071992547409.93"),
+            ),
+            ("CONCAT('p=', c1)", &[Int(110), Null, Null], Str("p=1.10")),
+            ("CAST(CAST(1.1 AS DECIMAL(10, 2)) AS TEXT)", row, Str("1.10")),
+            ("CAST(CAST(c3 AS DECIMAL(12, 2)) AS TEXT)", row, Str("3.00")),
             ("CAST(1.005 AS DECIMAL(10, 2))", row, Int(101)),
             ("CAST('2.5' AS DECIMAL(10, 2))", row, Int(250)),
         ],

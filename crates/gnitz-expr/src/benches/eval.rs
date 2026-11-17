@@ -501,7 +501,47 @@ fn expr_kernel_bench() {
             vec![],
             T::I64,
         ),
-        slot("int_to_str", vec![c1, L::IntToStr { a: r(0) }], vec![], T::String),
+        slot(
+            "int_to_str",
+            vec![c1, L::IntToStr { a: r(0), scale: 0 }],
+            vec![],
+            T::String,
+        ),
+        // Each to-text spelling over a spread of values: a DECIMAL at scale 2,
+        // a day count, and a microsecond count with a fraction.
+        slot(
+            "dec2_to_str",
+            vec![
+                c1,
+                k(123_457),
+                L::IntArith { op: IntArithOp::Mul, a: r(0), b: r(1) },
+                L::IntToStr { a: r(2), scale: 2 },
+            ],
+            vec![],
+            T::String,
+        ),
+        slot(
+            "date_to_str",
+            vec![
+                c1,
+                k(37),
+                L::IntArith { op: IntArithOp::Mul, a: r(0), b: r(1) },
+                L::TemporalToStr { a: r(2), micros: false },
+            ],
+            vec![],
+            T::String,
+        ),
+        slot(
+            "ts_to_str",
+            vec![
+                c1,
+                k(86_400_000_123),
+                L::IntArith { op: IntArithOp::Mul, a: r(0), b: r(1) },
+                L::TemporalToStr { a: r(2), micros: true },
+            ],
+            vec![],
+            T::String,
+        ),
     ]);
     run(&ints, &int_view, shapes);
     drop(int_view);

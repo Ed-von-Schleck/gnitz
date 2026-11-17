@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gnitz_wire::{
     Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IdxTabRow, IdxTabSlot, KeyRange, PkColList,
     RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, ReadBound, ReadSpec, SchemaTabRow, SchemaTabSlot, SysFamily, SysRow,
-    TableProps, TableTabRow, ViewProps, ViewTabRow, payload_bytes, payload_u64,
+    TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, payload_bytes, payload_u64,
 };
 
 use crate::catalog::{CATALOG_FAMILIES, Catalog, IndexRow, idx_rows};
@@ -252,15 +252,15 @@ impl ViewBundle {
             // A segment's name is unique because vids are, and no SQL surface can
             // spell it because gnitz_wire::validate_user_identifier rejects a leading
             // `_`; the owner_view_id column records its ownership.
-            let (name, owner_view_id, props, definition) = if vid == owner_vid {
+            let (name, owner, props, definition) = if vid == owner_vid {
                 (
                     self.name.name().to_string(),
-                    0,
+                    None,
                     self.props.unwrap_or_default(),
                     definition,
                 )
             } else {
-                (format!("_seg{vid}"), owner_vid, ViewProps::default(), &[][..])
+                (format!("_seg{vid}"), Some(owner_vid), ViewProps::default(), &[][..])
             };
 
             // A foreign key constrains a base table, not a view.
@@ -273,21 +273,16 @@ impl ViewBundle {
                 },
                 1,
             );
-            let (capacity_bytes, delta_bytes) = props.budget.row_words();
             // The VIEW_TAB register hook triggers server-side compilation.
             b.put(
-                &ViewTabRow {
-                    view_id: vid,
+                &ViewTabRow::of(
+                    vid,
                     schema_id,
-                    name: name.as_str().into(),
-                    pk_col_idx: PkColList::from_slice(pv.schema.pk_cols()),
-                    capacity_bytes,
-                    delta_bytes,
-                    owner_view_id,
-                    pk_repeats: pv.pk_repeats,
-                    compress: props.compress,
-                    definition: definition.into(),
-                },
+                    name,
+                    PkColList::from_slice(pv.schema.pk_cols()),
+                    ViewParts { props, owner, pk_repeats: pv.pk_repeats },
+                    definition,
+                ),
                 1,
             );
         }

@@ -53,6 +53,7 @@ fn join_with_own_trace(c: &mut Circuit, d: NodeId, kind: JoinKind) -> NodeId {
 /// A scan of `source` stating `cols` of [`wide_schema`] as its scatter key.
 fn scattered(c: &mut Circuit, source: u64, cols: &[u32]) -> NodeId {
     c.input_scattered(source, ReadBound::None, Some(self_typed_slots(&wide_schema(), cols)))
+        .unwrap()
 }
 
 /// `input` re-keyed onto `cols` of [`wide_schema`].
@@ -346,7 +347,7 @@ fn a_source_routes_by_the_one_key_it_states() {
 /// refused there, on the master and on every worker alike.
 #[test]
 fn a_circuit_routing_cannot_stand_behind_is_rejected() {
-    let cases: [(Build, &str); 4] = [
+    let cases: [(Build, &str); 3] = [
         // Integrated wherever it was produced, beside a trace scattered by the key.
         (
             |c: &mut Circuit| {
@@ -355,14 +356,6 @@ fn a_circuit_routing_cannot_stand_behind_is_rejected() {
                 join_with_own_trace(c, delta, JoinKind::Equi);
             },
             "source 7 feeds a join and states no scatter key",
-        ),
-        // Scattering by either key alone leaves the trace side keyed by the other.
-        (
-            |c: &mut Circuit| {
-                let [a, b] = [1, 2].map(|col| scan_keyed(c, 7, &self_typed_slots(&wide_schema(), &[col])));
-                c.join([a, b], [a, b], JoinKind::Equi);
-            },
-            "source 7 is scanned under several distinct scatter keys",
         ),
         // A column the relation has not got.
         (
@@ -460,7 +453,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
         (
             "a source's rows walked back to its scan, while a join relays its delta",
             |c| {
-                let a = c.input_scattered(7, ReadBound::None, Some(vec![(3, I64)]));
+                let a = c.input_scattered(7, ReadBound::None, Some(vec![(3, I64)])).unwrap();
                 let da = reindex(c, a, &[(3, I64)]);
                 let db = scan_keyed(c, 9, &[(3, I64)]);
                 c.join([da, db], [da, db], JoinKind::Equi);
@@ -593,7 +586,7 @@ fn rows_left_off_their_keys_owner_place_the_view_by_no_key() {
             "a join beside a scan relayed by a payload column",
             |c| {
                 let joined = equi_on_3(c);
-                let other = c.input_scattered(11, ReadBound::None, Some(u64_slots(&[2])));
+                let other = c.input_scattered(11, ReadBound::None, Some(u64_slots(&[2]))).unwrap();
                 let copied = map_copy(c, other, &u64_slots(&[0, 1]));
                 c.union(joined, copied);
             },
@@ -653,7 +646,7 @@ fn an_operator_over_rows_its_key_does_not_co_locate_is_refused() {
         (
             "a join side relayed by another column than it joins on",
             |c| {
-                let a = c.input_scattered(7, ReadBound::None, Some(u64_slots(&[2])));
+                let a = c.input_scattered(7, ReadBound::None, Some(u64_slots(&[2]))).unwrap();
                 let a = c.map_reindex(a, &u64_slots(&[3]), &[0], NullKeys::Keep);
                 let b = scan_keyed(c, 9, &u64_slots(&[3]));
                 c.join([a, b], [a, b], JoinKind::Equi);

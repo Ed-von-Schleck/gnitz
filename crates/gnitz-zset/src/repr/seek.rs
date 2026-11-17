@@ -2,8 +2,7 @@
 
 use std::ops::Range;
 
-use crate::schema::{PkSortKey, pk_width_dispatch};
-use gnitz_wire::RowSource;
+use gnitz_wire::{PkSortKey, RowSource, pk_width_dispatch};
 
 /// A column as `base + row * stride`. Stride 0 reads one shared element for
 /// every row. `base` itself need not lie inside the column: a decoded window is

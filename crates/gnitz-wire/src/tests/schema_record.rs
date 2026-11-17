@@ -69,9 +69,12 @@ fn column_meta_and_the_widest_pk_survive_the_record() {
 /// them: a merged table asserting only "an error" would pass on the wrong guard.
 #[test]
 fn each_guard_rejects_its_own_forgery() {
-    // The column section opens right after `column_count`, `pk_count` and the
-    // one PK index byte; a column is type, flags, scale, then its name prefix.
-    const COL0: usize = 4 + 1 + 1;
+    // The column count follows `pk_count` and the one PK index byte, and the
+    // column section follows it; a column is type, flags, scale, then its name
+    // prefix.
+    const COUNT: usize = 2 + 1;
+    const COL0: usize = COUNT + 2;
+    let set_count = |r: &mut Vec<u8>, n: u16| r[COUNT..COL0].copy_from_slice(&n.to_le_bytes());
     let forge = |f: &dyn Fn(&mut Vec<u8>)| {
         let mut r = simple();
         f(&mut r);
@@ -79,20 +82,20 @@ fn each_guard_rejects_its_own_forgery() {
     };
     let wide_pk: Vec<u32> = (0..=MAX_PK_COLUMNS as u32).collect();
     let cases = [
+        (forge(&|r| set_count(r, 0)), "at least one column".into()),
         (
-            forge(&|r| crate::write_u32_le(r, 0, 0)),
-            format!("column count 0 out of range 1..={MAX_COLUMNS}"),
-        ),
-        (
-            forge(&|r| crate::write_u32_le(r, 0, MAX_COLUMNS as u32 + 1)),
-            format!("column count {} out of range", MAX_COLUMNS + 1),
+            forge(&|r| set_count(r, MAX_COLUMNS as u16 + 1)),
+            format!("columns: {} entries exceeds cap {MAX_COLUMNS}", MAX_COLUMNS + 1),
         ),
         // A lowered count leaves the second column's bytes unclaimed.
-        (forge(&|r| crate::write_u32_le(r, 0, 1)), "trailing bytes".into()),
+        (forge(&|r| set_count(r, 1)), "trailing bytes".into()),
         (forge(&|r| r.push(0)), "trailing bytes".into()),
         (
             encode(all_key_cols(MAX_PK_COLUMNS + 1).into_iter(), &wide_pk),
-            format!("pk column count {} exceeds {MAX_PK_COLUMNS}", MAX_PK_COLUMNS + 1),
+            format!(
+                "pk columns: {} entries exceeds cap {MAX_PK_COLUMNS}",
+                MAX_PK_COLUMNS + 1
+            ),
         ),
         (forge(&|r| r[COL0] = 0), "invalid column type 0/0".into()),
         (forge(&|r| r[COL0 + 1] = 1 << 3), "unknown flag bits 0x08".into()),
@@ -135,9 +138,9 @@ fn the_record_layout_is_fixed() {
     ];
     #[rustfmt::skip]
     let mut want: Vec<u8> = vec![
-        3, 0, 0, 0,                  // column_count
-        2,                           // pk_count
+        2, 0,                        // pk_count
         1, 0,                        // PK indices, in declared PK-tuple order
+        3, 0,                        // column_count
         8, 0, 0, 1, 0, 0, 0, b'b',   // U64, no flags, scale 0, name "b"
         6, 0, 0, 1, 0, 0, 0, b'a',   // I32, no flags, scale 0, name "a"
         18, 0b11, 9, 25, 0, 0, 0,    // DECIMAL, nullable|hidden, scale 9

@@ -167,28 +167,19 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
 
 // ── Backfill bounds ─────────────────────────────────────────────────────
 
-/// A backfill bound survives per source scanned once; a source scanned twice
-/// shares one backfill cursor, so it keeps none even where one scan is bounded.
+/// Each source's scan keeps the backfill bound its node carries.
 #[test]
-fn a_source_scanned_once_keeps_its_backfill_bound() {
+fn each_source_keeps_its_backfill_bound() {
     use gnitz_wire::{KeyRange, PkColList};
     let schema = make_schema_u64_i64();
-    let bound = |col: u32| ReadBound::Range(KeyRange::point(PkColList::from_slice(&[col]), &[0]));
-    let bounds_of = |scans: [(u64, ReadBound); 2]| {
-        let mut c = Circuit::default();
-        let [a, b] = scans.clone().map(|(source, bound)| c.input_delta(source, bound));
-        c.union(a, b);
-        let out = compile(&c, &sources([(10, schema), (11, schema)]), false).expect("the fixture compiles");
-        scans.map(|(source, _)| out.scan(source).bound.clone())
-    };
+    let bound = ReadBound::Range(KeyRange::point(PkColList::from_slice(&[1]), &[0]));
+    let mut c = Circuit::default();
+    let a = c.input_delta(10, bound.clone());
+    let b = c.input_delta(11, ReadBound::None);
+    c.union(a, b);
+    let out = compile(&c, &sources([(10, schema), (11, schema)]), false).expect("the fixture compiles");
     assert_eq!(
-        bounds_of([(10, bound(1)), (11, ReadBound::None)]),
-        [bound(1), ReadBound::None],
-        "each source scanned once keeps its own"
-    );
-    assert_eq!(
-        bounds_of([(10, bound(1)), (10, ReadBound::None)]),
-        [ReadBound::None, ReadBound::None],
-        "a source scanned twice has none"
+        [10, 11].map(|source| out.scan(source).bound.clone()),
+        [bound, ReadBound::None]
     );
 }

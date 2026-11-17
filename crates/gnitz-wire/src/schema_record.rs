@@ -3,9 +3,9 @@
 //! engine as the blob of a `PUSH` and of each `PUSH_TXN` family.
 //!
 //! ```text
-//! u32              column_count
-//! u8               pk_count
+//! u16              pk_count
 //! u8 × pk_count    PK column indices, in declared PK-tuple order
+//! u16              column_count
 //! per column:
 //!   u8             type_code
 //!   u8             flags        NULLABLE | HIDDEN
@@ -13,7 +13,8 @@
 //!   u32 + bytes    name
 //! ```
 //!
-//! The record carries no length of its own; every carrier length-prefixes it.
+//! Both lists are the codec's counted lists ([`Writer::count`]). The record
+//! carries no length of its own; every carrier length-prefixes it.
 
 use smallvec::SmallVec;
 
@@ -43,15 +44,11 @@ const DEFINED_FLAGS: u8 = NULLABLE | HIDDEN;
 /// name's own length prefix.
 const COL_FIXED_BYTES: usize = 3 + 4;
 
-/// Written for a PK count or column index the record's `u8` fields cannot hold.
-const PK_FIELD_OVERFLOW: u8 = u8::MAX;
+/// Written for a PK column index the record's `u8` cannot hold.
+const PK_INDEX_OVERFLOW: u8 = u8::MAX;
 const _: () = assert!(
-    PK_FIELD_OVERFLOW as usize >= MAX_COLUMNS,
+    PK_INDEX_OVERFLOW as usize >= MAX_COLUMNS,
     "a PK index this wide must be refused"
-);
-const _: () = assert!(
-    PK_FIELD_OVERFLOW as usize > MAX_PK_COLUMNS,
-    "a PK count this wide must be refused"
 );
 
 /// One column, read forward.
@@ -75,13 +72,13 @@ pub fn encode<'a>(cols: impl Iterator<Item = RecordCol<'a>> + Clone, pk_cols: &[
     let (count, columns) = cols.clone().fold((0usize, 0usize), |(n, b), c| {
         (n + 1, b + COL_FIXED_BYTES + c.name.len())
     });
-    let mut w = Writer::with_capacity(4 + 1 + pk_cols.len() + columns);
-    w.u32(count as u32)
-        .u8(u8::try_from(pk_cols.len()).unwrap_or(PK_FIELD_OVERFLOW));
+    let mut w = Writer::with_capacity(2 + pk_cols.len() + 2 + columns);
+    w.count(pk_cols.len());
     for &c in pk_cols {
         debug_assert!(u8::try_from(c).is_ok(), "PK column index {c} does not fit the record");
-        w.u8(u8::try_from(c).unwrap_or(PK_FIELD_OVERFLOW));
+        w.u8(u8::try_from(c).unwrap_or(PK_INDEX_OVERFLOW));
     }
+    w.count(count);
     for c in cols {
         w.u8(c.ty.tc.as_wire())
             .u8((if c.nullable { NULLABLE } else { 0 }) | (if c.hidden { HIDDEN } else { 0 }))
@@ -103,26 +100,16 @@ pub fn decode<'a>(
     mut on_col: impl FnMut(RecordCol<'a>) -> Result<(), String>,
 ) -> Result<PkIndices, String> {
     decode_all(buf, "schema record", |r| {
-        let (count, pk) = take_header(r)?;
-        for _ in 0..count {
-            on_col(take_col(r)?)?;
+        let mut pk = PkIndices::new();
+        r.items("pk columns", MAX_PK_COLUMNS, |r| {
+            pk.push(r.u8()?.into());
+            Ok(())
+        })?;
+        if r.items("columns", MAX_COLUMNS, |r| on_col(take_col(r)?))?.is_empty() {
+            return Err("a record holds at least one column".into());
         }
         Ok(pk)
     })
-}
-
-/// The record's header: column count and PK list.
-fn take_header(r: &mut Reader<'_>) -> Result<(usize, PkIndices), String> {
-    let count = r.u32()? as usize;
-    if count == 0 || count > MAX_COLUMNS {
-        return Err(format!("column count {count} out of range 1..={MAX_COLUMNS}"));
-    }
-    let len = r.u8()? as usize;
-    if len > MAX_PK_COLUMNS {
-        return Err(format!("pk column count {len} exceeds {MAX_PK_COLUMNS}"));
-    }
-    let pk = (0..len).map(|_| r.u8().map(u32::from)).collect::<Result<_, _>>()?;
-    Ok((count, pk))
 }
 
 /// `Err` naming the first difference unless `got` lays out the same columns as

@@ -1,4 +1,5 @@
 use super::*;
+use crate::VALUE_TEXT_MAX;
 
 #[test]
 fn format_is_canonical_and_parse_accepts_its_spellings() {
@@ -10,7 +11,7 @@ fn format_is_canonical_and_parse_accepts_its_spellings() {
         (0, "00000000-0000-0000-0000-000000000000"),
         (u128::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff"),
     ] {
-        assert_eq!(format_uuid(v), canonical);
+        assert_eq!(write_uuid(v, &mut [0; VALUE_TEXT_MAX]), canonical);
         for s in [
             canonical.to_string(),
             canonical.to_uppercase(),

@@ -506,7 +506,7 @@ fn cork_fault(peer: &mut Peer, target_id: u64, fault: &WireFault) {
     cork_msg(peer, WireMsg { target_id, ..WireMsg::fault(fault) })
 }
 
-#[cfg(test)]
+#[cfg(all(test, fuzzing))]
 #[path = "fuzz/executor.rs"]
 mod fuzz;
 

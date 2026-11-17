@@ -115,7 +115,7 @@ impl ViewBudget {
     }
 
     /// The `(capacity, delta)` `VIEW_TAB` words.
-    pub fn row_words(self) -> (u64, u64) {
+    pub(crate) fn row_words(self) -> (u64, u64) {
         (self.capacity_bytes().unwrap_or(0), self.delta_bytes().unwrap_or(0))
     }
 

@@ -111,7 +111,7 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
             gnitz_wire::checksum(&vocabulary),
             gnitz_wire::EXPR_BLOB_VERSION
         ),
-        (want, 17023075754260568460, 8),
+        (want, 4881666981418961328, 9),
         "the expr-blob layout or opcode vocabulary changed: bump EXPR_BLOB_VERSION if a number moved, \
          then paste what is reported here"
     );

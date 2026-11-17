@@ -319,7 +319,9 @@ fn source(
                 .unwrap_or(ReadBound::None)
         }
     };
-    let node = cb.input_scattered(src.tid(), bound, scatter);
+    let node = cb
+        .input_scattered(src.tid(), bound, scatter)
+        .map_err(GnitzSqlError::Rejected)?;
     filter(cb, node, &conjuncts, &frame.schema)
 }
 

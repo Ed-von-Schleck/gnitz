@@ -16,7 +16,7 @@ mod payload_order;
 pub use gnitz_expr::{SchemaColumn, SchemaDescriptor};
 pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range_band};
 
-pub(crate) use key::{PkSortKey, band, compare_pk_ordering, group_floor, pack_pk_be, pk_width_dispatch};
+pub(crate) use key::{band, compare_pk_ordering, group_floor};
 pub(crate) use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are

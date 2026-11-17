@@ -132,6 +132,7 @@ mod rel_descriptor;
 mod temporal;
 mod types;
 mod uuid;
+mod value_text;
 mod xxh;
 
 #[cfg(feature = "field-map")]
@@ -166,4 +167,5 @@ pub use rel_descriptor::*;
 pub use temporal::*;
 pub use types::*;
 pub use uuid::*;
+pub use value_text::*;
 pub use xxh::*;

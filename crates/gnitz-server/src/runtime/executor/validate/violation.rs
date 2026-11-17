@@ -2,6 +2,10 @@
 
 use super::*;
 
+use gnitz_wire::{
+    FixedInt, TypeCode, VALUE_TEXT_MAX, decode_opk_i64, decode_opk_u128, write_date, write_decimal, write_timestamp,
+    write_uuid,
+};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// What a key collided with.
@@ -13,25 +17,33 @@ pub(super) enum Clash {
     Committed,
 }
 
-/// A PK rendered from its OPK bytes for an error message: the per-column native
-/// values in PK-list order, comma-separated. A calendar or decimal column
-/// renders as the integer it is stored as.
-fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8]) -> String {
-    use gnitz_wire::TypeCode;
+/// A PK rendered from its OPK bytes for an error message: the per-column values
+/// in PK-list order, comma-separated, each as a client prints it. `scales` are
+/// the PK columns' DECIMAL scales, which only the catalog carries: a column
+/// past them renders at scale 0, as the integer it is stored as.
+fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8], scales: &[u8]) -> String {
+    let buf = &mut [0; VALUE_TEXT_MAX];
     let mut off = 0usize;
     schema
         .pk_columns()
-        .map(|col| {
+        .enumerate()
+        .map(|(i, col)| {
             let cell = &pk_bytes[off..off + col.size()];
             off += cell.len();
             let tc = col.type_code;
-            match gnitz_wire::FixedInt::from_type_code(tc) {
-                Some(fi) if fi.is_signed() => format!("{}", gnitz_wire::decode_opk_i64(cell, fi)),
-                Some(fi) => format!("{}", gnitz_wire::decode_opk_i64(cell, fi) as u64),
-                None => {
-                    let native = gnitz_wire::decode_opk_u128(cell, tc);
+            match (tc, FixedInt::from_type_code(tc)) {
+                (TypeCode::Date, Some(fi)) => write_date(decode_opk_i64(cell, fi), buf).to_owned(),
+                (TypeCode::Timestamp, Some(fi)) => write_timestamp(decode_opk_i64(cell, fi), buf).to_owned(),
+                (TypeCode::Decimal, Some(fi)) => {
+                    let scale = scales.get(i).copied().unwrap_or(0);
+                    write_decimal(decode_opk_i64(cell, fi), scale, buf).to_owned()
+                }
+                (_, Some(fi)) if fi.is_signed() => format!("{}", decode_opk_i64(cell, fi)),
+                (_, Some(fi)) => format!("{}", decode_opk_i64(cell, fi) as u64),
+                (_, None) => {
+                    let native = decode_opk_u128(cell, tc);
                     match tc {
-                        TypeCode::UUID => gnitz_wire::format_uuid(native),
+                        TypeCode::UUID => write_uuid(native, buf).to_owned(),
                         TypeCode::I128 => format!("{}", native as i128),
                         _ => format!("{native}"),
                     }
@@ -50,7 +62,7 @@ pub(super) fn pk_violation_err(
     pk_bytes: &[u8],
     clash: Clash,
 ) -> WireFault {
-    let key_str = format_pk_bytes(schema, pk_bytes);
+    let key_str = format_pk_bytes(schema, pk_bytes, &cat.column_scales(tid, schema.pk_cols()));
     let (sn, tn) = cat.qualified_name_or_unknown(tid);
     let cols = cat.column_names(tid, schema.pk_cols());
     let what = match clash {

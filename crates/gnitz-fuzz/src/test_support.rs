@@ -24,7 +24,7 @@ pub(crate) fn predicate() -> Vec<u8> {
 /// A scan of source 50 filtered by `predicate`, behind a scan of source 51
 /// nothing reads, encoded. The filter's input is node 0 with any one node
 /// dropped or repeated, so every item edit of the node list leaves a circuit
-/// that decodes.
+/// that decodes, but one repeating a scan: that names its source twice.
 pub(crate) fn circuit(predicate: &[u8]) -> Vec<u8> {
     let mut c = Circuit::default();
     let scan = c.input_delta(50, ReadBound::None);

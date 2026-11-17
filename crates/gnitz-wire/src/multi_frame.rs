@@ -21,8 +21,9 @@
 //! `target_id` is the view and whose `arg0`/`arg1` carry the tag and tick of the
 //! [`DeltaCursor`] to read from next. Tick 0 is never sent.
 //!
-//! The module also holds the [`DeltaCursor`] a `DELTA_POLL` item and terminal
-//! carry, and the held-ids blob of a `SYNC_PUSHED` reply ([`encode_held`]).
+//! The module also holds the delta feed's ids: the [`DeltaCursor`] a
+//! `DELTA_POLL` item and terminal carry, and the held-ids blob ([`encode_held`])
+//! of a `SYNC_PUSHED` request, a single-item verb.
 
 use crate::control::{Section, VerbShape, frame_size};
 use crate::region::Regions;

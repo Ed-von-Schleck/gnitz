@@ -760,7 +760,9 @@ refused: record again after a format change.
 
 An in-process target is a `*_fuzz` test in a `fuzz/` module beside the code it
 reaches, attached as that module's tests and benchmarks are; plain `cargo test`
-runs each for a second on random inputs. Fuzzing needs a nightly toolchain,
+runs each for a second on random inputs, except one linking `gnitz-fuzz`, which
+builds only under `cargo bolero`: its field map hooks every wire decode, and no
+test or benchmark build may carry it. Fuzzing needs a nightly toolchain,
 `cargo-afl` and `cargo-bolero`.
 
 ## Debugging failures

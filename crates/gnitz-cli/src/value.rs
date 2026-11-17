@@ -6,7 +6,9 @@ use std::fmt::Write as _;
 
 use gnitz_core::{ScanReply, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{ColType, FixedInt, FloatText, TypeCode, format_date, format_decimal, format_timestamp, format_uuid};
+use gnitz_wire::{
+    ColType, FixedInt, FloatText, TypeCode, VALUE_TEXT_MAX, write_date, write_decimal, write_timestamp, write_uuid,
+};
 
 /// One cell. Each variant keeps what its renderings need: the text a terminal
 /// shows, and the JSON type a script reads back.
@@ -89,6 +91,7 @@ fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> Value
     }
     let mut scratch = [0u8; 16];
     let b = loc.native_le_bytes(batch, row, &mut scratch);
+    let text = &mut [0; VALUE_TEXT_MAX];
     let wide = |b: &[u8]| <[u8; 16]>::try_from(b).expect("a 128-bit cell is 16 bytes");
     let int = || {
         loc.decode_i64(
@@ -105,10 +108,10 @@ fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> Value
         TypeCode::F64 => Value::F64(f64::from_le_bytes(b.try_into().expect("an F64 cell is 8 bytes"))),
         TypeCode::U128 => Value::U128(u128::from_le_bytes(wide(b))),
         TypeCode::I128 => Value::I128(i128::from_le_bytes(wide(b))),
-        TypeCode::UUID => Value::Text(format_uuid(u128::from_le_bytes(wide(b)))),
-        TypeCode::Date => Value::Text(format_date(int())),
-        TypeCode::Timestamp => Value::Text(format_timestamp(int())),
-        TypeCode::Decimal => Value::Text(format_decimal(int(), ty.scale)),
+        TypeCode::UUID => Value::Text(write_uuid(u128::from_le_bytes(wide(b)), text).to_owned()),
+        TypeCode::Date => Value::Text(write_date(int(), text).to_owned()),
+        TypeCode::Timestamp => Value::Text(write_timestamp(int(), text).to_owned()),
+        TypeCode::Decimal => Value::Text(write_decimal(int(), ty.scale, text).to_owned()),
         TypeCode::String => Value::Text(String::from_utf8_lossy(&loc.content(batch, row)).into_owned()),
         TypeCode::Blob => Value::Bytes(loc.content(batch, row).into_owned()),
     }

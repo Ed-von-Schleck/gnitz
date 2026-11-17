@@ -416,27 +416,24 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
     };
 
-    // A flag-clear word names no list at all, rejected at the decode before any
-    // count is read.
-    assert_rejects(0, "carries no packed-list flag");
     // Count out of range, rejected at the decode.
-    assert_rejects(PK_LIST_PACKED_FLAG, "at least one column"); // count 0
-    assert_rejects(PK_LIST_PACKED_FLAG | 5, "out of range 1..=4"); // count 5
-    assert_rejects(PK_LIST_PACKED_FLAG | 15, "out of range 1..=4"); // count 15
+    assert_rejects(0, "at least one column"); // count 0
+    assert_rejects(5, "out of range 1..=4"); // count 5
+    assert_rejects(15, "out of range 1..=4"); // count 15
 
     // Out-of-bounds index (index 5, only 3 columns).
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (5 << 4), "out of bounds");
+    assert_rejects(1 | (5 << 4), "out of bounds");
     // Duplicate index [0, 0]. The `(0 << N)` forms document the slot layout
     // (count=2, idx0@bit4=0, idx1@bit11=0) even though they evaluate to 0.
     #[allow(clippy::identity_op)]
-    let packed = PK_LIST_PACKED_FLAG | 2 | (0u64 << 4) | (0u64 << 11);
+    let packed = 2 | (0u64 << 4) | (0u64 << 11);
     assert_rejects(packed, "names column 0 twice");
     // Non-integer PK column (c1 is STRING).
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "only fixed-width integer");
+    assert_rejects(1 | (1 << 4), "only fixed-width integer");
     // Float PK column (c3 is F32) — floats break the byte-equal PK contract.
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (3 << 4), "only fixed-width integer");
+    assert_rejects(1 | (3 << 4), "only fixed-width integer");
     // Nullable PK column (c2 is nullable).
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (2 << 4), "must not be nullable");
+    assert_rejects(1 | (2 << 4), "must not be nullable");
 
     engine.close();
 }

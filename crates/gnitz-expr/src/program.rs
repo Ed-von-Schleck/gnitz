@@ -12,7 +12,7 @@
 use crate::calendar::CalendarOp;
 use crate::like::{LikeMatcher, LikePattern};
 use crate::{ColumnLocator, SchemaDescriptor};
-use gnitz_wire::{FixedInt, ScalarKind, TypeCode, encode_german_string};
+use gnitz_wire::{FixedInt, MAX_DECIMAL_SCALE, ScalarKind, TypeCode, encode_german_string};
 use std::fmt;
 
 /// The register file is capped at 64: the `BoolBinary` 3VL paths, the
@@ -438,8 +438,11 @@ crate::blob::expr_instrs! {
         /// is SQL `||` — NULL in either operand, NULL out.
         StrConcat = 34 { a @ A1: Reg, b @ A2: Reg, skip_null @ SEL: bool },
         /// Integer register to decimal text, read signed or unsigned per the
-        /// resolve-time U64 tracking of `a`.
-        IntToStr = 35 { a @ A1: Reg },
+        /// resolve-time U64 tracking of `a`. A non-zero `scale` reads `a` as a
+        /// signed DECIMAL of that scale and spells it as
+        /// [`gnitz_wire::write_decimal`] does; resolve refuses a scale past
+        /// [`gnitz_wire::MAX_DECIMAL_SCALE`].
+        IntToStr = 35 { a @ A1: Reg, scale @ A2: u8 },
         /// Float register to text, as [`gnitz_wire::FloatText`] spells it. `f32`: `a`
         /// holds a widened f32, spelled as that f32's shortest form.
         FloatToStr = 36 { a @ A1: Reg, f32 @ SEL: bool },
@@ -474,6 +477,10 @@ crate::blob::expr_instrs! {
         /// `col LIKE 'lit%'`: whether German-string column `col` starts with the
         /// text at `const_idx`.
         StrColPrefix = 46 { col @ A1: u32, const_idx @ A2: ConstIdx },
+        /// A temporal register to text, as [`gnitz_wire::write_timestamp`]
+        /// spells microseconds when `micros` and [`gnitz_wire::write_date`] a
+        /// DATE's day count, read at its 32-bit storage width, otherwise.
+        TemporalToStr = 47 { a @ A1: Reg, micros @ SEL: bool },
     }
 }
 
@@ -677,6 +684,11 @@ pub(crate) enum Instr {
     },
     IntToStr {
         a: IntReg,
+        scale: u8,
+    },
+    TemporalToStr {
+        a: u16,
+        micros: bool,
     },
     FloatToStr {
         a: u16,
@@ -1087,7 +1099,15 @@ impl LogicalProgram {
                     I::StrLike { src, matcher_idx }
                 }
                 L::StrConcat { a: Reg(a), b: Reg(b), skip_null } => I::StrConcat { a, b, skip_null },
-                L::IntToStr { a } => I::IntToStr { a: int_reg(a) },
+                // `scaled_bytes` asserts its scale, so a forged one stops here.
+                L::IntToStr { scale, .. } if scale > MAX_DECIMAL_SCALE => {
+                    return Err(ExprValidateErr::BadSelector {
+                        op: ExprOp::IntToStr.as_wire(),
+                        selector: scale.into(),
+                    });
+                }
+                L::IntToStr { a, scale } => I::IntToStr { a: int_reg(a), scale },
+                L::TemporalToStr { a: Reg(a), micros } => I::TemporalToStr { a, micros },
                 L::FloatToStr { a: Reg(a), f32 } => I::FloatToStr { a, f32 },
                 L::StrToInt { a: Reg(a), fi } => I::StrToInt { a, fi },
                 L::StrToFloat { a: Reg(a) } => I::StrToFloat { a },
@@ -1392,7 +1412,9 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::LoadConstStr { const_idx } => writes(WStr).with_pool(const_idx, PoolEntry::Text),
         // A NULL on every row.
         L::LoadNullStr => writes(WStr).may_null(),
-        L::IntToStr { a } | L::FloatToStr { a, f32: _ } => writes(WStr).reading(a, RVal),
+        L::IntToStr { a, scale: _ } | L::FloatToStr { a, f32: _ } | L::TemporalToStr { a, micros: _ } => {
+            writes(WStr).reading(a, RVal)
+        }
         L::StrLen { a, chars: _ } => writes(WVal(Fixed(false))).reading(a, RStr),
         // Both text→number parses yield NULL on an unparsable or out-of-range
         // value.

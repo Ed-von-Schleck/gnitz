@@ -1,15 +1,14 @@
-//! Canonical UUID text: the one format/parse pair. A UUID is stored as a `u128`.
+//! Canonical UUID text: the one write/parse pair. A UUID is stored as a `u128`.
 
-/// Render a UUID value in the canonical lowercase 8-4-4-4-12 hyphenated form.
-pub fn format_uuid(v: u128) -> String {
-    write_uuid(v, &mut [0; 36]).to_owned()
-}
+use crate::VALUE_TEXT_MAX;
 
-/// [`format_uuid`]'s text, written into `out` and borrowed from it.
-pub fn write_uuid(v: u128, out: &mut [u8; 36]) -> &str {
+/// A UUID value in the canonical lowercase 8-4-4-4-12 hyphenated form,
+/// written into `buf` and borrowed from it.
+pub fn write_uuid(v: u128, buf: &mut [u8; VALUE_TEXT_MAX]) -> &str {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     // Where each byte's two digits land: the hyphens sit at 8, 13, 18 and 23.
     const AT: [usize; 16] = [0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34];
+    let out = &mut buf[..36];
     out.fill(b'-');
     for (byte, at) in v.to_be_bytes().into_iter().zip(AT) {
         out[at] = HEX[(byte >> 4) as usize];

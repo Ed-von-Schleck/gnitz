@@ -20,7 +20,10 @@ fn a_shape_outside_the_equation_is_refused() {
             c.join([da, db], [da, other], JoinKind::Equi);
         }),
         ("a non-equi kind", |c| {
-            let deltas = [100, 200].map(|s| c.input_scattered(s, gnitz_wire::ReadBound::None, Some(Vec::new())));
+            let deltas = [100, 200].map(|s| {
+                c.input_scattered(s, gnitz_wire::ReadBound::None, Some(Vec::new()))
+                    .unwrap()
+            });
             c.join(deltas, deltas, JoinKind::Cross);
         }),
         ("a union as the output", |c| {

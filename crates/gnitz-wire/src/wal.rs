@@ -2,8 +2,9 @@
 //!
 //! A WAL block is a header of the `WAL_OFF_*` words, then the canonical region
 //! list packed end to end. A block is read only under its schema, so the header
-//! carries only what a schema cannot supply: the row count, the heap length, and
-//! an upper bound on the heap bytes no string cell references.
+//! carries only what a schema cannot supply: the total size, the row count, and
+//! an upper bound on the heap bytes no string cell references. The heap is what
+//! follows the rows' fixed regions.
 //! The dead-byte bound is the writer's claim, which an untrusting reader
 //! recomputes.
 //!
@@ -13,14 +14,13 @@
 
 use crate::{FIXED_REGION_BYTES, Reader, read_u32_le, write_u32_le};
 
-pub const WAL_HEADER_SIZE: usize = 16;
+pub const WAL_HEADER_SIZE: usize = 12;
 
 /// Total block size: header, fixed regions and heap.
 const WAL_OFF_SIZE: usize = 0;
 const WAL_OFF_ROWS: usize = 4;
-const WAL_OFF_HEAP_LEN: usize = 8;
 /// An upper bound on the heap bytes no string cell of the block references.
-const WAL_OFF_HEAP_DEAD: usize = 12;
+const WAL_OFF_HEAP_DEAD: usize = 8;
 const _: () = assert!(WAL_OFF_HEAP_DEAD + 4 == WAL_HEADER_SIZE);
 
 /// The framed size of a block over the canonical region list `regions`.
@@ -37,7 +37,6 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
     let total = WAL_HEADER_SIZE + fixed_len + heap_len;
     write_u32_le(dst, WAL_OFF_SIZE, total as u32);
     write_u32_le(dst, WAL_OFF_ROWS, rows as u32);
-    write_u32_le(dst, WAL_OFF_HEAP_LEN, heap_len as u32);
     write_u32_le(dst, WAL_OFF_HEAP_DEAD, heap_dead as u32);
     total
 }
@@ -45,10 +44,6 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
 /// Overwrite the dead-heap bound in the header of `block`, which
 /// [`parse_block`] accepts, with `heap_dead`: at most its heap's length.
 pub fn set_heap_dead(block: &mut [u8], heap_dead: usize) {
-    debug_assert!(
-        heap_dead <= read_u32_le(block, WAL_OFF_HEAP_LEN) as usize,
-        "a heap holds at most its own length dead"
-    );
     write_u32_le(block, WAL_OFF_HEAP_DEAD, heap_dead as u32);
 }
 
@@ -126,7 +121,7 @@ pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'
     }
     let mut r = Reader::new(block);
     // The header's words in layout order; the length check has seen it whole.
-    let [size, rows, heap_len, heap_dead] = [(); 4].map(|()| r.u32().expect("a whole header") as usize);
+    let [size, rows, heap_dead] = [(); 3].map(|()| r.u32().expect("a whole header") as usize);
     debug_assert_eq!(r.pos(), WAL_HEADER_SIZE);
     if size != block.len() {
         return Err("declared size is not the block's length");
@@ -135,10 +130,10 @@ pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'
         return Err("block holds no rows");
     }
     let fixed_end = rows.checked_mul(row_width).and_then(|f| f.checked_add(WAL_HEADER_SIZE));
-    let Some(fixed_end) = fixed_end.filter(|&e| e.checked_add(heap_len) == Some(size)) else {
-        return Err("block size does not match its rows and heap");
+    let Some(fixed_end) = fixed_end.filter(|&e| e <= size) else {
+        return Err("block is too short for its rows");
     };
-    if heap_dead > heap_len {
+    if heap_dead > size - fixed_end {
         return Err("block declares more dead heap than heap");
     }
     Ok(ParsedBlock {

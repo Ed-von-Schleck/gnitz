@@ -63,8 +63,11 @@ help: ## Show this help
 # Tests & quality gates
 # ---------------------------------------------------------------------------
 
+# gnitz-fuzz builds gnitz-wire with its field map, and cargo would unify that
+# feature into every crate of one build: it is tested in a build of its own.
 test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
-	cd crates && cargo test --workspace --exclude gnitz-py $(INTEGRATION) $(T)
+	cd crates && cargo test --workspace --exclude gnitz-py --exclude gnitz-fuzz $(INTEGRATION) $(T)
+	cd crates && cargo test -p gnitz-fuzz $(T)
 
 rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-store + gnitz-server tests (faster inner loop)
 	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz-server $(T)
@@ -160,7 +163,8 @@ FUZZ_DRIVER    := $(CURDIR)/crates/target/release/gnitz-fuzz
 # gives each test one while recording. A failing test fails the recording run.
 fuzz-seeds: server pyext ## Record the traffic of every test that drives a server, as fuzz seeds -> tmp/fuzz/seeds
 	rm -rf $(FUZZ)/recordings
-	cd crates && GNITZ_RECORD_FRAMES=$(FUZZ)/recordings cargo test --workspace --exclude gnitz-py $(INTEGRATION)
+	cd crates && GNITZ_RECORD_FRAMES=$(FUZZ)/recordings cargo test --workspace --exclude gnitz-py --exclude gnitz-fuzz $(INTEGRATION)
+	cd crates && GNITZ_RECORD_FRAMES=$(FUZZ)/recordings cargo test -p gnitz-fuzz
 	cd crates/gnitz-py && GNITZ_RECORD_FRAMES=$(FUZZ)/recordings GNITZ_WORKERS=4 uv run pytest tests/ -q
 	cd crates && cargo run --release -p gnitz-fuzz -- import $(FUZZ)/recordings $(FUZZ)
 
@@ -187,10 +191,11 @@ fuzz-server: ## Fuzz real servers with edited seed traffic under AFL++ (JOBS=, T
 	afl -M main
 
 # The in-process targets, each a `*_fuzz` test in the `fuzz/` module of the code
-# it reaches, as name@package@test; plain `cargo test` runs each for a second on
-# random inputs. Their inputs touch far more code than libFuzzer is built for, so
-# hit counts are left out of its features, and an input may grow to its full
-# length at once.
+# it reaches, as name@package@test. Plain `cargo test` runs program and reply for
+# a second on random inputs; traffic and hello read through gnitz-fuzz's field
+# map, so they build only under `cargo bolero`. Their inputs touch far more code
+# than libFuzzer is built for, so hit counts are left out of its features, and an
+# input may grow to its full length at once.
 FUZZ_TARGETS := traffic@gnitz@runtime::executor::fuzz::traffic_fuzz \
                 program@gnitz-expr@program::fuzz::program_fuzz \
                 reply@gnitz-core@connection::fuzz::reply_fuzz \
@@ -263,7 +268,7 @@ distclean: clean ## clean + cargo target cache + post-mortem logs
 bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs one)
 	mkdir -p tmp
 	cd crates && GNITZ_SERVER_BIN=$(abspath gnitz-server-release) TMPDIR=$(abspath tmp) \
-		cargo test --release --workspace --exclude gnitz-py --tests \
+		cargo test --release --workspace --exclude gnitz-py --exclude gnitz-fuzz --tests \
 		$(INTEGRATION) \
 		$(or $(T),_bench) \
 		-- --ignored --nocapture --test-threads=1

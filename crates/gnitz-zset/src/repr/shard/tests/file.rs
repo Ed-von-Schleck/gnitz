@@ -10,7 +10,7 @@ use gnitz_wire::{Heap, TypeCode, write_u64_le};
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (31, 2559406928089890759);
+    const PINNED: (u64, u64) = (32, 2559406928089890759);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let str = SchemaColumn::new(TypeCode::String, false);
     let schema = u64_pk_schema(&[int, int, str, str, SchemaColumn::new(TypeCode::I64, true), int, str]);

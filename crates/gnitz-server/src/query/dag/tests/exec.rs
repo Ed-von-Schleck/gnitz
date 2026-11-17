@@ -87,7 +87,7 @@ fn times(rows: &[(u64, i64, i64)], k: i64) -> HashMap<RowKey, i64> {
 // ── Ticks ───────────────────────────────────────────────────────────────────
 
 /// A tick of the base drives the whole dependent closure through real compiled
-/// plans — a side per scan of the source, a view over a view reading its
+/// plans — two sides over the source's one scan, a view over a view reading its
 /// producer's output, and a view two producers feed passing its reader both —
 /// for an insert and for the retraction a delete pushes.
 #[test]
@@ -172,7 +172,9 @@ fn join_base_with_count(base: u64, counts: u64) -> Circuit {
     // `(source, key column, payload column)`: a count's `v` is its PK.
     let deltas = [(base, 1, 0), (counts, 0, 1)].map(|(source, key, payload)| {
         let key = [(key, TypeCode::I64)];
-        let scan = circuit.input_scattered(source, ReadBound::None, Some(key.to_vec()));
+        let scan = circuit
+            .input_scattered(source, ReadBound::None, Some(key.to_vec()))
+            .unwrap();
         circuit.map_reindex(scan, &key, &[payload], NullKeys::Keep)
     });
     circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
@@ -214,7 +216,9 @@ fn join_on_v(a: u64, b: u64, distinct: bool) -> Circuit {
     let mut circuit = Circuit::default();
     let key = [(1, TypeCode::I64)];
     let deltas = [(a, distinct), (b, false)].map(|(source, distinct)| {
-        let scan = circuit.input_scattered(source, ReadBound::None, Some(key.to_vec()));
+        let scan = circuit
+            .input_scattered(source, ReadBound::None, Some(key.to_vec()))
+            .unwrap();
         let rows = match distinct {
             true => circuit.distinct(scan),
             false => scan,

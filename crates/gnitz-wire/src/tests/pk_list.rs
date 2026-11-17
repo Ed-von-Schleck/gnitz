@@ -15,36 +15,27 @@ fn a_pk_col_list_roundtrips_through_its_packed_word() {
         assert_eq!(list.as_slice(), cols);
         assert_eq!(PkColList::unpack(list.pack()), Ok(list), "{cols:?}");
     }
-    assert_eq!(PkColList::from_slice(&[3, 9]).pack(), 1 << 63 | 9 << 11 | 3 << 4 | 2);
+    assert_eq!(PkColList::from_slice(&[3, 9]).pack(), 9 << 11 | 3 << 4 | 2);
 }
 
-/// A flag-clear word names no column list, whatever its other bits say; a
-/// crafted count of zero or past the cap, a repeated column, a column no schema
-/// has and a bit outside the list's fields are refused.
+/// A crafted count of zero or past the cap, a repeated column, a column no
+/// schema has and a bit outside the list's fields are refused.
 #[test]
-fn unpack_refuses_an_untagged_word_and_a_crafted_list() {
+fn unpack_refuses_a_crafted_list() {
     use PkRule::*;
     let over = PK_LIST_MAX_COLS + 1;
     for (w, want) in [
-        (0, NotPacked),
-        (7, NotPacked),
-        (PK_LIST_PACKED_FLAG, Empty),
+        (0, Empty),
+        (over as u64, TooManyColumns { count: over, max: PK_LIST_MAX_COLS }),
+        (15, TooManyColumns { count: 15, max: PK_LIST_MAX_COLS }),
+        (2 | 1 << 4 | 1 << 11, Duplicate { col: 1 }),
         (
-            PK_LIST_PACKED_FLAG | over as u64,
-            TooManyColumns { count: over, max: PK_LIST_MAX_COLS },
-        ),
-        (
-            PK_LIST_PACKED_FLAG | 15,
-            TooManyColumns { count: 15, max: PK_LIST_MAX_COLS },
-        ),
-        (PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11, Duplicate { col: 1 }),
-        (
-            PK_LIST_PACKED_FLAG | 1 | (MAX_COLUMNS as u64) << 4,
+            1 | (MAX_COLUMNS as u64) << 4,
             IndexOutOfRange { col: MAX_COLUMNS as u32 },
         ),
-        (PK_LIST_PACKED_FLAG | 1 << 62 | 1 | 3 << 4, NonCanonical),
-        (PK_LIST_PACKED_FLAG | 1 | 3 << 4 | 1 << 11, NonCanonical),
-        (PK_LIST_PACKED_FLAG | 1 | 3 << 4 | 1 << 32, NonCanonical),
+        (1 << 63 | 1 | 3 << 4, NonCanonical),
+        (1 | 3 << 4 | 1 << 11, NonCanonical),
+        (1 | 3 << 4 | 1 << 32, NonCanonical),
     ] {
         assert_eq!(PkColList::unpack(w), Err(want), "{w:#x}");
     }

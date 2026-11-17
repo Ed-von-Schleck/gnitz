@@ -218,7 +218,9 @@ pub fn scan_routed(
     key: &[gnitz_wire::ReindexSlot],
     routed: usize,
 ) -> gnitz_wire::NodeId {
-    let scan = circuit.input_scattered(source, gnitz_wire::ReadBound::None, Some(key[..routed].to_vec()));
+    let scan = circuit
+        .input_scattered(source, gnitz_wire::ReadBound::None, Some(key[..routed].to_vec()))
+        .unwrap();
     circuit.map_reindex(scan, key, &[0], gnitz_wire::NullKeys::Keep)
 }
 
@@ -265,8 +267,8 @@ pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::Node
     let b_key = [(1, TypeCode::U64)];
     // `b` first: a backfill feeds the sources in scan order, and `a`'s rows are
     // then null-filled against a `b` that is already there.
-    let sb = c.input_scattered(b, ReadBound::None, Some(b_key.to_vec()));
-    let sa = c.input_scattered(a, ReadBound::None, Some(a_key.to_vec()));
+    let sb = c.input_scattered(b, ReadBound::None, Some(b_key.to_vec())).unwrap();
+    let sa = c.input_scattered(a, ReadBound::None, Some(a_key.to_vec())).unwrap();
     let rb = c.map_reindex(sb, &b_key, &[2], NullKeys::Drop);
     let ra = c.map_reindex(sa, &a_key, &[0, 1, 2], NullKeys::Drop);
     let all = match key == 2 {

@@ -90,8 +90,8 @@ fn a_views_roots_are_dropped_and_recomputed_with_its_view() {
     assert_eq!(engine.dag.roots_of(v2), [t2]);
 }
 
-/// A view links to each source once however many scans name it, in first-scan
-/// order. Forgetting a view drops its edges and its pending rebuild, leaves a
+/// A view links to each source once however many times its builder named it, in
+/// scan order. Forgetting a view drops its edges and its pending rebuild, leaves a
 /// sibling over the same source linked, keeps no emptied entry, and is a no-op
 /// when repeated or for an id never linked.
 #[test]

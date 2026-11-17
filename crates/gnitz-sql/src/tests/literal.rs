@@ -130,17 +130,34 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
         (F32, "1.00000005960464477539063", Ok(f32_bits(1.0))),
         // A float literal past the column's range is refused, as an integer
         // column refuses one, where it was stored as an infinity.
+        // A literal past `i128` has no exact decimal, so it is quoted as its
+        // float.
+        (F32, "1e39", Err("F32 value out of range: 1e39")),
+        (I64, "1.10", Ok(1)),
+        (I8, "-128.5", Err("I8 value out of range: -128.5")),
         (
-            F32,
-            "1e39",
-            Err("F32 value out of range: 1000000000000000000000000000000000000000"),
+            Date,
+            "123456789012345678901.5",
+            Err("123456789012345678901.5 is not a DATE value"),
+        ),
+        (I64, "DATE '2020-01-02'", Ok(D)),
+        (Date, "TIMESTAMP '2020-01-02 03:04:05.5'", Ok(D)),
+        (
+            String,
+            "DATE '2020-01-02'",
+            Err("DATE '2020-01-02' is not a STRING value"),
+        ),
+        (
+            Bool,
+            "TIMESTAMP '2020-01-02 03:04:05.5'",
+            Err("TIMESTAMP '2020-01-02 03:04:05.5' is not a BOOLEAN value"),
         ),
         (
             F32,
             U128_MAX,
             Err("F32 value out of range: 340282366920938463463374607431768211455"),
         ),
-        (F64, "1e400", Err("F64 value out of range: inf")),
+        (F64, "1e400", Err("F64 value out of range: Infinity")),
         (Date, "1.5", Err("1.5 is not a DATE value")),
         (U32, "'5'", Err("invalid U32 literal: '5'")),
         (F64, "'5'", Err("invalid F64 literal: '5'")),

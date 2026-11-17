@@ -64,31 +64,90 @@ impl WireSysFamily {
     }
 }
 
-/// Declare one system family from one field list: the
-/// [`WireSysFamily`] its [`SysFamily`] variant's [`SysFamily::def`] returns, the
-/// struct holding the cells a row stores, its payload-slot enum, and the writer
-/// and the reader, which decodes every typed cell.
+/// Declare the system families from one list in apply order: per family its
+/// [`SysFamily`] variant, the [`WireSysFamily`] [`SysFamily::def`] returns, what
+/// a row is called in a message, and the row the field list yields through
+/// `sys_row!`.
+macro_rules! sys_families {
+    (
+        $(#[$meta:meta])*
+        pub enum SysFamily;
+        $(
+            $(#[$rmeta:meta])*
+            $Variant:ident, id $id:literal, $name:literal, $noun:literal,
+            $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
+            key { $($k:ident),+ $(,)? }
+            payload { $($(#[$pmeta:meta])* $p:ident: $tc:ident),+ $(,)? }
+        )+
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SysFamily {
+            $($Variant,)+
+        }
+
+        impl SysFamily {
+            pub const COUNT: usize = [$(SysFamily::$Variant),+].len();
+
+            /// Every family, in apply order.
+            pub const ALL: [SysFamily; Self::COUNT] = [$(SysFamily::$Variant),+];
+
+            /// This family's wire identity: its table id, its name and its column
+            /// shape.
+            pub const fn def(self) -> &'static WireSysFamily {
+                match self {
+                    $(SysFamily::$Variant => {
+                        const DEF: WireSysFamily = WireSysFamily {
+                            id: $id,
+                            name: $name,
+                            cols: &[
+                                $(WireSysCol { name: stringify!($k), type_code: TypeCode::U64 },)+
+                                $(WireSysCol { name: stringify!($p), type_code: sys_row!(@tc $tc) },)+
+                            ],
+                            pk_cols: SYS_KEY_COLS.split_at([$(stringify!($k)),+].len()).0,
+                        };
+                        &DEF
+                    })+
+                }
+            }
+
+            /// What one of this family's rows is called in a message.
+            pub const fn row_noun(self) -> &'static str {
+                match self {
+                    $(SysFamily::$Variant => $noun,)+
+                }
+            }
+
+            /// The family whose table id is `id`; `None` for any other id. Two
+            /// families sharing an id would be an unreachable arm here, which the
+            /// workspace lints refuse.
+            pub const fn from_id(id: u64) -> Option<Self> {
+                match id {
+                    $($id => Some(SysFamily::$Variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        $(sys_row! {
+            $(#[$rmeta])*
+            $Variant, $Row $(<$lt>)?, $Slot -> $E,
+            key { $($k),+ }
+            payload { $($(#[$pmeta])* $p: $tc),+ }
+        })+
+    };
+}
+
+/// One system family's row: the struct holding the cells a row stores, its
+/// payload-slot enum, and the writer and the reader, which decodes every typed
+/// cell.
 macro_rules! sys_row {
     (
         $(#[$meta:meta])*
-        $id:literal, $name:literal, $Variant:ident / $fam:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
+        $Variant:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
         key { $($k:ident),+ $(,)? }
         payload { $($(#[$pmeta:meta])* $p:ident: $tc:ident),+ $(,)? }
     ) => {
-        const $fam: WireSysFamily = WireSysFamily {
-            id: $id,
-            name: $name,
-            cols: &[
-                $(WireSysCol { name: stringify!($k), type_code: TypeCode::U64 },)+
-                $(WireSysCol { name: stringify!($p), type_code: sys_row!(@tc $tc) },)+
-            ],
-            pk_cols: SYS_KEY_COLS.split_at([$(stringify!($k)),+].len()).0,
-        };
-        const _: () = assert!(
-            SysFamily::$Variant.def().id == $id,
-            concat!("SysFamily::", stringify!($Variant), " names another family's definition")
-        );
-
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct $Row $(<$lt>)? {
@@ -161,69 +220,22 @@ macro_rules! sys_row {
     (@put $s:ident, $v:expr, Blob) => { $s.put_bytes(&$v) };
 }
 
-sys_row! {
+sys_families! {
+    /// A system family. Declared in apply order — the engine applies a bundle's
+    /// families, and a boot's replay, in this order — and the discriminant is the
+    /// position, the index every per-family array on either side is laid out by.
+    pub enum SysFamily;
+
     /// One `SCHEMA_TAB` row: the schema `schema_id`, named `name`.
-    1, "schemas", Schema / SCHEMA_TAB_FAMILY, SchemaTabRow<'a>, SchemaTabSlot -> String,
+    Schema, id 1, "schemas", "schema",
+    SchemaTabRow<'a>, SchemaTabSlot -> String,
     key { schema_id }
     payload { name: String }
-}
 
-sys_row! {
-    /// One `TABLE_TAB` row.
-    2, "tables", Table / TABLE_TAB_FAMILY, TableTabRow<'a>, TableTabSlot -> String,
-    key { table_id }
-    payload {
-        schema_id: U64,
-        name: String,
-        pk_col_idx: Key,
-        /// [`TableProps::stream`].
-        stream: Bool,
-        /// [`TableProps::serial`].
-        serial: Bool,
-        /// The table is [`TableDistribution::Replicated`].
-        replicated: Bool,
-        /// A keyed table's [`TableDistribution::Keyed`] prefix length, `0` for
-        /// the full PK; `0` for a replicated table.
-        dist_prefix: U64,
-        /// [`TableProps::compress`].
-        compress: Bool,
-    }
-}
-
-sys_row! {
-    /// One `VIEW_TAB` row.
-    3, "views", View / VIEW_TAB_FAMILY, ViewTabRow<'a>, ViewTabSlot -> String,
-    key { view_id }
-    payload {
-        schema_id: U64,
-        name: String,
-        pk_col_idx: Key,
-        /// [`ViewBudget::row_words`]: `WITH (capacity = …)` in bytes, `0`
-        /// absent.
-        capacity_bytes: U64,
-        /// [`ViewBudget::row_words`]: `WITH (delta = …)` in bytes, `0` absent.
-        delta_bytes: U64,
-        /// The user view this row is an internal chain segment of; `0` is a user
-        /// view.
-        owner_view_id: U64,
-        /// Two of the view's rows may carry the same PK, or one may stand at
-        /// weight above 1, so its PK region identifies no single row. The
-        /// planner that compiled the view states it; the engine stores it
-        /// verbatim.
-        pk_repeats: Bool,
-        /// [`ViewProps::compress`].
-        compress: Bool,
-        /// The user view's body as its planner recorded it, for a client to
-        /// write the view again; the engine stores it verbatim and reads none of
-        /// it. Empty for a chain segment, and for a view no planner wrote.
-        definition: Blob,
-    }
-}
-
-sys_row! {
     /// One `COL_TAB` row: column `col_idx` of the table or view `owner_id`. The
     /// pair is a column record's identity.
-    4, "columns", Column / COL_TAB_FAMILY, ColTabRow<'a>, ColTabSlot -> String,
+    Column, id 4, "columns", "column",
+    ColTabRow<'a>, ColTabSlot -> String,
     key { owner_id, col_idx }
     payload {
         name: String,
@@ -243,11 +255,68 @@ sys_row! {
         /// [`ColType`]'s scale: a DECIMAL column's, else `0`.
         scale: U64,
     }
-}
 
-sys_row! {
+    /// `view_id`'s one `CIRCUIT_TAB` row.
+    Circuit, id 11, "circuits", "circuit",
+    CircuitRow<'a>, CircuitSlot -> std::convert::Infallible,
+    key { view_id }
+    payload {
+        /// The view's whole circuit, as [`crate::Circuit::encode`] lays it out.
+        circuit: Blob,
+    }
+
+    /// One `TABLE_TAB` row.
+    Table, id 2, "tables", "table",
+    TableTabRow<'a>, TableTabSlot -> String,
+    key { table_id }
+    payload {
+        schema_id: U64,
+        name: String,
+        pk_col_idx: Key,
+        /// [`TableProps::stream`].
+        stream: Bool,
+        /// [`TableProps::serial`].
+        serial: Bool,
+        /// The table is [`TableDistribution::Replicated`].
+        replicated: Bool,
+        /// A keyed table's [`TableDistribution::Keyed`] prefix length, `0` for
+        /// the full PK; `0` for a replicated table.
+        dist_prefix: U64,
+        /// [`TableProps::compress`].
+        compress: Bool,
+    }
+
+    /// One `VIEW_TAB` row.
+    View, id 3, "views", "view",
+    ViewTabRow<'a>, ViewTabSlot -> String,
+    key { view_id }
+    payload {
+        schema_id: U64,
+        name: String,
+        pk_col_idx: Key,
+        /// `WITH (capacity = …)` in bytes, `0` absent.
+        capacity_bytes: U64,
+        /// `WITH (delta = …)` in bytes, `0` absent.
+        delta_bytes: U64,
+        /// The user view this row is an internal chain segment of; `0` is a user
+        /// view.
+        owner_view_id: U64,
+        /// Two of the view's rows may carry the same PK, or one may stand at
+        /// weight above 1, so its PK region identifies no single row. The
+        /// planner that compiled the view states it; the engine stores it
+        /// verbatim.
+        pk_repeats: Bool,
+        /// [`ViewProps::compress`].
+        compress: Bool,
+        /// The user view's body as its planner recorded it, for a client to
+        /// write the view again; the engine stores it verbatim and reads none of
+        /// it. Empty for a chain segment, and for a view no planner wrote.
+        definition: Blob,
+    }
+
     /// One `IDX_TAB` row: the index `index_id` on columns of `owner_id`.
-    5, "indices", Index / IDX_TAB_FAMILY, IdxTabRow<'a>, IdxTabSlot -> String,
+    Index, id 5, "indices", "index",
+    IdxTabRow<'a>, IdxTabSlot -> String,
     key { index_id }
     payload {
         owner_id: U64,
@@ -257,63 +326,12 @@ sys_row! {
         /// The index enforces uniqueness.
         is_unique: Bool,
     }
-}
 
-sys_row! {
     /// One `SEQ_TAB` row.
-    7, "sequences", Sequence / SEQ_TAB_FAMILY, SeqTabRow, SeqTabSlot -> std::convert::Infallible,
+    Sequence, id 7, "sequences", "sequence",
+    SeqTabRow, SeqTabSlot -> std::convert::Infallible,
     key { seq_id }
     payload { next_val: U64 }
-}
-
-sys_row! {
-    /// `view_id`'s one `CIRCUIT_TAB` row.
-    11, "circuits", Circuit / CIRCUIT_TAB_FAMILY, CircuitRow<'a>, CircuitSlot -> std::convert::Infallible,
-    key { view_id }
-    payload {
-        /// The view's whole circuit, as [`crate::Circuit::encode`] lays it out.
-        circuit: Blob,
-    }
-}
-
-/// Declare [`SysFamily`] from one list in apply order: each variant and the
-/// [`WireSysFamily`] its [`SysFamily::def`] returns.
-macro_rules! sys_families {
-    ($(#[$meta:meta])* $($Variant:ident => $fam:ident,)+) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        pub enum SysFamily {
-            $($Variant,)+
-        }
-
-        impl SysFamily {
-            pub const COUNT: usize = [$(SysFamily::$Variant),+].len();
-
-            /// Every family, in apply order.
-            pub const ALL: [SysFamily; Self::COUNT] = [$(SysFamily::$Variant),+];
-
-            /// This family's wire identity: its table id, its name and its column
-            /// shape.
-            pub const fn def(self) -> &'static WireSysFamily {
-                match self {
-                    $(SysFamily::$Variant => &$fam,)+
-                }
-            }
-        }
-    };
-}
-
-sys_families! {
-    /// A system family. Declared in apply order — the engine applies a bundle's
-    /// families, and a boot's replay, in this order — and the discriminant is the
-    /// position, the index every per-family array on either side is laid out by.
-    Schema => SCHEMA_TAB_FAMILY,
-    Column => COL_TAB_FAMILY,
-    Circuit => CIRCUIT_TAB_FAMILY,
-    Table => TABLE_TAB_FAMILY,
-    View => VIEW_TAB_FAMILY,
-    Index => IDX_TAB_FAMILY,
-    Sequence => SEQ_TAB_FAMILY,
 }
 
 impl SysFamily {
@@ -334,48 +352,7 @@ impl SysFamily {
     pub const fn name(self) -> &'static str {
         self.def().name
     }
-
-    /// What one of this family's rows is called in a message.
-    pub const fn row_noun(self) -> &'static str {
-        match self {
-            SysFamily::Schema => "schema",
-            SysFamily::Table => "table",
-            SysFamily::View => "view",
-            SysFamily::Column => "column",
-            SysFamily::Index => "index",
-            SysFamily::Sequence => "sequence",
-            SysFamily::Circuit => "circuit",
-        }
-    }
-
-    /// The family whose table id is `id`; `None` for any other id.
-    pub const fn from_id(id: u64) -> Option<Self> {
-        let mut i = 0;
-        while i < Self::COUNT {
-            if Self::ALL[i].id() == id {
-                return Some(Self::ALL[i]);
-            }
-            i += 1;
-        }
-        None
-    }
 }
-
-// No two families share an id.
-const _: () = {
-    let mut i = 0;
-    while i < SysFamily::COUNT {
-        let mut j = 0;
-        while j < i {
-            assert!(
-                SysFamily::ALL[j].id() != SysFamily::ALL[i].id(),
-                "two system families share an id"
-            );
-            j += 1;
-        }
-        i += 1;
-    }
-};
 
 /// A system family's key columns are a prefix of these: its leading one or two,
 /// each a `U64`.
@@ -584,7 +561,32 @@ pub struct ViewParts {
     pub pk_repeats: bool,
 }
 
-impl ViewTabRow<'_> {
+impl<'a> ViewTabRow<'a> {
+    /// The row for view `view_id`: [`Self::parts`]'s inverse.
+    pub fn of(
+        view_id: u64,
+        schema_id: u64,
+        name: impl Into<std::borrow::Cow<'a, str>>,
+        pk_col_idx: PkColList,
+        parts: ViewParts,
+        definition: impl Into<std::borrow::Cow<'a, [u8]>>,
+    ) -> Self {
+        debug_assert_ne!(parts.owner, Some(0), "owner 0 is a user view's word");
+        let (capacity_bytes, delta_bytes) = parts.props.budget.row_words();
+        ViewTabRow {
+            view_id,
+            schema_id,
+            name: name.into(),
+            pk_col_idx,
+            capacity_bytes,
+            delta_bytes,
+            owner_view_id: parts.owner.unwrap_or(0),
+            pk_repeats: parts.pk_repeats,
+            compress: parts.props.compress,
+            definition: definition.into(),
+        }
+    }
+
     /// The row's words beyond its name and key, decoded and held to the rule that
     /// a chain segment, which the planner mints, carries no `WITH` option.
     pub fn parts(&self) -> Result<ViewParts, String> {
@@ -666,7 +668,7 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
 
 /// Version of the compiled expression-program blob `gnitz-expr` lays out, folded
 /// into [`SYS_SCHEMA_DIGEST`].
-pub const EXPR_BLOB_VERSION: u8 = 8;
+pub const EXPR_BLOB_VERSION: u8 = 9;
 
 // ---------------------------------------------------------------------------
 // Object-id ranges

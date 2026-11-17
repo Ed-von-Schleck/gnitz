@@ -65,9 +65,9 @@ fn decode_rejects_malformed() {
     }
     // The column list's own rules are `PkColList`'s; one shows the
     // decode routes the word through it.
-    let mut untagged = good.clone();
-    untagged[..8].copy_from_slice(&1u64.to_le_bytes());
-    assert!(dec(&untagged).unwrap_err().contains("packed-list flag"));
+    let mut empty = good.clone();
+    empty[..8].copy_from_slice(&0u64.to_le_bytes());
+    assert!(dec(&empty).unwrap_err().contains("at least one column"));
 }
 
 #[test]

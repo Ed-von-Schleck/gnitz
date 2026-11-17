@@ -1354,15 +1354,54 @@ fn string_producers_answer_their_reference_rows() {
             "U64 to text",
             vec![int(TypeCode::U64, [u64::MAX as i64, 0])],
             vec![],
-            |r| vec![L::IntToStr { a: r[0] }],
+            |r| vec![L::IntToStr { a: r[0], scale: 0 }],
             vec![Some("18446744073709551615"), Some("0")],
         ),
         (
             "I64 to text",
             vec![i64s([i64::MIN, -7])],
             vec![],
-            |r| vec![L::IntToStr { a: r[0] }],
+            |r| vec![L::IntToStr { a: r[0], scale: 0 }],
             vec![Some("-9223372036854775808"), Some("-7")],
+        ),
+        // A DECIMAL keeps exactly `scale` fractional digits and every digit of
+        // its i64, which an f64 detour would not.
+        (
+            "DECIMAL to text",
+            vec![int(TypeCode::Decimal, [110, -5, i64::MIN, 0])],
+            vec![],
+            |r| vec![L::IntToStr { a: r[0], scale: 2 }],
+            vec![Some("1.10"), Some("-0.05"), Some("-92233720368547758.08"), Some("0.00")],
+        ),
+        (
+            "DATE to text",
+            vec![int(TypeCode::Date, [19_723, -719_893])],
+            vec![],
+            |r| vec![L::TemporalToStr { a: r[0], micros: false }],
+            vec![Some("2024-01-01"), Some("-001-01-01")],
+        ),
+        // A day count is read at its 32-bit storage width, so a register past
+        // it spells the date of its low half rather than overflowing.
+        (
+            "DATE to text past i32",
+            vec![i64s([i64::MAX])],
+            vec![],
+            |r| vec![L::TemporalToStr { a: r[0], micros: false }],
+            vec![Some("1969-12-31")],
+        ),
+        (
+            "TIMESTAMP to text",
+            vec![int(
+                TypeCode::Timestamp,
+                [1_704_110_400_500_000, 1_704_110_400_000_000, -1],
+            )],
+            vec![],
+            |r| vec![L::TemporalToStr { a: r[0], micros: true }],
+            vec![
+                Some("2024-01-01 12:00:00.5"),
+                Some("2024-01-01 12:00:00"),
+                Some("1969-12-31 23:59:59.999999"),
+            ],
         ),
     ];
     for (label, cols, consts, mk, want) in rows {

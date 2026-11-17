@@ -4,6 +4,8 @@
 //! those counts and a civil date, and the text forms each type parses from and
 //! prints as.
 
+use crate::VALUE_TEXT_MAX;
+
 pub const MICROS_PER_SEC: i64 = 1_000_000;
 pub const MICROS_PER_MIN: i64 = 60 * MICROS_PER_SEC;
 pub const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MIN;
@@ -115,23 +117,84 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     join_micros(days, h as u32, mi as u32, sec as u32, micros as u32)
 }
 
-/// A day count as `YYYY-MM-DD`: [`parse_date`]'s inverse.
-pub fn format_date(days: i64) -> String {
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
+/// A day count as `YYYY-MM-DD`, [`parse_date`]'s inverse, written into `buf`
+/// and borrowed from it. The count is read at a DATE's 32-bit storage width, so
+/// a wider one spells the date of its low half. The year is at least four
+/// characters wide, a sign included (`-001` is the year before year 0).
+pub fn write_date(days: i64, buf: &mut [u8; VALUE_TEXT_MAX]) -> &str {
+    std::str::from_utf8(date_bytes(days, buf)).expect("digits, hyphens")
+}
+
+/// [`write_date`]'s ASCII bytes, unvalidated for a per-row caller that stores
+/// bytes.
+pub fn date_bytes(days: i64, buf: &mut [u8; VALUE_TEXT_MAX]) -> &[u8] {
+    let n = put_date(buf, i64::from(days as i32));
+    &buf[..n]
 }
 
 /// A microsecond count as `YYYY-MM-DD HH:MM:SS`, with the fraction only as
-/// long as it needs to be: [`parse_timestamp`]'s inverse.
-pub fn format_timestamp(micros: i64) -> String {
+/// long as it needs to be, [`parse_timestamp`]'s inverse, written into `buf`
+/// and borrowed from it.
+pub fn write_timestamp(micros: i64, buf: &mut [u8; VALUE_TEXT_MAX]) -> &str {
+    std::str::from_utf8(timestamp_bytes(micros, buf)).expect("digits and separators")
+}
+
+/// [`write_timestamp`]'s ASCII bytes, unvalidated for a per-row caller that
+/// stores bytes.
+pub fn timestamp_bytes(micros: i64, buf: &mut [u8; VALUE_TEXT_MAX]) -> &[u8] {
     let (days, h, mi, s, us) = split_micros(micros);
-    let mut out = format!("{} {h:02}:{mi:02}:{s:02}", format_date(days));
+    let mut n = put_date(buf, days);
+    buf[n] = b' ';
+    n = put2(buf, n + 1, h);
+    buf[n] = b':';
+    n = put2(buf, n + 1, mi);
+    buf[n] = b':';
+    n = put2(buf, n + 1, s);
     if us != 0 {
-        let frac = format!("{us:06}");
-        out.push('.');
-        out.push_str(frac.trim_end_matches('0'));
+        buf[n] = b'.';
+        n = put_digits(buf, n + 1, us.into(), 6);
+        while buf[n - 1] == b'0' {
+            n -= 1;
+        }
     }
-    out
+    &buf[..n]
+}
+
+/// `YYYY-MM-DD` of `days` at the head of `buf`; returns its length. Every day
+/// count an `i32` or a [`split_micros`] of an `i64` yields fits.
+fn put_date(buf: &mut [u8], days: i64) -> usize {
+    let (y, m, d) = civil_from_days(days);
+    let mut n = 0;
+    if y < 0 {
+        buf[0] = b'-';
+        n = 1;
+    }
+    // Four characters wide with the sign, as `{y:04}` pads.
+    n = put_digits(buf, n, y.unsigned_abs(), 4 - n);
+    buf[n] = b'-';
+    n = put2(buf, n + 1, m);
+    buf[n] = b'-';
+    put2(buf, n + 1, d)
+}
+
+/// `v`, below 100, as two digits at `buf[at..]`; returns the index past them.
+fn put2(buf: &mut [u8], at: usize, v: u32) -> usize {
+    debug_assert!(v < 100);
+    buf[at..at + 2].copy_from_slice(&[b'0' + (v / 10) as u8, b'0' + (v % 10) as u8]);
+    at + 2
+}
+
+/// `v`'s decimal digits at `buf[at..]`, zero-padded to at least `width`;
+/// returns the index past the last.
+fn put_digits(buf: &mut [u8], at: usize, v: u64, width: usize) -> usize {
+    let len = v.checked_ilog10().map_or(1, |l| l as usize + 1);
+    let end = at + len.max(width);
+    let mut v = v;
+    for slot in buf[at..end].iter_mut().rev() {
+        *slot = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    end
 }
 
 /// A microsecond count as `(days, hour, minute, second, microsecond)`, the

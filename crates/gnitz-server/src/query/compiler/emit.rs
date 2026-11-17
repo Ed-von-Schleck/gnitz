@@ -30,7 +30,7 @@ pub(super) struct EmitCtx<'a> {
     /// or, for a base table's store, the scan's its re-key reads. A clamp's
     /// integral is its own history, read through the clamp.
     pub(super) integrals: Vec<Option<(Integral, DeltaReg, Option<ClampKind>)>>,
-    /// Each scanned source's scan, once per source, in first-scan order.
+    /// Each scanned source's scan, in the circuit's node order.
     pub(super) sources: Vec<(u64, Scan)>,
     /// The view, whose store is the integral of its output node's register.
     view: u64,
@@ -284,13 +284,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
         OpNode::ScanDelta { source: tid, bound, .. } => {
             let relation = ctx.meta.source(*tid);
             let schema = relation.schema();
-            // One epoch seeds one delta, and one backfill cursor feeds every scan of it.
             let read = payload_read(ctx.circuit, nid, &schema);
-            if let Some((_, scan)) = ctx.sources.iter_mut().find(|(s, _)| s == tid) {
-                scan.bound = ReadBound::None;
-                scan.read |= read;
-                return Ok(scan.reg);
-            }
             let seed = ctx.prog.seed(schema);
             let route = ctx.meta.source_route(*tid);
             // The share or the relay round routes each row by its key's columns.
@@ -301,13 +295,12 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
                 Some(r) => (seed, Some(r.clone())),
                 None => (seed, None),
             };
-            let bound = bound.clone();
             ctx.sources.push((
                 *tid,
                 Scan {
                     seed,
                     reg,
-                    bound,
+                    bound: bound.clone(),
                     relay,
                     read: read | routed_by,
                 },

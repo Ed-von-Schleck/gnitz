@@ -95,8 +95,8 @@ fn rekeyed_join(c: &mut Circuit, key: &[ReindexSlot], distinct: bool, kind: Join
         JoinKind::Range { .. } => key[..key.len() - 1].to_vec(),
         _ => key.to_vec(),
     };
-    let mut a = c.input_scattered(10, ReadBound::None, Some(routed(key)));
-    let b = c.input_scattered(11, ReadBound::None, Some(routed(&b_key)));
+    let mut a = c.input_scattered(10, ReadBound::None, Some(routed(key))).unwrap();
+    let b = c.input_scattered(11, ReadBound::None, Some(routed(&b_key))).unwrap();
     if distinct {
         a = c.distinct(a);
     }
@@ -688,7 +688,7 @@ fn a_scan_reads_the_columns_its_readers_name() {
             0b10001,
         ),
         (
-            "two scans of one source",
+            "one source named twice by the builder",
             |c| {
                 let x = scan(c, 10);
                 let x = map_copy(c, x, &[(1, I64)]);

@@ -370,8 +370,9 @@ fn indexed_predicates_bound_the_backfill_scan() {
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE other = 5 GROUP BY g", &[]),
         (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", &["[2]"]),
         (&on_ind, "SELECT g FROM t WHERE ind = 5 EXCEPT SELECT val FROM u", &["[2]"]),
-        // Each scan carries its bound; the engine drops a twice-scanned source's.
-        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", &["[2]", "[2]"]),
+        // A source's one scan keeps a bound its readers share and widens differing ones.
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", &[]),
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT other FROM t WHERE ind = 5", &["[2]"]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", &["pk set 1"]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk BETWEEN 1 AND 9 GROUP BY g", &["pk range"]),
         // An index keeps the backfill over a PK range.

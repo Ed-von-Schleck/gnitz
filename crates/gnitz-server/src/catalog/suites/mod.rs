@@ -26,8 +26,7 @@ use std::fs;
 
 use gnitz_store::relation::{ChildKind, IndexClaim, Relation, RelationKind, SecondaryIndex, StoreConfig, relation_dir};
 use gnitz_wire::{
-    CatalogColumn, Circuit, ColTabRow, NullKeys, PK_LIST_PACKED_FLAG, PkColList, SysRow, TableTabRow, TypeCode,
-    ViewTabRow, payload_u64,
+    CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, SysRow, TableTabRow, TypeCode, ViewTabRow, payload_u64,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 

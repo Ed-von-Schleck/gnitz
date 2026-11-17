@@ -36,6 +36,8 @@ categories = ["database-implementations"]
 # not let a crate layer on top of the shared one.
 [workspace.lints.rust]
 warnings = "deny"
+# `cargo bolero` builds a fuzz target with `--cfg fuzzing`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.cargo]
 unused_dependencies = "deny"

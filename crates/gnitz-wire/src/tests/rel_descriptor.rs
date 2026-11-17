@@ -59,9 +59,9 @@ fn each_decode_guard_rejects_its_own_forgery() {
         // The list's own rules are `PkColList`'s; one shows the decode
         // routes the word through it.
         (
-            "untagged index list",
+            "empty index list",
             forge(&|b| crate::write_u64_le(b, ix, 0)),
-            "column list word carries no packed-list flag",
+            "column list must name at least one column",
         ),
         ("is_unique byte 2", forge(&|b| b[ix + 8] = 2), "neither 0 nor 1"),
     ];

@@ -36,7 +36,7 @@ use routing::ViewMeta;
 /// program, exchanges included.
 pub(super) struct CompileOutput {
     pub(in crate::query) vm: Vm,
-    /// Each scanned source's scan, once per source, in first-scan order.
+    /// Each scanned source's scan, in the circuit's node order.
     sources: Box<[(u64, Scan)]>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Replay>,
@@ -51,7 +51,7 @@ impl CompileOutput {
         }
     }
 
-    /// The relations the circuit scans, each once, in first-scan order.
+    /// The relations the circuit scans, each once, in the circuit's node order.
     pub(in crate::query) fn source_ids(&self) -> impl Iterator<Item = u64> {
         self.sources.iter().map(|&(source, _)| source)
     }

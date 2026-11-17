@@ -131,7 +131,7 @@ impl RecvBuf {
 
     /// `bytes` as a frame charged to a budget of its own, which nothing else
     /// draws on.
-    #[cfg(test)]
+    #[cfg(all(test, fuzzing))]
     pub(crate) fn detached(bytes: &[u8]) -> RecvBuf {
         let charge = Budget::new(bytes.len())
             .charge(bytes.len())
@@ -978,6 +978,6 @@ mod tests;
 #[path = "benches/conn.rs"]
 mod bench;
 
-#[cfg(test)]
+#[cfg(all(test, fuzzing))]
 #[path = "fuzz/conn.rs"]
 mod fuzz;

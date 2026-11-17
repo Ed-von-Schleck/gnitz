@@ -9,9 +9,10 @@ fn traffic() -> Vec<Frame> {
 /// Every edit of a frame's insides, at every pick and in every mode, leaves
 /// the other frames as they were. An integer edit changes the bytes of one
 /// field or cell alone; an edit that keeps lengths true leaves a frame that
-/// decodes as deep as it did. A text edit is held to its blocks and strings
-/// alone: the string it rewrote may no longer decode as the circuit it held,
-/// and that circuit's node list is then not read.
+/// decodes as deep as it did, but a repeated scan: a circuit naming one source
+/// twice is refused, and its node list then not read. A text edit is held to
+/// its blocks and strings alone: the string it rewrote may no longer decode as
+/// the circuit it held, and that circuit's node list is then not read.
 #[test]
 fn every_edit_changes_only_what_it_picks() {
     let traffic = traffic();
@@ -46,6 +47,11 @@ fn every_edit_changes_only_what_it_picks() {
                     Kind::Text => {
                         let (blocks, _, strings) = depth(&Anatomy::of(after));
                         assert_eq!((blocks, strings), (a.blocks.len(), a.strings.len()), "{pick} {how}");
+                    }
+                    Kind::RepeatItem => {
+                        let (blocks, lists, strings) = depth(&Anatomy::of(after));
+                        assert_eq!((blocks, strings), (a.blocks.len(), a.strings.len()), "{pick} {how}");
+                        assert!(lists + 1 >= a.lists.len(), "{pick} {how}: {lists} lists");
                     }
                     _ => assert_eq!(depth(&Anatomy::of(after)), depth(&a), "{kind:?} {pick} {how}"),
                 }

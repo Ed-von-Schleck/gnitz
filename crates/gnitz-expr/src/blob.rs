@@ -178,6 +178,16 @@ impl Field for ConstIdx {
     }
 }
 
+/// A byte-wide operand; a word past 255 is outside its domain.
+impl Field for u8 {
+    fn put(self, w: &mut [u32; INSTR_WORDS], at: usize) {
+        w[at] = self.into();
+    }
+    fn get(w: &[u32; INSTR_WORDS], at: usize) -> Option<Self> {
+        u8::try_from(w[at]).ok()
+    }
+}
+
 /// A two-member family's word, 0 or 1.
 impl Field for bool {
     fn put(self, w: &mut [u32; INSTR_WORDS], at: usize) {

@@ -74,7 +74,7 @@ fn a_zero_row_block_is_refused() {
 }
 
 /// Every guard, against the block that trips it — including every one-bit
-/// forgery of every header word, and of `ROWS` by one row.
+/// forgery of every header word, and of `ROWS` by one row more.
 #[test]
 fn each_guard_rejects_its_forgery() {
     let clean = encode_dead(&slices(&fixture()), 0);
@@ -84,7 +84,7 @@ fn each_guard_rejects_its_forgery() {
         write_u32_le(&mut buf, off, v);
         buf
     };
-    let mismatch = "block size does not match its rows and heap";
+    let short = "block is too short for its rows";
     let not_its_length = "declared size is not the block's length";
     let mut overlong = clean.clone();
     overlong.push(0);
@@ -102,7 +102,7 @@ fn each_guard_rejects_its_forgery() {
             Some(not_its_length),
         ),
         ("a trailing byte".into(), overlong, Some(not_its_length)),
-        ("one row fewer".into(), forged(WAL_OFF_ROWS, &|r| r - 1), Some(mismatch)),
+        ("one row too many".into(), forged(WAL_OFF_ROWS, &|r| r + 1), Some(short)),
     ];
     for bit in 0..32 {
         let flip = |off| forged(off, &|v| v ^ (1 << bit));
@@ -110,10 +110,9 @@ fn each_guard_rejects_its_forgery() {
         let rows_err = if ROWS ^ (1 << bit) == 0 {
             "block holds no rows"
         } else {
-            mismatch
+            short
         };
         cases.push((format!("ROWS bit {bit}"), flip(WAL_OFF_ROWS), Some(rows_err)));
-        cases.push((format!("HEAP_LEN bit {bit}"), flip(WAL_OFF_HEAP_LEN), Some(mismatch)));
         // A dead-byte bound within the heap is a legitimate claim.
         let dead_err = ((1usize << bit) > heap_len).then_some("block declares more dead heap than heap");
         cases.push((format!("HEAP_DEAD bit {bit}"), flip(WAL_OFF_HEAP_DEAD), dead_err));
@@ -153,10 +152,9 @@ fn the_block_layout_is_pinned_byte_for_byte() {
 
     #[rustfmt::skip]
     let want: &[u8] = &[
-        // Header: SIZE, ROWS, HEAP_LEN, HEAP_DEAD, each u32 LE.
-        (16 + 2 * ROW + LONG.len()) as u8, 0, 0, 0,
+        // Header: SIZE, ROWS, HEAP_DEAD, each u32 LE.
+        (12 + 2 * ROW + LONG.len()) as u8, 0, 0, 0,
         2, 0, 0, 0,
-        LONG.len() as u8, 0, 0, 0,
         0, 0, 0, 0,
         // PK: the I16 sign-flipped and big-endian, then the U8.
         0x7F, 0xFE, 0x03, 0x81, 0x02, 0x06,

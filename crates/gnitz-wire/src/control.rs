@@ -207,6 +207,8 @@ pub fn encode_frame_head(out: &mut [u8], hdr: &ControlHeader, blob: &[u8], has_d
 /// Decode the control header at the front of the whole frame `data`, and locate
 /// the blocks behind it.
 pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
+    // A header cut short is refused before any word is read, so a field map of
+    // it holds no field.
     if data.len() < CTRL_HEADER_SIZE {
         return Err("control header truncated".into());
     }
