@@ -3,7 +3,6 @@
 //! request on its way.
 
 use std::sync::{Arc, Mutex};
-use std::task::Poll;
 
 use pyo3::prelude::*;
 
@@ -150,12 +149,12 @@ enum Reply {
     Converted(PyResult<Py<PyAny>>, bool),
 }
 
-/// The reply in `slot` if it has arrived, taken out to be converted; `None`
-/// once it is.
-fn arrived(slot: &Mutex<Reply>) -> Poll<Option<Result<Unconverted, ClientError>>> {
+/// The reply in `slot` if it has arrived, taken out to be converted, or
+/// `Some(None)` once it is; `None` while it is on its way.
+fn arrived(slot: &Mutex<Reply>) -> Option<Option<Result<Unconverted, ClientError>>> {
     match &mut *lock(slot) {
-        Reply::Waiting(sent) => sent.try_take().map_or(Poll::Pending, |reply| Poll::Ready(Some(reply))),
-        Reply::Converted(..) => Poll::Ready(None),
+        Reply::Waiting(sent) => sent.try_take().map(Some),
+        Reply::Converted(..) => Some(None),
     }
 }
 
@@ -164,17 +163,10 @@ fn arrived(slot: &Mutex<Reply>) -> Poll<Option<Result<Unconverted, ClientError>>
 /// leaves the reply waiting, for the next to take up.
 fn land(py: Python<'_>, client: &Py<PyClient>, slot: &Mutex<Reply>) -> PyResult<()> {
     let reply = match arrived(slot) {
-        Poll::Ready(reply) => reply,
-        Poll::Pending => client.get().blocking(|blocking| {
-            blocking.call(py, async |c| {
-                loop {
-                    if let Poll::Ready(reply) = arrived(slot) {
-                        break Ok::<_, ClientError>(reply);
-                    }
-                    c.turn().await?;
-                }
-            })
-        })?,
+        Some(reply) => reply,
+        None => client
+            .get()
+            .blocking(|blocking| blocking.call(py, async |c| c.until(|| arrived(slot)).await))?,
     };
     if let Some(reply) = reply {
         let converted = reply.map_err(client_err).and_then(|convert| convert(py));

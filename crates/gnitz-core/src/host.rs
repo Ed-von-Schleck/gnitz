@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, Waker};
 
 use crate::client::GnitzClient;
 use crate::error::ClientError;
@@ -172,12 +172,11 @@ impl<T> Future for Pending<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        loop {
-            if let Some(reply) = this.sent.try_take() {
-                return Poll::Ready(reply);
-            }
-            ready!(this.client.session.turn(&mut *this.client.host, cx))?;
-        }
+        let sent = &mut this.sent;
+        this.client
+            .session
+            .poll_until(&mut *this.client.host, cx, |_| sent.try_take())
+            .map(Result::flatten)
     }
 }
 

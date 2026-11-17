@@ -1090,6 +1090,7 @@ fn a_held_poll_leaves_its_client_free() {
     assert!(t0.elapsed() < RELEASED, "the commit released the poll");
     let report = block_on(fx.mirror().finish_sync(synced))
         .expect("the second half")
+        .take()
         .mirrored;
     assert_eq!(report.len(), 2, "one entry per view: {report:?}");
     assert_advanced(&report);
@@ -1101,6 +1102,7 @@ fn a_held_poll_leaves_its_client_free() {
     let synced = block_on(fx.mirror().wait(synced));
     let report = block_on(fx.mirror().finish_sync(synced))
         .expect("the second half")
+        .take()
         .mirrored;
     assert_eq!(report.len(), 1, "{report:?}");
     assert_eq!(report[0].view_id, keyed);

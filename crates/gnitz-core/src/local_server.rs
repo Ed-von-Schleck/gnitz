@@ -17,8 +17,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use gnitz_foundation::log::READY_LINE;
+use gnitz_foundation::posix_io::ScratchDir;
 use gnitz_foundation::process::{await_log, default_env, die_with_parent, log_tail};
-use tempfile::TempDir;
 
 /// The server's binary name.
 pub const SERVER: &str = "gnitz-server";
@@ -46,7 +46,7 @@ const LOG_TAIL_LINES: usize = 20;
 pub struct LocalServer {
     child: Child,
     /// The socket, the log and a throwaway server's data; `None` once stopped.
-    scratch: Option<TempDir>,
+    scratch: Option<ScratchDir>,
     socket: PathBuf,
     data_dir: PathBuf,
     /// The server's stderr, in the scratch directory.
@@ -58,10 +58,7 @@ impl LocalServer {
     /// `data_dir` where one is given and in the scratch directory otherwise,
     /// and return once it serves.
     pub fn start(bin: &Path, data_dir: Option<&Path>, workers: u32) -> Result<Self, String> {
-        let scratch = tempfile::Builder::new()
-            .prefix("gnitz-")
-            .tempdir()
-            .map_err(|e| format!("cannot create a scratch directory: {e}"))?;
+        let scratch = ScratchDir::new("gnitz-").map_err(|e| format!("cannot create a scratch directory: {e}"))?;
         let socket = scratch.path().join("gnitz.sock");
         let log_path = scratch.path().join("server.log");
         let log = fs::File::create(&log_path).map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;

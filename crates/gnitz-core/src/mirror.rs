@@ -36,12 +36,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, ScanReply, Session, Target};
+use crate::connection::{DeltaCursor, RawBlock, RelDescriptor, ScanReply, Session, Target};
+use crate::ddl::DdlBundle;
 use crate::error::ClientError;
 use crate::host::{BoxFut, Host, Pending, Sent, offload};
 use crate::{RelName, Schema, ZSetBatch};
 use gnitz_wire::multi_frame::{DeltaPollItem, SubId, kept_as};
-use gnitz_wire::{RELTAB_PAY_NAME, RelClass, SysFamily, WireStatus, payload_str};
+use gnitz_wire::{RelClass, WireStatus};
 
 // ---------------------------------------------------------------------------
 // The store
@@ -172,7 +173,7 @@ struct MirroredView {
     /// Whether its copy was read whole and no caller has been handed the
     /// [`PollResult::Reseeded`] yet. Cleared only by [`MirrorState::report`],
     /// so an interrupt that discards a report re-announces it next poll; set
-    /// again for a report handed back unclaimed.
+    /// again for one in a [`crate::Delivery`] dropped untaken.
     owed_reseed: bool,
 }
 
@@ -334,11 +335,11 @@ impl MirrorState {
         self.views.keys().map(failed).collect()
     }
 
-    /// Owe each view `outcomes` reports reseeded, and still registered, its
+    /// Owe each view of `view_ids` still registered its
     /// [`PollResult::Reseeded`] again.
-    pub(crate) fn owe_reseeds(&mut self, outcomes: &[PollOutcome]) {
-        for o in outcomes.iter().filter(|o| o.result.reseeded()) {
-            if let Some(view) = self.views.get_mut(&o.view_id) {
+    pub(crate) fn owe_reseeds(&mut self, view_ids: &[u64]) {
+        for id in view_ids {
+            if let Some(view) = self.views.get_mut(id) {
                 view.owed_reseed = true;
             }
         }
@@ -601,46 +602,50 @@ impl GnitzClient {
         // each step's blocks as they come.
         let mut ended: Vec<usize> = Vec::new();
         let mut due: Vec<(u64, Vec<RawBlock>, DeltaCursor)> = Vec::new();
-        while let Some((i, polled)) = poll.next(host).await? {
-            let tid = tids[i];
-            let end = match polled {
-                // What follows a block the store refused goes nowhere.
-                Polled::Block(_) if failed.is_some() => None,
-                Polled::Block(b) => {
-                    blocks.push(b);
-                    None
-                }
-                Polled::End(end) => Some(end),
-            };
-            match (froms[i], end) {
-                // A copy read whole takes each step's blocks before the
-                // session reads on, and is erased by the first of them.
-                (None, end) => {
-                    let sealed_at = end.as_ref().and_then(|end| end.as_ref().ok().copied());
-                    if failed.is_none()
-                        && (sealed_at.is_some() || end.is_none() && poll.drained() && !blocks.is_empty())
-                    {
-                        // Owed from here: the job erases the copy whether or not this call
-                        // lives to see it end.
-                        let open = match std::mem::replace(&mut opened, true) {
-                            true => None,
-                            false => views.get_mut(&tid).map(|v| {
-                                v.owed_reseed = true;
-                                (v.name.clone(), Arc::clone(&v.desc))
-                            }),
-                        };
-                        let taken = std::mem::take(&mut blocks);
-                        let fill = move |s: &mut dyn MirrorStore| {
-                            if let Some((name, desc)) = open {
-                                s.refill(&name, &desc)?;
-                            }
-                            let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
-                            s.fill(tid, &taken, sealed_at)
-                        };
-                        failed = store.clone().run(host, fill).await?.err();
+        loop {
+            while poll.at < tids.len() {
+                let (i, tid) = (poll.at, tids[poll.at]);
+                let id = kept_as(first, i);
+                let end = match poll.session.take_reading(id) {
+                    Some(read) => {
+                        blocks.extend(read);
+                        None
                     }
-                    if let Some(end) = end {
-                        blocks.clear();
+                    None => Some(poll.session.take_pushed(id).map(|(read, next)| {
+                        blocks.extend(read);
+                        next
+                    })),
+                };
+                let sealed_at = end.as_ref().and_then(|end| end.as_ref().ok().copied());
+                // A copy read whole takes each step's blocks before the session
+                // reads on, and is erased by the first of them. What follows a
+                // block the store refused goes nowhere.
+                if froms[i].is_none() && failed.is_none() && (sealed_at.is_some() || !blocks.is_empty()) {
+                    // Owed from here: the job erases the copy whether or not this call
+                    // lives to see it end.
+                    let open = match std::mem::replace(&mut opened, true) {
+                        true => None,
+                        false => views.get_mut(&tid).map(|v| {
+                            v.owed_reseed = true;
+                            (v.name.clone(), Arc::clone(&v.desc))
+                        }),
+                    };
+                    let taken = std::mem::take(&mut blocks);
+                    let fill = move |s: &mut dyn MirrorStore| {
+                        if let Some((name, desc)) = open {
+                            s.refill(&name, &desc)?;
+                        }
+                        let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
+                        s.fill(tid, &taken, sealed_at)
+                    };
+                    failed = store.clone().run(host, fill).await?.err();
+                }
+                let Some(end) = end else {
+                    // The item is still being read.
+                    break;
+                };
+                match (froms[i], end) {
+                    (None, end) => {
                         opened = false;
                         let read = match (failed.take(), end) {
                             (Some(e), _) | (None, Err(e)) => Err(e),
@@ -653,18 +658,16 @@ impl GnitzClient {
                         }
                         done.push((tid, read));
                     }
+                    (Some(_), Ok(next)) => {
+                        ended.push(i);
+                        due.push((tid, std::mem::take(&mut blocks), next));
+                    }
+                    (Some(_), Err(e)) => done.push((tid, Err(e))),
                 }
-                (Some(_), None) => {}
-                (Some(_), Some(Ok(next))) => {
-                    ended.push(i);
-                    due.push((tid, std::mem::take(&mut blocks), next));
-                }
-                (Some(_), Some(Err(e))) => {
-                    blocks.clear();
-                    done.push((tid, Err(e)));
-                }
+                blocks.clear();
+                poll.at += 1;
             }
-            if poll.drained() && !due.is_empty() {
+            if !due.is_empty() {
                 let advanced = store.clone().advance(host, std::mem::take(&mut due)).await?;
                 for (i, advanced) in ended.drain(..).zip(advanced) {
                     let tid = tids[i];
@@ -676,6 +679,10 @@ impl GnitzClient {
                     done.push((tid, advanced));
                 }
             }
+            if poll.at == tids.len() {
+                break;
+            }
+            poll_fn(|cx| poll.session.turn(host, cx)).await?;
         }
         Ok(done)
     }
@@ -801,33 +808,26 @@ impl GnitzClient {
             .await
     }
 
-    /// After this client's own DDL `families` committed: drop the copy of every
-    /// view it retracted, except a mirrored view it also wrote back — a rename —
-    /// which is rebound under its new name.
-    pub(crate) async fn ddl_committed(&mut self, families: &[(SysFamily, ZSetBatch)]) {
+    /// After this client's own `bundle` committed, for each view it retracted:
+    /// a mirrored view the bundle wrote back under a new name is rebound under
+    /// it; the copy of every other is dropped.
+    pub(crate) async fn ddl_committed(&mut self, bundle: &DdlBundle) {
         let Some(m) = self.mirror.as_deref() else {
             return;
         };
-        let Some((_, b)) = families.iter().find(|(family, _)| *family == SysFamily::View) else {
-            return;
-        };
-        let vid = |i| gnitz_wire::sys_leading_id(b.pks.get_bytes(i));
+        let moved = bundle.views_moved();
         let mut dropped: Vec<u64> = Vec::new();
         let mut renamed = Vec::new();
-        for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
-            let written_back = m
-                .views
-                .get(&v)
-                .and_then(|view| Some((view, b.live_rows().find(|&j| vid(j) == v)?)));
-            match written_back {
-                Some((view, j)) => renamed.push(MirroredView {
-                    name: payload_str(b, j, RELTAB_PAY_NAME)
-                        .ok()
-                        .and_then(|new| view.name.sibling(&new).ok())
+        for (v, new) in moved {
+            match (m.views.get(&v), new) {
+                (Some(view), Some(new)) => renamed.push(MirroredView {
+                    name: view
+                        .name
+                        .sibling(&new)
                         .expect("a bundle this client built names its views"),
                     ..view.clone()
                 }),
-                None => dropped.push(v),
+                _ => dropped.push(v),
             }
         }
         for v in dropped {
@@ -994,20 +994,24 @@ impl GnitzClient {
     }
 }
 
-/// A delta poll in flight: `items` in one request, handed out as each item's
-/// blocks and then its one end, the items in order. Dropping it drops what is
-/// left of its trains. A subscription it kept, item `i` as `kept_as(first, i)`,
-/// is its caller's only once recorded where the next sync names it from.
+/// A delta poll in flight: `items` in one request, item `i` parked in the
+/// session as `kept_as(first, i)` and taken in order. Dropping it releases
+/// every item not yet taken whole, which drops what is left of its train. A
+/// subscription it kept is its caller's only once recorded where the next
+/// sync names it from.
 struct DeltaPoll<'s> {
     session: &'s mut Session,
-    /// Ends handed out so far: the index of the item being answered.
-    answered: usize,
+    first: SubId,
+    /// The item being answered: every one before it was taken whole.
+    at: usize,
     items: usize,
 }
 
 impl Drop for DeltaPoll<'_> {
     fn drop(&mut self) {
-        self.session.abandon_poll();
+        for i in self.at..self.items {
+            self.session.release(kept_as(self.first, i));
+        }
     }
 }
 
@@ -1015,27 +1019,11 @@ impl<'s> DeltaPoll<'s> {
     /// Poll `items`, item `i` kept as the subscription `kept_as(first, i)`.
     fn start(session: &'s mut Session, first: SubId, items: &[DeltaPollItem]) -> Self {
         session.submit_delta_poll(first, items);
-        DeltaPoll { session, answered: 0, items: items.len() }
-    }
-
-    /// Everything the last step queued has been handed out.
-    fn drained(&self) -> bool {
-        self.session.polled_out()
-    }
-
-    /// The next block or end, with its item's index; `None` once every item
-    /// has ended. `Err` is the host's alone.
-    async fn next(&mut self, host: &mut dyn Host) -> Result<Option<(usize, Polled)>, ClientError> {
-        loop {
-            if let Some(next) = self.session.next_polled() {
-                let item = self.answered;
-                self.answered += matches!(next, Polled::End(_)) as usize;
-                return Ok(Some((item, next)));
-            }
-            if self.answered == self.items {
-                return Ok(None);
-            }
-            poll_fn(|cx| self.session.turn(host, cx)).await?;
+        DeltaPoll {
+            session,
+            first,
+            at: 0,
+            items: items.len(),
         }
     }
 }

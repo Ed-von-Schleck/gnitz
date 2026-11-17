@@ -41,13 +41,13 @@ __all__ = ["AsyncGnitzClient", "connect"]
 async def _claimed(delivery: "asyncio.Future[Any]") -> Synced:
     """What `AsyncGnitzClient.sync` returns: its delivery is taken when the
     awaiting task resumes. A task cancelled after the answer arrived resumes
-    with `CancelledError` instead, and hands the delivery back for the next
-    sync."""
+    with `CancelledError` instead, and drops the delivery at once, so the next
+    sync reports its reseeds again."""
     try:
         reply = await delivery
     except asyncio.CancelledError:
         if delivery.done() and not delivery.cancelled() and delivery.exception() is None:
-            delivery.result().hand_back()
+            delivery.result().release()
         raise
     taken: Synced = reply.take()
     return taken

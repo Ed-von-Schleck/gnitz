@@ -17,7 +17,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
-use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Sent, serve};
+use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Sent, serve, sync_op};
 
 use crate::client::{Convert, Mode, PyClient, VerbOp, resolve_target, whole};
 use crate::reply::{none, synced};
@@ -198,7 +198,8 @@ impl Drop for Owed {
 }
 
 /// A sync's [`Delivery`], from the step that finished the sync to the task
-/// that awaits it. Dropped untaken, the delivery goes back to the client.
+/// that awaits it. Dropped untaken, the delivery hands its reseeds back to the
+/// client.
 #[pyclass(name = "_SyncDelivery", frozen, module = "gnitz._native")]
 struct SyncDelivery(Mutex<Option<Delivery>>);
 
@@ -209,16 +210,16 @@ fn delivered(py: Python<'_>, delivery: Delivery) -> PyResult<Py<PyAny>> {
 
 #[pymethods]
 impl SyncDelivery {
-    /// The sync's result, taken once.
+    /// The sync's result, taken once. Its trains decode with the GIL released.
     fn take(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match lock(&self.0).take() {
-            Some(delivery) => synced(py, delivery.take()),
+            Some(delivery) => synced(py, py.detach(|| delivery.take())),
             None => Err(client_err(ClientError::Closed)),
         }
     }
 
-    /// Hand the delivery back untaken: the next sync reports it.
-    fn hand_back(&self) {
+    /// Drop the delivery untaken, so the next sync reports its reseeds again.
+    fn release(&self) {
         drop(lock(&self.0).take());
     }
 }
@@ -380,26 +381,16 @@ impl LoopCore {
     /// finished, and its `Delivery` goes to the loop future, held by a
     /// `_SyncDelivery`. What this
     /// returns is `gnitz.aio._claimed` over that future: the awaiting task takes
-    /// the delivery when it resumes. A delivery never taken (its future
-    /// cancelled, or its task cancelled after the answer arrived) goes back
-    /// to the client, and the next sync reports it.
+    /// the delivery when it resumes. What the sync brought a reader stays
+    /// with the client until a delivery is taken; a delivery never taken (its
+    /// future cancelled, or its task cancelled after the answer arrived) hands
+    /// its reseeds back, and the next sync reports them.
     pub(crate) fn sync(&self, py: Python<'_>, wait: Duration) -> PyResult<Py<PyAny>> {
         let delivery = self.queue(py, |owed| {
-            Box::new(move |client| {
-                Box::pin(async move {
-                    // The step that reads the answer queues the rest, and
-                    // the `serve` loop takes it up before it waits again.
-                    client.begin_sync(wait).then(move |reply| {
-                        let shared = Arc::clone(&owed.shared);
-                        let rest: Op = Box::new(move |client| {
-                            Box::pin(async move {
-                                let synced = client.finish_sync(reply).await.map(|s| client.delivery(s));
-                                owed.land(synced.map_err(client_err), delivered);
-                            })
-                        });
-                        shared.state().queue.push_back(rest);
-                    })
-                })
+            let shared = Arc::clone(&owed.shared);
+            let requeue = move |rest| shared.state().queue.push_back(rest);
+            sync_op(wait, requeue, move |synced| {
+                owed.land(synced.map_err(client_err), delivered)
             })
         })?;
         static CLAIMED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();

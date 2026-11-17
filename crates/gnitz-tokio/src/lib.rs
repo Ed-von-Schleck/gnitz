@@ -7,7 +7,9 @@ use std::os::fd::OwnedFd;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use gnitz_core::{BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced, promise, serve};
+use gnitz_core::{
+    BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced, promise, serve, sync_op,
+};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::mpsc;
 
@@ -155,18 +157,21 @@ impl AsyncClient {
     /// [`GnitzClient::sync`], leaving the client to the handle's other calls
     /// while the server holds the reply.
     ///
-    /// Cancel-safe: a sync dropped before it has its answer leaves what it
-    /// would have taken for the next sync, and one dropped later hands its
-    /// [`Delivery`](gnitz_core::Delivery) back.
+    /// Cancel-safe: a sync dropped at any point is still finished when its
+    /// answer arrives, and what it brought a reader's subscriptions stays with
+    /// the client for the next sync, with the reseeds of its
+    /// [`Delivery`](gnitz_core::Delivery). An outstanding sync keeps the
+    /// [`Connection`] serving until its answer arrives.
     pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
-        let reply = self
-            .run(move |c| Box::pin(std::future::ready(c.begin_sync(wait))))
-            .await?
-            .await;
-        let delivery = self
-            .run(move |c| Box::pin(async move { c.finish_sync(reply).await.map(|s| c.delivery(s)) }))
-            .await??;
-        Ok(delivery.take())
+        let (mut to, sent) = promise();
+        let tx = self.tx.clone();
+        let requeue = move |rest| {
+            let _ = tx.send(rest);
+        };
+        let _ = self
+            .tx
+            .send(sync_op(wait, requeue, move |delivery| to.fulfil(delivery)));
+        Ok(sent.await?.take())
     }
 }
 

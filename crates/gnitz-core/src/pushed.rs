@@ -2,15 +2,16 @@
 //! subscribe, then sync, which answers with the view's deltas since and
 //! advances every mirrored view.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::Schema;
 use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, RawBlock, ScanReply, SubId, Target};
+use crate::connection::{DeltaCursor, Held, RawBlock, ScanReply, SubId, Target, park, untaken};
 use crate::error::ClientError;
-use crate::host::Sent;
+use crate::host::{Op, Sent};
 use crate::mirror::PollOutcome;
 use gnitz_wire::multi_frame::kept_as;
 
@@ -23,38 +24,95 @@ pub struct Pushed {
     pub result: Result<(ScanReply, DeltaCursor), ClientError>,
 }
 
-/// A sync's [`Synced`], on its way to a caller who may be gone. Dropped
-/// untaken, it goes back to its client: the next sync reports it in front of
-/// what that one brings, and is not held. Each subscription's rows come before
-/// the next sync's, under that sync's cursor, and an end is reported once; a
-/// view reported [`PollResult::Reseeded`](crate::PollResult::Reseeded) is
-/// reported so again by the next sync that advances it. An
-/// [`GnitzClient::unsubscribe`] made after the hand-back drops what it holds
-/// for that id.
+/// A sync's [`Synced`], on its way to a caller who may be gone. What syncs
+/// brought a reader's subscriptions stays with the client until a delivery is
+/// taken, and a sync while any of it waits is not held. Taking one hands over
+/// each subscription's rows so far, in arrival order under the newest cursor,
+/// and an end once. Dropped untaken, a delivery hands back only its reseeds:
+/// a view it reports [`PollResult::Reseeded`](crate::PollResult::Reseeded) is
+/// reported so again by the next sync that advances it.
 pub struct Delivery {
-    synced: Option<Synced>,
-    back: Arc<Mutex<Vec<Synced>>>,
+    /// `None` once taken.
+    mirrored: Option<Vec<PollOutcome>>,
+    received: Arc<Mutex<Received>>,
 }
 
 impl Delivery {
     pub fn take(mut self) -> Synced {
-        self.synced.take().expect("a delivery is taken once")
+        let mirrored = self.mirrored.take().unwrap_or_default();
+        // Moved out under the lock and decoded after it, so a large train
+        // never holds up the client's own use of `received`.
+        let taken: Vec<_> = {
+            let mut received = lock(&self.received);
+            let mut taken = Vec::with_capacity(received.readers.len());
+            received.readers.retain(|&sub, Reader { schema, held }| {
+                let result = match held {
+                    Ok((blocks, cursor)) => Ok((Arc::clone(schema), std::mem::take(blocks), *cursor)),
+                    Err(why) => Err(why.clone()),
+                };
+                let kept = result.is_ok();
+                taken.push((sub, result));
+                kept
+            });
+            taken
+        };
+        let pushed: Vec<Pushed> = taken
+            .into_iter()
+            .map(|(sub, taken)| Pushed {
+                sub,
+                result: taken.and_then(|(schema, blocks, cursor)| {
+                    let batch = decode_wal_blocks(blocks.iter().map(RawBlock::block), &schema)?;
+                    Ok((ScanReply { schema, batch, lsn: None }, cursor))
+                }),
+            })
+            .collect();
+        // A train that does not decode ends its subscription, as an end does.
+        let mut received = lock(&self.received);
+        for p in pushed.iter().filter(|p| p.result.is_err()) {
+            received.readers.remove(&p.sub);
+        }
+        drop(received);
+        Synced { pushed, mirrored }
     }
 }
 
 impl Drop for Delivery {
     fn drop(&mut self) {
-        if let Some(synced) = self.synced.take() {
-            self.back.lock().unwrap_or_else(PoisonError::into_inner).push(synced);
+        if let Some(mirrored) = self.mirrored.take() {
+            let reseeded = mirrored.iter().filter(|o| o.result.reseeded()).map(|o| o.view_id);
+            lock(&self.received).reseeded.extend(reseeded);
         }
     }
+}
+
+/// What a reader's subscriptions were brought and not yet handed over, shared
+/// by a client and its [`Delivery`]s.
+#[derive(Default)]
+pub(crate) struct Received {
+    /// Each of a reader's subscriptions by id, in the order they were made.
+    readers: BTreeMap<SubId, Reader>,
+    /// The views reported reseeded by deliveries dropped untaken, owed their
+    /// report again by the next sync.
+    reseeded: Vec<u64>,
+}
+
+struct Reader {
+    /// The layout its trains decode under.
+    schema: Arc<Schema>,
+    held: Held,
+}
+
+fn lock(received: &Mutex<Received>) -> MutexGuard<'_, Received> {
+    received.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// What one sync brought a client.
 #[must_use]
 pub struct Synced {
-    /// One entry for each subscription [`GnitzClient::subscribe`] made, in
-    /// the order they were made.
+    /// One entry for each subscription [`GnitzClient::subscribe`] made and
+    /// held when the delivery was taken, in the order they were made. A
+    /// delivery taken late carries the trains of syncs since, under the
+    /// newest cursor.
     pub pushed: Vec<Pushed>,
     /// One entry for each mirrored view, at the id it is mirrored under now.
     pub mirrored: Vec<PollOutcome>,
@@ -77,21 +135,21 @@ impl GnitzClient {
             .session
             .submit_delta_read(view.into(), from, reply_schema, spec, Some(id));
         let (rows, cursor) = self.wait(sent).await?;
-        self.readers.insert(id, Arc::clone(reply_schema));
+        let schema = Arc::clone(reply_schema);
+        let held = Ok((Vec::new(), cursor));
+        lock(&self.received).readers.insert(id, Reader { schema, held });
         Ok((id, rows, cursor))
     }
 
     /// End subscription `id`: no sync reports it again. The next sync tells
-    /// the server, and drops what was pushed for `id` until then. An id this
-    /// client does not hold is ignored.
+    /// the server, and drops what was pushed for `id` until then, taken by a
+    /// sync or not. An id this client does not hold is ignored.
     pub fn unsubscribe(&mut self, id: SubId) {
         // A mirror's subscription ids come from the same counter, so only a
         // reader's id is released.
-        if self.readers.remove(&id).is_some() {
+        if lock(&self.received).readers.remove(&id).is_some() {
             self.session.release(id);
         }
-        self.reclaim();
-        self.unclaimed.retain(|p| p.sub != id);
     }
 
     /// Bring every subscription of this connection, a reader's and a
@@ -106,98 +164,67 @@ impl GnitzClient {
         if let Err(e @ ClientError::Interrupted(_)) = synced {
             return Err(e);
         }
-        self.finish_sync(synced).await
+        self.finish_sync(synced).await.map(Delivery::take)
     }
 
     /// The first half of [`Self::sync`]: its request, sent. The client is free
     /// until the answer arrives: a request made meanwhile is answered while the
     /// server holds the sync, and leaves it held.
     pub fn begin_sync(&mut self, wait: Duration) -> Sent<()> {
-        self.reclaim();
-        let wait = if self.unclaimed.is_empty() {
-            wait
-        } else {
-            Duration::ZERO
+        let (wait, readers) = {
+            let mut received = lock(&self.received);
+            if let Some(m) = self.mirror.as_deref_mut() {
+                m.owe_reseeds(&received.reseeded);
+            }
+            received.reseeded.clear();
+            let untaken = received.readers.values().any(|r| untaken(&r.held));
+            let held = received.readers.iter().filter(|(_, r)| r.held.is_ok());
+            let held: Vec<SubId> = held.map(|(&id, _)| id).collect();
+            (if untaken { Duration::ZERO } else { wait }, held)
         };
         let (wait, mirrored) = self.mirror_hold(wait);
-        let held: Vec<SubId> = self.readers.keys().copied().chain(mirrored).collect();
+        let held: Vec<SubId> = readers.into_iter().chain(mirrored).collect();
         self.session.submit_sync(&held, wait)
     }
 
     /// The second half of [`Self::sync`], given the reply to the first's
     /// request. A sync that failed is the end of every subscription.
     ///
-    /// What it takes from the client is the caller's alone: a driver whose
-    /// caller may be gone by the time it completes hands it over as a
-    /// [`Self::delivery`].
-    pub async fn finish_sync(&mut self, synced: Result<(), ClientError>) -> Result<Synced, ClientError> {
-        self.reclaim();
+    /// What the sync brought a reader's subscriptions stays with the client
+    /// until the [`Delivery`] is taken.
+    pub async fn finish_sync(&mut self, synced: Result<(), ClientError>) -> Result<Delivery, ClientError> {
         let mirrored = self.advance_mirror(&synced).await?;
-        let mut pushed = self.drain_readers(&synced);
-        put_in_front(std::mem::take(&mut self.unclaimed), &mut pushed);
-        Ok(Synced { pushed, mirrored })
-    }
-
-    /// `synced`, on its way to a caller who may be gone: see [`Delivery`].
-    pub fn delivery(&self, synced: Synced) -> Delivery {
-        Delivery {
-            synced: Some(synced),
-            back: Arc::clone(&self.returned),
-        }
-    }
-
-    /// Take up what dropped [`Delivery`]s handed back, in the order they were
-    /// dropped.
-    fn reclaim(&mut self) {
-        let returned = std::mem::take(&mut *self.returned.lock().unwrap_or_else(PoisonError::into_inner));
-        for Synced { mut pushed, mirrored } in returned {
-            if let Some(m) = self.mirror.as_deref_mut() {
-                m.owe_reseeds(&mirrored);
+        let GnitzClient { session, received, .. } = self;
+        for (&sub, reader) in &mut lock(received).readers {
+            // An ended one keeps its end until a delivery reports it.
+            if reader.held.is_ok() {
+                park(&mut reader.held, synced.clone().and_then(|()| session.take_pushed(sub)));
             }
-            put_in_front(std::mem::take(&mut self.unclaimed), &mut pushed);
-            // Rows-free entries carry nothing the next sync's cursor does not.
-            pushed.retain(|p| p.result.as_ref().map_or(true, |(rows, _)| !rows.batch.is_empty()));
-            self.unclaimed = pushed;
         }
-    }
-
-    /// Take what was pushed for each of a reader's subscriptions, and let go
-    /// of the ones that ended.
-    fn drain_readers(&mut self, synced: &Result<(), ClientError>) -> Vec<Pushed> {
-        let GnitzClient { session, readers, .. } = self;
-        let mut pushed = Vec::with_capacity(readers.len());
-        readers.retain(|&sub, schema| {
-            let taken = synced.clone().and_then(|()| session.take_pushed(sub));
-            let result = taken.and_then(|(blocks, cursor)| {
-                let batch = decode_wal_blocks(blocks.iter().map(RawBlock::block), schema)?;
-                let schema = Arc::clone(schema);
-                Ok((ScanReply { schema, batch, lsn: None }, cursor))
-            });
-            let held = result.is_ok();
-            pushed.push(Pushed { sub, result });
-            held
-        });
-        pushed
+        Ok(Delivery {
+            mirrored: Some(mirrored),
+            received: Arc::clone(received),
+        })
     }
 }
 
-/// Put the deliveries of an earlier sync, `earlier`, in front of a later one's,
-/// `later`: a subscription's rows before the later sync's under its cursor,
-/// and an end that sync no longer reports kept. A subscription `later` does
-/// not report and that had not ended was let go of since.
-fn put_in_front(earlier: Vec<Pushed>, later: &mut Vec<Pushed>) {
-    for Pushed { sub, result } in earlier {
-        match (result, later.iter_mut().find(|p| p.sub == sub)) {
-            (Ok((first, _)), Some(Pushed { result: Ok((rows, _)), .. })) => {
-                let next = std::mem::replace(&mut rows.batch, first.batch);
-                rows.batch.extend_from_owned(next);
-            }
-            // The later end stands: the reader reads again from the cursor
-            // it was last handed, which is before these rows.
-            (Ok(_), _) => {}
-            (Err(end), Some(p)) => p.result = Err(end),
-            (Err(end), None) => later.push(Pushed { sub, result: Err(end) }),
-        }
-    }
-    later.sort_by_key(|p| p.sub);
+/// A sync as one queued call of a [`serve`](crate::serve) loop: its request
+/// goes out, and the rest, finishing it and handing the [`Delivery`] to
+/// `land`, is queued with `requeue` from wherever the answer arrives; `serve`
+/// takes it up before it waits again. The sync is finished whether or not its
+/// caller is still there; a delivery nobody takes hands back its reseeds, and
+/// what the sync brought a reader stays with the client until one is taken.
+pub fn sync_op(
+    wait: Duration,
+    requeue: impl FnOnce(Op) + Send + 'static,
+    land: impl FnOnce(Result<Delivery, ClientError>) + Send + 'static,
+) -> Op {
+    Box::new(move |client| {
+        client.begin_sync(wait).then(move |reply| {
+            requeue(Box::new(move |client| {
+                Box::pin(async move { land(client.finish_sync(reply).await) })
+            }))
+        });
+        Box::pin(std::future::ready(()))
+    })
 }

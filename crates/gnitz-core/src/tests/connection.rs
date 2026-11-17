@@ -433,32 +433,27 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
             s.step(Interest::READ);
         }
         assert_eq!(s.is_closed(), !refused);
-        let ends: Vec<PollEnd> = std::mem::take(&mut s.inbox.polls.queue)
-            .into_iter()
-            .map(|polled| match polled {
-                Polled::End(end) => end,
-                Polled::Block(_) => panic!("no view sent a block"),
-            })
-            .collect();
-        assert_eq!(ends.len(), 3, "one end per view: {ends:?}");
-        assert!(ends[0].is_ok(), "{ends:?}");
-        for end in &ends[1..] {
-            match end {
+        assert!(matches!(s.take_pushed(sub_id(1)), Ok((b, _)) if b.is_empty()));
+        for i in (1..3).map(|i| kept_as(sub_id(1), i)) {
+            assert!(s.take_reading(i).is_none(), "view {i} ended");
+            match s.take_pushed(i) {
                 Err(ClientError::Refused(f)) => assert!(refused && f.text == "refused"),
                 Err(ClientError::ConnectionLost(_)) => assert!(!refused),
                 other => panic!("{other:?}"),
             }
+            let gone = s.take_pushed(i).expect_err("ended once");
+            assert!(gone.to_string().contains("not held"), "{gone:?}");
         }
     }
 }
 
-/// A poll whose reader is gone hands nothing on: its trains are read off the
-/// socket and dropped, and the next poll's results are the queue's alone.
+/// A poll whose ids are released parks nothing: its trains are read off the
+/// socket and dropped, and only the next poll's are parked.
 #[test]
-fn an_abandoned_poll_queues_nothing() {
+fn a_released_poll_parks_nothing() {
     let (mut s, peer) = pair();
     s.submit_delta_poll(sub_id(1), &[delta_item(7)]);
-    s.abandon_poll();
+    s.release(sub_id(1));
     s.submit_delta_poll(sub_id(2), &[delta_item(8)]);
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
@@ -468,12 +463,63 @@ fn an_abandoned_poll_queues_nothing() {
     }
     peer.send_bytes(&wire);
     step_until_idle(&mut s);
-    let Some(Polled::Block(block)) = s.next_polled() else {
-        panic!("the live poll's block comes first");
-    };
-    assert_eq!(decode_wal_block(block.block(), &schema_a()).unwrap(), batch_a(&[8]));
-    assert!(matches!(s.next_polled(), Some(Polled::End(Ok(_)))));
-    assert!(s.polled_out());
+    assert!(
+        s.take_reading(sub_id(1)).is_none(),
+        "nothing parked for the released poll"
+    );
+    assert!(
+        s.take_pushed(sub_id(1)).is_err(),
+        "nothing parked for the released poll"
+    );
+    let (blocks, _) = s.take_pushed(sub_id(2)).expect("the next poll's train is held");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(decode_wal_block(blocks[0].block(), &schema_a()).unwrap(), batch_a(&[8]));
+    assert!(!s.inbox.polls.untaken());
+}
+
+/// A train pushed in the same read as a poll's terminal joins the train the
+/// item is held with: its blocks behind the poll's, and its cursor.
+#[test]
+fn a_train_pushed_behind_a_polls_terminal_joins_it() {
+    let (mut s, peer) = pair();
+    s.submit_delta_poll(sub_id(3), &[delta_item(7)]);
+    s.step(Interest::WRITE);
+    peer.recv();
+    let mut wire = framed(&delta_frame(7, Some(&batch_a(&[1])), None));
+    wire.extend(framed(&delta_terminal(7, 1, 9)));
+    wire.extend(pushed_train(7, sub_id(3), &batch_a(&[2]), Ok((1, 11))));
+    peer.send_bytes(&wire);
+    step_until_idle(&mut s);
+    let (blocks, at) = s.take_pushed(sub_id(3)).expect("the item is held");
+    let rows: Vec<ZSetBatch> = blocks
+        .iter()
+        .map(|b| decode_wal_block(b.block(), &schema_a()).unwrap())
+        .collect();
+    assert_eq!((rows, at), (vec![batch_a(&[1]), batch_a(&[2])], cursor(11)));
+}
+
+/// A train in progress hands out its blocks so far, and once its id is
+/// released the rest of it and what is pushed for the id are dropped.
+#[test]
+fn a_poll_released_mid_train_drops_the_rest() {
+    let (mut s, peer) = pair();
+    s.submit_delta_poll(sub_id(3), &[delta_item(7)]);
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&delta_frame(7, Some(&batch_a(&[1])), None));
+    s.step(Interest::READ);
+    assert_eq!(s.take_reading(sub_id(3)).map(|b| b.len()), Some(1), "its block so far");
+    s.release(sub_id(3));
+    let after = s.submit(COMMIT);
+    let mut wire = framed(&delta_frame(7, Some(&batch_a(&[2])), None));
+    wire.extend(framed(&delta_terminal(7, 1, 9)));
+    wire.extend(pushed_train(7, sub_id(3), &batch_a(&[3]), Ok((1, 11))));
+    wire.extend(framed(&reply_ctrl(0, 1)));
+    peer.send_bytes(&wire);
+    assert_eq!(await_reply(&mut s, after).unwrap(), 1);
+    assert!(!s.is_closed());
+    assert!(s.take_reading(sub_id(3)).is_none() && s.take_pushed(sub_id(3)).is_err());
+    assert!(!s.inbox.polls.untaken(), "nothing parked");
 }
 
 /// A read of view 7's delta feed after `(tag 1, tick 4)`.
@@ -791,7 +837,9 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     peer.recv();
     peer.send(&delta_terminal(7, 1, 9));
     s.step(Interest::READ);
-    s.abandon_poll();
+    // The reader took view 7's train, and went before 8's.
+    assert!(s.take_reading(first).is_none() && s.take_pushed(first).is_ok());
+    s.release(kept_as(first, 1));
     assert_eq!(s.requests_sent(), 1, "the poll alone");
     let mut bytes = framed(&delta_terminal(8, 1, 9));
     bytes.extend(pushed_train(8, kept_as(first, 1), &batch_a(&[1]), Ok((1, 11))));
@@ -809,7 +857,7 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     await_reply(&mut s, synced).unwrap();
     let gone = s.take_pushed(first).expect_err("nobody named it");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
-    assert!(s.polled_out() && !s.inbox.polls.untaken());
+    assert!(!s.inbox.polls.untaken());
 }
 
 #[test]

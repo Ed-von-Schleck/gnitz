@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gnitz_wire::{
     Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IdxTabRow, IdxTabSlot, KeyRange, PkColList,
     RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, ReadBound, ReadSpec, SchemaTabRow, SchemaTabSlot, SysFamily, SysRow,
-    TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, payload_bytes, payload_u64,
+    TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, payload_bytes, payload_str, payload_u64,
 };
 
 use crate::catalog::{CATALOG_FAMILIES, Catalog, IndexRow, idx_rows};
@@ -142,7 +142,7 @@ pub enum ColumnChange<'a> {
 
 /// The rows of one DDL transaction: one batch per system family it writes.
 #[derive(Default)]
-struct DdlBundle(Vec<(SysFamily, ZSetBatch)>);
+pub(crate) struct DdlBundle(Vec<(SysFamily, ZSetBatch)>);
 
 impl DdlBundle {
     /// `family`'s batch, opened on first use — so a family nothing wrote to has
@@ -181,6 +181,27 @@ impl DdlBundle {
             }
         }
         ids
+    }
+
+    /// Each view the bundle retracts, with the name it writes it back under
+    /// — a rename — or `None` — a drop.
+    pub(crate) fn views_moved(&self) -> Vec<(u64, Option<String>)> {
+        let Some((_, b)) = self.0.iter().find(|(family, _)| *family == SysFamily::View) else {
+            return Vec::new();
+        };
+        let vid = |i| gnitz_wire::sys_leading_id(b.pks.get_bytes(i));
+        (0..b.len())
+            .filter(|&i| b.weights[i] < 0)
+            .map(vid)
+            .map(|v| {
+                let new = b.live_rows().find(|&j| vid(j) == v).map(|j| {
+                    payload_str(b, j, RELTAB_PAY_NAME)
+                        .expect("a bundle this client built names its views")
+                        .into_owned()
+                });
+                (v, new)
+            })
+            .collect()
     }
 
     /// Whether `other` holds the same live rows, family for family.
@@ -405,7 +426,7 @@ impl GnitzClient {
         self.ack(Request::DdlTxn(&bundle.0)).await?;
         let written = bundle.relations_written();
         self.kept.retain(|_, rel| !written.contains(&rel.tid));
-        self.ddl_committed(&bundle.0).await;
+        self.ddl_committed(&bundle).await;
         Ok(())
     }
 
@@ -581,61 +602,67 @@ impl GnitzClient {
     }
 
     /// Retire every named relation of `family` in **one** DDL zone: the whole set
-    /// goes or none does, and a name repeated in `names` retires once.
+    /// goes or none does, and a name repeated in `names` retires once. Every name
+    /// is looked up in one cut of SCHEMA_TAB, TABLE_TAB and VIEW_TAB, matched as
+    /// RESOLVE matches it: the live schema row by name, then the live relation row
+    /// by schema id and name.
     ///
-    /// `if_exists` answers a name that does not resolve, and nothing else: a name
-    /// that resolves to another family, a dependent view and an FK child outside
-    /// the batch all still fail the statement.
+    /// `if_exists` answers a name that does not resolve — its schema missing
+    /// included — and nothing else: a name held by the other family, a dependent
+    /// view and an FK child outside the batch all still fail the statement.
+    /// Without it, a missing schema is refused as a missing schema.
     async fn drop_relations(
         &mut self,
         family: SysFamily,
         names: &[RelName],
         if_exists: bool,
     ) -> Result<(), ClientError> {
+        // Nothing to look up, or a transaction `commit_ddl` refuses: no cut.
+        if names.is_empty() || self.txn.is_some() {
+            return self.commit_ddl(DdlBundle::default()).await;
+        }
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let [schemas, tables, views] = self
+            .sys_cut([SysFamily::Schema, SysFamily::Table, SysFamily::View], &all)
+            .await?;
         let mut b = DdlBundle::default();
         for (k, name) in names.iter().enumerate() {
             // RelName compares by its folded `schema.name`, so a repeat spelled
-            // differently is still a repeat.
+            // differently is still a repeat; the cut would find its row again.
             if names[..k].contains(name) {
                 continue;
             }
-            match self.relation_retraction(family, name).await? {
-                Some((scanned, i)) => b.retract(family, &scanned, i),
+            let Some(sid) = live_schema_id(&schemas, name.schema()) else {
+                if if_exists {
+                    continue;
+                }
+                return Err(not_found("schema", name.schema()));
+            };
+            let held = [(SysFamily::Table, &tables), (SysFamily::View, &views)]
+                .into_iter()
+                .find_map(|(f, rows)| {
+                    rows.live_rows()
+                        .find(|&i| {
+                            payload_u64(rows, i, RELTAB_PAY_SCHEMA_ID) == sid
+                                && payload_bytes(rows, i, RELTAB_PAY_NAME) == name.name().as_bytes()
+                        })
+                        .map(|i| (f, rows, i))
+                });
+            match held {
+                Some((f, rows, i)) if f == family => b.retract(family, rows, i),
+                Some((f, ..)) => {
+                    // A name held by the other kind — `DROP TABLE <view>` — is
+                    // refused as such, never as a `not_found` a caller may read as
+                    // "already gone".
+                    let what = self.resolve(name).await?.map_or(f.row_noun(), |d| d.class.describe());
+                    let noun = family.row_noun();
+                    return Err(format!("'{name}' is a {what}; DROP {} requires a {noun}", noun.to_uppercase()).into());
+                }
                 None if if_exists => {}
                 None => return Err(not_found(family.row_noun(), name)),
             }
         }
         self.commit_ddl(b).await
-    }
-
-    /// The live `family` row of `name`, by one master-local seek. `Ok(None)` is the
-    /// *resolve* miss alone; a name held by the other kind — `DROP TABLE <view>` —
-    /// is refused as such, never as a `not_found` a caller may read as "already gone".
-    async fn relation_retraction(
-        &mut self,
-        family: SysFamily,
-        name: &RelName,
-    ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
-        let noun = family.row_noun();
-        let Some(desc) = self.resolve(name).await? else {
-            return Ok(None);
-        };
-        if desc.class.family() != family {
-            return Err(format!(
-                "'{name}' is a {}; DROP {} requires a {noun}",
-                desc.class.describe(),
-                noun.to_uppercase()
-            )
-            .into());
-        }
-        let (scanned, i) = self
-            .seek_sys_row(family, &[desc.tid as u128], || not_found(noun, name))
-            .await?;
-        // Renamed since the resolve: the name no longer denotes this relation.
-        if payload_bytes(&scanned, i, RELTAB_PAY_NAME) != name.name().as_bytes() {
-            return Ok(None);
-        }
-        Ok(Some((scanned, i)))
     }
 
     /// Rename `rel`: a `(-1, +1)` rewrite pair of its TABLE_TAB / VIEW_TAB row.

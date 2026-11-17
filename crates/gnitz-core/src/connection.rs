@@ -281,12 +281,10 @@ enum Slot {
         to: Promise<SnapshotPage>,
     },
     /// One train per view, its blocks kept raw; the train in progress is
-    /// `views[at]`, handed to the poll's reader while it is live.
+    /// `views[at]`, parked under the id it is kept as while that id is read.
     DeltaPoll {
         views: Vec<u64>,
         at: usize,
-        /// The poll this request is, see [`Polls::live`].
-        poll: u64,
         /// The subscription id `views[0]` is kept as, the rest counting up.
         first: SubId,
     },
@@ -359,34 +357,44 @@ impl Train {
 /// that ended its position.
 pub(crate) type PollEnd = Result<DeltaCursor, ClientError>;
 
-/// What a delta poll hands its reader as each frame arrives.
-pub(crate) enum Polled {
-    /// One data block of the view's train.
-    Block(RawBlock),
-    /// The view's terminal; the position is answered.
-    End(PollEnd),
-}
-
-/// Where the trains of a delta poll go.
+/// Where the trains of delta polls and pushed trains go.
 #[derive(Default)]
 struct Polls {
-    /// The poll whose reader is live.
-    live: u64,
-    /// The live poll's results, in item order: each view's blocks, then its
-    /// one [`Polled::End`], however the poll ends.
-    queue: VecDeque<Polled>,
-    /// What was pushed for each subscription the session holds, by its id,
-    /// kept until its owner takes it. An id with no entry is one nobody holds.
-    subs: HashMap<SubId, Parked>,
+    /// The blocks so far of each delta poll item still being answered, by
+    /// the id it is kept as. An item that ends moves to [`Self::subs`].
+    reading: HashMap<SubId, Vec<RawBlock>>,
+    /// What was read or pushed for each subscription the session holds, by
+    /// its id, kept until its owner takes it. An id with no entry in either
+    /// map is one nobody holds: its frames are dropped.
+    subs: HashMap<SubId, Held>,
     /// The server may hold a subscription of this connection: a read it was
     /// asked to keep was answered with a cursor since the last sync, or that
     /// sync named one.
     server_holds: bool,
 }
 
-/// The blocks pushed for one subscription and not yet taken, and the cursor
-/// past everything pushed — or the fault that ended the subscription.
-type Parked = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
+/// What is kept for one subscription until its owner takes it: the blocks
+/// read or pushed and not yet taken, with the cursor past them, or the fault
+/// that ended it.
+pub(crate) type Held = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
+
+/// Whether `held` keeps a train or an end its owner has not taken.
+pub(crate) fn untaken(held: &Held) -> bool {
+    held.as_ref().map_or(true, |(blocks, _)| !blocks.is_empty())
+}
+
+/// Merge `taken` into `held`: its blocks after those kept, under its cursor,
+/// or its end in their place. An ended `held` stays as it is.
+pub(crate) fn park(held: &mut Held, taken: Held) {
+    match (held, taken) {
+        (Ok((blocks, at)), Ok((train, cursor))) => {
+            blocks.extend(train);
+            *at = cursor;
+        }
+        (held @ Ok(_), end @ Err(_)) => *held = end,
+        (Err(_), _) => {}
+    }
+}
 
 impl Polls {
     /// Hold subscription `id` at `cursor` before the reader takes the reply:
@@ -396,36 +404,27 @@ impl Polls {
         self.subs.insert(id, Ok((Vec::new(), cursor)));
     }
 
-    /// One view of the request poll `poll`, kept as `kept`, ended with `end`.
-    fn reader_end(&mut self, poll: u64, kept: SubId, end: PollEnd) {
-        // A cursor is what the server keeps a subscription from, live reader or not.
+    /// The delta poll's item kept as `id` ended with `end`: its train is held
+    /// at the cursor, or the item ended. An id no longer read is left as it is.
+    fn poll_end(&mut self, id: SubId, end: PollEnd) {
+        // A cursor is what the server keeps a subscription from, held here or not.
         self.server_holds |= end.is_ok();
-        if poll != self.live {
-            return;
+        if let Some(blocks) = self.reading.remove(&id) {
+            self.subs.insert(id, end.map(|cursor| (blocks, cursor)));
         }
-        if let Ok(cursor) = &end {
-            self.hold(kept, *cursor);
-        }
-        self.queue.push_back(Polled::End(end));
     }
 
     /// A train pushed for `sub` ended with `end`, after `train`.
     fn holder_end(&mut self, sub: SubId, train: Vec<RawBlock>, end: PollEnd) {
         self.server_holds |= end.is_ok();
-        match (self.subs.get_mut(&sub), end) {
-            (Some(Ok((held, at))), Ok(cursor)) => {
-                held.extend(train);
-                *at = cursor;
-            }
-            (Some(parked @ Ok(_)), Err(why)) => *parked = Err(why),
-            _ => {}
+        if let Some(held) = self.subs.get_mut(&sub) {
+            park(held, end.map(|cursor| (train, cursor)));
         }
     }
 
     /// Whether a subscription holds a train or an end nobody took yet.
     fn untaken(&self) -> bool {
-        let quiet = |parked: &Parked| matches!(parked, Ok((blocks, _)) if blocks.is_empty());
-        self.subs.values().any(|parked| !quiet(parked))
+        self.subs.values().any(untaken)
     }
 }
 
@@ -731,36 +730,48 @@ impl Session {
     ///
     /// `Err` is the end of the subscription, which the session then holds no
     /// more: the server ended it, or this connection never held it.
-    pub(crate) fn take_pushed(&mut self, id: SubId) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let Entry::Occupied(mut parked) = self.inbox.polls.subs.entry(id) else {
+    pub(crate) fn take_pushed(&mut self, id: SubId) -> Held {
+        let Entry::Occupied(mut held) = self.inbox.polls.subs.entry(id) else {
             return Err(ClientError::from(format!(
                 "subscription {id} is not held on this connection; read from its cursor and subscribe again"
             )));
         };
-        match parked.get_mut() {
+        match held.get_mut() {
             Ok((blocks, cursor)) => Ok((std::mem::take(blocks), *cursor)),
-            Err(_) => parked.remove(),
+            Err(_) => held.remove(),
         }
+    }
+
+    /// The blocks read for the delta poll's item kept as `id` since they were
+    /// last taken, while its train is read; `None` once it ended, its train
+    /// and end then taken by [`Self::take_pushed`].
+    pub(crate) fn take_reading(&mut self, id: SubId) -> Option<Vec<RawBlock>> {
+        self.inbox.polls.reading.get_mut(&id).map(std::mem::take)
     }
 
     /// Stop holding subscription `id`: what is pushed for it from now on is
     /// dropped unparked. The next sync still tells the server.
     pub(crate) fn release(&mut self, id: SubId) {
+        self.inbox.polls.reading.remove(&id);
         self.inbox.polls.subs.remove(&id);
     }
 
-    /// DELTA_POLL of `views`, the items of the live poll: each one's train
-    /// queues for [`Self::next_polled`], in order, and a request the session
-    /// refuses ends each with the refusal. A view answered with a cursor stays
-    /// subscribed from it, item `i` as [`kept_as`]`(first, i)`.
+    /// DELTA_POLL of `views`, item `i` kept as [`kept_as`]`(first, i)`: its
+    /// train's blocks for [`Self::take_reading`] as they arrive, then for
+    /// [`Self::take_pushed`] the cursor it is held at, or the fault that ended
+    /// it. A request the session
+    /// refuses ends each with the refusal. An id released before its item
+    /// ends drops what is left of its train.
     pub(crate) fn submit_delta_poll(&mut self, first: SubId, views: &[multi_frame::DeltaPollItem]) {
         if views.is_empty() {
             return;
         }
+        // Before the request is queued, so a refusal finds every item to end.
+        let reading = (0..views.len()).map(|i| (kept_as(first, i), Vec::new()));
+        self.inbox.polls.reading.extend(reading);
         let slot = Slot::DeltaPoll {
             views: views.iter().map(|v| v.view.tid).collect(),
             at: 0,
-            poll: self.inbox.polls.live,
             first,
         };
         self.enqueue(|out| multi_frame::encode_delta_poll(out, views, Some(first)), slot);
@@ -862,6 +873,23 @@ impl Session {
         })
     }
 
+    /// Step until `ready` yields, asking it before each step: a step with
+    /// nothing outstanding is `Closed`, so an answer already in hand is taken
+    /// first.
+    pub(crate) fn poll_until<R>(
+        &mut self,
+        host: &mut dyn Host,
+        cx: &mut Context<'_>,
+        mut ready: impl FnMut(&mut Session) -> Option<R>,
+    ) -> Poll<Result<R, ClientError>> {
+        loop {
+            if let Some(r) = ready(self) {
+                return Poll::Ready(Ok(r));
+            }
+            ready!(self.turn(host, cx))?;
+        }
+    }
+
     /// One read of the socket, each frame it completes fed to the head slot. A
     /// failure ends the session.
     fn read(&mut self) {
@@ -873,23 +901,6 @@ impl Session {
             Ok(more) => self.unread = more,
             Err(e) => self.end(ClientError::ConnectionLost(e)),
         }
-    }
-
-    /// The live delta poll's next result.
-    pub(crate) fn next_polled(&mut self) -> Option<Polled> {
-        self.inbox.polls.queue.pop_front()
-    }
-
-    /// Everything the last step queued has been handed out.
-    pub(crate) fn polled_out(&self) -> bool {
-        self.inbox.polls.queue.is_empty()
-    }
-
-    /// The live poll's reader is gone: drop what it was handed and what its
-    /// slots are still to be fed.
-    pub(crate) fn abandon_poll(&mut self) {
-        self.inbox.polls.live += 1;
-        self.inbox.polls.queue.clear();
     }
 
     /// Whether a cap [`Self::submit`] refuses on is reached. A driver that can
@@ -964,11 +975,11 @@ impl Slot {
             // A DELTA_POLL fault naming a view ends that view's position alone;
             // every other fault ends the request.
             return match (&mut *self, want) {
-                (Slot::DeltaPoll { views, at, poll, first }, Some(view)) if named != 0 => {
+                (Slot::DeltaPoll { views, at, first }, Some(view)) if named != 0 => {
                     if named != view {
                         return Err(out_of_order(view, named));
                     }
-                    polls.reader_end(*poll, kept_as(*first, *at), Err(refused));
+                    polls.poll_end(kept_as(*first, *at), Err(refused));
                     *at += 1;
                     Ok(*at == views.len())
                 }
@@ -984,14 +995,14 @@ impl Slot {
         }
         match (&mut *self, ctrl.data.clone()) {
             (_, None) => {}
-            (Slot::DeltaPoll { poll, .. }, Some(block)) => {
-                if *poll == polls.live {
+            (Slot::DeltaPoll { at, first, .. }, Some(block)) => {
+                if let Some(blocks) = polls.reading.get_mut(&kept_as(*first, *at)) {
                     let frame = std::mem::take(&mut buf).into_owned();
-                    polls.queue.push_back(Polled::Block(RawBlock { frame, block }));
+                    blocks.push(RawBlock { frame, block });
                 }
             }
             (Slot::Pushed { sub, blocks, .. }, Some(block)) => {
-                if polls.subs.contains_key(sub) {
+                if matches!(polls.subs.get(sub), Some(Ok(_))) {
                     let frame = std::mem::take(&mut buf).into_owned();
                     blocks.push(RawBlock { frame, block });
                 }
@@ -1050,8 +1061,8 @@ impl Slot {
                 }
                 to.fulfil(Ok((reply, cursor)))
             }
-            Slot::DeltaPoll { views, at, poll, first } => {
-                polls.reader_end(*poll, kept_as(*first, *at), Ok(cursor()?));
+            Slot::DeltaPoll { views, at, first } => {
+                polls.poll_end(kept_as(*first, *at), Ok(cursor()?));
                 *at += 1;
                 if *at < views.len() {
                     return Ok(false);
@@ -1081,9 +1092,9 @@ impl Slot {
             Slot::Scan { to, .. } => to.fulfil(Err(why)),
             Slot::Page { to, .. } => to.fulfil(Err(why)),
             Slot::Delta { to, .. } => to.fulfil(Err(why)),
-            Slot::DeltaPoll { views, at, poll, first } => {
+            Slot::DeltaPoll { views, at, first } => {
                 for at in *at..views.len() {
-                    polls.reader_end(*poll, kept_as(*first, at), Err(why.clone()));
+                    polls.poll_end(kept_as(*first, at), Err(why.clone()));
                 }
             }
             Slot::Pushed { sub, blocks, .. } => polls.holder_end(*sub, std::mem::take(blocks), Err(why)),

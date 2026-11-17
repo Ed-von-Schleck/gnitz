@@ -12,7 +12,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use gnitz_core::{
@@ -451,25 +450,26 @@ fn drive<F: Future>(rt: &Runtime, conn: &mut Connection, f: F) -> F::Output {
     )
 }
 
-/// A sync dropped while the client finishes it loses nothing: the next sync
-/// reports the rows it took in front of its own, weights and all.
+/// A sync dropped before its answer loses nothing: the client still finishes
+/// it, and the next sync reports the rows it took in front of its own,
+/// weights and all.
 #[test]
-fn a_sync_cancelled_after_its_answer_hands_its_rows_to_the_next() {
-    cancel_after_the_answer(false);
+fn a_sync_cancelled_before_its_answer_hands_its_rows_to_the_next() {
+    cancel_a_sync(false);
 }
 
-/// So does one dropped once the client finished it, its delivery arrived and
-/// never read.
+/// So does one dropped once its delivery arrived, never read.
 #[test]
 fn a_sync_cancelled_after_its_delivery_hands_its_rows_to_the_next() {
-    cancel_after_the_answer(true);
+    cancel_a_sync(true);
 }
 
-/// Drop a sync once its answer is in — and, if `delivered`, once the client
-/// finished it — then check the next sync reports its rows.
-fn cancel_after_the_answer(delivered: bool) {
+/// Drop a sync before its answer is written or, if `delivered`, once its
+/// delivery arrived, then check the next sync reports its rows.
+fn cancel_a_sync(delivered: bool) {
     let rt = Runtime::new().unwrap();
     let (client, mut conn, mut peer) = connect_to_peer(&rt);
+    let (go, answer) = std::sync::mpsc::channel::<()>();
 
     let script = std::thread::spawn(move || {
         let poll = peek_control_block(&read_frame(&mut peer))
@@ -486,12 +486,17 @@ fn cancel_after_the_answer(delivered: bool) {
         write_frame(&mut peer, &frame(terminal, &[]));
 
         expect_sync(&mut peer);
-        assert_eq!(request(&mut peer), 5, "the probe");
-        push_train_and_answer(&mut peer, sub, &[(1, 1), (2, 2)], 11);
+        assert_eq!(request(&mut peer), 5, "the first probe");
         reply(&mut peer, 5, 55);
+        answer.recv().expect("the go-ahead to answer");
+        push_train_and_answer(&mut peer, sub, &[(1, 1), (2, 2)], 11);
+        if delivered {
+            assert_eq!(request(&mut peer), 6, "the second probe");
+            reply(&mut peer, 6, 66);
+        }
 
         let next = expect_sync(&mut peer);
-        assert_eq!(next.arg0, 0, "a held delivery is no reason to wait");
+        assert_eq!(next.arg0, 0, "an untaken delivery is no reason to wait");
         push_train_and_answer(&mut peer, sub, &[(1, -1)], 12);
         peer
     });
@@ -502,8 +507,8 @@ fn cancel_after_the_answer(delivered: bool) {
         client.run(move |c| Box::pin(async move { c.subscribe(Target::from(40), Some(from), &schema(), &spec).await }));
     let (sub, _, _) = drive(&rt, &mut conn, subscribed).unwrap().expect("subscribed");
 
-    // The sync's request goes first, then the probe's; the probe's reply
-    // follows the sync's answer, so once it is in the answer is too.
+    // The sync's request goes first, then the probe's, so once the probe is
+    // answered the sync's request is out; its answer waits for `go`.
     let mut sync = Box::pin(client.sync(Duration::from_secs(30)));
     let noop = std::task::Waker::noop();
     assert!(
@@ -512,14 +517,16 @@ fn cancel_after_the_answer(delivered: bool) {
             .is_pending()
     );
     assert_eq!(drive(&rt, &mut conn, scan(&client, 5)).unwrap().lsn, Some(55));
-    // Its answer in, the sync queues the client's half and awaits it.
-    let polled = rt.block_on(std::future::poll_fn(|cx| Poll::Ready(sync.as_mut().poll(cx))));
-    assert!(polled.is_pending());
     if delivered {
-        // Calls run in order, so the client's half has run once this has.
-        drive(&rt, &mut conn, client.run(|_| Box::pin(std::future::ready(())))).unwrap();
+        go.send(()).unwrap();
+        // The second probe's reply follows the sync's answer, and the
+        // connection finishes the sync in the poll that reads the answer.
+        assert_eq!(drive(&rt, &mut conn, scan(&client, 6)).unwrap().lsn, Some(66));
+        drop(sync);
+    } else {
+        drop(sync);
+        go.send(()).unwrap();
     }
-    drop(sync);
 
     rt.spawn(conn);
     let synced = settled(&rt, client.sync(Duration::from_secs(30))).expect("the next sync");

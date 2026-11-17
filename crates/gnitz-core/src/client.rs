@@ -3,6 +3,7 @@
 //! relation resolution.
 
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -34,10 +35,11 @@ pub struct GnitzClient {
     /// The local copy this client reads through, if a host attached one. Boxed,
     /// so a client that never mirrors pays one `None` and no allocation.
     pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
-    /// A reader's subscriptions, each with the layout its trains decode
-    /// under, in the order they were made. A mirror keeps its own with the
-    /// views they feed.
-    pub(crate) readers: std::collections::BTreeMap<SubId, Arc<Schema>>,
+    /// A reader's subscriptions with what syncs brought them and no
+    /// [`crate::Delivery`] handed over yet, and the reseeds of deliveries
+    /// dropped untaken. A mirror keeps its own subscriptions with the views
+    /// they feed.
+    pub(crate) received: Arc<Mutex<crate::pushed::Received>>,
     /// Qualified name → the descriptor its last RESOLVE answered, for
     /// [`Self::kept_desc`]. This client's own DDL drops the relations it wrote.
     pub(crate) kept: HashMap<RelName, Arc<RelDescriptor>>,
@@ -46,13 +48,6 @@ pub struct GnitzClient {
     /// of a connection since replaced is told that one ended, never handed
     /// another's trains.
     pub(crate) next_sub: SubId,
-    /// What a sync took for a reader's subscriptions and nobody received,
-    /// taken up from [`Self::returned`]: the next sync reports it in front of
-    /// its own, and is not held.
-    pub(crate) unclaimed: Vec<crate::Pushed>,
-    /// Deliveries dropped untaken, taken up into
-    /// [`Self::unclaimed`] by the next sync or unsubscribe.
-    pub(crate) returned: Arc<Mutex<Vec<crate::Synced>>>,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -118,11 +113,9 @@ impl GnitzClient {
             serial_cache: HashMap::new(),
             txn: None,
             mirror: None,
-            readers: Default::default(),
+            received: Default::default(),
             kept: HashMap::new(),
             next_sub: SubId::FIRST,
-            unclaimed: Vec::new(),
-            returned: Default::default(),
         })
     }
 
@@ -150,11 +143,9 @@ impl GnitzClient {
             serial_cache,
             txn: _,
             mirror,
-            readers: _,
+            received: _,
             kept,
             next_sub: _,
-            unclaimed: _,
-            returned: _,
         } = self;
         host.attach(fresh.as_fd().try_clone_to_owned()?)?;
         *session = fresh;
@@ -192,18 +183,20 @@ impl GnitzClient {
         Pending { client: self, sent }
     }
 
-    /// Wait for the socket and step once. `Closed` when nothing is outstanding.
-    pub async fn turn(&mut self) -> Result<(), ClientError> {
-        std::future::poll_fn(|cx| self.session.turn(&mut *self.host, cx)).await
+    /// Step this client's session until `ready` yields, asking it before each
+    /// step. `Closed` when nothing is outstanding while it yields nothing.
+    pub async fn until<R>(&mut self, mut ready: impl FnMut() -> Option<R>) -> Result<R, ClientError> {
+        poll_fn(|cx| self.session.poll_until(&mut *self.host, cx, |_| ready())).await
     }
 
     /// Step until the connection is under its in-flight caps, at which a
     /// request is refused.
     pub async fn make_room(&mut self) -> Result<(), ClientError> {
-        while self.session.at_capacity() {
-            self.turn().await?;
-        }
-        Ok(())
+        poll_fn(|cx| {
+            self.session
+                .poll_until(&mut *self.host, cx, |s| (!s.at_capacity()).then_some(()))
+        })
+        .await
     }
 
     // ── Catalog and SERIAL ids ─────────────────────────────────────────────

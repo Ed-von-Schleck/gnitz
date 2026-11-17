@@ -52,9 +52,9 @@ fn reply_fuzz() {
         {
             assert!(answered, "request {k} was never answered");
         }
-        let queue = &s.inbox.polls.queue;
-        let ends = queue.iter().filter(|p| matches!(p, Polled::End(_))).count();
-        assert_eq!(ends, 1, "the poll's one view ends exactly once");
-        assert!(matches!(queue.back(), Some(Polled::End(_))));
+        assert!(
+            s.inbox.polls.subs.contains_key(&sub_id(100)) && s.inbox.polls.reading.is_empty(),
+            "the poll's one view ends"
+        );
     });
 }

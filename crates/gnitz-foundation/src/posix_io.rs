@@ -165,6 +165,36 @@ pub fn rename_noreplace(from: &str, to: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// A directory this process created for itself under the temp directory,
+/// mode 0700 and named `prefix` and six random characters, removed with what
+/// it holds when dropped.
+pub struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    pub fn new(prefix: &str) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStringExt;
+        let template = std::env::temp_dir().join(format!("{prefix}XXXXXX"));
+        let mut template = std::ffi::CString::new(template.into_os_string().into_vec())?.into_bytes_with_nul();
+        // SAFETY: `template` is a NUL-terminated, writable buffer that mkdtemp
+        // rewrites in place; it outlives the call.
+        if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        template.pop();
+        Ok(ScratchDir(std::ffi::OsString::from_vec(template).into()))
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/posix_io.rs"]
 mod tests;

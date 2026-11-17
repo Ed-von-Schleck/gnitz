@@ -573,6 +573,20 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     assert!(!db.exists("keeper") && !db.exists("b"));
 }
 
+/// `IF EXISTS` skips a name whose schema is missing, as PostgreSQL does;
+/// without it, the drop is refused as a missing schema.
+#[test]
+fn if_exists_skips_a_drop_in_a_missing_schema() {
+    let mut db = Db::boot(1);
+    db.exec("CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    db.exec("DROP TABLE IF EXISTS nosuchschema.t, t");
+    assert!(!db.exists("t"), "the batch's other name still drops");
+    db.exec("DROP VIEW IF EXISTS nosuchschema.v");
+    for sql in ["DROP TABLE nosuchschema.t", "DROP VIEW nosuchschema.v"] {
+        db.refuses(sql, Refused(NotFound), "schema 'nosuchschema' not found");
+    }
+}
+
 /// A qualifier is the relation's schema on every name surface, and a name
 /// without one is the session's. An index name — being global — takes none.
 #[test]

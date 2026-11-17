@@ -37,7 +37,7 @@ pub use ddl::{ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, 
 pub use error::{ClientError, ProtocolError, not_found};
 pub use host::{BlockingHost, BoxFut, Host, Job, Op, Pending, Promise, Sent, block_on, drain_cancel, promise, serve};
 pub use mirror::{MirrorStore, Planner, PollOutcome, PollResult, Subscription};
-pub use pushed::{Delivery, Pushed, Synced};
+pub use pushed::{Delivery, Pushed, Synced, sync_op};
 pub use rel_name::RelName;
 pub use schema::{Schema, sys_schema};
 pub use snapshot::DEFAULT_PAGE_ROWS;
