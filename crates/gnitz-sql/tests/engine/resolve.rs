@@ -292,17 +292,12 @@ impl Host for Interruptible {
         self.host.attach(fd)
     }
 
-    fn poll_io(
-        &mut self,
-        want: Interest,
-        cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
+    fn poll_io(&mut self, want: Interest, cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
         if self.armed.swap(false, Ordering::Relaxed) {
             let why: Box<dyn std::error::Error + Send + Sync> = "interrupted".into();
             return Poll::Ready(Err(ClientError::Interrupted(why.into())));
         }
-        self.host.poll_io(want, cx, io)
+        self.host.poll_io(want, cx)
     }
 
     fn spawn(&mut self, job: Job) {

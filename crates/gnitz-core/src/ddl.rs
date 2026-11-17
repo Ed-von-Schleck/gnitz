@@ -775,7 +775,7 @@ impl GnitzClient {
     /// the server checks the reply against that schema's layout.
     async fn sys_rows(&mut self, family: SysFamily, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
         Ok(self
-            .scan_spec(family, &ReadSpec::all_rows(bound), sys_schema(family))
+            .scan_served(family, &ReadSpec::all_rows(bound), sys_schema(family))
             .await?
             .batch)
     }

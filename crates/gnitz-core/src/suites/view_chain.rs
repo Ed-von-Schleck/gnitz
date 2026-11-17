@@ -33,7 +33,7 @@ fn chain(name: RelName, base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
 /// weight 1.
 fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
     let view_tab = crate::sys_schema(SysFamily::View);
-    let b = block_on(client.scan_spec(SysFamily::View, &ReadSpec::all_rows(ReadBound::None), view_tab))
+    let b = block_on(client.scan_served(SysFamily::View, &ReadSpec::all_rows(ReadBound::None), view_tab))
         .unwrap()
         .batch;
     let owners = &b.payload[ViewTabSlot::owner_view_id as usize].bytes;

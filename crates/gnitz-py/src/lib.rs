@@ -2,8 +2,9 @@
 //! through, and the `_native` registration.
 //!
 //! `client` holds every verb; `blocking` and `aio` are how each client class
-//! waits; `write` and `read` encode and decode values; `reply` turns the
-//! other replies into Python objects; `schema` describes columns.
+//! waits, and `pool` is where an `aio` client's blocking work runs; `write`
+//! and `read` encode and decode values; `reply` turns the other replies into
+//! Python objects; `schema` describes columns.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -16,6 +17,7 @@ mod aio;
 mod blocking;
 mod client;
 mod local_server;
+mod pool;
 mod read;
 mod reply;
 mod schema;

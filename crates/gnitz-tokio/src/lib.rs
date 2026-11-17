@@ -22,12 +22,17 @@ struct TokioHost {
     fd: Option<AsyncFd<OwnedFd>>,
 }
 
-fn fired(
-    polled: Poll<std::io::Result<AsyncFdReadyGuard<'_, OwnedFd>>>,
-) -> std::io::Result<Option<AsyncFdReadyGuard<'_, OwnedFd>>> {
+/// Whether a direction `polled` fired, spending it: `AsyncFd` reports edges,
+/// and before the client asks again it reads until the socket has no more, and
+/// writes until it refuses bytes. An edge that arrives after this is a new one,
+/// which clearing does not take.
+fn spent(polled: Poll<std::io::Result<AsyncFdReadyGuard<'_, OwnedFd>>>) -> std::io::Result<bool> {
     match polled {
-        Poll::Ready(r) => r.map(Some),
-        Poll::Pending => Ok(None),
+        Poll::Ready(guard) => guard.map(|mut guard| {
+            guard.clear_ready();
+            true
+        }),
+        Poll::Pending => Ok(false),
     }
 }
 
@@ -44,36 +49,16 @@ impl Host for TokioHost {
     /// Polls only the directions `want` names; one that did not fire registers
     /// its waker. Stepping a direction that did not fire would cost a syscall
     /// per wakeup to discover it was not ready.
-    fn poll_io(
-        &mut self,
-        want: Interest,
-        cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
+    fn poll_io(&mut self, want: Interest, cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
         let fd = self.fd.as_ref().expect("a client attaches its host before waiting");
-        let read = match want.read {
-            true => fired(fd.poll_read_ready(cx))?,
-            false => None,
-        };
-        let write = match want.write {
-            true => fired(fd.poll_write_ready(cx))?,
-            false => None,
-        };
         let ready = Interest {
-            read: read.is_some(),
-            write: write.is_some(),
+            read: want.read && spent(fd.poll_read_ready(cx))?,
+            write: want.write && spent(fd.poll_write_ready(cx))?,
         };
-        if ready.is_empty() {
-            return Poll::Pending;
+        match ready.is_empty() {
+            true => Poll::Pending,
+            false => Poll::Ready(Ok(ready)),
         }
-        io(ready);
-        // `AsyncFd` reports edges, and a direction that fired is spent: the
-        // client reads until the socket has no more, and writes until it
-        // refuses bytes, before it asks again.
-        for mut guard in [read, write].into_iter().flatten() {
-            guard.clear_ready();
-        }
-        Poll::Ready(Ok(()))
     }
 
     /// A runtime shutting down drops the job.

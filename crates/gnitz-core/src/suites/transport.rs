@@ -356,7 +356,7 @@ fn a_restart_fails_the_old_connection_fast_and_admits_a_new_one() {
     for ((client, _, tid, schema), target) in clients.iter_mut().zip(&targets) {
         let t0 = Instant::now();
         for _ in 0..2 {
-            let err = block_on(client.scan_spec(*tid, &ReadSpec::all_rows(ReadBound::None), schema)).unwrap_err();
+            let err = block_on(client.scan_served(*tid, &ReadSpec::all_rows(ReadBound::None), schema)).unwrap_err();
             assert!(matches!(err, ClientError::ConnectionLost(_)), "{target}: {err:?}");
         }
         assert!(t0.elapsed() < Duration::from_secs(5), "{target}: {:?}", t0.elapsed());

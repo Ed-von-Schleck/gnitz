@@ -2,13 +2,16 @@
 //! return a future of their result — `sync`, a coroutine over one.
 //!
 //! The client lives inside a `serve` loop, polled from the event loop's own
-//! callbacks: its reader and writer on the socket, and a flush the loop runs
-//! on its next turn. A verb queues a call for `serve` to run and hands back
-//! the loop future the call resolves.
+//! callbacks: its reader and writer on the socket, a flush the loop runs on
+//! its next turn, and a reader on a wake-up socket a finished job writes. Its
+//! connect runs on the [`pool`](crate::pool) first, and nothing of it blocks
+//! the loop; a pool thread wakes the loop without taking the GIL. A verb queues a call
+//! for `serve` to run and hands back the loop future the call resolves.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::mpsc;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -17,7 +20,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
-use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, serve, sync_op};
+use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, drain_cancel, serve, sync_op};
 
 use crate::client::{Convert, Mode, PyClient, VerbOp, resolve_target, whole};
 use crate::reply::{none, synced};
@@ -36,8 +39,7 @@ fn settle(py: Python<'_>, future: &Py<PyAny>, value: PyResult<Py<PyAny>>) {
 /// it runs all share.
 struct Shared {
     event_loop: Py<PyAny>,
-    /// No Python runs while this is locked: a job's wake-up takes the GIL and
-    /// then this lock, from a thread of its own.
+    /// No Python runs while this is locked.
     state: Mutex<State>,
 }
 
@@ -47,8 +49,10 @@ struct State {
     queue: VecDeque<Op>,
     /// Calls made whose loop future is unresolved.
     owed: usize,
-    /// No further call is taken, and the client closes once nothing is owed.
-    closing: bool,
+    /// Once set, no further call is taken, the client closes once nothing is
+    /// owed, and this is what every call it will never run is answered with:
+    /// `Closed`, or why the connect failed.
+    closed: Option<ClientError>,
 
     /// The client's socket, from its host's `attach` to that host's drop.
     fd: Option<OwnedFd>,
@@ -84,10 +88,7 @@ impl Shared {
             };
             let now = to(&st);
             let was = std::mem::replace(&mut st.watched, now);
-            let callbacks = st
-                .callbacks
-                .as_ref()
-                .map(|cb| (cb.readable.clone_ref(py), cb.writable.clone_ref(py)));
+            let callbacks = (st.callbacks.as_ref()).map(|cb| (cb.readable.clone_ref(py), cb.writable.clone_ref(py)));
             (fd, was, now, callbacks)
         };
         let (on_read, on_write) = callbacks.unzip();
@@ -118,14 +119,15 @@ impl Shared {
         }
     }
 
-    /// The callback that pumps the core; `None` once it closed.
-    fn flush(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-        self.state().callbacks.as_ref().map(|cb| cb.flush.clone_ref(py))
+    /// What a call the client will never run is answered with.
+    fn refusal(&self) -> ClientError {
+        self.state().closed.clone().unwrap_or(ClientError::Closed)
     }
 
-    /// Have the loop pump the core on its next turn.
+    /// Have the loop pump the core on its next turn; nothing once it closed.
+    /// A burst's start writes no wake-up socket: `call_soon` costs no syscall.
     fn flush_soon(&self, py: Python<'_>) -> PyResult<()> {
-        let Some(flush) = self.flush(py) else {
+        let Some(flush) = self.state().callbacks.as_ref().map(|cb| cb.flush.clone_ref(py)) else {
             return Ok(());
         };
         self.event_loop.call_method1(py, intern!(py, "call_soon"), (flush,))?;
@@ -133,19 +135,36 @@ impl Shared {
     }
 }
 
-/// Wakes the `serve` loop from the thread a job ran on.
-impl Wake for Shared {
+/// Wakes the `serve` loop from whatever thread finished a job, GIL or not:
+/// a byte written to `tx` makes `rx` readable, which the loop watches.
+struct Wakeup {
+    tx: UnixStream,
+    rx: UnixStream,
+}
+
+impl Wakeup {
+    fn new() -> std::io::Result<Self> {
+        let (tx, rx) = UnixStream::pair()?;
+        tx.set_nonblocking(true)?;
+        rx.set_nonblocking(true)?;
+        Ok(Wakeup { tx, rx })
+    }
+
+    /// Take every wake so far, so the loop calls back again only on the next.
+    fn drain(&self) {
+        drain_cancel(&self.rx);
+    }
+}
+
+impl Wake for Wakeup {
     fn wake(self: Arc<Self>) {
-        // `move`: the last handle may be this one, and its `Py`s drop under the GIL.
-        Python::attach(move |py| {
-            let Some(flush) = self.flush(py) else {
-                return;
-            };
-            // A loop that is closed has nobody left to wake.
-            let _ = self
-                .event_loop
-                .call_method1(py, intern!(py, "call_soon_threadsafe"), (flush,));
-        });
+        self.wake_by_ref()
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // Refused only while the socket is full of wakes the loop has yet to
+        // take.
+        let _ = (&self.tx).write(&[1]);
     }
 }
 
@@ -186,12 +205,13 @@ impl Owed {
     }
 }
 
-/// An `Owed` dropped before it landed resolves as `Closed`; either way the
-/// call is no longer owed.
+/// An `Owed` dropped before it landed resolves as `Closed`, or as the
+/// connect's failure; either way the call is no longer owed.
 impl Drop for Owed {
     fn drop(&mut self) {
         if let Some(future) = self.future.take() {
-            Python::attach(move |py| settle(py, &future, Err(client_err(ClientError::Closed))));
+            let why = self.shared.refusal();
+            Python::attach(move |py| settle(py, &future, Err(client_err(why))));
         }
         self.shared.state().owed -= 1;
     }
@@ -225,10 +245,9 @@ impl SyncDelivery {
 }
 
 /// Waits through the event loop's reader and writer callbacks, and runs jobs
-/// on one thread of its own, started with the first job.
+/// on the [`pool`](crate::pool).
 struct LoopHost {
     shared: Arc<Shared>,
-    jobs: Option<mpsc::Sender<Job>>,
 }
 
 impl Host for LoopHost {
@@ -240,12 +259,7 @@ impl Host for LoopHost {
         Ok(())
     }
 
-    fn poll_io(
-        &mut self,
-        want: Interest,
-        _cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
+    fn poll_io(&mut self, want: Interest, _cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
         let ready = {
             let mut st = self.shared.state();
             Interest {
@@ -265,18 +279,11 @@ impl Host for LoopHost {
             });
             return Poll::Pending;
         }
-        io(ready);
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(ready))
     }
 
     fn spawn(&mut self, job: Job) {
-        let jobs = self.jobs.get_or_insert_with(|| {
-            let (tx, rx) = mpsc::channel::<Job>();
-            std::thread::spawn(move || rx.into_iter().for_each(|job| job()));
-            tx
-        });
-        // The thread ends only when this sender drops.
-        let _ = jobs.send(job);
+        crate::pool::spawn(job)
     }
 }
 
@@ -298,6 +305,8 @@ pub(crate) struct LoopCore {
     /// Locked by the pump that polls it, and by nothing else.
     actor: Mutex<Actor>,
     shared: Arc<Shared>,
+    /// Read by the loop from construction until the core ends.
+    wakeup: Arc<Wakeup>,
     waker: Waker,
 }
 
@@ -318,8 +327,10 @@ impl Drop for LoopHandle {
 }
 
 impl LoopCore {
-    /// Connect on the calling thread, GIL released, to serve on the running loop.
-    fn connect(py: Python<'_>, target: &str) -> PyResult<LoopHandle> {
+    /// A client of `target` on the running loop, its connect started: the
+    /// calls made meanwhile run once it is up, and are answered with its
+    /// failure if it fails.
+    fn connect(py: Python<'_>, target: String) -> PyResult<LoopHandle> {
         let event_loop = py
             .import(intern!(py, "asyncio"))?
             .call_method0(intern!(py, "get_running_loop"))?
@@ -328,25 +339,32 @@ impl LoopCore {
             event_loop,
             state: Mutex::new(State::default()),
         });
-        let host = LoopHost { shared: Arc::clone(&shared), jobs: None };
-        let client = py
-            .detach(|| GnitzClient::connect_on(target, Box::new(host)))
-            .map_err(client_err)?;
+        let host = LoopHost { shared: Arc::clone(&shared) };
         let queue = Arc::clone(&shared);
-        let next = move |_: &mut Context<'_>| {
-            let mut st = queue.state();
-            match st.queue.pop_front() {
-                Some(op) => Poll::Ready(Some(op)),
-                None if st.closing => Poll::Ready(None),
-                None => Poll::Pending,
+        let actor = async move {
+            match GnitzClient::connect_with(&target, Box::new(host)).await {
+                Ok(client) => {
+                    let next = move |_: &mut Context<'_>| {
+                        let mut st = queue.state();
+                        match st.queue.pop_front() {
+                            Some(op) => Poll::Ready(Some(op)),
+                            None if st.closed.is_some() => Poll::Ready(None),
+                            None => Poll::Pending,
+                        }
+                    };
+                    serve(client, next).await
+                }
+                Err(why) => queue.state().closed = Some(why),
             }
         };
+        let wakeup = Arc::new(Wakeup::new()?);
         let core = Bound::new(
             py,
             LoopCore {
-                actor: Mutex::new(Some(Box::pin(serve(client, next)))),
+                actor: Mutex::new(Some(Box::pin(actor))),
                 shared: Arc::clone(&shared),
-                waker: Waker::from(Arc::clone(&shared)),
+                waker: Waker::from(Arc::clone(&wakeup)),
+                wakeup,
             },
         )?;
         // The callbacks are the core's own methods, so they exist only now.
@@ -357,6 +375,13 @@ impl LoopCore {
             flush: callback(intern!(py, "on_flush"))?,
         };
         shared.state().callbacks = Some(callbacks);
+        shared.event_loop.call_method1(
+            py,
+            intern!(py, "add_reader"),
+            (core.get().wakeup.rx.as_raw_fd(), callback(intern!(py, "on_wakeup"))?),
+        )?;
+        // Hands the connect to the pool.
+        core.get().pump(py);
         Ok(LoopHandle(core.unbind()))
     }
 
@@ -402,7 +427,7 @@ impl LoopCore {
 
     /// Whether the client was asked to close: it takes no call after that.
     pub(crate) fn closing(&self) -> bool {
-        self.shared.state().closing
+        self.shared.state().closed.is_some()
     }
 
     /// A loop future already resolved to `value`.
@@ -414,7 +439,7 @@ impl LoopCore {
 
     /// Close once nothing is owed.
     fn release(&self, py: Python<'_>) {
-        self.shared.state().closing = true;
+        self.close();
         self.pump(py);
     }
 
@@ -422,15 +447,15 @@ impl LoopCore {
     /// future back.
     fn queue(&self, py: Python<'_>, build: impl FnOnce(Owed) -> Op) -> PyResult<Py<PyAny>> {
         let future = self.shared.event_loop.call_method0(py, intern!(py, "create_future"))?;
-        let (closing, idle, first) = {
+        let (closed, idle, first) = {
             let st = self.shared.state();
             let idle = st.owed == 0;
             // A call queued behind none, while another is unresolved, is the
             // first of a burst: nothing is on its way to start it.
-            (st.closing, idle, !idle && st.queue.is_empty())
+            (st.closed.clone(), idle, !idle && st.queue.is_empty())
         };
-        if closing {
-            settle(py, &future, Err(client_err(ClientError::Closed)));
+        if let Some(why) = closed {
+            settle(py, &future, Err(client_err(why)));
             return Ok(future);
         }
         if first {
@@ -473,7 +498,7 @@ impl LoopCore {
         if let Some(serving) = actor.as_mut()
             && serving.as_mut().poll(&mut Context::from_waker(&self.waker)).is_ready()
         {
-            self.end(&mut actor);
+            self.end(py, &mut actor);
         }
         // Readiness nothing used: the `serve` loop is not stepping, and a
         // level-triggered loop would call back again at once.
@@ -486,17 +511,17 @@ impl LoopCore {
         // drain, and with nothing owed dropping it loses nothing.
         let abandoned = actor.is_some() && {
             let st = self.shared.state();
-            st.closing && st.owed == 0
+            st.closed.is_some() && st.owed == 0
         };
         if abandoned {
-            self.end(&mut actor);
+            self.end(py, &mut actor);
         }
     }
 
     /// Drop the client, which closes its connection; every call still owed a
-    /// result resolves as `Closed`.
-    fn end(&self, actor: &mut Actor) {
-        self.shared.state().closing = true;
+    /// result resolves as `Closed`, or as the connect's failure.
+    fn end(&self, py: Python<'_>, actor: &mut Actor) {
+        self.close();
         // Out of its slot before it drops: dropping it resolves what it owed,
         // which runs Python, and a call that was waiting on a reply queues the
         // rest of itself, which goes with the queue below.
@@ -506,6 +531,17 @@ impl LoopCore {
             (std::mem::take(&mut st.queue), st.callbacks.take())
         };
         drop((unstarted, callbacks));
+        // While the core still holds the wake-up socket, so no other
+        // descriptor is ever read in its place. A loop that is closed has
+        // nothing to deregister from.
+        let remove = intern!(py, "remove_reader");
+        let _ = (self.shared.event_loop).call_method1(py, remove, (self.wakeup.rx.as_raw_fd(),));
+    }
+
+    /// Take no further call; one the client will never run is `Closed`,
+    /// unless the connect failed.
+    fn close(&self) {
+        self.shared.state().closed.get_or_insert(ClientError::Closed);
     }
 }
 
@@ -521,9 +557,14 @@ impl LoopCore {
         self.pump(py);
     }
 
-    /// A burst's deferred start, a finished job's wake-up, and a pump that
-    /// found another running.
+    /// A burst's deferred start, and a pump that found another running.
     fn on_flush(&self, py: Python<'_>) {
+        self.pump(py);
+    }
+
+    /// A finished job's wake-up, the connect's among them.
+    fn on_wakeup(&self, py: Python<'_>) {
+        self.wakeup.drain();
         self.pump(py);
     }
 }
@@ -533,18 +574,20 @@ impl LoopCore {
 // ---------------------------------------------------------------------------
 
 /// A connection on the running asyncio event loop: every verb submits when
-/// called and returns a future of its result. It is connected when built, so
-/// awaiting it yields itself, and `async with` closes it on exit.
+/// called and returns a future of its result. Building it starts its connect
+/// and blocks nothing; awaiting it, or entering it with `async with`, yields
+/// it once connected and raises if the connect failed, and `async with`
+/// closes it on exit.
 #[pyclass(name = "AsyncGnitzClient", extends = PyClient, frozen, module = "gnitz")]
 pub struct PyAsyncClient;
 
 #[pymethods]
 impl PyAsyncClient {
-    /// Connect on the calling thread, and serve on the running loop.
+    /// Start connecting, to serve on the running loop.
     #[new]
     #[pyo3(signature = (target = None, schema = "public"))]
     fn new(py: Python<'_>, target: Option<String>, schema: &str) -> PyResult<PyClassInitializer<Self>> {
-        let handle = LoopCore::connect(py, &resolve_target(target)?)?;
+        let handle = LoopCore::connect(py, resolve_target(target)?)?;
         Ok(PyClient::init(Mode::Loop(handle), schema).add_subclass(PyAsyncClient))
     }
 
@@ -555,9 +598,12 @@ impl PyAsyncClient {
         slf.as_super().get().on_loop()?.aclose(slf.py())
     }
 
+    /// This client, once every call made before is answered — the connect
+    /// first among them; its failure raises.
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         let core = slf.as_super().get().on_loop()?;
-        core.settled(slf.py(), slf.clone().into_any().unbind())
+        let me = slf.clone().into_any().unbind();
+        core.submit(slf.py(), whole!(|_c| ()), move |_, ()| Ok(me))
     }
 
     /// `await connect(p)`, beside `async with connect(p)`.

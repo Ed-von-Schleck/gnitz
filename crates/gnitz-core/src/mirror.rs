@@ -926,11 +926,13 @@ impl GnitzClient {
         Some(Arc::clone(&view.desc))
     }
 
-    /// [`Self::scan_spec`], answered off the copy when it holds `target`, with
-    /// no served LSN: a copy's freshness is [`Self::cursor_of`]. The gate and
-    /// the scan run under one guard, and a poisoned store refuses a read its
-    /// copy would answer.
-    pub fn scan_spec_local_first(
+    /// Run a parameterized bounded read, replied in `reply_schema`'s layout:
+    /// off the copy when it holds `target`, with no served LSN — a copy's
+    /// freshness is [`Self::cursor_of`] — and from the server, at the LSN it
+    /// was served at, otherwise. The gate and the scan run under one guard,
+    /// and a poisoned store refuses a read its copy would answer. A server
+    /// read of a relation the copy holds is [`Self::scan_many`]'s.
+    pub fn scan_spec(
         &mut self,
         target: impl Into<Target>,
         spec: gnitz_wire::ReadSpec,
@@ -954,7 +956,7 @@ impl GnitzClient {
                 return self.wait(Sent::ready(reply));
             }
         }
-        self.scan_spec(target, &spec, reply_schema)
+        self.scan_served(target, &spec, reply_schema)
     }
 
     /// Make every copy and its cursor durable.

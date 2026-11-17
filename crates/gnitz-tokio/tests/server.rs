@@ -110,7 +110,7 @@ fn push(c: &AsyncClient, tid: u64, schema: &Arc<Schema>, batch: ZSetBatch) -> Se
 /// Read `tid` under `spec`, submitted when called.
 fn scan(c: &AsyncClient, tid: u64, spec: ReadSpec, schema: &Arc<Schema>) -> Sent<ScanReply> {
     let schema = Arc::clone(schema);
-    c.send(move |c| c.scan_spec(tid, &spec, &schema))
+    c.send(move |c| c.scan_spec(tid, spec, &schema))
 }
 
 // ── Pipelining ────────────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ fn one_writev_per_burst() {
         eprintln!("strace not installed; skipping the syscall count");
         return;
     };
-    let pushed = block_on(blocking.scan_spec(tid, &all_rows(), &schema)).unwrap().batch;
+    let pushed = block_on(blocking.scan_spec(tid, all_rows(), &schema)).unwrap().batch;
     assert_eq!(unit_rows(&pushed), BURST as usize, "the traced child pushed its burst");
     // The transport writes the socket through `write_vectored`; plain `write`
     // is the harness's own stdout. One for the HELLO, one for the burst.
@@ -268,7 +268,7 @@ fn a_shared_client_mirrors() {
         {
             let read = |tid| {
                 let schema = Arc::clone(&schema);
-                client.send(move |c| c.scan_spec_local_first(tid, all_rows(), &schema))
+                client.send(move |c| c.scan_spec(tid, all_rows(), &schema))
             };
             let sent = || client.run(|c| Box::pin(async move { c.requests_sent() }));
 

@@ -84,7 +84,7 @@ fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
 
 /// Every row of `tid`, decoded under `schema`.
 fn scan_all(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>) -> ZSetBatch {
-    block_on(client.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), schema))
+    block_on(client.scan_served(tid, &ReadSpec::all_rows(ReadBound::None), schema))
         .unwrap()
         .batch
 }

@@ -14,7 +14,7 @@ fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
 
     let tables = sys_schema(SysFamily::Table);
-    let batch = block_on(client.scan_spec(SysFamily::Table, &ReadSpec::all_rows(ReadBound::None), tables))
+    let batch = block_on(client.scan_served(SysFamily::Table, &ReadSpec::all_rows(ReadBound::None), tables))
         .unwrap()
         .batch;
     let mut pks: Vec<u128> = (0..batch.len()).map(|i| batch.pks.get(i)).collect();
@@ -27,7 +27,7 @@ fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {
     // A reply layout that is not the family's is refused.
     let one_col = Arc::new(schema_of(&[("k", TypeCode::U64)]));
     assert_ne!(one_col.layout().layout_digest(), tables.layout().layout_digest());
-    let err = block_on(client.scan_spec(SysFamily::Table, &ReadSpec::all_rows(ReadBound::None), &one_col))
+    let err = block_on(client.scan_served(SysFamily::Table, &ReadSpec::all_rows(ReadBound::None), &one_col))
         .expect_err("a reply layout that is not the family's must be refused");
     assert_eq!(
         err.status(),

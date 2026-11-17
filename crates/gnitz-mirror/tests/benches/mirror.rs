@@ -61,14 +61,14 @@ fn mirror_call_cost_bench() {
     .map(|(label, bound, rows)| (label, ReadSpec::all_rows(bound), rows));
 
     for (label, spec, rows) in &reads {
-        let served = block_on(fx.direct.scan_spec(&*rel, spec, &rel.schema)).expect("served read");
+        let served = block_on(fx.direct.scan_spec(&*rel, spec.clone(), &rel.schema)).expect("served read");
         assert_eq!(
             served.batch.weights.len(),
             *rows,
             "{label}: the bound walks what its label says"
         );
         cell(&format!("served {label}, {rows} rows"), CALLS, &mut fx.direct, |c| {
-            black_box(block_on(c.scan_spec(&*rel, spec, &rel.schema)).expect("served read"));
+            black_box(block_on(c.scan_spec(&*rel, spec.clone(), &rel.schema)).expect("served read"));
         });
     }
     for tier in ["RAM tier", "shards"] {
@@ -77,7 +77,7 @@ fn mirror_call_cost_bench() {
         }
         for (label, spec, rows) in &reads {
             cell(&format!("local {label}, {tier}"), CALLS, fx.mirror(), |m| {
-                let local = block_on(m.scan_spec_local_first(&*rel, spec.clone(), &rel.schema));
+                let local = block_on(m.scan_spec(&*rel, spec.clone(), &rel.schema));
                 assert_eq!(black_box(local.expect("local read")).batch.weights.len(), *rows);
             });
         }

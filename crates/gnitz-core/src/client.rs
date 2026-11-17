@@ -90,16 +90,15 @@ impl GnitzClient {
         Self::connect_on(target, Box::new(BlockingHost::default()))
     }
 
-    /// A client that waits the way `host` does. The connect itself blocks the
-    /// calling thread, a TLS handshake included; a driver whose thread must not
-    /// block runs this where blocking is allowed.
+    /// A client that waits the way `host` does, connected on the calling
+    /// thread, which blocks — a TLS handshake included.
     pub fn connect_on(target: &str, host: Box<dyn Host>) -> Result<Self, ClientError> {
         Self::over(Session::connect(target)?, host)
     }
 
     /// [`Self::connect_on`] with the connect run as a job on `host`, where it
-    /// may block — for a host whose own thread must not, as [`Self::reconnect`]
-    /// does. A panic in the connect resumes here; a job the host dropped is
+    /// may block — for a host whose own thread must not, as an event loop's
+    /// does, and as [`Self::reconnect`] does. A panic in the connect resumes here; a job the host dropped is
     /// `Closed`.
     pub async fn connect_with(target: &str, mut host: Box<dyn Host>) -> Result<Self, ClientError> {
         let target = target.to_owned();
@@ -262,8 +261,11 @@ impl GnitzClient {
         self.ack(Request::Push { target, schema, batch, mode })
     }
 
-    /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
-    pub fn scan_spec(
+    /// Run a parameterized bounded read on the server, replied in
+    /// `reply_schema`'s layout: what [`Self::scan_spec`] falls back on, and the
+    /// read of a relation no copy holds — a system family, or a table read to
+    /// write it — whose reply always carries its LSN.
+    pub(crate) fn scan_served(
         &mut self,
         target: impl Into<Target>,
         spec: &ReadSpec,
@@ -274,8 +276,8 @@ impl GnitzClient {
         self.wait(sent)
     }
 
-    /// N [`Self::scan_spec`]s as one request, answered in request order: no
-    /// commit is in some of the replies and not in others.
+    /// N bounded reads as one request, answered by the server in request
+    /// order: no commit is in some of the replies and not in others.
     pub fn scan_many(&mut self, scans: &[(Target, &ReadSpec, &Arc<Schema>)]) -> Pending<'_, Vec<ScanReply>> {
         let sent = self.session.submit_scan_multi(scans);
         self.wait(sent)
@@ -315,8 +317,8 @@ impl GnitzClient {
 
     // ── Reads, by the freshness asked for ──────────────────────────────────
     //
-    // `resolve` and `scan_spec` ask the server; `mirrored_desc` and
-    // `scan_spec_local_first`, with the mirror's other verbs, consult the copy
+    // `resolve` and `scan_many` ask the server; `mirrored_desc` and
+    // `scan_spec`, with the mirror's other verbs, consult the copy
     // first, and `kept_desc` the last RESOLVE's answer. **The gate is what the
     // copy holds, never whether a store is attached**, so a client with one
     // reads exactly like a client without for every relation the copy does

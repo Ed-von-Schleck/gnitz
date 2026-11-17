@@ -46,7 +46,7 @@ const BIG: usize = 200_000;
 
 /// A read of every row of `tid`, submitted when called.
 fn scan(c: &AsyncClient, tid: u64) -> Sent<ScanReply> {
-    c.send(move |c| c.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema()))
+    c.send(move |c| c.scan_spec(tid, ReadSpec::all_rows(ReadBound::None), &schema()))
 }
 
 /// A push of `batch` to `tid`, submitted when called.
@@ -367,9 +367,15 @@ fn an_owned_client_waits_on_the_runtime_and_reconnects() {
 
     let answered = answering(peer, 1..=3);
     settled(&rt, async {
-        assert_eq!(client.scan_spec(1, &spec, &schema()).await.unwrap().lsn, Some(11));
-        let first = client.scan_spec(2, &spec, &schema()).detach();
-        assert_eq!(client.scan_spec(3, &spec, &schema()).await.unwrap().lsn, Some(33));
+        assert_eq!(
+            client.scan_spec(1, spec.clone(), &schema()).await.unwrap().lsn,
+            Some(11)
+        );
+        let first = client.scan_spec(2, spec.clone(), &schema()).detach();
+        assert_eq!(
+            client.scan_spec(3, spec.clone(), &schema()).await.unwrap().lsn,
+            Some(33)
+        );
         assert_eq!(first.await.unwrap().lsn, Some(22));
     });
     let mut old = answered.join().unwrap();
@@ -380,7 +386,10 @@ fn an_owned_client_waits_on_the_runtime_and_reconnects() {
     assert_eq!(old.read(&mut [0]).map_err(|e| e.kind()), Ok(0), "the old socket closed");
     let answered = answering(accepted.join().unwrap(), 4..=4);
     settled(&rt, async {
-        assert_eq!(client.scan_spec(4, &spec, &schema()).await.unwrap().lsn, Some(44));
+        assert_eq!(
+            client.scan_spec(4, spec.clone(), &schema()).await.unwrap().lsn,
+            Some(44)
+        );
     });
     answered.join().unwrap();
 }

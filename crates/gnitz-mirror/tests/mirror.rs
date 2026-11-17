@@ -2933,13 +2933,8 @@ mod cut_short {
         fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
             self.inner.attach(fd)
         }
-        fn poll_io(
-            &mut self,
-            want: Interest,
-            cx: &mut Context<'_>,
-            io: &mut dyn FnMut(Interest),
-        ) -> Poll<Result<(), ClientError>> {
-            self.inner.poll_io(want, cx, io)
+        fn poll_io(&mut self, want: Interest, cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
+            self.inner.poll_io(want, cx)
         }
         fn spawn(&mut self, job: Job) {
             if self.s.defer.load(Ordering::SeqCst) {

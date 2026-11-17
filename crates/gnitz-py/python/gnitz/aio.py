@@ -25,9 +25,10 @@ round trip::
 takes the sync's delivery when it resumes, so a task cancelled at any point
 loses nothing, and the next sync brings it.
 
-Socket I/O runs on the loop, and a mirror store's disk work on one thread of
-its own. ``connect`` blocks the calling thread. Abandoning a
-future is not cancellation: the request is still written and committed.
+Nothing blocks the loop: socket I/O runs on it, and the connect and a mirror
+store's disk work on a thread pool every client in the process shares.
+Abandoning a future is not cancellation: the request is still written and
+committed.
 """
 
 import asyncio
@@ -54,9 +55,13 @@ async def _claimed(delivery: "asyncio.Future[Any]") -> Synced:
 
 
 def connect(target: str | None = None, schema: str = "public") -> AsyncGnitzClient:
-    """Connect to the gnitz server at `target`, ``GNITZ_TARGET`` where it is
+    """A client of the gnitz server at `target`, ``GNITZ_TARGET`` where it is
     not given, with unqualified relation names resolving in `schema`;
-    `other.name` names a relation of another schema. The connection is made
-    when this returns, so awaiting it yields itself, and `async with` closes
-    it on exit."""
+    `other.name` names a relation of another schema.
+
+    It returns at once and connects in the background. Awaiting the client,
+    or entering it with `async with`, yields it once it is connected, and
+    raises if the connect failed; `async with` closes it on exit. A verb
+    called before then is queued behind the connect, and raises its failure
+    if it fails."""
     return AsyncGnitzClient(target, schema)

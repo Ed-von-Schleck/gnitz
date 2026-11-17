@@ -9,6 +9,7 @@ so a value- or row-level claim belongs to the coordinate that owns it —
 import asyncio
 import os
 import shutil
+import socket
 import time
 
 import pytest
@@ -193,6 +194,43 @@ async def test_a_dropped_connection_frees_its_socket(server):
     assert len(await fut) > 0
     await asyncio.sleep(0)
     assert _open_sockets() == before
+
+
+async def test_connecting_leaves_the_loop_free(tmp_path):
+    """The connect runs off the loop: a peer that never answers the handshake
+    holds up the client and not the loop. Calls made meanwhile wait behind the
+    connect, and its failure is what the client and every one of them raise,
+    a call made after it included."""
+    path = str(tmp_path / "mute.sock")
+    with socket.socket(socket.AF_UNIX) as mute:
+        mute.bind(path)
+        mute.listen()           # queues the connection, and answers nothing
+        started = time.monotonic()
+        conn = aio.connect(path)
+        assert time.monotonic() - started < 1
+        calls = [conn.requests_sent, conn.mirrored_ids()]
+        await asyncio.sleep(0.2)
+        assert not any(c.done() for c in calls)
+    # Closing the listener resets the connection it queued.
+    raised = []
+    for awaitable in [conn, *calls, conn.requests_sent]:
+        with pytest.raises(gnitz.GnitzConnectionError) as failed:
+            await asyncio.wait_for(awaitable, timeout=30)
+        raised.append(str(failed.value))
+    assert len(set(raised)) == 1, raised
+    await conn.aclose()
+
+
+async def test_calls_made_while_connecting_wait_for_it(server):
+    """Calls made before the connect is up are queued, not refused, and run
+    in order once it is."""
+    conn = aio.connect(server)
+    schemas, sent = await asyncio.gather(conn.resolve_table(SCHEMAS), conn.requests_sent)
+    assert sent == 1
+    assert await conn is conn
+    async with conn as entered:
+        assert entered is conn
+        assert len(await conn.scan(*schemas)) > 0
 
 
 # ---------------------------------------------------------------------------

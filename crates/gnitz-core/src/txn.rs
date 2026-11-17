@@ -121,7 +121,7 @@ impl GnitzClient {
                     sink: spec.sink.clone(),
                 });
                 let ScanReply { batch, lsn, .. } = self
-                    .scan_spec(target, narrowed.as_ref().unwrap_or(&spec), &reply)
+                    .scan_served(target, narrowed.as_ref().unwrap_or(&spec), &reply)
                     .await?;
                 (batch, lsn.expect("a server read carries its watermark"))
             }

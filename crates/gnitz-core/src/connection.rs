@@ -91,6 +91,15 @@ pub(crate) struct RawBlock {
 }
 
 impl RawBlock {
+    /// Own `frame`'s buffer, taking it out of the Cow (a borrowed frame lives
+    /// in the transport window), with its data block at `block`.
+    fn own(frame: &mut Cow<'_, [u8]>, block: std::ops::Range<usize>) -> Self {
+        RawBlock {
+            frame: std::mem::take(frame).into_owned(),
+            block,
+        }
+    }
+
     /// The data block's bytes, ready to decode against the reply schema.
     pub(crate) fn block(&self) -> &[u8] {
         &self.frame[self.block.clone()]
@@ -257,29 +266,9 @@ enum Slot {
     /// RESOLVE: the descriptor, or `None` when no such relation exists.
     /// Uncorrelated on the wire, because the request names no id.
     Resolve { to: Promise<Option<Arc<RelDescriptor>>> },
-    /// SCAN_MULTI: one train per relation, in request order, each reply
-    /// gathered as its train terminates. The train in progress is
-    /// `trains[replies.len()]`.
-    Scan {
-        trains: Vec<Train>,
-        replies: Vec<ScanReply>,
-        to: Promise<Vec<ScanReply>>,
-    },
-    /// One view's delta read: a scan's train, whose terminal carries the cursor
-    /// to read from next.
-    Delta {
-        train: Train,
-        /// The subscription id the view is kept as from that cursor.
-        keep: Option<SubId>,
-        to: Promise<(ScanReply, DeltaCursor)>,
-    },
-    /// SNAPSHOT_PAGE: a scan's trains, with where each worker's ends.
-    Page {
-        train: Train,
-        /// The row count at the end of each worker's train so far.
-        worker_ends: Vec<usize>,
-        to: Promise<SnapshotPage>,
-    },
+    /// A reply of rows, one relation's train at a time: `train` is the one in
+    /// progress, and `to` what its terminal answers.
+    Rows { train: Train, to: RowsTo },
     /// One train per view, its blocks kept raw; the train in progress is
     /// `views[at]`, parked under the id it is kept as while that id is read.
     DeltaPoll {
@@ -294,6 +283,31 @@ enum Slot {
         tid: u64,
         sub: SubId,
         blocks: Vec<RawBlock>,
+    },
+}
+
+/// What a [`Slot::Rows`] train's terminal answers.
+enum RowsTo {
+    /// A one-relation SCAN_MULTI, at the LSN its terminal names.
+    Scan(Promise<ScanReply>),
+    /// SCAN_MULTI of several, replied in request order: the trains after the
+    /// one in progress, last first, and the replies before it.
+    Scans {
+        next: Vec<Train>,
+        replies: Vec<ScanReply>,
+        to: Promise<Vec<ScanReply>>,
+    },
+    /// One view's delta read, whose terminal carries the cursor to read from
+    /// next; with `keep`, the subscription id the view is kept as from it.
+    Delta {
+        keep: Option<SubId>,
+        to: Promise<(ScanReply, DeltaCursor)>,
+    },
+    /// SNAPSHOT_PAGE: every worker's rows as one train, with the row count at
+    /// the end of each worker's so far.
+    Page {
+        worker_ends: Vec<usize>,
+        to: Promise<SnapshotPage>,
     },
 }
 
@@ -331,8 +345,7 @@ impl Train {
     ) -> Result<(), ProtocolError> {
         self.rows += parse_wal_block(&frame[block.clone()], &self.schema)?.rows;
         if more {
-            let frame = std::mem::take(frame).into_owned();
-            self.held.push(RawBlock { frame, block });
+            self.held.push(RawBlock::own(frame, block));
         }
         Ok(())
     }
@@ -605,8 +618,15 @@ impl Session {
         spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Sent<ScanReply> {
-        self.submit_scan_multi(&[(target, spec, reply_schema)])
-            .map(|mut replies| replies.pop().expect("a one-item scan answers with one reply"))
+        let spec = spec.encode();
+        let item = scan_item(target, reply_schema, &spec);
+        let (to, sent) = promise();
+        let slot = Slot::Rows {
+            train: Train::new(target.tid, reply_schema),
+            to: RowsTo::Scan(to),
+        };
+        self.enqueue(|out| multi_frame::encode_scan_multi(out, &[item]), slot);
+        sent
     }
 
     /// SNAPSHOT_PAGE: up to `limit` rows of `tid` as snapshot `snapshot` holds
@@ -627,10 +647,9 @@ impl Session {
             after: after.to_vec(),
         };
         let (to, sent) = promise();
-        let slot = Slot::Page {
+        let slot = Slot::Rows {
             train: Train::new(tid, reply_schema),
-            worker_ends: Vec::new(),
-            to,
+            to: RowsTo::Page { worker_ends: Vec::new(), to },
         };
         let request = request.encode();
         self.enqueue(|out| append_payload(out, hdr, &request, None), slot);
@@ -643,27 +662,26 @@ impl Session {
         &mut self,
         scans: &[(Target, &gnitz_wire::ReadSpec, &Arc<Schema>)],
     ) -> Sent<Vec<ScanReply>> {
-        if scans.is_empty() {
-            return Sent::ready(Err(ClientError::from("a multi-read names no relation")));
-        }
         let specs: Vec<Vec<u8>> = scans.iter().map(|(_, spec, _)| spec.encode()).collect();
         let items: Vec<multi_frame::ScanItem> = scans
             .iter()
             .zip(&specs)
-            .map(|(&(target, _, schema), spec)| multi_frame::ScanItem {
-                target,
-                reply_layout: schema.layout().layout_digest(),
-                spec,
-            })
+            .map(|(&(target, _, schema), spec)| scan_item(target, schema, spec))
             .collect();
+        let mut next: Vec<Train> = (scans.iter().rev())
+            .map(|&(target, _, schema)| Train::new(target.tid, schema))
+            .collect();
+        let Some(train) = next.pop() else {
+            return Sent::ready(Err(ClientError::from("a multi-read names no relation")));
+        };
         let (to, sent) = promise();
-        let slot = Slot::Scan {
-            trains: scans
-                .iter()
-                .map(|&(target, _, schema)| Train::new(target.tid, schema))
-                .collect(),
-            replies: Vec::with_capacity(scans.len()),
-            to,
+        let slot = Slot::Rows {
+            train,
+            to: RowsTo::Scans {
+                next,
+                replies: Vec::with_capacity(scans.len()),
+                to,
+            },
         };
         self.enqueue(|out| multi_frame::encode_scan_multi(out, &items), slot);
         sent
@@ -681,10 +699,9 @@ impl Session {
         keep: Option<SubId>,
     ) -> Sent<(ScanReply, DeltaCursor)> {
         let (to, sent) = promise();
-        let slot = Slot::Delta {
+        let slot = Slot::Rows {
             train: Train::new(view.tid, reply_schema),
-            keep,
-            to,
+            to: RowsTo::Delta { keep, to },
         };
         let item = multi_frame::DeltaPollItem {
             view,
@@ -844,33 +861,33 @@ impl Session {
     /// `Closed` when the session will answer nothing more: it ended, or the
     /// reply awaited belongs to a session since replaced.
     pub(crate) fn turn(&mut self, host: &mut dyn Host, cx: &mut Context<'_>) -> Poll<Result<(), ClientError>> {
-        if self.unread {
-            ready!(host.poll_proceed(cx));
-            self.step(Interest::READ);
-            return Poll::Ready(Ok(()));
-        }
         let want = self.interest();
-        if want.is_empty() {
-            return Poll::Ready(Err(ClientError::Closed));
-        }
-        if want.write && !self.refused {
+        let ready = if self.unread || (want.write && !self.refused) {
             ready!(host.poll_proceed(cx));
-            self.step(Interest::WRITE);
-            return Poll::Ready(Ok(()));
-        }
-        let waited = ready!(host.poll_io(want, cx, &mut |ready| self.step(ready)));
-        Poll::Ready(match waited {
-            // A wait that failed is the connection's end, which every reply owed
-            // arrives as; an interrupt leaves the session as it stood.
-            Err(e) if !matches!(e, ClientError::Interrupted(_)) => {
-                self.end(match e {
-                    ClientError::Protocol(lost) => ClientError::ConnectionLost(lost),
-                    e => e,
-                });
-                Ok(())
+            match self.unread {
+                true => Interest::READ,
+                false => Interest::WRITE,
             }
-            waited => waited,
-        })
+        } else if want.is_empty() {
+            return Poll::Ready(Err(ClientError::Closed));
+        } else {
+            match ready!(host.poll_io(want, cx)) {
+                Ok(ready) => ready,
+                // An interrupt leaves the session as it stood.
+                Err(e @ ClientError::Interrupted(_)) => return Poll::Ready(Err(e)),
+                // A wait that failed is the connection's end, which every reply
+                // owed arrives as.
+                Err(e) => {
+                    self.end(match e {
+                        ClientError::Protocol(lost) => ClientError::ConnectionLost(lost),
+                        e => e,
+                    });
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        };
+        self.step(ready);
+        Poll::Ready(Ok(()))
     }
 
     /// Step until `ready` yields, asking it before each step: a step with
@@ -967,8 +984,8 @@ impl Slot {
         let want = match self {
             Slot::Ack { tid, .. } | Slot::Pushed { tid, .. } => Some(*tid),
             Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
+            Slot::Rows { train, .. } => Some(train.tid),
             Slot::Resolve { .. } => None,
-            _ => self.train().map(|t| t.tid),
         };
         if let Some(fault) = ctrl.fault(&buf) {
             let refused = ClientError::Refused(fault);
@@ -997,27 +1014,26 @@ impl Slot {
             (_, None) => {}
             (Slot::DeltaPoll { at, first, .. }, Some(block)) => {
                 if let Some(blocks) = polls.reading.get_mut(&kept_as(*first, *at)) {
-                    let frame = std::mem::take(&mut buf).into_owned();
-                    blocks.push(RawBlock { frame, block });
+                    blocks.push(RawBlock::own(&mut buf, block));
                 }
             }
             (Slot::Pushed { sub, blocks, .. }, Some(block)) => {
                 if matches!(polls.subs.get(sub), Some(Ok(_))) {
-                    let frame = std::mem::take(&mut buf).into_owned();
-                    blocks.push(RawBlock { frame, block });
+                    blocks.push(RawBlock::own(&mut buf, block));
                 }
             }
-            (slot, Some(r)) => match slot.train() {
-                Some(train) => train.take(&mut buf, r, ctrl.hdr.flags.continuation)?,
-                None => {
-                    return Err(ProtocolError::DecodeError(
-                        "a data block on a reply that carries no rows".into(),
-                    ));
-                }
-            },
+            (Slot::Rows { train, .. }, Some(r)) => train.take(&mut buf, r, ctrl.hdr.flags.continuation)?,
+            (Slot::Ack { .. } | Slot::Resolve { .. }, Some(_)) => {
+                return Err(ProtocolError::DecodeError(
+                    "a data block on a reply that carries no rows".into(),
+                ));
+            }
         }
 
-        if let Slot::Page { train, worker_ends, .. } = &mut *self
+        if let Slot::Rows {
+            train,
+            to: RowsTo::Page { worker_ends, .. },
+        } = &mut *self
             && ctrl.hdr.flags.scan_last
         {
             worker_ends.push(train.rows);
@@ -1035,32 +1051,35 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
-            Slot::Scan { trains, replies, to } => {
-                let reply = trains[replies.len()].reply(last(), Some(ctrl.hdr.arg0))?;
-                replies.push(reply);
-                if replies.len() < trains.len() {
-                    return Ok(false);
+            Slot::Rows { train, to } => match to {
+                RowsTo::Scan(to) => to.fulfil(Ok(train.reply(last(), Some(ctrl.hdr.arg0))?)),
+                RowsTo::Scans { next, replies, to } => {
+                    replies.push(train.reply(last(), Some(ctrl.hdr.arg0))?);
+                    if let Some(following) = next.pop() {
+                        *train = following;
+                        return Ok(false);
+                    }
+                    to.fulfil(Ok(std::mem::take(replies)))
                 }
-                to.fulfil(Ok(std::mem::take(replies)))
-            }
-            Slot::Page { train, worker_ends, to } => {
-                let batch = train.finish(last())?;
-                // The next page's rows are shared over the stores this one
-                // names, so a page naming none is no reply to a page request.
-                if worker_ends.is_empty() {
-                    return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
+                RowsTo::Page { worker_ends, to } => {
+                    let batch = train.finish(last())?;
+                    // The next page's rows are shared over the stores this one
+                    // names, so a page naming none is no reply to a page request.
+                    if worker_ends.is_empty() {
+                        return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
+                    }
+                    let worker_ends = std::mem::take(worker_ends);
+                    to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
                 }
-                let worker_ends = std::mem::take(worker_ends);
-                to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
-            }
-            Slot::Delta { train, keep, to } => {
-                let cursor = cursor()?;
-                let reply = train.reply(last(), None)?;
-                if let Some(id) = *keep {
-                    polls.hold(id, cursor);
+                RowsTo::Delta { keep, to } => {
+                    let cursor = cursor()?;
+                    let reply = train.reply(last(), None)?;
+                    if let Some(id) = *keep {
+                        polls.hold(id, cursor);
+                    }
+                    to.fulfil(Ok((reply, cursor)))
                 }
-                to.fulfil(Ok((reply, cursor)))
-            }
+            },
             Slot::DeltaPoll { views, at, first } => {
                 polls.poll_end(kept_as(*first, *at), Ok(cursor()?));
                 *at += 1;
@@ -1073,25 +1092,18 @@ impl Slot {
         Ok(true)
     }
 
-    /// The train in progress of a slot that reads rows; `None` for one that
-    /// carries none, or keeps its blocks raw.
-    fn train(&mut self) -> Option<&mut Train> {
-        match self {
-            Slot::Delta { train, .. } | Slot::Page { train, .. } => Some(train),
-            Slot::Scan { trains, replies, .. } => trains.get_mut(replies.len()),
-            _ => None,
-        }
-    }
-
     /// The request ended unanswered: `why` is its reply, and the end of each
     /// view a delta poll had yet to answer.
     fn fail(&mut self, why: ClientError, polls: &mut Polls) {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Err(why)),
             Slot::Resolve { to } => to.fulfil(Err(why)),
-            Slot::Scan { to, .. } => to.fulfil(Err(why)),
-            Slot::Page { to, .. } => to.fulfil(Err(why)),
-            Slot::Delta { to, .. } => to.fulfil(Err(why)),
+            Slot::Rows { to, .. } => match to {
+                RowsTo::Scan(to) => to.fulfil(Err(why)),
+                RowsTo::Scans { to, .. } => to.fulfil(Err(why)),
+                RowsTo::Delta { to, .. } => to.fulfil(Err(why)),
+                RowsTo::Page { to, .. } => to.fulfil(Err(why)),
+            },
             Slot::DeltaPoll { views, at, first } => {
                 for at in *at..views.len() {
                     polls.poll_end(kept_as(*first, at), Err(why.clone()));
@@ -1099,6 +1111,15 @@ impl Slot {
             }
             Slot::Pushed { sub, blocks, .. } => polls.holder_end(*sub, std::mem::take(blocks), Err(why)),
         }
+    }
+}
+
+/// One SCAN_MULTI item: `target` read under `spec`, replied in `schema`'s layout.
+fn scan_item<'a>(target: Target, schema: &Schema, spec: &'a [u8]) -> multi_frame::ScanItem<'a> {
+    multi_frame::ScanItem {
+        target,
+        reply_layout: schema.layout().layout_digest(),
+        spec,
     }
 }
 

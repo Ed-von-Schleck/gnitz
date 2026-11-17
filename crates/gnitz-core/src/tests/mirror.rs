@@ -987,7 +987,7 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
         drop(peer);
         if lost_before {
             let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
-            let r = block_on(client.scan_spec(1, &spec, &Arc::new(kv_schema(TypeCode::I64))));
+            let r = block_on(client.scan_served(1, &spec, &Arc::new(kv_schema(TypeCode::I64))));
             assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
         }
 

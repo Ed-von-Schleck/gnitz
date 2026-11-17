@@ -29,7 +29,7 @@ fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
     // The peer never answers, so the scan parks; the signal makes the park
     // return `EINTR`, which is the one place the hook runs.
     let (sa, spec) = (Arc::new(kv_schema(TypeCode::I64)), ReadSpec::all_rows(ReadBound::None));
-    let r = block_on(c.scan_spec(1, &spec, &sa));
+    let r = block_on(c.scan_served(1, &spec, &sa));
     assert!(matches!(r, Err(ClientError::Interrupted(ref e)) if e.to_string() == "interrupted"));
     stop.store(true, Ordering::Relaxed);
     sig.join().unwrap();
@@ -43,7 +43,7 @@ fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
         peer.send(&reply_ctrl(1, 200));
         peer
     });
-    assert_eq!(block_on(c.scan_spec(1, &spec, &sa)).unwrap().lsn, Some(200));
+    assert_eq!(block_on(c.scan_served(1, &spec, &sa)).unwrap().lsn, Some(200));
     let _peer = h.join().unwrap();
     assert_eq!(c.session.interest(), Interest::NONE);
 }
@@ -57,7 +57,7 @@ fn a_cancellable_wait_gives_up_on_a_readable_cancel_socket_and_drains_it() {
     let mut c = GnitzClient::over(s, Box::new(BlockingHost::cancelled_by(cancel).unwrap())).unwrap();
     let (sa, spec) = (Arc::new(kv_schema(TypeCode::I64)), ReadSpec::all_rows(ReadBound::None));
     std::io::Write::write_all(&mut canceller, b"xx").unwrap();
-    let r = block_on(c.scan_spec(1, &spec, &sa));
+    let r = block_on(c.scan_served(1, &spec, &sa));
     assert!(matches!(r, Err(ClientError::Interrupted(_))));
 
     peer.recv();
@@ -67,7 +67,7 @@ fn a_cancellable_wait_gives_up_on_a_readable_cancel_socket_and_drains_it() {
         peer.send(&reply_ctrl(1, 200));
         peer
     });
-    assert_eq!(block_on(c.scan_spec(1, &spec, &sa)).unwrap().lsn, Some(200));
+    assert_eq!(block_on(c.scan_served(1, &spec, &sa)).unwrap().lsn, Some(200));
     let _peer = h.join().unwrap();
 }
 
@@ -103,18 +103,12 @@ impl Host for PendingHost {
         Ok(())
     }
 
-    fn poll_io(
-        &mut self,
-        _: Interest,
-        _: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
+    fn poll_io(&mut self, _: Interest, _: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
         self.asked = !self.asked;
         if self.asked {
             return Poll::Pending;
         }
-        io(Interest { read: true, write: true });
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(Interest { read: true, write: true }))
     }
 
     fn spawn(&mut self, job: Job) {
@@ -132,12 +126,7 @@ impl Host for FailingHost {
         Ok(())
     }
 
-    fn poll_io(
-        &mut self,
-        _: Interest,
-        _: &mut Context<'_>,
-        _: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
+    fn poll_io(&mut self, _: Interest, _: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
         Poll::Ready(Err(std::io::Error::other("no reactor").into()))
     }
 
@@ -371,13 +360,8 @@ impl Host for Budgeted {
         self.inner.attach(fd)
     }
 
-    fn poll_io(
-        &mut self,
-        want: Interest,
-        cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
-        self.inner.poll_io(want, cx, io)
+    fn poll_io(&mut self, want: Interest, cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
+        self.inner.poll_io(want, cx)
     }
 
     fn spawn(&mut self, job: Job) {

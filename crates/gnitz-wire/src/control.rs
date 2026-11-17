@@ -214,8 +214,10 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
     }
     let mut r = Reader::new(data);
     // The header's words in layout order, each read whole: none can run short.
-    let [status, blob_len] = [(); 2].map(|()| r.u32().expect("a whole header"));
-    let [word, target_id, arg0, arg1] = [(); 4].map(|()| r.u64().expect("a whole header"));
+    let whole = "a whole header";
+    let (status, blob_len) = (r.u32().expect(whole), r.u32().expect(whole));
+    let (word, target_id) = (r.u64().expect(whole), r.u64().expect(whole));
+    let (arg0, arg1) = (r.u64().expect(whole), r.u64().expect(whole));
     debug_assert_eq!(r.pos(), CTRL_HEADER_SIZE);
     r.take(blob_len as usize)
         .map_err(|_| "control blob runs past the frame")?;

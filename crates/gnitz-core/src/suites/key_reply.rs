@@ -24,7 +24,7 @@ fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec
     );
     assert_eq!(reply_schema.layout().pk_stride(), schema.layout().pk_stride());
     let spec = ReadSpec { bound: ReadBound::None, predicate, sink };
-    let reply = block_on(client.scan_spec(tid, &spec, &reply_schema))
+    let reply = block_on(client.scan_served(tid, &spec, &reply_schema))
         .expect("a PK-only reply must not be rejected")
         .batch;
     assert!(reply.payload.is_empty() && reply.blob.is_empty());

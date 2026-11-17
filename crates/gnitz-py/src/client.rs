@@ -156,11 +156,7 @@ impl PyClient {
     /// The rows `spec` selects of relation `tid` in `schema`'s layout, off this
     /// client's local copy if it mirrors one.
     fn read(slf: &Bound<'_, Self>, tid: u64, schema: PySchema, spec: ReadSpec) -> PyResult<Py<PyAny>> {
-        Self::run(
-            slf,
-            single!(|c| c.scan_spec_local_first(tid, spec, &schema.rust)),
-            scanned,
-        )
+        Self::run(slf, single!(|c| c.scan_spec(tid, spec, &schema.rust)), scanned)
     }
 }
 

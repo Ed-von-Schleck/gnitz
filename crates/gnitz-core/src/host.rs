@@ -26,16 +26,11 @@ pub trait Host: Send {
     /// The client's socket is `fd` from here on, until the next `attach`.
     fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()>;
 
-    /// Once the socket is ready for any of `want`, step the client on what is
-    /// ready by calling `io`. Readiness is spent by
-    /// the call: before it asks again, the client reads on by itself until the
-    /// socket has no more, and writes by itself until the socket refuses bytes.
-    fn poll_io(
-        &mut self,
-        want: Interest,
-        cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>>;
+    /// Once the socket is ready for any of `want`, what it is ready for.
+    /// Readiness is spent by the call: before it asks again, the client reads
+    /// on by itself until the socket has no more, and writes by itself until
+    /// the socket refuses bytes.
+    fn poll_io(&mut self, want: Interest, cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>>;
 
     /// Run `job` where it may block. A host that cannot run it drops it.
     fn spawn(&mut self, job: Job);
@@ -96,12 +91,7 @@ impl Host for BlockingHost {
         Ok(())
     }
 
-    fn poll_io(
-        &mut self,
-        want: Interest,
-        _cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest),
-    ) -> Poll<Result<(), ClientError>> {
+    fn poll_io(&mut self, want: Interest, _cx: &mut Context<'_>) -> Poll<Result<Interest, ClientError>> {
         let fd = self
             .fd
             .as_ref()
@@ -110,10 +100,7 @@ impl Host for BlockingHost {
         let cancel = self.cancel.as_ref();
         loop {
             match poll_fd_or_cancel(fd, want, cancel.map(AsFd::as_fd), None) {
-                Ok(Some(ready)) => {
-                    io(ready);
-                    return Poll::Ready(Ok(()));
-                }
+                Ok(Some(ready)) => return Poll::Ready(Ok(ready)),
                 Ok(None) => {
                     drain_cancel(cancel.expect("only a cancel socket cancels"));
                     let why: Box<dyn std::error::Error + Send + Sync> = "cancelled".into();
@@ -350,16 +337,6 @@ impl<T> Sent<T> {
             }
             _ => *slot = Awaited::Routed(Box::new(route)),
         }
-    }
-
-    /// The reply `f` makes of this one, arriving with it.
-    pub fn map<U: Send + 'static>(self, f: impl FnOnce(T) -> U + Send + 'static) -> Sent<U>
-    where
-        T: 'static,
-    {
-        let (mut to, mapped) = promise();
-        self.then(move |reply| to.fulfil(reply.map(f)));
-        mapped
     }
 }
 

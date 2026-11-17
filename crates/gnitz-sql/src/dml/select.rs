@@ -268,14 +268,14 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
     let (batch, lsn) = match case {
         ReadCase::Constant { row } => (row, None),
         ReadCase::Rows { read, .. } => {
-            let reply = client.scan_spec_local_first(&*read.desc, read.spec, &schema).await?;
+            let reply = client.scan_spec(&*read.desc, read.spec, &schema).await?;
             (reply.batch, reply.lsn)
         }
         ReadCase::Fold { read, mut finish, .. } => {
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
             let partial = client
-                .scan_spec_local_first(&*read.desc, read.spec, finish.partial_schema())
+                .scan_spec(&*read.desc, read.spec, finish.partial_schema())
                 .await?;
             (finish.finish(partial.batch), partial.lsn)
         }

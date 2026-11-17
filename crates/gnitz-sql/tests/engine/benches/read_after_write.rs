@@ -63,7 +63,9 @@ fn view_read_after_write_bench() {
                 .add_row(i as u128, 1)
                 .int_val((i % 8) as i64);
             block_on(db.client.push(t.tid, &t.schema, batch, WireConflictMode::Update)).unwrap();
-            let got = block_on(db.client.scan_spec(v.tid, &all, &v.schema)).unwrap().batch;
+            let got = block_on(db.client.scan_spec(v.tid, all.clone(), &v.schema))
+                .unwrap()
+                .batch;
             let rows: i64 = got.weights.iter().sum();
             assert_eq!(
                 rows as u64,
