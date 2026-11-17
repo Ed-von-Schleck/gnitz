@@ -509,13 +509,7 @@ fn cancel_a_sync(delivered: bool) {
 
     // The sync's request goes first, then the probe's, so once the probe is
     // answered the sync's request is out; its answer waits for `go`.
-    let mut sync = Box::pin(client.sync(Duration::from_secs(30)));
-    let noop = std::task::Waker::noop();
-    assert!(
-        sync.as_mut()
-            .poll(&mut std::task::Context::from_waker(noop))
-            .is_pending()
-    );
+    let sync = client.sync(Duration::from_secs(30));
     assert_eq!(drive(&rt, &mut conn, scan(&client, 5)).unwrap().lsn, Some(55));
     if delivered {
         go.send(()).unwrap();

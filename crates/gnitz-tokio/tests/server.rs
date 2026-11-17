@@ -220,7 +220,8 @@ fn syscall_count_child() {
 }
 
 /// A burst of pushes called together leaves in one `writev`, not one each: the
-/// driver runs every call queued before it steps.
+/// driver runs every call queued before it steps, as many as tokio's coop
+/// budget lets one poll take.
 #[test]
 fn one_writev_per_burst() {
     let srv = ServerHandle::start();
@@ -350,8 +351,8 @@ async fn subscribe(client: &AsyncClient, vid: u64, schema: &Arc<Schema>) -> (Sub
     subscribed.await.unwrap().expect("subscribe")
 }
 
-/// Poll `f` once, which makes the calls it starts with; whether it is pending.
-async fn started<F: Future + Unpin>(f: &mut F) -> bool {
+/// Whether `f` is still pending, polled once.
+async fn pending<F: Future + Unpin>(f: &mut F) -> bool {
     std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *f).poll(cx).is_pending())).await
 }
 
@@ -384,10 +385,9 @@ fn a_held_sync_leaves_the_shared_handle_free() {
         assert_eq!(pushed_rows(client.sync(Duration::ZERO).await.unwrap(), sub), 0);
 
         let mut held = Box::pin(client.sync(HELD));
-        assert!(started(&mut held).await);
         let beside = scan(&client.clone(), tid, all_rows(), &schema).await.unwrap();
         assert_eq!(unit_rows(&beside.batch), 50);
-        assert!(started(&mut held).await, "the scan left the sync held");
+        assert!(pending(&mut held).await, "the scan left the sync held");
 
         push(50..60);
         assert_eq!(pushed_rows(held.await.unwrap(), sub), 10);
@@ -414,10 +414,9 @@ fn a_dropped_held_sync_loses_nothing() {
         assert_eq!(pushed_rows(client.sync(Duration::ZERO).await.unwrap(), sub), 0);
 
         let mut held = Box::pin(client.sync(HELD));
-        assert!(started(&mut held).await);
         // Answered behind the sync's request, so the server holds that one.
         scan(&client, tid, all_rows(), &schema).await.unwrap();
-        assert!(started(&mut held).await);
+        assert!(pending(&mut held).await);
         drop(held);
 
         push(50..60);

@@ -2937,7 +2937,7 @@ mod cut_short {
             &mut self,
             want: Interest,
             cx: &mut Context<'_>,
-            io: &mut dyn FnMut(Interest) -> bool,
+            io: &mut dyn FnMut(Interest),
         ) -> Poll<Result<(), ClientError>> {
             self.inner.poll_io(want, cx, io)
         }

@@ -107,7 +107,7 @@ impl Host for PendingHost {
         &mut self,
         _: Interest,
         _: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> bool,
+        io: &mut dyn FnMut(Interest),
     ) -> Poll<Result<(), ClientError>> {
         self.asked = !self.asked;
         if self.asked {
@@ -136,7 +136,7 @@ impl Host for FailingHost {
         &mut self,
         _: Interest,
         _: &mut Context<'_>,
-        _: &mut dyn FnMut(Interest) -> bool,
+        _: &mut dyn FnMut(Interest),
     ) -> Poll<Result<(), ClientError>> {
         Poll::Ready(Err(std::io::Error::other("no reactor").into()))
     }
@@ -242,10 +242,9 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
     for _ in 0..2 {
         let detached = Arc::clone(&detached);
         calls.push_back(Box::new(move |c| {
-            Box::pin(async move {
-                let sent = c.ack(Request::AllocIds(1)).detach();
-                detached.lock().unwrap().push(sent);
-            })
+            let sent = c.ack(Request::AllocIds(1)).detach();
+            detached.lock().unwrap().push(sent);
+            finished()
         }));
     }
     let (owed, mut answered) = (Arc::clone(&detached), Vec::new());
@@ -322,7 +321,8 @@ fn serve_ends_the_session_as_the_hosts_failure() {
     let owed: Arc<Mutex<Option<Sent<u64>>>> = Arc::default();
     let out = Arc::clone(&owed);
     let mut call: Option<Op> = Some(Box::new(move |c| {
-        Box::pin(async move { *out.lock().unwrap() = Some(c.ack(Request::AllocIds(1)).detach()) })
+        *out.lock().unwrap() = Some(c.ack(Request::AllocIds(1)).detach());
+        finished()
     }));
     block_on(serve(c, |_| Poll::Ready(call.take())));
     let failed = owed.lock().unwrap().take().unwrap().try_take();
@@ -330,4 +330,99 @@ fn serve_ends_the_session_as_the_hosts_failure() {
         matches!(&failed, Some(Err(ClientError::ConnectionLost(ProtocolError::IoError(e)))) if e.to_string() == "no reactor"),
         "{failed:?}"
     );
+}
+
+/// An op a reply queues on the client runs, though `next` yielded `None`
+/// before that reply arrived.
+#[test]
+fn serve_runs_an_op_a_reply_queues_after_the_calls_ended() {
+    let (s, peer) = session_pair();
+    // Its own descriptor of the socket, which outlives the session moved into the client.
+    let fd = s.as_fd().try_clone_to_owned().unwrap();
+    let peer = numbering_peer(peer);
+    let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&ran);
+    let mut call: Option<Op> = Some(Box::new(move |c| {
+        let resumed = Arc::clone(&c.resumed);
+        c.ack(Request::AllocIds(1)).detach().then(move |_| {
+            resumed.lock().unwrap().push_back(Box::new(move |_: &mut GnitzClient| {
+                done.store(true, Ordering::Relaxed);
+                finished()
+            }))
+        });
+        finished()
+    }));
+    drive(fd.as_fd(), serve(c, |_| Poll::Ready(call.take())));
+    assert!(ran.load(Ordering::Relaxed), "the op the reply queued ran");
+    drop(fd);
+    peer.join().unwrap();
+}
+
+/// Waits like a [`BlockingHost`], and pends every step that waits on nothing
+/// while `proceed` is unset.
+struct Budgeted {
+    inner: BlockingHost,
+    proceed: Arc<AtomicBool>,
+}
+
+impl Host for Budgeted {
+    fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
+        self.inner.attach(fd)
+    }
+
+    fn poll_io(
+        &mut self,
+        want: Interest,
+        cx: &mut Context<'_>,
+        io: &mut dyn FnMut(Interest),
+    ) -> Poll<Result<(), ClientError>> {
+        self.inner.poll_io(want, cx, io)
+    }
+
+    fn spawn(&mut self, job: Job) {
+        self.inner.spawn(job)
+    }
+
+    fn poll_proceed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.proceed.load(Ordering::Relaxed) {
+            return Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+/// A step that waits on nothing asks the host first: one that may not go on
+/// leaves the request unwritten until it may.
+#[test]
+fn a_host_that_may_not_proceed_holds_a_direct_step() {
+    let (s, peer) = session_pair();
+    let proceed = Arc::new(AtomicBool::new(false));
+    let host = Budgeted {
+        inner: BlockingHost::default(),
+        proceed: Arc::clone(&proceed),
+    };
+    let mut c = GnitzClient::over(s, Box::new(host)).unwrap();
+    let sent = c.ack(Request::AllocIds(1)).detach();
+    let mut waiting = c.wait(sent);
+    assert!(
+        Pin::new(&mut waiting)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    peer.0.set_nonblocking(true).unwrap();
+    let unwritten = std::io::Read::read(&mut &peer.0, &mut [0u8; 1]).map_err(|e| e.kind());
+    assert_eq!(
+        unwritten,
+        Err(std::io::ErrorKind::WouldBlock),
+        "the request was written"
+    );
+    peer.0.set_nonblocking(false).unwrap();
+
+    proceed.store(true, Ordering::Relaxed);
+    let peer = numbering_peer(peer);
+    assert_eq!(block_on(waiting).unwrap(), 0);
+    drop(c);
+    peer.join().unwrap();
 }

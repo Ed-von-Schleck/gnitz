@@ -244,7 +244,7 @@ impl Host for LoopHost {
         &mut self,
         want: Interest,
         _cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> bool,
+        io: &mut dyn FnMut(Interest),
     ) -> Poll<Result<(), ClientError>> {
         let ready = {
             let mut st = self.shared.state();
@@ -255,22 +255,17 @@ impl Host for LoopHost {
         };
         if ready.is_empty() {
             // The callbacks poll the loop that polled this; no waker is needed.
+            // The loop watches for writability only while the socket refuses
+            // bytes, the one time a client waits to write.
             Python::attach(|py| {
                 self.shared.watch(py, |st| Interest {
                     read: st.watched.read || want.read,
-                    write: st.watched.write || want.write,
+                    write: want.write,
                 })
             });
             return Poll::Pending;
         }
-        let refused = io(ready);
-        if ready.write {
-            // The loop watches for writability only while the socket refuses bytes.
-            Python::attach(|py| {
-                self.shared
-                    .watch(py, |st| Interest { read: st.watched.read, write: refused })
-            });
-        }
+        io(ready);
         Poll::Ready(Ok(()))
     }
 
@@ -387,11 +382,7 @@ impl LoopCore {
     /// its reseeds back, and the next sync reports them.
     pub(crate) fn sync(&self, py: Python<'_>, wait: Duration) -> PyResult<Py<PyAny>> {
         let delivery = self.queue(py, |owed| {
-            let shared = Arc::clone(&owed.shared);
-            let requeue = move |rest| shared.state().queue.push_back(rest);
-            sync_op(wait, requeue, move |synced| {
-                owed.land(synced.map_err(client_err), delivered)
-            })
+            sync_op(wait, move |synced| owed.land(synced.map_err(client_err), delivered))
         })?;
         static CLAIMED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
         let claimed = CLAIMED.import(py, "gnitz.aio", "_claimed")?;

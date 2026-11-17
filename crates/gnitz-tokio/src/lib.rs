@@ -3,12 +3,14 @@
 //! [`connect`] is a `gnitz-core` client that waits on this runtime, for the task
 //! that owns it; [`share`] hands one to a driver, and tasks share the handle.
 
+use std::future::Future;
 use std::os::fd::OwnedFd;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use gnitz_core::{
-    BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced, promise, serve, sync_op,
+    BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced, finished, promise,
+    serve, sync_op,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::mpsc;
@@ -46,7 +48,7 @@ impl Host for TokioHost {
         &mut self,
         want: Interest,
         cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> bool,
+        io: &mut dyn FnMut(Interest),
     ) -> Poll<Result<(), ClientError>> {
         let fd = self.fd.as_ref().expect("a client attaches its host before waiting");
         let read = match want.read {
@@ -64,13 +66,11 @@ impl Host for TokioHost {
         if ready.is_empty() {
             return Poll::Pending;
         }
-        let refused = io(ready);
-        // `AsyncFd` reports edges. The client reads the socket dry before it
-        // asks again; write readiness lasts until the socket refuses bytes.
-        if let Some(mut guard) = read {
-            guard.clear_ready();
-        }
-        if refused && let Some(mut guard) = write {
+        io(ready);
+        // `AsyncFd` reports edges, and a direction that fired is spent: the
+        // client reads until the socket has no more, and writes until it
+        // refuses bytes, before it asks again.
+        for mut guard in [read, write].into_iter().flatten() {
             guard.clear_ready();
         }
         Poll::Ready(Ok(()))
@@ -80,6 +80,12 @@ impl Host for TokioHost {
     fn spawn(&mut self, job: Job) {
         drop(tokio::task::spawn_blocking(job));
     }
+
+    /// Spends the task's coop budget, so a reply that keeps the socket full
+    /// yields the worker as tokio's own I/O does.
+    fn poll_proceed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        tokio::task::coop::poll_proceed(cx).map(|budget| budget.made_progress())
+    }
 }
 
 /// Connect to `target`, on the blocking pool, and hand back a client whose
@@ -87,6 +93,9 @@ impl Host for TokioHost {
 ///
 /// A panic in the connect resumes here; a connect the shutting-down runtime
 /// dropped is `Closed`.
+///
+/// The socket waits on this runtime's I/O driver, and after a reconnect on
+/// that of the runtime the reconnect ran on.
 pub async fn connect(target: &str) -> Result<GnitzClient, ClientError> {
     GnitzClient::connect_with(target, Box::new(TokioHost::default())).await
 }
@@ -104,6 +113,10 @@ pub fn share(client: GnitzClient) -> (AsyncClient, Connection) {
 
 /// The handle to a [`Connection`], shared by cloning. Its calls run on the one
 /// client behind it in the order they were made, one at a time.
+///
+/// Each call is queued when made and returns a future that borrows nothing;
+/// dropping that future cancels nothing. Calls queue without bound in front of
+/// the connection's caps, so a producer bounds its memory by awaiting replies.
 #[derive(Clone)]
 pub struct AsyncClient {
     tx: mpsc::UnboundedSender<Op>,
@@ -116,8 +129,10 @@ const _: fn() = || {
 };
 
 impl AsyncClient {
-    /// Run `f` with the client to itself, queued when called, and resolve to
-    /// what it returns — [`ClientError::Closed`] if the driver is gone.
+    /// Run `f` with the client to itself, and resolve to what it returns —
+    /// [`ClientError::Closed`] if the driver is gone. A call that waits on the
+    /// server, as [`GnitzClient::sync`] does, holds the client for that whole
+    /// wait; [`Self::sync`] does not.
     ///
     /// ```ignore
     /// client.run(|c| Box::pin(c.create_schema("s", false))).await??;
@@ -135,9 +150,9 @@ impl AsyncClient {
         sent
     }
 
-    /// Submit the one request `f` makes, queued when called, and resolve to
-    /// its reply. The client is free once the request is submitted, so
-    /// requests sent together share a round trip.
+    /// Submit the one request `f` makes, and resolve to its reply. The client
+    /// is free once the request is submitted, so requests sent together share
+    /// a round trip.
     ///
     /// ```ignore
     /// let lsn = client.send(move |c| c.push(tid, &schema, batch, mode)).await?;
@@ -149,7 +164,8 @@ impl AsyncClient {
     {
         let (mut to, sent) = promise();
         let _ = self.tx.send(Box::new(move |client| {
-            Box::pin(async move { f(client).detach().then(move |reply| to.fulfil(reply)) })
+            f(client).detach().then(move |reply| to.fulfil(reply));
+            finished()
         }));
         sent
     }
@@ -159,23 +175,21 @@ impl AsyncClient {
     ///
     /// Cancel-safe: a sync dropped at any point is still finished when its
     /// answer arrives, and what it brought a reader's subscriptions stays with
-    /// the client for the next sync, with the reseeds of its
-    /// [`Delivery`](gnitz_core::Delivery). An outstanding sync keeps the
-    /// [`Connection`] serving until its answer arrives.
-    pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
+    /// the client for the next sync, with the reseeds of its [`Delivery`]. An
+    /// outstanding sync keeps the [`Connection`] serving until its answer
+    /// arrives.
+    pub fn sync(&self, wait: Duration) -> impl Future<Output = Result<Synced, ClientError>> + Send + use<> {
         let (mut to, sent) = promise();
-        let tx = self.tx.clone();
-        let requeue = move |rest| {
-            let _ = tx.send(rest);
-        };
-        let _ = self
-            .tx
-            .send(sync_op(wait, requeue, move |delivery| to.fulfil(delivery)));
-        Ok(sent.await?.take())
+        let _ = self.tx.send(sync_op(wait, move |delivery| to.fulfil(delivery)));
+        // Taken here, on the caller's task: its trains decode off the driver,
+        // and a delivery dropped untaken hands its reseeds back.
+        async move { sent.await.map(Delivery::take) }
     }
 }
 
 /// Owns the client and serves the calls its [`AsyncClient`]s make: poll it to
 /// completion. It completes once every handle is dropped and nothing is
-/// outstanding; a lost connection fails the calls and does not end it.
+/// outstanding; a lost connection fails the calls and does not end it. A panic
+/// in a call's closure ends it, and every call outstanding or made after is
+/// `Closed`.
 pub type Connection = BoxFut<'static, ()>;

@@ -2,7 +2,7 @@
 //! every other `impl GnitzClient` file builds on — waiting, ids, requests and
 //! relation resolution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use gnitz_wire::{ReadSpec, WireConflictMode};
 
 use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session, SubId, Target};
 use crate::error::{ClientError, not_found};
-use crate::host::{BlockingHost, Host, Pending, Sent, offload, serve};
+use crate::host::{BlockingHost, Host, Op, Pending, Sent, offload, serve};
 use crate::txn::TxnBuffer;
 use crate::{PushBatch, RelName, Schema, ZSetBatch};
 
@@ -48,6 +48,9 @@ pub struct GnitzClient {
     /// of a connection since replaced is told that one ended, never handed
     /// another's trains.
     pub(crate) next_sub: SubId,
+    /// Ops a reply queued, as a sync's second half is when its answer
+    /// arrives. A [`serve`] loop runs them ahead of the calls it is handed.
+    pub(crate) resumed: Arc<Mutex<VecDeque<Op>>>,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -116,6 +119,7 @@ impl GnitzClient {
             received: Default::default(),
             kept: HashMap::new(),
             next_sub: SubId::FIRST,
+            resumed: Default::default(),
         })
     }
 
@@ -146,6 +150,7 @@ impl GnitzClient {
             received: _,
             kept,
             next_sub: _,
+            resumed: _,
         } = self;
         host.attach(fresh.as_fd().try_clone_to_owned()?)?;
         *session = fresh;

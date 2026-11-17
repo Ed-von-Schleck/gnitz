@@ -838,12 +838,14 @@ impl Session {
     /// waiting, since the socket has no new edge to report; so is a write
     /// while the last flush left no bytes the socket refused, since a socket
     /// takes bytes until it refuses them, and asking the host first would cost
-    /// a wait per request. Otherwise it parks on `interest()`.
+    /// a wait per request. Otherwise it parks on `interest()`. A step that
+    /// waits on nothing first asks the host's [`Host::poll_proceed`].
     ///
     /// `Closed` when the session will answer nothing more: it ended, or the
     /// reply awaited belongs to a session since replaced.
     pub(crate) fn turn(&mut self, host: &mut dyn Host, cx: &mut Context<'_>) -> Poll<Result<(), ClientError>> {
         if self.unread {
+            ready!(host.poll_proceed(cx));
             self.step(Interest::READ);
             return Poll::Ready(Ok(()));
         }
@@ -852,13 +854,11 @@ impl Session {
             return Poll::Ready(Err(ClientError::Closed));
         }
         if want.write && !self.refused {
+            ready!(host.poll_proceed(cx));
             self.step(Interest::WRITE);
             return Poll::Ready(Ok(()));
         }
-        let waited = ready!(host.poll_io(want, cx, &mut |ready| {
-            self.step(ready);
-            self.interest().write
-        }));
+        let waited = ready!(host.poll_io(want, cx, &mut |ready| self.step(ready)));
         Poll::Ready(match waited {
             // A wait that failed is the connection's end, which every reply owed
             // arrives as; an interrupt leaves the session as it stood.

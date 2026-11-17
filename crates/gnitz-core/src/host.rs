@@ -27,19 +27,26 @@ pub trait Host: Send {
     fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()>;
 
     /// Once the socket is ready for any of `want`, step the client on what is
-    /// ready by calling `io`. It answers whether bytes are still waiting to be
-    /// written: after a write, ones the socket refused. Readiness is spent by
+    /// ready by calling `io`. Readiness is spent by
     /// the call: before it asks again, the client reads on by itself until the
     /// socket has no more, and writes by itself until the socket refuses bytes.
     fn poll_io(
         &mut self,
         want: Interest,
         cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> bool,
+        io: &mut dyn FnMut(Interest),
     ) -> Poll<Result<(), ClientError>>;
 
     /// Run `job` where it may block. A host that cannot run it drops it.
     fn spawn(&mut self, job: Job);
+
+    /// Whether the client may step without waiting on the socket: on the rest
+    /// of a read the last step left unfinished, or on a write the socket has
+    /// not refused. A host whose scheduler budgets its tasks pends here once
+    /// the task's budget is spent, and wakes `cx` to go on.
+    fn poll_proceed(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
+    }
 }
 
 /// Waits in `poll(2)` and runs jobs in place, so a future over it never pends:
@@ -93,7 +100,7 @@ impl Host for BlockingHost {
         &mut self,
         want: Interest,
         _cx: &mut Context<'_>,
-        io: &mut dyn FnMut(Interest) -> bool,
+        io: &mut dyn FnMut(Interest),
     ) -> Poll<Result<(), ClientError>> {
         let fd = self
             .fd
@@ -187,28 +194,42 @@ pub type Op = Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, ()> + Se
 /// A boxed future a host can move between threads.
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Run the ops `next` yields on `client`, in order and one at a time. Steps
-/// the session while none is ready, and after `next` yields `None` until
-/// nothing is outstanding; then drops the client.
+/// The future of an op that did all its work in its closure. Zero-sized, so
+/// boxing it allocates nothing.
+pub fn finished<'a>() -> BoxFut<'a, ()> {
+    Box::pin(poll_fn(|_| Poll::Ready(())))
+}
+
+/// Run the ops `next` yields on `client`, in order and one at a time, after
+/// any a reply queued on the client. Steps the session while none is ready,
+/// and once `next` yields `None` until nothing is outstanding; then drops the
+/// client.
 pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) {
-    let mut more = true;
     loop {
         let op = poll_fn(|cx| {
             loop {
-                if more {
-                    match next(cx) {
-                        Poll::Ready(Some(op)) => return Poll::Ready(Some(op)),
-                        Poll::Ready(None) => more = false,
-                        Poll::Pending => {}
-                    }
+                // Queued only from inside a step or an op, both run below, so
+                // nothing has to wake this.
+                if let Some(op) = client
+                    .resumed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                {
+                    return Poll::Ready(Some(op));
                 }
+                let drained = match next(cx) {
+                    Poll::Ready(Some(op)) => return Poll::Ready(Some(op)),
+                    Poll::Ready(None) => true,
+                    Poll::Pending => false,
+                };
                 match client.session.turn(&mut *client.host, cx) {
                     Poll::Ready(Ok(())) => {}
                     // Nothing outstanding and nothing buffered.
                     Poll::Ready(Err(ClientError::Closed)) => {
-                        return match more {
-                            true => Poll::Pending,
-                            false => Poll::Ready(None),
+                        return match drained {
+                            true => Poll::Ready(None),
+                            false => Poll::Pending,
                         };
                     }
                     // No call is waiting to hand an interrupt to.

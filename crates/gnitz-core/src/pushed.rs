@@ -11,7 +11,7 @@ use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
 use crate::connection::{DeltaCursor, Held, RawBlock, ScanReply, SubId, Target, park, untaken};
 use crate::error::ClientError;
-use crate::host::{Op, Sent};
+use crate::host::{Op, Sent, finished};
 use crate::mirror::PollOutcome;
 use gnitz_wire::multi_frame::kept_as;
 
@@ -183,7 +183,8 @@ impl GnitzClient {
             (if untaken { Duration::ZERO } else { wait }, held)
         };
         let (wait, mirrored) = self.mirror_hold(wait);
-        let held: Vec<SubId> = readers.into_iter().chain(mirrored).collect();
+        let mut held = readers;
+        held.extend(mirrored);
         self.session.submit_sync(&held, wait)
     }
 
@@ -210,21 +211,18 @@ impl GnitzClient {
 
 /// A sync as one queued call of a [`serve`](crate::serve) loop: its request
 /// goes out, and the rest, finishing it and handing the [`Delivery`] to
-/// `land`, is queued with `requeue` from wherever the answer arrives; `serve`
-/// takes it up before it waits again. The sync is finished whether or not its
-/// caller is still there; a delivery nobody takes hands back its reseeds, and
-/// what the sync brought a reader stays with the client until one is taken.
-pub fn sync_op(
-    wait: Duration,
-    requeue: impl FnOnce(Op) + Send + 'static,
-    land: impl FnOnce(Result<Delivery, ClientError>) + Send + 'static,
-) -> Op {
+/// `land`, is queued on the client when the answer arrives; `serve` takes it up
+/// before it waits again, and serves on until it has. The sync is finished
+/// whether or not its caller is still there; a delivery nobody takes hands back
+/// its reseeds, and what the sync brought a reader stays with the client until
+/// one is taken.
+pub fn sync_op(wait: Duration, land: impl FnOnce(Result<Delivery, ClientError>) + Send + 'static) -> Op {
     Box::new(move |client| {
+        let resumed = Arc::clone(&client.resumed);
         client.begin_sync(wait).then(move |reply| {
-            requeue(Box::new(move |client| {
-                Box::pin(async move { land(client.finish_sync(reply).await) })
-            }))
+            let rest: Op = Box::new(move |client| Box::pin(async move { land(client.finish_sync(reply).await) }));
+            resumed.lock().unwrap_or_else(PoisonError::into_inner).push_back(rest);
         });
-        Box::pin(std::future::ready(()))
+        finished()
     })
 }
