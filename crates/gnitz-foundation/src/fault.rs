@@ -1,76 +1,81 @@
 //! Debug-only fault-injection seams — the one place a `GNITZ_INJECT_*` variable
 //! is read and the one place release builds fold it away.
 //!
-//! A seam is a `static Seam` next to the code it perturbs. Every accessor is
+//! A seam is a `static` next to the code it perturbs, of the kind its variable
+//! takes: a [`Switch`] is on or off, a [`Count`] carries a positive number, a
+//! [`Stage`] names one of the injection points it lists. Every accessor is
 //! statically false/`None` in a release build, so the guarded branch is dead
 //! code the optimizer drops: no call site needs its own `#[cfg]`, and a seam
 //! cannot leak into a release binary. The variable is read once per process —
 //! it cannot change mid-run, and several seams sit on per-push or per-tick
-//! paths where a fresh `std::env::var` would allocate every call.
+//! paths.
 //!
-//! Which build decides is *this* crate's: the `cfg!(debug_assertions)` below is
-//! evaluated in `gnitz-foundation`'s compilation unit, so a per-package
-//! `debug-assertions` override on this crate arms or disarms every seam,
-//! wherever it is declared.
+//! A value `env`'s flag rule reads as off disarms a seam of any kind. Any other
+//! value its kind does not read panics at the seam's first use, as an `env`
+//! override's does: a misspelt setting never leaves a seam silently inert.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct Seam {
-    var: &'static str,
-    setting: OnceLock<Option<String>>,
+use crate::env::{BOOLEAN, POSITIVE, flag, parsed, positive, raw};
+
+/// Whether this build keeps its seams. Decided in *this* crate's compilation
+/// unit, so a per-package `debug-assertions` override on `gnitz-foundation`
+/// arms or disarms every seam, wherever it is declared.
+pub const ARMED: bool = cfg!(debug_assertions);
+
+/// A seam's variable as its kind reads it, `None` while disarmed.
+struct Var<T> {
+    name: &'static str,
+    value: OnceLock<Option<T>>,
+}
+
+impl<T: Copy> Var<T> {
+    const fn new(name: &'static str) -> Self {
+        Var { name, value: OnceLock::new() }
+    }
+
+    /// The setting as `read` reads the variable's raw value, read once per
+    /// process; always `None` in a build without seams.
+    fn get(&self, read: impl FnOnce(&str, Option<&str>) -> Option<T>) -> Option<T> {
+        if !ARMED {
+            return None;
+        }
+        *self.value.get_or_init(|| read(self.name, raw(self.name).as_deref()))
+    }
+}
+
+/// `raw`, `name`'s value, as `rule` reads it: `None` when unset or off.
+///
+/// # Panics
+///
+/// On a value neither off nor read by `rule`, which should have been `what`.
+fn arm<T>(name: &str, raw: Option<&str>, rule: impl Fn(&str) -> Option<T>, what: &str) -> Option<T> {
+    let v = raw.filter(|v| flag(v) != Some(false))?;
+    Some(parsed(name, v, rule, what))
+}
+
+/// A seam that is on or off.
+pub struct Switch {
+    var: Var<bool>,
     spent: AtomicBool,
 }
 
-impl Seam {
+impl Switch {
     pub const fn new(var: &'static str) -> Self {
-        Self {
-            var,
-            setting: OnceLock::new(),
+        Switch {
+            var: Var::new(var),
             spent: AtomicBool::new(false),
         }
     }
 
-    /// The seam's setting, read once per process; always `None` in release.
-    fn setting(&self) -> Option<&str> {
-        if cfg!(debug_assertions) {
-            self.setting.get_or_init(|| std::env::var(self.var).ok()).as_deref()
-        } else {
-            None
-        }
+    fn read(name: &str, raw: Option<&str>) -> Option<bool> {
+        arm(name, raw, flag, BOOLEAN)
     }
 
-    /// The setting while it is anything `env`'s flag rule does not read as off.
-    fn armed_setting(&self) -> Option<&str> {
-        self.setting().filter(|v| crate::env::flag(v) != Some(false))
-    }
-
-    /// True while the seam is set to anything `env`'s flag rule does not read as
-    /// off, so a seam carrying a stage or a count is armed too.
+    /// True while the seam is on.
     pub fn armed(&self) -> bool {
-        self.armed_setting().is_some()
-    }
-
-    /// True while the seam names this stage — for seams that pick one of several
-    /// injection points.
-    pub fn at(&self, stage: &str) -> bool {
-        self.setting() == Some(stage)
-    }
-
-    /// The seam's setting as a positive count (milliseconds, rows, bytes —
-    /// whatever the caller's unit is); `None` while the seam is not armed.
-    ///
-    /// # Panics
-    ///
-    /// On an armed setting that is not a positive integer.
-    pub fn count(&self) -> Option<u64> {
-        let v = self.armed_setting()?;
-        Some(crate::env::parsed(
-            self.var,
-            v,
-            crate::env::positive,
-            "a positive integer",
-        ))
+        self.var.get(Self::read).is_some()
     }
 
     /// Consume the seam's one-shot latch: true on the first call while armed,
@@ -80,7 +85,55 @@ impl Seam {
     }
 }
 
-// The seams read `None` in release, so their tests hold in debug only.
+/// A seam carrying a positive count (milliseconds, rows, bytes — whatever the
+/// caller's unit is).
+pub struct Count(Var<u64>);
+
+impl Count {
+    pub const fn new(var: &'static str) -> Self {
+        Count(Var::new(var))
+    }
+
+    fn read(name: &str, raw: Option<&str>) -> Option<u64> {
+        arm(name, raw, positive, POSITIVE)
+    }
+
+    /// The count; `None` while the seam is disarmed.
+    pub fn count(&self) -> Option<u64> {
+        self.0.get(Self::read)
+    }
+}
+
+/// A seam that picks one of several injection points.
+pub struct Stage {
+    var: Var<&'static str>,
+    stages: &'static [&'static str],
+}
+
+impl Stage {
+    pub const fn new(var: &'static str, stages: &'static [&'static str]) -> Self {
+        Stage { var: Var::new(var), stages }
+    }
+
+    /// The stage of `stages` that `raw` names; `None` when off.
+    fn read(&self, name: &str, raw: Option<&str>) -> Option<&'static str> {
+        let rule = |v: &str| self.stages.iter().copied().find(|s| *s == v);
+        arm(name, raw, rule, &format!("one of {}", self.stages.join("|")))
+    }
+
+    /// True while the seam names `stage`, one of those it lists.
+    pub fn at(&self, stage: &str) -> bool {
+        debug_assert!(
+            self.stages.contains(&stage),
+            "{stage:?} is no stage of {}",
+            self.var.name
+        );
+        self.var.get(|name, raw| self.read(name, raw)) == Some(stage)
+    }
+}
+
+// The seams read as disarmed without debug assertions, so their tests hold in
+// debug only.
 #[cfg(all(test, debug_assertions))]
 #[path = "tests/fault.rs"]
 mod tests;

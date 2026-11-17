@@ -14,7 +14,7 @@ use crate::catalog::{AppliedDdl, DdlBundle, SysFamily, SysFamilyExt};
 use crate::runtime::master::ApplyLock;
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Switch;
 use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
 
@@ -46,7 +46,7 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
 /// Below a checkpoint threshold of one zone, and with no tick request
 /// outstanding, that task is the committer, inside the checkpoint the zone's
 /// crossing of the threshold woke it for. One-shot.
-static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
+static DDL_HOLD_FOR_CHECKPOINT: Switch = Switch::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
 
 /// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
 const DDL_HOLD_MAX_POLLS: u32 = 10_000;

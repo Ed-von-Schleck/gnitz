@@ -1,6 +1,7 @@
 //! The TLS flags, and what a TLS listener's connections are served under, read
 //! again on every reload.
 
+use gnitz_foundation::{gnitz_note, gnitz_warn};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;

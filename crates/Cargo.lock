@@ -766,6 +766,7 @@ dependencies = [
  "gnitz-core",
  "gnitz-dump",
  "gnitz-expr",
+ "gnitz-foundation",
  "gnitz-sql",
  "gnitz-test-harness",
  "gnitz-wire",
@@ -828,7 +829,6 @@ name = "gnitz-foundation"
 version = "0.1.8"
 dependencies = [
  "libc",
- "tempfile",
 ]
 
 [[package]]

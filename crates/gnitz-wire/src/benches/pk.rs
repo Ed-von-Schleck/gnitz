@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counters, Event};
 use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
@@ -9,7 +9,7 @@ use std::hint::black_box;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_keys_from_keys_bench() {
-    let counters = [Counter::instructions(), Counter::cycles()];
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     for shape in ["random", "dense-shuffled", "dense-ascending"] {
         for n in [1024usize, 65_536, 4 << 20] {
             for stride in [8usize, 16, 24, 40] {
@@ -34,12 +34,10 @@ fn pk_keys_from_keys_bench() {
                     }
                 }
                 black_box(PkKeys::from_keys(stride, flat.chunks_exact(stride)));
-                let [instr, cycles] = counters.each_ref().map(|counter| {
-                    let (keys, count) =
-                        counter.measure(|| PkKeys::from_keys(stride, black_box(&flat).chunks_exact(stride)));
-                    black_box(keys);
-                    count as f64 / n as f64
-                });
+                let (keys, counts) =
+                    counters.measure(|| PkKeys::from_keys(stride, black_box(&flat).chunks_exact(stride)));
+                black_box(keys);
+                let [instr, cycles] = counts.map(|count| count as f64 / n as f64);
                 println!(
                     "pk_keys_from_keys_bench {shape:<15} n={n:<8} stride={stride:<3} {instr:7.1} instr/key, {cycles:7.1} cycles/key"
                 );

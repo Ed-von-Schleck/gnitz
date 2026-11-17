@@ -652,21 +652,15 @@ impl Shell {
     /// `\e`: `file`, else the last statement, in the editor, then in the
     /// next prompt's buffer.
     fn edit(&mut self, file: &str) -> Result<Flow, Failed> {
-        if !self.options.interactive {
+        let Some(scratch) = &self.scratch else {
             return self.fail("\\e needs an interactive session");
-        }
-        // The last statement's file, removed once its text is read back.
-        let last;
+        };
+        let last = scratch.path().join("statement.sql");
         let path = match file {
             "" => {
-                last = tempfile::Builder::new()
-                    .prefix("gnitz-")
-                    .suffix(".sql")
-                    .tempfile()
-                    .or_else(|e| self.fail(format!("\\e: {e}")))?;
-                std::fs::write(last.path(), &self.last_statement)
-                    .or_else(|e| self.fail(format!("{}: {e}", last.path().display())))?;
-                last.path()
+                std::fs::write(&last, &self.last_statement)
+                    .or_else(|e| self.fail(format!("{}: {e}", last.display())))?;
+                last.as_path()
             }
             f => Path::new(f),
         };

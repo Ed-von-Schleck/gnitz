@@ -2,7 +2,7 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, weighted_rows};
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
@@ -57,7 +57,7 @@ fn run_merge_dup_pk_bench() {
     const K: usize = 4;
     const N: usize = 200_000;
     const DUP: usize = 8;
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     for (label, schema) in [("fixed_int", make_schema_u64_i64()), ("generic", generic_schema())] {
         let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
@@ -67,7 +67,7 @@ fn run_merge_dup_pk_bench() {
         };
         // K copies of one batch: every row folds with its twins.
         assert_eq!(merge(), (K * N) as i64);
-        let (instr, cyc) = (instructions.measure(merge).1, cycles.measure(merge).1);
+        let (_, [instr, cyc]) = counters.measure(merge);
         println!(
             "run_merge_dup_pk_bench {label:<9} {:5.1} instr/row, {:5.1} cycles/row",
             instr as f64 / (K * N) as f64,
@@ -158,7 +158,7 @@ fn striped_sum_bench() {
 fn two_way_bench() {
     const N: usize = 500_000;
     const RUN: usize = 4096;
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     let schema = make_schema_u64_i64();
     /// Row `i` of side 0 or 1 as `(pk, payload)`, each side strictly ascending:
     /// the merge takes consolidated operands.
@@ -192,7 +192,7 @@ fn two_way_bench() {
         let rows = (N + side1) as f64;
         let mem = [a.as_mem_batch(), b.as_mem_batch()];
         black_box(merge_consolidated(&mem, &schema));
-        let ((out, instr), cyc) = cycles.measure(|| instructions.measure(|| merge_consolidated(&mem, &schema)));
+        let (out, [instr, cyc]) = counters.measure(|| merge_consolidated(&mem, &schema));
         assert_eq!(out.len(), survivors, "{label}");
         println!(
             "two_way_bench {label:<20} {:5.1} instr/row, {:5.1} cycles/row",
@@ -249,7 +249,7 @@ fn seeded_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, u64)]) -> Batch {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn two_way_shapes_bench() {
-    let (instructions, cycles, misses) = (Counter::instructions(), Counter::cycles(), Counter::branch_misses());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES, Event::BRANCH_MISSES]);
     let col = SchemaColumn::new;
     let wide = u64_pk_schema(&[
         col(TypeCode::I64, false),
@@ -329,8 +329,8 @@ fn two_way_shapes_bench() {
                     // The least of several runs: nothing but the kernel can lower a count.
                     let mut least = [u64::MAX; 3];
                     for _ in 0..9 {
-                        let ((((), i), c), m) = misses.measure(|| cycles.measure(|| instructions.measure(run)));
-                        least = [least[0].min(i), least[1].min(c), least[2].min(m)];
+                        let ((), counts) = counters.measure(run);
+                        least = std::array::from_fn(|k| least[k].min(counts[k]));
                     }
                     let [i, c, m] = least.map(|x| x as f64 / (rows * calls) as f64);
                     line += &format!(" | {name} {i:5.1} {c:5.1} {m:4.2}");

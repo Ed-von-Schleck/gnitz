@@ -4,8 +4,8 @@
 //! reader selects a value the operator did not ask for.
 //!
 //! A panic and not an exit: clients and `gnitz-mirror` link this too, and a
-//! library does not end its host. Call-site-specific clamps and `OnceLock`
-//! caching stay local to the consumer.
+//! library does not end its host. A knob confined to a range is read with
+//! [`env_num_in`], so an override outside it is refused rather than clamped.
 
 /// A positive number, or `None` for a zero or unparseable value: an override
 /// never zeroes a knob.
@@ -20,6 +20,24 @@ pub(crate) fn flag(v: &str) -> Option<bool> {
         "" | "0" | "false" | "no" => Some(false),
         "1" | "true" | "yes" => Some(true),
         _ => None,
+    }
+}
+
+/// What a value [`positive`] refuses should have been.
+pub(crate) const POSITIVE: &str = "a positive integer";
+/// What a value [`flag`] refuses should have been.
+pub(crate) const BOOLEAN: &str = "a boolean (0|1|true|false|yes|no)";
+
+/// `name`'s value, `None` when unset.
+///
+/// # Panics
+///
+/// On a value that is not UTF-8, which no rule reads.
+pub(crate) fn raw(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(v)) => panic!("{name}={v:?} is not UTF-8"),
     }
 }
 
@@ -41,15 +59,29 @@ fn read<T>(name: &str, raw: Option<&str>, default: T, rule: impl Fn(&str) -> Opt
 /// A positive-integer env override; unset reads as `default`, and a zero or
 /// unparseable value panics.
 pub fn env_num<T: std::str::FromStr + Default + PartialOrd>(name: &str, default: T) -> T {
-    let raw = std::env::var(name).ok();
-    read(name, raw.as_deref(), default, positive, "a positive integer")
+    read(name, raw(name).as_deref(), default, positive, POSITIVE)
+}
+
+/// An integer env override within `range`; unset reads as `default`, and a
+/// value outside it, or unparseable, panics.
+pub fn env_num_in<T, R>(name: &str, default: T, range: R) -> T
+where
+    T: std::str::FromStr + PartialOrd,
+    R: std::ops::RangeBounds<T> + std::fmt::Debug,
+{
+    read(
+        name,
+        raw(name).as_deref(),
+        default,
+        |v| v.parse().ok().filter(|n| range.contains(n)),
+        &format!("an integer in {range:?}"),
+    )
 }
 
 /// A boolean env override under [`flag`]'s rule; unset reads as `default`, and
 /// a value the rule does not read panics.
 pub fn env_flag(name: &str, default: bool) -> bool {
-    let raw = std::env::var(name).ok();
-    read(name, raw.as_deref(), default, flag, "a boolean (0|1|true|false|yes|no)")
+    read(name, raw(name).as_deref(), default, flag, BOOLEAN)
 }
 
 /// A path env override, `None` when unset; an empty value, which names no

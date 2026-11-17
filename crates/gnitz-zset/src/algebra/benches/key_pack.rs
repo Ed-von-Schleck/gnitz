@@ -2,7 +2,7 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
 use crate::test_support::u64_pk_schema;
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counters, Event};
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
@@ -10,11 +10,17 @@ const N: usize = 500_000;
 
 /// Instructions and cycles per row of [`FoldCols::key_row`] and of
 /// [`FoldCols::for_each_chunk`] by column count, over `[U64 PK, I64, U32 NULL, I64,
-/// I64, I64]` — the cycles the least of several passes.
+/// I64, I64]` — each count the least of several passes.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn fold_key_bench() {
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
+    let least = |f: &dyn Fn() -> u128| {
+        (0..9)
+            .map(|_| counters.measure(f).1)
+            .reduce(|[i, c], [ni, nc]| [i.min(ni), c.min(nc)])
+            .unwrap()
+    };
     let schema = u64_pk_schema(&[
         SchemaColumn::new(TypeCode::I64, false),
         SchemaColumn::new(TypeCode::U32, true),
@@ -49,10 +55,8 @@ fn fold_key_bench() {
             black_box(acc)
         };
         assert_eq!(row(), chunked(), "for_each_chunk digests as key_row does");
-        let (_, instr) = instructions.measure(row);
-        let cyc = (0..9).map(|_| cycles.measure(row).1).min().unwrap();
-        let (_, chunk_instr) = instructions.measure(chunked);
-        let chunk_cyc = (0..9).map(|_| cycles.measure(chunked).1).min().unwrap();
+        let [instr, cyc] = least(&row);
+        let [chunk_instr, chunk_cyc] = least(&chunked);
         println!(
             "fold_key_bench {cols} columns key_row {:6.1} instr/row {:6.1} cycles/row   chunked {:6.1} instr/row {:6.1} cycles/row",
             instr as f64 / N as f64,

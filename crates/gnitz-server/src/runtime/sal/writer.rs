@@ -2,6 +2,7 @@
 //! hold that serializes writers, the publication scope with its atomic zone,
 //! LSNs, and when a checkpoint is due.
 
+use gnitz_foundation::gnitz_debug;
 use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -21,7 +22,7 @@ use crate::runtime::park::{WorkerParks, WorkerSet};
 use crate::runtime::reactor::Reactor;
 use crate::runtime::sync::{AsyncRwLock, Parked, WriteGuard};
 use crate::runtime::w2m::RequestId;
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Stage;
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{MAX_WORKERS, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
@@ -29,7 +30,7 @@ use gnitz_zset::repr::Batch;
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<ddl|commit>`: crash the master between a zone's
 /// groups publishing and its closing member. `commit` aborts a zone a push is
 /// a member of, `ddl` one no push is a member of.
-static ZONE_PANIC: Seam = Seam::new("GNITZ_INJECT_SAL_ZONE_PANIC");
+static ZONE_PANIC: Stage = Stage::new("GNITZ_INJECT_SAL_ZONE_PANIC", &["ddl", "commit"]);
 
 /// The payload span from which a group's payloads are written with `pwrite`
 /// rather than stored through the mapping.

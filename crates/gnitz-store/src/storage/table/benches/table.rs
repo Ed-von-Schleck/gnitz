@@ -1,6 +1,6 @@
 use super::{Cut, DEFAULT_RAM_TIER_BYTES, RecoverySource, flush_barrier};
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table, table_shards};
-use gnitz_foundation::perf::{self, Counter};
+use gnitz_foundation::perf::{self, Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
@@ -84,7 +84,7 @@ fn ram_tier_ceiling_bench() {
     const UPDATES: u64 = 1_500_000;
     const PER_TICK: u64 = 16;
     let schema = make_schema_u64_i64();
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     let dir = tempfile::tempdir().unwrap();
     for fill in [50u64, 85, 92, 96, 99] {
         let hot = (TIER as u64 / 32) * fill / 100;
@@ -108,12 +108,10 @@ fn ram_tier_ceiling_bench() {
                 make_batch_raw(&schema, &rows)
             })
             .collect();
-        let (((), instr), cyc) = cycles.measure(|| {
-            instructions.measure(|| {
-                for tick in ticks {
-                    table.ingest(tick).unwrap();
-                }
-            })
+        let ((), [instr, cyc]) = counters.measure(|| {
+            for tick in ticks {
+                table.ingest(tick).unwrap();
+            }
         });
         assert_eq!(table.full_scan().len() as u64, hot, "{fill}%: the held rows");
         println!(

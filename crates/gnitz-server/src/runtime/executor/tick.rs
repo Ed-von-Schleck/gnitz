@@ -3,13 +3,14 @@
 //! and the read lock that asks for a drain when a read would otherwise miss a
 //! commit no tick has taken yet.
 
+use gnitz_foundation::gnitz_warn;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::{CatalogLock, Shared, park_until};
 use crate::runtime::sal::SalExcl;
 use crate::runtime::sync::{Either, ReadGuard, chan, select2};
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Switch;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
 
@@ -17,7 +18,7 @@ use gnitz_wire::WireFault;
 /// flight, the apply lock held and its ACKs outstanding, until a DDL or a
 /// checkpoint parks on that lock. With no checkpoint asked for, a DDL then
 /// provably lands mid-tick. One-shot.
-static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
+static TICK_HOLD_FOR_DDL: Switch = Switch::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
 
 /// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
 const TICK_HOLD_MAX_POLLS: u32 = 10_000;

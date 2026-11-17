@@ -1,3 +1,4 @@
+use gnitz_foundation::gnitz_debug;
 use gnitz_store::relation::{IndexClaim, RelationSpec, StateLayout};
 use gnitz_wire::{IdxTabRow, TableDistribution, ViewParts};
 use gnitz_zset::algebra::Placement;

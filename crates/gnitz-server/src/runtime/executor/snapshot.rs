@@ -13,6 +13,7 @@
 use super::{Shared, cork_train, decode_fault};
 use crate::runtime::reactor::{Peer, SendBody};
 use crate::runtime::sal::Read;
+use gnitz_foundation::gnitz_warn;
 use gnitz_store::relation::Snapshot;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{ControlHeader, WireFault};

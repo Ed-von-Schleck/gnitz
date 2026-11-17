@@ -20,11 +20,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-// Crate-wide scope for `gnitz_warn!` and its siblings; a plain `use` would
-// reach this module only.
-#[macro_use]
-extern crate gnitz_foundation;
-
 // Neither rung below `runtime` ends the process; `tests/rungs.rs` covers the
 // spellings this lint does not.
 #[deny(clippy::exit)]
@@ -33,6 +28,7 @@ mod catalog;
 mod query;
 mod runtime;
 
+use gnitz_foundation::gnitz_error;
 use gnitz_foundation::log::Level;
 use runtime::ServerExit;
 use rustls::pki_types::ServerName;
@@ -151,15 +147,6 @@ Exit codes:
   134  fail-stop abort (128 + SIGABRT)
 ";
 
-fn parse_level(s: &str) -> Result<Level, String> {
-    match s {
-        "quiet" => Ok(Level::Quiet),
-        "normal" => Ok(Level::Normal),
-        "verbose" | "debug" => Ok(Level::Debug),
-        _ => Err(format!("invalid log level {s:?} (expected quiet, normal or verbose)")),
-    }
-}
-
 /// Parse `--workers=N` into `1..=MAX_WORKERS`, or `--workers=auto` into `None`.
 fn parse_workers(val: &str) -> Result<Option<u32>, String> {
     const MAX: u32 = gnitz_wire::MAX_WORKERS as u32;
@@ -185,7 +172,7 @@ struct Args {
 /// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
 fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> {
     let mut level = match env_level {
-        Some(v) => parse_level(v).map_err(|e| format!("GNITZ_LOG_LEVEL: {e}"))?,
+        Some(v) => Level::parse(v).map_err(|e| format!("GNITZ_LOG_LEVEL: {e}"))?,
         None => Level::Quiet,
     };
     let mut workers = Some(1);
@@ -197,7 +184,7 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
         if let Some(val) = arg.strip_prefix("--log-level=") {
-            level = parse_level(val)?;
+            level = Level::parse(val)?;
         } else if let Some(val) = arg.strip_prefix("--workers=") {
             workers = parse_workers(val)?;
         } else if let Some(val) = arg.strip_prefix("--tls-listen=") {
@@ -342,7 +329,8 @@ fn main() {
         process::exit(ServerExit::Usage.code());
     };
     let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| refuse(e));
-    gnitz_foundation::log::init(args.level, gnitz_foundation::log::Tag::Master);
+    gnitz_foundation::log::set_level(args.level);
+    gnitz_foundation::log::set_tag(gnitz_foundation::log::Tag::Master);
     // Before the boot: a bind the policy refuses and a PEM file that does not
     // load are refusals of argv.
     let tls = args

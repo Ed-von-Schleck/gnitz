@@ -17,7 +17,8 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::mesh::Mesh;
 use crate::runtime::sal::{Apply, Inbound, Ingest, Read, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Switch;
+use gnitz_foundation::gnitz_debug;
 use gnitz_store::relation::{IndexClaim, Snapshot};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{PkKeys, WireFault};
@@ -42,7 +43,7 @@ pub(super) struct WorkerProcess<'c> {
 }
 
 /// `GNITZ_INJECT_KEY_SPANS_ERROR`: fail every `KeySpans` request, after its claim.
-static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
+static KEY_SPANS_ERROR: Switch = Switch::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
     pub(super) fn new(

@@ -21,25 +21,36 @@ pub fn default_env(cmd: &mut Command, key: &str, value: &str) {
     }
 }
 
+/// In a child `parent` forked, have the kernel send this process `signal`
+/// when the thread that forked it ends. Fails with ESRCH when `parent` died
+/// before the `prctl`, since the signal would then never come.
+///
+/// Async-signal-safe and allocation-free, so a child may call it between
+/// `fork` and `exec`.
+#[cfg(target_os = "linux")]
+pub fn set_parent_death_signal(parent: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `prctl` and `getppid` touch no memory of this process.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, signal) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        match libc::getppid() == parent {
+            true => Ok(()),
+            false => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        }
+    }
+}
+
 /// Have the kernel send the child `signal` when the thread that spawns it
-/// ends. The spawn fails with ESRCH when this process died between the fork
-/// and the `prctl`, since the signal would then never come. A no-op off Linux.
+/// ends: [`set_parent_death_signal`], failing the spawn. A no-op off Linux.
 #[cfg(target_os = "linux")]
 pub fn die_with_parent(cmd: &mut Command, signal: libc::c_int) {
     use std::os::unix::process::CommandExt;
     let parent = std::process::id() as libc::pid_t;
-    // SAFETY: `prctl` and `getppid` are async-signal-safe, and the closure
-    // allocates nothing.
+    // SAFETY: the closure only calls `set_parent_death_signal`, which is
+    // async-signal-safe and allocates nothing.
     unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, signal) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            match libc::getppid() == parent {
-                true => Ok(()),
-                false => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
-            }
-        });
+        cmd.pre_exec(move || set_parent_death_signal(parent, signal));
     }
 }
 

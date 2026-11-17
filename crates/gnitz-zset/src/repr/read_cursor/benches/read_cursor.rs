@@ -3,7 +3,7 @@ use super::*;
 use crate::repr::{Batch, BatchBuilder, MappedShard, Run};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{map_shard, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_wire::{PkKeys, TypeCode};
 use std::hint::black_box;
@@ -70,7 +70,7 @@ fn cursor_drain_bench() {
         })
         .collect();
 
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     for (label, schema, shards) in [
         ("overlapping strings", strings, &overlapping),
         ("interleaved packed", packed, &interleaved),
@@ -80,9 +80,9 @@ fn cursor_drain_bench() {
         let drain = || black_box(create_read_cursor(&[], shards, schema).materialize()).len();
         // The first drain faults the shards in.
         drain();
-        let (instr, cyc) = (instructions.measure(drain).1, cycles.measure(drain).1);
+        let [instr, cyc] = counters.measure(drain).1;
         let key = shards[0].get_pk_bytes(shards[0].row_count() / 2);
-        let (_, band) = instructions.measure(|| {
+        let (_, [band, _]) = counters.measure(|| {
             let runs = shards.iter().cloned().map(Run::Shard);
             black_box(from_runs_in_band(runs, schema, key, None).drain_chunk(100))
         });
@@ -146,19 +146,22 @@ fn adv_merge_cursor(dir: &Path, schema: SchemaDescriptor, total: usize, k: usize
 }
 
 /// Instructions and cycles per probe of a rewound `c` advanced through `keys`.
-fn adv_cost(c: &mut ReadCursor, [instructions, cycles]: &[Counter; 2], keys: impl Iterator<Item = usize>) -> String {
+fn adv_cost(c: &mut ReadCursor, counters: &Counters<2>, keys: impl Iterator<Item = usize>) -> String {
     let stride = c.schema.pk_stride();
     let keys: Vec<u8> = keys.flat_map(|n| adv_key(n, stride).into_iter().take(stride)).collect();
-    let [instr, cyc] = [instructions, cycles].map(|counter| {
+    let mut sweep = || {
         c.rewind();
-        let sweep = || {
-            for key in keys.chunks_exact(stride) {
-                c.advance_to(black_box(key));
-                black_box(c.current_weight());
-            }
-        };
-        counter.measure(sweep).1 as f64 / (keys.len() / stride) as f64
-    });
+        for key in keys.chunks_exact(stride) {
+            c.advance_to(black_box(key));
+            black_box(c.current_weight());
+        }
+    };
+    // The first sweep faults the sources in.
+    sweep();
+    let [instr, cyc] = counters
+        .measure(&mut sweep)
+        .1
+        .map(|n| n as f64 / (keys.len() / stride) as f64);
     format!("{instr:7.1} instr/probe, {cyc:7.1} cycles/probe")
 }
 
@@ -174,7 +177,7 @@ fn adv_cost(c: &mut ReadCursor, [instructions, cycles]: &[Counter; 2], keys: imp
 fn advance_to_bench() {
     const TOTAL: usize = 1 << 20;
     const GAPS: [usize; 3] = [1, 128, 4096];
-    let counters = [Counter::instructions(), Counter::cycles()];
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     for pk in [
         &[TypeCode::U64][..],
         &[TypeCode::U64, TypeCode::U32],

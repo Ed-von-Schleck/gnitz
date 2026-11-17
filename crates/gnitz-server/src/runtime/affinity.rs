@@ -5,6 +5,7 @@
 //! onto each other unless each runs in its own cgroup cpuset. A cgroup CPU quota
 //! narrower than that cpuset turns pinning off: the cores are shared.
 
+use gnitz_foundation::gnitz_note;
 use std::collections::BTreeMap;
 
 use gnitz_wire::MAX_WORKERS;

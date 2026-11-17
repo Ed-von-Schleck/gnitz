@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use io_uring::types::FsyncFlags;
 use io_uring::{IoUring, opcode, types};
 
+use gnitz_foundation::gnitz_warn;
 use gnitz_zset::repr::StorageError;
 
 /// The fds one sync batch opens, and the ring's SQ size.

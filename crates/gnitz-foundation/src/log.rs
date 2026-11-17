@@ -15,7 +15,7 @@ pub const READY_LINE: &str = "GnitzDB ready";
 const LINE_MAX: usize = 512;
 
 /// Which macros emit: ERROR, WARN and NOTE always do.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     /// ERROR/WARN/NOTE only.
     Quiet,
@@ -23,6 +23,21 @@ pub enum Level {
     Normal,
     /// + DEBUG.
     Debug,
+}
+
+impl Level {
+    /// The level a `GNITZ_LOG_LEVEL` or `--log-level` word names: `quiet`,
+    /// `normal`, or `verbose` (alias `debug`); the refusal of any other word.
+    pub fn parse(word: &str) -> Result<Level, String> {
+        match word {
+            "quiet" => Ok(Level::Quiet),
+            "normal" => Ok(Level::Normal),
+            "verbose" | "debug" => Ok(Level::Debug),
+            _ => Err(format!(
+                "invalid log level {word:?} (expected quiet, normal or verbose)"
+            )),
+        }
+    }
 }
 
 /// The process a line came from.
@@ -37,14 +52,15 @@ static LEVEL: AtomicU32 = AtomicU32::new(Level::Quiet as u32);
 /// `0` untagged, `1` the master, `w + 2` worker `w`.
 static TAG: AtomicU32 = AtomicU32::new(0);
 
-/// Set the log level and process tag.
-pub fn init(level: Level, tag: Tag) {
+/// Set the level of every line this process logs from here on. Quiet until a
+/// process sets it, so each host that links a crate that logs sets it: the
+/// server from its arguments, the Python extension from `GNITZ_LOG_LEVEL`.
+pub fn set_level(level: Level) {
     LEVEL.store(level as u32, Ordering::Relaxed);
-    set_tag(tag);
 }
 
-/// Re-tag this process, leaving the level alone — what a forked child that
-/// inherits the level needs.
+/// Tag every line this process logs from here on; untagged until set. A forked
+/// worker re-tags itself and keeps the level it inherited.
 pub fn set_tag(tag: Tag) {
     let packed = match tag {
         Tag::Master => 1,

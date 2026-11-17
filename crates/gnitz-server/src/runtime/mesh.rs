@@ -61,23 +61,25 @@ const SPINS_BEFORE_PARK: u32 = 1000;
 /// further below the outbox's high-water mark returns the pages beyond it.
 const RESIDENT_SLACK_BYTES: usize = 64 << 20;
 
-/// The outbox size: `GNITZ_MESH_OUTBOX_BYTES`, clamped, or [`OUTBOX_BYTES`].
+/// The outbox size: [`OUTBOX_BYTES`], or `GNITZ_MESH_OUTBOX_PAGES` pages, from
+/// one page of blocks past the head up to [`OUTBOX_BYTES`].
 pub(crate) fn outbox_bytes() -> usize {
-    let asked = gnitz_foundation::env::env_num("GNITZ_MESH_OUTBOX_BYTES", OUTBOX_BYTES);
-    let size = asked.clamp(2 * PAGE_BYTES, OUTBOX_BYTES).next_multiple_of(PAGE_BYTES);
-    if size != asked {
-        gnitz_info!(
-            "GNITZ_MESH_OUTBOX_BYTES={asked} is outside [{}, {OUTBOX_BYTES}] or not page-sized; using {size}",
-            2 * PAGE_BYTES
-        );
-    }
-    size
+    let pages = gnitz_foundation::env::env_num_in(
+        "GNITZ_MESH_OUTBOX_PAGES",
+        OUTBOX_BYTES / PAGE_BYTES,
+        (BLOCKS_AT + PAGE_BYTES) / PAGE_BYTES..=OUTBOX_BYTES / PAGE_BYTES,
+    );
+    pages * PAGE_BYTES
 }
 
 /// The mesh among `parks.len()` workers, over outboxes of `outbox_bytes`: one fresh
 /// shared mapping, never unmapped, and every worker's view of it in rank order.
 /// Zeroed. A memfd, so [`Mesh::trim`] can return pages by file offset.
 pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result<Vec<Mesh>> {
+    assert!(
+        outbox_bytes.is_multiple_of(PAGE_BYTES) && outbox_bytes > BLOCKS_AT,
+        "an outbox of {outbox_bytes} bytes is not whole pages past its head"
+    );
     let nw = parks.len();
     let len = HEADER_BYTES + 2 * nw * outbox_bytes;
     // Leaked with the mapping.

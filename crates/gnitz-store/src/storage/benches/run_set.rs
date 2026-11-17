@@ -1,7 +1,7 @@
 use super::super::table::{DEFAULT_RAM_TIER_BYTES, MEMTABLE_BYTES};
 use super::*;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
-use gnitz_foundation::perf::{self, Counter};
+use gnitz_foundation::perf::{self, Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_zset::repr::BatchBuilder;
 use std::rc::Rc;
@@ -119,7 +119,7 @@ fn run_set_push_bench() {
         ("ints", make_schema_u64_i64()),
         ("strings", make_schema_pk_u64_payload_string()),
     ];
-    let (counter, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     println!(
         "run_set_push_bench {:<28} {:>9} {:>12} {:>10} {:>10} {:>10}",
         "", "rows/fill", "folded/row", "instr/row", "cycles/row", "probed"
@@ -156,15 +156,13 @@ fn run_set_push_bench() {
                             folded += rows_folded(&before, rows, &shadow) as u64;
                         }
                         let (runs, held) = (shadow.len(), shadow.row_count() as u64);
-                        let (((), i), c) = cycles.measure(|| {
-                            counter.measure(|| {
-                                for b in ticks {
-                                    set.push_run(Rc::new(b.trimmed()), &schema);
-                                    if probed {
-                                        std::hint::black_box(set.may_contain(0));
-                                    }
+                        let ((), [i, c]) = counters.measure(|| {
+                            for b in ticks {
+                                set.push_run(Rc::new(b.trimmed()), &schema);
+                                if probed {
+                                    std::hint::black_box(set.may_contain(0));
                                 }
-                            })
+                            }
                         });
                         instructions += i;
                         unprobed_cycles += c * !probed as u64;
@@ -209,7 +207,7 @@ fn run_set_probe_bench() {
         ("interleaved runs", RUNS, |run, row, _| row * RUNS + run),
     ];
     let schema = make_schema_u64_i64();
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     // Held keys are even, so `2k + 1` is absent and inside the span.
     let keys = |odd: u64| -> Vec<([u8; 8], u64)> {
         (0..PROBES)
@@ -230,7 +228,7 @@ fn run_set_probe_bench() {
         assert!(!set.is_full(), "{label}: past the tier's ceiling");
 
         let (first, _) = keys(0)[0];
-        let ((), build) = instructions.measure(|| set.holding(&first, probe_key(&first)).for_each(drop));
+        let ((), [build, _]) = counters.measure(|| set.holding(&first, probe_key(&first)).for_each(drop));
         println!(
             "run_set_probe_bench {runs:>2} {label:<17} bloom build {:5.1} instr/row",
             build as f64 / ROWS as f64
@@ -238,16 +236,14 @@ fn run_set_probe_bench() {
         for (kind, odd) in [("hits", 0), ("misses", 1)] {
             let keys = keys(odd);
             let passes = keys.iter().filter(|(_, f)| set.may_contain(*f)).count();
-            let ((found, instr), cyc) = cycles.measure(|| {
-                instructions.measure(|| {
-                    let mut found = 0u64;
-                    for (key, fingerprint) in &keys {
-                        for (run, rows) in set.holding(key, *fingerprint) {
-                            found += run.get_weight(rows.start) as u64
-                        }
+            let (found, [instr, cyc]) = counters.measure(|| {
+                let mut found = 0u64;
+                for (key, fingerprint) in &keys {
+                    for (run, rows) in set.holding(key, *fingerprint) {
+                        found += run.get_weight(rows.start) as u64
                     }
-                    found
-                })
+                }
+                found
             });
             assert_eq!(found, PROBES * (1 - odd), "{label}, {kind}");
             println!(

@@ -9,6 +9,7 @@ use super::Shared;
 use super::family::{FamilyRows, TxnFamily};
 use super::write::HeldTables;
 use crate::runtime::sync::{Either, chan, oneshot, select2};
+use gnitz_foundation::gnitz_warn;
 use gnitz_store::relation::PkRule;
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;

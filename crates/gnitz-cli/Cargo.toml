@@ -38,11 +38,12 @@ dirs = "7"
 signal-hook = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 console = "0.16"
-tempfile.workspace = true
+gnitz-foundation.workspace = true
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 libc.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -16,6 +16,7 @@
 //! [`validate`] between the region and any [`BinaryFuse8Ref`].
 
 use crate::schema::PROBE_KEY_INJECTIVE_BYTES;
+use gnitz_foundation::gnitz_warn;
 use gnitz_wire::{read_u32_le, read_u64_le};
 use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, FilterRef};
 

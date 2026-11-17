@@ -4,6 +4,7 @@
 //! Nothing here submits: every SQE ships with the loop's own submit, before the
 //! task awaiting it can run.
 
+use gnitz_foundation::{gnitz_debug, gnitz_warn};
 use std::mem::MaybeUninit;
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -47,7 +48,7 @@ impl Limits {
             inbound_cap,
             // Every connection at its share together stays under the cap, so
             // what one has queued never refuses another's frame.
-            conn_inbound_share: inbound_cap / max_conns.max(1),
+            conn_inbound_share: inbound_cap / max_conns,
             client_send_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
                 "GNITZ_CLIENT_SEND_TIMEOUT_MS",
                 30_000,
@@ -65,13 +66,13 @@ const INBOUND_CAP_FLOOR: usize = gnitz_wire::MAX_FRAME_PAYLOAD;
 const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
 
 /// The global inbound-memory ceiling, resolved once at startup: a quarter of the
-/// process memory budget, or `GNITZ_INBOUND_MEM_BYTES`, never outside the bounds
-/// above. A fraction of the *actual* budget scales with the deployment where a
+/// process memory budget within the bounds above, or a `GNITZ_INBOUND_MEM_BYTES`
+/// no lower than the floor. A fraction of the *actual* budget scales with the deployment where a
 /// flat constant would OOM a mid-size box yet never trip in a small container.
 fn resolve_inbound_cap() -> usize {
     let host = gnitz_foundation::host::available_memory_bytes();
     let default = (host / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
-    gnitz_foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
+    gnitz_foundation::env::env_num_in("GNITZ_INBOUND_MEM_BYTES", default, INBOUND_CAP_FLOOR..)
 }
 
 /// A capped running total. Each [`Charge`] counts toward it until dropped.

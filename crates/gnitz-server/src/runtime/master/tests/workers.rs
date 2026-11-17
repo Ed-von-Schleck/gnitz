@@ -7,12 +7,14 @@ use gnitz_foundation::posix_io::retry_eintr;
 
 /// A child that lives until it is killed, or until this thread exits.
 fn spawn_live() -> NonZero<libc::pid_t> {
-    // `PR_SET_PDEATHSIG` on the forking thread: a panicking test unwinds off
-    // this thread and takes the paused child with it, rather than orphaning it.
+    // Tied to the forking thread: a panicking test unwinds off this thread and
+    // takes the paused child with it, rather than orphaning it.
+    let parent = std::process::id() as libc::pid_t;
     let pid = unsafe {
         fork_child(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-            libc::pause();
+            if gnitz_foundation::process::set_parent_death_signal(parent, libc::SIGKILL).is_ok() {
+                libc::pause();
+            }
         })
     };
     NonZero::new(pid).unwrap()

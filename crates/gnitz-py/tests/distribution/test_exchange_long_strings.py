@@ -23,7 +23,7 @@ _VIEWS = {
 
 
 def test_long_string_rounds_span_many_parts(own_server):
-    own_server.start(workers=MULTI, extra_env={"GNITZ_MESH_OUTBOX_BYTES": "8192"})
+    own_server.start(workers=MULTI, extra_env={"GNITZ_MESH_OUTBOX_PAGES": "2"})
     with gnitz.connect(own_server.target) as client:
         client.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, body TEXT NOT NULL); "

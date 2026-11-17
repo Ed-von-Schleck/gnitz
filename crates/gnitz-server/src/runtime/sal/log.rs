@@ -32,16 +32,10 @@ const _: () = assert!(
 /// plus the checkpoint headroom.
 pub(super) const MIN_SAL_BYTES: usize = 16 << 20;
 
-/// `SAL_MMAP_SIZE`, or `GNITZ_SAL_BYTES` clamped into
-/// `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` and logged when the clamp moves it — for
-/// test servers sharing a tmpfs, since each `fallocate`s its whole SAL.
+/// `SAL_MMAP_SIZE`, or a `GNITZ_SAL_BYTES` in `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` —
+/// for test servers sharing a tmpfs, since each `fallocate`s its whole SAL.
 fn sal_mmap_size() -> usize {
-    let asked = gnitz_foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE);
-    let size = asked.clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE);
-    if size != asked {
-        gnitz_info!("GNITZ_SAL_BYTES={asked} is outside [{MIN_SAL_BYTES}, {SAL_MMAP_SIZE}]; using {size}");
-    }
-    size
+    gnitz_foundation::env::env_num_in("GNITZ_SAL_BYTES", SAL_MMAP_SIZE, MIN_SAL_BYTES..=SAL_MMAP_SIZE)
 }
 
 /// The word at `offset` as an atomic: a publication prefix, or the anchor or

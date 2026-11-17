@@ -1,9 +1,10 @@
 use super::*;
+use crate::posix_io::ScratchDir;
 
 /// A cgroup tree `root/a/b` with the given `memory.max` at each level, `None`
 /// writing no file.
-fn tree(levels: [Option<&str>; 3]) -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
+fn tree(levels: [Option<&str>; 3]) -> ScratchDir {
+    let root = ScratchDir::new("gnitz-test-").unwrap();
     let dirs = [root.path().to_owned(), root.path().join("a"), root.path().join("a/b")];
     std::fs::create_dir_all(&dirs[2]).unwrap();
     for (dir, max) in dirs.iter().zip(levels) {

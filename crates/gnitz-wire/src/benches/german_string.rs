@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counters, Event};
 use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
@@ -10,7 +10,7 @@ use std::hint::black_box;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shift_german_string_heaps_bench() {
     const N: usize = 1 << 20;
-    let counters = [Counter::instructions(), Counter::cycles(), Counter::branch_misses()];
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES, Event::BRANCH_MISSES]);
     let mut rng = Rng::new(0x5EED_6E57);
     // (name, shortest length, lengths drawn): mixed straddles the threshold.
     let shapes = [("mixed", 0, 25), ("all-short", 0, 13), ("all-long", 13, 12)];
@@ -24,10 +24,8 @@ fn shift_german_string_heaps_bench() {
             }
         }
         shift_german_string_heaps(black_box(&mut cells), black_box(1));
-        let [instr, cycles, misses] = counters.each_ref().map(|counter| {
-            let ((), count) = counter.measure(|| shift_german_string_heaps(black_box(&mut cells), black_box(1)));
-            count as f64 / N as f64
-        });
+        let ((), counts) = counters.measure(|| shift_german_string_heaps(black_box(&mut cells), black_box(1)));
+        let [instr, cycles, misses] = counts.map(|count| count as f64 / N as f64);
         black_box(&cells);
         println!(
             "shift_german_string_heaps_bench {name:<9} {instr:6.2} instr/cell, {cycles:6.2} cycles/cell, {misses:6.3} branch-misses/cell"

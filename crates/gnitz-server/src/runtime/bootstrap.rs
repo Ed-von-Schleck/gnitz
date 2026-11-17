@@ -6,12 +6,13 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
+use gnitz_foundation::{gnitz_error, gnitz_info, gnitz_note};
 use std::collections::BTreeSet;
 use std::num::NonZero;
 use std::os::fd::AsRawFd;
 
 use crate::catalog::{CatalogEngine, SysFamily};
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::{Stage, Switch};
 
 use crate::runtime::ServerExit;
 use crate::runtime::affinity;
@@ -56,12 +57,15 @@ fn system_tail(tail: &CommittedTail) -> impl Iterator<Item = Result<(SysFamily, 
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
 /// stage, so the crash-window E2E tests can cut boot at a precise point.
-static RECOVERY_PANIC: Seam = Seam::new("GNITZ_INJECT_RECOVERY_PANIC");
+static RECOVERY_PANIC: Stage = Stage::new(
+    "GNITZ_INJECT_RECOVERY_PANIC",
+    &["genbump", "reset", "backfill", "sweep"],
+);
 
 /// `GNITZ_INJECT_BOOT_FLUSH_ERROR`: fail a worker's boot recovery after its base
 /// flush, as a real flush failure would — one that, swallowed, would let the SAL
 /// reset destroy the replayed rows' only durable copy.
-static BOOT_FLUSH_ERROR: Seam = Seam::new("GNITZ_INJECT_BOOT_FLUSH_ERROR");
+static BOOT_FLUSH_ERROR: Switch = Switch::new("GNITZ_INJECT_BOOT_FLUSH_ERROR");
 
 fn inject_recovery_panic(stage: &str) {
     if RECOVERY_PANIC.at(stage) {

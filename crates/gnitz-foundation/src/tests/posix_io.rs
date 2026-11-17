@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn retry_eintr_retries_only_eintr() {
     let set_errno = |e| unsafe { *libc::__errno_location() = e };
@@ -32,7 +33,7 @@ fn set_sockopt_int_reports_a_refused_option() {
 
 #[test]
 fn fsync_dir_syncs_a_directory_and_refuses_a_missing_one() {
-    let root = tempfile::tempdir().unwrap();
+    let root = ScratchDir::new("gnitz-test-").unwrap();
     fsync_dir(root.path().to_str().unwrap()).unwrap();
     let missing = root.path().join("absent");
     assert_eq!(
@@ -41,24 +42,10 @@ fn fsync_dir_syncs_a_directory_and_refuses_a_missing_one() {
     );
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn rename_noreplace_moves_a_directory_and_refuses_to_replace_one() {
-    let root = tempfile::tempdir().unwrap();
-    let path = |name: &str| root.path().join(name).to_str().unwrap().to_string();
-    std::fs::create_dir(path("from")).unwrap();
-    std::fs::create_dir(path("taken")).unwrap();
-    let refused = rename_noreplace(&path("from"), &path("taken")).unwrap_err();
-    assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
-    rename_noreplace(&path("from"), &path("to")).unwrap();
-    assert!(!std::path::Path::new(&path("from")).exists());
-    assert!(std::path::Path::new(&path("to")).is_dir());
-}
-
 #[test]
 fn write_file_durable_replaces_the_file_with_its_own_mode() {
     use std::os::unix::fs::PermissionsExt as _;
-    let root = tempfile::tempdir().unwrap();
+    let root = ScratchDir::new("gnitz-test-").unwrap();
     let path = root.path().join("key");
     // A stale, world-readable tmp file a crash left behind.
     std::fs::write(root.path().join("key.tmp"), b"stale").unwrap();

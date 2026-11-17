@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Switch;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
     DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig, lock_data_dir,
@@ -53,7 +53,7 @@ const ROOT: &str = "_mirror";
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance or a cursor
 /// move. A panic rather than an `Err`: nothing else poisons the client's
 /// lock on the store.
-static INGEST_PANIC: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
+static INGEST_PANIC: Switch = Switch::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
 
 /// A maintained local copy of one or more views.
 ///

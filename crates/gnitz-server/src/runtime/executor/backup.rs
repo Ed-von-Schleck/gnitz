@@ -9,6 +9,7 @@
 //! checkpoint and the copy back to back, so no write and no other checkpoint
 //! lands between them, and the catalog guard keeps every DDL out.
 
+use gnitz_foundation::{gnitz_info, gnitz_warn};
 use std::fs;
 use std::path::Path;
 
@@ -48,7 +49,7 @@ pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault
         let synced = |dir: &str| posix_io::fsync_dir(dir).map_err(|e| format!("fsync '{dir}': {e}"));
         // The copy's own entries, durable before the name makes it a backup.
         synced(&partial)?;
-        posix_io::rename_noreplace(&partial, &dest).map_err(|e| format!("name backup '{dest}': {e}"))?;
+        rename_noreplace(&partial, &dest).map_err(|e| format!("name backup '{dest}': {e}"))?;
         copy_at = &dest;
         synced(root).map_err(WireFault::from)
     });
@@ -79,6 +80,26 @@ fn entry_name(name: &[u8]) -> Result<&str, WireFault> {
         && !name.starts_with('.')
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
     ok.then_some(name).ok_or_else(refused)
+}
+
+/// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
+/// `std::fs::rename` replaces a file, or an empty directory, in its place.
+fn rename_noreplace(from: &str, to: &str) -> std::io::Result<()> {
+    let (from, to) = (std::ffi::CString::new(from)?, std::ffi::CString::new(to)?);
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

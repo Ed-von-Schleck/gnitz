@@ -10,7 +10,7 @@ use crate::test_support::{
     make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
     weighted_rows,
 };
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
@@ -29,13 +29,13 @@ fn slice_blob_relocate_bench() {
     const ITERS: usize = 50;
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_pk_u64_payload_string();
-    let cycles = Counter::cycles();
+    let cycles = Counters::open([Event::CYCLES]);
     let arm = |shard: &MappedShard, rc: usize, relocate: bool| {
         let carried = (!relocate).then(|| (shard.heap().plain().expect("a plain heap"), 0));
         let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried, 0)));
         // The first slice faults in the cold mmap pages.
         assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried, 0).len(), rc);
-        cycles.measure(|| (0..ITERS).for_each(|_| slice())).1 as f64 / ITERS as f64
+        cycles.measure(|| (0..ITERS).for_each(|_| slice())).1[0] as f64 / ITERS as f64
     };
 
     for w in [16usize, 40, 256, 1024, 4096] {
@@ -344,7 +344,7 @@ fn shard_read_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_filter_bench() {
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     for rows in [1usize << 12, 1 << 16, 1 << 20] {
@@ -359,15 +359,17 @@ fn pk_filter_bench() {
                 batch.write_as_shard(path.to_str().unwrap(), opts).unwrap();
                 path
             };
-            let (path, i) = instructions.measure(|| write("instructions"));
+            // The first write warms the allocator and the page cache.
+            write("warm");
+            let (path, counts) = counters.measure(|| write("counted"));
             let shard = MappedShard::open(path.to_str().unwrap(), &schema).unwrap();
             assert_eq!(shard.has_pk_filter(), !skip_pk_filter);
-            let per_row = [i, cycles.measure(|| write("cycles")).1].map(|n| n as f64 / rows as f64);
+            let per_row = counts.map(|n| n as f64 / rows as f64);
             (shard, per_row)
         });
         let probes: Vec<u64> = (0..rows).map(|row| probe_key(with.0.get_pk_bytes(row))).collect();
-        let (admitted, probe) =
-            instructions.measure(|| probes.iter().filter(|&&p| with.0.pk_filter_may_contain(p)).count());
+        let (admitted, [probe, _]) =
+            counters.measure(|| probes.iter().filter(|&&p| with.0.pk_filter_may_contain(p)).count());
         assert_eq!(admitted, rows);
         println!(
             "pk_filter_bench {rows:>7} rows: {:.1} instr/row and {:.1} cycles/row with the filter, \

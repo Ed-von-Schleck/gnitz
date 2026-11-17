@@ -1,6 +1,7 @@
 //! The client listeners: the AF_UNIX socket every server has and the TCP socket
 //! `--tls-listen` adds, and the file that tells clients where the TCP one bound.
 
+use gnitz_foundation::{gnitz_info, gnitz_note};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;

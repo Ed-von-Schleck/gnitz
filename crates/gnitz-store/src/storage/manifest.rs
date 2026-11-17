@@ -11,6 +11,7 @@ use std::path::Path;
 use io_uring::types::FsyncFlags;
 
 use super::batch_fsync::Syncer;
+use gnitz_foundation::gnitz_warn;
 use gnitz_wire::PkBuf;
 use gnitz_wire::{Reader, Writer};
 use gnitz_zset::repr::StorageError;

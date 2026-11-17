@@ -4,11 +4,11 @@
 
 use super::dirs::ensure_dir;
 use super::*;
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Count;
 
 /// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
 /// directory and its child subdir, so a concurrent DROP races it.
-static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
+static TABLE_CREATE_DELAY: Count = Count::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 impl RelationRegistry {
     /// [`Self::register_at`] with no index and no trace, every store rebuilt.

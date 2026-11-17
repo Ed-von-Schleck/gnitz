@@ -41,7 +41,7 @@ __all__ = [
     "MAX_COLUMNS",
     "READY_LINE",
     "MAX_IN_FLIGHT",
-    "debug_assertions",
+    "fault_seams",
     "type_codes",
     "instructions_retired",
     "LocalServer",
@@ -52,7 +52,7 @@ FIRST_USER_TABLE_ID: int
 MAX_COLUMNS: int
 READY_LINE: str
 MAX_IN_FLIGHT: int
-debug_assertions: bool
+fault_seams: bool
 
 def type_codes() -> list[tuple[str, int]]: ...
 def instructions_retired(f: Callable[[], object]) -> int: ...

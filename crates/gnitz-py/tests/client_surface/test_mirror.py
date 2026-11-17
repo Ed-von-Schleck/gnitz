@@ -216,7 +216,7 @@ def test_a_fault_degrades_one_copy_and_the_process_lives(client, server, mirror_
     Gated on the *extension's* build, not the server's: the seams fire in the
     mirror's process, which runs the extension's code.
     """
-    if not gnitz.debug_assertions:
+    if not gnitz.fault_seams:
         pytest.skip("fault seams require a debug extension")
     fed_view(client)
     churn(client, 1, 40)

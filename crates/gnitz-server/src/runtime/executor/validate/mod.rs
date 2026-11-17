@@ -59,8 +59,11 @@ impl Checks {
             unique_filters: RefCell::default(),
             fk_presence: RefCell::default(),
             fk_presence_cap: gnitz_foundation::env::env_num("GNITZ_FK_PRESENCE_KEYS", 1usize << 20),
-            cascade_bytes: gnitz_foundation::env::env_num("GNITZ_CASCADE_BYTES", gnitz_wire::MAX_FRAME_PAYLOAD)
-                .min(gnitz_wire::MAX_FRAME_PAYLOAD),
+            cascade_bytes: gnitz_foundation::env::env_num_in(
+                "GNITZ_CASCADE_BYTES",
+                gnitz_wire::MAX_FRAME_PAYLOAD,
+                1..=gnitz_wire::MAX_FRAME_PAYLOAD,
+            ),
         }
     }
 

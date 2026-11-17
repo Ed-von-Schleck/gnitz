@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::io::Write;
 
-use gnitz_foundation::perf::{Counter, voluntary_ctx_switches};
+use gnitz_foundation::perf::{Counter, Counters, Event, voluntary_ctx_switches};
 
 use super::super::test_support::*;
 use super::*;
@@ -10,7 +10,7 @@ use crate::runtime::w2m::fixtures::id;
 const PASSES: u64 = 100_000;
 
 /// Spawn a task on `r` that parks in `park` over and over, then run `PASSES`
-/// passes under each counter, `publish` ahead of each pass and outside the count.
+/// passes, `publish` ahead of each pass and outside the count.
 /// Every pass must bring the task back from one park.
 fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: impl FnMut()) {
     let parks = Rc::new(Cell::new(0u64));
@@ -23,18 +23,20 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
     });
     r.tick(); // the first poll parks the task
 
-    // One counter at a time: two open at once would count each other's ioctls.
-    let [user, all] = [Counter::instructions as fn() -> Counter, Counter::instructions_all].map(|open| {
-        let counter = open();
-        let mut instructions = 0;
-        for _ in 0..PASSES {
-            publish();
-            instructions += counter.measure(|| r.tick()).1;
-        }
-        let empty = (0..PASSES).map(|_| counter.measure(|| ()).1).sum::<u64>();
-        (instructions - empty) as f64 / PASSES as f64
-    });
-    assert_eq!(parks.get(), 2 * PASSES, "{label}: a pass that woke nothing");
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::INSTRUCTIONS.with_kernel()]);
+    let mut instructions = [0u64; 2];
+    for _ in 0..PASSES {
+        publish();
+        let ((), counted) = counters.measure(|| r.tick());
+        instructions = std::array::from_fn(|i| instructions[i] + counted[i]);
+    }
+    let mut empty = [0u64; 2];
+    for _ in 0..PASSES {
+        let ((), counted) = counters.measure(|| ());
+        empty = std::array::from_fn(|i| empty[i] + counted[i]);
+    }
+    let [user, all] = std::array::from_fn(|i| (instructions[i] - empty[i]) as f64 / PASSES as f64);
+    assert_eq!(parks.get(), PASSES, "{label}: a pass that woke nothing");
     println!("reactor_pass_bench {label:<12} {user:>7.1} user, {all:>8.1} user+kernel instr/pass");
     r.tasks.borrow_mut().clear(); // the task holds the reactor
 }

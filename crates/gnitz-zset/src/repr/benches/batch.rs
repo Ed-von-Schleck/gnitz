@@ -4,7 +4,7 @@ use crate::schema::SchemaColumn;
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, make_string_batch, pk_payload_schema, string_batch, u64_pk_schema,
 };
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
@@ -268,21 +268,19 @@ fn blob_cache_bench() {
     for src in [&one, &hundred, &many] {
         assert_eq!(write(src), src.count);
     }
-    let counters = [("instr", Counter::instructions()), ("cycles", Counter::cycles())];
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
+    // The summed counts of `WRITES` writes of `src`, each after a write of `before`.
+    let sum_after = |before: &Batch, src: &Batch| {
+        (0..WRITES).fold([0u64; 2], |[i, c], _| {
+            write(before);
+            let [ni, nc] = counters.measure(|| write(src)).1;
+            [i + ni, c + nc]
+        })
+    };
     for (shape, src) in [("one cell", &one), ("100 rows x 2 string columns", &hundred)] {
-        for (unit, counter) in &counters {
-            let small: u64 = (0..WRITES)
-                .map(|_| {
-                    write(src);
-                    counter.measure(|| write(src)).1
-                })
-                .sum();
-            let large: u64 = (0..WRITES)
-                .map(|_| {
-                    write(&many);
-                    counter.measure(|| write(src)).1
-                })
-                .sum();
+        let (small, large) = (sum_after(src, src), sum_after(&many, src));
+        for (u, unit) in ["instr", "cycles"].into_iter().enumerate() {
+            let (small, large) = (small[u], large[u]);
             println!(
                 "blob_cache_bench: {shape}: {} {unit} after a write of its own shape, {} after a 50 000-span write",
                 small / WRITES,

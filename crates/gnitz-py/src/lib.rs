@@ -161,6 +161,14 @@ fn instructions_retired(f: &Bound<'_, PyAny>) -> PyResult<u64> {
 // would be false.
 #[pymodule(gil_used = true)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // This extension's own copies of gnitz-mirror and gnitz-store log, and
+    // nothing else in the process sets their level.
+    if let Some(word) = std::env::var_os("GNITZ_LOG_LEVEL") {
+        let word = word.to_string_lossy();
+        let level = gnitz_foundation::log::Level::parse(&word)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("GNITZ_LOG_LEVEL: {e}")))?;
+        gnitz_foundation::log::set_level(level);
+    }
     m.add_class::<PyColumnDef>()?;
     m.add_class::<PySchema>()?;
     m.add_class::<PyRow>()?;
@@ -197,12 +205,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MAX_IN_FLIGHT", gnitz_core::MAX_IN_FLIGHT)?;
     // What a server logs once it serves, for the code that starts one.
     m.add("READY_LINE", gnitz_foundation::log::READY_LINE)?;
-    // Whether *this extension* keeps its `#[cfg(debug_assertions)]` fault seams.
-    // A mirroring test arms seams that fire in this process — the mirror's
-    // ingest, in this extension's own copies of gnitz-mirror and gnitz-store — so
-    // the server's build says nothing about them: `e2e-release` pairs a release
-    // server with a debug extension.
-    m.add("debug_assertions", cfg!(debug_assertions))?;
+    // Whether *this extension* keeps its fault seams. A mirroring test arms
+    // seams that fire in this process — the mirror's ingest, in this
+    // extension's own copies of gnitz-mirror and gnitz-store — so the server's
+    // build says nothing about them: `e2e-release` pairs a release server with
+    // a debug extension.
+    m.add("fault_seams", gnitz_foundation::fault::ARMED)?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     m.add_function(wrap_pyfunction!(instructions_retired, m)?)?;
     m.add_function(wrap_pyfunction!(local_server::find_server, m)?)?;

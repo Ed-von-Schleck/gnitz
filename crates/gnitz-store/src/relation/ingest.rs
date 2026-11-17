@@ -11,8 +11,8 @@ use std::rc::Rc;
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
 /// *handling*, not a rolled-back write.
-static INGEST_APPLY_ERROR: gnitz_foundation::fault::Seam =
-    gnitz_foundation::fault::Seam::new("GNITZ_INJECT_INGEST_APPLY_ERROR");
+static INGEST_APPLY_ERROR: gnitz_foundation::fault::Stage =
+    gnitz_foundation::fault::Stage::new("GNITZ_INJECT_INGEST_APPLY_ERROR", &["index", "store"]);
 
 /// Inert for [`RelationKind::SystemCatalog`]: an armed process must reach the
 /// push it is meant to fail.

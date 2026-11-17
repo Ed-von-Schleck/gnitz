@@ -13,6 +13,7 @@ use gnitz_wire::PkColList;
 
 use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, StateLayout};
 use crate::storage::{link_stores, manifest_path, read_at, read_intact, retire_stores};
+use gnitz_foundation::gnitz_debug;
 use gnitz_zset::algebra::Slot;
 
 /// What a child directory holds.

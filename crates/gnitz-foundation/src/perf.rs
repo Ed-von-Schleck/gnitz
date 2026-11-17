@@ -1,7 +1,6 @@
-//! Cost probes for benchmarks and cost-claim tests, immune to the frequency and
-//! scheduling noise in wall clock: instructions retired, core cycles and
-//! voluntary context switches on the calling thread, and this process's
-//! resident set.
+//! Cost probes for benchmarks, immune to the frequency and scheduling noise in
+//! wall clock: hardware events on the calling thread, its voluntary context
+//! switches, and this process's resident set.
 
 use std::fs::File;
 use std::io::Read;
@@ -33,79 +32,127 @@ const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
 const FLAG_DISABLED: u64 = 1 << 0;
 const FLAG_EXCLUDE_KERNEL: u64 = 1 << 5;
 const FLAG_EXCLUDE_HV: u64 = 1 << 6;
+const FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+const FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+const FORMAT_GROUP: u64 = 1 << 3;
 const IOC_ENABLE: libc::c_ulong = 0x2400;
 const IOC_DISABLE: libc::c_ulong = 0x2401;
 const IOC_RESET: libc::c_ulong = 0x2403;
+const IOC_FLAG_GROUP: libc::c_ulong = 1;
 
-/// An open hardware counter over the calling thread's user-space execution.
-///
-/// Kernel mode is excluded on every machine, so a figure does not depend on
-/// `perf_event_paranoid`. What a call costs in the kernel is counted as requests
-/// and as [`voluntary_ctx_switches`].
-pub struct Counter(File);
+/// A hardware event, counted in user mode unless [`Event::with_kernel`] says
+/// otherwise. A user-mode count does not depend on `perf_event_paranoid`; one
+/// that takes in the kernel needs it at 1 or below.
+#[derive(Clone, Copy)]
+pub struct Event {
+    config: u64,
+    kernel: bool,
+}
 
-impl Counter {
-    /// Instructions retired. Panics where the kernel refuses the counter.
-    pub fn instructions() -> Self {
-        Self::open(PERF_COUNT_HW_INSTRUCTIONS)
+impl Event {
+    pub const INSTRUCTIONS: Event = Event {
+        config: PERF_COUNT_HW_INSTRUCTIONS,
+        kernel: false,
+    };
+    pub const CYCLES: Event = Event {
+        config: PERF_COUNT_HW_CPU_CYCLES,
+        kernel: false,
+    };
+    pub const BRANCH_MISSES: Event = Event {
+        config: PERF_COUNT_HW_BRANCH_MISSES,
+        kernel: false,
+    };
+
+    /// The same event, kernel mode counted too: what a call costs in the
+    /// kernel on this thread's behalf.
+    pub const fn with_kernel(self) -> Event {
+        Event { kernel: true, ..self }
+    }
+}
+
+/// `N` hardware counters over the calling thread, opened as one group: enabled,
+/// disabled and read together, so every one counts the same window and none
+/// counts another's ioctls.
+pub struct Counters<const N: usize> {
+    /// The group's leader first.
+    fds: [File; N],
+}
+
+impl<const N: usize> Counters<N> {
+    /// Panics where the kernel refuses an event.
+    pub fn open(events: [Event; N]) -> Self {
+        const { assert!(N > 0, "a group has a leader") };
+        let mut leader = -1;
+        let fds = events.map(|e| {
+            let attr = PerfEventAttr {
+                type_: PERF_TYPE_HARDWARE,
+                size: std::mem::size_of::<PerfEventAttr>() as u32,
+                config: e.config,
+                read_format: FORMAT_GROUP | FORMAT_TOTAL_TIME_ENABLED | FORMAT_TOTAL_TIME_RUNNING,
+                // Only the leader starts disabled: a member follows its leader.
+                flags: (if leader < 0 { FLAG_DISABLED } else { 0 })
+                    | (if e.kernel { 0 } else { FLAG_EXCLUDE_KERNEL })
+                    | FLAG_EXCLUDE_HV,
+                ..Default::default()
+            };
+            // pid 0 = this thread, cpu -1 = any, the leader's group, no flags.
+            let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr as *const _, 0, -1, leader, 0) };
+            assert!(fd >= 0, "perf_event_open: {}", std::io::Error::last_os_error());
+            if leader < 0 {
+                leader = fd as libc::c_int;
+            }
+            // SAFETY: a descriptor the syscall just returned, owned by nothing else.
+            unsafe { File::from_raw_fd(fd as libc::c_int) }
+        });
+        Counters { fds }
     }
 
-    /// Core cycles. Panics where the kernel refuses the counter.
-    pub fn cycles() -> Self {
-        Self::open(PERF_COUNT_HW_CPU_CYCLES)
-    }
-
-    /// Mispredicted branches. Panics where the kernel refuses the counter.
-    pub fn branch_misses() -> Self {
-        Self::open(PERF_COUNT_HW_BRANCH_MISSES)
-    }
-
-    /// Instructions retired, user and kernel mode both.
-    pub fn instructions_all() -> Self {
-        Self::open_flags(PERF_COUNT_HW_INSTRUCTIONS, FLAG_DISABLED | FLAG_EXCLUDE_HV)
-    }
-
-    /// Core cycles, user and kernel mode both.
-    pub fn cycles_all() -> Self {
-        Self::open_flags(PERF_COUNT_HW_CPU_CYCLES, FLAG_DISABLED | FLAG_EXCLUDE_HV)
-    }
-
-    fn open(config: u64) -> Self {
-        Self::open_flags(config, FLAG_DISABLED | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV)
-    }
-
-    fn open_flags(config: u64, flags: u64) -> Self {
-        let attr = PerfEventAttr {
-            type_: PERF_TYPE_HARDWARE,
-            size: std::mem::size_of::<PerfEventAttr>() as u32,
-            config,
-            flags,
-            ..Default::default()
-        };
-        // pid 0 = this thread, cpu -1 = any, no group, no flags.
-        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr as *const _, 0, -1, -1, 0) };
-        assert!(fd >= 0, "perf_event_open: {}", std::io::Error::last_os_error());
-        // SAFETY: a descriptor the syscall just returned, owned by nothing else.
-        Counter(unsafe { File::from_raw_fd(fd as libc::c_int) })
-    }
-
-    /// The events `f` counted on this thread.
-    pub fn measure<T>(&self, f: impl FnOnce() -> T) -> (T, u64) {
-        let fd = self.0.as_raw_fd();
+    /// The events `f` counted on this thread, in the order they were opened.
+    ///
+    /// # Panics
+    ///
+    /// Where the group was not counting for the whole of every window it was
+    /// enabled for — the kernel multiplexed it with other events, or the
+    /// thread ran on a core the events do not cover — since its counts would
+    /// then be partial.
+    pub fn measure<T>(&self, f: impl FnOnce() -> T) -> (T, [u64; N]) {
+        let fd = self.fds[0].as_raw_fd();
         unsafe {
-            libc::ioctl(fd, IOC_RESET, 0);
-            libc::ioctl(fd, IOC_ENABLE, 0);
+            libc::ioctl(fd, IOC_RESET, IOC_FLAG_GROUP);
+            libc::ioctl(fd, IOC_ENABLE, IOC_FLAG_GROUP);
         }
         let out = f();
-        unsafe { libc::ioctl(fd, IOC_DISABLE, 0) };
-        let mut buf = [0u8; 8];
-        (&self.0).read_exact(&mut buf).expect("read the perf counter");
-        (out, u64::from_le_bytes(buf))
+        unsafe { libc::ioctl(fd, IOC_DISABLE, IOC_FLAG_GROUP) };
+        // `{ nr, time_enabled, time_running, value[nr] }`. The times add up
+        // over every window and only advance in one, so they stay equal while
+        // each window counted throughout.
+        let mut buf = vec![0u8; 8 * (3 + N)];
+        (&self.fds[0]).read_exact(&mut buf).expect("read the perf counters");
+        let word = |i: usize| u64::from_ne_bytes(buf[8 * i..8 * i + 8].try_into().unwrap());
+        assert_eq!(word(1), word(2), "the perf counters ran for part of their window");
+        (out, std::array::from_fn(|i| word(3 + i)))
+    }
+}
+
+/// User-mode instructions retired on the calling thread: the one event most
+/// benches read alone.
+pub struct Counter(Counters<1>);
+
+impl Counter {
+    /// Panics where the kernel refuses the counter.
+    pub fn instructions() -> Self {
+        Counter(Counters::open([Event::INSTRUCTIONS]))
+    }
+
+    /// The instructions `f` retired on this thread.
+    pub fn measure<T>(&self, f: impl FnOnce() -> T) -> (T, u64) {
+        let (out, [n]) = self.0.measure(f);
+        (out, n)
     }
 }
 
 /// This thread's voluntary context switches — one per park. Same scope as
-/// [`Counter`].
+/// [`Counters`].
 pub fn voluntary_ctx_switches() -> i64 {
     // SAFETY: `getrusage` writes a plain POD struct this call owns.
     unsafe {

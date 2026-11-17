@@ -379,12 +379,8 @@ impl Feeds {
     /// view's cursor is refused as one of an unregistered relation. `spec` is the
     /// request's encoded bytes.
     fn cursor_tag(&self, view: u64, spec: &[u8]) -> u64 {
-        // splitmix64's finalizer, a bijection on u64: under one spec, two views
-        // of one boot never share a tag.
-        let mut z = view.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        self.boot_nonce ^ (z ^ (z >> 31)) ^ gnitz_wire::checksum(spec)
+        // A bijection: under one spec, two views of one boot never share a tag.
+        self.boot_nonce ^ gnitz_foundation::rng::splitmix(view) ^ gnitz_wire::checksum(spec)
     }
 
     /// `feed` lost a subscriber: forget it with its last.

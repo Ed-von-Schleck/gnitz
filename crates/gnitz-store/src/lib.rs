@@ -38,11 +38,6 @@
 // inside a private module is an error (`warnings = "deny"`).
 #![warn(unreachable_pub)]
 
-// Crate-wide scope for `gnitz_warn!` and its siblings; a plain `use` would
-// reach this module only.
-#[macro_use]
-extern crate gnitz_foundation;
-
 pub mod read;
 pub mod relation;
 mod storage;

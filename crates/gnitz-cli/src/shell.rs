@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use gnitz_core::{BlockingHost, Catalog, ClientError, GnitzClient, block_on};
+use gnitz_foundation::posix_io::ScratchDir;
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use nu_ansi_term::{Color, Style};
 
@@ -62,6 +63,9 @@ pub struct Shell {
     pub(crate) last_statement: String,
     /// Text for the next prompt's buffer, from `\e`.
     pub(crate) prefill: Option<String>,
+    /// The line editor's session's files, `\e`'s among them; `None` outside
+    /// one. Removed when the shell is dropped.
+    pub(crate) scratch: Option<ScratchDir>,
 }
 
 /// A client of `target` whose waits give up once `interrupt` is readable.
@@ -82,6 +86,7 @@ impl Shell {
             failed: false,
             last_statement: String::new(),
             prefill: None,
+            scratch: None,
         })
     }
 

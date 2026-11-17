@@ -321,7 +321,11 @@ pub(crate) fn create(parks: WorkerParks) -> std::io::Result<(Vec<W2mWriter>, W2m
     rings(
         parks,
         gnitz_foundation::env::env_num("GNITZ_W2M_RING_BYTES", W2M_REGION_SIZE),
-        gnitz_foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", gnitz_wire::MAX_FRAME_PAYLOAD),
+        gnitz_foundation::env::env_num_in(
+            "GNITZ_REPLY_FRAME_BUDGET",
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            1..=gnitz_wire::MAX_FRAME_PAYLOAD,
+        ),
     )
 }
 
@@ -517,11 +521,10 @@ impl W2mWriter {
     }
 
     /// The wire budget of a frame of a reply train: never past what a client
-    /// reads in one frame, nor past what this ring holds.
+    /// reads in one frame, which `create` refuses a budget above, nor past what
+    /// this ring holds.
     pub fn frame_budget(&self) -> usize {
-        self.frame_budget
-            .min(gnitz_wire::MAX_FRAME_PAYLOAD)
-            .min(self.max_message_bytes())
+        self.frame_budget.min(self.max_message_bytes())
     }
 
     /// Everything below it the master has released.

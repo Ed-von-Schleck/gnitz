@@ -3,7 +3,7 @@ use crate::repr::BatchBuilder;
 use crate::repr::merge::run_merge;
 use crate::schema::SchemaColumn;
 use crate::test_support::{map_coded_shard, map_shard, pk_payload_schema, pk_u64_two_i64_schema, prose, u64_pk_schema};
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_wire::{PkBuf, TypeCode};
 use std::hint::black_box;
@@ -18,7 +18,7 @@ fn for_compaction_bench() {
     const TOTAL: usize = 1 << 20;
     let schema = pk_u64_two_i64_schema();
     let dir = tempfile::tempdir().unwrap();
-    let (cycles, instructions) = (Counter::cycles(), Counter::instructions());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     for (sources, guards, skeleton) in [(4, 1, false), (32, 32, false), (64, 64, false), (32, 32, true)] {
         let per = TOTAL / sources;
         let inputs: Vec<Rc<MappedShard>> = (0..sources)
@@ -38,14 +38,12 @@ fn for_compaction_bench() {
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
         let mut merge = GuardMerge::begin(inputs, guard_keys[1..].to_vec(), skeleton).unwrap();
-        let ((rows, i), c) = cycles.measure(|| {
-            instructions.measure(|| {
-                let mut rows = 0;
-                while !merge.done() {
-                    rows += merge.next(None).map_or(0, |run| black_box(run).row_count());
-                }
-                rows
-            })
+        let (rows, [i, c]) = counters.measure(|| {
+            let mut rows = 0;
+            while !merge.done() {
+                rows += merge.next(None).map_or(0, |run| black_box(run).row_count());
+            }
+            rows
         });
         // Every source holds every key, each under its own payload.
         assert_eq!(rows, if skeleton { per } else { TOTAL });

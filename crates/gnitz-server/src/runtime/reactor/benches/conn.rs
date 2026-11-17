@@ -74,14 +74,16 @@ fn fanout_coalesced_egress_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pushed_train_band_bench() {
-    use gnitz_foundation::perf::Counter;
+    use gnitz_foundation::perf::{Counters, Event};
     const ROUNDS: usize = 2000;
     const CAP: usize = COALESCE_MAX_BYTES;
     const HEAD: usize = 64;
     const ANSWER: usize = 64;
-    let user = Counter::instructions();
-    let all = Counter::instructions_all();
-    let cycles = Counter::cycles_all();
+    let counters = Counters::open([
+        Event::INSTRUCTIONS,
+        Event::INSTRUCTIONS.with_kernel(),
+        Event::CYCLES.with_kernel(),
+    ]);
 
     for n in [1usize, 8] {
         for body_len in [
@@ -94,7 +96,7 @@ fn pushed_train_band_bench() {
             4 * CAP,
         ] {
             let r = make_reactor();
-            let per_peer = 3 * 2 * ROUNDS * (HEAD + body_len + ANSWER);
+            let per_peer = 2 * ROUNDS * (HEAD + body_len + ANSWER);
             let mut peers = Vec::new();
             let mut drains = Vec::new();
             for _ in 0..n {
@@ -108,30 +110,28 @@ fn pushed_train_band_bench() {
 
             // [arm][0 = sends, 1 = user instr, 2 = user+kernel instr, 3 = cycles]
             let mut cost = [[0u64; 4]; 2];
-            // Each counter in a pass of its own: two open at once would count
-            // each other's ioctls.
-            for (which, counter) in [(1usize, &user), (2, &all), (3, &cycles)] {
-                for i in 0..2 * ROUNDS {
-                    let arm = usize::from(matches!(i % 4, 1 | 2));
-                    let before = SENDS.with(Cell::get);
-                    let ((), counted) = counter.measure(|| {
-                        r.block_on(async {
-                            for peer in &mut peers {
-                                peer.cork(&head);
-                                let body = SendBody::Shared(Rc::clone(&body));
-                                if arm == 0 && body_len > CAP / 2 {
-                                    peer.flush_egress().await.expect("an open peer");
-                                    peer.send_raw(body).await.expect("an open peer");
-                                } else {
-                                    peer.send(body).await.expect("an open peer");
-                                }
-                                peer.cork(&answer);
+            for i in 0..2 * ROUNDS {
+                let arm = usize::from(matches!(i % 4, 1 | 2));
+                let before = SENDS.with(Cell::get);
+                let ((), counted) = counters.measure(|| {
+                    r.block_on(async {
+                        for peer in &mut peers {
+                            peer.cork(&head);
+                            let body = SendBody::Shared(Rc::clone(&body));
+                            if arm == 0 && body_len > CAP / 2 {
                                 peer.flush_egress().await.expect("an open peer");
+                                peer.send_raw(body).await.expect("an open peer");
+                            } else {
+                                peer.send(body).await.expect("an open peer");
                             }
-                        })
-                    });
-                    cost[arm][which] += counted;
-                    cost[arm][0] += SENDS.with(Cell::get) - before;
+                            peer.cork(&answer);
+                            peer.flush_egress().await.expect("an open peer");
+                        }
+                    })
+                });
+                cost[arm][0] += SENDS.with(Cell::get) - before;
+                for (c, k) in cost[arm][1..].iter_mut().zip(counted) {
+                    *c += k;
                 }
             }
             drop(peers);
@@ -142,15 +142,14 @@ fn pushed_train_band_bench() {
                     "a reader saw every byte of both arms"
                 );
             }
-            // Sends were counted in all three passes.
-            let per = |x: u64, passes: u64| x as f64 / (passes * ROUNDS as u64 * n as u64) as f64;
+            let per = |x: u64| x as f64 / (ROUNDS as u64 * n as u64) as f64;
             let arm = |c: [u64; 4]| {
                 format!(
                     "{:.2} sends, {:>6.0} user, {:>6.0} user+kernel instr, {:>6.0} cycles",
-                    per(c[0], 3),
-                    per(c[1], 1),
-                    per(c[2], 1),
-                    per(c[3], 1)
+                    per(c[0]),
+                    per(c[1]),
+                    per(c[2]),
+                    per(c[3])
                 )
             };
             println!(

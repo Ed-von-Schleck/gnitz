@@ -39,7 +39,7 @@ def test_help_goes_to_stdout(flag):
 @pytest.mark.parametrize("var,value", [
     ("GNITZ_SAL_BYTES", "1g"),
     ("GNITZ_CHECKPOINT_BYTES", "64k"),
-    ("GNITZ_MESH_OUTBOX_BYTES", "x"),
+    ("GNITZ_MESH_OUTBOX_PAGES", "x"),
     ("GNITZ_INBOUND_MEM_BYTES", "-1"),
     ("GNITZ_MAX_CONNS", "0"),
     ("GNITZ_HELLO_TIMEOUT_MS", "5s"),
@@ -53,6 +53,8 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_CASCADE_BYTES", "1MB"),
     ("GNITZ_FK_PRESENCE_KEYS", "-1"),
     ("GNITZ_PUSH_QUEUE_BYTES", "8M"),
+    ("GNITZ_SAL_BYTES", str(1 << 20)),
+    ("GNITZ_MESH_OUTBOX_PAGES", "1"),
     ("GNITZ_PATIENT_TICK_GAP_MS", "10ms"),
     ("GNITZ_TICK_COALESCE_ROWS", "10k"),
 ])

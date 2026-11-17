@@ -4,7 +4,7 @@
 
 use std::fmt::Debug;
 
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counters, Event};
 use gnitz_wire::TypeCode;
 
 use crate::eval::Resolved;
@@ -603,15 +603,14 @@ pub(crate) const PATTERNS: &[u128] = &[
 /// compare cycles: a wider instruction retires as one whatever it costs to
 /// execute.
 pub(crate) struct Meter {
-    instructions: Counter,
-    cycles: Counter,
+    /// Instructions, then cycles.
+    counters: Counters<2>,
 }
 
 impl Meter {
     pub(crate) fn new() -> Self {
         Meter {
-            instructions: Counter::instructions(),
-            cycles: Counter::cycles(),
+            counters: Counters::open([Event::INSTRUCTIONS, Event::CYCLES]),
         }
     }
 
@@ -619,9 +618,7 @@ impl Meter {
     /// `rows` rows, after one pass of warm-up.
     pub(crate) fn pass<T>(&self, bench: &str, case: &str, rows: usize, mut pass: impl FnMut() -> T) {
         std::hint::black_box(pass());
-        let ((_, instructions), cycles) = self
-            .cycles
-            .measure(|| self.instructions.measure(|| std::hint::black_box(pass())));
+        let (_, [instructions, cycles]) = self.counters.measure(|| std::hint::black_box(pass()));
         println!(
             "{bench} {case:<36} {:8.2} instr/row {:8.2} cycles/row",
             instructions as f64 / rows as f64,

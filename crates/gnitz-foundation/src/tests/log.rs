@@ -3,23 +3,40 @@ use std::time::Duration;
 
 /// The one test that touches the process-global level and tag.
 #[test]
-fn init_sets_the_level_and_the_tag() {
+fn the_setters_set_the_level_and_the_tag() {
     for (level, info, debug) in [
         (Level::Quiet, false, false),
         (Level::Normal, true, false),
         (Level::Debug, true, true),
     ] {
-        init(level, Tag::Master);
+        set_level(level);
         assert_eq!(
             (enabled(Level::Normal), enabled(Level::Debug)),
             (info, debug),
             "{level:?}"
         );
     }
+    assert_eq!(tag(), None);
+    set_tag(Tag::Master);
     assert_eq!(tag(), Some(Tag::Master));
     set_tag(Tag::Worker(63));
     assert_eq!(tag(), Some(Tag::Worker(63)));
     assert!(enabled(Level::Debug), "re-tagging leaves the level alone");
+}
+
+#[test]
+fn parse_reads_the_level_words() {
+    for (word, level) in [
+        ("quiet", Some(Level::Quiet)),
+        ("normal", Some(Level::Normal)),
+        ("verbose", Some(Level::Debug)),
+        ("debug", Some(Level::Debug)),
+        ("loud", None),
+        ("Quiet", None),
+    ] {
+        assert_eq!(Level::parse(word).ok(), level, "{word:?}");
+    }
+    assert!(Level::parse("loud").unwrap_err().contains("\"loud\""));
 }
 
 /// Each macro is one expression, so a match arm takes it without a block.

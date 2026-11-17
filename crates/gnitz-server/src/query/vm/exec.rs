@@ -1,5 +1,6 @@
 //! Epoch execution: the entry points and the opcode dispatch loop.
 
+use gnitz_foundation::gnitz_debug;
 use std::borrow::Cow;
 
 use super::*;

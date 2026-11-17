@@ -90,7 +90,9 @@ impl Signals {
 pub(super) fn detach_worker(master_pid: i32) {
     // Die immediately if the master exits for any reason: a worker parks on the
     // SAL with no timeout, so this is its only notice.
-    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    if gnitz_foundation::process::set_parent_death_signal(master_pid, libc::SIGKILL).is_err() {
+        unsafe { libc::_exit(0) };
+    }
     let sigs = [libc::SIGHUP, libc::SIGINT, libc::SIGTERM];
     for sig in sigs {
         unsafe { libc::signal(sig, libc::SIG_IGN) };
@@ -98,8 +100,4 @@ pub(super) fn detach_worker(master_pid: i32) {
     // The fork inherits the master's blocked SIGHUP; a blocked signal is held
     // pending even while ignored, so unblocking lets the kernel discard it.
     mask(libc::SIG_UNBLOCK, &sigs);
-    // Re-check: parent may have died in the fork→prctl window.
-    if unsafe { libc::getppid() } != master_pid {
-        unsafe { libc::_exit(0) };
-    }
 }

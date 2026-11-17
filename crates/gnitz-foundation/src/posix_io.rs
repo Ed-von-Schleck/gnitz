@@ -1,22 +1,26 @@
 //! Syscall idioms `std` does not offer. Each returns `io::Result`, the errno
 //! captured at the syscall.
+//!
+//! The idioms only the server calls — the EINTR retry, the fork-shared
+//! mapping and the memfd — are gated to Linux, where the server runs; the
+//! rest builds on any Unix, as a client does.
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
 
 use libc::c_int;
 
 /// Retry a raw syscall until it succeeds (`>= 0`) or fails with an error other
 /// than EINTR, handing back what it returned. Not for a `write`: a partial
 /// write returns a non-negative count, which this reports as success.
-pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<c_int> {
+#[cfg(target_os = "linux")]
+pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> io::Result<c_int> {
     loop {
         let ret = f();
         if ret >= 0 {
             return Ok(ret);
         }
-        let err = std::io::Error::last_os_error();
+        let err = io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINTR) {
             return Err(err);
         }
@@ -24,7 +28,7 @@ pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<c_int> {
 }
 
 /// `setsockopt(level, opt)` with a `c_int` value.
-pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> std::io::Result<()> {
+pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> io::Result<()> {
     // SAFETY: `val` lives across the call and the length passed is its size.
     let rc = unsafe {
         libc::setsockopt(
@@ -36,7 +40,7 @@ pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> std::
         )
     };
     if rc < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -45,7 +49,9 @@ pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> std::
 /// from offset 0, or zeroed anonymous memory for `None`. `MAP_NORESERVE`, which
 /// only the anonymous form is subject to: its pages are charged as they are
 /// touched, so a mapping sized far above its occupancy is not refused for its size.
-pub fn map_shared(fd: Option<BorrowedFd<'_>>, len: usize) -> io::Result<*mut u8> {
+#[cfg(target_os = "linux")]
+pub fn map_shared(fd: Option<std::os::fd::BorrowedFd<'_>>, len: usize) -> io::Result<*mut u8> {
+    use std::os::fd::AsRawFd;
     let (flags, raw) = match fd {
         Some(fd) => (libc::MAP_SHARED | libc::MAP_NORESERVE, fd.as_raw_fd()),
         None => (libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1),
@@ -87,7 +93,7 @@ pub fn fsync_dir(dir: impl AsRef<std::path::Path>) -> io::Result<()> {
 
 /// Make `path`'s own entry durable: sync its parent, the working directory for
 /// a bare name.
-pub fn fsync_parent(path: impl AsRef<std::path::Path>) -> io::Result<()> {
+fn fsync_parent(path: impl AsRef<std::path::Path>) -> io::Result<()> {
     match path.as_ref().parent() {
         Some(p) if !p.as_os_str().is_empty() => fsync_dir(p),
         _ => fsync_dir("."),
@@ -140,27 +146,6 @@ pub fn write_all_vectored(w: &mut impl io::Write, mut bufs: &mut [io::IoSlice<'_
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
-    }
-    Ok(())
-}
-
-/// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
-/// `std::fs::rename` replaces a file, or an empty directory, in its place.
-#[cfg(target_os = "linux")]
-pub fn rename_noreplace(from: &str, to: &str) -> io::Result<()> {
-    let (from, to) = (std::ffi::CString::new(from)?, std::ffi::CString::new(to)?);
-    // SAFETY: both paths are NUL-terminated and outlive the call.
-    let r = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! The reactor's io_uring wrapper: queue, submit, wait, drain.
 
+use gnitz_foundation::gnitz_warn;
 use std::mem::MaybeUninit;
 use std::time::Duration;
 

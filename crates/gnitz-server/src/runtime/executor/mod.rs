@@ -25,6 +25,7 @@ mod tick;
 mod validate;
 mod write;
 
+use gnitz_foundation::{gnitz_debug, gnitz_error, gnitz_info, gnitz_note, gnitz_warn};
 use std::cell::{Cell, Ref};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;

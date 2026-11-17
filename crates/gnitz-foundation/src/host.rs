@@ -1,7 +1,9 @@
-//! Host sensing: what the machine — or the container — will actually give us.
+//! Host sensing: what the machine — or the container — will actually give us,
+//! and why it refuses io_uring when it does.
 //!
-//! A policy input, not a syscall wrapper: a budget expressed as a fraction of
-//! this scales with the deployment where a flat constant cannot.
+//! The memory and CPU readings are policy inputs, not syscall wrappers: a
+//! budget expressed as a fraction of them scales with the deployment where a
+//! flat constant cannot.
 
 use std::path::Path;
 
@@ -84,7 +86,7 @@ fn refusal(errno: Option<i32>, disabled: Option<&str>) -> Option<String> {
             "kernel.io_uring_disabled=2 disables io_uring for every process; set it to 0".to_string()
         }
         (libc::EPERM | libc::EACCES, Some("1")) => "kernel.io_uring_disabled=1 allows io_uring only to \
-             CAP_SYS_ADMIN and the group kernel.io_uring_group names; set it to 0, or run the server in that group"
+             CAP_SYS_ADMIN and the group kernel.io_uring_group names; set it to 0, or run this process in that group"
             .to_string(),
         (libc::ENOSYS, _) => format!(
             "a seccomp filter denies it (podman's default profile does), the kernel has no io_uring, or the \

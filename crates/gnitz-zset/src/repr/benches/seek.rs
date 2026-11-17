@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_foundation::perf::Counter;
+use gnitz_foundation::perf::{Counters, Event};
 use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
@@ -27,7 +27,7 @@ fn region(rows: usize, stride: usize) -> Vec<u8> {
 fn seek_bench() {
     const ROWS: usize = 1 << 20;
     const PROBES: usize = 100_000;
-    let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     /// The hint for a probe at row `r`, the last probe having landed at `prev`.
     type Hint = fn(usize, usize) -> usize;
     let drivers: [(&str, bool, Hint); 4] = [
@@ -52,7 +52,7 @@ fn seek_bench() {
             landed
         };
         assert_eq!(lower_bounds(), probes.iter().sum::<usize>(), "row r holds key r");
-        let (instr, cyc) = (instructions.measure(lower_bounds).1, cycles.measure(lower_bounds).1);
+        let [instr, cyc] = counters.measure(lower_bounds).1;
         println!(
             "seek_bench stride={stride:>2} lower bound at random keys {:6.1} instr/probe, {:6.1} cycles/probe",
             instr as f64 / PROBES as f64,
@@ -75,7 +75,7 @@ fn seek_bench() {
                     landed
                 };
                 assert_eq!(sweep(), probes.iter().sum::<usize>(), "row r holds key r");
-                let (instr, cyc) = (instructions.measure(sweep).1, cycles.measure(sweep).1);
+                let [instr, cyc] = counters.measure(sweep).1;
                 println!(
                     "seek_bench stride={stride:>2} advance, gap={gap:>4} {label:<21} \
                      {:6.1} instr/probe, {:6.1} cycles/probe",

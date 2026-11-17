@@ -20,3 +20,16 @@ fn a_backup_name_is_one_plain_visible_path_component() {
     }
     assert!(entry_name(&[0xff]).is_err());
 }
+
+#[test]
+fn rename_noreplace_moves_a_directory_and_refuses_to_replace_one() {
+    let root = tempfile::tempdir().unwrap();
+    let path = |name: &str| root.path().join(name).to_str().unwrap().to_string();
+    std::fs::create_dir(path("from")).unwrap();
+    std::fs::create_dir(path("taken")).unwrap();
+    let refused = rename_noreplace(&path("from"), &path("taken")).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+    rename_noreplace(&path("from"), &path("to")).unwrap();
+    assert!(!std::path::Path::new(&path("from")).exists());
+    assert!(std::path::Path::new(&path("to")).is_dir());
+}

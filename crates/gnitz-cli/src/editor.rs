@@ -178,9 +178,9 @@ fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
 /// The session: read a buffer at each prompt and run it, until `\q`, an exit
 /// word or Ctrl-D.
 pub fn run(shell: &mut Shell, vi: bool) -> ExitCode {
-    // Alt-E's buffer file lives here, removed when the session ends.
-    let scratch = match tempfile::Builder::new().prefix("gnitz-").tempdir() {
-        Ok(dir) => dir,
+    // Alt-E's buffer file lives here, and `\e`'s.
+    let scratch = match gnitz_foundation::posix_io::ScratchDir::new("gnitz-") {
+        Ok(dir) => shell.scratch.insert(dir),
         Err(e) => {
             eprintln!("gnitz: cannot make a scratch directory: {e}");
             return ExitCode::FAILURE;

@@ -1,6 +1,7 @@
 //! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, backfill,
 //! tick) and the tick ledger, the DDL zone, push groups, and the backup round.
 
+use gnitz_foundation::{gnitz_debug, gnitz_info, gnitz_note, gnitz_warn};
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 
@@ -12,17 +13,17 @@ use crate::catalog::{ZoneError, ZoneSink};
 use crate::runtime::reactor::AckWait;
 use crate::runtime::sal::{Apply, SalFull, SalScope};
 use crate::runtime::sync::{WriteGuard, oneshot};
-use gnitz_foundation::fault::Seam;
+use gnitz_foundation::fault::Switch;
 use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::MemBatch;
 
 /// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
 /// its own, as a crash part-way through a backup would.
-static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
+static BACKUP_ABORT: Switch = Switch::new("GNITZ_INJECT_BACKUP_ABORT");
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit that has something to
 /// tick, once, as a full SAL would.
-static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
+static TICK_EMIT_ERROR: Switch = Switch::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 /// The relations owed a tick, the rounds the ticks written took, and the waits
 /// on both. `pending` grows under the SAL hold its commit groups are written
