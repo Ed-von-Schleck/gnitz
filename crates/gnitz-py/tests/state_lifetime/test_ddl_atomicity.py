@@ -127,16 +127,16 @@ def test_the_boot_sweep_reclaims_exactly_the_dropped_directories(own_server):
         # Dropped `a` meanwhile waits for a checkpoint's sweep, still on disk.
         conn.execute_sql(f"CREATE TABLE a {_TABLE_DDL}")
         a_tid, _ = conn.resolve_table("a")
-        conn.drop_table("a")
+        conn.execute_sql("DROP TABLE a")
         conn.execute_sql(f"CREATE TABLE b {_TABLE_DDL}")
         b_tid, _ = conn.resolve_table("b")
 
         # A dropped schema's member is reclaimed by the same sweep.
-        conn.create_schema("dropped")
+        conn.execute_sql("CREATE SCHEMA dropped")
         conn.schema = "dropped"
         conn.execute_sql(f"CREATE TABLE t {_TABLE_DDL}")
         dropped_tid, _ = conn.resolve_table("t")
-        conn.drop_schema("dropped")
+        conn.execute_sql("DROP SCHEMA dropped CASCADE")
 
     assert os.path.isdir(relation_dir(own_server.data_dir, a_tid)), \
         "dropped a's dir waits for the sweep (still on disk) pre-crash"

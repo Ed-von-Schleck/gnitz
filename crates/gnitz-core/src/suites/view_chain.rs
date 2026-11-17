@@ -172,7 +172,7 @@ fn a_schema_drop_retires_a_chain_with_its_segments() {
     block_on(client.create_view_chain(chain(rel(&sn, "f"), base_tid, &schema))).unwrap();
     assert_eq!(live_views(&mut client).len(), 3);
 
-    block_on(client.drop_schema(&sn)).unwrap();
+    block_on(client.drop_schema(&[sn.as_str()], true, false)).unwrap();
     assert_eq!(live_views(&mut client), []);
 }
 

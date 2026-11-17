@@ -8,7 +8,7 @@ use super::guard::{
 use super::options::parse_table_options;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
-use crate::names::{extract_index_name, extract_object_name};
+use crate::names::{extract_global_name, extract_object_name};
 use crate::rules::{ClassWant, canonical_user_name, reject_duplicate_names, require_class, require_column};
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
@@ -572,43 +572,56 @@ pub(crate) fn plan_create_table(
     }))
 }
 
-/// `DROP TABLE | VIEW | INDEX`; returns the statement's command tag.
+/// `DROP SCHEMA | TABLE | VIEW | INDEX`; returns the statement's command tag.
 pub(crate) async fn execute_drop(
     client: &mut GnitzClient,
     schema_name: &str,
     object_type: &ObjectType,
     names: &[sqlparser::ast::ObjectName],
     if_exists: bool,
+    cascade: bool,
 ) -> Result<&'static str, GnitzSqlError> {
-    // The kind is the statement's, not each name's, so it is settled once.
-    if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
-        return Err(unsupported_clause("DROP", &object_type.to_string()));
-    }
+    const CTX: &str = "DROP";
+    // CASCADE widens a schema's drop to the relations in it; no other kind
+    // has members to take along.
+    reject_if(cascade && !matches!(object_type, ObjectType::Schema), CTX, "CASCADE")?;
+    // A schema or index name is global, so a qualifier on one means nothing.
+    let global = |noun: &str| {
+        names
+            .iter()
+            .map(|n| extract_global_name(n, noun, CTX))
+            .collect::<Result<Vec<String>, _>>()
+    };
+    let relations = || {
+        names
+            .iter()
+            .map(|n| extract_object_name(n, schema_name, CTX))
+            .collect::<Result<Vec<RelName>, _>>()
+    };
     // `IF EXISTS` rides the verb, which resolves its own targets. It softens
     // nothing else: one refusal still fails the whole statement.
-    if let ObjectType::Index = object_type {
-        // An index name is global, so a qualifier on one means nothing.
-        let targets = names
-            .iter()
-            .map(|n| extract_index_name(n, "DROP"))
-            .collect::<Result<Vec<String>, _>>()?;
-        let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-        client.drop_indexes_by_name(&targets, if_exists).await?;
-        return Ok("DROP INDEX");
-    }
-    let targets = names
-        .iter()
-        .map(|n| extract_object_name(n, schema_name, "DROP"))
-        .collect::<Result<Vec<RelName>, GnitzSqlError>>()?;
     match object_type {
+        ObjectType::Schema => {
+            let targets = global("schema")?;
+            let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+            client.drop_schema(&targets, cascade, if_exists).await?;
+            Ok("DROP SCHEMA")
+        }
+        ObjectType::Index => {
+            let targets = global("index")?;
+            let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+            client.drop_indexes_by_name(&targets, if_exists).await?;
+            Ok("DROP INDEX")
+        }
         ObjectType::View => {
-            client.drop_view(&targets, if_exists).await?;
+            client.drop_view(&relations()?, if_exists).await?;
             Ok("DROP VIEW")
         }
-        _ => {
-            client.drop_table(&targets, if_exists).await?;
+        ObjectType::Table => {
+            client.drop_table(&relations()?, if_exists).await?;
             Ok("DROP TABLE")
         }
+        _ => Err(unsupported_clause(CTX, &object_type.to_string())),
     }
 }
 
@@ -654,7 +667,11 @@ pub(crate) async fn execute_create_index(
     reject_unhonored_create_index_clauses(ci)?;
     let columns = index_column_names(&ci.columns, CTX)?;
     let owner_name = extract_object_name(&ci.table_name, schema_name, CTX)?;
-    let explicit_name = ci.name.as_ref().map(|n| extract_index_name(n, CTX)).transpose()?;
+    let explicit_name = ci
+        .name
+        .as_ref()
+        .map(|n| extract_global_name(n, "index", CTX))
+        .transpose()?;
     // `IF NOT EXISTS` tests the name alone: a standing index under it ends the
     // statement before the owner or the column list is resolved. Index
     // names are global, so the index may stand on any relation. sqlparser

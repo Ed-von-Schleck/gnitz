@@ -1,4 +1,4 @@
-//! DDL: CREATE SCHEMA (`schema`), CREATE / DROP TABLE and CREATE INDEX
+//! DDL: CREATE SCHEMA (`schema`), CREATE TABLE, CREATE INDEX and every DROP
 //! (`table`), ALTER TABLE (`alter`), CREATE / ALTER VIEW (`view`), whose body
 //! `crate::hir` compiles, and the definition each records (`view_def`); the
 //! `WITH (…)` codec, read and written (`options`); and the catalog written back

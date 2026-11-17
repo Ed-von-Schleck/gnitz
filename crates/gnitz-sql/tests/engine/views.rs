@@ -505,11 +505,52 @@ fn create_schema_and_a_blob_column_are_sql() {
     let mut db = Db::boot(2);
     db.exec("CREATE SCHEMA archive; CREATE SCHEMA IF NOT EXISTS archive");
     db.refuses("CREATE SCHEMA archive", Refused(Error), "");
-    db.refuses("CREATE SCHEMA a.b", Rejected, "one identifier");
+    db.refuses("CREATE SCHEMA a.b", Rejected, "no qualifier");
     db.exec("CREATE TABLE archive.files (id BIGINT PRIMARY KEY, body BLOB, note BYTEA NOT NULL)");
     let files = block_on(db.client.resolve_relation(&rel("archive", "files"))).unwrap();
     let types: Vec<TypeCode> = files.schema.columns().iter().map(|c| c.ty.tc).collect();
     assert_eq!(types, [TypeCode::I64, TypeCode::Blob, TypeCode::Blob]);
+}
+
+/// `DROP SCHEMA` takes an empty schema as it is, and one holding relations
+/// only under CASCADE, which drops them with it.
+#[test]
+fn drop_schema_restricts_unless_cascaded() {
+    let mut db = Db::boot(2);
+    db.exec("CREATE SCHEMA empty; DROP SCHEMA empty RESTRICT; DROP SCHEMA IF EXISTS empty, empty");
+    db.refuses(
+        "DROP SCHEMA empty",
+        Refused(gnitz_wire::WireStatus::NotFound),
+        "not found",
+    );
+
+    db.exec(
+        "CREATE SCHEMA full;
+         CREATE TABLE full.t (id BIGINT PRIMARY KEY, v BIGINT);
+         CREATE VIEW full.v AS SELECT id FROM full.t",
+    );
+    db.refuses("DROP SCHEMA full", Refused(Error), "not empty");
+    db.refuses("DROP SCHEMA full RESTRICT", Refused(Error), "not empty");
+    db.refuses("DROP SCHEMA full CASCADE PURGE", Rejected, "PURGE");
+    db.refuses(
+        "DROP SCHEMA full, empty CASCADE",
+        Refused(gnitz_wire::WireStatus::NotFound),
+        "not found",
+    );
+    db.refuses("DROP SCHEMA a.b CASCADE", Rejected, "no qualifier");
+    assert!(block_on(db.client.resolve_relation(&rel("full", "t"))).is_ok());
+
+    db.exec("DROP SCHEMA full CASCADE");
+    db.refuses("SELECT * FROM full.t", Refused(gnitz_wire::WireStatus::NotFound), "");
+    db.exec("CREATE SCHEMA full; CREATE TABLE full.t (id BIGINT PRIMARY KEY)");
+
+    // Several schemas go in one bundle, a name given twice once.
+    db.exec("CREATE SCHEMA other; DROP SCHEMA full, other, full CASCADE");
+    db.refuses("SELECT * FROM full.t", Refused(gnitz_wire::WireStatus::NotFound), "");
+    db.exec("CREATE SCHEMA other");
+
+    // RESTRICT is every drop's default, so no kind refuses it.
+    db.exec("CREATE TABLE r (id BIGINT PRIMARY KEY); DROP TABLE r RESTRICT");
 }
 
 // ── Subscriptions ────────────────────────────────────────────────────────────

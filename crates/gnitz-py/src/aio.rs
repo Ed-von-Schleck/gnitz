@@ -17,7 +17,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
-use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Sent, serve, sync_op};
+use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, serve, sync_op};
 
 use crate::client::{Convert, Mode, PyClient, VerbOp, resolve_target, whole};
 use crate::reply::{none, synced};

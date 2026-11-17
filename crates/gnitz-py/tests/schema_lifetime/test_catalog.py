@@ -60,14 +60,13 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):
     for vid in (va, vb):
         assert bag(client.scan(vid, KV), "pk", "val") == {(1, 10): 1}
 
-    client.drop_view("va")
+    client.execute_sql("DROP VIEW va")
     with pytest.raises(gnitz.GnitzNotFoundError):
         client.scan(va, KV)
     client.push(tid, kv((2, 20)))
     assert bag(client.scan(vb, KV), "pk", "val") == {(1, 10): 1, (2, 20): 1}
 
-    client.drop_view("vb")
-    client.drop_table("src")
+    client.execute_sql("DROP VIEW vb; DROP TABLE src")
     with pytest.raises(gnitz.GnitzNotFoundError):
         client.scan(tid, KV)
 

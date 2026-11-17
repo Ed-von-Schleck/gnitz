@@ -183,15 +183,9 @@ impl GnitzClient {
         Pending { client: self, sent }
     }
 
-    /// Step this client's session until `ready` yields, asking it before each
-    /// step. `Closed` when nothing is outstanding while it yields nothing.
-    pub async fn until<R>(&mut self, mut ready: impl FnMut() -> Option<R>) -> Result<R, ClientError> {
-        poll_fn(|cx| self.session.poll_until(&mut *self.host, cx, |_| ready())).await
-    }
-
     /// Step until the connection is under its in-flight caps, at which a
     /// request is refused.
-    pub async fn make_room(&mut self) -> Result<(), ClientError> {
+    pub(crate) async fn make_room(&mut self) -> Result<(), ClientError> {
         poll_fn(|cx| {
             self.session
                 .poll_until(&mut *self.host, cx, |s| (!s.at_capacity()).then_some(()))

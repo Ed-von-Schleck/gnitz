@@ -115,12 +115,17 @@ pub(crate) fn extract_object_name(
     .map_err(GnitzSqlError::Rejected)
 }
 
-/// An index name, canonical. Index names are global, so it takes no qualifier.
-pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
+/// A schema or an index name, canonical. Both are global, so neither takes a
+/// qualifier; `noun` names which one the statement wants.
+pub(crate) fn extract_global_name(
+    name: &sqlparser::ast::ObjectName,
+    noun: &str,
+    context: &str,
+) -> Result<String, GnitzSqlError> {
     match object_name_parts(name, context)?.as_slice() {
         [n] => canonical_user_name(n),
         _ => Err(GnitzSqlError::Rejected(format!(
-            "{context}: an index name takes no qualifier (index names are global, not schema-scoped)"
+            "{context}: a {noun} name is global, so it takes no qualifier"
         ))),
     }
 }

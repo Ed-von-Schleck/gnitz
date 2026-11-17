@@ -15,7 +15,7 @@ from pathlib import Path
 import gnitz
 import pytest
 
-from _read import bag, result_rows, rows
+from _read import bag, reply, rows
 from _serverproc import server_binary
 
 pytest_plugins = ["pytester"]
@@ -137,7 +137,7 @@ async def test_an_async_connect_takes_its_target_from_the_environment(server, mo
 
     monkeypatch.setenv("GNITZ_TARGET", server)
     async with gnitz.aio.connect() as conn:
-        assert bag(result_rows(await conn.execute_sql("SELECT 1 AS one"))) == {(1,): 1}
+        assert bag(reply(await conn.execute_sql("SELECT 1 AS one"))) == {(1,): 1}
 
 
 def test_the_server_extra_pins_this_release():

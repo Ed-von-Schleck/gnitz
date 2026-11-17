@@ -22,7 +22,7 @@ mod schema;
 mod write;
 
 use aio::PyAsyncClient;
-use blocking::{PyGnitzClient, PyPending, PyPipeline};
+use blocking::PyGnitzClient;
 use client::{PyClient, PyTxn};
 use local_server::PyLocalServer;
 use read::{PyRow, PyScanResult};
@@ -31,69 +31,42 @@ use schema::{PyColumnDef, PySchema};
 use write::{PyZSetBatch, install_append_method};
 
 // ---------------------------------------------------------------------------
-// GnitzError Python exception
+// Exceptions
 // ---------------------------------------------------------------------------
+
+/// Declares each exception class and the `add_exceptions` that registers
+/// every one of them on the module, from one table.
+macro_rules! exceptions {
+    ($($name:ident($base:ty): $doc:literal;)*) => {
+        $(pyo3::create_exception!(gnitz, $name, $base, $doc);)*
+
+        fn add_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
+            $(m.add(stringify!($name), m.py().get_type::<$name>())?;)*
+            Ok(())
+        }
+    };
+}
 
 // Created under `gnitz`, which re-exports every one of them: an exception is
 // pickled by its module and name, and `_native` is no module an unpickler can
 // import. `client_err` decides which class a failure raises.
-pyo3::create_exception!(
-    gnitz,
-    GnitzError,
-    pyo3::exceptions::PyException,
-    "The base of every exception gnitz raises."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzRefusedError,
-    GnitzError,
-    "The request was understood and declined; the connection is intact."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzConnectionError,
-    GnitzError,
-    "The connection is unusable: it failed, was lost, or was closed."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzMirrorPoisonedError,
-    GnitzError,
-    "The mirror store may be torn; recovery is close_mirror() and nothing else."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzConflictError,
-    GnitzRefusedError,
-    "Nothing was written; run it again."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzDeltaExpiredError,
-    GnitzRefusedError,
-    "The feed does not continue this delta cursor; discard the copy and bootstrap again."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzSalFullError,
-    GnitzRefusedError,
-    "The server's log had no room for the request; run it again."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzNotFoundError,
-    GnitzRefusedError,
-    "The named relation or schema does not exist."
-);
-pyo3::create_exception!(
-    gnitz,
-    GnitzIntegrityError,
-    GnitzRefusedError,
-    "The write would break a primary key, unique index or foreign key; nothing was written."
-);
+exceptions! {
+    GnitzError(pyo3::exceptions::PyException): "The base of every exception gnitz raises.";
+    GnitzRefusedError(GnitzError): "The request was understood and declined; the connection is intact.";
+    GnitzConnectionError(GnitzError): "The connection is unusable: it failed, was lost, or was closed.";
+    GnitzConflictError(GnitzRefusedError): "Nothing was written; run it again.";
+    GnitzDeltaExpiredError(GnitzRefusedError):
+        "The feed does not continue this delta cursor; discard the copy and bootstrap again.";
+    GnitzSalFullError(GnitzRefusedError): "The server's log had no room for the request; run it again.";
+    GnitzMirrorPoisonedError(GnitzError):
+        "The mirror store may be torn; recovery is close_mirror() and nothing else.";
+    GnitzNotFoundError(GnitzRefusedError): "The named relation or schema does not exist.";
+    GnitzIntegrityError(GnitzRefusedError):
+        "The write would break a primary key, unique index or foreign key; nothing was written.";
+}
 
 /// Wrap any `Display` error as a plain `GnitzError`.
-pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
+fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
     GnitzError::new_err(e.to_string())
 }
 
@@ -179,24 +152,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGnitzClient>()?;
     m.add_class::<PyAsyncClient>()?;
     m.add_class::<PyTxn>()?;
-    m.add_class::<PyPipeline>()?;
-    m.add_class::<PyPending>()?;
     m.add_class::<PyPollResult>()?;
     m.add_class::<PyLocalServer>()?;
     m.add_class::<PyPushed>()?;
     m.add_class::<PySynced>()?;
-    m.add("GnitzError", m.py().get_type::<GnitzError>())?;
-    m.add("GnitzRefusedError", m.py().get_type::<GnitzRefusedError>())?;
-    m.add("GnitzConnectionError", m.py().get_type::<GnitzConnectionError>())?;
-    m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
-    m.add("GnitzDeltaExpiredError", m.py().get_type::<GnitzDeltaExpiredError>())?;
-    m.add("GnitzSalFullError", m.py().get_type::<GnitzSalFullError>())?;
-    m.add(
-        "GnitzMirrorPoisonedError",
-        m.py().get_type::<GnitzMirrorPoisonedError>(),
-    )?;
-    m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
-    m.add("GnitzIntegrityError", m.py().get_type::<GnitzIntegrityError>())?;
+    add_exceptions(m)?;
     // The first id a user relation takes, single-sourced from gnitz_wire.
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
     // The schema-width cap, so a test locates the boundary instead of naming it.

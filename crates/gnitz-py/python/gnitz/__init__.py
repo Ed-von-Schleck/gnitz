@@ -4,7 +4,7 @@ from gnitz._native import (
     GnitzSalFullError, GnitzMirrorPoisonedError, GnitzNotFoundError,
     GnitzIntegrityError, Row, ScanResult,
     ColumnDef, Schema, ZSetBatch, GnitzClient, AsyncGnitzClient,
-    PollResult, Pushed, Synced, Pending,
+    PollResult, Pushed, Synced,
     FIRST_USER_TABLE_ID, MAX_COLUMNS, MAX_IN_FLIGHT,
     fault_seams,
 )
@@ -24,7 +24,7 @@ __all__ = [
     "GnitzSalFullError", "GnitzMirrorPoisonedError", "GnitzNotFoundError",
     "GnitzIntegrityError", "Row", "ScanResult",
     "ColumnDef", "Schema", "ZSetBatch", "GnitzClient", "AsyncGnitzClient",
-    "PollResult", "Pushed", "Synced", "Pending",
+    "PollResult", "Pushed", "Synced",
     "FIRST_USER_TABLE_ID", "MAX_COLUMNS", "MAX_IN_FLIGHT",
     "fault_seams",
     "TypeCode", "SqlResult",

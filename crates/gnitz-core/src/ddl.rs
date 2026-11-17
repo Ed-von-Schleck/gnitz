@@ -430,17 +430,17 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// `CREATE SCHEMA [IF NOT EXISTS]`. With `if_not_exists`, an existing
-    /// schema's id is returned, and the id fetched alongside the probe goes
-    /// unused: a gap in the id sequence and nothing more.
-    pub async fn create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<u64, ClientError> {
+    /// `CREATE SCHEMA [IF NOT EXISTS]`. With `if_not_exists` and the schema
+    /// standing, the id fetched alongside the probe goes unused: a gap in the
+    /// id sequence and nothing more.
+    pub async fn create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<(), ClientError> {
         // Refuses the empty string, a leading `_` (the reserved system prefix)
         // and illegal characters.
         let name = gnitz_wire::canonical_identifier(name)?;
         let schema_id = if if_not_exists {
             let ([schemas], fresh) = self.cut_and_ids([SysFamily::Schema], 1).await?;
-            if let Some(standing) = live_schema_id(&schemas, &name) {
-                return Ok(standing);
+            if live_schema_id(&schemas, &name).is_some() {
+                return Ok(());
             }
             fresh
         } else {
@@ -448,31 +448,47 @@ impl GnitzClient {
         };
         let mut b = DdlBundle::default();
         b.put(&SchemaTabRow { schema_id, name: name.as_str().into() }, 1);
-        self.commit_ddl(b).await?;
-        Ok(schema_id)
+        self.commit_ddl(b).await
     }
 
-    /// `DROP SCHEMA … CASCADE`: the schema and every table and view in it, as
-    /// one DDL bundle. A relation outside the schema that depends on one inside
-    /// fails the bundle, and nothing is dropped.
-    pub async fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
-        let name = gnitz_wire::canonical_identifier(name)?;
+    /// `DROP SCHEMA`: the schemas in `names`, as one DDL bundle. Under
+    /// `cascade` the bundle takes every table and view in them too, and a
+    /// relation outside them that depends on one inside fails it, so nothing
+    /// is dropped; without, the engine refuses a schema still holding a
+    /// relation. A missing schema is not found, or skipped under `if_exists`.
+    pub async fn drop_schema(&mut self, names: &[&str], cascade: bool, if_exists: bool) -> Result<(), ClientError> {
         let all = ReadSpec::all_rows(ReadBound::None);
         let [schemas, views, tables] = self
             .sys_cut([SysFamily::Schema, SysFamily::View, SysFamily::Table], &all)
             .await?;
-        let at = schema_row(&schemas, &name).ok_or_else(|| not_found("schema", &name))?;
-        let schema_id = gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at));
+        let mut dropped = Vec::new();
+        for name in names {
+            let name = gnitz_wire::canonical_identifier(name)?;
+            match schema_row(&schemas, &name) {
+                Some(at) if dropped.contains(&at) => {}
+                Some(at) => dropped.push(at),
+                None if if_exists => {}
+                None => return Err(not_found("schema", name)),
+            }
+        }
 
         let mut b = DdlBundle::default();
-        for (family, scanned) in [(SysFamily::View, views), (SysFamily::Table, tables)] {
-            for i in scanned.live_rows() {
-                if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
-                    b.retract(family, &scanned, i);
+        if cascade {
+            let ids: Vec<u64> = dropped
+                .iter()
+                .map(|&at| gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at)))
+                .collect();
+            for (family, scanned) in [(SysFamily::View, views), (SysFamily::Table, tables)] {
+                for i in scanned.live_rows() {
+                    if ids.contains(&payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID)) {
+                        b.retract(family, &scanned, i);
+                    }
                 }
             }
         }
-        b.retract(SysFamily::Schema, &schemas, at);
+        for at in dropped {
+            b.retract(SysFamily::Schema, &schemas, at);
+        }
         self.commit_ddl(b).await
     }
 

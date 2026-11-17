@@ -1,12 +1,12 @@
 """One client, two ways of waiting: `gnitz.GnitzClient` and
-`gnitz.AsyncGnitzClient` run the same verbs, and each has the other's way of
-sharing a round trip.
+`gnitz.AsyncGnitzClient` run the same verbs, and the async one shares round
+trips between calls made together.
 
 What a verb *does* is owned by the coordinate that tests it through the
 blocking client. This suite owns what only the pair has: that the verb set is
 one set, that an event loop runs calls in the order they were made, that the
 verbs made of several round trips — DDL, SQL, a transaction, a mirror — work
-with the loop doing the waiting, and that the blocking client pipelines.
+with the loop doing the waiting.
 """
 
 import asyncio
@@ -15,8 +15,8 @@ import pytest
 import gnitz
 from gnitz import aio
 from _feedviews import churn, fed_view
-from _read import bag, result_rows, rows, scanned
-from _schemas import KV, SCHEMAS, kv
+from _read import bag, reply, rows, scanned
+from _schemas import KV, kv
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ def test_the_two_classes_share_every_verb():
 
     base = gnitz.GnitzClient.__mro__[1]
     assert base is gnitz.AsyncGnitzClient.__mro__[1]
-    assert own(gnitz.GnitzClient) == {"close", "pipeline"}
+    assert own(gnitz.GnitzClient) == {"close"}
     assert own(gnitz.AsyncGnitzClient) == {"aclose"}
     assert {"push", "execute_sql", "mirror_view", "transaction", "create_table"} <= own(base)
 
@@ -54,13 +54,13 @@ async def test_ddl_sql_and_reads_on_the_loop(aconn):
     tid, schema = await aconn.resolve_table("t")
     assert bag(await aconn.scan(tid, schema)) == {(1, 10): 1, (2, 21): 1}
     assert bag(await aconn.seek(tid, schema, 2)) == {(2, 21): 1}
-    assert bag(result_rows(await aconn.execute_sql("SELECT val FROM t WHERE pk = 1"))) == {(10,): 1}
+    assert bag(reply(await aconn.execute_sql("SELECT val FROM t WHERE pk = 1"))) == {(10,): 1}
 
     other = await aconn.create_table("u", KV)
     await aconn.push(other, kv((7, 70)))
     await aconn.delete(other, KV, [7])
     assert bag(await aconn.scan(other, KV)) == {}
-    await aconn.drop_table("u")
+    await aconn.execute_sql("DROP TABLE u")
     with pytest.raises(gnitz.GnitzNotFoundError):
         await aconn.resolve_table("u")
 
@@ -78,7 +78,7 @@ async def test_calls_run_in_the_order_they_were_made(aconn):
         aconn.execute_sql("SELECT pk, val FROM t"),
     )
     assert inserted[0] == {"type": "RowsAffected", "count": 1}
-    assert bag(result_rows(selected)) == {(1, 11): 1, (2, 20): 1}
+    assert bag(reply(selected)) == {(1, 11): 1, (2, 20): 1}
 
 
 async def test_a_transaction_on_the_loop(aconn, client):
@@ -192,7 +192,7 @@ async def test_a_mirror_on_the_loop(aconn, client, server, mirror_dir):
     assert cursor == polled.cursor and cursor is not None
 
     before = await aconn.requests_sent
-    local = result_rows(await aconn.execute_sql("SELECT * FROM f"))
+    local = reply(await aconn.execute_sql("SELECT * FROM f"))
     assert await aconn.requests_sent == before, "the read was delegated upstream"
     served = rows(client, "SELECT * FROM f")
     assert bag(local) == bag(served) != {}
@@ -239,112 +239,3 @@ async def test_a_push_sends_the_batch_as_it_was_called_with(aconn):
     await asyncio.gather(held_back, pushed)
     assert bag(await aconn.scan(tid, KV)) == {(1, 10): 1}
     assert len(batch) == 2
-
-
-# ---------------------------------------------------------------------------
-# Pipelining, on the blocking client
-# ---------------------------------------------------------------------------
-
-def test_a_pipeline_defers_the_waits(client):
-    """Inside `pipeline()` a one-request verb returns once its request is sent.
-    Its `Pending` resolves to what the verb returns outside one, in call order,
-    and a read made behind a push in the block sees that push."""
-    tid = client.create_table("t", KV)
-    with client.pipeline() as piped:
-        assert piped is client
-        lsns = [client.push(tid, kv((i, i * 10))) for i in range(100)]
-        scan = client.scan(tid, KV)
-        point = client.seek(tid, KV, 7)
-        many = client.scan_many([(tid, KV)])
-        assert all(isinstance(p, gnitz.Pending) for p in [*lsns, scan, point, many])
-        # A result read inside the block waits for exactly that reply.
-        assert bag(point.result()) == {(7, 70): 1}
-    values = [p.result() for p in lsns]
-    assert min(values) > 0 and values == sorted(values)
-    expected = {(i, i * 10): 1 for i in range(100)}
-    assert bag(scan.result()) == expected
-    assert [bag(r) for r in many.result()] == [expected]
-    # Outside the block a verb is a round trip again.
-    assert isinstance(client.push(tid, kv((500, 0))), int)
-
-
-def test_a_pipeline_runs_longer_verbs_in_their_turn(client):
-    """A verb of several round trips finishes inside its call, in its place in
-    the order — and returns a `Pending` like every other verb there."""
-    tid = client.create_table("t", KV)
-    with client.pipeline():
-        client.push(tid, kv((1, 10)))
-        selected = client.execute_sql("SELECT pk, val FROM t")
-        client.push(tid, kv((2, 20)))
-    assert bag(result_rows(selected.result())) == {(1, 10): 1}
-    assert bag(client.scan(tid, KV)) == {(1, 10): 1, (2, 20): 1}
-
-
-def test_a_pipeline_raises_the_failure_nobody_read(client):
-    """Leaving the block raises the first failed reply no `result()` took, so a
-    refused push cannot pass silently; one that was read is not raised twice.
-    Either way the calls around the failure still happened."""
-    tid = client.create_table("t", KV)
-
-    with pytest.raises(gnitz.GnitzNotFoundError):
-        with client.pipeline():
-            client.push(tid, kv((1, 1)))
-            client.push(0xDEAD_BEEF, kv((1, 1)))        # no such relation
-            client.push(tid, kv((2, 2)))
-    assert bag(client.scan(tid, KV)) == {(1, 1): 1, (2, 2): 1}
-
-    with client.pipeline():
-        refused = client.push(0xDEAD_BEEF, kv((1, 1)))
-        with pytest.raises(gnitz.GnitzNotFoundError):
-            refused.result()
-        with pytest.raises(gnitz.GnitzNotFoundError):
-            refused.result()
-
-
-def test_a_pipeline_that_raises_waits_for_nothing(client):
-    """A block that raises lets its own exception through; the requests it sent
-    still commit, and their replies stay there to be read."""
-    tid = client.create_table("t", KV)
-    with pytest.raises(RuntimeError, match="boom"):
-        with client.pipeline():
-            sent = client.push(tid, kv((1, 1)))
-            client.push(0xDEAD_BEEF, kv((1, 1)))
-            raise RuntimeError("boom")
-    assert sent.result() > 0
-    assert bag(client.scan(tid, KV)) == {(1, 1): 1}
-    with pytest.raises(gnitz.GnitzError, match="already open"):
-        with client.pipeline():
-            with client.pipeline():
-                pass
-
-
-def test_a_pipeline_that_closes_its_client_raises_its_own_exception(server):
-    """A block's exception outranks the client it left unusable, as a
-    transaction block's does."""
-    conn = gnitz.connect(server)
-    with pytest.raises(RuntimeError, match="boom"):
-        with conn.pipeline():
-            conn.close()
-            raise RuntimeError("boom")
-
-
-def test_a_pipeline_past_the_in_flight_cap_makes_room(client):
-    """More requests than a connection may hold in flight: the pipeline waits
-    for room instead of taking the refusal a connection raises at the cap."""
-    schemas = client.resolve_table(SCHEMAS)
-    with client.pipeline():
-        scans = [client.scan(*schemas) for _ in range(gnitz.MAX_IN_FLIGHT + 200)]
-    sizes = {len(s.result()) for s in scans}
-    assert len(sizes) == 1 and sizes.pop() > 0
-
-
-def test_a_pipelined_push_sends_the_batch_as_it_was_called_with(client):
-    tid = client.create_table("t", KV)
-    batch = kv((1, 10))
-    with client.pipeline():
-        client.push(tid, batch)
-        batch.append(pk=2, val=20)
-    assert bag(client.scan(tid, KV)) == {(1, 10): 1}
-    client.push(tid, batch)
-    assert bag(client.scan(tid, KV)) == {(1, 10): 1, (2, 20): 1}
-

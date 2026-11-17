@@ -26,7 +26,7 @@ def _build(conn):
     """Views before rows, so every row reaches its views through a tick."""
     for shape, (tables, rows, views) in SHAPES.items():
         conn.schema = shape
-        conn.create_schema(shape)
+        conn.execute_sql(f'CREATE SCHEMA "{shape}"')
         conn.execute_sql("; ".join(filter(None, (tables, views_ddl(views), rows))))
 
 
@@ -171,7 +171,7 @@ def test_a_recovered_view_keeps_ticking(own_server, graceful):
     own_server.start(workers=MULTI)
     with gnitz.connect(own_server.target) as conn:
         for name, (tables, rws, body, want, _) in _TICKS.items():
-            conn.create_schema(name)
+            conn.execute_sql(f'CREATE SCHEMA "{name}"')
             conn.schema = name
             conn.execute_sql(f"{tables}; CREATE VIEW v AS {body}; {rws}")
             assert bag(scanned(conn, "v")) == want, f"{name}: before the restart"

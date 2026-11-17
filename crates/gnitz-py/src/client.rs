@@ -20,7 +20,7 @@ use gnitz_sql::GnitzSqlError;
 use gnitz_wire::{KeyRange, PkColList, PkListRole, ReadBound, ReadSpec, WireConflictMode};
 
 use crate::aio::{LoopCore, LoopHandle};
-use crate::blocking::Blocking;
+use crate::blocking;
 use crate::read::scan_result;
 use crate::reply::{delta, none, polled, scanned, sql_results, synced, value};
 use crate::schema::PySchema;
@@ -32,13 +32,12 @@ pub(crate) enum Mode {
     /// `None` once closed. Held by the verb running on it: one that finds it
     /// held — from another thread, or from Python the running verb ran — is
     /// refused.
-    Blocking(Mutex<Option<Box<Blocking>>>),
+    Blocking(Mutex<Option<Box<GnitzClient>>>),
     Loop(LoopHandle),
 }
 
 /// The verbs both client classes inherit. A verb's value is its result on a
-/// `GnitzClient`, a future of it on an `AsyncGnitzClient`, and a `Pending`
-/// inside `GnitzClient.pipeline()`.
+/// `GnitzClient`, and a future of it on an `AsyncGnitzClient`.
 #[pyclass(name = "_Client", subclass, frozen, module = "gnitz._native")]
 pub struct PyClient {
     mode: Mode,
@@ -51,7 +50,7 @@ pub struct PyClient {
 /// itself, and its value is the verb's.
 macro_rules! whole {
     (|$c:ident| $body:expr) => {
-        move |$c| Box::pin(async move { Ok(Sent::ready(Ok($body))) })
+        move |$c| Box::pin(async move { Ok(gnitz_core::Sent::ready(Ok($body))) })
     };
 }
 pub(crate) use whole;
@@ -73,9 +72,9 @@ impl PyClient {
         })
     }
 
-    /// The blocking client's slot: an error on a client that lives on an event
-    /// loop, and on one a verb is running on.
-    fn blocking_slot(&self) -> PyResult<MutexGuard<'_, Option<Box<Blocking>>>> {
+    /// The blocking client's slot, `None` once closed: an error on a client
+    /// that lives on an event loop, and on one a verb is running on.
+    pub(crate) fn blocking_slot(&self) -> PyResult<MutexGuard<'_, Option<Box<GnitzClient>>>> {
         let Mode::Blocking(slot) = &self.mode else {
             return Err(PyTypeError::new_err(
                 "this client lives on an event loop; await its verbs",
@@ -90,17 +89,11 @@ impl PyClient {
 
     /// Run `f` on the blocking client: an error on a closed one, as
     /// [`Self::blocking_slot`] gives.
-    pub(crate) fn blocking<R>(&self, f: impl FnOnce(&mut Blocking) -> PyResult<R>) -> PyResult<R> {
+    pub(crate) fn blocking<R>(&self, f: impl FnOnce(&mut GnitzClient) -> PyResult<R>) -> PyResult<R> {
         match self.blocking_slot()?.as_deref_mut() {
-            Some(blocking) => f(blocking),
+            Some(c) => f(c),
             None => Err(client_err(ClientError::Closed)),
         }
-    }
-
-    /// Close a blocking client: its driver, which the caller drops. `None`
-    /// once closed.
-    pub(crate) fn take_blocking(&self) -> PyResult<Option<Box<Blocking>>> {
-        Ok(self.blocking_slot()?.take())
     }
 
     /// The event loop's half of a client on one: an error on a blocking client.
@@ -115,11 +108,19 @@ impl PyClient {
     fn run<T, O, C>(slf: &Bound<'_, Self>, op: O, convert: C) -> PyResult<Py<PyAny>>
     where
         T: Send + 'static,
-        O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
-        C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+        O: VerbOp<T>,
+        C: Convert<T>,
     {
         match &slf.get().mode {
-            Mode::Blocking(_) => slf.get().blocking(|blocking| blocking.run(slf, op, convert)),
+            Mode::Blocking(_) => {
+                let reply = slf.get().blocking(|c| {
+                    blocking::call(c, slf.py(), async move |c| {
+                        let sent = op(c).await?;
+                        Ok::<_, GnitzSqlError>(c.wait(sent).await?)
+                    })
+                })?;
+                convert(slf.py(), reply)
+            }
             Mode::Loop(handle) => handle.get().submit(slf.py(), op, convert),
         }
     }
@@ -130,12 +131,10 @@ impl PyClient {
     where
         T: Send + 'static,
         R: FnOnce(&mut GnitzClient) -> T + Send + 'static,
-        C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+        C: Convert<T>,
     {
         match &slf.get().mode {
-            Mode::Blocking(_) => slf
-                .get()
-                .blocking(|blocking| convert(slf.py(), read(&mut blocking.client))),
+            Mode::Blocking(_) => slf.get().blocking(|c| convert(slf.py(), read(c))),
             Mode::Loop(_) => Self::run(slf, whole!(|c| read(c)), convert),
         }
     }
@@ -208,14 +207,6 @@ impl PyClient {
 
     // ----- DDL -----
 
-    fn create_schema(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.create_schema(&name, false).await?), value)
-    }
-
-    fn drop_schema(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.drop_schema(&name).await?), none)
-    }
-
     /// create_table(table_name, schema). Partitioned, default distribution; no
     /// inline UNIQUE surface.
     fn create_table(slf: &Bound<'_, Self>, table_name: String, schema: PySchema) -> PyResult<Py<PyAny>> {
@@ -225,16 +216,6 @@ impl PyClient {
             whole!(|c| c.create_table(&TableDef::new(table, (*schema.rust).clone())).await?),
             value,
         )
-    }
-
-    fn drop_table(slf: &Bound<'_, Self>, table_name: String) -> PyResult<Py<PyAny>> {
-        let table = Self::relation(slf, &table_name)?;
-        Self::run(slf, whole!(|c| c.drop_table(&[table], false).await?), none)
-    }
-
-    fn drop_view(slf: &Bound<'_, Self>, view_name: String) -> PyResult<Py<PyAny>> {
-        let view = Self::relation(slf, &view_name)?;
-        Self::run(slf, whole!(|c| c.drop_view(&[view], false).await?), none)
     }
 
     // ----- DML -----
@@ -610,9 +591,7 @@ pub struct PyTxn {
 #[pymethods]
 impl PyTxn {
     fn __enter__(&self, py: Python<'_>) -> PyResult<Py<PyClient>> {
-        self.client
-            .get()
-            .blocking(|blocking| blocking.client.txn_begin().map_err(client_err))?;
+        self.client.get().blocking(|c| c.txn_begin().map_err(client_err))?;
         Ok(self.client.clone_ref(py))
     }
 
@@ -622,7 +601,7 @@ impl PyTxn {
         let ended = self
             .client
             .get()
-            .blocking(|blocking| Ok(blocking.call(py, async |c| end_txn(c, clean).await)));
+            .blocking(|client| Ok(blocking::call(client, py, async |c| end_txn(c, clean).await)));
         match ended {
             Ok(ended) => ended?,
             // The block's own exception outranks a client it left unusable.
@@ -670,8 +649,7 @@ async fn end_txn(c: &mut GnitzClient, clean: bool) -> Result<(), ClientError> {
     Ok(())
 }
 
-/// A verb's request: runs on the client and yields the verb's answer. Spelled
-/// out on [`PyClient::run`] itself, where a closure's signature is inferred.
+/// A verb's request: runs on the client and yields the verb's answer.
 pub(crate) trait VerbOp<T>:
     for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static
 {

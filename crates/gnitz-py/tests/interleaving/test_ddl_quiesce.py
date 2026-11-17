@@ -71,7 +71,7 @@ def test_a_drop_does_not_race_a_worker_still_creating_the_table(own_server):
     client = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_TABLE_CREATE_DELAY_MS": "50"}).target)
     for i in range(3):
         client.create_table(f"t{i}", KV)
-        client.drop_table(f"t{i}")
+        client.execute_sql(f"DROP TABLE t{i}")
     tid = client.create_table("t", KV)
     client.push(tid, kv((1, 1)))
     assert bag(client.scan(tid, KV)) == {(1, 1): 1}

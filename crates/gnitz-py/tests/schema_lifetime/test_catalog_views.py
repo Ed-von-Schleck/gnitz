@@ -6,6 +6,7 @@ The per-DDL deltas of such a view are `storage_policy/test_catalog_feed.py`'s.
 
 import pytest
 import gnitz
+from gnitz.testing import fresh_schema
 from _catalog import family, schema_id
 from _read import bag, scanned
 from _uid import uid
@@ -95,13 +96,10 @@ def test_a_cascade_that_takes_a_catalog_view_leaves_the_others_exact(client, ser
     _over(client, "tables", "tv")
     client.execute_sql(
         "CREATE VIEW names AS SELECT table_id, name FROM tv; CREATE VIEW n AS SELECT COUNT(*) AS n FROM tv")
-    other = "o" + uid()
-    with gnitz.connect(server, schema=other) as conn:
-        conn.create_schema(other)
+    with fresh_schema(server, "o" + uid()) as conn:
         _over(conn, "tables", "theirs")
         conn.execute_sql("CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY)")
         client.execute_sql("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY)")
-        conn.drop_schema(other)
     client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY)")
     assert _names(client, "tv", "tables") == ["a", "b"]
 
@@ -116,13 +114,10 @@ def test_a_catalog_view_created_after_the_last_one_was_dropped_is_exact(client, 
     is exact from its backfill on, through the ticks after it."""
     client.execute_sql(
         "CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); CREATE INDEX iy ON y (v)")
-    other = "o" + uid()
-    with gnitz.connect(server, schema=other) as conn:
-        conn.create_schema(other)
+    with fresh_schema(server, "o" + uid()) as conn:
         conn.execute_sql("CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
         conn.execute_sql("CREATE INDEX ON x (v)")
         conn.execute_sql("CREATE VIEW theirs AS SELECT index_id, name FROM _system.indices")
-        conn.drop_schema(other)
     client.execute_sql("CREATE VIEW mine AS SELECT index_id, name FROM _system.indices")
 
     def mine():

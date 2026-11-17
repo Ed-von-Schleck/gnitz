@@ -14,6 +14,7 @@ to a row-set or `len()` comparison, and it is the one a replay bug produces.
 
 import pytest
 import gnitz
+from _catalog import schema_id
 from _read import bag, rows, scanned
 from _schemas import KV, kv
 from _sql import insert
@@ -117,7 +118,8 @@ def test_every_ddl_kind_survives_a_crash(own_server):
     re-issues an id already in use."""
     own_server.start()
     with gnitz.connect(own_server.target, schema="dur") as conn:
-        sid = conn.create_schema("dur")
+        conn.execute_sql("CREATE SCHEMA dur")
+        sid = schema_id(conn)
         conn.execute_sql(
             "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
         conn.execute_sql("INSERT INTO t1 VALUES (1, 10)")
@@ -145,7 +147,8 @@ def test_every_ddl_kind_survives_a_crash(own_server):
     own_server.restart()
     with gnitz.connect(own_server.target, schema="dur") as conn:
         assert {n: conn.resolve_table(n)[0] for n in ids} == ids
-        sid2 = conn.create_schema("dur2")
+        conn.execute_sql("CREATE SCHEMA dur2")
+        sid2 = schema_id(conn, "dur2")
         conn.execute_sql("CREATE TABLE fresh (pk BIGINT NOT NULL PRIMARY KEY)")
         fresh = conn.resolve_table("fresh")[0]
         assert fresh > max(dropped_ids), "an id allocated before the crash was reissued"

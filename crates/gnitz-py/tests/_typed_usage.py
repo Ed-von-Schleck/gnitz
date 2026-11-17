@@ -64,12 +64,6 @@ def blocking(client: gnitz.GnitzClient) -> None:
 
     with client.transaction() as txn:
         assert_type(txn, gnitz.GnitzClient)
-    with client.pipeline() as piped:
-        lsn = piped.push(tid, batches())
-        assert_type(lsn, gnitz.Pending[int])
-        assert_type(piped.scan(tid, KV), gnitz.Pending[ScanResult])
-        assert_type(piped.execute_sql("SELECT 1"), gnitz.Pending[list[gnitz.SqlResult]])
-    assert_type(lsn.result(), int)
     with client as entered:
         assert_type(entered, gnitz.GnitzClient)
     assert_type(client.close(), None)
@@ -89,7 +83,6 @@ async def on_a_loop() -> None:
             assert_type(txn, gnitz.AsyncGnitzClient)
         with conn.transaction():  # type: ignore[misc]
             pass
-        conn.pipeline()  # type: ignore[attr-defined]
         conn.push(tid, batches()) + 1  # type: ignore[operator]
     assert_type(await gnitz.aio.connect("sock"), gnitz.AsyncGnitzClient)
     assert_type(await conn.aclose(), None)

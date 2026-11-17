@@ -251,7 +251,6 @@ fn create_index_naming_and_rejections() {
         ("DROP INDEX \"__invalid\"", "cannot start with '_'"),
         // Every DROP clause gnitz does not honor, named rather than dropped.
         ("DROP TABLE t CASCADE", "CASCADE"),
-        ("DROP TABLE t RESTRICT", "RESTRICT"),
         ("DROP TABLE t PURGE", "PURGE"),
         // An ineligible column is named, on both index surfaces.
         ("CREATE INDEX ON t(s)", "'s'"),

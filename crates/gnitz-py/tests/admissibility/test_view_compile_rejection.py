@@ -97,7 +97,7 @@ def test_a_view_never_compiles_to_silently_empty(caps, ns, sql_for, want):
     def create(n):
         caps.execute_sql(f"CREATE VIEW v AS {sql_for(n)}")
         got = bag(scanned(caps, "v"))
-        caps.drop_view("v")
+        caps.execute_sql("DROP VIEW v")
         assert got == dict.fromkeys(want(n), 1), f"n={n}"
 
     first_rejected(create, ns)

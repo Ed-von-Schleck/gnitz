@@ -1969,7 +1969,7 @@ fn a_ddl_that_retires_a_view_retires_its_copy() {
         ("s", "v_rep", &|m| sql(m, "s", &replace)),
         // One `-1` per member view, all in one bundle.
         ("s2", "v_u", &|m| {
-            block_on(m.drop_schema("s2")).expect("drop the schema")
+            block_on(m.drop_schema(&["s2"], true, false)).expect("drop the schema")
         }),
     ];
     for (schema, view, retire) in cases {

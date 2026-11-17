@@ -13,13 +13,7 @@ import math
 def rows(client, q):
     """The rows of a one-statement SELECT, in result order. `client` is anything
     with a blocking `execute_sql` — a connection or a mirroring client."""
-    return result_rows(client.execute_sql(q))
-
-
-def result_rows(results):
-    """`rows` over the results `execute_sql` already returned — an awaited
-    call's, or a `Pending`'s."""
-    return list(reply(results))
+    return list(reply(client.execute_sql(q)))
 
 
 def reply(results):

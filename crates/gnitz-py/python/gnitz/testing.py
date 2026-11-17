@@ -43,16 +43,16 @@ def fresh_schema(target: str, name: str) -> Iterator[gnitz.GnitzClient]:
     """A connection to `target` whose unqualified names resolve in a new
     schema `name`, dropped with everything in it on exit.
 
-    `drop_schema` is ``DROP SCHEMA ... CASCADE``: one atomic DDL bundle that
+    The drop is ``DROP SCHEMA ... CASCADE``: one atomic DDL bundle that
     retracts every view, then every table, then the schema row, so a test
     never tears its own objects down. The drop is not wrapped: a schema that
     refuses to drop is a finding, and swallowing it leaks the objects into the
     catalog every later test shares.
     """
     with gnitz.connect(target, schema=name) as conn:
-        conn.create_schema(name)
+        conn.execute_sql(f'CREATE SCHEMA "{name}"')
         yield conn
-        conn.drop_schema(name)
+        conn.execute_sql(f'DROP SCHEMA "{name}" CASCADE')
 
 
 @pytest.fixture

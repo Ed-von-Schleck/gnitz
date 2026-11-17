@@ -89,7 +89,7 @@ async def test_a_gathered_burst_resolves_every_future(aconn, table):
 
 async def test_a_burst_past_the_in_flight_cap_makes_room(client, aconn):
     """More calls than a connection may hold in flight: the later ones wait for
-    room, as a blocking pipeline's do."""
+    room instead of taking the refusal a connection raises at the cap."""
     schemas = client.resolve_table(SCHEMAS)
     scans = await asyncio.gather(*[aconn.scan(*schemas) for _ in range(gnitz.MAX_IN_FLIGHT + 200)])
     sizes = {len(s) for s in scans}

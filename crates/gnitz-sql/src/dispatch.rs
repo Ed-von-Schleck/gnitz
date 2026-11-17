@@ -294,18 +294,18 @@ async fn execute_ddl(
             names,
             if_exists,
             cascade,
-            restrict,
+            // Every drop's default: it is refused while anything outside it
+            // depends on a target, and sqlparser refuses it beside CASCADE.
+            restrict: _,
             purge,
             temporary,
             table,
         } => {
             const CTX: &str = "DROP";
-            reject_if(*cascade, CTX, "CASCADE")?;
-            reject_if(*restrict, CTX, "RESTRICT")?;
             reject_if(*purge, CTX, "PURGE")?;
             reject_if(*temporary, CTX, "TEMPORARY")?;
             reject_if(table.is_some(), CTX, "ON <table> (MySQL DROP INDEX target)")?;
-            ddl::execute_drop(client, schema_name, object_type, names, *if_exists).await
+            ddl::execute_drop(client, schema_name, object_type, names, *if_exists, *cascade).await
         }
         Statement::CreateSchema {
             schema_name: name,

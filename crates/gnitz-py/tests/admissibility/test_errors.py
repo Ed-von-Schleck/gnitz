@@ -94,7 +94,7 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client):
 
     absent = "schema 'nonexistent_schema_xyz' not found"
     with pytest.raises(gnitz.GnitzNotFoundError, match=absent):
-        client.drop_schema("nonexistent_schema_xyz")
+        client.execute_sql("DROP SCHEMA nonexistent_schema_xyz")
     client.schema = "nonexistent_schema_xyz"
     with pytest.raises(gnitz.GnitzNotFoundError, match=absent):
         client.create_table("t", KV)
@@ -108,13 +108,12 @@ def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, o
     tid = other_client.create_table("t", KV)
     client.execute_sql(f"CREATE VIEW v AS SELECT * FROM {other_client.schema}.t")
 
-    for drop in (lambda: other_client.drop_table("t"),
-                 lambda: other_client.drop_schema(other_client.schema)):
+    for drop in ("DROP TABLE t", f"DROP SCHEMA {other_client.schema} CASCADE"):
         with pytest.raises(gnitz.GnitzRefusedError, match=rf"dependent views \({client.schema}\.v\)"):
-            drop()
+            other_client.execute_sql(drop)
     assert other_client.resolve_table("t")[0] == tid
 
-    client.drop_view("v")
+    client.execute_sql("DROP VIEW v")
 
 
 @pytest.mark.parametrize("tables,body,base", [

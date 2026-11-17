@@ -1,8 +1,7 @@
 //! CREATE SCHEMA.
 
-use crate::ast_util::single_part_ident;
 use crate::error::GnitzSqlError;
-use crate::rules::canonical_user_name;
+use crate::names::extract_global_name;
 use gnitz_core::GnitzClient;
 use sqlparser::ast::SchemaName;
 
@@ -19,9 +18,7 @@ pub(crate) async fn execute_create_schema(
             "{CTX}: AUTHORIZATION is not supported"
         )));
     };
-    let name = single_part_ident(name)
-        .ok_or_else(|| GnitzSqlError::Rejected(format!("{CTX}: a schema name is one identifier")))?;
-    let canonical = canonical_user_name(name)?;
-    client.create_schema(&canonical, if_not_exists).await?;
+    let name = extract_global_name(name, "schema", CTX)?;
+    client.create_schema(&name, if_not_exists).await?;
     Ok(())
 }

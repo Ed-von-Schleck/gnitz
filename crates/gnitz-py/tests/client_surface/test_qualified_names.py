@@ -4,7 +4,7 @@ import pytest
 
 import gnitz
 from gnitz import aio
-from _read import bag, result_rows, rows
+from _read import bag, reply, rows
 from _schemas import KV, kv
 
 
@@ -43,8 +43,7 @@ def test_a_qualified_name_reaches_a_relation_of_another_schema(server, client, i
         public.execute_sql(f"CREATE VIEW {view} AS SELECT * FROM {items}")
         assert client.resolve_table("v")[0] == public.resolve_table(view)[0]
         assert bag(rows(client, "SELECT pk, val FROM v")) == want
-        public.drop_view(view)
-        public.drop_table(items)
+        public.execute_sql(f"DROP VIEW {view}; DROP TABLE {items}")
         with pytest.raises(gnitz.GnitzNotFoundError):
             client.resolve_table("items")
 
@@ -67,6 +66,6 @@ async def test_an_event_loop_connection_names_another_schema(server, client, ite
     async with aio.connect(server) as public:
         tid, schema = await public.resolve_table(items)
         assert bag(await public.scan(tid, schema)) == _ITEMS
-        assert bag(result_rows(await public.execute_sql(f"SELECT pk, val FROM {items}"))) == _ITEMS
+        assert bag(reply(await public.execute_sql(f"SELECT pk, val FROM {items}"))) == _ITEMS
     async with aio.connect(server, schema=client.schema) as conn:
         assert (await conn.resolve_table("items"))[0] == tid

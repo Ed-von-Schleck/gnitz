@@ -268,7 +268,7 @@ fn test_edge_cases() {
 
 // ── test_nonempty_schema_drop_rejected ───────────────────────────────────
 // precheck_family refuses a bare SCHEMA_TAB -1 on a non-empty schema before
-// anything is written; a DROP SCHEMA cascade never sends one.
+// anything is written; a DROP SCHEMA without CASCADE sends one.
 
 #[test]
 fn test_nonempty_schema_drop_rejected() {
