@@ -66,7 +66,7 @@ fn view_read_after_write_bench() {
             let got = block_on(db.client.scan_spec(v.tid, all.clone(), &v.schema))
                 .unwrap()
                 .batch;
-            let rows: i64 = got.weights.iter().sum();
+            let rows: i64 = got.weights().sum();
             assert_eq!(
                 rows as u64,
                 (i + 1).min(if shape == "filter" { u64::MAX } else { 8 }),

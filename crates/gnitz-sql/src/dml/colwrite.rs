@@ -1,32 +1,33 @@
 //! Column value encoding: SQL literal → one region cell, in the canonical region order.
 //!
-//! One encoder, [`append_value_to_col`], writes both an INSERT cell and a SET
+//! One encoder, [`write_value_cell`], writes both an INSERT cell and a SET
 //! literal, so `300` means the same thing whichever verb writes it; and
 //! [`check_not_null`] is the NOT NULL verdict both DML write paths take.
 
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use crate::literal::assign;
-use gnitz_wire::{ColumnDef, TypeCode, push_zero_cell};
+use gnitz_wire::{ColumnDef, TypeCode};
 
-/// Append one written literal to column region `col`, spilling a string into
-/// `blob`. Dispatch is on the *column type*, never on the literal: `5` into a
-/// UUID column is the decimal spelling.
-pub(crate) fn append_value_to_col<R>(
-    col: &mut Vec<u8>,
+/// Write one literal into `cell`, one cell of its column's region, spilling a string into
+/// `blob`. Dispatch is on the *column type*, never on the literal: `5` into a UUID column is
+/// the decimal spelling.
+pub(crate) fn write_value_cell<R>(
+    cell: &mut [u8],
     blob: &mut Vec<u8>,
     def: &ColumnDef,
     lit: &BExpr<R>,
 ) -> Result<(), GnitzSqlError> {
     let tc = def.ty.tc;
+    debug_assert_eq!(cell.len(), tc.wire_stride(), "one cell of the column");
     match (lit, tc) {
         // NULL is the one value every column type encodes alike: a zeroed cell
         // of the type's own stride, with the null bit set by the caller.
-        (BExpr::LitNull, _) => push_zero_cell(col, tc),
+        (BExpr::LitNull, _) => cell.fill(0),
         (BExpr::LitStr(s), TypeCode::String) => {
-            col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob))
+            cell.copy_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob))
         }
-        _ => col.extend_from_slice(&native_value(lit, def)?.to_le_bytes()[..tc.wire_stride()]),
+        _ => cell.copy_from_slice(&native_value(lit, def)?.to_le_bytes()[..tc.wire_stride()]),
     }
     Ok(())
 }

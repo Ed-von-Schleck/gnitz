@@ -76,7 +76,7 @@ fn rows(plan: &WritePlan) -> &ZSetBatch {
 
 /// Each row's key as its native value.
 fn keys(b: &ZSetBatch) -> Vec<u128> {
-    (0..b.pks.len()).map(|r| b.pks.get(r)).collect()
+    (0..b.len()).map(|r| b.pk(r)).collect()
 }
 
 /// A column list names which column each value lands in, in any order and case; a
@@ -125,7 +125,11 @@ fn values_land_in_the_columns_the_list_names() {
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         let schema = &plan.target.schema;
-        assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`");
+        match want_keys.is_empty() {
+            // A SERIAL key is reserved at execute: planned, it is zero bytes.
+            true => assert!(rows(&plan).pk_region().iter().all(|&b| b == 0), "`{sql}`"),
+            false => assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`"),
+        }
         assert_eq!(rows_of(schema, rows(&plan)), want_rows, "`{sql}`");
     }
 }
@@ -141,7 +145,7 @@ fn a_written_key_packs_in_pk_list_order() {
         "INSERT INTO c VALUES (1, 2, 99) ON CONFLICT (a, b) DO NOTHING",
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        assert_eq!(rows(&plan).pks.region(), [0, 2, 0, 0, 0, 0, 0, 0, 0, 1], "`{sql}`");
+        assert_eq!(rows(&plan).pk_region(), [0, 2, 0, 0, 0, 0, 0, 0, 0, 1], "`{sql}`");
     }
 }
 
@@ -170,7 +174,7 @@ fn an_inserted_key_is_the_key_its_literal_seeks() {
             insert(&cat, &format!("INSERT INTO t VALUES ({lit}, 0)")).unwrap_or_else(|e| panic!("{tc:?}: {e:?}"));
         for pred in [format!("id = {lit}"), format!("id IN ({lit}, {lit})")] {
             let (bound, _) = bound_and_predicate(&s, &bind_where(&pred, &s), &[]).unwrap();
-            assert_eq!(bound, ReadBound::PkSet(rows(&plan).pks.keys()), "{tc:?}: {pred}");
+            assert_eq!(bound, ReadBound::PkSet(rows(&plan).pk_keys()), "{tc:?}: {pred}");
         }
     }
 }

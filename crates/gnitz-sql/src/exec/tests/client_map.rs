@@ -39,70 +39,45 @@ pub(super) fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
 }
 
 /// Every row keeps its key and weight. A PK copy is the key's native value — the OPK sign
-/// flip undone — and never NULL. A payload copy moves its source region, cloned only while
-/// a later slot still reads it. A computed string spills into the output arena while a
+/// flip undone — and never NULL. A computed string spills into the output heap while a
 /// copied one keeps its offset into the source's, so both read back from one batch; with
-/// no copied string the output arena holds only what the map computes, and none at all
+/// no copied string the output heap holds only what the map computes, and none at all
 /// when nothing is.
 #[test]
 fn a_map_keeps_key_and_weight_and_fills_each_slot() {
     let src = source();
     let fallback = format!("COALESCE(CASE WHEN v IS NULL THEN s END, '{FALLBACK}')");
-    // (items, whether each output slot holds a source region, rows, the output arena's
-    // length where the case pins it)
-    for (items, moved, want, want_blob) in [
-        (
-            &["v", "k"][..],
-            [true, false],
-            [[Int(7), Int(-5)], [Null, Int(3)]],
-            Some(0),
-        ),
-        (&["v", "v"], [false, true], [[Int(7), Int(7)], [Null, Null]], None),
+    // (items, rows, the output heap's length where the case pins it)
+    for (items, want, want_blob) in [
+        (&["v", "k"][..], [[Int(7), Int(-5)], [Null, Int(3)]], Some(0)),
+        (&["v", "v"], [[Int(7), Int(7)], [Null, Null]], None),
         (
             &["s", &fallback],
-            [true, false],
             [[Str(LONG), Str(FALLBACK)], [Null, Str(FALLBACK)]],
             None,
         ),
-        (
-            &["s", "v + 1"],
-            [true, false],
-            [[Str(LONG), Int(8)], [Null, Null]],
-            None,
-        ),
-        // A computed string and no copied one: the arena holds only the re-encoded body.
+        (&["s", "v + 1"], [[Str(LONG), Int(8)], [Null, Null]], None),
+        // A computed string and no copied one: the heap holds only the re-encoded body.
         (
             &["v", "COALESCE(s, 'x')"],
-            [true, false],
             [[Int(7), Str(LONG)], [Null, Str("x")]],
             Some(LONG.len()),
         ),
         // The source's own layout: the batch comes back as it went in.
-        (&["v", "s"], [true, true], [[Int(7), Str(LONG)], [Null, Null]], None),
+        (&["v", "s"], [[Int(7), Str(LONG)], [Null, Null]], None),
     ] {
         let b = keyed_batch(
             &src,
             &[(&[(-5i64) as u128], 1, &[Int(7), Str(LONG)]), (&[3], 2, &[Null, Null])],
         );
-        let (pks, regions) = (
-            b.pks.clone(),
-            b.payload.iter().map(|c| c.bytes.as_ptr()).collect::<Vec<_>>(),
-        );
+        let pks = b.pk_region().to_vec();
         let mut map = map_of(&src, items);
         let out = map.apply(b);
-        assert_eq!(out.pks, pks, "{items:?}");
-        assert_eq!(
-            out.payload
-                .iter()
-                .map(|c| regions.contains(&c.bytes.as_ptr()))
-                .collect::<Vec<_>>(),
-            moved,
-            "{items:?}"
-        );
+        assert_eq!(out.pk_region(), pks, "{items:?}");
         let want: Vec<_> = want.into_iter().map(Vec::from).zip([1, 2]).collect();
         assert_eq!(rows_of(map.out_schema(), &out), want, "{items:?}");
         if let Some(n) = want_blob {
-            assert_eq!(out.blob.len(), n, "{items:?}");
+            assert_eq!(out.heap().len(), n, "{items:?}");
         }
     }
 }

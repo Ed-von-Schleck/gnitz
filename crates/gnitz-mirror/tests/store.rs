@@ -169,11 +169,11 @@ fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
 
 /// [`held`]'s fold over one reply batch.
 fn rows_of(batch: &ZSetBatch) -> BTreeMap<(u64, i64), i64> {
-    let vals = &batch.payload[0].bytes;
+    let vals = batch.col(0);
     let mut out = BTreeMap::new();
-    for row in 0..batch.weights.len() {
-        let pk = batch.pks.get(row) as u64;
-        *out.entry((pk, gnitz_wire::read_i64_le(vals, row * 8))).or_insert(0) += batch.weights[row];
+    for row in 0..batch.len() {
+        let pk = batch.pk(row) as u64;
+        *out.entry((pk, gnitz_wire::read_i64_le(vals, row * 8))).or_insert(0) += batch.weight(row);
     }
     out.retain(|_, w| *w != 0);
     out
@@ -217,7 +217,7 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
     store.register(&rel("v"), &desc_of(OTHER_TID, &wide, &[])).unwrap();
     assert_eq!(store.cursor_of(OTHER_TID), None, "another layout is another copy");
     let rows = store.scan_spec(OTHER_TID, ReadSpec::all_rows(ReadBound::None), &wide);
-    assert_eq!(rows.unwrap().weights.len(), 0, "which starts empty");
+    assert_eq!(rows.unwrap().len(), 0, "which starts empty");
 }
 
 /// A forgotten copy is gone — cursor, rows, record and directory — so no delta

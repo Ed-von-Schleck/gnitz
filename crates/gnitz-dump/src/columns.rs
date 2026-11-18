@@ -31,7 +31,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, push_zero_cell};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, as_le_bytes, push_zero_cell};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as Physical, ZstdLevel};
 use parquet::column::reader::{ColumnReader, get_typed_column_reader};
 use parquet::data_type::{
@@ -191,7 +191,7 @@ impl TableWriter {
 
     /// `batch`'s rows as one row group; every row must stand at weight 1.
     pub(crate) fn write(&mut self, batch: &ZSetBatch) -> Result<(), DumpError> {
-        if let Some(&w) = batch.weights.iter().find(|&&w| w != 1) {
+        if let Some(w) = batch.weights().find(|&w| w != 1) {
             return Err(DumpError::from(format!("a base-table row at weight {w}")));
         }
         if batch.is_empty() {
@@ -226,16 +226,16 @@ fn write_column(
     nullable: bool,
 ) -> Result<(), DumpError> {
     let bit = loc.null_bit();
-    let levels: Option<Vec<i16>> = nullable.then(|| batch.nulls.iter().map(|&w| i16::from(w & bit == 0)).collect());
+    let levels: Option<Vec<i16>> = nullable.then(|| batch.null_words().map(|w| i16::from(w & bit == 0)).collect());
     let levels = levels.as_deref();
     // Native little-endian cells; a key column's are decoded out of the key region.
     let cells: Cow<'_, [u8]> = match loc {
-        ColumnLocator::Payload { slot, .. } => Cow::Borrowed(&batch.payload[slot as usize].bytes),
+        ColumnLocator::Payload { slot, .. } => Cow::Borrowed(batch.col(slot as usize)),
         ColumnLocator::Pk { byte_off, size, type_code } => {
             let mut cells = vec![0; batch.len() * size as usize];
             gnitz_wire::decode_pk_cells(
-                batch.pks.region(),
-                batch.pks.stride(),
+                batch.pk_region(),
+                batch.pk_stride(),
                 byte_off as usize,
                 type_code,
                 &mut cells,
@@ -245,8 +245,8 @@ fn write_column(
     };
     let present = cells
         .chunks_exact(loc.size())
-        .zip(&batch.nulls)
-        .filter(|&(_, &w)| w & bit == 0)
+        .zip(batch.null_words())
+        .filter(|&(_, w)| w & bit == 0)
         .map(|(c, _)| c);
     let le = |c: &[u8]| -> [u8; 8] { c.try_into().expect("an 8-byte cell") };
     match codec {
@@ -281,7 +281,10 @@ fn write_column(
         Codec::Bytes => put::<ByteArrayType>(
             writer,
             byte_values(present, |c, all| {
-                all.extend_from_slice(gnitz_wire::german_string_content(c.first_chunk().unwrap(), &batch.blob))
+                all.extend_from_slice(gnitz_wire::german_string_content(
+                    c.first_chunk().unwrap(),
+                    batch.heap(),
+                ))
             }),
             levels,
         ),
@@ -365,10 +368,7 @@ impl TableReader {
         self.next += 1;
         let (schema, cols) = (&self.schema, &self.cols);
         let n = usize::try_from(group.metadata().num_rows()).map_err(|_| DumpError::from("a negative row count"))?;
-        let mut batch = ZSetBatch::new(schema);
-        batch.weights = vec![1; n];
-        batch.nulls = vec![0; n];
-        let ZSetBatch { payload, nulls, blob, .. } = &mut batch;
+        let (mut nulls, mut heap) = (vec![0u64; n], Vec::new());
         let mut read = |ci: usize, cells: &mut Vec<u8>| -> Result<(), DumpError> {
             let (loc, codec, nullable) = cols[ci];
             let null_words = nullable.then_some((&mut nulls[..], loc.null_bit()));
@@ -379,7 +379,7 @@ impl TableReader {
                 loc.type_code(),
                 cells,
                 null_words,
-                blob,
+                &mut heap,
             )
             .map_err(|e| DumpError(format!("column {}: {e}", schema.columns()[ci].name)))
         };
@@ -389,11 +389,20 @@ impl TableReader {
             read(ci as usize, &mut cells)?;
             keys.push(cells);
         }
-        for (pi, ci, _) in schema.payload_columns() {
-            read(ci, &mut payload[pi].bytes)?;
-        }
-        batch.pks = PkColumn::from_native_columns(schema, &keys);
-        Ok(Some(batch))
+        let payload = (schema.payload_columns())
+            .map(|(_, ci, _)| {
+                let mut cells = Vec::new();
+                read(ci, &mut cells)?;
+                Ok(cells)
+            })
+            .collect::<Result<Vec<_>, DumpError>>()?;
+        let (keys, weights) = (PkColumn::from_native_columns(schema, &keys), vec![1i64; n]);
+        let mut regions = vec![keys.region(), as_le_bytes(&weights), as_le_bytes(&nulls)];
+        regions.extend(payload.iter().map(Vec::as_slice));
+        regions.push(&heap);
+        ZSetBatch::from_own_regions(schema, &regions)
+            .map(Some)
+            .map_err(|e| DumpError(e.to_string()))
     }
 }
 

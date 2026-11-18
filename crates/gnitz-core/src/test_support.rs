@@ -457,5 +457,9 @@ pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
 
 /// A WAL block decoded under `schema` into a fresh batch.
 pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<ZSetBatch, ProtocolError> {
-    crate::batch::decode_wal_blocks(std::iter::once(data), schema)
+    let block = crate::batch::FrameBlock {
+        frame: std::borrow::Cow::Borrowed(data),
+        block: 0..data.len(),
+    };
+    crate::batch::decode_wal_blocks(Vec::new(), Some(block), schema)
 }

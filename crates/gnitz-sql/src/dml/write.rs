@@ -77,7 +77,11 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
     {
         // One reservation for the whole statement.
         let n = rows.len();
-        rows.pks = serial_keys(client.reserve_serial_ids(&target, n as u64).await?, n, schema)?;
+        rows.set_keys(&serial_keys(
+            client.reserve_serial_ids(&target, n as u64).await?,
+            n,
+            schema,
+        )?);
     }
     let (tag, count) = match write {
         Write::Insert { rows, returning } => {
@@ -104,7 +108,7 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
             }));
         }
         Write::Upsert { rows, mut set } => {
-            let bound = ReadBound::PkSet(rows.pks.keys());
+            let bound = ReadBound::PkSet(rows.pk_keys());
             let count = client
                 .read_modify_write(&target, bound, Vec::new(), set.is_none(), |held| {
                     resolve_conflicts(rows, held, set.as_deref_mut(), schema)
@@ -123,7 +127,7 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
         Write::Delete { bound, predicate } => {
             let count = client
                 .read_modify_write(&target, bound, predicate, true, |held| {
-                    Ok::<_, GnitzSqlError>(ZSetBatch::retraction(schema, held.pks))
+                    Ok::<_, GnitzSqlError>(held.key_retraction(schema))
                 })
                 .await?;
             ("DELETE", count)

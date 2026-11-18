@@ -90,11 +90,8 @@ impl FoldFinish {
     /// The partials as one row per group. A group's first row absorbs every later row of the
     /// group, in reply order; the absorbed rows are then dropped.
     fn combine(&self, mut partial: ZSetBatch) -> ZSetBatch {
-        debug_assert!(
-            partial.weights.iter().all(|&w| w == 1),
-            "a fold partial is one reduce row"
-        );
-        let Firsts { absorbed, keep } = firsts(&partial.pks);
+        debug_assert!(partial.weights().all(|w| w == 1), "a fold partial is one reduce row");
+        let Firsts { absorbed, keep } = firsts(partial.pk_region(), partial.pk_stride());
         for &(loc, extreme) in &self.aggs {
             match extreme {
                 Some(wins) => {
@@ -107,7 +104,7 @@ impl FoldFinish {
                 None => {
                     let float = loc.type_code().is_float();
                     let pi = loc.payload_slot().expect("an aggregate is a payload column");
-                    let cells = partial.payload[pi].bytes.as_chunks_mut::<8>().0;
+                    let cells = partial.col_mut(pi).as_chunks_mut::<8>().0;
                     for &(row, first) in &absorbed {
                         let (acc, add) = (
                             u64::from_le_bytes(cells[first as usize]),
@@ -130,17 +127,17 @@ impl FoldFinish {
 /// Row `row`'s cell at payload `loc` replaces row `first`'s when it compares `wins` against
 /// it; a NULL cell loses to any value.
 fn take_extreme(b: &mut ZSetBatch, first: usize, row: usize, wins: Ordering, loc: ColumnLocator) {
-    if loc.is_null_word(b.nulls[row]) {
+    if loc.is_null_word(b.null_word(row)) {
         return;
     }
-    if loc.is_null_word(b.nulls[first]) || loc.cmp_non_null(&*b, row, &*b, first) == wins {
+    if loc.is_null_word(b.null_word(first)) || loc.cmp_non_null(&*b, row, &*b, first) == wins {
         // Both rows are in one batch, so one arena: a string cell moves verbatim.
         let (pi, w) = (
             loc.payload_slot().expect("an aggregate is a payload column"),
             loc.size(),
         );
-        b.payload[pi].bytes.copy_within(row * w..(row + 1) * w, first * w);
-        b.nulls[first] &= !loc.null_bit();
+        b.col_mut(pi).copy_within(row * w..(row + 1) * w, first * w);
+        b.set_null_word(first, b.null_word(first) & !loc.null_bit());
     }
 }
 

@@ -2,11 +2,12 @@ use super::*;
 use crate::bind::bind_constant;
 use crate::test_support::{ncol, parse_expr_sql};
 
-/// `src` written into a fresh column `c` of type `tc`: the cell and the blob spill.
+/// `src` written into a cell of a column `c` of type `tc`, every byte of which was set
+/// before: the cell and the blob spill.
 fn write(tc: TypeCode, src: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (mut col, mut blob) = (Vec::new(), Vec::new());
+    let (mut col, mut blob) = (vec![0xEE; tc.wire_stride()], Vec::new());
     let lit = bind_constant(&parse_expr_sql(src)).unwrap_or_else(|e| panic!("{src}: {e}"));
-    append_value_to_col(&mut col, &mut blob, &ncol("c", tc), &lit).map_err(|e| e.to_string())?;
+    write_value_cell(&mut col, &mut blob, &ncol("c", tc), &lit).map_err(|e| e.to_string())?;
     Ok((col, blob))
 }
 

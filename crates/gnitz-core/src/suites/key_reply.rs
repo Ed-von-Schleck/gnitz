@@ -27,12 +27,12 @@ fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec
     let reply = block_on(client.scan_served(tid, &spec, &reply_schema))
         .expect("a PK-only reply must not be rejected")
         .batch;
-    assert!(reply.payload.is_empty() && reply.blob.is_empty());
+    assert!(reply.payload_count() == 0 && reply.heap().is_empty());
     reply
         .validate(&reply_schema)
         .expect("the reply validates under its schema");
     // Weights reach the client unsummed: no top-k gate, one row per key.
-    assert!(reply.weights.iter().all(|&w| w == 1), "per-row weights preserved");
+    assert!(reply.weights().all(|w| w == 1), "per-row weights preserved");
     (reply_schema, reply)
 }
 
@@ -60,7 +60,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
         &schema,
         cmp_all(&[(CmpOp::Gt, 1, 150)]).to_blob_bytes(),
     );
-    let mut got: Vec<u64> = (0..reply.len()).map(|i| reply.pks.get(i) as u64).collect();
+    let mut got: Vec<u64> = (0..reply.len()).map(|i| reply.pk(i) as u64).collect();
     got.sort_unstable();
     assert_eq!(got, (151u64..=200).collect::<Vec<_>>());
 }
@@ -101,7 +101,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         &schema,
         cmp_all(&[(CmpOp::Gt, 2, 15)]).to_blob_bytes(),
     );
-    let mut got: Vec<Vec<u8>> = (0..reply.len()).map(|i| reply.pks.get_bytes(i).to_vec()).collect();
+    let mut got: Vec<Vec<u8>> = (0..reply.len()).map(|i| reply.pk_bytes(i).to_vec()).collect();
     // The OPK image, spelled by hand: a signed I64 is big-endian with the sign
     // bit flipped, an unsigned U32 is plain big-endian.
     let mut want: Vec<Vec<u8>> = rows[1..]

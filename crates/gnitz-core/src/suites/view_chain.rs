@@ -36,10 +36,10 @@ fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
     let b = block_on(client.scan_served(SysFamily::View, &ReadSpec::all_rows(ReadBound::None), view_tab))
         .unwrap()
         .batch;
-    let owners = &b.payload[ViewTabSlot::owner_view_id as usize].bytes;
-    assert!(b.weights.iter().all(|&w| w == 1), "{:?}", b.weights);
+    let owners = b.col(ViewTabSlot::owner_view_id as usize);
+    assert!(b.weights().all(|w| w == 1), "{b:?}");
     let mut out: Vec<_> = (0..b.len())
-        .map(|i| (b.pks.get(i) as u64, gnitz_wire::read_u64_le(owners, i * 8)))
+        .map(|i| (b.pk(i) as u64, gnitz_wire::read_u64_le(owners, i * 8)))
         .collect();
     out.sort();
     out
@@ -196,8 +196,8 @@ fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     assert_eq!(weighted_rows(&replies[0].batch), base, "the table");
     let views = &replies[1].batch;
     let listed: Vec<u64> = (0..views.len())
-        .filter(|&i| views.weights[i] > 0)
-        .map(|i| views.pks.get(i) as u64)
+        .filter(|&i| views.weight(i) > 0)
+        .map(|i| views.pk(i) as u64)
         .collect();
     assert_eq!(listed, [vid], "the family lists the one view");
     assert_eq!(weighted_rows(&replies[2].batch), base, "the view");

@@ -102,7 +102,7 @@ fn copy_index_bench() {
         let (rows, read) = counter.measure(|| {
             specs
                 .into_iter()
-                .map(|spec| store.scan_spec(TID, spec, &schema).unwrap().weights.len() as u64)
+                .map(|spec| store.scan_spec(TID, spec, &schema).unwrap().len() as u64)
                 .sum::<u64>()
         });
         assert_eq!(rows, READS * SELECTED, "every read answers its span");

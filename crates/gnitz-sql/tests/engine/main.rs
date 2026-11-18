@@ -112,7 +112,7 @@ impl Db {
         let mut zset = std::collections::BTreeMap::<Vec<i64>, i64>::new();
         for r in 0..batch.len() {
             let row = idxs.iter().map(|&ci| cell(&schema, &batch, ci, r)).collect();
-            *zset.entry(row).or_default() += batch.weights[r];
+            *zset.entry(row).or_default() += batch.weight(r);
         }
         zset.into_iter()
             .filter(|&(_, w)| w != 0)

@@ -112,7 +112,7 @@ fn rows(client: &mut GnitzClient, sql: &str) -> Vec<(Vec<Option<Vec<u8>>>, i64)>
                     })
                 })
                 .collect();
-            (cells, batch.weights[i])
+            (cells, batch.weight(i))
         })
         .collect();
     out.sort();

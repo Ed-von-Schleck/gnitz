@@ -27,7 +27,7 @@ fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Option<usize> {
 
 /// The id of the live schema `schema_name` (already canonical) in `schemas`.
 fn live_schema_id(schemas: &ZSetBatch, schema_name: &str) -> Option<u64> {
-    schema_row(schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at)))
+    schema_row(schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.pk_bytes(at)))
 }
 
 /// The catalog name of an unnamed index on `cols` of `table`, whose columns are
@@ -177,7 +177,7 @@ impl DdlBundle {
             for i in 0..rows.len() {
                 ids.insert(match *family {
                     SysFamily::Index => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
-                    _ => gnitz_wire::sys_leading_id(rows.pks.get_bytes(i)),
+                    _ => gnitz_wire::sys_leading_id(rows.pk_bytes(i)),
                 });
             }
         }
@@ -190,9 +190,9 @@ impl DdlBundle {
         let Some((_, b)) = self.0.iter().find(|(family, _)| *family == SysFamily::View) else {
             return Vec::new();
         };
-        let vid = |i| gnitz_wire::sys_leading_id(b.pks.get_bytes(i));
+        let vid = |i| gnitz_wire::sys_leading_id(b.pk_bytes(i));
         (0..b.len())
-            .filter(|&i| b.weights[i] < 0)
+            .filter(|&i| b.weight(i) < 0)
             .map(vid)
             .map(|v| {
                 let new = b.live_rows().find(|&j| vid(j) == v).map(|j| {
@@ -211,7 +211,7 @@ impl DdlBundle {
         // in, so each side is copied onto an arena laid out in key order.
         fn in_key_order(rows: &ZSetBatch) -> ZSetBatch {
             let mut live: Vec<u32> = rows.live_rows().map(|i| i as u32).collect();
-            live.sort_unstable_by_key(|&i| rows.pks.get_bytes(i as usize));
+            live.sort_unstable_by_key(|&i| rows.pk_bytes(i as usize));
             rows.gathered(&live)
         }
         self.0.len() == other.0.len()
@@ -473,7 +473,7 @@ impl GnitzClient {
         if cascade {
             let ids: Vec<u64> = dropped
                 .iter()
-                .map(|&at| gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at)))
+                .map(|&at| gnitz_wire::sys_leading_id(schemas.pk_bytes(at)))
                 .collect();
             for (family, scanned) in [(SysFamily::View, views), (SysFamily::Table, tables)] {
                 for i in scanned.live_rows() {
@@ -572,7 +572,7 @@ impl GnitzClient {
                 let views = &standing.0[0].1;
                 let i = views
                     .live_rows()
-                    .find(|&i| gnitz_wire::sys_leading_id(views.pks.get_bytes(i)) == vid)
+                    .find(|&i| gnitz_wire::sys_leading_id(views.pk_bytes(i)) == vid)
                     .ok_or_else(|| not_found("view", view))?;
                 let decode_err = |e| ProtocolError::DecodeError(format!("view {vid}: {e}"));
                 let row = ViewTabRow::read(views, i).map_err(decode_err)?;

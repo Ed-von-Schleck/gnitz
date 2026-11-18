@@ -27,7 +27,7 @@ mod test_support;
 mod transport;
 mod txn;
 
-pub use batch::{BatchAppender, PayloadColumn, PkColumn, RowMark, ZSetBatch};
+pub use batch::{BatchAppender, PkColumn, RowMark, RowWriter, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{GnitzClient, env_target};
 pub use connection::{MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply, encode_ddl_txn};

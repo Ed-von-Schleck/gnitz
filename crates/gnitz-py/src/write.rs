@@ -78,10 +78,10 @@ struct RowWriter {
 }
 
 impl PyZSetBatch {
-    /// Run `body` against this batch's rows, unshared; on error, truncate every
-    /// per-row vector back to the pre-call row count, so a half-written row
-    /// never leaves the batch with mismatched column lengths. Wrap once per
-    /// surface — `append` its one row, `extend` its whole loop.
+    /// Run `body` against this batch's rows, unshared; on error, truncate the
+    /// batch back to the rows and heap it held before the call, so a call that
+    /// raises leaves no row of its own. Wrap once per surface — `append` its one
+    /// row, `extend` its whole loop.
     fn with_rollback<F>(&mut self, body: F) -> PyResult<()>
     where
         F: FnOnce(&mut ZSetBatch, &mut RowWriter) -> PyResult<()>,
@@ -98,20 +98,20 @@ impl PyZSetBatch {
     }
 }
 
-/// Append one non-null payload cell of type `tc`, spilling a German string into
+/// Write one non-null payload cell of type `tc`, spilling a German string into
 /// `blob`. STRING extracts a `str` and BLOB arbitrary bytes: a `str` is UTF-8 by
 /// construction; the engine refuses a STRING cell that is not.
-fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, ty: ColType, val: &Bound<'_, PyAny>) -> PyResult<()> {
+fn write_column_value(cell: &mut [u8], blob: &mut Vec<u8>, ty: ColType, val: &Bound<'_, PyAny>) -> PyResult<()> {
     match ty.tc {
         TypeCode::String => {
             let s = val.cast::<PyString>()?.to_cow()?;
-            col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
+            cell.copy_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
         }
         TypeCode::Blob => {
             let b = val.extract::<Cow<[u8]>>()?;
-            col.extend_from_slice(&gnitz_wire::encode_german_string(&b, blob));
+            cell.copy_from_slice(&gnitz_wire::encode_german_string(&b, blob));
         }
-        _ => push_fixed_le(col, ty, val, Inexact::Round)?,
+        _ => write_fixed_le(cell, ty, val, Inexact::Round)?,
     }
     Ok(())
 }
@@ -316,36 +316,33 @@ impl RowWriter {
             }
             *native = py_native(ty, &v, Inexact::Round)?;
         }
-        batch.pks.push_natives(&natives[..plan.pks.len()]);
+        // The open row's cells start zero: a filler's and a NULL's cell are left as they are.
+        let mut row = batch.open_row();
+        row.key_natives(&natives[..plan.pks.len()]);
         let mut nulls = 0u64;
         // `enumerate`, because the dense payload index is the null-bitmap bit
         // position.
         for (payload_idx, &PayloadPlan { ci, ty, nullable, src }) in plan.payload.iter().enumerate() {
             let v = match src {
-                PayloadSrc::Filler => {
-                    batch.payload[payload_idx].push_zero();
-                    continue;
-                }
+                PayloadSrc::Filler => continue,
                 PayloadSrc::Arg(i) => Some(arg(i)),
                 PayloadSrc::Absent => None,
             };
             match v {
                 Some(v) if !v.is_none() => {
-                    let ZSetBatch { payload: cols, blob, .. } = batch;
-                    push_column_value(&mut cols[payload_idx].bytes, blob, ty, &v)?
+                    let (cell, heap) = row.cell_and_heap(payload_idx);
+                    write_column_value(cell, heap, ty, &v)?
                 }
                 _ => {
                     if !nullable {
                         return Err(not_nullable_err(&schema.columns()[ci].name));
                     }
                     gnitz_wire::null_word_set(&mut nulls, payload_idx, true);
-                    batch.payload[payload_idx].push_zero();
                 }
             }
         }
-        batch.weights.push(weight);
-        batch.nulls.push(nulls);
-        debug_assert_eq!(batch.pks.len(), batch.weights.len());
+        row.weight(weight).null_word(nulls);
+        row.commit();
         Ok(())
     }
 
@@ -661,60 +658,47 @@ enum Inexact {
     Refuse,
 }
 
-/// Where [`push_fixed_le`] writes a value's native little-endian bytes: a
-/// payload column, or the low bytes of a key's native image. Each arm writes a
-/// constant width, so a payload cell compiles to one fixed-size append.
-trait FixedSink {
-    fn put<const N: usize>(&mut self, bytes: [u8; N]);
+/// Write `bytes` at the front of `buf`: a payload cell, or the low bytes of a key's
+/// native image. Each arm of [`write_fixed_le`] writes a constant width, so a payload
+/// cell compiles to one fixed-size copy.
+#[inline(always)]
+fn put<const N: usize>(buf: &mut [u8], bytes: [u8; N]) {
+    buf[..N].copy_from_slice(&bytes);
 }
 
-impl FixedSink for Vec<u8> {
-    #[inline(always)]
-    fn put<const N: usize>(&mut self, bytes: [u8; N]) {
-        self.extend_from_slice(&bytes);
-    }
-}
-
-impl FixedSink for [u8; 16] {
-    #[inline(always)]
-    fn put<const N: usize>(&mut self, bytes: [u8; N]) {
-        self[..N].copy_from_slice(&bytes);
-    }
-}
-
-/// Write one non-null fixed-width value to `buf` as its native little-endian
-/// bytes. Each integer arm's `extract` is its range check.
+/// Write one non-null fixed-width value at the front of `buf` as its native
+/// little-endian bytes. Each integer arm's `extract` is its range check.
 ///
 /// Out of line: inlined into a caller, the arms' extracts and constant-size
 /// copies stop being inlined themselves, and every payload cell pays a call
 /// and a `memmove` more.
 #[inline(never)]
-fn push_fixed_le(buf: &mut impl FixedSink, ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
+fn write_fixed_le(buf: &mut [u8], ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
     match ty.tc {
-        TypeCode::U8 => buf.put([item.extract::<u8>()?]),
+        TypeCode::U8 => put(buf, [item.extract::<u8>()?]),
         // A `bool` only: `1` is an integer, as it is in SQL.
-        TypeCode::Bool => buf.put([u8::from(item.extract::<bool>()?)]),
-        TypeCode::I8 => buf.put(item.extract::<i8>()?.to_le_bytes()),
-        TypeCode::U16 => buf.put(item.extract::<u16>()?.to_le_bytes()),
-        TypeCode::I16 => buf.put(item.extract::<i16>()?.to_le_bytes()),
-        TypeCode::U32 => buf.put(item.extract::<u32>()?.to_le_bytes()),
-        TypeCode::I32 => buf.put(item.extract::<i32>()?.to_le_bytes()),
+        TypeCode::Bool => put(buf, [u8::from(item.extract::<bool>()?)]),
+        TypeCode::I8 => put(buf, item.extract::<i8>()?.to_le_bytes()),
+        TypeCode::U16 => put(buf, item.extract::<u16>()?.to_le_bytes()),
+        TypeCode::I16 => put(buf, item.extract::<i16>()?.to_le_bytes()),
+        TypeCode::U32 => put(buf, item.extract::<u32>()?.to_le_bytes()),
+        TypeCode::I32 => put(buf, item.extract::<i32>()?.to_le_bytes()),
         TypeCode::F32 => {
             let v = item.extract::<f64>()?;
             let f = gnitz_wire::narrow_f32(v).ok_or_else(|| {
                 pyo3::exceptions::PyOverflowError::new_err(format!("{v} is out of range for an F32 column"))
             })?;
-            buf.put(f.to_le_bytes())
+            put(buf, f.to_le_bytes())
         }
-        TypeCode::U64 => buf.put(item.extract::<u64>()?.to_le_bytes()),
-        TypeCode::I64 => buf.put(item.extract::<i64>()?.to_le_bytes()),
-        TypeCode::F64 => buf.put(item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::U128 => buf.put(item.extract::<u128>()?.to_le_bytes()),
-        TypeCode::I128 => buf.put(item.extract::<i128>()?.to_le_bytes()),
-        TypeCode::UUID => buf.put(extract_uuid(item)?.to_le_bytes()),
-        TypeCode::Date => buf.put(extract_days(item, inexact)?.to_le_bytes()),
-        TypeCode::Timestamp => buf.put(extract_micros(item)?.to_le_bytes()),
-        TypeCode::Decimal => buf.put(extract_decimal(item, ty.scale, inexact)?.to_le_bytes()),
+        TypeCode::U64 => put(buf, item.extract::<u64>()?.to_le_bytes()),
+        TypeCode::I64 => put(buf, item.extract::<i64>()?.to_le_bytes()),
+        TypeCode::F64 => put(buf, item.extract::<f64>()?.to_le_bytes()),
+        TypeCode::U128 => put(buf, item.extract::<u128>()?.to_le_bytes()),
+        TypeCode::I128 => put(buf, item.extract::<i128>()?.to_le_bytes()),
+        TypeCode::UUID => put(buf, extract_uuid(item)?.to_le_bytes()),
+        TypeCode::Date => put(buf, extract_days(item, inexact)?.to_le_bytes()),
+        TypeCode::Timestamp => put(buf, extract_micros(item)?.to_le_bytes()),
+        TypeCode::Decimal => put(buf, extract_decimal(item, ty.scale, inexact)?.to_le_bytes()),
         TypeCode::String | TypeCode::Blob => {
             unreachable!("a German-string column is never a fixed-width column or a PK column")
         }
@@ -725,7 +709,7 @@ fn push_fixed_le(buf: &mut impl FixedSink, ty: ColType, item: &Bound<'_, PyAny>,
 /// `v` as `ty`'s native value, zero-extended.
 fn py_native(ty: ColType, v: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<u128> {
     let mut le = [0u8; 16];
-    push_fixed_le(&mut le, ty, v, inexact)?;
+    write_fixed_le(&mut le, ty, v, inexact)?;
     Ok(u128::from_le_bytes(le))
 }
 

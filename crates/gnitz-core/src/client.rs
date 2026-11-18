@@ -344,3 +344,7 @@ impl GnitzClient {
         self.kept.get(name).cloned()
     }
 }
+
+#[cfg(test)]
+#[path = "benches/client.rs"]
+mod bench;

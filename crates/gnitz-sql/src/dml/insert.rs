@@ -5,7 +5,7 @@
 
 use std::convert::Infallible;
 
-use super::colwrite::{append_value_to_col, check_not_null, native_value};
+use super::colwrite::{check_not_null, native_value, write_value_cell};
 use super::set::{SetClause, SetCol, apply_set, bind_set_list};
 use super::write::{Write, WritePlan};
 use crate::ast_util::single_part_ident;
@@ -277,6 +277,8 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
         for e in row.iter() {
             cells.push(bind_constant(e)?);
         }
+        // A SERIAL key is left zero, for the keys reserved at execute to replace.
+        let mut out = rows.open_row();
         if serial_ci.is_none() {
             let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
             for (k, (&pi, &slot)) in schema.pk_cols().iter().zip(&pk_slots).enumerate() {
@@ -284,17 +286,16 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
                 check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
                 natives[k] = native_value(&cells[slot], def)?;
             }
-            rows.pks.push_natives(&natives[..pk_slots.len()]);
+            out.key_natives(&natives[..pk_slots.len()]);
         }
-        rows.weights.push(1);
+        out.weight(1);
 
         let mut null_bits: u64 = 0;
         for &(payload_idx, ci, col_def) in &payload {
             if col_def.is_hidden {
-                // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
-                // bit left unset), keeping the batch rectangular and a payload of
-                // non-null fixed-width integers non-null. The value is unobservable.
-                rows.payload[payload_idx].push_zero();
+                // Logical-dropped column: the open row's zero-filled NOT-NULL filler cell
+                // (null bit left unset), keeping a payload of non-null fixed-width
+                // integers non-null. The value is unobservable.
                 continue;
             }
             // Read off the *bound* constant, so `+NULL` is the NULL it spells;
@@ -305,10 +306,11 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             if is_null {
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
             }
-            let ZSetBatch { payload: cols, blob, .. } = &mut rows;
-            append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def, cell)?;
+            let (cell_bytes, heap) = out.cell_and_heap(payload_idx);
+            write_value_cell(cell_bytes, heap, col_def, cell)?;
         }
-        rows.nulls.push(null_bits);
+        out.null_word(null_bits);
+        out.commit();
     }
 
     let write = match on_conflict {
@@ -336,7 +338,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
 /// `rows` down to each key's first row, the one an ON CONFLICT resolves; under
 /// DO UPDATE (`refuse_repeat`) a second row for a key is refused instead.
 fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
-    let Firsts { absorbed, keep } = firsts(&rows.pks);
+    let Firsts { absorbed, keep } = firsts(rows.pk_region(), rows.pk_stride());
     if refuse_repeat && !absorbed.is_empty() {
         return Err(GnitzSqlError::rejected(
             "ON CONFLICT DO UPDATE cannot affect row a second time \
@@ -357,10 +359,10 @@ pub(super) fn resolve_conflicts(
     set: Option<&mut [SetCol]>,
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let at: FxHashMap<&[u8], usize> = (0..rows.len()).map(|i| (rows.pks.get_bytes(i), i)).collect();
+    let at: FxHashMap<&[u8], usize> = (0..rows.len()).map(|i| (rows.pk_bytes(i), i)).collect();
     let mut is_held = vec![false; rows.len()];
     let collided = (0..held.len())
-        .map(|r| match at.get(held.pks.get_bytes(r)) {
+        .map(|r| match at.get(held.pk_bytes(r)) {
             Some(&i) if !std::mem::replace(&mut is_held[i], true) => Ok(i as u32),
             Some(_) => Err(malformed_reply("a key held twice")),
             None => Err(malformed_reply("a key that was not read")),

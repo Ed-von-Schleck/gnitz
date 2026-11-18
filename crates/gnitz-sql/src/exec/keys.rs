@@ -4,7 +4,6 @@
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
-use gnitz_core::PkColumn;
 use rustc_hash::FxHashMap;
 
 /// A batch's rows split by whether each is its key's first.
@@ -16,9 +15,8 @@ pub(crate) struct Firsts {
     pub(crate) keep: Vec<(usize, usize)>,
 }
 
-/// Each key's first row, read off `pks`.
-pub(crate) fn firsts(pks: &PkColumn) -> Firsts {
-    let (stride, region) = (pks.stride(), pks.region());
+/// Each key's first row, read off `region`, keys of `stride` OPK bytes back to back.
+pub(crate) fn firsts(region: &[u8], stride: usize) -> Firsts {
     // A narrow key groups by its image, a wide one by its bytes.
     match stride <= gnitz_wire::NARROW_PK_MAX_BYTES {
         true => firsts_of(region.chunks_exact(stride).map(gnitz_wire::widen_pk_be)),

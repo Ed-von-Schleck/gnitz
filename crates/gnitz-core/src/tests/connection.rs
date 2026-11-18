@@ -473,7 +473,7 @@ fn a_released_poll_parks_nothing() {
     );
     let (blocks, _) = s.take_pushed(sub_id(2)).expect("the next poll's train is held");
     assert_eq!(blocks.len(), 1);
-    assert_eq!(decode_wal_block(blocks[0].block(), &schema_a()).unwrap(), batch_a(&[8]));
+    assert_eq!(decode_wal_block(blocks[0].bytes(), &schema_a()).unwrap(), batch_a(&[8]));
     assert!(!s.inbox.polls.untaken());
 }
 
@@ -493,7 +493,7 @@ fn a_train_pushed_behind_a_polls_terminal_joins_it() {
     let (blocks, at) = s.take_pushed(sub_id(3)).expect("the item is held");
     let rows: Vec<ZSetBatch> = blocks
         .iter()
-        .map(|b| decode_wal_block(b.block(), &schema_a()).unwrap())
+        .map(|b| decode_wal_block(b.bytes(), &schema_a()).unwrap())
         .collect();
     assert_eq!((rows, at), (vec![batch_a(&[1]), batch_a(&[2])], cursor(11)));
 }
@@ -1107,7 +1107,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     let schema = Arc::new(kv_schema(TypeCode::I64));
     let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
     let b1 = kv_rows(&[(3, 30, 1)]);
-    let b2 = ZSetBatch::retraction(&schema, PkColumn::from_natives(&schema, [4]));
+    let b2 = ZSetBatch::retraction(&schema, &PkColumn::from_natives(&schema, [4]));
 
     let family = |tid: u64, batch, mode, basis| PushFamily {
         target: tid.into(),

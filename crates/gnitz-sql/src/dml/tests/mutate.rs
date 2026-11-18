@@ -31,7 +31,7 @@ fn updated(schema: &Schema, set: &str, held: &[&[Cell]]) -> Result<ZSetBatch, Gn
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut set = set_list(plan(&cat, &format!("UPDATE t SET {set}"))?);
     let mut rows = batch_of(schema, held);
-    rows.weights.fill(3);
+    rows.fill_weights(3);
     apply_set(&mut set, rows, None, schema)
 }
 
@@ -125,7 +125,7 @@ fn a_uuid_column_is_copied() {
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut set = set_list(plan(&cat, "UPDATE t SET c1 = c2").unwrap());
     let out = apply_set(&mut set, rows, None, &schema).unwrap();
-    assert_eq!(out.payload[0].bytes, (u128::MAX - 7).to_le_bytes());
+    assert_eq!(out.col(0), (u128::MAX - 7).to_le_bytes());
 }
 
 /// A computed value outside its column's range is refused per row, not truncated
@@ -232,7 +232,7 @@ fn the_arena_holds_only_referenced_spill() {
         let schema = typed_schema(tys);
         let out = updated(&schema, set, &vec![*before; *n]).unwrap();
         assert_eq!(rows_of(&schema, &out), vec![(after.to_vec(), 1); *n], "{set}");
-        assert_eq!(out.blob.len(), *blob_len, "{set}");
+        assert_eq!(out.heap().len(), *blob_len, "{set}");
     }
 }
 

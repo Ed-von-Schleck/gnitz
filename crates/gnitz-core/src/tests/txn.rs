@@ -6,13 +6,13 @@ use gnitz_wire::{ColumnDef, TypeCode, payload_u64};
 
 fn del(pk: u64) -> ZSetBatch {
     let s = Arc::new(kv_schema(TypeCode::I64));
-    ZSetBatch::retraction(&s, PkColumn::from_natives(&s, [pk as u128]))
+    ZSetBatch::retraction(&s, &PkColumn::from_natives(&s, [pk as u128]))
 }
 
 /// `(pk, v, weight)` of a `kv_schema(I64)` batch, sorted.
 fn contents(b: &ZSetBatch) -> Vec<(u64, i64, i64)> {
     let mut out: Vec<_> = (0..b.len())
-        .map(|i| (b.pks.get(i) as u64, payload_u64(b, i, 0) as i64, b.weights[i]))
+        .map(|i| (b.pk(i) as u64, payload_u64(b, i, 0) as i64, b.weight(i)))
         .collect();
     out.sort();
     out
@@ -69,7 +69,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     let shape: Vec<_> = buf
         .families
         .iter()
-        .map(|f| (f.target.tid, f.mode, f.basis, f.batch.weights.clone()))
+        .map(|f| (f.target.tid, f.mode, f.basis, f.batch.weights().collect::<Vec<_>>()))
         .collect();
     assert_eq!(
         shape,

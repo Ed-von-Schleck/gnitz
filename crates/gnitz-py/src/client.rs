@@ -245,7 +245,7 @@ impl PyClient {
         schema: PySchema,
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let batch = ZSetBatch::retraction(&schema.rust, py_pks_to_column(&schema.rust, &pks)?);
+        let batch = ZSetBatch::retraction(&schema.rust, &py_pks_to_column(&schema.rust, &pks)?);
         Self::run(
             slf,
             single!(|c| c.push(target_id, &schema.rust, batch, WireConflictMode::Update)),

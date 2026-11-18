@@ -94,7 +94,7 @@ fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
 /// How many rows a read returned, every one of them at weight 1. Every relation
 /// here is keyed uniquely, so a row counted twice is one row at weight 2.
 fn unit_rows(batch: &ZSetBatch) -> usize {
-    assert!(batch.weights.iter().all(|w| *w == 1), "{:?}", batch.weights);
+    assert!(batch.weights().all(|w| w == 1), "{batch:?}");
     batch.len()
 }
 
@@ -170,7 +170,7 @@ fn pipelined_verbs() {
             let (found, missing) = (found.unwrap(), missing.unwrap());
             let one = one.unwrap().batch;
             assert_eq!(unit_rows(&one), 1);
-            assert_eq!((one.pks.get(0), read_i64_le(&one.payload[0].bytes, 0)), (7, -1));
+            assert_eq!((one.pk(0), read_i64_le(one.col(0), 0)), (7, -1));
             let many: Vec<usize> = many.unwrap().iter().map(|r| unit_rows(&r.batch)).collect();
             assert_eq!(
                 many,

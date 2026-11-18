@@ -97,7 +97,7 @@ impl Rows {
                 out.cells.push(cell);
             }
         }
-        out.weights = batch.weights.clone();
+        out.weights = batch.weights().collect();
         out
     }
 

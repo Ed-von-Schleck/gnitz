@@ -1,6 +1,6 @@
 use super::*;
 use crate::BatchAppender;
-use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
+use crate::test_support::{decode_wal_block, encode_wal_block, wide_rows, wide_schema};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{ColumnDef, TypeCode};
 use std::hint::black_box;
@@ -133,10 +133,10 @@ fn gather_bench() {
     }
 }
 
-/// Instructions per row to append two payload columns' rows to an empty batch, as a
-/// decoded WAL block and as the process's own region list: what a block's parse and
-/// German cell check cost over the own-regions append, over all-short cells, all-long
-/// cells and integer columns, which carry no cell to check.
+/// Instructions per row to decode two payload columns' rows into a batch, as a WAL block
+/// copied out of a borrowed frame and as the process's own region list: what a block's parse
+/// and German cell check cost over the own-regions copy, over all-short cells, all-long cells
+/// and integer columns, which carry no cell to check.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn region_append_bench() {
@@ -172,15 +172,11 @@ fn region_append_bench() {
         for (arm, wal) in [("a WAL block", true), ("own regions", false)] {
             let ((), instr) = counter.measure(|| {
                 for _ in 0..ITERS {
-                    let mut sink = ZSetBatch::with_capacity(&schema, ROWS);
-                    if wal {
-                        decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
-                    } else {
-                        sink.check_region_lengths(black_box(&regions)).unwrap();
-                        check_not_null(regions[REG_NULL_BMP], &schema).unwrap();
-                        sink.append_region_list(&regions);
-                    }
-                    black_box(&sink);
+                    let b = match wal {
+                        true => decode_wal_block(black_box(&block), &schema),
+                        false => ZSetBatch::from_own_regions(&schema, black_box(&regions)),
+                    };
+                    black_box(b.unwrap());
                 }
             });
             println!(
@@ -191,44 +187,44 @@ fn region_append_bench() {
     }
 }
 
-/// Instructions to decode a reply ([`decode_wal_blocks`] plus the batch's drop),
-/// against the allocation it does alone ([`ZSetBatch::with_capacity`] plus drop)
-/// and the copy into a batch that already owns its buffers, by column and row count.
+/// Instructions to decode a reply plus the batch's and the frame's drop: a block copied out of
+/// a frame the transport lent (a small reply, read whole in one socket read), and a block
+/// adopted with the frame the transport handed over (a reply larger than one read); against
+/// the arena's allocation alone ([`ZSetBatch::with_capacity`] plus drop), by column and row
+/// count.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reply_alloc_cost_bench() {
     const ROUNDS: u64 = 2000;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    for (ncols, rows) in [(4usize, 1usize), (16, 1), (64, 1), (4, 1000), (16, 1000)] {
+    for (ncols, rows) in [(4usize, 1usize), (16, 1), (64, 1), (4, 1000), (16, 1000), (64, 1000)] {
         let schema = wide_schema(ncols, false);
         let block = encode_wal_block(&wide_rows(&schema, rows, 0));
-        let (mut whole, mut alloc, mut warm) = (0, 0, 0);
+        let (mut copied, mut alloc, mut adopted) = (0, 0, 0);
         for _ in 0..ROUNDS {
-            whole += counter
-                .measure(|| {
-                    let b = decode_wal_blocks(std::iter::once(black_box(&block[..])), &schema).unwrap();
-                    black_box(&b);
-                })
+            copied += counter
+                .measure(|| drop(black_box(decode_wal_block(black_box(&block[..]), &schema).unwrap())))
                 .1;
             alloc += counter
-                .measure(|| {
-                    let b = ZSetBatch::with_capacity(black_box(&schema), black_box(rows));
-                    black_box(&b);
-                })
+                .measure(|| drop(black_box(ZSetBatch::with_capacity(black_box(&schema), black_box(rows)))))
                 .1;
-            let mut sink = ZSetBatch::with_capacity(&schema, rows);
-            warm += counter
+            let frame = FrameBlock {
+                frame: std::borrow::Cow::Owned(block.clone()),
+                block: 0..block.len(),
+            };
+            adopted += counter
                 .measure(|| {
-                    decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
-                    black_box(&sink);
+                    drop(black_box(
+                        decode_wal_blocks(Vec::new(), Some(black_box(frame)), &schema).unwrap(),
+                    ))
                 })
                 .1;
         }
         println!(
-            "reply_alloc_cost_bench {ncols:>2} cols {rows:>4} rows: decode + drop {:>6} instr, alloc + drop {:>6}, decode into owned buffers {:>6}",
-            whole / ROUNDS,
+            "reply_alloc_cost_bench {ncols:>2} cols {rows:>4} rows: copied + drop {:>6} instr, alloc + drop {:>6}, adopted + drop {:>6}",
+            copied / ROUNDS,
             alloc / ROUNDS,
-            warm / ROUNDS
+            adopted / ROUNDS
         );
     }
 }

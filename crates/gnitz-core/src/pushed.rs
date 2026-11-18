@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::Schema;
 use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
-use crate::connection::{Held, RawBlock, ScanReply, park, untaken};
+use crate::connection::{Held, ScanReply, park, untaken};
 use crate::error::ClientError;
 use crate::host::{Op, Sent, finished};
 use crate::mirror::PollOutcome;
@@ -62,7 +62,7 @@ impl Delivery {
             .map(|(sub, taken)| Pushed {
                 sub,
                 result: taken.and_then(|(schema, blocks, cursor)| {
-                    let batch = decode_wal_blocks(blocks.iter().map(RawBlock::block), &schema)?;
+                    let batch = decode_wal_blocks(blocks, None, &schema)?;
                     Ok((ScanReply { schema, batch, lsn: None }, cursor))
                 }),
             })

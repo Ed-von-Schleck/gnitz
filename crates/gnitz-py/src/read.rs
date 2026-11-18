@@ -428,7 +428,7 @@ impl PyRowIterator {
         // `drain` hands the values over already-owned, so the tuple build costs no
         // refcount traffic, and the Vec keeps its capacity for the next row.
         let values = PyTuple::new(py, self.row_buf.drain(..))?;
-        let obj = data.row_type.row(py, values, batch.weights[row])?;
+        let obj = data.row_type.row(py, values, batch.weight(row))?;
         self.pos += 1;
         Ok(Some(obj))
     }

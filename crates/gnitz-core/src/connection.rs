@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
-use crate::batch::{decode_wal_blocks, parse_wal_block};
+use crate::batch::{FrameBlock, decode_wal_blocks, parse_wal_block};
 use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
@@ -83,25 +83,14 @@ impl From<&RelDescriptor> for Target {
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
 /// block's extent within it.
-#[derive(Debug)]
-pub(crate) struct RawBlock {
-    frame: Vec<u8>,
-    block: std::ops::Range<usize>,
-}
+pub(crate) type RawBlock = FrameBlock<'static>;
 
-impl RawBlock {
-    /// Own `frame`'s buffer, taking it out of the Cow (a borrowed frame lives
-    /// in the transport window), with its data block at `block`.
-    fn own(frame: &mut Cow<'_, [u8]>, block: std::ops::Range<usize>) -> Self {
-        RawBlock {
-            frame: std::mem::take(frame).into_owned(),
-            block,
-        }
-    }
-
-    /// The data block's bytes, ready to decode against the reply schema.
-    pub(crate) fn block(&self) -> &[u8] {
-        &self.frame[self.block.clone()]
+/// Own `frame`'s buffer, taking it out of the Cow (a borrowed frame lives in the
+/// transport window), with its data block at `block`.
+fn own_block(frame: &mut Cow<'_, [u8]>, block: std::ops::Range<usize>) -> RawBlock {
+    FrameBlock {
+        frame: Cow::Owned(std::mem::take(frame).into_owned()),
+        block,
     }
 }
 
@@ -142,20 +131,20 @@ impl Request<'_> {
             Request::AllocSerial { table, .. } => Ok(table.tid),
             Request::DdlTxn(families) => {
                 for (family, batch) in families {
-                    batch.check_shape(sys_schema(*family))?;
+                    batch.layout_matches(sys_schema(*family))?;
                 }
                 Ok(0)
             }
             Request::PushTxn(families) => {
                 for f in families {
-                    f.batch.check_shape(&f.schema)?;
+                    f.batch.layout_matches(&f.schema)?;
                 }
                 Ok(0)
             }
             Request::Push { target, schema, batch, .. } => {
-                // Shape only: the server certifies every row's NULL bits and
+                // Layout only: the server certifies every row's NULL bits and
                 // cells against the relation's own schema.
-                batch.check_shape(schema)?;
+                batch.layout_matches(schema)?;
                 Ok(target.tid)
             }
             Request::AllocIds(_) | Request::SnapshotOpen | Request::SnapshotClose(_) | Request::Backup(_) => Ok(0),
@@ -332,8 +321,8 @@ impl Train {
 
     /// Take the data block at `block` of `frame`, its header checked at once.
     /// A continuation frame's is held, the frame owned, since a borrowed one
-    /// lives in the transport window; the terminal frame's is decoded in place
-    /// by [`Self::finish`], behind the held ones.
+    /// lives in the transport window; the terminal frame's is decoded by
+    /// [`Self::finish`], behind the held ones.
     fn take(
         &mut self,
         frame: &mut Cow<'_, [u8]>,
@@ -342,19 +331,18 @@ impl Train {
     ) -> Result<(), ProtocolError> {
         self.rows += parse_wal_block(&frame[block.clone()], &self.schema)?.rows;
         if more {
-            self.held.push(RawBlock::own(frame, block));
+            self.held.push(own_block(frame, block));
         }
         Ok(())
     }
 
     /// The train's rows: the held blocks, then the terminal frame's block
-    /// `last`, decoded in place.
-    fn finish(&mut self, last: Option<&[u8]>) -> Result<ZSetBatch, ProtocolError> {
-        let held = std::mem::take(&mut self.held);
-        decode_wal_blocks(held.iter().map(RawBlock::block).chain(last), &self.schema)
+    /// `last`.
+    fn finish(&mut self, last: Option<FrameBlock<'_>>) -> Result<ZSetBatch, ProtocolError> {
+        decode_wal_blocks(std::mem::take(&mut self.held), last, &self.schema)
     }
 
-    fn reply(&mut self, last: Option<&[u8]>, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
+    fn reply(&mut self, last: Option<FrameBlock<'_>>, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
         Ok(ScanReply {
             batch: self.finish(last)?,
             schema: Arc::clone(&self.schema),
@@ -1011,12 +999,12 @@ impl Slot {
             (_, None) => {}
             (Slot::DeltaPoll { at, first, .. }, Some(block)) => {
                 if let Some(blocks) = polls.reading.get_mut(&kept_as(*first, *at)) {
-                    blocks.push(RawBlock::own(&mut buf, block));
+                    blocks.push(own_block(&mut buf, block));
                 }
             }
             (Slot::Pushed { sub, blocks, .. }, Some(block)) => {
                 if matches!(polls.subs.get(sub), Some(Ok(_))) {
-                    blocks.push(RawBlock::own(&mut buf, block));
+                    blocks.push(own_block(&mut buf, block));
                 }
             }
             (Slot::Rows { train, .. }, Some(r)) => train.take(&mut buf, r, ctrl.hdr.flags.continuation)?,
@@ -1040,7 +1028,6 @@ impl Slot {
         }
 
         // The train terminated; a train slot's last block is still in `buf`.
-        let last = || ctrl.data.clone().map(|block| &buf[block]);
         let cursor = || {
             DeltaCursor::from_pair(ctrl.hdr.arg0, ctrl.hdr.arg1)
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))
@@ -1048,35 +1035,40 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
-            Slot::Rows { train, to } => match to {
-                RowsTo::Scan(to) => to.fulfil(Ok(train.reply(last(), Some(ctrl.hdr.arg0))?)),
-                RowsTo::Scans { next, replies, to } => {
-                    replies.push(train.reply(last(), Some(ctrl.hdr.arg0))?);
-                    if let Some(following) = next.pop() {
-                        *train = following;
-                        return Ok(false);
+            Slot::Rows { train, to } => {
+                // The frame is taken out of `buf`, so a frame the transport handed over whole
+                // becomes the batch.
+                let last = (ctrl.data.clone()).map(|block| FrameBlock { frame: std::mem::take(&mut buf), block });
+                match to {
+                    RowsTo::Scan(to) => to.fulfil(Ok(train.reply(last, Some(ctrl.hdr.arg0))?)),
+                    RowsTo::Scans { next, replies, to } => {
+                        replies.push(train.reply(last, Some(ctrl.hdr.arg0))?);
+                        if let Some(following) = next.pop() {
+                            *train = following;
+                            return Ok(false);
+                        }
+                        to.fulfil(Ok(std::mem::take(replies)))
                     }
-                    to.fulfil(Ok(std::mem::take(replies)))
-                }
-                RowsTo::Page { worker_ends, to } => {
-                    let batch = train.finish(last())?;
-                    // The next page's rows are shared over the stores this one
-                    // names, so a page naming none is no reply to a page request.
-                    if worker_ends.is_empty() {
-                        return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
+                    RowsTo::Page { worker_ends, to } => {
+                        let batch = train.finish(last)?;
+                        // The next page's rows are shared over the stores this one
+                        // names, so a page naming none is no reply to a page request.
+                        if worker_ends.is_empty() {
+                            return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
+                        }
+                        let worker_ends = std::mem::take(worker_ends);
+                        to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
                     }
-                    let worker_ends = std::mem::take(worker_ends);
-                    to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
-                }
-                RowsTo::Delta { keep, to } => {
-                    let cursor = cursor()?;
-                    let reply = train.reply(last(), None)?;
-                    if let Some(id) = *keep {
-                        polls.hold(id, cursor);
+                    RowsTo::Delta { keep, to } => {
+                        let cursor = cursor()?;
+                        let reply = train.reply(last, None)?;
+                        if let Some(id) = *keep {
+                            polls.hold(id, cursor);
+                        }
+                        to.fulfil(Ok((reply, cursor)))
                     }
-                    to.fulfil(Ok((reply, cursor)))
                 }
-            },
+            }
             Slot::DeltaPoll { views, at, first } => {
                 polls.poll_end(kept_as(*first, *at), Ok(cursor()?));
                 *at += 1;

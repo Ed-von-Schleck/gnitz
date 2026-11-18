@@ -94,8 +94,10 @@ fn scan_all(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>) -> ZSetBat
 fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
     let mut out: Vec<_> = (0..batch.len())
         .map(|i| {
-            let cells = batch.payload.iter().map(|p| read_i64_le(&p.bytes, i * 8)).collect();
-            (batch.pks.get(i) as u64, cells, batch.weights[i])
+            let cells = (0..batch.payload_count())
+                .map(|pi| read_i64_le(batch.col(pi), i * 8))
+                .collect();
+            (batch.pk(i) as u64, cells, batch.weight(i))
         })
         .collect();
     out.sort();

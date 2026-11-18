@@ -290,7 +290,7 @@ impl Store {
         let quiet = trains.iter().all(|(_, blocks, _)| blocks.is_empty());
         let apply = move || {
             let advance = |(tid, blocks, next): (u64, Vec<RawBlock>, DeltaCursor)| {
-                let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::block).collect();
+                let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::bytes).collect();
                 self.with(|s| s.advance(tid, &blocks, next))
             };
             trains.into_iter().map(advance).collect()
@@ -632,7 +632,7 @@ impl GnitzClient {
                         if let Some((name, desc)) = open {
                             s.refill(&name, &desc)?;
                         }
-                        let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
+                        let taken: Vec<&[u8]> = taken.iter().map(RawBlock::bytes).collect();
                         s.fill(tid, &taken, sealed_at)
                     };
                     failed = store.clone().run(host, fill).await?.err();

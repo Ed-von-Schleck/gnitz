@@ -163,11 +163,11 @@ fn a_text_table_past_one_frame_reads_back_whole() {
         );
         assert_eq!(cell(&schema, &batch, v_ci, row) as u64, id % GROUPS, "row {row}");
         assert_eq!(
-            gnitz_wire::german_string_content(s.german_cell(&batch, row), &batch.blob),
+            gnitz_wire::german_string_content(s.german_cell(&batch, row), batch.heap()),
             text.as_bytes(),
             "row {row}"
         );
-        assert_eq!(batch.weights[row], 1, "row {row}");
+        assert_eq!(batch.weight(row), 1, "row {row}");
     }
 
     let count = |db: &mut Db, pred: &str| db.rows(&format!("SELECT COUNT(*) AS n FROM t {pred}"), &["n"]);

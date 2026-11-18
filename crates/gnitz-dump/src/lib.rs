@@ -369,7 +369,7 @@ async fn restore_rows(client: &mut GnitzClient, rel: &CatalogRelation, path: &Pa
 
 /// The bytes `batch` takes in a push in `schema`'s layout.
 fn push_bytes(schema: &Schema, batch: &ZSetBatch) -> usize {
-    batch.blob.len() + batch.len() * schema.layout().row_width()
+    batch.heap().len() + batch.len() * schema.layout().row_width()
 }
 
 /// Push `chunk`, of `schema`, into table `tid` when it holds rows, and leave it empty.

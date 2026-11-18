@@ -101,7 +101,7 @@ fn every_row_comes_after_its_parents() {
         // The rows between one push end and the next.
         let sets: Vec<Vec<u64>> = order
             .split_inclusive(|&(_, may_end)| may_end)
-            .map(|s| s.iter().map(|&(r, _)| batch.pks.get(r as usize) as u64).collect())
+            .map(|s| s.iter().map(|&(r, _)| batch.pk(r as usize) as u64).collect())
             .collect();
         let set_of: HashMap<u64, usize> = sets
             .iter()

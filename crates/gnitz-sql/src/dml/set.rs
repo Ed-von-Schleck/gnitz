@@ -2,7 +2,7 @@
 //! binds the targets, `classify_set_rhs` compiles each value, [`apply_set`]
 //! rewrites a batch.
 
-use super::colwrite::{append_value_to_col, check_not_null};
+use super::colwrite::{check_not_null, write_value_cell};
 use crate::ast_util::{col_ref_parts, expr_any, single_part_ident};
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
@@ -133,8 +133,8 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
     let col = &schema.columns()[target];
     let ty = col.ty;
     if expr.is_literal() {
-        let (mut cell, mut spill) = (Vec::new(), Vec::new());
-        append_value_to_col(&mut cell, &mut spill, col, &expr)?;
+        let (mut cell, mut spill) = (vec![0; ty.tc.wire_stride()], Vec::new());
+        write_value_cell(&mut cell, &mut spill, col, &expr)?;
         return Ok(SetRhs::Const {
             cell,
             spill,
@@ -191,11 +191,11 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
 /// right-hand side reads the rows as they were. `excluded` holds the incoming
 /// VALUES rows aligned with `rows` (ON CONFLICT DO UPDATE only).
 ///
-/// Each assigned column is written whole into `new` and swapped in. Assigning a
-/// string column also rebuilds every other string column into `new`, whose arena
-/// then replaces `rows`'; otherwise nothing is encoded and `rows`' arena is kept.
-/// A computed value out of its column's range is refused as it is written; a
-/// NULL into a NOT NULL column once every column is.
+/// Each assigned column is written whole into `new`, a batch of as many rows, and copied
+/// back. Assigning a string column also rebuilds every other string column into `new`,
+/// whose heap then replaces `rows`'; otherwise nothing is encoded and `rows`' heap is
+/// kept. A computed value out of its column's range is refused as it is written; a NULL
+/// into a NOT NULL column once every column is.
 pub(super) fn apply_set(
     set: &mut [SetCol],
     mut rows: ZSetBatch,
@@ -205,8 +205,8 @@ pub(super) fn apply_set(
     let n = rows.len();
     let rebuild = set.iter().any(|a| (schema.columns()[a.ci].ty.tc).is_german_string());
     // `new` holds the rewritten columns and, from the rows' own, the null words.
-    let mut new = ZSetBatch::new(schema);
-    new.nulls = rows.nulls.clone();
+    let mut new = ZSetBatch::zeroed(schema, n);
+    new.copy_null_words(&rows);
     for a in set.iter_mut() {
         let def = &schema.columns()[a.ci];
         let pi = schema
@@ -219,32 +219,29 @@ pub(super) fn apply_set(
         };
         match &mut a.rhs {
             SetRhs::Const { cell, spill, null } => {
-                let ZSetBatch { payload, blob, nulls, .. } = &mut new;
+                let (col, heap) = new.col_and_heap_mut(pi);
                 // One spill for every row's cell.
                 let reloc;
                 let cell: &[u8] = if def.ty.tc.is_german_string() {
-                    reloc = relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, blob);
+                    reloc = relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, heap);
                     &reloc
                 } else {
                     cell
                 };
-                payload[pi].bytes = cell.repeat(n);
-                for w in nulls {
-                    null_word_set(w, pi, *null);
-                }
+                gnitz_wire::by_cell_width!(cell.len(), |T| {
+                    let cell: [u8; size_of::<T>()] = cell.try_into().expect("one cell");
+                    col.as_chunks_mut::<{ size_of::<T>() }>().0.fill(cell);
+                });
+                new.update_null_words(|_, w| null_word_set(w, pi, *null));
             }
             SetRhs::Copy { scope, src } => {
                 let b = scoped(*scope);
-                for (w, &sw) in new.nulls.iter_mut().zip(&b.nulls) {
-                    null_word_set(w, pi, null_word_get(sw, *src));
-                }
-                new.append_column_from(pi, b, *src);
+                new.update_null_words(|r, w| null_word_set(w, pi, null_word_get(b.null_word(r), *src)));
+                new.copy_column_from(pi, b, *src);
             }
             SetRhs::Expr { scope, ev } => {
-                new.payload[pi].bytes = vec![0; n * def.ty.tc.wire_stride()];
-                for w in &mut new.nulls {
-                    null_word_set(w, pi, false);
-                }
+                new.col_mut(pi).fill(0);
+                new.update_null_words(|_, w| null_word_set(w, pi, false));
                 ev.write_slot(scoped(*scope), &mut new, pi, def.ty.tc).map_err(|v| {
                     GnitzSqlError::rejected(format!("column '{}': {} value out of range: {v}", def.name, def.ty))
                 })?;
@@ -252,7 +249,7 @@ pub(super) fn apply_set(
         }
     }
     // Bit `pi` set where some rewritten row is NULL in column `pi`.
-    let any_null = new.nulls.iter().fold(0, |acc, &w| acc | w);
+    let any_null = new.null_words().fold(0, |acc, w| acc | w);
     for (pi, ci, def) in schema.payload_columns() {
         let assigned = set.iter().any(|a| a.ci == ci);
         if assigned {
@@ -260,17 +257,17 @@ pub(super) fn apply_set(
         }
         let restrung = rebuild && def.ty.tc.is_german_string();
         if restrung && !assigned {
-            new.append_column_from(pi, &rows, pi);
+            new.copy_column_from(pi, &rows, pi);
         }
         if assigned || restrung {
-            std::mem::swap(&mut rows.payload[pi], &mut new.payload[pi]);
+            rows.col_mut(pi).copy_from_slice(new.col(pi));
         }
     }
     if rebuild {
-        rows.blob = new.blob;
+        rows.set_heap(new.take_heap());
     }
-    rows.nulls = new.nulls;
-    rows.weights.fill(1);
+    rows.copy_null_words(&new);
+    rows.fill_weights(1);
     Ok(rows)
 }
 

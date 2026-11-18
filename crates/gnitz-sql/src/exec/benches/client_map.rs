@@ -6,8 +6,8 @@ use gnitz_wire::TypeCode;
 use gnitz_wire::payload_u64;
 
 /// Instructions of a client map's `apply` over a large reply and over one row, which is all
-/// call overhead: an I64 PK column decoded beside a payload column moved, computed, or a
-/// computed string, which copies the source arena.
+/// call overhead: an I64 PK column decoded beside a payload column copied, computed, or a
+/// computed string, which copies the source heap.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn client_map_bench() {
@@ -20,11 +20,7 @@ fn client_map_bench() {
         ],
         &[0],
     );
-    for (items, moves) in [
-        (["k", "v"], true),
-        (["k", "v + 1"], false),
-        (["k", "COALESCE(s, 'x')"], false),
-    ] {
+    for items in [["k", "v"], ["k", "v + 1"], ["k", "COALESCE(s, 'x')"]] {
         for n in [262_144usize, 1] {
             let mut b = ZSetBatch::new(&src);
             let mut app = BatchAppender::new(&mut b);
@@ -34,10 +30,8 @@ fn client_map_bench() {
                     .str_val(&format!("a string past the inline prefix {i}"));
             }
             let mut map = map_of(&src, &items);
-            let v = b.payload[0].bytes.as_ptr();
             let (out, instructions) = counter.measure(|| map.apply(b));
             assert_eq!(payload_u64(&out, 0, 0) as i64, -(n as i64 / 2), "{items:?}");
-            assert_eq!(out.payload[1].bytes.as_ptr() == v, moves, "{items:?}");
             std::hint::black_box(out);
             println!(
                 "client_map_bench {:<16} {n:>7} rows {instructions:>8} instr {:6.1} instr/row",

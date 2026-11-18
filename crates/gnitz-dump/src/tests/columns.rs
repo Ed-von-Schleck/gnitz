@@ -81,7 +81,7 @@ fn a_row_not_at_weight_one_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = TableWriter::create(&dir.path().join("t.parquet"), &schema).unwrap();
     let mut batch = rows(&schema);
-    batch.weights[2] = 2;
+    batch.set_weight(2, 2);
     let err = w.write(&batch).unwrap_err();
     assert!(err.0.contains("weight 2"), "{err}");
 }

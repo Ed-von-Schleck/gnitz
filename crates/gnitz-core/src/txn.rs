@@ -236,8 +236,8 @@ impl TidWrites {
             let batch = &families[fam].batch;
             let start = if p == from { *rows } else { 0 };
             for row in start..batch.len() {
-                if batch.weights[row] != 0 {
-                    last_op.insert(PkBuf::from_bytes(batch.pks.get_bytes(row)), (fam, row));
+                if batch.weight(row) != 0 {
+                    last_op.insert(PkBuf::from_bytes(batch.pk_bytes(row)), (fam, row));
                 }
             }
             (*at, *rows) = (p, batch.len());
@@ -350,7 +350,7 @@ impl TxnBuffer {
             return Ok(committed);
         };
         let keep: Vec<u32> = (0..committed.len())
-            .filter(|&i| !index.contains_key(committed.pks.get_bytes(i)))
+            .filter(|&i| !index.contains_key(committed.pk_bytes(i)))
             .map(|i| i as u32)
             .collect();
         // `gather` compacts the string arena the dropped rows carried.
@@ -359,7 +359,7 @@ impl TxnBuffer {
         // Each family's live rows, gathered family by family.
         let mut rows: Vec<Vec<u32>> = vec![Vec::new(); families.len()];
         let take = |&(fam, row): &(usize, usize)| {
-            if families[fam].batch.weights[row] > 0 {
+            if families[fam].batch.weight(row) > 0 {
                 rows[fam].push(row as u32);
             }
         };
@@ -371,7 +371,7 @@ impl TxnBuffer {
         for (fam, rows) in families.iter().zip(&rows).filter(|(_, rows)| !rows.is_empty()) {
             live.append_rows(&fam.batch, rows, true);
         }
-        live.weights.fill(1);
+        live.fill_weights(1);
         if live.is_empty() {
             return Ok(out);
         }
@@ -380,15 +380,14 @@ impl TxnBuffer {
         let ranges = filter.ranges(&live);
         if keys {
             // The predicate has read the payload; the key reply carries none.
-            live.payload.clear();
-            live.blob.clear();
-            live.retain_ranges(ranges);
-            live.nulls.fill(0);
-        } else {
-            let kept: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
-            live = live.gather(&kept);
+            let (keys, st) = (live.pk_region(), live.pk_stride());
+            for &(s, e) in ranges.iter() {
+                out.append_keys(&keys[s * st..e * st], 1);
+            }
+            return Ok(out);
         }
-        out.extend_from_owned(live);
+        let kept: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
+        out.extend_from_owned(live.gather(&kept));
         Ok(out)
     }
 }

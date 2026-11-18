@@ -50,7 +50,7 @@ fn run(b: &ZSetBatch, order: &[OrderKey], slice: WeightSlots) -> ZSetBatch {
 
 /// The id of each entry of `out`, in order.
 fn ids(out: &ZSetBatch) -> Vec<u64> {
-    (0..out.len()).map(|i| out.pks.get(i) as u64).collect()
+    (0..out.len()).map(|i| out.pk(i) as u64).collect()
 }
 
 /// Ids 4 and 2 tie on `v`, arriving against identity order: uncut ties stay in input order,
@@ -85,7 +85,7 @@ fn orders_by_the_written_keys() {
 /// whichever of several same-identity entries carries it.
 fn bag(out: &ZSetBatch) -> Vec<(u64, i64)> {
     let mut bag: Vec<(u64, i64)> = Vec::new();
-    for (id, &w) in ids(out).into_iter().zip(&out.weights) {
+    for (id, w) in ids(out).into_iter().zip(out.weights()) {
         match bag.last_mut() {
             Some((last, n)) if *last == id => *n += w,
             _ => bag.push((id, w)),

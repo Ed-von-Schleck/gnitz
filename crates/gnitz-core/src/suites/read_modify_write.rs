@@ -41,8 +41,8 @@ fn run_increment(f: &mut Fixture, side: impl FnOnce(&mut GnitzClient, &RelDescri
         a.read_modify_write(target, ReadBound::PkSet(keys), Vec::new(), false, |mut rows| {
             side(&mut *b, target);
             for r in 0..rows.len() {
-                let v = read_i64_le(&rows.payload[0].bytes, r * 8);
-                write_u64_le(&mut rows.payload[0].bytes, r * 8, (v + 1) as u64);
+                let v = read_i64_le(rows.col(0), r * 8);
+                write_u64_le(rows.col_mut(0), r * 8, (v + 1) as u64);
             }
             Ok::<_, ClientError>(rows)
         }),

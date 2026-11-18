@@ -26,7 +26,7 @@ fn push(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>, batch: ZSetBat
 /// Rows `pks` retracted at the payload [`rows`] gives them.
 fn retractions(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     let mut b = rows(schema, pks);
-    b.weights.iter_mut().for_each(|w| *w = -1);
+    b.fill_weights(-1);
     b
 }
 
@@ -87,13 +87,11 @@ fn pages_of_a_compound_key_return_every_row_once() {
     let id = block_on(client.snapshot_open()).unwrap();
     for page_rows in [1, 3, 64] {
         let got = read(&mut client, id, tid, &schema, page_rows);
-        let mut vals: Vec<i64> = (0..got.len())
-            .map(|i| read_i64_le(&got.payload[0].bytes, i * 8))
-            .collect();
+        let mut vals: Vec<i64> = (0..got.len()).map(|i| read_i64_le(got.col(0), i * 8)).collect();
         vals.sort_unstable();
         want.sort_unstable();
         assert_eq!(vals, want, "page_rows={page_rows}");
-        assert!(got.weights.iter().all(|&w| w == 1));
+        assert!(got.weights().all(|w| w == 1));
     }
 }
 

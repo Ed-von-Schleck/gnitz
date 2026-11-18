@@ -65,7 +65,7 @@ impl ResultCut {
             return batch;
         }
         debug_assert!(
-            batch.weights.iter().all(|&w| w > 0),
+            batch.weights().all(|w| w > 0),
             "client cut: non-positive weight violates the bag invariant"
         );
         let as_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
@@ -88,7 +88,7 @@ impl ResultCut {
         let mut n = 0;
         for i in 0..rows.len() {
             let r = rows[i];
-            let take = slots.take(batch.weights[r as usize]);
+            let take = slots.take(batch.weight(r as usize));
             if take > 0 {
                 rows[n] = r;
                 n += 1;
@@ -100,7 +100,9 @@ impl ResultCut {
         }
         rows.truncate(n);
         let mut out = batch.gather(&rows);
-        out.weights = takes;
+        for (r, w) in takes.into_iter().enumerate() {
+            out.set_weight(r, w);
+        }
         out
     }
 }

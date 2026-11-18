@@ -52,8 +52,8 @@ pub fn canonical(reply: &Reply) -> BTreeMap<RowKey, i64> {
 /// `ORDER BY` comparison needs, since the multiset above is order-blind and so
 /// accepts the right rows in the wrong order.
 pub fn canonical_rows((schema, batch): &Reply) -> Vec<(RowKey, i64)> {
-    (0..batch.weights.len())
-        .map(|row| (row_key(batch, schema.as_ref().layout(), row), batch.weights[row]))
+    (0..batch.len())
+        .map(|row| (row_key(batch, schema.as_ref().layout(), row), batch.weight(row)))
         .collect()
 }
 

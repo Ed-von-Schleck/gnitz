@@ -221,9 +221,9 @@ fn a_refused_verb_reaches_no_wire() {
     let (client, conn, mut peer) = connect_to_peer(&rt);
     rt.spawn(conn);
 
-    let mut keyless = ZSetBatch::new(&schema());
-    keyless.weights.push(1);
-    let refused = settled(&rt, push(&client, 1, keyless));
+    // A key of another type than the table's.
+    let other = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::I32, false)], &[0]).unwrap();
+    let refused = settled(&rt, push(&client, 1, batch(&other, 1)));
     assert!(matches!(refused, Err(ClientError::Refused(_))), "{refused:?}");
 
     let next = scan(&client, 2);
@@ -541,7 +541,7 @@ fn cancel_a_sync(delivered: bool) {
     let (rows, at) = pushed.result.as_ref().expect("the subscription is held");
     assert_eq!((pushed.sub, at.tick.get()), (sub, 12), "under the later cursor");
     let rows: Vec<(u128, i64)> = (0..rows.batch.len())
-        .map(|i| (rows.batch.pks.get(i), rows.batch.weights[i]))
+        .map(|i| (rows.batch.pk(i), rows.batch.weight(i)))
         .collect();
     assert_eq!(rows, [(1, 1), (2, 2), (1, -1)], "the cancelled sync's rows first");
 }

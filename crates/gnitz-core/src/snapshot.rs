@@ -81,7 +81,7 @@ impl GnitzClient {
             let (mut more, mut start) = (false, 0);
             for (at, &end) in after.iter_mut().zip(&worker_ends) {
                 if end > start {
-                    *at = Some(PkBuf::from_bytes(batch.pks.get_bytes(end - 1)));
+                    *at = Some(PkBuf::from_bytes(batch.pk_bytes(end - 1)));
                 }
                 more |= (end - start) as u64 == share;
                 start = end;

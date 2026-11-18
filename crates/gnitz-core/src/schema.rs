@@ -9,7 +9,8 @@ use gnitz_wire::{ColumnDef, PkColList, PkListRole, PkRule, SysFamily};
 #[derive(Clone)]
 pub struct Schema {
     columns: Vec<ColumnDef>,
-    layout: SchemaDescriptor,
+    /// Shared with every batch of this schema, which reads its region layout here.
+    layout: Arc<SchemaDescriptor>,
     /// The meta-schema record of `columns` and the PK list, encoded on first
     /// use. Every `&mut self` method that changes either resets it.
     record: OnceLock<Arc<[u8]>>,
@@ -53,7 +54,11 @@ impl Schema {
                 SchemaRefusal::Pk(rule) => pk_refusal(rule),
                 other => other.to_string(),
             })?;
-        Ok(Schema { columns, layout, record: OnceLock::new() })
+        Ok(Schema {
+            columns,
+            layout: Arc::new(layout),
+            record: OnceLock::new(),
+        })
     }
 
     pub fn columns(&self) -> &[ColumnDef] {
@@ -67,6 +72,11 @@ impl Schema {
 
     /// The layout facts of this schema's columns and PK list.
     pub fn layout(&self) -> &SchemaDescriptor {
+        &self.layout
+    }
+
+    /// [`Self::layout`], to share.
+    pub(crate) fn shared_layout(&self) -> &Arc<SchemaDescriptor> {
         &self.layout
     }
 

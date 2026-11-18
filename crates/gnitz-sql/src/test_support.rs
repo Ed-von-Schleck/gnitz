@@ -318,7 +318,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
             Cell::Null
         } else if tc.is_german_string() {
             let cell = b.german_cell(r, pi);
-            Cell::Str(std::str::from_utf8(gnitz_wire::german_string_content(cell, &b.blob)).unwrap())
+            Cell::Str(std::str::from_utf8(gnitz_wire::german_string_content(cell, b.heap())).unwrap())
         } else if tc == TypeCode::F64 {
             Cell::F64(f64::from_bits(payload_u64(b, r, pi)))
         } else {
@@ -331,7 +331,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
         .map(|r| {
             (
                 locs.iter().enumerate().map(|(pi, loc)| cell(r, pi, loc)).collect(),
-                b.weights[r],
+                b.weight(r),
             )
         })
         .collect()
