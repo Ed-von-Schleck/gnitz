@@ -162,15 +162,14 @@ fn the_file_names_each_columns_gnitz_type() {
 }
 
 /// A file this writer never produces, a cell its column cannot hold, is
-/// refused: an I8 key holding 300, a DECIMAL's nine bytes holding 2^63, one
-/// past `i64::MAX`, rather than wrapped, and TEXT that is not UTF-8.
+/// refused rather than wrapped: an I8 key holding 300, and a DECIMAL's nine
+/// bytes holding 2^63, one past `i64::MAX`.
 #[test]
 fn a_cell_its_column_cannot_hold_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     for (i, (key, v, refusal)) in [
         (TypeCode::I8, ColType::of(TypeCode::I64), "out of range"),
         (TypeCode::I64, ColType::decimal(2), "out of range"),
-        (TypeCode::I64, ColType::of(TypeCode::String), "not UTF-8"),
     ]
     .into_iter()
     .enumerate()
@@ -183,7 +182,7 @@ fn a_cell_its_column_cannot_hold_is_refused() {
             .unwrap(),
         );
         let path = dir.path().join(format!("{i}.parquet"));
-        let (root, types) = file_layout(&schema).unwrap();
+        let (root, types, _) = file_layout(&schema).unwrap();
         let props = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![KeyValue::new(COLUMNS_KEY.to_string(), types)]))
             .build();
@@ -197,7 +196,6 @@ fn a_cell_its_column_cannot_hold_is_refused() {
                     let cell = FixedLenByteArray::from(vec![0x00, 0x80, 0, 0, 0, 0, 0, 0, 0]);
                     c.write_batch(&[cell], None, None)
                 }
-                ColumnWriter::ByteArrayColumnWriter(c) => c.write_batch(&[ByteArray::from(vec![0xff])], None, None),
                 _ => unreachable!("no other column"),
             }
             .unwrap();

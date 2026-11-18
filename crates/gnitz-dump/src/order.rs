@@ -14,6 +14,9 @@ use gnitz_core::{Schema, ZSetBatch};
 /// inside such a set. With no `refs`, the rows in their own order.
 pub(crate) fn order(batch: &ZSetBatch, schema: &Schema, refs: &[usize]) -> Vec<(u32, bool)> {
     let n = batch.len();
+    if refs.is_empty() {
+        return (0..n as u32).map(|r| (r, true)).collect();
+    }
     let layout = schema.layout();
     let ref_locs: Vec<_> = refs.iter().map(|&c| layout.locate(c)).collect();
     let k = ref_locs.len();

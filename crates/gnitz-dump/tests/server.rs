@@ -10,7 +10,7 @@ use gnitz_core::{BatchAppender, Catalog, GnitzClient, RelName, ZSetBatch, block_
 use gnitz_sql::SqlResult;
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{Circuit, OpNode, ReadBound, RelClass, WireConflictMode};
-use parquet::column::writer::ColumnWriter;
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
@@ -240,43 +240,54 @@ fn a_restored_database_is_the_dumped_one() {
     assert!(rows(&mut b, "SELECT id FROM sales.orders WHERE customer = 1").is_empty());
 }
 
-/// A restore pushes without a duplicate-key check, so a file holding a key
-/// twice, which no dump writes, is caught by the rows it leaves.
+/// A file no dump writes is refused by what its rows leave or what its push is
+/// refused for: a key held twice, which a restore pushes without a
+/// duplicate-key check, by the rows the table holds after; TEXT that is not
+/// UTF-8 by the push.
 #[test]
-fn a_file_holding_a_key_twice_is_refused() {
+fn a_file_of_rows_no_table_holds_is_refused() {
     let server = ServerHandle::start_n(2);
     let mut a = GnitzClient::connect(server.sock_path()).unwrap();
-    exec(
-        &mut a,
-        "CREATE TABLE d (id BIGINT PRIMARY KEY, v BIGINT NOT NULL); INSERT INTO d VALUES (1, 10), (2, 20)",
-    );
-    let dir = tempfile::tempdir().unwrap();
-    dump(&mut a, dir.path());
-    exec(&mut a, "DROP TABLE d");
+    for (keys, texts, refusal) in [
+        (
+            &[1i64, 2, 1][..],
+            &[&b"a"[..], b"b", b"c"][..],
+            "3 rows, of which 2 have distinct keys",
+        ),
+        (&[1], &[&[0xff][..]], "not UTF-8"),
+    ] {
+        exec(
+            &mut a,
+            "CREATE TABLE d (id BIGINT PRIMARY KEY, v TEXT NOT NULL); INSERT INTO d VALUES (1, 'x')",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        dump(&mut a, dir.path());
+        exec(&mut a, "DROP TABLE d");
 
-    let file = dir.path().join("data/0.parquet");
-    let reader = SerializedFileReader::new(std::fs::File::open(&file).unwrap()).unwrap();
-    let meta = reader.metadata().file_metadata();
-    let root = Arc::new(meta.schema().clone());
-    let props = WriterProperties::builder()
-        .set_key_value_metadata(meta.key_value_metadata().cloned())
-        .build();
-    drop(reader);
-    let mut w = SerializedFileWriter::new(std::fs::File::create(&file).unwrap(), root, Arc::new(props)).unwrap();
-    let mut group = w.next_row_group().unwrap();
-    for values in [[1i64, 2, 1], [10, 20, 30]] {
+        let file = dir.path().join("data/0.parquet");
+        let reader = SerializedFileReader::new(std::fs::File::open(&file).unwrap()).unwrap();
+        let meta = reader.metadata().file_metadata();
+        let root = Arc::new(meta.schema().clone());
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(meta.key_value_metadata().cloned())
+            .build();
+        drop(reader);
+        let mut w = SerializedFileWriter::new(std::fs::File::create(&file).unwrap(), root, Arc::new(props)).unwrap();
+        let mut group = w.next_row_group().unwrap();
         let mut col = group.next_column().unwrap().unwrap();
-        let ColumnWriter::Int64ColumnWriter(c) = col.untyped() else {
-            panic!("two BIGINT columns")
-        };
-        c.write_batch(&values, None, None).unwrap();
+        col.typed::<Int64Type>().write_batch(keys, None, None).unwrap();
         col.close().unwrap();
-    }
-    group.close().unwrap();
-    w.close().unwrap();
+        let mut col = group.next_column().unwrap().unwrap();
+        let texts: Vec<ByteArray> = texts.iter().map(|t| ByteArray::from(t.to_vec())).collect();
+        col.typed::<ByteArrayType>().write_batch(&texts, None, None).unwrap();
+        col.close().unwrap();
+        group.close().unwrap();
+        w.close().unwrap();
 
-    let err = restore_err(&mut a, dir.path());
-    assert!(err.contains("3 rows, of which 2 have distinct keys"), "{err}");
+        let err = restore_err(&mut a, dir.path());
+        assert!(err.contains(refusal), "{err}");
+        exec(&mut a, "DROP TABLE d");
+    }
 }
 
 /// A row's parent, given its id.

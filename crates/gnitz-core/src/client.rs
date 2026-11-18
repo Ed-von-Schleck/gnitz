@@ -219,9 +219,7 @@ impl GnitzClient {
             // Refill, abandoning whatever tail the old range still held.
             _ => {
                 let want = count.max(SERIAL_RANGE_SIZE);
-                let base = self
-                    .ack(Request::AllocSerial { table: table.into(), count: want })
-                    .await?;
+                let base = self.reserve_serial_exact(table, want).await?;
                 self.serial_cache.insert(table.tid, base + count..base + want);
                 Ok(base)
             }
@@ -231,7 +229,7 @@ impl GnitzClient {
     /// Reserve exactly `count` SERIAL ids of `table` and return the first,
     /// leaving this client's own reservation untouched: what puts a restored
     /// table's sequence where its dump left it.
-    pub async fn reserve_serial_exact(&mut self, table: &RelDescriptor, count: u64) -> Result<u64, ClientError> {
+    pub async fn reserve_serial_exact(&mut self, table: impl Into<Target>, count: u64) -> Result<u64, ClientError> {
         self.ack(Request::AllocSerial { table: table.into(), count }).await
     }
 

@@ -16,8 +16,8 @@
 //! so a build whose formats moved on restores it; a view comes back from its
 //! recorded SQL, planned anew, under the names its sources carry now.
 //!
-//! A restore runs `schema.sql`, pushes each table's rows, puts each SERIAL
-//! sequence where the dump left it, and runs `post-data.sql`, so a view fills
+//! A restore runs `schema.sql`, puts each SERIAL sequence where the dump left
+//! it, pushes each table's rows, and runs `post-data.sql`, so a view fills
 //! once from its loaded sources and is planned with every index its sources
 //! have. Streams hold no rows, view contents are derived, and a delta feed's
 //! retained rounds and a client's mirrors are no state of the database, so none
@@ -32,9 +32,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use gnitz_core::{
-    CatalogRelation, ClientError, DEFAULT_PAGE_ROWS, GnitzClient, RelDescriptor, RelName, Schema, ZSetBatch,
-};
+use gnitz_core::{CatalogRelation, ClientError, DEFAULT_PAGE_ROWS, GnitzClient, RelName, Schema, ZSetBatch};
 use gnitz_foundation::posix_io::{create_dir_all_durable, fsync_dir, write_file_durable};
 use gnitz_wire::{FixedInt, PUBLIC_SCHEMA, RelClass, SYSTEM_SCHEMA, WireConflictMode};
 
@@ -167,6 +165,10 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
     // Every table's indexes ahead of every view, so each view is planned with
     // every index its sources have.
     let (mut post, mut views) = (Vec::new(), Vec::new());
+    // Each table entry's relation. A base table's rows are read once every
+    // statement has rendered, so a relation that renders no statement refuses
+    // the dump before any rows are read.
+    let mut tables = Vec::new();
     for rel in relations {
         let class = rel.class();
         match class {
@@ -174,21 +176,14 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
             RelClass::Table | RelClass::Stream => {
                 pre.push(gnitz_sql::create_table_statement(&catalog, rel)?);
                 post.extend(gnitz_sql::create_index_statements(rel));
-                let mut entry = TableEntry {
+                tables.push(rel);
+                manifest.tables.push(TableEntry {
                     schema: rel.schema.clone(),
                     name: rel.name.clone(),
-                    file: None,
+                    file: (class == RelClass::Table).then(|| format!("data/{}.parquet", manifest.tables.len())),
                     rows: 0,
                     serial: serials.get(&rel.id).copied(),
-                };
-                if class == RelClass::Table {
-                    let file = format!("data/{}.parquet", manifest.tables.len());
-                    entry.rows = dump_rows(client, snapshot, rel, &dir.join(&file))
-                        .await
-                        .map_err(|e| DumpError(format!("{}: {e}", rel.qualified())))?;
-                    entry.file = Some(file);
-                }
-                manifest.tables.push(entry);
+                });
             }
             RelClass::View | RelClass::BoundedView | RelClass::FedView => {
                 views.push(gnitz_sql::create_view_statement(&catalog, rel)?);
@@ -202,6 +197,13 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
         manifest.indexes.extend(rel.indexes.iter().map(|i| i.name.clone()));
     }
     post.extend(views);
+    for (entry, rel) in manifest.tables.iter_mut().zip(tables) {
+        if let Some(file) = &entry.file {
+            entry.rows = dump_rows(client, snapshot, rel, &dir.join(file))
+                .await
+                .map_err(|e| DumpError(format!("{}: {e}", rel.qualified())))?;
+        }
+    }
     let data = dir.join("data");
     fsync_dir(&data).map_err(|e| at(&data, e))?;
     let write = |name: &str, text: String| {
@@ -237,10 +239,8 @@ async fn dump_rows(
     rel: &CatalogRelation,
     path: &Path,
 ) -> Result<u64, DumpError> {
-    // The layout the store holds, dropped columns included; the file has the
-    // visible ones.
-    let columns: Vec<_> = rel.columns.iter().map(|c| c.def.clone()).collect();
-    let schema = Arc::new(Schema::from_parts(columns, rel.pk.as_slice())?);
+    // Dropped columns included; the file has the visible ones.
+    let schema = stored_schema(rel)?;
     let mut writer = TableWriter::create(path, &schema)?;
     client
         .snapshot_read(snapshot, rel.id, &schema, DEFAULT_PAGE_ROWS, |batch| {
@@ -250,6 +250,12 @@ async fn dump_rows(
     writer.finish()
 }
 
+/// The layout table `rel`'s store holds its rows in.
+fn stored_schema(rel: &CatalogRelation) -> Result<Arc<Schema>, DumpError> {
+    let columns = rel.columns.iter().map(|c| c.def.clone()).collect();
+    Ok(Arc::new(Schema::from_parts(columns, rel.pk.as_slice())?))
+}
+
 /// Restore the dump in `dir` into the database `client` is connected to.
 ///
 /// Refused before anything is written when the database holds a schema,
@@ -257,7 +263,8 @@ async fn dump_rows(
 /// push commits on its own, so a restore that fails part way leaves what it
 /// created: restore into a fresh database again. A table that references
 /// itself is held whole in memory, and each set of its rows that reference one
-/// another round a cycle goes in one push, so must fit a frame.
+/// another round a cycle goes in one push beside up to a quarter of a frame of
+/// other rows, so must fit in the rest of the frame.
 pub async fn restore(client: &mut GnitzClient, dir: &Path) -> Result<Summary, DumpError> {
     let read = |file: &str| {
         let path = dir.join(file);
@@ -294,18 +301,18 @@ pub async fn restore(client: &mut GnitzClient, dir: &Path) -> Result<Summary, Du
         let rel = catalog
             .get(&name)
             .ok_or_else(|| DumpError(format!("schema.sql created no {name}")))?;
-        let desc = client.resolve_relation(&name).await?;
+        // Ahead of the rows: a reservation is acknowledged before it is
+        // durable, and the durable push of any row holding one of its ids makes
+        // it durable too.
+        if let Some(last) = t.serial {
+            client.reserve_serial_exact(rel.id, last).await?;
+        }
         if let Some(file) = &t.file {
             let in_table = |e| DumpError(format!("{name} ({file}): {e}"));
-            let rows = restore_rows(client, rel, &desc, &dir.join(file))
-                .await
-                .map_err(in_table)?;
+            let rows = restore_rows(client, rel, &dir.join(file)).await.map_err(in_table)?;
             if rows != t.rows {
                 return Err(in_table(DumpError(format!("{rows} rows, the manifest {}", t.rows))));
             }
-        }
-        if let Some(last) = t.serial {
-            client.reserve_serial_exact(&desc, last).await?;
         }
     }
     gnitz_sql::execute(client, PUBLIC_SCHEMA, &post)
@@ -314,14 +321,10 @@ pub async fn restore(client: &mut GnitzClient, dir: &Path) -> Result<Summary, Du
     Ok(Summary::of(&manifest))
 }
 
-/// Push the rows of the table file `path` into `rel`, restored as `desc`.
-async fn restore_rows(
-    client: &mut GnitzClient,
-    rel: &CatalogRelation,
-    desc: &RelDescriptor,
-    path: &Path,
-) -> Result<u64, DumpError> {
-    let mut reader = TableReader::open(path, &desc.schema)?;
+/// Push the rows of the table file `path` into restored table `rel`.
+async fn restore_rows(client: &mut GnitzClient, rel: &CatalogRelation, path: &Path) -> Result<u64, DumpError> {
+    let schema = &stored_schema(rel)?;
+    let mut reader = TableReader::open(path, schema)?;
     // The columns that reference this table's own key.
     let refs: Vec<usize> = rel
         .columns
@@ -330,7 +333,6 @@ async fn restore_rows(
         .filter(|(_, c)| c.fk.is_some_and(|fk| fk.table_id == rel.id))
         .map(|(ci, _)| ci)
         .collect();
-    let schema = &desc.schema;
     let (mut rows, mut chunk) = (0, ZSetBatch::new(schema));
     // Whole row groups coalesce into a push; one too large for a push is cut in
     // `order::order`'s order, and its last rows carry on into the next.
@@ -343,7 +345,7 @@ async fn restore_rows(
         }
         rows += group.len() as u64;
         if push_bytes(schema, &chunk) + push_bytes(schema, &group) > PUSH_BYTES {
-            flush(client, desc, &mut chunk).await?;
+            flush(client, rel.id, schema, &mut chunk).await?;
         }
         if push_bytes(schema, &group) <= PUSH_BYTES {
             chunk.extend_from_owned(group);
@@ -351,12 +353,12 @@ async fn restore_rows(
             for (r, may_end) in order::order(&group, schema, &refs) {
                 chunk.copy_row_at(&group, r as usize, 1);
                 if may_end && push_bytes(schema, &chunk) >= PUSH_BYTES {
-                    flush(client, desc, &mut chunk).await?;
+                    flush(client, rel.id, schema, &mut chunk).await?;
                 }
             }
         }
     }
-    flush(client, desc, &mut chunk).await?;
+    flush(client, rel.id, schema, &mut chunk).await?;
     // The table was new, so a key the file holds twice replaced a row rather than being refused.
     let held = held_rows(client, rel).await?;
     if held != rows {
@@ -370,11 +372,16 @@ fn push_bytes(schema: &Schema, batch: &ZSetBatch) -> usize {
     batch.blob.len() + batch.len() * schema.layout().row_width()
 }
 
-/// Push `chunk` into `desc` when it holds rows, and leave it empty.
-async fn flush(client: &mut GnitzClient, desc: &RelDescriptor, chunk: &mut ZSetBatch) -> Result<(), DumpError> {
+/// Push `chunk`, of `schema`, into table `tid` when it holds rows, and leave it empty.
+async fn flush(
+    client: &mut GnitzClient,
+    tid: u64,
+    schema: &Arc<Schema>,
+    chunk: &mut ZSetBatch,
+) -> Result<(), DumpError> {
     if !chunk.is_empty() {
-        let full = std::mem::replace(chunk, ZSetBatch::new(&desc.schema));
-        client.push(desc, &desc.schema, full, WireConflictMode::Update).await?;
+        let full = std::mem::replace(chunk, ZSetBatch::new(schema));
+        client.push(tid, schema, full, WireConflictMode::Update).await?;
     }
     Ok(())
 }

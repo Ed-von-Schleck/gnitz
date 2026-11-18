@@ -60,17 +60,23 @@ const DECIMAL_PRECISION: i32 = 19;
 /// `DECIMAL_PRECISION` digits.
 const DECIMAL_BYTES: usize = 9;
 
-/// The Parquet schema of a file of `schema`'s visible columns, and its
-/// `COLUMNS_KEY` value.
-fn file_layout(schema: &Schema) -> Result<(Type, String), DumpError> {
-    let visible = || schema.visible_columns().map(|(_, def)| def);
-    let fields = visible()
-        .map(|d| parquet_column(d).map(Arc::new))
-        .collect::<Result<Vec<_>, _>>()?;
-    let types: Vec<String> = visible().map(|d| gnitz_sql::sql_type_name(d.ty)).collect();
+/// One column of a file: its place in a batch, its codec, and whether it may be NULL.
+type FileColumn = (ColumnLocator, Codec, bool);
+
+/// The Parquet schema of a file of `schema`'s visible columns, its
+/// `COLUMNS_KEY` value, and its columns in file order.
+fn file_layout(schema: &Schema) -> Result<(Type, String, Vec<FileColumn>), DumpError> {
+    let (mut fields, mut types, mut cols) = (Vec::new(), Vec::new(), Vec::new());
+    for (ci, def) in schema.visible_columns() {
+        let (codec, logical) = codec(def.ty);
+        fields.push(Arc::new(parquet_column(def, codec, logical)?));
+        types.push(gnitz_sql::sql_type_name(def.ty));
+        cols.push((schema.layout().locate(ci), codec, def.is_nullable));
+    }
     Ok((
         Type::group_type_builder("gnitz").with_fields(fields).build()?,
         serde_json::Value::from(types).to_string(),
+        cols,
     ))
 }
 
@@ -88,10 +94,8 @@ enum Codec {
     Wide,
     /// FIXED_LEN_BYTE_ARRAY(DECIMAL_BYTES): a DECIMAL's i64, big-endian and sign-extended.
     Decimal,
-    /// BYTE_ARRAY; a TEXT one is UTF-8.
-    Bytes {
-        text: bool,
-    },
+    /// BYTE_ARRAY.
+    Bytes,
 }
 
 impl Codec {
@@ -103,7 +107,7 @@ impl Codec {
             Codec::Float => Physical::FLOAT,
             Codec::Double => Physical::DOUBLE,
             Codec::Wide | Codec::Decimal => Physical::FIXED_LEN_BYTE_ARRAY,
-            Codec::Bytes { .. } => Physical::BYTE_ARRAY,
+            Codec::Bytes => Physical::BYTE_ARRAY,
         }
     }
 }
@@ -128,8 +132,8 @@ fn codec(ty: ColType) -> (Codec, Option<LogicalType>) {
         TypeCode::UUID => (Codec::Wide, Some(LogicalType::Uuid)),
         TypeCode::F32 => (Codec::Float, None),
         TypeCode::F64 => (Codec::Double, None),
-        TypeCode::String => (Codec::Bytes { text: true }, Some(LogicalType::String)),
-        TypeCode::Blob => (Codec::Bytes { text: false }, None),
+        TypeCode::String => (Codec::Bytes, Some(LogicalType::String)),
+        TypeCode::Blob => (Codec::Bytes, None),
         TypeCode::Date => (Codec::Int32(FixedInt::I32), Some(LogicalType::Date)),
         TypeCode::Timestamp => (Codec::Int64, Some(LogicalType::timestamp(false, TimeUnit::MICROS))),
         TypeCode::Decimal => (
@@ -140,9 +144,8 @@ fn codec(ty: ColType) -> (Codec, Option<LogicalType>) {
     }
 }
 
-/// The Parquet column `def` is written as.
-fn parquet_column(def: &ColumnDef) -> Result<Type, DumpError> {
-    let (codec, logical) = codec(def.ty);
+/// The Parquet column `def` is written as, its cells held as `codec`.
+fn parquet_column(def: &ColumnDef, codec: Codec, logical: Option<LogicalType>) -> Result<Type, DumpError> {
     let b = Type::primitive_type_builder(&def.name, codec.physical())
         .with_repetition(if def.is_nullable {
             Repetition::OPTIONAL
@@ -164,13 +167,12 @@ fn parquet_column(def: &ColumnDef) -> Result<Type, DumpError> {
 /// A table's Parquet file, written a batch — one row group — at a time.
 pub(crate) struct TableWriter {
     writer: SerializedFileWriter<File>,
-    /// Each visible column's place in a batch, its codec, and whether it may be NULL.
-    cols: Vec<(ColumnLocator, Codec, bool)>,
+    cols: Vec<FileColumn>,
 }
 
 impl TableWriter {
     pub(crate) fn create(path: &Path, schema: &Schema) -> Result<TableWriter, DumpError> {
-        let (root, types) = file_layout(schema)?;
+        let (root, types, cols) = file_layout(schema)?;
         let mut props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
             .set_key_value_metadata(Some(vec![KeyValue::new(COLUMNS_KEY.to_string(), types)]));
@@ -183,10 +185,7 @@ impl TableWriter {
         let file = File::create(path)?;
         Ok(TableWriter {
             writer: SerializedFileWriter::new(file, Arc::new(root), Arc::new(props.build()))?,
-            cols: schema
-                .visible_columns()
-                .map(|(ci, def)| (schema.layout().locate(ci), codec(def.ty).0, def.is_nullable))
-                .collect(),
+            cols,
         })
     }
 
@@ -279,7 +278,7 @@ fn write_column(
             }),
             levels,
         ),
-        Codec::Bytes { .. } => put::<ByteArrayType>(
+        Codec::Bytes => put::<ByteArrayType>(
             writer,
             byte_values(present, |c, all| {
                 all.extend_from_slice(gnitz_wire::german_string_content(c.first_chunk().unwrap(), &batch.blob))
@@ -327,6 +326,7 @@ fn byte_values<'c, V: From<ByteArray>>(
 pub(crate) struct TableReader {
     reader: SerializedFileReader<File>,
     schema: Arc<Schema>,
+    cols: Vec<FileColumn>,
     next: usize,
 }
 
@@ -339,7 +339,7 @@ impl TableReader {
         if schema.columns().iter().any(|c| c.is_hidden) {
             return Err(DumpError::from("restored into a table with hidden columns"));
         }
-        let (root, types) = file_layout(schema)?;
+        let (root, types, cols) = file_layout(schema)?;
         let meta = reader.metadata().file_metadata();
         let recorded = meta
             .key_value_metadata()
@@ -351,6 +351,7 @@ impl TableReader {
         Ok(TableReader {
             reader,
             schema: Arc::clone(schema),
+            cols,
             next: 0,
         })
     }
@@ -362,19 +363,25 @@ impl TableReader {
         }
         let group = self.reader.get_row_group(self.next)?;
         self.next += 1;
-        let schema = &self.schema;
+        let (schema, cols) = (&self.schema, &self.cols);
         let n = usize::try_from(group.metadata().num_rows()).map_err(|_| DumpError::from("a negative row count"))?;
         let mut batch = ZSetBatch::new(schema);
         batch.weights = vec![1; n];
         batch.nulls = vec![0; n];
         let ZSetBatch { payload, nulls, blob, .. } = &mut batch;
         let mut read = |ci: usize, cells: &mut Vec<u8>| -> Result<(), DumpError> {
-            let def = &schema.columns()[ci];
-            let null_words = def
-                .is_nullable
-                .then_some((&mut nulls[..], schema.layout().locate(ci).null_bit()));
-            read_column(group.get_column_reader(ci)?, n, def.ty, cells, null_words, blob)
-                .map_err(|e| DumpError(format!("column {}: {e}", def.name)))
+            let (loc, codec, nullable) = cols[ci];
+            let null_words = nullable.then_some((&mut nulls[..], loc.null_bit()));
+            read_column(
+                group.get_column_reader(ci)?,
+                n,
+                codec,
+                loc.type_code(),
+                cells,
+                null_words,
+                blob,
+            )
+            .map_err(|e| DumpError(format!("column {}: {e}", schema.columns()[ci].name)))
         };
         let mut keys = Vec::with_capacity(schema.pk_cols().len());
         for &ci in schema.pk_cols() {
@@ -390,19 +397,19 @@ impl TableReader {
     }
 }
 
-/// The `n` cells of a column of type `ty` appended to `cells` as a batch region
+/// The `n` cells of a `tc` column held as `codec` appended to `cells` as a batch region
 /// holds them — native little-endian, a zero cell under NULL, a string's bytes
 /// spilled into `blob` — each NULL row's word in `nulls` given the column's bit.
 fn read_column(
     reader: ColumnReader,
     n: usize,
-    ty: ColType,
+    codec: Codec,
+    tc: TypeCode,
     cells: &mut Vec<u8>,
     nulls: Option<(&mut [u64], u64)>,
     blob: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let tc = ty.tc;
-    match codec(ty).0 {
+    match codec {
         Codec::Int32(fi) => match fi.width() {
             1 => read_int32::<1>(reader, n, tc, cells, nulls, fi),
             2 => read_int32::<2>(reader, n, tc, cells, nulls, fi),
@@ -440,10 +447,8 @@ fn read_column(
             out.extend_from_slice(&x.to_le_bytes());
             Ok(())
         }),
-        Codec::Bytes { text } => read_cells::<ByteArrayType>(reader, n, tc, cells, nulls, |v, out| {
-            if text && std::str::from_utf8(v.data()).is_err() {
-                return Err("a TEXT cell that is not UTF-8".to_string());
-            }
+        // A TEXT cell's UTF-8 is the push's to check.
+        Codec::Bytes => read_cells::<ByteArrayType>(reader, n, tc, cells, nulls, |v, out| {
             out.extend_from_slice(&gnitz_wire::encode_german_string(v.data(), blob));
             Ok(())
         }),
