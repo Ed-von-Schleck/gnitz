@@ -48,14 +48,11 @@ pub(super) struct Writes {
     pub(super) checks: Checks,
 }
 
-/// The table locks one write holds: a guard on each of `tids`, the write guard
-/// when `exclusive`, else the read guard. The committer drops them once the
-/// write is laid out.
+/// The table locks one write holds: each table's id and its guard, the write
+/// guard or the read guard. The committer drops them once the write is laid out.
 #[derive(Default)]
 pub(super) struct HeldTables {
-    tids: LockSet,
-    exclusive: bool,
-    guards: SmallVec<[TableGuard; 4]>,
+    guards: SmallVec<[(u64, TableGuard); 4]>,
 }
 
 /// One table lock's guard.
@@ -66,16 +63,18 @@ enum TableGuard {
 
 impl HeldTables {
     fn holds(&self, tid: u64) -> bool {
-        self.tids.contains(&tid)
+        self.guards.iter().any(|(t, _)| *t == tid)
     }
 
     fn holds_exclusive(&self, tid: u64) -> bool {
-        self.exclusive && self.holds(tid)
+        self.guards
+            .iter()
+            .any(|(t, g)| *t == tid && matches!(g, TableGuard::Write { .. }))
     }
 
     /// Whether another write is parked on one of these locks.
     pub(super) fn contended(&self) -> bool {
-        self.guards.iter().any(|g| match g {
+        self.guards.iter().any(|(_, g)| match g {
             TableGuard::Read { guard } => guard.contended(),
             TableGuard::Write { guard } => guard.contended(),
         })
@@ -106,12 +105,13 @@ impl Writes {
         let mut guards = SmallVec::with_capacity(tids.len());
         for &tid in &tids {
             let lock = self.table_lock(tid);
-            guards.push(match exclusive {
+            let guard = match exclusive {
                 true => TableGuard::Write { guard: lock.write().await },
                 false => TableGuard::Read { guard: lock.read().await },
-            });
+            };
+            guards.push((tid, guard));
         }
-        HeldTables { tids, exclusive, guards }
+        HeldTables { guards }
     }
 
     /// OCC: whether `tid` committed a write after `basis`. `held`'s write guard on

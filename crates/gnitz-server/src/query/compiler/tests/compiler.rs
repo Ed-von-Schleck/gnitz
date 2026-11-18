@@ -150,7 +150,7 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
     let seeds = |op: Stage, source: Source, slot: Slot| {
         let out = compile_global(|c, a| _ = op(c, a), source, slot).expect("the fixture compiles");
         let reduces = out.vm.ops().filter_map(|op| match op {
-            Op::Reduce { plan, .. } => Some(plan.ground_row().is_some()),
+            Op::Reduce { plan, .. } => Some(plan.seeds_ground()),
             _ => None,
         });
         reduces.last().expect("a reduce")

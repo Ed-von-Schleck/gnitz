@@ -184,6 +184,12 @@ impl ReducePlan {
         })
     }
 
+    /// True iff the reduce is a global aggregate's, owing a row over an empty
+    /// input.
+    pub fn seeds_ground(&self) -> bool {
+        self.seeds_ground
+    }
+
     /// The row a global aggregate publishes over an empty input; `None` for a
     /// reduce that owes none.
     pub fn ground_row(&self) -> Option<Batch> {

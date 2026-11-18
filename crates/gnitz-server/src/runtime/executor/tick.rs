@@ -1,7 +1,6 @@
 //! Tick scheduling and read freshness: the task that ticks the views on
-//! request, the requests that wake it,
-//! and the read lock that asks for a drain when a read would otherwise miss a
-//! commit no tick has taken yet.
+//! request, and the read lock that asks for a drain when a read would
+//! otherwise miss a commit no tick has taken yet.
 
 use gnitz_foundation::gnitz_warn;
 use std::rc::Rc;
@@ -9,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::{CatalogLock, Shared, park_until};
 use crate::runtime::sal::SalExcl;
-use crate::runtime::sync::{Either, ReadGuard, chan, select2};
+use crate::runtime::sync::{Either, ReadGuard, select2};
 use gnitz_foundation::fault::Switch;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
@@ -23,58 +22,14 @@ static TICK_HOLD_FOR_DDL: Switch = Switch::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL")
 /// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
 const TICK_HOLD_MAX_POLLS: u32 = 10_000;
 
-/// The tick loop's handle and pacing.
-pub(super) struct Ticks {
-    /// The requests to [`tick_loop`]: tick whatever is pending, even nothing,
-    /// by the time sent. A commit that brings a tid to the row coalesce
-    /// threshold asks for a tick now; a drain asks for one by its deadline.
-    tx: chan::Sender<Instant>,
-    /// How long after a tick the next one waits for a request to fall due
-    /// (`GNITZ_PATIENT_TICK_GAP_MS`): a held sync is re-issued the moment it is
-    /// answered, so unpaced it would tick per commit.
-    patient_gap: Duration,
-    /// The pending rows of one table that fire an auto-tick.
-    /// `GNITZ_TICK_COALESCE_ROWS` lowers it, so tests reach it on small tables.
-    coalesce_rows: usize,
-}
-
-/// The requests [`tick_loop`] receives.
-pub(super) struct TickRequests(chan::Receiver<Instant>);
-
-impl Ticks {
-    /// The ticks' handle, and the requests [`tick_loop`] is to be spawned on.
-    pub(super) fn new() -> (Ticks, TickRequests) {
-        let (tx, rx) = chan::unbounded();
-        let ticks = Ticks {
-            tx,
-            patient_gap: Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10)),
-            coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
-        };
-        (ticks, TickRequests(rx))
-    }
-}
-
-impl Shared {
-    /// Credit `rows` against each tid's pending-tick count, and fire the
-    /// auto-tick when a tid stands at or above the coalesce threshold. Below
-    /// it a push only accumulates, and is taken by the next emit, whichever
-    /// task runs it. `laid_out` is the SAL hold the rows' groups were written
-    /// under.
-    pub(super) fn note_commit_rows(&self, laid_out: &SalExcl<'_>, rows: impl Iterator<Item = (u64, usize)>) {
-        for (tid, n) in rows {
-            self.dispatcher.credit(laid_out, tid, n);
-        }
-        if self.dispatcher.pending_reaches(self.ticks.coalesce_rows) {
-            self.ticks.tx.send(self.dispatcher.reactor().now());
-        }
-    }
-}
-
-/// One tick of everything pending per batch of requests. A batch is ticked
-/// once its first request is due, or [`Ticks::patient_gap`] after the loop's
-/// last tick where that is sooner.
-pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequests) {
+/// One tick of everything pending per batch of the dispatcher's tick requests.
+/// A batch is ticked once its first request is due, or `patient_gap` after the
+/// loop's last tick where that is sooner. `patient_gap`
+/// (`GNITZ_PATIENT_TICK_GAP_MS`) paces the loop: a held sync is re-issued the
+/// moment it is answered, so unpaced it would tick per commit.
+pub(super) async fn tick_loop(shared: Rc<Shared>, patient_gap: Duration) {
     let reactor = shared.dispatcher.reactor();
+    let mut rx = shared.dispatcher.tick_requests();
     let mut patient_from = reactor.now();
     loop {
         let mut due = patient_from;
@@ -101,7 +56,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequ
             }
             Ok(None) => {}
         }
-        patient_from = reactor.now() + shared.ticks.patient_gap;
+        patient_from = reactor.now() + patient_gap;
     }
 }
 
@@ -120,20 +75,15 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequ
 /// A failed tick is reported, not swallowed: its views are stale, and serving
 /// them under `WireStatus::Ok` is a silent stale read. Every emit holds the
 /// apply lock through its ACKs, so the drain also puts the read behind a tick
-/// already running.
+/// already running. A drain whose wait another task's emit answered leaves its
+/// request queued: the loop then ticks what was committed since.
 pub(super) async fn fresh_read_lock(
     shared: &Shared,
     targets: impl IntoIterator<Item = u64>,
     drain_by: Instant,
 ) -> Result<ReadGuard<CatalogLock>, WireFault> {
     if !shared.dispatcher.all_ticked(targets) {
-        // Wait for the next emit of everything pending. A request whose wait
-        // another task's emit answered stays queued: the loop then ticks what
-        // was committed since. No await between the two: the request is what
-        // guarantees the wait an answer.
-        let verdict = shared.dispatcher.next_emit();
-        shared.ticks.tx.send(drain_by);
-        verdict.await?;
+        shared.dispatcher.drain(drain_by).await?;
     }
     Ok(shared.catalog_rwlock.read().await)
 }

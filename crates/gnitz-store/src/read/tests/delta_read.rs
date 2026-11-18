@@ -292,12 +292,12 @@ fn reads_past_any_cursor_match_a_model() {
                 _ => (delta, HashMap::new()),
             };
             for part in [first, second].into_iter().filter(|part| !part.is_empty()) {
-                r.ingest_round(TID, batch(&part), round, false).unwrap();
+                r.ingest_round(TID, batch(&part), Some(round), false).unwrap();
                 log.push((round, part));
             }
             if rng.gen_range(5) == 0 {
                 let ghost: Row = (1, 1, 1, None, 1);
-                r.ingest_round(TID, batch([(&ghost, &2), (&ghost, &-2)]), round, false)
+                r.ingest_round(TID, batch([(&ghost, &2), (&ghost, &-2)]), Some(round), false)
                     .unwrap();
             }
 
@@ -387,9 +387,9 @@ fn reads_past_any_cursor_match_a_model() {
 fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
     let mut r = relation_fixture(fed_view(1 << 20), schema, &[], []);
-    r.ingest_round(TID, make_batch_raw(&schema, &[(7, 1, 70)]), 4, false)
+    r.ingest_round(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();
-    r.ingest_round(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), 5, false)
+    r.ingest_round(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
         .unwrap();
     let whole = || ReadSpec::all_rows(ReadBound::None);
     let read = |after_tick| batch_rows(&r.delta_read(TID, after_tick, whole(), schema.layout_digest()).unwrap());
@@ -400,9 +400,9 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
 
     let keys = pk_only_schema(&[TypeCode::U64]);
     let mut r = relation_fixture(fed_view(1 << 20), keys, &[], []);
-    r.ingest_round(TID, id_rows(&keys, [(7, 1)], |_, _| {}), 4, false)
+    r.ingest_round(TID, id_rows(&keys, [(7, 1)], |_, _| {}), Some(4), false)
         .unwrap();
-    r.ingest_round(TID, id_rows(&keys, [(7, -1), (8, 1)], |_, _| {}), 5, false)
+    r.ingest_round(TID, id_rows(&keys, [(7, -1), (8, 1)], |_, _| {}), Some(5), false)
         .unwrap();
     let b = r.delta_read(TID, 3, whole(), keys.layout_digest()).unwrap();
     let mut rows: Vec<_> = (0..b.len())
@@ -467,7 +467,7 @@ fn a_delta_read_reads_each_round_once_however_rounds_are_chunked() {
             })
             .collect();
         want.extend(rows.iter().copied().filter(|&(_, _, val)| val < 5));
-        r.ingest_round(TID, make_batch_raw(&schema, &rows), at as u64 + 2, false)
+        r.ingest_round(TID, make_batch_raw(&schema, &rows), Some(at as u64 + 2), false)
             .unwrap();
     }
     want.sort_unstable();

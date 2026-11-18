@@ -327,54 +327,34 @@ fn every_payload_shape_round_trips_and_no_prefix_decodes() {
     let fixed_rel = encode_schema_record(&fixed);
     let string_rel = encode_schema_record(strings.schema());
     let padded_rel = encode_schema_record(padded.schema());
-    /// A payload's blob, schema record and rows, beside the source batch and the
-    /// rows of it the payload sends, in the order it sends them.
-    type Shape<'a> = (
-        &'a [u8],
-        &'a [u8],
-        Option<WireRows<'a>>,
-        Option<(&'a Batch, Vec<usize>)>,
-    );
+    /// A payload's blob and rows, beside the source batch and the rows of it the
+    /// payload sends, in the order it sends them. A payload with rows has their
+    /// schema record as its blob.
+    type Shape<'a> = (&'a [u8], Option<WireRows<'a>>, Option<(&'a Batch, Vec<usize>)>);
     let shapes: [Shape<'_>; 7] = [
-        (b"", &[], None, None),
-        (b"a blob and no rows", &[], None, None),
+        (b"", None, None),
+        (b"a blob and no rows", None, None),
         (
-            b"",
             &fixed_rel,
             consolidated.wire_whole(),
             Some((&consolidated, whole(&consolidated))),
         ),
         // An empty batch has no rows to send.
-        (b"", &fixed_rel, empty.wire_whole(), None),
+        (&fixed_rel, empty.wire_whole(), None),
+        (&string_rel, strings.wire_whole(), Some((&strings, whole(&strings)))),
+        (&fixed_rel, Some(range), Some((&raw, vec![2, 3, 4]))),
         (
-            b"",
-            &string_rel,
-            strings.wire_whole(),
-            Some((&strings, whole(&strings))),
-        ),
-        (
-            b"rows behind a blob",
-            &fixed_rel,
-            Some(range),
-            Some((&raw, vec![2, 3, 4])),
-        ),
-        (
-            b"",
             &padded_rel,
             padded.as_mem_batch().wire_listed(&[6, 1, 3]),
             Some((&padded, vec![6, 1, 3])),
         ),
     ];
 
-    for (shape, (blob, record, data, sent)) in shapes.into_iter().enumerate() {
-        let wire = payload(blob, data.map(|d| (record, d)));
+    for (shape, (blob, data, sent)) in shapes.into_iter().enumerate() {
+        let wire = payload(blob, data);
         let (got_blob, got_rows) = payload_parse(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         assert_eq!(got_blob, blob, "shape {shape}");
-        assert_eq!(
-            got_rows.map(|(got_record, _)| got_record),
-            data.map(|_| record),
-            "shape {shape}"
-        );
+        assert_eq!(got_rows.is_some(), data.is_some(), "shape {shape}");
         let rows = sal_rows(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         match (sent, rows) {
             (None, None) => {}
@@ -389,7 +369,14 @@ fn every_payload_shape_round_trips_and_no_prefix_decodes() {
                 got.is_some()
             ),
         }
+        // A rows payload cut at the end of its blob is a payload without rows:
+        // a payload's extent comes from the digested directory, not from itself.
+        let blob_end = PAYLOAD_HEAD + blob.len();
         for cut in 0..wire.len() {
+            if data.is_some() && cut == blob_end {
+                assert_eq!(payload_parse(&wire[..cut]), Ok((blob, None)), "shape {shape}");
+                continue;
+            }
             assert!(
                 sal_rows(&wire[..cut]).is_err(),
                 "shape {shape}: a {cut}/{}-byte prefix decodes",
@@ -411,16 +398,11 @@ fn a_payload_with_bytes_it_does_not_declare_is_refused() {
     no_rows.push(0);
     assert!(
         sal_rows(&no_rows).is_err(),
-        "a byte past the blob of a payload without rows"
+        "a byte past the blob reads as a data block, which does not decode"
     );
 
-    let mut rows = payload(b"blob", Some((&record, batch.wire_whole().unwrap())));
+    let mut rows = payload(&record, Some(batch.wire_whole().unwrap()));
     assert!(sal_rows(&rows).expect("the payload decodes").is_some());
-    let block_at = PAYLOAD_HEAD + b"blob".len() + record.len();
-    assert!(
-        sal_rows(&rows[..block_at]).is_err(),
-        "a schema record with no data block behind it"
-    );
     rows.extend_from_slice(&[0; 8]);
     assert!(sal_rows(&rows).is_err(), "bytes past the data block");
 }
@@ -432,7 +414,7 @@ fn a_payload_lays_its_rows_out_under_the_known_schema_or_its_record() {
     let sd = make_schema_u64_i64();
     let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
     let junk = [0xFFu8; 12];
-    let wire = payload(&[], Some((&junk, batch.wire_whole().unwrap())));
+    let wire = payload(&junk, Some(batch.wire_whole().unwrap()));
     let got = payload_rows(&wire, |record| {
         assert_eq!(record, junk.as_slice());
         Some(sd)
@@ -444,7 +426,26 @@ fn a_payload_lays_its_rows_out_under_the_known_schema_or_its_record() {
     assert!(sal_rows(&wire).is_err(), "the junk record itself does not decode");
 
     let record = encode_schema_record(&sd);
-    let wire = payload(&[], Some((&record, batch.wire_whole().unwrap())));
+    let wire = payload(&record, Some(batch.wire_whole().unwrap()));
     let got = sal_rows(&wire).expect("the record decodes").expect("rows");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
+}
+
+/// A payload is its blob's length as a little-endian `u64`, the blob, then the
+/// data block. The bytes are pinned: a change to them moves `SAL_LAYOUT`.
+#[test]
+fn a_payload_is_its_blob_length_the_blob_and_the_block() {
+    let sd = make_schema_u64_i64();
+    let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
+    let record = encode_schema_record(&sd);
+    let rows = batch.wire_whole().unwrap();
+    let mut block = vec![0; rows.byte_size()];
+    rows.encode(&mut block);
+
+    let wire = payload(&record, Some(rows));
+    let mut want = (record.len() as u64).to_le_bytes().to_vec();
+    want.extend_from_slice(&record);
+    want.extend_from_slice(&block);
+    assert_eq!(wire, want, "the payload layout moved: bump `SAL_LAYOUT`");
+    assert_eq!(payload(b"abc", None), [3, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c']);
 }

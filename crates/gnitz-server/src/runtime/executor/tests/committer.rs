@@ -195,7 +195,7 @@ fn a_push_merges_behind_the_last_write_to_its_table() {
 fn workerless_committer(engine: CatalogEngine) -> (Rc<Shared>, impl Sized) {
     let (dispatcher, _) = test_dispatcher(0, engine);
     let reactor = dispatcher.reactor().clone();
-    let (shared, requests, _, asks) = Shared::new(dispatcher, Duration::ZERO, None);
+    let (shared, requests, asks) = Shared::new(dispatcher, Duration::ZERO, None);
     reactor.spawn(run(requests, Rc::clone(&shared)));
     (shared, asks)
 }
@@ -242,7 +242,7 @@ fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
         let reactor = shared.dispatcher.reactor();
         reactor.block_on(async {
             let laid_out = shared.dispatcher.sal().lock().await;
-            shared.note_commit_rows(&laid_out, [(t, 1)].into_iter());
+            shared.dispatcher.credit(&laid_out, t, 1);
         });
 
         let mut read = std::pin::pin!(fresh_read_lock(&shared, [v], reactor.now()));

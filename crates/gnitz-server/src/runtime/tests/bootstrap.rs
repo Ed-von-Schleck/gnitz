@@ -232,7 +232,7 @@ fn a_tail_lands_above_the_cut_of_a_scanned_table() {
     assert!(engine.boot.rebuild.contains(&v_rejected));
     // The boot's order: the rebuild reads its source at the cut, then the tick
     // brings the tail.
-    crate::query::backfill(&mut engine, v_rejected).unwrap();
+    crate::query::backfill(&mut engine, &[v_rejected]).unwrap();
     assert!(held(&engine, v_rejected).is_empty(), "the tail is above the cut");
     crate::query::tick(&mut engine, rejected, 2).unwrap();
     assert_eq!(held(&engine, v_rejected), rows, "each tail row once");

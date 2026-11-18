@@ -4,6 +4,7 @@
 use gnitz_foundation::{gnitz_debug, gnitz_info, gnitz_note, gnitz_warn};
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
+use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -12,7 +13,7 @@ use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
 use crate::runtime::reactor::AckWait;
 use crate::runtime::sal::{Apply, SalFull, SalScope};
-use crate::runtime::sync::{WriteGuard, oneshot};
+use crate::runtime::sync::{WriteGuard, chan, oneshot};
 use gnitz_foundation::fault::Switch;
 use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::MemBatch;
@@ -52,10 +53,20 @@ pub(super) struct TickLedger {
     next_watch: Cell<u64>,
     /// The waits for the verdict of the next emit.
     drains: RefCell<Vec<oneshot::Sender<Result<(), WireFault>>>>,
+    /// The requests to the tick loop: tick whatever is pending, even nothing,
+    /// by the time sent. A credit that brings a tid to `coalesce_rows` asks for
+    /// a tick now; a drain asks for one by its deadline.
+    requests: chan::Sender<Instant>,
+    /// The receiving end of `requests`, until the tick loop takes it.
+    inbox: Cell<Option<chan::Receiver<Instant>>>,
+    /// The pending rows of one relation that fire an auto-tick.
+    /// `GNITZ_TICK_COALESCE_ROWS` lowers it, so tests reach it on small tables.
+    pub(super) coalesce_rows: usize,
 }
 
 impl TickLedger {
     pub(super) fn new(last_lsn: u64) -> Self {
+        let (requests, inbox) = chan::unbounded();
         TickLedger {
             round: Cell::new(1),
             last_tick: RefCell::default(),
@@ -65,6 +76,9 @@ impl TickLedger {
             watches: RefCell::default(),
             next_watch: Cell::new(0),
             drains: RefCell::default(),
+            requests,
+            inbox: Cell::new(Some(inbox)),
+            coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
         }
     }
 
@@ -124,31 +138,22 @@ impl MasterDispatcher {
     /// moves no base store, the generation stands, and the ephemeral round
     /// republishes only the stores whose manifests changed.
     ///
-    /// Once its ACKs are in, the round flushes the system tables and rewinds the
-    /// SAL into the next epoch, under the hold its `Flush` was written under,
-    /// then removes every directory no live entity owns.
+    /// The round makes the system tables durable first, then writes its
+    /// `Flush`; once the ACKs are in it rewinds the SAL into the next epoch
+    /// under the hold the `Flush` was written under, then removes every
+    /// directory no live entity owns.
     ///
-    /// Every failure ends the process. A failed system flush leaves the log
-    /// unrewound, as the log's entries are those rows' only durable copy, while
-    /// the workers that ACKed the `Flush` have moved into the next epoch: no
-    /// group written after it would reach them, and only a restart's replay
-    /// repairs that.
+    /// Every failure ends the process; a failed system flush ends it before any
+    /// worker leaves the epoch.
     pub(crate) async fn checkpoint_base(&self, alone: &WriteGuard<ApplyLock>) {
         let mut excl = self.sal.lock().await;
-        if self.sal.holds_pushes()
-            && let Err(e) = self.cat_mut().advance_durable_generation()
-        {
-            gnitz_fatal_abort!("checkpoint generation advance failed: {e}");
+        if let Err(e) = self.cat_mut().flush_ahead_of_base_round(self.sal.holds_pushes()) {
+            gnitz_fatal_abort!("checkpoint system flush failed: {e}");
         }
         let wait = self
             .write_acked(alone, &mut excl, Apply::Flush)
             .unwrap_or_else(|e| gnitz_fatal_abort!("checkpoint Flush refused: {e}"));
         wait.acks().await;
-        if let Err(e) = self.cat_mut().flush_all_system_tables() {
-            gnitz_fatal_abort!(
-                "system flush after the checkpoint Flush failed; the workers left the epoch and the log was not rewound: {e}"
-            );
-        }
         let epoch = excl.checkpoint_reset();
         gnitz_note!("SAL checkpoint epoch={epoch}");
         // Every worker ACKed the Flush, so each has applied every DdlSync written
@@ -248,26 +253,36 @@ impl MasterDispatcher {
     // Tick ledger
     // -----------------------------------------------------------------------
 
-    /// Credit `rows` against `tid`'s pending-tick count, when a view scans
-    /// `tid`. Its first commit since the emit that last took it wakes the
-    /// watches naming it. `_laid_out` is the SAL hold the rows' groups were
-    /// written under.
-    pub(crate) fn credit(&self, _laid_out: &SalExcl<'_>, tid: u64, rows: usize) {
-        if !self.cat().dag.is_scanned(tid) {
-            return;
-        }
-        match self.ticks.pending.borrow_mut().entry(tid) {
-            Entry::Occupied(mut e) => *e.get_mut() += rows,
-            Entry::Vacant(e) => {
-                e.insert(rows);
-                self.ticks.wake(tid);
-            }
+    /// [`Self::owe`] `rows` to `tid` when a view scans `tid`: the credit of
+    /// rows whose landing and credit are decided under one hold.
+    pub(crate) fn credit(&self, laid_out: &SalExcl<'_>, tid: u64, rows: usize) {
+        if self.cat().dag.is_scanned(tid) {
+            self.owe(laid_out, tid, rows);
         }
     }
 
-    /// True when some relation has `rows` or more pending.
-    pub(crate) fn pending_reaches(&self, rows: usize) -> bool {
-        self.ticks.pending.borrow().values().any(|&n| n >= rows)
+    /// Credit `rows` that landed above the cut while a view scanned `tid`,
+    /// whether or not one still does, against `tid`'s pending-tick count. Its
+    /// first commit since the emit that last took it wakes the watches naming
+    /// it. A credit that brings `tid` to the coalesce threshold asks the tick
+    /// loop for a tick now; below it the rows only accumulate, and are taken by
+    /// the next emit, whichever task runs it. `_laid_out` is the SAL hold the
+    /// rows' groups were written under.
+    pub(crate) fn owe(&self, _laid_out: &SalExcl<'_>, tid: u64, rows: usize) {
+        let n = match self.ticks.pending.borrow_mut().entry(tid) {
+            Entry::Occupied(mut e) => {
+                *e.get_mut() += rows;
+                *e.get()
+            }
+            Entry::Vacant(e) => {
+                e.insert(rows);
+                self.ticks.wake(tid);
+                rows
+            }
+        };
+        if n >= self.ticks.coalesce_rows {
+            self.ticks.requests.send(self.reactor.now());
+        }
     }
 
     /// True when none of `relations` has a commit no emitted tick has taken.
@@ -308,10 +323,19 @@ impl MasterDispatcher {
         }
     }
 
-    /// The verdict of the next [`Self::emit_tick`], whichever task runs it.
-    pub(crate) fn next_emit(&self) -> oneshot::Receiver<Result<(), WireFault>> {
+    /// The requests the tick loop receives: tick whatever is pending by the
+    /// time sent. Taken once.
+    pub(crate) fn tick_requests(&self) -> chan::Receiver<Instant> {
+        self.ticks.inbox.take().expect("one tick loop takes the requests")
+    }
+
+    /// The verdict of the next [`Self::emit_tick`], whichever task runs it,
+    /// with a tick asked of the tick loop by `by`, so that some emit answers
+    /// it.
+    pub(crate) fn drain(&self, by: Instant) -> oneshot::Receiver<Result<(), WireFault>> {
         let (done, verdict) = oneshot::channel();
         self.ticks.drains.borrow_mut().push(done);
+        self.ticks.requests.send(by);
         verdict
     }
 
@@ -321,7 +345,7 @@ impl MasterDispatcher {
     /// refused emit leaves every relation pending and takes no round.
     ///
     /// The tids and the watermark are read under the hold [`Self::credit`] is
-    /// called under, so they are of the same commits. Every [`Self::next_emit`]
+    /// called under, so they are of the same commits. Every [`Self::drain`]
     /// is answered with the emit's verdict, at the emit and not its ACKs: its
     /// reader's scan follows the Tick group in the SAL. The answer shares no
     /// await with the read of what is pending, so every commit pending when the

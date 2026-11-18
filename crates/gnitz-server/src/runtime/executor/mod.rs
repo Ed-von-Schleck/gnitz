@@ -35,7 +35,6 @@ use self::committer::{CommitRequests, Committer};
 use self::ddl::{allocate_ids, handle_ddl_txn, reserve_serial_range};
 use self::delta::{Feeds, Subscriptions, handle_delta_poll};
 use self::snapshot::HeldSnapshots;
-use self::tick::{TickRequests, Ticks};
 use self::write::{Writes, handle_push, handle_push_txn};
 use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
@@ -77,7 +76,6 @@ struct Shared {
     dispatcher: MasterDispatcher,
     committer: Committer,
     catalog_rwlock: AsyncRwLock<CatalogLock>,
-    ticks: Ticks,
     writes: Writes,
     feeds: Feeds,
     /// How long a connection may take from accept to its HELLO, handshake
@@ -93,33 +91,26 @@ struct Shared {
 
 impl Shared {
     /// The state of an executor over `dispatcher`, and the request queues of
-    /// its committer, its tick loop and its delta pump.
+    /// its committer and its delta pump.
     fn new(
         dispatcher: MasterDispatcher,
         hello_timeout: Duration,
         backup_dir: Option<String>,
-    ) -> (
-        Rc<Shared>,
-        CommitRequests,
-        TickRequests,
-        chan::Receiver<oneshot::Sender<()>>,
-    ) {
+    ) -> (Rc<Shared>, CommitRequests, chan::Receiver<oneshot::Sender<()>>) {
         let boot_seed = dispatcher.sal().watermark();
         let (committer, committer_rx) = Committer::new();
-        let (ticks, tick_rx) = Ticks::new();
         let (feeds, asks) = Feeds::new();
         let shared = Rc::new(Shared {
             dispatcher,
             committer,
             catalog_rwlock: AsyncRwLock::default(),
-            ticks,
             writes: Writes::new(boot_seed),
             feeds,
             hello_timeout,
             last_snapshot: Cell::new(0),
             backup_dir,
         });
-        (shared, committer_rx, tick_rx, asks)
+        (shared, committer_rx, asks)
     }
 
     fn cat(&self) -> Ref<'_, CatalogEngine> {
@@ -147,7 +138,8 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
         "GNITZ_HELLO_TIMEOUT_MS",
         (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
     ));
-    let (shared, committer_rx, tick_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
+    let patient_gap = Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10));
+    let (shared, committer_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
 
     let signals = signals::Signals::open();
     // Past the last env knob the boot reads, so one it refuses stops the
@@ -161,7 +153,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     for listener in listeners {
         reactor.spawn(accept_loop(Rc::clone(&shared), listener));
     }
-    reactor.spawn(tick::tick_loop(Rc::clone(&shared), tick_rx));
+    reactor.spawn(tick::tick_loop(Rc::clone(&shared), patient_gap));
     reactor.spawn(delta::pump(Rc::clone(&shared), asks));
 
     serve_until_signalled(&shared, tls.as_deref(), signals).await

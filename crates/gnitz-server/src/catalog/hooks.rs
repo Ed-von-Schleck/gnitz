@@ -63,8 +63,8 @@ impl CatalogEngine {
                             self.qualified_name(src)
                         ));
                     }
-                    // A segment keeps its rows only for the build of its chain, so only
-                    // that chain may scan it — and a capacity-bounded view, which
+                    // A segment holds no rows, so only its chain, which receives its
+                    // deltas, may scan it — and a capacity-bounded view, which
                     // recomputes a key from the rows of what it scans, not at all.
                     let holder = self.dag.chain_of(src);
                     if holder != src && (holder != chain || rel.kind().is_bounded()) {

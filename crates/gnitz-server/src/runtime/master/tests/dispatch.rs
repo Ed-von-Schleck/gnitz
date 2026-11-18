@@ -166,10 +166,9 @@ fn an_emit_ticks_what_is_pending_and_answers_its_waits() {
     disp.credit(&disp.sal().excl(), t, 3);
     disp.credit(&disp.sal().excl(), t, 4);
     disp.credit(&disp.sal().excl(), u, 9);
-    assert!(disp.pending_reaches(7) && !disp.pending_reaches(8));
     assert!(disp.none_pending([u]), "no view scans `u`");
 
-    let mut verdict = disp.next_emit();
+    let mut verdict = disp.drain(disp.reactor().now());
     let wait = disp.reactor().block_on(disp.emit_tick(&alone)).unwrap();
     assert!(wait.is_some(), "a group was written");
     assert!(matches!(try_poll_once(&mut verdict), Some(Ok(()))));
@@ -188,12 +187,48 @@ fn an_emit_ticks_what_is_pending_and_answers_its_waits() {
 
     disp.ticks.last_lsn.set(u64::MAX);
     let cursor = disp.sal().cursor();
-    let mut verdict = disp.next_emit();
+    let mut verdict = disp.drain(disp.reactor().now());
     assert!(disp.reactor().block_on(disp.emit_tick(&alone)).unwrap().is_none());
     assert!(matches!(try_poll_once(&mut verdict), Some(Ok(()))));
     assert_eq!(disp.sal().cursor(), cursor, "nothing to tick writes no group");
     assert_eq!(disp.last_lsn(), disp.sal().watermark());
     drop(alone);
+    disp.into_catalog().close();
+}
+
+/// A credit that brings a scanned relation to the coalesce threshold asks for
+/// a tick now, and one below it, or of a relation no view scans, asks for
+/// none. A drain asks for a tick by its deadline, and is answered by the next
+/// emit.
+#[test]
+fn a_credit_reaching_the_coalesce_threshold_or_a_drain_requests_a_tick() {
+    use crate::test_support::{register_identity_view, table_engine, u64_i64_cols};
+    use std::time::Duration;
+
+    let cols = u64_i64_cols();
+    let (_dir, mut engine, t) = table_engine(1, &cols);
+    let u = engine.create_table("public.u", &cols, &[0]).unwrap();
+    register_identity_view(&mut engine, t, "v", &cols);
+    let (disp, _) = test_dispatcher(1, engine);
+    let mut requests = disp.tick_requests();
+    let n = disp.ticks.coalesce_rows;
+
+    disp.credit(&disp.sal().excl(), t, n - 1);
+    assert_eq!(requests.try_recv(), None, "below the threshold");
+    disp.credit(&disp.sal().excl(), t, 1);
+    assert!(requests.try_recv().is_some(), "at the threshold");
+    assert_eq!(requests.try_recv(), None, "one request");
+    disp.credit(&disp.sal().excl(), u, n);
+    assert_eq!(requests.try_recv(), None, "no view scans `u`");
+
+    let by = disp.reactor().now() + Duration::from_secs(1);
+    let mut verdict = disp.drain(by);
+    assert_eq!(requests.try_recv(), Some(by));
+    assert!(try_poll_once(&mut verdict).is_none(), "no emit has run");
+    let alone = disp.alone();
+    let wait = disp.reactor().block_on(disp.emit_tick(&alone)).unwrap();
+    assert!(matches!(try_poll_once(&mut verdict), Some(Ok(()))));
+    drop((wait, alone));
     disp.into_catalog().close();
 }
 
@@ -344,8 +379,8 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         .unwrap();
         n
     };
-    let record = engine.wire_target(tid).unwrap().1.clone();
-    let sal_record = engine.sal_target(tid).unwrap().1.clone();
+    let record = engine.wire_target(tid).unwrap().1.to_vec();
+    let sal_record = engine.sal_target(tid).unwrap().1.to_vec();
     let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
 
     refused_then_applied(
@@ -353,8 +388,8 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         add,
         |disp| {
             assert_eq!(width(&disp.cat()), 2, "the refused ADD COLUMN leaves the schema");
-            assert_eq!(disp.cat().wire_target(tid).unwrap().1, &record);
-            assert_eq!(disp.cat().sal_target(tid).unwrap().1, &sal_record);
+            assert_eq!(disp.cat().wire_target(tid).unwrap().1, &record[..]);
+            assert_eq!(disp.cat().sal_target(tid).unwrap().1, &sal_record[..]);
             assert_eq!(scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(), col_rows);
         },
         |disp| {

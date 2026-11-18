@@ -397,7 +397,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     let clustered = Source::from(schema).placed(Placement::keyed(&schema, 1));
     let inherited = clustered.placement;
     let replicated = clustered.placed(Placement::Replicated);
-    let cases: [(&str, Build, [Source; 2], Placement); 16] = [
+    let cases: [(&str, Build, [Source; 2], Placement); 15] = [
         (
             "a bare scan re-emits its source's PK region",
             |c| _ = scan(c, 7),
@@ -471,15 +471,6 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             },
             [replicated; 2],
             Placement::Replicated,
-        ),
-        (
-            "a replicated source beside a keyed one",
-            |c| {
-                let (a, b) = (scan(c, 7), scan(c, 9));
-                c.union(a, b);
-            },
-            [replicated, clustered],
-            Placement::Local,
         ),
         (
             "a source whose rows no key places",
@@ -581,7 +572,7 @@ fn equi_on_3(c: &mut Circuit) -> NodeId {
 /// owner would miss them.
 #[test]
 fn rows_left_off_their_keys_owner_place_the_view_by_no_key() {
-    let cases: [(&str, Build, Placement); 5] = [
+    let cases: [(&str, Build, Placement); 4] = [
         (
             "a join beside a scan relayed by a payload column",
             |c| {
@@ -620,20 +611,50 @@ fn rows_left_off_their_keys_owner_place_the_view_by_no_key() {
             },
             Placement::Keyed { dist_stride: 8 },
         ),
-        (
-            "a pure-range join of broadcast deltas is computed whole on every worker",
-            |c| {
-                let deltas = [7, 9].map(|s| scan_routed(c, s, &u64_slots(&[3]), 0));
-                c.join(deltas, deltas, RANGE);
-            },
-            Placement::Local,
-        ),
     ];
     let registry = of_four([7, 9, 11].map(|s| (s, wide_u64())));
     for (why, build, want) in cases {
         let mut c = Circuit::default();
         build(&mut c);
         assert_eq!(placed(&c, &registry).expect(why), want, "{why}");
+    }
+}
+
+/// Rows every worker computes are an identical full copy on each, so the view
+/// is replicated; beside rows one worker holds, a read gathering every worker's
+/// rows would count them once per worker, so the circuit is refused at any
+/// worker count.
+#[test]
+fn rows_every_worker_computes_are_a_full_copy_never_counted_beside_a_slice() {
+    let mut c = Circuit::default();
+    let deltas = [7, 9].map(|s| scan_routed(&mut c, s, &u64_slots(&[3]), 0));
+    c.join(deltas, deltas, RANGE);
+    let registry = of_four([7, 9, 11].map(|s| (s, wide_u64())));
+    assert_eq!(placed(&c, &registry).unwrap(), Placement::Replicated);
+
+    let cases: [(&str, Build); 2] = [
+        ("a union of a replicated scan and a keyed one", |c| {
+            let (a, b) = (scan(c, 7), scan(c, 9));
+            c.union(a, b);
+        }),
+        ("a cross join whose one term meets two whole operands", |c| {
+            let [a, b] = [7, 9].map(|s| c.input_scattered(s, ReadBound::None, Some(vec![])).unwrap());
+            let ib = c.shard(b);
+            c.join([a, b], [a, ib], JoinKind::Cross);
+        }),
+    ];
+    let replicated = Source::from(wide_u64()).placed(Placement::Replicated);
+    for slot in [Slot::new(0, 4), Slot::SOLO] {
+        let registry = sources_at(slot, [(7, replicated), (9, wide_u64().into())]);
+        for (why, build) in cases {
+            let mut c = Circuit::default();
+            build(&mut c);
+            assert_eq!(
+                rejection(compile(&c, &registry, false)),
+                "rows every worker computes beside rows one worker holds",
+                "{why}"
+            );
+        }
     }
 }
 

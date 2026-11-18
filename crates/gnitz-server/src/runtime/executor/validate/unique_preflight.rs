@@ -39,9 +39,9 @@ impl PreflightKeyStream<'_> {
 
 /// Streaming k-way merge over the workers' sorted span trains, holding one frame's
 /// spans per worker. Equal spans pop adjacently whether one worker or two hold
-/// them, so the first adjacent equal pair is a duplicate: `None`, the rest of the
-/// trains left for the lease drop. Otherwise the filter of every distinct span.
-async fn merge_index_scan(scan: Train<'_>, frame_schema: &SchemaDescriptor) -> Result<Option<UniqueFilter>, WireFault> {
+/// them, so the first adjacent equal pair is a duplicate: `true`, the rest of the
+/// trains left for the lease drop.
+async fn merge_index_scan(scan: Train<'_>, frame_schema: &SchemaDescriptor) -> Result<bool, WireFault> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -58,19 +58,18 @@ async fn merge_index_scan(scan: Train<'_>, frame_schema: &SchemaDescriptor) -> R
         }
     }
 
-    let (mut seed, mut prev) = (UniqueFilter::new(), None);
+    let mut prev = None;
     while let Some(Reverse((key, i))) = heap.pop() {
         // Spans are byte-equal iff value-equal.
         if prev == Some(key) {
-            return Ok(None);
+            return Ok(true);
         }
         prev = Some(key);
-        seed.insert(key.pk_bytes());
         if let Some(next) = streams[i].next_key(frame_schema).await? {
             heap.push(Reverse((next, i)));
         }
     }
-    Ok(Some(seed))
+    Ok(false)
 }
 
 /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:
@@ -78,31 +77,28 @@ async fn merge_index_scan(scan: Train<'_>, frame_schema: &SchemaDescriptor) -> R
 /// filled from its committed partition, and streams its spans back off it,
 /// sorted; the master's streaming k-way merge (`merge_index_scan`) finds any
 /// adjacent equal pair, within or across partitions — which no worker's own
-/// slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
+/// slice can show. Master memory is `O(num_workers)`.
 ///
 /// Runs under the DDL's catalog write, before the zone is laid out, so the index
 /// each worker filled is the one its catalog claim adopts; the caller releases
 /// every claim it leaves. The DDL's hold of the apply lock keeps a checkpoint's
 /// sweep off the claimed directory meanwhile.
-///
-/// `Some(filter)` seeds the index's unique filter; `None` when the
-/// index covers the owner's PK and so can never collide.
 pub(in crate::runtime::executor) async fn validate_unique_index_create(
     disp: &MasterDispatcher,
     owner_id: u64,
     cols: PkColList,
-) -> Result<Option<UniqueFilter>, WireFault> {
+) -> Result<(), WireFault> {
     let spec = {
         let cat = disp.cat();
         let Some(owner_schema) = cat.registry.relation(owner_id).map(Relation::schema) else {
             // Created in this same bundle, so empty.
-            return Ok(Some(UniqueFilter::new()));
+            return Ok(());
         };
         // What the IDX_TAB precheck refuses is refused before any scan.
         let spec = cat.validate_index_create(owner_id, cols.as_slice(), true)?;
         // A PK-covering index skips the scan, and every check it would ever plan.
         if owner_schema.covers_pk(cols.as_slice()) {
-            return Ok(None);
+            return Ok(());
         }
         spec
     };
@@ -112,15 +108,15 @@ pub(in crate::runtime::executor) async fn validate_unique_index_create(
     // pop each value `nw` times.
     let mut lease = disp.scan(Read::KeySpans { tid: owner_id, cols, claim: true }).await?;
 
-    let Some(seed) = merge_index_scan(lease.next_train().await, &frame_schema).await? else {
+    if merge_index_scan(lease.next_train().await, &frame_schema).await? {
         let cat = disp.cat();
         return Err(integrity_violation(format!(
             "cannot create unique index on '{}' column '{}': column contains duplicate values",
             cat.qualified_name(owner_id),
             cat.column_names(owner_id, cols.as_slice()),
         )));
-    };
-    Ok(Some(seed))
+    }
+    Ok(())
 }
 
 #[cfg(test)]

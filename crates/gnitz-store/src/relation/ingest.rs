@@ -172,10 +172,17 @@ impl RelationRegistry {
     /// [`Self::ingest`], without its seal of pending rows (a view holds none:
     /// [`Self::ingest_with`] refuses one), of one round of view `id`'s
     /// output, captured as round `round` by the delta feed this process serves
-    /// for it; the batch as applied comes back iff `echo` and it holds a row.
+    /// for it, and by none where `round` is `None`; the batch as applied comes
+    /// back iff `echo` and it holds a row.
     #[inline]
-    pub fn ingest_round(&mut self, id: u64, batch: Batch, round: u64, echo: bool) -> Result<Option<Batch>, String> {
-        let landing = Landing::Cut { round: Some(round), echo };
+    pub fn ingest_round(
+        &mut self,
+        id: u64,
+        batch: Batch,
+        round: Option<u64>,
+        echo: bool,
+    ) -> Result<Option<Batch>, String> {
+        let landing = Landing::Cut { round, echo };
         self.relation_mut_or_err(id)?.apply(batch, landing, PkRule::Enforce)
     }
 

@@ -176,10 +176,8 @@ impl Session {
         let mut views = applied.created_views;
         // Ascending id order is dependency order.
         views.sort_unstable();
-        for view in views {
-            crate::query::backfill(&mut self.cat, view)
-                .unwrap_or_else(|e| panic!("the backfill of new view {view} failed: {e}"));
-        }
+        crate::query::backfill(&mut self.cat, &views)
+            .unwrap_or_else(|e| panic!("the backfill of new views {views:?} failed: {e}"));
         applied.held_above.into_iter().for_each(|family| self.tick(family));
     }
 

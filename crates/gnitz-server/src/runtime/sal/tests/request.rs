@@ -103,7 +103,7 @@ fn every_request_decodes_from_its_written_group() {
         let decoded = SalRequest::decode(&msg.head.request, blob);
         assert_eq!(decoded.as_ref(), Ok(request));
         assert_eq!(msg.head.request, group.request);
-        let carries_rows = matches!(group.data, Payloads::Shared(Some(_)) | Payloads::EachRows(..));
+        let carries_rows = matches!(group.data, Payloads::Shared(Some(_)) | Payloads::EachRows(_));
         assert_eq!(rows.is_some(), carries_rows, "{request:?}");
     }
 }

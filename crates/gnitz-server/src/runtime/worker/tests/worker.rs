@@ -106,7 +106,7 @@ fn in_wait_dispositions() {
     engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let record = engine.sal_target(tid).unwrap().1.clone();
+    let record = engine.sal_target(tid).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -193,7 +193,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let record = engine.sal_target(tid).unwrap().1.clone();
+    let record = engine.sal_target(tid).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -338,13 +338,9 @@ fn exchange_answers_the_rounds_verdict() {
 #[test]
 fn a_train_advances_with_every_request() {
     const GROUPS: usize = 5;
-    let fixed = make_schema_u64_i64();
-    let rows = make_batch_raw(&fixed, &(0..40).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let (mut wp, sal, rx) = test_worker(&mut engine);
-    wp.replies
-        .set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
-    wp.replies.reply(route(1, 11), Ok(Rows::from(rows)));
+    queue_train(&mut wp);
 
     for _ in 0..GROUPS {
         // Control-only and unanswered: nothing of its own reaches the ring.
@@ -353,6 +349,53 @@ fn a_train_advances_with_every_request() {
     wp.drain_sal(false);
     assert_eq!(reqs(&frames(&rx)), [11; GROUPS + 1]);
     assert_eq!(owed(&wp.replies), [("train", 11)], "ten frames, six sent");
+}
+
+/// A train queued for a 40-row reply, cut into frames of four rows.
+fn queue_train(wp: &mut WorkerProcess) {
+    let fixed = make_schema_u64_i64();
+    let rows = make_batch_raw(&fixed, &(0..40).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    wp.replies
+        .set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
+    wp.replies.reply(route(1, 11), Ok(Rows::from(rows)));
+}
+
+/// An exchange wait whose round is still out sends a frame of a queued train
+/// with nothing on the SAL.
+#[test]
+fn a_train_advances_in_a_wait_with_nothing_on_the_sal() {
+    let (_dir, mut engine, _) = table_engine(1, &u64_i64_cols());
+    let (mut wp, _sal, rx) = test_worker(&mut engine);
+    queue_train(&mut wp);
+    assert!(frames(&rx).is_empty(), "the reply is owed");
+
+    drain_in_wait(&mut wp);
+    assert_eq!(reqs(&frames(&rx)), [11]);
+    assert_eq!(owed(&wp.replies), [("train", 11)]);
+}
+
+/// An exchange wait with a seal of its `Tick` group still ahead sends a frame
+/// of a queued train and serves none of the SAL: the push stays on it.
+#[test]
+fn a_wait_behind_a_seal_sends_but_serves_nothing() {
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
+    let schema = make_schema_u64_i64();
+    let record = engine.sal_target(tid).unwrap().1.to_vec();
+    let row = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let (mut wp, sal, rx) = test_worker(&mut engine);
+    queue_train(&mut wp);
+    sal.excl()
+        .push(tid, &record, Routed::Same(row.wire_whole()))
+        .expect("group fits");
+
+    wp.seals_ahead = true;
+    drain_in_wait(&mut wp);
+    assert_eq!(reqs(&frames(&rx)), [11]);
+    assert!(
+        weighted_rows(&scan_all(wp.catalog, tid)).is_empty(),
+        "the push is not applied"
+    );
+    assert!(!wp.sal_reader.is_empty(), "the push is still on the SAL");
 }
 
 /// The pre-flight's span read enters the index under its claim, filled from the
@@ -410,7 +453,7 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     let (v1, counts) = register_count_of(&mut engine, t1, &schema, &[1], "v1");
     register_count_of(&mut engine, v1, counts.output_schema(), &[], "total");
     let v2 = register_identity_view(&mut engine, t2, "v2", &cols);
-    let record = engine.sal_target(t2).unwrap().1.clone();
+    let record = engine.sal_target(t2).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     engine
         .registry

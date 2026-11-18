@@ -464,40 +464,80 @@ fn segment_view_tick_bench() {
     let matches = rows(&engine, u, 1, 0..2 * KEYS, |id| [id % KEYS]);
     engine.registry.ingest(u, matches).unwrap();
 
-    // A segment is a view whose row names an owner, a user view created with it.
-    let segment = engine.allocate_ids(2).unwrap();
-    let view = segment + 1;
-    let joined = [
-        col_def("k", TypeCode::U64),
-        col_def("t_id", TypeCode::U64),
-        col_def("u_id", TypeCode::U64),
-    ];
-    let joined_schema =
-        crate::test_support::u64_pk_schema(&[gnitz_zset::schema::SchemaColumn::new(TypeCode::U64, false); 2]);
-    let aggs = [
-        AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
-        AggDescriptor::COUNT_STAR,
-    ];
-    let reduced = *gnitz_zset::stream::ReducePlan::from_wire(&joined_schema, &[0], &aggs, false)
-        .unwrap()
-        .output_schema();
-    let mut circuit = Circuit::default();
-    let scan = circuit.input_delta(segment, ReadBound::None);
-    circuit.reduce_local(scan, GroupAggs { group_cols: vec![0], aggs: aggs.to_vec() });
-    let segment_row = ViewTabRow {
-        owner_view_id: view,
-        ..view_tab_row(segment, "_segment")
-    };
-    let rows = sys_batch([(segment_row, 1), (view_tab_row(view, "reduced"), 1)]);
-    let join = two_term_join_circuit(t, u, TypeCode::U64);
-    let reduced_cols = cols_of(&reduced);
-    let created = [(segment, &join, &joined[..]), (view, &circuit, &reduced_cols[..])];
-    crate::test_support::apply_ddl(&mut engine, view_blocks(created, rows)).unwrap();
-    backfill(&mut engine, segment);
-    backfill(&mut engine, view);
+    let (segment, view) = crate::test_support::join_chain_under_a_reduce(&mut engine, t, u);
+    backfill_set(&mut engine, &[segment, view]);
 
     let ticks = wide_ticks(&mut engine, &counter, t, 0, false, |id| [mix(id) % KEYS]);
     assert_eq!(net_weight(&engine, segment), 0, "the segment stored no tick");
     assert_eq!(net_weight(&engine, view) as u64, KEYS, "a group a key");
     println!("segment into a reduce: {WIDE_TICK_ROWS}-row ticks {ticks:>6.1} instr/row");
+}
+
+/// The backfill of a chain, its segment and its owner as one set, over
+/// `BACKFILL_ROWS` rows of `t`: a join of `t` with two rows of `u` a key under
+/// `SELECT k, SUM(t_id), COUNT(*) … GROUP BY k`, where the segment emits twice
+/// its input; and `t` filtered to one row in a hundred under a join of it with
+/// `u`, one row a key, where the segment emits a hundredth of it.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn chain_backfill_bench() {
+    const KEYS: u64 = 1_000;
+    let counter = perf::Counter::instructions();
+    let two = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let joined = [
+        col_def("k", TypeCode::U64),
+        col_def("a_id", TypeCode::U64),
+        col_def("b_id", TypeCode::U64),
+    ];
+
+    // A fanout-2 join segment under a reduce.
+    let (_dir, mut engine) = empty_catalog(1);
+    let t = engine.create_table("public.t", &two, &[0]).unwrap();
+    let u = engine.create_table("public.u", &two, &[0]).unwrap();
+    engine
+        .registry
+        .ingest(u, rows(&engine, u, 1, 0..2 * KEYS, |id| [id % KEYS]))
+        .unwrap();
+    engine
+        .registry
+        .ingest(t, rows(&engine, t, 1, 0..BACKFILL_ROWS, |id| [mix(id) % KEYS]))
+        .unwrap();
+    let (segment, view) = crate::test_support::join_chain_under_a_reduce(&mut engine, t, u);
+    let ((), fill) = counter.measure(|| backfill_set(&mut engine, &[segment, view]));
+    assert_eq!(net_weight(&engine, view) as u64, KEYS, "a group a key");
+    println!(
+        "chain backfill, fanout-2 join under a reduce: {:>7.1} instr/source row",
+        fill as f64 / BACKFILL_ROWS as f64
+    );
+
+    // A 1%-selectivity filter segment under a join.
+    let three = [
+        col_def("id", TypeCode::U64),
+        col_def("k", TypeCode::U64),
+        col_def("f", TypeCode::I64),
+    ];
+    let (_dir, mut engine) = empty_catalog(1);
+    let t = engine.create_table("public.t", &three, &[0]).unwrap();
+    let u = engine.create_table("public.u", &two, &[0]).unwrap();
+    engine
+        .registry
+        .ingest(u, rows(&engine, u, 1, 0..KEYS, |id| [id]))
+        .unwrap();
+    let cells = |id: u64| [mix(id) % KEYS, mix(id ^ 0x55) % 100];
+    engine
+        .registry
+        .ingest(t, rows(&engine, t, 1, 0..BACKFILL_ROWS, cells))
+        .unwrap();
+    let kept = (0..BACKFILL_ROWS).filter(|&id| cells(id)[1] < 1).count() as i64;
+    let mut filter = Circuit::default();
+    let scan = filter.input_delta(t, ReadBound::None);
+    filter.filter(scan, cmp_all(&[(gnitz_expr::CmpOp::Lt, 2, 1)]).to_blob_bytes());
+    let join = |segment| two_term_join_circuit(segment, u, TypeCode::U64);
+    let (segment, view) = crate::test_support::register_chain(&mut engine, &filter, &three, join, &joined);
+    let ((), fill) = counter.measure(|| backfill_set(&mut engine, &[segment, view]));
+    assert_eq!(net_weight(&engine, view), kept, "a match a kept row");
+    println!(
+        "chain backfill, 1% filter under a join:       {:>7.1} instr/source row",
+        fill as f64 / BACKFILL_ROWS as f64
+    );
 }

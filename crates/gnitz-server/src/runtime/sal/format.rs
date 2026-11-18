@@ -40,7 +40,7 @@ pub(super) const fn anchor_word(epoch: u32) -> u64 {
 
 /// The epoch of the log's own layout: the group header, its directory and the
 /// payload codec. The header's byte-pin test fails until it moves with one.
-const SAL_LAYOUT: u32 = 1;
+const SAL_LAYOUT: u32 = 2;
 
 /// The format word beside the anchor: the log's layout, and the
 /// [`WIRE_VERSION`] of the schema records and data blocks its payloads hold.
@@ -361,56 +361,52 @@ impl Header {
     }
 }
 
-// A payload is `[blob_len u32][record_len u32][blob][schema record][data block]`:
-// the blob of the group's request, or the worker's own in its place, then the
-// rows the worker is sent as a WAL block behind the schema record that lays them
-// out. `record_len == 0` says the payload carries no rows, and it then ends with
-// its blob; otherwise the block is the rest of the payload.
+// A payload is `[blob_len u64][blob][data block?]`: the blob of the group's
+// request, or the worker's own in its place, then the rows the worker is sent
+// as a WAL block. A payload carries rows iff bytes follow its blob, and its
+// blob is then the schema record that lays those rows out.
 
-/// The two lengths in front of every payload.
+/// The blob length in front of every payload; a `u64`, so a blob starts and
+/// ends 8-aligned within its payload.
 pub(super) const PAYLOAD_HEAD: usize = 8;
 
-/// The rows of a payload to write: their schema record, which is not empty, and
-/// the rows.
-pub(super) type PayloadRows<'a> = Option<(&'a [u8], WireRows<'a>)>;
+/// The rows of a payload to write.
+pub(super) type PayloadRows<'a> = Option<WireRows<'a>>;
 
 /// The size of the payload [`payload_encode`] writes.
 #[inline]
 pub(super) fn payload_size(blob: &[u8], rows: PayloadRows<'_>) -> usize {
-    PAYLOAD_HEAD + blob.len() + rows.map_or(0, |(record, d)| record.len() + d.byte_size())
+    PAYLOAD_HEAD + blob.len() + rows.map_or(0, |d| d.byte_size())
 }
 
 /// Write the payload of `blob` and `rows` into `out`, which is exactly
-/// [`payload_size`] bytes, every one of which is written. Both lengths fit their
-/// `u32`: the writer has admitted the group into the ring, which the log maps
-/// at no more bytes than a `u32` counts.
+/// [`payload_size`] bytes, every one of which is written. A payload with rows
+/// has their schema record as its blob.
 ///
 /// Always inlined: the writer encodes through it once per payload, and left to
 /// the inliner's judgement it becomes a call there as its other callers grow.
 #[inline(always)]
 pub(super) fn payload_encode(out: &mut [u8], blob: &[u8], rows: PayloadRows<'_>) {
-    let record = rows.map_or(&[][..], |(record, _)| record);
-    debug_assert!(rows.is_none() || !record.is_empty(), "rows need a schema record");
-    write_u32_le(out, 0, blob.len() as u32);
-    write_u32_le(out, 4, record.len() as u32);
+    debug_assert!(
+        rows.is_none() || !blob.is_empty(),
+        "rows need their schema record as the blob"
+    );
+    write_u64_le(out, 0, blob.len() as u64);
     let mut pos = PAYLOAD_HEAD;
     out[pos..pos + blob.len()].copy_from_slice(blob);
     pos += blob.len();
-    if let Some((record, d)) = rows {
-        out[pos..pos + record.len()].copy_from_slice(record);
-        pos += record.len();
+    if let Some(d) = rows {
         pos += d.encode(&mut out[pos..]);
     }
     assert_eq!(pos, out.len(), "payload_size and payload_encode disagree");
 }
 
-/// A payload read back: its blob, and the schema record and data block of its
-/// rows.
-type ParsedPayload<'a> = (&'a [u8], Option<(&'a [u8], &'a [u8])>);
+/// A payload read back: its blob, and the data block of its rows.
+type ParsedPayload<'a> = (&'a [u8], Option<&'a [u8]>);
 
-/// The parts of the payload `bytes`. A payload without rows must end with its
-/// blob; the block of one with rows is the rest of it, whose length the block's
-/// decoder holds to the size the block declares.
+/// The parts of the payload `bytes`: its blob, and, when bytes follow the blob,
+/// those bytes as the data block, whose length the block's decoder holds to the
+/// size the block declares.
 ///
 /// Always inlined: left to the inliner, it becomes a call in the live drain
 /// whenever the worker's own code around it changes shape.
@@ -419,25 +415,16 @@ fn payload_parse(bytes: &[u8]) -> Result<ParsedPayload<'_>, String> {
     let Some((head, body)) = bytes.split_first_chunk::<PAYLOAD_HEAD>() else {
         return Err(format!("a payload of {} bytes holds no payload head", bytes.len()));
     };
-    let (blob_len, record_len) = (read_u32_le(head, 0) as usize, read_u32_le(head, 4) as usize);
-    let Some((blob, rest)) = body.split_at_checked(blob_len) else {
+    let blob_len = read_u64_le(head, 0);
+    let Some((blob, rest)) = usize::try_from(blob_len).ok().and_then(|n| body.split_at_checked(n)) else {
         return Err(format!("a blob of {blob_len} bytes runs past its payload"));
     };
-    if record_len == 0 {
-        if !rest.is_empty() {
-            return Err(format!("{} bytes past the blob of a payload without rows", rest.len()));
-        }
-        return Ok((blob, None));
-    }
-    match rest.split_at_checked(record_len) {
-        Some(rows) => Ok((blob, Some(rows))),
-        None => Err(format!("a schema record of {record_len} bytes runs past its payload")),
-    }
+    Ok((blob, (!rest.is_empty()).then_some(rest)))
 }
 
-/// A payload's blob, and the rows of its data block under the payload's own
-/// schema record; `known` answers what that record decodes to when the caller
-/// already knows.
+/// A payload's blob, and the rows of its data block under the schema record
+/// that is the blob; `known` answers what that record decodes to when the
+/// caller already knows.
 ///
 /// Inlined: the live drain decodes every group it is addressed in through it,
 /// and without the attribute it is a call there.
@@ -446,13 +433,13 @@ pub(super) fn payload_rows(
     bytes: &[u8],
     known: impl FnOnce(&[u8]) -> Option<SchemaDescriptor>,
 ) -> Result<(&[u8], Option<Batch>), String> {
-    let (blob, rows) = payload_parse(bytes)?;
-    let Some((record, block)) = rows else {
+    let (blob, block) = payload_parse(bytes)?;
+    let Some(block) = block else {
         return Ok((blob, None));
     };
-    let schema = match known(record) {
+    let schema = match known(blob) {
         Some(s) => s,
-        None => decode_schema_record(record)?,
+        None => decode_schema_record(blob)?,
     };
     let batch = MemBatch::of_wal_block(block, &schema)?.to_batch();
     batch.debug_verify_null_bits();

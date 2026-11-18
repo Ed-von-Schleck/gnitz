@@ -59,6 +59,8 @@ pub(super) enum Rows {
     Batch(ReadRows),
     /// Sorted key spans, a chunk at a time; the first empty chunk ends them.
     Spans(Box<KeySpans>),
+    /// A read answered with no rows: its train is one empty last frame.
+    Nothing,
 }
 
 impl From<ReadRows> for Rows {
@@ -93,6 +95,10 @@ impl Train {
         loop {
             let (batch, ends) = match &mut self.answer {
                 Err(fault) => return w2m.try_send_msg(id, false, &WireMsg::fault(fault)).map(|()| true),
+                Ok(Rows::Nothing) => {
+                    let msg = WireMsg::train_frame(self.route.target_id, true, None);
+                    return w2m.try_send_msg(id, false, &msg).map(|()| true);
+                }
                 Ok(Rows::Batch(batch)) => (&**batch, true),
                 Ok(Rows::Spans(spans)) => {
                     if self.next_row == spans.chunk().len() {
@@ -126,6 +132,7 @@ fn whole<'a>(route: &ReplyRoute, answer: &'a Result<Rows, WireFault>, budget: us
     match answer {
         Err(fault) => Some(WireMsg::fault(fault)),
         Ok(Rows::Spans(_)) => None,
+        Ok(Rows::Nothing) => Some(WireMsg::train_frame(route.target_id, true, None)),
         Ok(Rows::Batch(batch)) => {
             let msg = WireMsg::train_frame(route.target_id, true, batch.wire_whole());
             (msg.data.is_none() || msg.size() <= budget).then_some(msg)
@@ -228,6 +235,13 @@ impl Replies {
         if self.waits_on_master() {
             self.w2m.park_for_master(|| idle() && self.waits_on_master());
         }
+    }
+
+    /// An owed reply can leave now, without the master releasing room or
+    /// ending a hold.
+    #[inline]
+    pub(super) fn can_leave(&self) -> bool {
+        !self.owed.is_empty() && !self.waits_on_master()
     }
 
     /// No owed reply can leave before the master releases room or ends a hold:

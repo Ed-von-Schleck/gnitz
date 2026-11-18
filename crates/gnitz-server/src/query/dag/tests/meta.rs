@@ -118,37 +118,29 @@ fn forgetting_a_view_drops_only_what_it_linked() {
 
 /// The schedule names one step per dependency edge out of the source's forward
 /// closure, ordered by view id — so a producer always precedes the steps it
-/// feeds. Each step says whether it is its producer's last reader and whether a
-/// later one reads its view.
+/// feeds. Each step says whether it is its producer's last reader.
 #[test]
 fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
-    // `(view, producer, last, needed)` of each step.
-    let steps = |dag: &mut DagEngine| -> Vec<(u64, u64, bool, bool)> {
+    // `(view, producer, last)` of each step.
+    let steps = |dag: &mut DagEngine| -> Vec<(u64, u64, bool)> {
         let steps = dag.tick_schedule(1);
-        steps.iter().map(|s| (s.view, s.producer, s.last, s.needed)).collect()
+        steps.iter().map(|s| (s.view, s.producer, s.last)).collect()
     };
     let mut dag = DagEngine::default();
     for (view, sources) in [(2, &[1][..]), (3, &[1]), (4, &[2, 3]), (5, &[4]), (7, &[6])] {
         dag.dep.link(view, sources.iter().copied());
     }
 
-    let every = [
-        (2, 1, false, true),
-        (3, 1, true, true),
-        (4, 2, true, true),
-        (4, 3, true, true),
-        (5, 4, true, false),
-    ];
+    let every = [(2, 1, false), (3, 1, true), (4, 2, true), (4, 3, true), (5, 4, true)];
     assert_eq!(steps(&mut dag), every);
 
     // A view linked or dropped after a schedule was read moves that schedule.
     dag.dep.link(8, [5]);
     let mut grown = every.to_vec();
-    grown[4].3 = true;
-    grown.push((8, 5, true, false));
+    grown.push((8, 5, true));
     assert_eq!(steps(&mut dag), grown);
     dag.dep.unlink(4, [2, 3]);
-    assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);
+    assert_eq!(steps(&mut dag), [(2, 1, false), (3, 1, true)]);
 }
 
 /// Steps relaying one producer by one scatter key share one round: the first

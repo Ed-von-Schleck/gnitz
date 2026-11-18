@@ -130,6 +130,21 @@ def test_a_catalog_view_created_after_the_last_one_was_dropped_is_exact(client, 
     assert len(before) - len(mine()) == 1
 
 
+def test_a_catalog_view_created_after_dropping_an_indexed_one_is_exact(client):
+    """Dropping the last view over a family retracts that view's own index row
+    in the same zone; the next view over the family reads it retracted."""
+    client.execute_sql(
+        "CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "CREATE INDEX iy ON y (v); "
+        "CREATE VIEW sv AS SELECT index_id, owner_id FROM _system.indices; "
+        "CREATE INDEX isv ON sv (owner_id)")
+    client.execute_sql("DROP VIEW sv")
+    client.execute_sql("CREATE VIEW sv2 AS SELECT index_id, owner_id FROM _system.indices")
+    got = bag(scanned(client, "sv2"))
+    assert got == family(client, "indices", "index_id", "owner_id")
+    assert all(w == 1 for w in got.values())
+
+
 def test_a_failed_bundle_leaves_every_catalog_view_unchanged(client):
     """Each bundle is refused by the engine, the views' after their column and
     circuit rows were applied."""

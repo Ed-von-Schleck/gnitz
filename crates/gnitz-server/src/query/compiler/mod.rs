@@ -6,7 +6,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use rustc_hash::FxHashMap;
 use std::rc::Rc;
 
 use crate::query::vm::{DeltaReg, Integral, Replay, Vm};
@@ -36,8 +35,10 @@ use routing::ViewMeta;
 /// program, exchanges included.
 pub(super) struct CompileOutput {
     pub(in crate::query) vm: Vm,
-    /// Each scanned source's scan, in the circuit's node order.
-    sources: Box<[(u64, Scan)]>,
+    /// The relations the circuit scans, each once, in the circuit's node order.
+    source_ids: Box<[u64]>,
+    /// Each one's scan, in the same order.
+    scans: Box<[Scan]>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Replay>,
 }
@@ -45,15 +46,21 @@ pub(super) struct CompileOutput {
 impl CompileOutput {
     /// `source`'s scan. Panics unless the circuit scans `source`.
     pub(in crate::query) fn scan(&self, source: u64) -> &Scan {
-        match self.sources.iter().find(|(s, _)| *s == source) {
-            Some((_, scan)) => scan,
+        match self.source_ids.iter().position(|&s| s == source) {
+            Some(at) => &self.scans[at],
             None => panic!("the plan scans no relation {source}"),
         }
     }
 
     /// The relations the circuit scans, each once, in the circuit's node order.
     pub(in crate::query) fn source_ids(&self) -> impl Iterator<Item = u64> {
-        self.sources.iter().map(|&(source, _)| source)
+        self.source_ids.iter().copied()
+    }
+
+    /// The program, beside the sources past the first `fed` of
+    /// [`Self::source_ids`]: those a run has fed the view no row of.
+    pub(in crate::query) fn vm_and_unfed(&mut self, fed: usize) -> (&mut Vm, &[u64]) {
+        (&mut self.vm, &self.source_ids[fed.min(self.source_ids.len())..])
     }
 }
 
@@ -76,10 +83,11 @@ pub(super) fn compile_view(
     if !vm.out_schema().same_region_types(view_schema) {
         return Err("the circuit's output schema is not the view's".into());
     }
-    let placement = meta.placement(&dists[circuit.out()], vm.out_schema());
+    let placement = dists[circuit.out()].placement(vm.out_schema());
     let mut output = CompileOutput {
         vm,
-        sources: sources.into_boxed_slice(),
+        source_ids: sources.iter().map(|&(id, _)| id).collect(),
+        scans: sources.into_iter().map(|(_, scan)| scan).collect(),
         hydration: None,
     };
     if bounded {

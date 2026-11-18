@@ -260,6 +260,13 @@ impl Vm {
             .any(|i| matches!(i.op, Op::Reduce { out_trace: Integral::Relation(..), .. }))
     }
 
+    /// True iff a reduce owes a row over an empty input: a global aggregate's.
+    pub(in crate::query) fn mints_ground_rows(&self) -> bool {
+        self.instructions
+            .iter()
+            .any(|i| matches!(&i.op, Op::Reduce { plan, .. } if plan.seeds_ground()))
+    }
+
     /// Some instruction reads `reg` at net weights, so its batch is folded when
     /// it stands.
     pub(in crate::query) fn folds(&self, reg: DeltaReg) -> bool {

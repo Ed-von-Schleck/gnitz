@@ -104,14 +104,33 @@ impl Apply<'_> {
 }
 
 impl Ingest {
-    /// The scalars the group's header carries; it has no blob. The inverse of
-    /// [`SalRequest::decode`].
+    /// The scalars the group's header carries: the inverse of [`Self::decode`].
+    /// The group's blob is its rows' schema record, which the payload codec
+    /// reads.
     pub(super) fn encode(self) -> RequestHead {
         use SalMessageKind as K;
         match self {
             Ingest::DdlSync { family } => RequestHead::new(K::DdlSync, family.id(), 0, 0),
             Ingest::Push { tid, rule } => RequestHead::new(K::Push, tid, u64::from(rule == PkRule::Fresh), 0),
         }
+    }
+
+    /// The ingest `head` carries; refused where it carries another request.
+    pub(super) fn decode(head: &RequestHead) -> Result<Self, String> {
+        let RequestHead { kind, target_id: tid, arg0, .. } = *head;
+        Ok(match kind {
+            SalMessageKind::DdlSync => Ingest::DdlSync {
+                family: SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?,
+            },
+            SalMessageKind::Push => Ingest::Push {
+                tid,
+                rule: match gnitz_wire::bool_word(arg0)? {
+                    true => PkRule::Fresh,
+                    false => PkRule::Enforce,
+                },
+            },
+            _ => return Err(format!("{head:?} carries no ingest")),
+        })
     }
 }
 
@@ -158,22 +177,11 @@ impl<'r> SalRequest<'r> {
     pub(super) fn decode(head: &RequestHead, blob: &'r [u8]) -> Result<Self, String> {
         let RequestHead { kind, target_id: tid, arg0, arg1 } = *head;
         Ok(match kind {
+            SalMessageKind::DdlSync | SalMessageKind::Push => Ingest::decode(head)?.into(),
             SalMessageKind::Flush => Apply::Flush.into(),
             SalMessageKind::FlushEph => Apply::FlushEph { generation: arg0 }.into(),
-            SalMessageKind::DdlSync => Ingest::DdlSync {
-                family: SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?,
-            }
-            .into(),
             SalMessageKind::Backfill => Apply::Backfill {
                 views: gnitz_wire::le_scalars(blob)?.into(),
-            }
-            .into(),
-            SalMessageKind::Push => Ingest::Push {
-                tid,
-                rule: match gnitz_wire::bool_word(arg0)? {
-                    true => PkRule::Fresh,
-                    false => PkRule::Enforce,
-                },
             }
             .into(),
             SalMessageKind::Tick => Apply::Tick {

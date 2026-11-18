@@ -29,9 +29,12 @@ pub(crate) struct Limits {
     /// recv is not re-armed until the task takes them back under it or takes
     /// every queued one.
     pub conn_inbound_share: usize,
-    /// One kernel send making no progress for this long evicts the client, whose
-    /// stalled sends would otherwise pin W2M ring space and block a worker
-    /// (`GNITZ_CLIENT_SEND_TIMEOUT_MS`).
+    /// One kernel send making no progress for this long evicts the client
+    /// (`GNITZ_CLIENT_SEND_TIMEOUT_MS`). A peer that stops reading holds its
+    /// connection, the copies of every frame given back while its replies
+    /// waited, and each worker's unsent train for those replies until then; it
+    /// is the only reaper for a TCP peer that keeps acknowledging at a zero
+    /// window and for an AF_UNIX peer, which no keepalive reaches.
     pub client_send_timeout: Duration,
     /// Ceiling on open client connections, across every listener and
     /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed

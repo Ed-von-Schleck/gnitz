@@ -5,8 +5,8 @@ use gnitz_wire::TypeCode;
 use gnitz_zset::repr::Batch;
 
 /// Merge the trains the workers send for `partitions[w]`, two spans a frame and
-/// a row-less terminal frame.
-fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
+/// a row-less terminal frame: true where the merge found a duplicate.
+fn merge(partitions: &[&[u64]]) -> bool {
     let frame_schema = pk_only_schema(&[TypeCode::U64]);
     let (reactor, mut lease, mut writers) = train_lease(partitions.len(), "KeySpans");
     let req = lease.id();
@@ -31,20 +31,13 @@ fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
 /// frames split it.
 #[test]
 fn merge_finds_a_duplicate_within_or_across_workers() {
-    assert!(merge(&[&[1, 3, 7], &[2, 3]]).is_none(), "across workers");
-    assert!(merge(&[&[1, 2, 2, 4], &[3]]).is_none(), "across one worker's frames");
+    assert!(merge(&[&[1, 3, 7], &[2, 3]]), "across workers");
+    assert!(merge(&[&[1, 2, 2, 4], &[3]]), "across one worker's frames");
 }
 
-/// A duplicate-free merge seeds the filter with exactly the distinct spans,
-/// empty partitions included.
+/// Distinct spans spread over the workers, empty partitions included, are no
+/// duplicate.
 #[test]
-fn a_duplicate_free_merge_seeds_every_span() {
-    let seed = merge(&[&[1, 4, 6, 9, 11], &[], &[2, 3, 10]]).expect("no duplicate");
-    let held = |k: u64| seed.may_contain(&k.to_be_bytes());
-    for k in [1, 2, 3, 4, 6, 9, 10, 11] {
-        assert!(held(k), "{k} is seeded");
-    }
-    for k in [0, 5, 7, 12] {
-        assert!(!held(k), "{k} is not");
-    }
+fn a_duplicate_free_merge_finds_none() {
+    assert!(!merge(&[&[1, 4, 6, 9, 11], &[], &[2, 3, 10]]));
 }

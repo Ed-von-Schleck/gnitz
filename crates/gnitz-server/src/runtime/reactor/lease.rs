@@ -57,15 +57,12 @@ impl Routes {
 /// The undecoded frames of one [`TrainLease`]; each pins its ring space until
 /// dropped, unless it was copied out of the ring.
 struct TrainRoute {
-    /// The workers the lease's reads were written to.
-    set: WorkerSet,
     /// The workers holding this lease's trains: their queued frames were copied
     /// out when their ring was given back, and each sends it nothing more until
     /// its reader has taken that worker's copies and waits on it for the next
     /// frame, or the lease drops.
     held: WorkerSet,
-    /// One queue per launched worker, indexed by worker id; only the queues of
-    /// `set` take slots.
+    /// One queue per launched worker, indexed by worker id.
     queues: Box<[VecDeque<W2mSlot>]>,
     /// The lease's one reader while it waits: the worker it waits on, and its
     /// waker. Each wait replaces the last, so a dropped wait stops counting
@@ -100,9 +97,6 @@ impl Reactor {
     #[cold]
     fn give_back(&self, w: usize) {
         for (&id, t) in self.routes.borrow_mut().trains.iter_mut() {
-            if !t.set.contains(w) {
-                continue;
-            }
             let queue = &mut t.queues[w];
             if !queue.iter().any(W2mSlot::in_ring) {
                 continue;
@@ -132,10 +126,6 @@ impl Reactor {
         let Some(t) = routes.trains.get_mut(&slot.request_id) else {
             return;
         };
-        if !t.set.contains(w) {
-            debug_assert!(false, "worker {w} answered a read it was not sent");
-            return;
-        }
         let reader = t.reader.take_if(|(r, _)| *r == w);
         if slot.passed() && reader.is_none() {
             slot.detach();
@@ -166,7 +156,6 @@ impl Reactor {
             routes.trains.insert(
                 id,
                 TrainRoute {
-                    set: WorkerSet::EMPTY,
                     held: WorkerSet::EMPTY,
                     queues,
                     reader: None,
@@ -245,10 +234,15 @@ impl Drop for TrainLease {
         for w in train.held.iter() {
             self.reactor.w2m.unhold(w, self.id);
         }
+        let written = self.reads.iter().fold(WorkerSet::EMPTY, |u, &(_, s)| u.union(s));
         // Every slot is dropped before the box is kept: one left queued would
         // hold up its ring's released prefix and reach the next lease to take
         // the box.
-        for q in train.queues.iter_mut() {
+        for (w, q) in train.queues.iter_mut().enumerate() {
+            debug_assert!(
+                written.contains(w) || q.is_empty(),
+                "worker {w} answered a read it was not sent"
+            );
             q.clear();
             if q.capacity() > SPARE_QUEUE_CAP {
                 *q = VecDeque::new();
@@ -290,12 +284,6 @@ impl TrainLease {
     pub(crate) fn add(&mut self, set: WorkerSet, what: &'static str) {
         let set = set.within(self.reactor.w2m.num_workers());
         debug_assert!(set.len() > 0, "every read owes at least one reply");
-        let mut routes = self.reactor.routes.borrow_mut();
-        let route = routes
-            .trains
-            .get_mut(&self.id)
-            .expect("a lease's id is routed while it lives");
-        route.set = route.set.union(set);
         self.reads.push((what, set));
     }
 
@@ -339,7 +327,6 @@ impl TrainLease {
                 .trains
                 .get_mut(&self.id)
                 .expect("a lease's id is routed while it lives");
-            debug_assert!(route.set.contains(w), "the train was written to `w`");
             match route.queues[w].pop_front() {
                 Some(slot) => Poll::Ready(slot),
                 None => {

@@ -159,8 +159,9 @@ impl DagEngine {
     ///     replays a push; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store; and
-    ///   * every view of its chain is valid — a segment's rows are dropped once
-    ///     its chain is built, so a chain member's rebuild needs them rebuilt; and
+    ///   * every view of its chain is valid — a passthrough segment's store holds
+    ///     no rows, so a chain member rebuilds only with the segments that feed
+    ///     it; and
     ///   * none of its sources is a STREAM or a system family — its state
     ///     integrates stream rows that are gone, or catalog rows no boot replays
     ///     into it.
@@ -271,16 +272,17 @@ fn open_state<'a>(
 }
 
 impl RegisteredView {
-    /// The plan of this view, `view_id`, beside the stores a run of it reads: its
-    /// operator state, opened on a miss, and `unfed`, the sources it has been fed
-    /// no row of.
+    /// The program of this view, `view_id`, beside the stores a run of it
+    /// reads: its operator state, opened on a miss, with every source past the
+    /// first `fed` of its scan order reading empty.
     fn opened<'a>(
         &'a mut self,
         registry: &'a RelationRegistry,
         view_id: u64,
-        unfed: &'a [u64],
-    ) -> Result<(&'a mut CompileOutput, vm::Stores<'a>), String> {
+        fed: usize,
+    ) -> Result<(&'a mut vm::Vm, vm::Stores<'a>), String> {
         let own = open_state(&mut self.state, registry, view_id)?;
-        Ok((&mut self.code, vm::Stores { own, registry, unfed }))
+        let (vm, unfed) = self.code.vm_and_unfed(fed);
+        Ok((vm, vm::Stores { own, registry, unfed }))
     }
 }

@@ -3,9 +3,9 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    EchoDrive, RowKey, chunked, col_def, empty_catalog, empty_catalog_with, make_batch, make_schema_u64_i64,
-    push_and_tick, register_count_of, register_identity_view, scan_all, scan_keyed, table_engine, try_register_view,
-    two_term_join_circuit, u64_i64_cols, zset_of,
+    EchoDrive, RowKey, chunked, col_def, cols_of, empty_catalog, empty_catalog_with, join_chain_under_a_reduce,
+    make_batch, make_schema_u64_i64, push_and_tick, register_chain, register_count_of, register_identity_view,
+    scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{Circuit, ReadBound, TypeCode};
@@ -157,7 +157,7 @@ fn a_ticks_independent_rounds_share_one_wait() {
             None => register_count(&mut engine, source, &[1], &name),
             Some(schema) => register_count_of(&mut engine, source, &schema, &[], &name),
         };
-        backfill(&mut engine, oracle).unwrap();
+        backfill(&mut engine, &[oracle]).unwrap();
         let want = held(&mut engine, oracle);
         assert!(!want.is_empty());
         assert_eq!(held(&mut engine, view), want, "view {view}");
@@ -203,7 +203,7 @@ fn a_step_waits_only_on_its_own_view_and_its_producer() {
     // step over `count_v` then runs on without a round.
     assert_eq!((host.rounds, host.waits), (2, 1));
     let oracle = try_register_view(&mut engine, join_base_with_count(base, count_v), "oracle", &cols, 0, 0).unwrap();
-    backfill(&mut engine, oracle).unwrap();
+    backfill(&mut engine, &[oracle]).unwrap();
     let want = held(&mut engine, oracle);
     assert!(!want.is_empty());
     assert_eq!(held(&mut engine, joined), want);
@@ -295,7 +295,7 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
 
     tick(&mut engine, base, 1).unwrap();
     assert!(held(&mut engine, count).is_empty(), "no tick mints the ground row");
-    backfill(&mut engine, count).unwrap();
+    backfill(&mut engine, &[count]).unwrap();
     for round in 0..=2 {
         assert_eq!(held(&mut engine, count), ground, "round {round}: the ground row, once");
         assert!(held(&mut engine, once).is_empty(), "round {round}");
@@ -305,27 +305,42 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     push_and_tick(&mut engine, base, base_rows(&[(1, 1, 10)]));
     assert_eq!(held(&mut engine, once), times(&[(1, 1, 10)], 1));
     let (oracle, _) = register_count(&mut engine, base, &[], "oracle");
-    backfill(&mut engine, oracle).unwrap();
+    backfill(&mut engine, &[oracle]).unwrap();
     assert_eq!(held(&mut engine, count), held(&mut engine, oracle));
     assert_ne!(held(&mut engine, count), ground);
 }
 
 // ── Backfills ───────────────────────────────────────────────────────────────
 
-/// A backfill runs the named view alone — not the source's closure, which
-/// would double-count into the dependents the source already populated — and
-/// not the view's own dependents, which backfill from its store afterwards.
+/// A backfill of a set feeds each member once: a member scanning another reads
+/// the deltas that member emits, never its store, so each holds its own multiple
+/// of the base's rows.
 #[test]
-fn a_backfill_runs_only_the_named_view() {
+fn a_backfill_feeds_each_member_of_its_set_once() {
     let (_dir, mut engine, base, views) = engine_with_views();
-    let rows = [(1, 1, 10)];
-
+    let rows = [(1, 1, 10), (2, 1, 20)];
     engine.registry.ingest(base, base_rows(&rows)).unwrap();
-    backfill(&mut engine, views.twice).unwrap();
-    assert_eq!(held(&mut engine, views.twice), times(&rows, 2));
-    for vid in views.all().into_iter().filter(|&v| v != views.twice) {
-        assert!(held(&mut engine, vid).is_empty(), "view {vid}");
+    backfill(&mut engine, &views.all()).unwrap();
+    let ks = [
+        (views.twice, 2),
+        (views.once, 1),
+        (views.deep, 2),
+        (views.union, 3),
+        (views.over_union, 3),
+    ];
+    for (vid, k) in ks {
+        assert_eq!(held(&mut engine, vid), times(&rows, k), "view {vid}");
     }
+}
+
+/// A backfill of a view without a view that scans it would leave that reader
+/// fed the view's rows by neither the backfill nor a later one.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "readers are backfilled with it")]
+fn a_backfill_set_holds_every_reader_of_its_members() {
+    let (_dir, mut engine, _, views) = engine_with_views();
+    let _ = backfill(&mut engine, &[views.twice]);
 }
 
 /// A view `name` joining tables `a` and `b`, each `(id, k)`, on column `key` of
@@ -367,7 +382,7 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
             engine.registry.ingest(tid, rows).unwrap();
         }
 
-        backfill(&mut engine, view).unwrap();
+        backfill(&mut engine, &[view]).unwrap();
 
         let schema = engine.registry.relation_or_err(view).unwrap().schema();
         let mut bb = gnitz_zset::repr::BatchBuilder::new(&schema);
@@ -407,14 +422,14 @@ fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
                 .unwrap();
         }
 
-        backfill(&mut engine, view).unwrap();
+        backfill(&mut engine, &[view]).unwrap();
         let at_cut = held(&mut engine, view);
         for (&tid, round) in tables.iter().zip(2..) {
             tick(&mut engine, tid, round).unwrap();
         }
 
         let fresh = register_join(&mut engine, tables, key, "fresh");
-        backfill(&mut engine, fresh).unwrap();
+        backfill(&mut engine, &[fresh]).unwrap();
         let (got, want) = (held(&mut engine, view), held(&mut engine, fresh));
         assert_eq!(got, want, "keyed on column {key}");
         assert!(at_cut.len() < want.len(), "premise: the tail adds matches");
@@ -438,4 +453,114 @@ fn the_ground_row_is_minted_where_the_whole_input_arrives() {
     assert_eq!(mints, receives);
     assert_eq!(mints.iter().filter(|&&m| m).count(), 1, "one owner");
     assert!(mints_ground_row(Slot::SOLO, false), "one worker");
+}
+
+// ── Chains and sets ─────────────────────────────────────────────────────────
+
+/// `t (id, k)` and `u (id, k)`, U64 both, in a catalog scanning four rows a
+/// chunk.
+fn chunked_tables() -> (tempfile::TempDir, CatalogEngine, [u64; 2]) {
+    let (dir, mut engine) = empty_catalog_with(1, chunked(4));
+    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let tables = ["t", "u"].map(|name| engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap());
+    (dir, engine, tables)
+}
+
+/// A chain backfilled as one set feeds its owner the segment's output as it
+/// runs, chunk by chunk: the owner lands what ticks over the same rows land, and
+/// the segment's store holds no row.
+#[test]
+fn a_chain_backfills_through_its_segment_in_memory() {
+    let (_dir, mut engine, tables) = chunked_tables();
+    let [t, u] = tables;
+    // Built by ticks: a backfill over nothing, then the rows.
+    let (oracle_seg, oracle) = join_chain_under_a_reduce(&mut engine, tables[0], tables[1]);
+    backfill(&mut engine, &[oracle_seg, oracle]).unwrap();
+    let schema = engine.registry.relation_or_err(t).unwrap().schema();
+    // Two rows of `u` a key; `t`'s rows span several chunks.
+    let u_rows: Vec<(u64, i64, i64)> = (0..10).map(|id| (id, 1, (id % 5) as i64)).collect();
+    let t_rows: Vec<(u64, i64, i64)> = (0..23).map(|id| (id, 1, (id * 7 % 6) as i64)).collect();
+    push_and_tick(&mut engine, u, make_batch(&schema, &u_rows));
+    push_and_tick(&mut engine, t, make_batch(&schema, &t_rows));
+
+    let (seg, top) = join_chain_under_a_reduce(&mut engine, tables[0], tables[1]);
+    backfill(&mut engine, &[seg, top]).unwrap();
+    let want = held(&mut engine, oracle);
+    assert!(!want.is_empty());
+    assert_eq!(held(&mut engine, top), want);
+    assert!(held(&mut engine, seg).is_empty(), "the segment stores no row");
+}
+
+/// `t JOIN v ON id`, `v` an identity view over `t`, backfilled with `v` as one
+/// set: the join reads `t` from its store and `v` from its own trace, and pairs
+/// each row once, as ticks over the same rows do.
+#[test]
+fn a_set_feeds_a_shared_source_reader_once() {
+    let (_dir, mut engine, [t, _]) = chunked_tables();
+    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let pair = |engine: &mut CatalogEngine, name: &str| {
+        let v = register_identity_view(engine, t, &format!("{name}_v"), &cols);
+        let w = register_join(engine, [t, v], 0, &format!("{name}_w"));
+        [v, w]
+    };
+    let oracle = pair(&mut engine, "oracle");
+    backfill(&mut engine, &oracle).unwrap();
+    let schema = engine.registry.relation_or_err(t).unwrap().schema();
+    let rows: Vec<(u64, i64, i64)> = (0..11).map(|id| (id, 1, id as i64 % 3)).collect();
+    push_and_tick(&mut engine, t, make_batch(&schema, &rows));
+
+    let views = pair(&mut engine, "set");
+    backfill(&mut engine, &views).unwrap();
+    for (got, want) in views.into_iter().zip(oracle) {
+        let want = held(&mut engine, want);
+        assert!(!want.is_empty());
+        assert_eq!(held(&mut engine, got), want, "view {got}");
+    }
+}
+
+/// A segment's global `COUNT(*)` over an empty table owes its ground row, which
+/// reaches its owner as the segment's output: the owner holds it once, and so
+/// does the segment, whose reduce reads its own store.
+#[test]
+fn a_segment_ground_row_reaches_its_head() {
+    let (_dir, mut engine, [t, _]) = chunked_tables();
+    let schema = engine.registry.relation_or_err(t).unwrap().schema();
+    let plan = ReducePlan::from_wire(&schema, &[], &[gnitz_wire::AggDescriptor::COUNT_STAR], true).unwrap();
+    let mut count = Circuit::default();
+    let scan = count.input_delta(t, ReadBound::None);
+    count.reduce(
+        scan,
+        gnitz_wire::GroupAggs {
+            group_cols: vec![],
+            aggs: vec![gnitz_wire::AggDescriptor::COUNT_STAR],
+        },
+    );
+    let out = cols_of(plan.output_schema());
+    let identity = |segment| crate::test_support::identity_circuit(segment, ReadBound::None);
+    let (seg, top) = register_chain(&mut engine, &count, &out, identity, &out);
+    backfill(&mut engine, &[seg, top]).unwrap();
+    let ground = plan.ground_row().unwrap();
+    let ground = zset_of(&ground, ground.schema());
+    assert_eq!(held(&mut engine, top), ground);
+    assert_eq!(held(&mut engine, seg), ground);
+}
+
+/// A global `COUNT(*)` over a view backfilled with it holds the count of the
+/// view's rows alone: its ground row lands before the view's rows reach it, so
+/// the first of them retracts it.
+#[test]
+fn a_ground_row_lands_before_the_rows_of_its_set() {
+    let (_dir, mut engine, [t, _]) = chunked_tables();
+    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let schema = engine.registry.relation_or_err(t).unwrap().schema();
+    let rows: Vec<(u64, i64, i64)> = (0..9).map(|id| (id, 1, id as i64)).collect();
+    engine.registry.ingest(t, make_batch(&schema, &rows)).unwrap();
+    let v = register_identity_view(&mut engine, t, "v", &cols);
+    let (count, _) = register_count_of(&mut engine, v, &schema, &[], "count");
+    backfill(&mut engine, &[v, count]).unwrap();
+    let (oracle, _) = register_count_of(&mut engine, t, &schema, &[], "oracle");
+    backfill(&mut engine, &[oracle]).unwrap();
+    let want = held(&mut engine, oracle);
+    assert_eq!(want.len(), 1, "one row, the count");
+    assert_eq!(held(&mut engine, count), want);
 }

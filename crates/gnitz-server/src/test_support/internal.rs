@@ -696,6 +696,72 @@ pub fn view_tab_row(view_id: u64, name: &str) -> ViewTabRow<'_> {
     }
 }
 
+/// A chain created as one DDL bundle: a segment running `segment` over
+/// `segment_cols`, and its owner, the next id, running `owner(segment id)` over
+/// `owner_cols` and holding `capacity_bytes` (`0` = off). Answers
+/// `(segment, owner)` or the bundle's refusal.
+pub fn try_register_chain(
+    engine: &mut CatalogEngine,
+    segment: &Circuit,
+    segment_cols: &[CatalogColumn],
+    owner: impl FnOnce(u64) -> Circuit,
+    owner_cols: &[CatalogColumn],
+    capacity_bytes: u64,
+) -> Result<(u64, u64), String> {
+    let seg = engine.allocate_ids(2).unwrap();
+    let top = seg + 1;
+    let owner = owner(seg);
+    let names = [format!("_seg{seg}"), format!("top{top}")];
+    let segment_row = ViewTabRow {
+        owner_view_id: top,
+        ..view_tab_row(seg, &names[0])
+    };
+    let owner_row = ViewTabRow {
+        capacity_bytes,
+        ..view_tab_row(top, &names[1])
+    };
+    let rows = sys_batch([(segment_row, 1), (owner_row, 1)]);
+    let created = [(seg, segment, segment_cols), (top, &owner, owner_cols)];
+    apply_ddl(engine, view_blocks(created, rows))?;
+    Ok((seg, top))
+}
+
+/// [`try_register_chain`] of an unbounded chain that must succeed.
+pub fn register_chain(
+    engine: &mut CatalogEngine,
+    segment: &Circuit,
+    segment_cols: &[CatalogColumn],
+    owner: impl FnOnce(u64) -> Circuit,
+    owner_cols: &[CatalogColumn],
+) -> (u64, u64) {
+    try_register_chain(engine, segment, segment_cols, owner, owner_cols, 0).unwrap()
+}
+
+/// `t JOIN u ON t.k = u.k`, both `(id, k)` U64, as a segment `(k, t_id, u_id)`,
+/// under `SELECT k, SUM(t_id), COUNT(*) … GROUP BY k`, a reduce local to the
+/// join's key. Answers `(segment, owner)`.
+pub fn join_chain_under_a_reduce(engine: &mut CatalogEngine, t: u64, u: u64) -> (u64, u64) {
+    use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadBound};
+    let joined = ["k", "t_id", "u_id"].map(|name| col_def(name, TypeCode::U64));
+    let joined_schema =
+        crate::test_support::u64_pk_schema(&[gnitz_zset::schema::SchemaColumn::new(TypeCode::U64, false); 2]);
+    let aggs = [
+        AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
+        AggDescriptor::COUNT_STAR,
+    ];
+    let reduced = *gnitz_zset::stream::ReducePlan::from_wire(&joined_schema, &[0], &aggs, false)
+        .unwrap()
+        .output_schema();
+    let reduce = |segment| {
+        let mut circuit = Circuit::default();
+        let scan = circuit.input_delta(segment, ReadBound::None);
+        circuit.reduce_local(scan, GroupAggs { group_cols: vec![0], aggs: aggs.to_vec() });
+        circuit
+    };
+    let join = two_term_join_circuit(t, u, TypeCode::U64);
+    register_chain(engine, &join, &joined, reduce, &cols_of(&reduced))
+}
+
 /// Register a view running `circuit` as one DDL bundle, returning its vid or
 /// the bundle's refusal. Budgets in bytes,
 /// `0` = off.

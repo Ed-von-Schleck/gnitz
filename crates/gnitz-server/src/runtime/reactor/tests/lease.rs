@@ -437,3 +437,16 @@ fn a_hold_ends_when_the_read_being_taken_waits_on_its_worker() {
     assert!(try_poll_once(train.next()).is_none());
     assert!(!writers[0].held(id), "asking past them ends it");
 }
+
+/// A frame from a worker none of the lease's reads was written to is a worker
+/// bug, reported when the lease drops.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "worker 1 answered a read it was not sent")]
+fn a_frame_from_a_worker_the_lease_never_wrote_to_is_reported() {
+    let (r, mut writers) = reactor_with_rings(2);
+    let lease = lease_of(&r, &[WorkerSet::one(0)]);
+    writers[1].send_train_frame(lease.id(), true, None);
+    r.drain_all_w2m();
+    drop(lease);
+}

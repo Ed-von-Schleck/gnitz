@@ -32,8 +32,7 @@ use gnitz_zset::repr::MemBatch;
 
 use self::fk_presence::FkPresence;
 
-use unique_filter::SpanClaim;
-pub(super) use unique_filter::UniqueFilter;
+use unique_filter::{SpanClaim, UNIQUE_FILTER_CAP, UniqueFilter};
 pub(super) use unique_preflight::validate_unique_index_create;
 
 /// The validation caches of the master's write path.
@@ -41,6 +40,8 @@ pub(super) struct Checks {
     /// The filter of each unique index that has one, by (table_id, column
     /// list). Every entry holds all of its index's spans.
     unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
+    /// Spans one unique filter holds before it caps; a test lowers it.
+    unique_filter_cap: usize,
     /// The presence cache of each table an FK probe found a key of, by table id.
     fk_presence: RefCell<FxHashMap<u64, FkPresence>>,
     /// Keys one presence cache holds before it is dropped whole.
@@ -57,6 +58,7 @@ impl Checks {
     pub(super) fn new() -> Self {
         Checks {
             unique_filters: RefCell::default(),
+            unique_filter_cap: UNIQUE_FILTER_CAP,
             fk_presence: RefCell::default(),
             fk_presence_cap: gnitz_foundation::env::env_num("GNITZ_FK_PRESENCE_KEYS", 1usize << 20),
             cascade_bytes: gnitz_foundation::env::env_num_in(

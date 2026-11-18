@@ -18,31 +18,48 @@ pub(super) struct ViewMeta<'a> {
     /// there is one worker.
     pub(super) self_contained: bool,
     /// Every scanned source, by id.
-    sources: BTreeMap<u64, &'a Relation>,
-    /// source table id → how a worker relays the delta this source scatters by —
-    /// a share of it where the source is replicated, a round otherwise. A source
-    /// absent from it does not scatter. Derived as beside other workers, whatever
-    /// the worker count, so that a key no relay could route by is refused at any.
-    source_routes: FxHashMap<u64, Relay>,
-    /// source table id → where its scan's rows sit, as beside other workers.
-    scan_dists: BTreeMap<u64, Dist>,
+    sources: BTreeMap<u64, SourceMeta<'a>>,
+}
+
+/// One scanned source of a view's circuit.
+struct SourceMeta<'a> {
+    relation: &'a Relation,
+    /// How a worker relays the delta this source scatters by — a share of it
+    /// where the source is replicated, a round otherwise; `None` where it does
+    /// not scatter. Derived as beside other workers, whatever the worker count,
+    /// so that a key no relay could route by is refused at any.
+    route: Option<Relay>,
+    /// Where its scan's rows sit, as beside other workers.
+    dist: Dist,
 }
 
 impl<'a> ViewMeta<'a> {
     /// Derive `circuit`'s routing metadata.
     pub(super) fn derive(circuit: &Circuit, registry: &'a RelationRegistry) -> Result<ViewMeta<'a>, String> {
         let uses = source_uses(circuit);
-        let sources: BTreeMap<u64, &Relation> = uses
+        // Each scan leaves its rows as its store places them unless the loop
+        // below relays its delta or finds it routed by its scatter key.
+        let mut sources: BTreeMap<u64, SourceMeta> = uses
             .keys()
-            .map(|&tid| Ok((tid, registry.relation_or_err(tid)?)))
+            .map(|&tid| {
+                let relation = registry.relation_or_err(tid)?;
+                Ok((
+                    tid,
+                    SourceMeta {
+                        relation,
+                        route: None,
+                        dist: native_dist(relation),
+                    },
+                ))
+            })
             .collect::<Result<_, String>>()?;
         if let Some((tid, _)) = uses.iter().find(|(_, u)| u.reaches_join && u.key.is_none()) {
             return Err(format!("source {tid} feeds a join and states no scatter key"));
         }
-        let all_replicated = sources.values().all(|s| s.placement().is_replicated());
+        let all_replicated = sources.values().all(|s| s.relation.placement().is_replicated());
         let self_contained = all_replicated || registry.slot().of <= 1;
 
-        let replicated = |tid: u64| sources[&tid].placement().is_replicated();
+        let replicated = |tid: u64| sources[&tid].relation.placement().is_replicated();
         let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key?)));
         // A replicated partner holds every row on every worker, so each match is
         // made once, on the other side's own worker — unless that side's delta is
@@ -51,28 +68,25 @@ impl<'a> ViewMeta<'a> {
         let has_replicated_partner = keyed().any(|(tid, ..)| replicated(tid))
             && keyed().all(|(tid, u, key)| !key.is_empty() && (!replicated(tid) || !u.outside_join));
 
-        let mut source_routes: FxHashMap<u64, Relay> = FxHashMap::default();
-        // Where each scan leaves its rows: by its relay, by its scatter key where
-        // that routes to the source's owners, as its store places them otherwise.
-        let mut scan_dists = BTreeMap::new();
         for (tid, use_, key) in keyed() {
-            let source = sources[&tid];
+            let source = sources.get_mut(&tid).expect("a scanned source");
+            let replicated = source.relation.placement().is_replicated();
             let partner_makes_every_match = has_replicated_partner
                 // A clamp over one worker's slice admits the key once per worker.
-                && (replicated(tid) || !use_.set_fed);
+                && (replicated || !use_.set_fed);
             let plan = match key.is_empty() {
                 // Every worker already holds the whole delta a broadcast would
                 // hand it.
-                true if replicated(tid) => continue,
+                true if replicated => continue,
                 true => ScatterPlan::broadcast(),
                 false => {
                     // Refused whether or not the relay is skipped below.
-                    let plan = ScatterPlan::join(&source.schema(), key)
+                    let plan = ScatterPlan::join(&source.relation.schema(), key)
                         .map_err(|e| format!("source {tid} scatter key: {e}"))?;
                     // Only a keyed relay can skip: a broadcast's matches spread
                     // over the whole other side.
-                    if plan.routes_to_native_owner(source.placement()) {
-                        scan_dists.insert(tid, Dist::on(key));
+                    if plan.routes_to_native_owner(source.relation.placement()) {
+                        source.dist = Dist::on(key);
                         continue;
                     }
                     if partner_makes_every_match {
@@ -83,32 +97,26 @@ impl<'a> ViewMeta<'a> {
             };
             // A broadcast hands every worker the whole delta; a keyed route, or
             // a replicated source's share, its part.
-            scan_dists.insert(tid, if key.is_empty() { Dist::Whole } else { Dist::on(key) });
-            let relay = Relay { plan: Rc::new(plan), key: key.into() };
-            source_routes.insert(tid, relay);
-        }
-        for (&tid, source) in &sources {
-            scan_dists.entry(tid).or_insert_with(|| native_dist(source));
+            source.dist = if key.is_empty() { Dist::Whole } else { Dist::on(key) };
+            source.route = Some(Relay { plan: Rc::new(plan), key: key.into() });
         }
         refuse_exchange_behind_ground(circuit)?;
         Ok(ViewMeta {
             replicated: all_replicated,
             self_contained,
             sources,
-            source_routes,
-            scan_dists,
         })
     }
 
     /// The scanned source `source_id`. Panics unless the circuit scans it.
     pub(super) fn source(&self, source_id: u64) -> &'a Relation {
-        self.sources[&source_id]
+        self.sources[&source_id].relation
     }
 
     /// Beside other workers, `source_id`'s delta would not enter the view where
     /// the source's store places it — whatever the worker count.
     pub(super) fn states_route(&self, source_id: u64) -> bool {
-        self.source_routes.contains_key(&source_id)
+        self.sources.get(&source_id).is_some_and(|s| s.route.is_some())
     }
 
     /// How a worker relays `source_id`'s delta into this view — two views
@@ -117,28 +125,17 @@ impl<'a> ViewMeta<'a> {
     /// them, and a route would name a key they were never stored under, or every
     /// worker computes the view's whole result.
     pub(super) fn source_route(&self, source_id: u64) -> Option<&Relay> {
-        self.source_routes.get(&source_id).filter(|_| !self.self_contained)
+        self.sources
+            .get(&source_id)?
+            .route
+            .as_ref()
+            .filter(|_| !self.self_contained)
     }
 
     /// Where the rows of `source_id`'s scan sit beside other workers. Panics
     /// unless the circuit scans it.
     pub(super) fn scan_dist(&self, source_id: u64) -> Dist {
-        self.scan_dists[&source_id].clone()
-    }
-
-    /// The placement a view registers under, whose circuit's output node, of
-    /// schema `out`, leaves its rows by `dist`. `out`'s PK region is the
-    /// view's.
-    pub(super) fn placement(&self, dist: &Dist, out: &SchemaDescriptor) -> Placement {
-        // Every worker computes the whole result from its own full copies.
-        if self.replicated {
-            return Placement::Replicated;
-        }
-        match dist {
-            Dist::On(slots) => pk_prefix_routed(out, slots).map_or(Placement::Local, |k| Placement::keyed(out, k)),
-            // No key's owner alone holds each row.
-            Dist::Whole | Dist::Anywhere => Placement::Local,
-        }
+        self.sources[&source_id].dist.clone()
     }
 }
 
@@ -209,6 +206,18 @@ pub(super) enum Dist {
 }
 
 impl Dist {
+    /// The placement a view registers under whose circuit's output node, of
+    /// schema `out`, leaves its rows by `self`. `out`'s PK region is the
+    /// view's. A `Whole` output is an identical full copy on every worker.
+    pub(super) fn placement(&self, out: &SchemaDescriptor) -> Placement {
+        match self {
+            Dist::Whole => Placement::Replicated,
+            Dist::On(slots) => pk_prefix_routed(out, slots).map_or(Placement::Local, |k| Placement::keyed(out, k)),
+            // No key's owner alone holds each row.
+            Dist::Anywhere => Placement::Local,
+        }
+    }
+
     fn on(slots: &[gnitz_wire::ReindexSlot]) -> Dist {
         Dist::On(slots.iter().copied().map(KeySlot::of).collect())
     }
@@ -234,23 +243,28 @@ impl Dist {
     }
 
     /// Where the rows of a node reading `self`'s and `other`'s, laid out alike,
-    /// sit: a key both sit by, in the columns both hold it in.
-    fn common(&self, other: &Dist) -> Dist {
-        match (self, other) {
+    /// sit: a key both sit by, in the columns both hold it in. Refuses rows
+    /// every worker computes beside rows one worker holds, which a read
+    /// gathering every worker's rows would count once per worker.
+    fn common(&self, other: &Dist) -> Result<Dist, String> {
+        Ok(match (self, other) {
             (Dist::On(a), Dist::On(b)) if a.len() == b.len() => {
                 let mut slots = Vec::with_capacity(a.len());
                 for (a, b) in a.iter().zip(b) {
                     let cols: Vec<u32> = a.cols.iter().copied().filter(|c| b.cols.contains(c)).collect();
                     if a.ty != b.ty || cols.is_empty() {
-                        return Dist::Anywhere;
+                        return Ok(Dist::Anywhere);
                     }
                     slots.push(KeySlot { cols, ty: a.ty });
                 }
                 Dist::On(slots)
             }
             (a, b) if a == b => a.clone(),
+            (Dist::Whole, _) | (_, Dist::Whole) => {
+                return Err("rows every worker computes beside rows one worker holds".into());
+            }
             _ => Dist::Anywhere,
-        }
+        })
     }
 
     /// The union of `self` and `other`'s columns, slot by slot, for two keys
@@ -326,6 +340,11 @@ pub(super) fn node_dist(
     dists: &[Dist],
     schema: impl Fn(NodeId) -> SchemaDescriptor,
 ) -> Result<Dist, String> {
+    // Every worker computes every node from its own full copies: nothing
+    // relays or exchanges.
+    if meta.replicated {
+        return Ok(Dist::Whole);
+    }
     let inputs = circuit.inputs(nid);
     let out = schema(nid);
     let unary = || &dists[inputs[0]];
@@ -378,7 +397,7 @@ pub(super) fn node_dist(
             let ahead = if *nulls_first { type_codes.len() } else { 0 };
             unary().mapped(|c, _| shifted(&input, &out, c, 0, ahead))
         }
-        OpNode::Union => dists[inputs[0]].common(&dists[inputs[1]]),
+        OpNode::Union => dists[inputs[0]].common(&dists[inputs[1]])?,
         OpNode::Join(kind) => join_dist(*kind, inputs, dists, &schema, &out)?,
         // An exchange leaves each row on the owner of the key it scatters by,
         // the PK its operator emits, wherever its input sat.
@@ -460,7 +479,7 @@ fn join_dist(
     };
     let ab = term(da, ib, false)?;
     let ba = term(db, ia, true)?;
-    Ok(ab.common(&ba))
+    ab.common(&ba)
 }
 
 // ---------------------------------------------------------------------------

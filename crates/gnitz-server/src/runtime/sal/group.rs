@@ -37,11 +37,11 @@ impl Routed<'_> {
 #[derive(Clone, Copy)]
 pub(super) enum Payloads<'a> {
     /// One payload, which every addressed worker reads: the request's blob, and
-    /// any rows behind their schema record.
+    /// any rows, whose schema record that blob then is.
     Shared(PayloadRows<'a>),
-    /// Worker `w` is sent the request's blob and the rows `each[w]` behind the
-    /// schema record `record`; one entry per worker.
-    EachRows(&'a [u8], &'a [Option<WireRows<'a>>]),
+    /// Worker `w` is sent the request's blob, which is the rows' schema record,
+    /// and the rows `each[w]`; one entry per worker.
+    EachRows(&'a [Option<WireRows<'a>>]),
     /// Worker `w` is sent no rows and `blobs[w]` in place of the request's blob;
     /// one entry per worker.
     EachBlob(&'a [Vec<u8>]),
@@ -88,27 +88,29 @@ impl<'a> Group<'a> {
     }
 
     /// A push of `rows` into `tid`, held to `rule`, whose schema record is
-    /// `record`: sent to the workers `rows` holds rows for, answered by none.
+    /// `record` and the group's blob: sent to the workers `rows` holds rows for,
+    /// answered by none.
     pub(super) fn push(tid: u64, rule: PkRule, record: &'a [u8], rows: Routed<'a>) -> Self {
         Group {
             request: Ingest::Push { tid, rule }.encode(),
-            blob: &[],
+            blob: record,
             data: match rows {
-                Routed::Same(d) => Payloads::Shared(d.map(|d| (record, d))),
-                Routed::Each(each) => Payloads::EachRows(record, each),
+                Routed::Same(d) => Payloads::Shared(d),
+                Routed::Each(each) => Payloads::EachRows(each),
             },
             to: rows.holders(),
             reply: None,
         }
     }
 
-    /// A catalog mutation of `family`: `batch`, sent whole to every worker. A
-    /// family that reaches no worker is logged and addresses none.
+    /// A catalog mutation of `family`: `batch`, sent whole to every worker under
+    /// the family's schema record as the blob. A family that reaches no worker is
+    /// logged and addresses none.
     pub(super) fn ddl_sync(family: SysFamily, batch: &'a Batch) -> Self {
         Group {
             request: Ingest::DdlSync { family }.encode(),
-            blob: &[],
-            data: Payloads::Shared(batch.wire_whole().map(|d| (family.sal_record(), d))),
+            blob: family.sal_record(),
+            data: Payloads::Shared(batch.wire_whole()),
             to: if family.master_only() {
                 WorkerSet::EMPTY
             } else {
@@ -135,7 +137,7 @@ impl<'a> Group<'a> {
     pub(super) fn sizes(&self, nw: usize, sizes: &mut [usize; MAX_WORKERS]) -> WorkerSet {
         let per_worker = match self.data {
             Payloads::Shared(_) => nw,
-            Payloads::EachRows(_, each) => each.len(),
+            Payloads::EachRows(each) => each.len(),
             Payloads::EachBlob(blobs) => blobs.len(),
         };
         assert_eq!(per_worker, nw, "per-worker entries={per_worker} != num_workers={nw}");
@@ -151,14 +153,14 @@ impl<'a> Group<'a> {
         payloads
     }
 
-    /// Worker `w`'s payload: the blob it is sent, and its rows behind their
-    /// schema record. The one definition — sizing and encoding both go through
-    /// it, so a payload's size and its bytes cannot disagree.
+    /// Worker `w`'s payload: the blob it is sent, and its rows. The one
+    /// definition — sizing and encoding both go through it, so a payload's size
+    /// and its bytes cannot disagree.
     #[inline]
     pub(super) fn payload(&self, w: usize) -> (&[u8], PayloadRows<'_>) {
         match self.data {
             Payloads::Shared(rows) => (self.blob, rows),
-            Payloads::EachRows(record, each) => (self.blob, each[w].map(|d| (record, d))),
+            Payloads::EachRows(each) => (self.blob, each[w]),
             Payloads::EachBlob(blobs) => (&blobs[w][..], None),
         }
     }

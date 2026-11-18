@@ -13,11 +13,13 @@ impl DagEngine {
         view_id: u64,
         keys: PkKeys,
     ) -> Result<Batch, String> {
-        let (code, mut stores) = self.registered(view_id)?.opened(registry, view_id, &[])?;
-        let replay = code
+        let view = self.registered(view_id)?;
+        let replay = view
+            .code
             .hydration
             .ok_or_else(|| format!("view {view_id} holds skeleton rows but was compiled unbounded"))?;
-        vm::replay_keys(&mut code.vm, &mut stores, &replay, keys)
+        let (vm, mut stores) = view.opened(registry, view_id, usize::MAX)?;
+        vm::replay_keys(vm, &mut stores, &replay, keys)
     }
 }
 

@@ -7,9 +7,6 @@ use gnitz_store::relation::RelationKind;
 const UNSUPPORTED: &str =
     "capacity-bounded view: only a filter/projection over one relation or over an inner equi-join is supported";
 
-const READS_OWN_STORE: &str =
-    "capacity-bounded view: a reduce as its output would read the view's skeleton rows back as its trace";
-
 /// Walk back from `from` through nodes that hand a subset of their input's
 /// rows on, each on its own worker with the PK region intact, to the first
 /// node that does not.
@@ -32,9 +29,6 @@ pub(super) fn derive_hydration(
     regs: &[DeltaReg],
     integrals: &[Option<(Integral, DeltaReg, Option<ClampKind>)>],
 ) -> Result<Replay, String> {
-    if code.vm.reads_view_store() {
-        return Err(READS_OWN_STORE.into());
-    }
     // A replay runs on one worker, and so no exchange round.
     if circuit.ops().any(|(_, op)| op.exchanges()) {
         return Err(UNSUPPORTED.into());

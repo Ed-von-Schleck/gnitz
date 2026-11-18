@@ -368,6 +368,25 @@ fn a_full_ring_owes_instead_of_blocking() {
     assert_eq!(weighted_rows(&out[0].rows(&fixed)), weighted_rows(&one));
 }
 
+/// A read answered with no rows, owed for want of room, is one last frame
+/// without a data block once the master has released room.
+#[test]
+fn a_reply_of_nothing_owed_is_one_empty_last_frame() {
+    let (mut q, rx) = queue_over(4096);
+    while q.w2m.try_send_msg(id(1), false, &WireMsg::default()).is_ok() {}
+
+    q.reply(route(1, 5), Ok(Rows::Nothing));
+    assert_eq!(owed(&q), [("train", 5)]);
+    assert!(frames(&rx).iter().all(|f| f.req == 1), "nothing of the reply was sent");
+
+    drain(&mut q);
+    let out = frames(&rx);
+    assert_eq!(reqs(&out), [5]);
+    assert_eq!(out[0].ctrl.hdr.status, WireStatus::Ok);
+    assert!(out[0].ctrl.hdr.flags.scan_last);
+    assert!(out[0].ctrl.data.is_none(), "no data block");
+}
+
 /// A span train carries every span in order, cut into frames by `chunk_rows` or
 /// the byte budget, whichever is hit first, and ends in one row-less terminal frame.
 #[test]

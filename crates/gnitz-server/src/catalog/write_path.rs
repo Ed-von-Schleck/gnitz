@@ -37,8 +37,9 @@ pub(crate) enum ZoneError {
 /// drop cascade included.
 #[derive(Default)]
 pub(crate) struct AppliedDdl {
-    /// The system families a view scans that the zone wrote, in
-    /// `SysFamily::ALL` order: a worker holds them above its cut, owed a tick.
+    /// The system families the zone wrote while a view scanned them, in
+    /// `SysFamily::ALL` order: a worker holds those groups above its cut, owed
+    /// a tick.
     pub(crate) held_above: Vec<u64>,
     pub(crate) created_views: Vec<u64>,
     /// Tables and views, chain segments included.

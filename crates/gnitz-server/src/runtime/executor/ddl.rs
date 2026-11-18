@@ -8,7 +8,7 @@
 //! none of that: a `sequences` advance has no DAG evaluation, and the row
 //! it logs is one no worker reads.
 
-use super::validate::{self, UniqueFilter};
+use super::validate;
 use super::{CatalogLock, Shared, decode_fault, park_until};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily, SysFamilyExt};
 use crate::runtime::master::ApplyLock;
@@ -93,19 +93,13 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     if !unique_creates.is_empty() {
         release_preflight(shared).await;
     }
-    let Committed { applied, zone_lsn, filter_seeds } = committed?;
+    let Committed { applied, zone_lsn } = committed?;
 
     for &id in &applied.dropped_relations {
         shared.forget_relation(&locks.catalog, id);
     }
     for &(owner_id, cols) in &applied.dropped_indexes {
         shared.writes.checks.unique_filter_remove(owner_id, cols);
-    }
-
-    // After the fsync, which aborts on failure: a seed is published only for an
-    // index that committed.
-    for (owner_id, cols, filter) in filter_seeds {
-        shared.writes.checks.unique_filter_seed(owner_id, cols, filter);
     }
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
@@ -138,12 +132,10 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     Ok(zone_lsn)
 }
 
-/// A bundle made durable: what it applied, its zone, and the unique-filter seed of
-/// each unique index it created over rows already present.
+/// A bundle made durable: what it applied and its zone.
 struct Committed {
     applied: AppliedDdl,
     zone_lsn: u64,
-    filter_seeds: Vec<(u64, PkColList, UniqueFilter)>,
 }
 
 /// Pre-flight every unique index of the bundle, then apply it and make its zone
@@ -157,12 +149,8 @@ async fn commit_bundle(
     // Pre-flight global uniqueness for every unique secondary index in this
     // bundle before opening the zone or mutating the catalog, so a
     // violation needs no rollback.
-    let mut filter_seeds = Vec::new();
     for &(owner_id, cols) in unique_creates {
-        // `None`: the index covers the owner's PK, so nothing will consult a filter.
-        if let Some(filter) = validate::validate_unique_index_create(&shared.dispatcher, owner_id, cols).await? {
-            filter_seeds.push((owner_id, cols, filter));
-        }
+        validate::validate_unique_index_create(&shared.dispatcher, owner_id, cols).await?;
     }
 
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
@@ -177,15 +165,16 @@ async fn commit_bundle(
         let (applied, zone_lsn) = shared
             .dispatcher
             .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?;
-        // The zone's families a view scans are owed the tick that follows the
-        // backfill; `alone` keeps every other emit from taking them first.
+        // The families whose groups landed above the cut are owed the tick
+        // that follows the backfill, even when the zone dropped every view that
+        // scanned them; `alone` keeps every other emit from taking them first.
         for &family in &applied.held_above {
-            shared.dispatcher.credit(&excl, family, 0);
+            shared.dispatcher.owe(&excl, family, 0);
         }
         (applied, zone_lsn)
     };
     shared.dispatcher.sal().durable_through(zone_lsn).await;
-    Ok(Committed { applied, zone_lsn, filter_seeds })
+    Ok(Committed { applied, zone_lsn })
 }
 
 /// Release the pre-flight's index claims, committed or not, while the DDL still

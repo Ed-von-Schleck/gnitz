@@ -255,19 +255,14 @@ fn master_pre_fork_recovery(
 ) -> Result<CatalogEngine, String> {
     let mut catalog = CatalogEngine::open_master(data_dir, num_workers, config, system_tail(tail))
         .map_err(|e| format!("failed to open catalog: {e}"))?;
-    if tail.holds_pushes() {
-        // G → G+1, the resume point left at G: the workers' boot flush moves
-        // the base stores past what the views at G integrate, so until the
-        // boot's ephemeral round restamps at G+1 a crash rebuilds every view
-        // instead of resuming it.
-        catalog.advance_durable_generation()?;
-    } else {
-        // No push is replayed, so every base store stays what the views at G
-        // integrate, and a view this boot keeps is still valid at G.
-        catalog
-            .flush_all_system_tables()
-            .map_err(|e| format!("boot system flush failed: {e}"))?;
-    }
+    // With a replayed push, G → G+1, the resume point left at G: the workers'
+    // boot flush moves the base stores past what the views at G integrate, so
+    // until the boot's ephemeral round restamps at G+1 a crash rebuilds every
+    // view instead of resuming it. With none, every base store stays what the
+    // views at G integrate, and a view this boot keeps is still valid at G.
+    catalog
+        .flush_ahead_of_base_round(tail.holds_pushes())
+        .map_err(|e| format!("boot system flush failed: {e}"))?;
     inject_recovery_panic("genbump");
     tail.write_above(catalog.applied_zone());
     Ok(catalog)

@@ -337,40 +337,7 @@ fn remove_trace(dir: &str, vid: u64) {
 
 // ── Chains ───────────────────────────────────────────────────────────────
 
-/// `seg`, a segment running `segment`, and its owner `top`, running `owner(seg)`
-/// and holding `capacity_bytes`.
-fn register_chain(
-    engine: &mut CatalogEngine,
-    segment: Circuit,
-    owner: impl FnOnce(u64) -> Circuit,
-    cols: &[CatalogColumn],
-    capacity_bytes: u64,
-) -> Result<(u64, u64), String> {
-    let seg = engine.allocate_ids(2).unwrap();
-    let top = seg + 1;
-    let owner = owner(seg);
-    let rows = sys_batch([
-        (
-            ViewTabRow {
-                owner_view_id: top,
-                ..view_tab_row(seg, &format!("_seg{seg}"))
-            },
-            1,
-        ),
-        (
-            ViewTabRow {
-                capacity_bytes,
-                ..view_tab_row(top, &format!("top{top}"))
-            },
-            1,
-        ),
-    ]);
-    let created = [(seg, &segment, cols), (top, &owner, cols)];
-    apply_ddl(engine, view_blocks(created, rows))?;
-    Ok((seg, top))
-}
-
-/// [`register_chain`] of an identity segment over `tid` and a DISTINCT owner
+/// [`try_register_chain`] of an identity segment over `tid` and a DISTINCT owner
 /// over it: the owner alone holds a trace.
 fn register_distinct_chain(
     engine: &mut CatalogEngine,
@@ -379,13 +346,13 @@ fn register_distinct_chain(
     capacity_bytes: u64,
 ) -> Result<(u64, u64), String> {
     let identity = crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
-    register_chain(engine, identity, distinct_circuit, cols, capacity_bytes)
+    try_register_chain(engine, &identity, cols, distinct_circuit, cols, capacity_bytes)
 }
 
 // ── a_chain_resumes_or_rebuilds_as_one ──────────────────────────────────
-// A chain's segment holds its rows only while the chain is built, so the verdict
-// that rejects one of its views has to reject the segments that view's backfill
-// reads — which a check of the segment's own children would keep.
+// A chain's segment holds no rows, so the verdict that rejects one of its views
+// has to reject the segments that feed that view's rebuild — which a check of
+// the segment's own children would keep.
 #[test]
 fn a_chain_resumes_or_rebuilds_as_one() {
     let tmp = tempfile::tempdir().unwrap();
@@ -394,17 +361,11 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     let (tid, cols) = seed_base(&mut engine, "public.cbase");
     let (seg, top) = register_distinct_chain(&mut engine, tid, &cols, 0).unwrap();
 
-    backfill(&mut engine, seg);
-    assert_eq!(
-        net_weight(&engine, seg),
-        N,
-        "a segment holds its rows for its chain's build"
-    );
-    backfill(&mut engine, top);
+    backfill_set(&mut engine, &[seg, top]);
     assert_eq!(
         (net_weight(&engine, seg), net_weight(&engine, top)),
         (0, N),
-        "its last reader's backfill drops them"
+        "a segment stores nothing at its build"
     );
 
     tick(&mut engine, tid, N as u64, 0);
@@ -494,11 +455,9 @@ fn a_rebuilt_chain_takes_its_owners_dependents() {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.dbase");
     let identity = |_| crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
-    let (seg, top) = register_chain(&mut engine, traced_circuit(tid, &cols), identity, &cols, 0).unwrap();
+    let (seg, top) = register_chain(&mut engine, &traced_circuit(tid, &cols), &cols, identity, &cols);
     let over_top = register_identity_view(&mut engine, top, "over_top", &cols);
-    for view in [seg, top, over_top] {
-        backfill(&mut engine, view);
-    }
+    backfill_set(&mut engine, &[seg, top, over_top]);
     let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
     engine.close();
@@ -509,9 +468,7 @@ fn a_rebuilt_chain_takes_its_owners_dependents() {
         assert!(engine.boot.rebuild.contains(&view), "view {view}");
     }
     // The boot's order: the rebuilds, then the replayed tail's tick.
-    for view in [seg, top, over_top] {
-        backfill(&mut engine, view);
-    }
+    backfill_set(&mut engine, &[seg, top, over_top]);
     tick(&mut engine, tid, N as u64, 0);
     assert_eq!(
         (net_weight(&engine, top), net_weight(&engine, over_top)),

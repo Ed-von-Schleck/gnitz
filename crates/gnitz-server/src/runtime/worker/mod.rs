@@ -8,7 +8,7 @@
 //! This file reads the SAL and runs what it asks: a read is answered off the
 //! catalog, rows are ingested, a round is run and ACKed. `reply` owns the ring
 //! and what the worker owes on it; `exchange` is the wait a drive's round spends
-//! on its peers, and what of the SAL is served meanwhile.
+//! on its peers, while it serves the SAL and sends owed replies.
 
 mod exchange;
 mod reply;
@@ -20,10 +20,8 @@ use crate::runtime::w2m::W2mWriter;
 use gnitz_foundation::fault::Switch;
 use gnitz_foundation::gnitz_debug;
 use gnitz_store::relation::{IndexClaim, Snapshot};
-use gnitz_wire::TypeCode;
 use gnitz_wire::{PkKeys, WireFault};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use reply::{Replies, Rows};
 use rustc_hash::FxHashMap;
 
@@ -66,32 +64,44 @@ impl<'c> WorkerProcess<'c> {
     /// the loop.
     pub(super) fn run(&mut self) -> ! {
         loop {
-            // An owed reply goes out without waiting on the SAL, unless the ring
-            // refused the next frame to leave or the master holds every reply
-            // owed; then the master's release or end of a hold wakes the park too.
-            if self.replies.is_empty() {
-                self.mesh.park().park(|| self.sal_reader.is_empty());
-            } else {
-                self.replies.wait_for_master(|| self.sal_reader.is_empty());
-            }
-
+            self.wait(|| !self.sal_reader.is_empty());
             self.drain_sal(false);
         }
     }
 
-    /// Serve the SAL's pending groups, one owed reply frame after each, and at
-    /// the top level one ahead of the first: neither waits for the other to run
-    /// dry. `in_drive`: inside an exchange wait, which stops as soon as its
-    /// round is complete, sending no frame after; the next wait, or the top
-    /// level, serves what the SAL still holds, in order.
+    /// Park this worker until `woken`, unless an owed reply can leave now.
+    /// While every owed reply waits on the master, for room the ring refused or
+    /// the end of a hold, the master's release or end of a hold wakes the park
+    /// too.
+    fn wait(&self, woken: impl Fn() -> bool) {
+        if self.replies.is_empty() {
+            self.mesh.park().park(|| !woken());
+        } else {
+            self.replies.wait_for_master(|| !woken());
+        }
+    }
+
+    /// Serve the SAL's pending groups and send owed reply frames, neither
+    /// waiting for the other to run dry. `in_drive`: inside an exchange wait.
+    ///
+    /// - At the top level: one frame ahead of the first group, and one after
+    ///   each group served.
+    /// - In an exchange wait whose round is still out: the same, so a train
+    ///   moves while the SAL is empty. While a seal of the running `Tick` group
+    ///   is still ahead no group is served, so every worker seals the log as
+    ///   far as the group; the frame ahead still goes.
+    /// - In an exchange wait whose round is complete: one group is served and
+    ///   no frame is sent, then the drive goes on. That one group keeps the
+    ///   reads on the SAL moving through a long drive, whose rounds may each be
+    ///   complete when its wait begins (with one worker, always). The next
+    ///   wait, or the top level, serves what the SAL still holds, in order.
     fn drain_sal(&mut self, in_drive: bool) {
-        if !in_drive {
+        let serves = !self.seals_ahead;
+        let open = |wp: &Self| !in_drive || !wp.mesh.complete();
+        if open(self) {
             self.replies.emit_frame();
         }
-        while self.serve_next(in_drive) {
-            if in_drive && self.mesh.complete() {
-                break;
-            }
+        while serves && self.serve_next(in_drive) && open(self) {
             self.replies.emit_frame();
         }
     }
@@ -198,10 +208,7 @@ impl<'c> WorkerProcess<'c> {
                 Ok(())
             }
             Apply::Backfill { ref views } => {
-                debug_assert!(views.is_sorted(), "a backfill fills its views in id order");
-                views.iter().try_for_each(|&view| {
-                    crate::query::backfill(self, view).map_err(|e| format!("backfill of view {view}: {e}"))
-                })
+                crate::query::backfill(self, views).map_err(|e| format!("backfill of views {views:?}: {e}"))
             }
         }
     }
@@ -243,7 +250,7 @@ fn answer(
         }
         Read::ReleasePreflight => {
             cat.registry.release_claim(IndexClaim::Preflight);
-            Ok(no_rows())
+            Ok(Rows::Nothing)
         }
         // A worker holds no system family a snapshot reads: the master answers
         // those from its own pin.
@@ -251,11 +258,11 @@ fn answer(
         Read::Pin { snapshot } => {
             let prior = snapshots.insert(snapshot, cat.registry.pin());
             debug_assert!(prior.is_none(), "snapshot {snapshot} pinned twice");
-            Ok(no_rows())
+            Ok(Rows::Nothing)
         }
         Read::Unpin { snapshot } => {
             snapshots.remove(&snapshot);
-            Ok(no_rows())
+            Ok(Rows::Nothing)
         }
         Read::SnapshotPage { snapshot, tid, page } => {
             let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
@@ -266,15 +273,9 @@ fn answer(
         }
         Read::Backup { dir } => {
             cat.registry.link_published_into(dir)?;
-            Ok(no_rows())
+            Ok(Rows::Nothing)
         }
     }
-}
-
-/// The reply of a read that answers with no rows: one empty frame.
-fn no_rows() -> Rows {
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
-    Rows::from(Batch::empty_with_schema(&schema))
 }
 
 #[cfg(test)]

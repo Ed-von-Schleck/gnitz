@@ -14,8 +14,8 @@ impl DriveHost for WorkerProcess<'_> {
     }
 
     /// Publish `lanes` as this worker's rounds — one, or as few as hold them —
-    /// and block until every part of each is complete. SAL groups served
-    /// meanwhile go through [`WorkerProcess::drain_sal`] with `in_drive`.
+    /// and block until every part of each is complete, serving the SAL and
+    /// sending owed reply frames meanwhile.
     fn exchange<'b>(
         &mut self,
         mut lanes: impl ExactSizeIterator<Item = Lane<'b>>,
@@ -33,20 +33,18 @@ impl DriveHost for WorkerProcess<'_> {
 
 impl WorkerProcess<'_> {
     /// Wait out every part of `round` and push each lane's rows to `gathered`:
-    /// whether every worker was drained. SAL groups arriving meanwhile are
-    /// served, unless a seal of the running `Tick` group is still ahead: then
-    /// the SAL waits, and every worker seals the log as far as the group.
+    /// whether every worker was drained. Meanwhile SAL groups are served and
+    /// owed reply frames sent, by [`WorkerProcess::drain_sal`]; the wait spins
+    /// for the part only while no frame can leave.
     fn finish_round(&mut self, round: &mut Round<'_>, gathered: &mut Vec<Batch>) -> bool {
         let serves = !self.seals_ahead;
         loop {
-            let sal = &self.sal_reader;
-            let woken = || serves && !sal.is_empty();
-            self.mesh.spin_for_part(woken);
-            self.mesh.park().park(|| !woken() && !self.mesh.complete());
-            // Once the round is complete the drive goes on.
-            if serves {
-                self.drain_sal(true);
+            if !self.replies.can_leave() {
+                let sal = &self.sal_reader;
+                self.mesh.spin_for_part(|| serves && !sal.is_empty());
             }
+            self.wait(|| serves && !self.sal_reader.is_empty() || self.mesh.complete());
+            self.drain_sal(true);
             if let Some(drained) = self.mesh.step(round, gathered) {
                 return drained;
             }

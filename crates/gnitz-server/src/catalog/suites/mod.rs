@@ -53,9 +53,10 @@ use crate::test_support::{
     apply_ddl, bundle, chunked, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit,
     empty_catalog, empty_catalog_with, equi_join_circuit, fk_child_cols, fk_def, fk_def_on_delete, fk_parent,
     idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_and_tick,
-    push_sys_row, read_rows, refusal, register_full_pk, register_identity_view, scan_all, schema_tab_batch,
-    sum_weights, sys_batch, table_engine, table_engine_with, table_tab_batch, table_tab_row,
-    try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks, view_tab_row, weights,
+    push_sys_row, read_rows, refusal, register_chain, register_full_pk, register_identity_view, scan_all,
+    schema_tab_batch, sum_weights, sys_batch, table_engine, table_engine_with, table_tab_batch, table_tab_row,
+    try_register_chain, try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks,
+    view_tab_row, weights,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -151,9 +152,15 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
         .expect("three U64 PK columns encode to 24 bytes")
 }
 
-/// Backfill `view`, as a worker's `Backfill` does.
+/// Backfill `view`, which no view scans, as a worker's `Backfill` does.
 fn backfill(engine: &mut CatalogEngine, view: u64) {
-    crate::query::backfill(engine, view).unwrap();
+    backfill_set(engine, &[view]);
+}
+
+/// Backfill `views`, sorted and closed under dependents, as one set, as a
+/// worker's `Backfill` does.
+fn backfill_set(engine: &mut CatalogEngine, views: &[u64]) {
+    crate::query::backfill(engine, views).unwrap();
 }
 
 /// The child directories of relation `id` holding a manifest.

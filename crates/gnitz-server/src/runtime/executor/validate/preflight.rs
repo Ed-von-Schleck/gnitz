@@ -255,11 +255,12 @@ impl Checks {
     }
 }
 
-/// The `(row, key)` of each row of a probe reply that answers a probed key.
+/// The `(row, key)` of each row of a probe reply: every row answers a probed key.
 fn answered<'r>(rows: &'r MemBatch<'_>) -> impl Iterator<Item = (usize, &'r [u8])> {
-    (0..rows.len())
-        .filter(|&j| rows.get_weight(j) == 1)
-        .map(|j| (j, rows.get_pk_bytes(j)))
+    (0..rows.len()).map(|j| {
+        debug_assert_eq!(rows.get_weight(j), 1, "a probe reply holds each found row once");
+        (j, rows.get_pk_bytes(j))
+    })
 }
 
 /// Rule U-PK, reply half, over one reply frame `rows` of `t`'s PK probe: an
@@ -442,7 +443,7 @@ fn plan_fk_existence<'a>(
         } else {
             let index = parent
                 .index_on(&[parent_col as u32])
-                .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
+                .expect("an FK's target column keeps a unique index while the FK exists");
             let cols = PkColList::from_slice(&[parent_col as u32]);
             (index.key_spec().key_size(), Probe::Index(cols, NonZeroU64::MAX))
         };
@@ -669,13 +670,13 @@ async fn removed_references(
 
         let mut checks: Vec<Check<ReferencePlan>> = Vec::new();
         for (edge, cascades, values) in seeds.drain(..) {
-            let FkEdge { child_tid, fk_col, .. } = edge;
+            let FkEdge { child_tid, .. } = edge;
             let cat = disp.cat();
             let child = cat.registry.relation_or_err(child_tid)?;
             let cols = edge.child_index_cols();
             let index = child
                 .index_on(cols.as_slice())
-                .ok_or_else(|| format!("FK check: no index on child {child_tid} col {fk_col}"))?;
+                .expect("a child's FK index is registered with its FK edge");
             let schema = child.schema();
             // Only a key of the child's fold is exempt, so one entry past its
             // key count is a violation. A cascade's reply holds as well the rows

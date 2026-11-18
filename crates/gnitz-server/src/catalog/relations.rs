@@ -11,7 +11,6 @@
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::num::NonZeroU64;
-use std::rc::Rc;
 
 use gnitz_store::relation::Relation;
 use gnitz_wire::{
@@ -36,10 +35,10 @@ pub(crate) type LockSet = SmallVec<[u64; 4]>;
 pub(in crate::catalog) struct RelationEntry {
     /// The relation's [`encode_record`]: what a RESOLVE answers, and what a
     /// client's push is checked against.
-    record: Rc<[u8]>,
+    record: Box<[u8]>,
     /// The relation's [`encode_schema_record`]: what every SAL group of it
     /// carries, and what a worker checks one against.
-    sal_record: Rc<[u8]>,
+    sal_record: Box<[u8]>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
     /// The token of [`CatalogEngine::resolve_answer`], once computed. Reset by
@@ -50,20 +49,18 @@ pub(in crate::catalog) struct RelationEntry {
 impl RelationEntry {
     /// The entry of a relation of `schema`, whose columns `defs` describe.
     pub(in crate::catalog) fn new(schema: &SchemaDescriptor, defs: &[CatalogColumn], fks: Vec<FkEdge>) -> Self {
-        let mut entry = RelationEntry {
-            record: Rc::default(),
-            sal_record: Rc::default(),
+        RelationEntry {
+            record: encode_record(schema.pk_cols(), defs),
+            sal_record: encode_schema_record(schema).into(),
             fks,
             token: Cell::new(None),
-        };
-        entry.set_records(schema, defs);
-        entry
+        }
     }
 
     /// Re-encode both records for `schema`, whose columns `defs` describe.
     pub(in crate::catalog) fn set_records(&mut self, schema: &SchemaDescriptor, defs: &[CatalogColumn]) {
-        self.record = Rc::from(encode_record(schema.pk_cols(), defs));
-        self.sal_record = Rc::from(encode_schema_record(schema));
+        self.record = encode_record(schema.pk_cols(), defs);
+        self.sal_record = encode_schema_record(schema).into();
     }
 }
 
@@ -81,16 +78,16 @@ impl CatalogEngine {
     }
 
     /// `tid`'s relation and its named record; `None` for an unregistered id.
-    pub(crate) fn wire_target(&self, tid: u64) -> Option<(&Relation, &Rc<[u8]>)> {
-        Some((self.registry.relation(tid)?, &self.caches.relations.get(&tid)?.record))
+    pub(crate) fn wire_target(&self, tid: u64) -> Option<(&Relation, &[u8])> {
+        Some((self.registry.relation(tid)?, &*self.caches.relations.get(&tid)?.record))
     }
 
     /// `tid`'s relation and the nameless record its SAL push groups carry;
     /// `None` for an unregistered id.
-    pub(crate) fn sal_target(&self, tid: u64) -> Option<(&Relation, &Rc<[u8]>)> {
+    pub(crate) fn sal_target(&self, tid: u64) -> Option<(&Relation, &[u8])> {
         Some((
             self.registry.relation(tid)?,
-            &self.caches.relations.get(&tid)?.sal_record,
+            &*self.caches.relations.get(&tid)?.sal_record,
         ))
     }
 
@@ -98,7 +95,7 @@ impl CatalogEngine {
     /// lays `tid`'s groups out with.
     pub(crate) fn known_decode(&self, tid: u64, frame_record: &[u8]) -> Option<SchemaDescriptor> {
         let (rel, record) = self.sal_target(tid)?;
-        (**record == *frame_record).then(|| rel.schema())
+        (record == frame_record).then(|| rel.schema())
     }
 
     /// What a RESOLVE of `tid` answers: its encoded descriptor, its named record

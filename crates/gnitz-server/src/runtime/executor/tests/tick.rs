@@ -17,12 +17,12 @@ fn a_relations_first_unticked_commit_wakes_its_watches_and_refuses_new_ones() {
         register_identity_view(&mut engine, t, "v", &cols);
         register_identity_view(&mut engine, u, "w", &cols);
         let (dispatcher, _) = test_dispatcher(0, engine);
-        let (shared, _commits, _ticks, _asks) = Shared::new(dispatcher, Duration::ZERO, None);
+        let (shared, _commits, _asks) = Shared::new(dispatcher, Duration::ZERO, None);
         let reactor = shared.dispatcher.reactor();
         let commit = |tid| {
             reactor.block_on(async {
                 let laid_out = shared.dispatcher.sal().lock().await;
-                shared.note_commit_rows(&laid_out, [(tid, 1)].into_iter());
+                shared.dispatcher.credit(&laid_out, tid, 1);
             });
         };
         let mut on_t = shared

@@ -5,110 +5,6 @@ use super::*;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 
-// ── Epoch execution ─────────────────────────────────────────────────────
-
-/// Run one view's backfill epoch over `input`, a chunk of `src_id`'s rows —
-/// what a relay round gathered of it where the view's scan of `src_id` relays —
-/// `None` once drained. Answers `None` where the epoch produced no row.
-/// `unfed`: the sources the view has been fed no row of. `drained`: what each
-/// round it runs passes to [`DriveHost::exchange`], and takes from it.
-// Inlined: a call copies the output batch whole, once per chunk.
-#[inline(always)]
-fn run_view_epoch(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    mut input: Option<Batch>,
-    src_id: u64,
-    unfed: &[u64],
-    drained: &mut bool,
-) -> Result<Option<Batch>, String> {
-    let mut ran = start_epoch(host, view_id, src_id, input.as_mut(), true, unfed)?;
-    let mut gathered = Vec::new();
-    loop {
-        let mut epoch = match ran {
-            None => return Ok(None),
-            Some(vm::Ran::Done(out)) => return Ok((!out.is_empty()).then_some(out)),
-            Some(vm::Ran::Round(epoch)) => epoch,
-        };
-        let (batch, plan, fold) = epoch.round();
-        let lane = Lane { view: view_id, batch, plan, fold };
-        *drained = host.exchange(std::iter::once(lane), *drained, &mut gathered);
-        let rows = gathered.pop().expect("a lane per round");
-        ran = Some(resume_epoch(host, view_id, epoch, rows, unfed)?);
-    }
-}
-
-/// Start view `view_id`'s epoch over `input`, `src_id`'s delta, given where
-/// `take` and lent otherwise, as [`vm::start`] runs it. `None` where the epoch
-/// idles: its delta is empty and reaches no round. `unfed` as [`RegisteredView::opened`]'s.
-fn start_epoch(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    src_id: u64,
-    input: Option<&mut Batch>,
-    take: bool,
-    unfed: &[u64],
-) -> Result<Option<vm::Ran>, String> {
-    let (dag, registry) = host.parts();
-    // A view's run reaches it only from a source its circuit scans.
-    let view = dag.registered(view_id)?;
-    let reg = view.code.scan(src_id).seed;
-    let seed = input.filter(|input| !input.is_empty());
-    // An empty delta still runs its round, on every worker, whatever this one
-    // holds. One that runs none is skipped before its view's stores are opened.
-    if seed.is_none() && view.code.vm.idles_on_empty(reg) {
-        return Ok(None);
-    }
-    let (code, mut stores) = view.opened(registry, view_id, unfed)?;
-    vm::start(&mut code.vm, &mut stores, reg, seed, take).map(Some)
-}
-
-/// Run view `view_id`'s `epoch` on over `rows`, what its round gathered. The
-/// exchange held the host: the plan and its stores are looked up again.
-fn resume_epoch(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    epoch: vm::Epoch,
-    rows: Batch,
-    unfed: &[u64],
-) -> Result<vm::Ran, String> {
-    let (dag, registry) = host.parts();
-    let (code, mut stores) = dag.registered(view_id)?.opened(registry, view_id, unfed)?;
-    vm::resume(&mut code.vm, &mut stores, epoch, rows)
-}
-
-/// What the round relaying `input`, `src_id`'s delta, into view `view_id` sends
-/// of it — given where `take`, else a copy — and the plan it sends it by. The
-/// round runs on every worker, whatever this one holds; `None` is an empty
-/// delta. `fold` as [`Lane::fold`].
-fn relay_operand(
-    host: &mut impl DriveHost,
-    view_id: u64,
-    src_id: u64,
-    input: Option<&mut Batch>,
-    take: bool,
-    fold: bool,
-) -> (Batch, Rc<ScatterPlan>) {
-    let code = &host.parts().0.views[&view_id].code;
-    let scan = code.scan(src_id);
-    let plan = Rc::clone(&scan.relay.as_ref().expect("a relayed scan has a relay").plan);
-    let Some(input) = input else {
-        return (Batch::empty_with_schema(code.vm.schema_of(scan.seed)), plan);
-    };
-    // Every worker sends its rows, and decodes theirs, under the seed's label.
-    code.vm.label(scan.seed, input);
-    // Every worker gathers every row of a broadcast: one fold at the sender
-    // serves them all.
-    if fold && plan.is_broadcast() {
-        input.consolidate_in_place();
-    }
-    let rows = match take {
-        true => input.take(),
-        false => input.clone(),
-    };
-    (rows, plan)
-}
-
 // ── DAG traversal driver ────────────────────────────────────────────────
 
 /// Whether this process mints the row a global aggregate owes over an empty input: each
@@ -125,66 +21,69 @@ pub(crate) fn tick(host: &mut impl DriveHost, source: u64, round: u64) -> Result
     run_tick(host, source, round, delta)
 }
 
-/// Fill `view`, and it alone, from each relation it scans, in scan order, each
-/// read at its cut: rows above it reach the view with the tick that seals them.
-/// The caller fills views in id order, a view after every view it scans.
-pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), String> {
-    let (dag, registry) = host.parts();
-    let sources: Vec<u64> = dag.sources_of(view).collect();
-    let chunk_rows = registry.scan_chunk_rows();
-    let mut gathered = Vec::new();
-    // No source has fed the view yet.
-    let replicated = registry.relation_or_err(view)?.placement().is_replicated();
-    let (code, mut stores) = dag.registered(view)?.opened(registry, view, &sources)?;
-    if mints_ground_row(registry.slot(), replicated) {
-        let minted = vm::mint_ground_rows(&mut code.vm, &mut stores)?;
-        registry.ingest(view, minted)?;
+/// Fill `views`, sorted and closed under dependents, from each relation outside
+/// the set that a member scans, read at its cut: rows above it reach the views
+/// with the tick that seals them. Every global aggregate's ground row is minted
+/// first. Then each member in id order drains its sources outside the set, in
+/// scan order, each chunk run through one schedule: the member's epoch over it
+/// and, in the same run, every member downstream of it over the deltas it
+/// emits. A member's sources inside the set reach it only as
+/// those deltas, so a chain segment's rows go to its readers as a tick's do, and
+/// its store holds none of them.
+pub(crate) fn backfill(host: &mut impl DriveHost, views: &[u64]) -> Result<(), String> {
+    let dag = host.parts().0;
+    debug_assert!(views.is_sorted(), "a backfill fills its views in id order");
+    debug_assert!(
+        views
+            .iter()
+            .all(|&v| dag.dependents_of(v).iter().all(|d| views.binary_search(d).is_ok())),
+        "a backfilled view's readers are backfilled with it: each would otherwise read its deltas twice"
+    );
+    let mut run = std::mem::take(&mut dag.tick);
+    let ran = run.backfill(host, views);
+    // A failed ground-row landing leaves its rows held.
+    run.clear();
+    host.parts().0.tick = run;
+    ran
+}
+
+/// What a run feeds the views it steps.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// A tick, its views' outputs captured as `round` by the delta feeds.
+    Tick { round: u64 },
+    /// A backfill feeding `member`, which captures nothing. A fill run steps
+    /// only `member` and the views above it: `member` has been fed its first
+    /// `fed` sources, in scan order, and every other view the run steps none.
+    Fill { member: u64, fed: usize },
+}
+
+impl Default for Pass {
+    fn default() -> Self {
+        Pass::Tick { round: 0 }
     }
-    for (at, &source) in sources.iter().enumerate() {
-        let (dag, registry) = host.parts();
-        // `sources` came from this view's own plan.
-        let code = &dag.views[&view].code;
-        let scan = code.scan(source);
-        // Whether a round relays the source's rows, and whether it folds them.
-        let relay_fold = scan.relay.is_some().then(|| code.vm.folds(scan.seed));
-        let relation = registry.relation_or_err(source)?;
-        // A stream holds no rows: every worker skips it alike, so no round is owed.
-        if relation.kind() == RelationKind::Stream {
-            continue;
-        }
-        let mut cursor = relation.open_sealed(scan.bound.clone(), scan.read)?;
-        let unfed = &sources[at + 1..];
-        loop {
-            let mut chunk = cursor.drain_chunk(chunk_rows);
-            // `None` once drained, until every worker is: all run the same rounds.
-            let mut drained = chunk.is_none();
-            if let Some(fold) = relay_fold {
-                let (rows, plan) = relay_operand(host, view, source, chunk.as_mut(), true, fold);
-                let lane = Lane {
-                    view,
-                    batch: Cow::Owned(rows),
-                    plan: &plan,
-                    fold,
-                };
-                drained = host.exchange(std::iter::once(lane), drained, &mut gathered);
-                chunk = gathered.pop();
-            }
-            if let Some(out) = run_view_epoch(host, view, chunk, source, unfed, &mut drained)? {
-                host.parts().1.ingest(view, out)?;
-            }
-            if drained {
-                break;
-            }
-        }
-        let (dag, registry) = host.parts();
-        // Views fill in id order, so the last to scan a source is its last reader.
-        let last_reader = dag.dependents_of(source).iter().max() == Some(&view);
-        if last_reader && dag.passes_through(source) {
-            registry.clear_rows(source)?;
+}
+
+impl Pass {
+    /// The round a run's outputs are captured as.
+    fn round(self) -> Option<u64> {
+        match self {
+            Pass::Tick { round } => Some(round),
+            Pass::Fill { .. } => None,
         }
     }
-    // Once, not per chunk: the view's first reads open over fewer runs.
-    host.parts().1.settle(view)
+
+    /// How many of `view`'s sources, in scan order, it has been fed: every
+    /// later one reads empty.
+    fn fed(self, view: u64) -> usize {
+        match self {
+            Pass::Tick { .. } => usize::MAX,
+            Pass::Fill { member, fed } => {
+                debug_assert!(view >= member, "a fill run steps no view below its member");
+                if view == member { fed } else { 0 }
+            }
+        }
+    }
 }
 
 /// The round a step of the running tick stands at.
@@ -200,11 +99,11 @@ enum Stage {
     Epoch(vm::Epoch),
 }
 
-/// One tick's run of its schedule, in waves: steps start in schedule order, each
-/// run to its first round or its end, up to the first that cannot start yet;
-/// then the rounds every step stands at run as one [`DriveHost::exchange`]. Each
-/// epoch sends and gathers exactly the rows a round of its own would; only the
-/// waits are shared.
+/// One run of a schedule, in waves: steps start in schedule order, each run to
+/// its first round or its end, up to the first that cannot start yet; then the
+/// rounds every step stands at run as one [`DriveHost::exchange`]. Each epoch
+/// sends and gathers exactly the rows a round of its own would; only the waits
+/// are shared.
 ///
 /// A step starts only once no step standing at a round is of its view or of its
 /// producer. Besides its producer's output, a view's epoch reads only its own
@@ -212,15 +111,18 @@ enum Stage {
 /// of which another view's step moves: a view's store is never another view's
 /// integral. A round's lanes follow the schedule, the same on every worker. An
 /// epoch at a round holds its registers, and with them its own copy of a delta
-/// it reads again, until the round gathers, so a tick holds the state of every
+/// it reads again, until the round gathers, so a run holds the state of every
 /// epoch of a wave at once.
 ///
-/// The engine keeps one between ticks, empty, for its capacity.
+/// A tick runs its source's schedule once. A backfill runs one over its
+/// ground rows, and one per chunk it feeds a member.
+///
+/// The engine keeps one between runs, empty, for its capacity.
 #[derive(Default)]
 pub(super) struct TickRun {
     schedule: Rc<[Step]>,
-    round: u64,
-    /// The batch each producer of the tick has emitted, keyed by producer. A
+    pass: Pass,
+    /// The batch each producer of the run has emitted, keyed by producer. A
     /// producer with no entry produced nothing.
     outputs: FxHashMap<u64, Batch>,
     /// What each relay round gathered, indexed by [`meta::RelaySlot`], from
@@ -235,16 +137,6 @@ pub(super) struct TickRun {
 }
 
 impl TickRun {
-    /// Step `i`'s delta, and whether it may take it: what its relay round
-    /// gathered, or its producer's output.
-    fn feed(&mut self, i: usize) -> (Option<&mut Batch>, bool) {
-        let Step { producer, last, relay, .. } = self.schedule[i];
-        match relay {
-            Some(slot) => (self.relays[slot.at].as_mut(), slot.last),
-            None => (self.outputs.get_mut(&producer), last),
-        }
-    }
-
     /// Whether step `i` can start: a relay round another step runs for it has
     /// gathered, and no step at a round is of its view or of its producer.
     fn ready(&self, i: usize) -> bool {
@@ -267,11 +159,29 @@ impl TickRun {
 
     /// Start step `i`: run it to its first round, or its end.
     fn start(&mut self, host: &mut impl DriveHost, i: usize) -> Result<(), String> {
-        let Step { view, producer, last, relay, .. } = self.schedule[i];
+        let Step { view, producer, last, relay } = self.schedule[i];
         // A relayed step reads its round's rows: the round's first reader runs it.
         if let Some(slot) = relay.filter(|slot| slot.first) {
             debug_assert_eq!(slot.at, self.relays.len(), "rounds start in slot order");
-            let (rows, plan) = relay_operand(host, view, producer, self.outputs.get_mut(&producer), last, slot.fold);
+            let code = &host.parts().0.views[&view].code;
+            let scan = code.scan(producer);
+            let plan = Rc::clone(&scan.relay.as_ref().expect("a relayed scan has a relay").plan);
+            // The round runs on every worker, whatever this one holds: it sends
+            // the producer's output, taken where no later step reads it.
+            let rows = match self.outputs.get_mut(&producer) {
+                None => Batch::empty_with_schema(code.vm.schema_of(scan.seed)),
+                Some(input) => {
+                    // Every worker sends its rows, and decodes theirs, under the
+                    // seed's label.
+                    code.vm.label(scan.seed, input);
+                    // Every worker gathers every row of a broadcast: one fold at
+                    // the sender serves them all.
+                    if slot.fold && plan.is_broadcast() {
+                        input.consolidate_in_place();
+                    }
+                    if last { input.take() } else { input.clone() }
+                }
+            };
             self.relays.push(None);
             let fold = slot.fold;
             self.standing.push_back((i, Stage::Relay { rows, plan, fold }));
@@ -280,15 +190,28 @@ impl TickRun {
         self.start_epoch(host, i)
     }
 
-    /// Start step `i`'s epoch over its [`Self::feed`], lent where a later step
-    /// reads it too.
+    /// Start step `i`'s epoch over its delta: what its relay round gathered, or
+    /// its producer's output, lent where a later step reads it too.
     fn start_epoch(&mut self, host: &mut impl DriveHost, i: usize) -> Result<(), String> {
-        let Step { view, producer, .. } = self.schedule[i];
-        let (input, take) = self.feed(i);
-        match start_epoch(host, view, producer, input, take, &[])? {
-            Some(ran) => self.ran(host, i, ran),
-            None => Ok(()),
+        let Step { view, producer, last, relay } = self.schedule[i];
+        let fed = self.pass.fed(view);
+        let (input, take) = match relay {
+            Some(slot) => (self.relays[slot.at].as_mut(), slot.last),
+            None => (self.outputs.get_mut(&producer), last),
+        };
+        let (dag, registry) = host.parts();
+        // A view's run reaches it only from a source its circuit scans.
+        let registered = dag.registered(view)?;
+        let reg = registered.code.scan(producer).seed;
+        let seed = input.filter(|input| !input.is_empty());
+        // An empty delta still runs its round, on every worker, whatever this one
+        // holds. One that runs none is skipped before its view's stores are opened.
+        if seed.is_none() && registered.code.vm.idles_on_empty(reg) {
+            return Ok(());
         }
+        let (vm, mut stores) = registered.opened(registry, view, fed)?;
+        let ran = vm::start(vm, &mut stores, reg, seed, take)?;
+        self.ran(host, i, ran)
     }
 
     /// Step `i`'s epoch ran to `ran`: a round, where it stands, or its end.
@@ -298,21 +221,22 @@ impl TickRun {
                 self.standing.push_back((i, Stage::Epoch(epoch)));
                 Ok(())
             }
-            vm::Ran::Done(out) => self.complete(host, i, out),
+            vm::Ran::Done(out) => self.land(host, self.schedule[i].view, out),
         }
     }
 
-    /// Step `i` ran to its end with `out`: ingest it, and hold it for its readers.
-    fn complete(&mut self, host: &mut impl DriveHost, i: usize, out: Batch) -> Result<(), String> {
+    /// Ingest `out`, `view`'s output, unless the view passes it through, and hold
+    /// it for its readers where a view scans it: each is a later step of the run.
+    fn land(&mut self, host: &mut impl DriveHost, view: u64, out: Batch) -> Result<(), String> {
         if out.is_empty() {
             return Ok(());
         }
-        let Step { view, needed, .. } = self.schedule[i];
         let (dag, registry) = host.parts();
+        let needed = dag.is_scanned(view);
         let echo = match dag.passes_through(view) {
-            // A tick's delta reaches its readers in this schedule.
+            // Its delta reaches its readers in this run.
             true => needed.then_some(out),
-            false => registry.ingest_round(view, out, self.round, needed)?,
+            false => registry.ingest_round(view, out, self.pass.round(), needed)?,
         };
         if let Some(out) = echo {
             match self.outputs.entry(view) {
@@ -330,8 +254,31 @@ impl TickRun {
         Ok(())
     }
 
+    /// Run `schedule` as `pass` over `seed`, a producer's output, beside what
+    /// the run already holds, and drop what it leaves. `drained`: what the
+    /// run's first round passes to [`DriveHost::exchange`]; each round passes
+    /// what the last answered. Answers what the last answered, `drained` where
+    /// no round ran.
+    fn run(
+        &mut self,
+        host: &mut impl DriveHost,
+        schedule: Rc<[Step]>,
+        pass: Pass,
+        seed: Option<(u64, Batch)>,
+        drained: bool,
+    ) -> Result<bool, String> {
+        self.schedule = schedule;
+        self.pass = pass;
+        // Room for the schedule: growing the map rehashes it once per doubling.
+        self.outputs.reserve(self.schedule.len());
+        self.outputs.extend(seed);
+        let ran = self.waves(host, drained);
+        self.clear();
+        ran
+    }
+
     /// Run every step: start what can start, then the rounds it stands at as one.
-    fn run(&mut self, host: &mut impl DriveHost) -> Result<(), String> {
+    fn waves(&mut self, host: &mut impl DriveHost, mut drained: bool) -> Result<bool, String> {
         let mut next = 0;
         loop {
             while next < self.schedule.len() && self.ready(next) {
@@ -340,7 +287,7 @@ impl TickRun {
             }
             if self.standing.is_empty() {
                 debug_assert_eq!(next, self.schedule.len(), "a step waits on no round");
-                return Ok(());
+                return Ok(drained);
             }
             let schedule = &self.schedule;
             let lanes = self.standing.iter_mut().map(|(i, stage)| {
@@ -356,7 +303,7 @@ impl TickRun {
                     fold,
                 }
             });
-            host.exchange(lanes, false, &mut self.gathered);
+            drained = host.exchange(lanes, drained, &mut self.gathered);
             let mut gathered = std::mem::take(&mut self.gathered);
             debug_assert_eq!(self.standing.len(), gathered.len(), "a lane per round");
             for rows in gathered.drain(..) {
@@ -368,13 +315,106 @@ impl TickRun {
                         self.start_epoch(host, i)?;
                     }
                     Stage::Epoch(epoch) => {
-                        let ran = resume_epoch(host, self.schedule[i].view, epoch, rows, &[])?;
+                        // The exchange held the host: the plan and its stores are
+                        // looked up again.
+                        let view = self.schedule[i].view;
+                        let (dag, registry) = host.parts();
+                        let (vm, mut stores) = dag.registered(view)?.opened(registry, view, self.pass.fed(view))?;
+                        let ran = vm::resume(vm, &mut stores, epoch, rows)?;
                         self.ran(host, i, ran)?;
                     }
                 }
             }
             self.gathered = gathered;
         }
+    }
+
+    /// Drop what a run leaves: a failed step leaves the others' epochs at their
+    /// rounds, dropped here, registers and all.
+    fn clear(&mut self) {
+        self.outputs.clear();
+        self.relays.clear();
+        self.standing.clear();
+        self.gathered.clear();
+    }
+
+    /// [`backfill`] of `views`.
+    fn backfill(&mut self, host: &mut impl DriveHost, views: &[u64]) -> Result<(), String> {
+        let Some(&first) = views.first() else {
+            return Ok(());
+        };
+        // No member has been fed a row yet.
+        let pass = Pass::Fill { member: first, fed: 0 };
+        self.pass = pass;
+        // Every ground row lands in its view before any row reaches the view: a
+        // reduce retracts its group's stored row, and a ground row minted over
+        // rows it already holds would stand beside them.
+        let mut minting = Vec::new();
+        for &view in views {
+            let (dag, registry) = host.parts();
+            let registered = dag.registered(view)?;
+            // Worker-identical: every worker runs the schedule that feeds it on.
+            if !registered.code.vm.mints_ground_rows() {
+                continue;
+            }
+            minting.push(view);
+            let replicated = registry.relation_or_err(view)?.placement().is_replicated();
+            if mints_ground_row(registry.slot(), replicated) {
+                let (vm, mut stores) = registered.opened(registry, view, 0)?;
+                let rows = vm::mint_ground_rows(vm, &mut stores)?;
+                self.land(host, view, rows)?;
+            }
+        }
+        if !minting.is_empty() {
+            let schedule = host.parts().0.schedule_from(&minting, Vec::new());
+            self.run(host, schedule, pass, None, false)?;
+        }
+        for &view in views {
+            self.drain_into(host, view, views)?;
+            // Once, not per chunk: the view's first reads open over fewer runs.
+            // Nothing lands in it after its own sources: only lower ids feed it.
+            host.parts().1.settle(view)?;
+        }
+        Ok(())
+    }
+
+    /// Feed member `view` of the backfilled `views` each source outside the set,
+    /// in scan order, a chunk a run, against the sources fed before it.
+    fn drain_into(&mut self, host: &mut impl DriveHost, view: u64, views: &[u64]) -> Result<(), String> {
+        let (dag, registry) = host.parts();
+        let sources: Vec<u64> = dag.sources_of(view).collect();
+        let chunk_rows = registry.scan_chunk_rows();
+        for (at, &source) in sources.iter().enumerate() {
+            if views.binary_search(&source).is_ok() {
+                continue;
+            }
+            let (dag, registry) = host.parts();
+            debug_assert!(
+                !dag.passes_through(source),
+                "a passthrough view holds no rows: it is backfilled with its readers"
+            );
+            let relation = registry.relation_or_err(source)?;
+            // A stream holds no rows: every worker skips it alike, so no round is owed.
+            if relation.kind() == RelationKind::Stream {
+                continue;
+            }
+            // `sources` came from this view's own plan.
+            let scan = dag.views[&view].code.scan(source);
+            let mut cursor = relation.open_sealed(scan.bound.clone(), scan.read)?;
+            let schedule = dag.schedule_from(&[view], vec![(view, source)]);
+            // The source joins those fed before it as it drains.
+            let pass = Pass::Fill { member: view, fed: at + 1 };
+            loop {
+                let chunk = cursor.drain_chunk(chunk_rows);
+                // Until every worker is drained: all run the same rounds.
+                let drained = chunk.is_none();
+                let seed = chunk.map(|chunk| (source, chunk));
+                if self.run(host, Rc::clone(&schedule), pass, seed, drained)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -385,20 +425,11 @@ impl TickRun {
 fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Batch>) -> Result<(), String> {
     let dag = host.parts().0;
     let mut run = std::mem::take(&mut dag.tick);
-    run.schedule = dag.tick_schedule(source);
-    run.round = round;
-    // Room for the schedule: growing the map rehashes it once per doubling.
-    run.outputs.reserve(run.schedule.len());
-    run.outputs.extend(delta.map(|delta| (source, delta)));
-    let ran = run.run(host);
-    // A failed step leaves the others' epochs at their rounds: dropped here,
-    // registers and all.
-    run.outputs.clear();
-    run.relays.clear();
-    run.standing.clear();
-    run.gathered.clear();
+    let schedule = dag.tick_schedule(source);
+    let seed = delta.map(|delta| (source, delta));
+    let ran = run.run(host, schedule, Pass::Tick { round }, seed, false);
     host.parts().0.tick = run;
-    ran
+    ran.map(drop)
 }
 
 #[cfg(test)]

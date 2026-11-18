@@ -418,13 +418,9 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
             disp.sal().want_durable(lsn);
         }
         // The auto-tick this may fire overlaps the fdatasync.
-        shared.note_commit_rows(
-            &excl,
-            s.units
-                .iter()
-                .flat_map(CommitUnit::laid)
-                .map(|f| (f.tid, f.rows.view().len())),
-        );
+        for f in s.units.iter().flat_map(CommitUnit::laid) {
+            disp.credit(&excl, f.tid, f.rows.view().len());
+        }
         (zone_lsn.unwrap_or(0), again)
     };
 

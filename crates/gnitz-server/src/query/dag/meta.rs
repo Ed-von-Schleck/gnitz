@@ -13,8 +13,6 @@ pub(super) struct Step {
     /// No later step reads `producer`'s own output: one sharing a relay round
     /// another step ran reads what the round gathered instead.
     pub(super) last: bool,
-    /// A later step reads `view`'s output.
-    pub(super) needed: bool,
     /// The tick's one round of `producer`'s delta that `view`'s relay reads,
     /// where its scan of `producer` is relayed by a round.
     pub(super) relay: Option<RelaySlot>,
@@ -54,7 +52,6 @@ fn schedule<'k>(mut edges: Vec<(u64, u64)>, relay_key: impl Fn(u64, u64) -> Rela
             view,
             producer,
             last: false,
-            needed: false,
             relay: relay_key(view, producer).map(|(key, fold)| {
                 let shared = rounds.iter().position(|&(p, k, _)| (p, k) == (producer, key));
                 let at = shared.unwrap_or(rounds.len());
@@ -80,9 +77,6 @@ fn schedule<'k>(mut edges: Vec<(u64, u64)>, relay_key: impl Fn(u64, u64) -> Rela
             slot.last = relayed.insert(slot.at);
             slot.fold = rounds[slot.at].2;
         }
-    }
-    for step in steps.iter_mut() {
-        step.needed = read.contains(&step.view);
     }
     steps.into()
 }
@@ -142,6 +136,13 @@ impl DepMap {
     }
 }
 
+/// The relay round `view`'s scan of `producer` reads, as [`RelayKey`] names it.
+fn relay_key(views: &FxHashMap<u64, RegisteredView>, view: u64, producer: u64) -> RelayKey<'_> {
+    let code = &views.get(&view)?.code;
+    let scan = code.scan(producer);
+    Some((&*scan.relay.as_ref()?.key, code.vm.folds(scan.seed)))
+}
+
 impl DagEngine {
     /// One [`Step`] per dependency edge out of `source`'s forward closure, in
     /// execution order. Worker-identical, which keeps the workers in lockstep.
@@ -160,20 +161,23 @@ impl DagEngine {
     #[cold]
     #[inline(never)]
     fn derive_tick_schedule(&mut self, source: u64) -> Rc<[Step]> {
-        let (views, dep) = (&self.views, &mut self.dep);
-        // A step's view scans its producer.
-        let relay_key = |view: u64, producer: u64| {
-            let code = &views.get(&view)?.code;
-            let scan = code.scan(producer);
-            Some((&*scan.relay.as_ref()?.key, code.vm.folds(scan.seed)))
-        };
-        let producers = std::iter::once(source).chain(dep.downstream([source]));
-        let edges = producers
-            .flat_map(|producer| dep.forward_of(producer).iter().map(move |&view| (view, producer)))
-            .collect();
-        let steps = schedule(edges, relay_key);
-        dep.tick_steps.insert(source, Rc::clone(&steps));
+        let steps = self.schedule_from(&[source], Vec::new());
+        self.dep.tick_steps.insert(source, Rc::clone(&steps));
         steps
+    }
+
+    /// `edges`, each `(view, producer)`, and one per dependency edge out of each
+    /// of `seeds` and out of every view their forward closure reaches, as one
+    /// schedule, kept by no one. A tick's of `source` is `([source], [])`.
+    pub(super) fn schedule_from(&self, seeds: &[u64], mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
+        let mut producers = self.dep.downstream(seeds.iter().copied());
+        producers.extend(seeds);
+        edges.extend(
+            producers
+                .into_iter()
+                .flat_map(|producer| self.dep.forward_of(producer).iter().map(move |&view| (view, producer))),
+        );
+        schedule(edges, |view, producer| relay_key(&self.views, view, producer))
     }
 
     // ── Dependency map ──────────────────────────────────────────────────

@@ -165,6 +165,38 @@ fn test_boot_generation_advance_monotonic() {
     engine.close();
 }
 
+/// A flush ahead of a base round makes every system row durable, and advances
+/// the generation only for a round over pushes.
+#[test]
+fn a_flush_ahead_of_a_base_round_advances_the_generation_iff_pushes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (user_seq, generation) = {
+        let mut engine = CatalogEngine::open(dir, 1).unwrap();
+        let user_seq = engine.create_serial_table("public.t").unwrap();
+        let generation = engine.durable_generation();
+        reserve(&mut engine, user_seq, 64).unwrap();
+        engine.flush_ahead_of_base_round(false).unwrap();
+        assert_eq!(engine.durable_generation(), generation);
+        // Crash semantics: no `close()`, so only what the flush wrote survives.
+        drop(engine);
+        (user_seq, generation)
+    };
+    {
+        let mut engine = CatalogEngine::open(dir, 1).unwrap();
+        assert_eq!(engine.durable_generation(), generation);
+        assert_eq!(engine.sequence_value(user_seq), Some(64));
+        reserve(&mut engine, user_seq, 64).unwrap();
+        engine.flush_ahead_of_base_round(true).unwrap();
+        assert_eq!(engine.durable_generation(), generation + 1);
+        drop(engine);
+    }
+    let engine = CatalogEngine::open(dir, 1).unwrap();
+    assert_eq!(engine.durable_generation(), generation + 1);
+    assert_eq!(engine.sequence_value(user_seq), Some(128));
+    engine.close();
+}
+
 /// A drop, a system flush and a reopen must not hand out again an id a dropped
 /// relation held.
 #[test]

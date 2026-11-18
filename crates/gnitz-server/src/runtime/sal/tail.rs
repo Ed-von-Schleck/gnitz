@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use super::format::{SalMessageKind, epoch_word, next_epoch, word_epoch};
 use super::log::{SalLog, SalMessage};
 use super::reader::SalReader;
-use super::request::{Ingest, SalRequest};
+use super::request::Ingest;
 
 /// The committed part of the un-checkpointed tail.
 pub(crate) struct CommittedTail {
@@ -79,15 +79,12 @@ impl CommittedTail {
     }
 
     /// Every group a boot replays, in log order, as the ingest it carries: a zone
-    /// holds nothing else, and an ingest has no blob. A stream's push is written
-    /// outside every zone, so each push here targets a base table.
+    /// holds nothing else. A stream's push is written outside every zone, so each
+    /// push here targets a base table.
     pub(crate) fn ingests(&self) -> impl Iterator<Item = Result<(Ingest, SalMessage<'_>), String>> {
-        self.groups().map(|m| match SalRequest::decode(&m.head.request, &[]) {
-            Ok(SalRequest::Ingest(ingest)) => Ok((ingest, m)),
-            other => Err(format!(
-                "SAL replay: the zone member at offset={} carries no ingest: {other:?}",
-                m.base
-            )),
+        self.groups().map(|m| match Ingest::decode(&m.head.request) {
+            Ok(ingest) => Ok((ingest, m)),
+            Err(e) => Err(format!("SAL replay: the zone member at offset={}: {e}", m.base)),
         })
     }
 

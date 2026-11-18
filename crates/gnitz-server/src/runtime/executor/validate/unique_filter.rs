@@ -8,53 +8,54 @@ use gnitz_wire::PkKeys;
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::schema::probe_key;
 
-/// Spans a filter tracks before it disables itself.
-const UNIQUE_FILTER_CAP: usize = 7 << 20;
+/// Spans a filter tracks before it disables itself; a filter that churned past
+/// it is rebuilt from the live index once, under half of it.
+pub(super) const UNIQUE_FILTER_CAP: usize = 7 << 20;
 
-pub(crate) struct UniqueFilter {
-    /// `probe_key` fingerprints of every span the index holds, or `None` once
-    /// the filter capped.
-    values: Option<FxHashSet<u64>>,
-    /// [`UNIQUE_FILTER_CAP`], held per filter so a test can reach it in a few spans.
-    cap: usize,
+pub(crate) enum UniqueFilter {
+    /// `probe_key` fingerprints of every span the index holds.
+    Live(FxHashSet<u64>),
+    /// An admitted write capped it: it proves nothing until the next write to
+    /// its index rebuilds it from the spans the index holds.
+    Churned,
+    /// It capped while it was built: it proves nothing for the boot.
+    Capped,
 }
 
 impl UniqueFilter {
     pub(super) fn new() -> Self {
-        UniqueFilter {
-            values: Some(FxHashSet::default()),
-            cap: UNIQUE_FILTER_CAP,
-        }
+        UniqueFilter::Live(FxHashSet::default())
     }
 
-    /// Records `span`; false once the cap has dropped the set and disabled the
-    /// filter.
-    pub(super) fn insert(&mut self, span: &[u8]) -> bool {
-        let Some(values) = self.values.as_mut() else {
+    /// Records `span`; false once a set of `cap` spans has been dropped,
+    /// leaving the filter [`Self::Capped`].
+    pub(super) fn insert(&mut self, span: &[u8], cap: usize) -> bool {
+        let UniqueFilter::Live(values) = self else {
             return false;
         };
         let key = probe_key(span);
         // Growing past the cap would copy the whole table for a set this call drops.
-        if values.len() >= self.cap && !values.contains(&key) {
-            self.values = None;
+        if values.len() >= cap && !values.contains(&key) {
+            *self = UniqueFilter::Capped;
             return false;
         }
         values.insert(key);
         true
     }
 
-    /// Records every span of `spans` up to the first the cap refuses; false
-    /// once the filter has capped.
-    pub(super) fn insert_all<'s>(&mut self, spans: impl IntoIterator<Item = &'s [u8]>) -> bool {
-        spans.into_iter().all(|span| self.insert(span))
+    /// Records every span of `spans` up to the first `cap` refuses; false once
+    /// the filter has capped.
+    pub(super) fn insert_all<'s>(&mut self, spans: impl IntoIterator<Item = &'s [u8]>, cap: usize) -> bool {
+        spans.into_iter().all(|span| self.insert(span, cap))
     }
 
     /// A fingerprint probe: a collision, and every span once the filter has
     /// capped, answers true.
     pub(super) fn may_contain(&self, span: &[u8]) -> bool {
-        self.values
-            .as_ref()
-            .is_none_or(|values| values.contains(&probe_key(span)))
+        match self {
+            UniqueFilter::Live(values) => values.contains(&probe_key(span)),
+            UniqueFilter::Churned | UniqueFilter::Capped => true,
+        }
     }
 }
 
@@ -75,16 +76,21 @@ impl Checks {
     /// every span a committed row holds; it holds more after a delete, and
     /// after a write its committer fails.
     ///
+    /// A claim that caps its filter marks it churned; the filter stays, proving
+    /// nothing, until the next write to its index rebuilds it.
+    ///
     /// No filter is built or dropped between a write's validation and its
     /// commit: a warm scan runs under the table's write guard, which the write
-    /// holds until it is laid out, and a DDL seeds or removes a filter under
-    /// the catalog write guard, which the write's read guard keeps out. So the
-    /// filter each claim was taken against is still there.
+    /// holds until it is laid out, and a DDL removes a filter under the catalog
+    /// write guard, which the write's read guard keeps out. So the filter each
+    /// claim was taken against is still there.
     pub(super) fn unique_filters_admit(&self, claims: &[SpanClaim]) {
         let mut filters = self.unique_filters.borrow_mut();
         for c in claims {
             let filter = filters.get_mut(&(c.tid, c.cols)).expect("a claim's filter stays");
-            filter.insert_all(c.spans.chunks_exact(c.key_size));
+            if !filter.insert_all(c.spans.chunks_exact(c.key_size), self.unique_filter_cap) {
+                *filter = UniqueFilter::Churned;
+            }
         }
     }
 
@@ -107,17 +113,16 @@ impl Checks {
     }
 
     /// Publish a filter holding every span of the index on `cols`.
-    pub(in crate::runtime::executor) fn unique_filter_seed(
-        &self,
-        table_id: u64,
-        cols: PkColList,
-        filter: UniqueFilter,
-    ) {
+    pub(super) fn unique_filter_seed(&self, table_id: u64, cols: PkColList, filter: UniqueFilter) {
         self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
 
-    /// Build the filter of each index of `uniques` that has none, from the
-    /// spans the workers' index stores hold.
+    /// Build the filter of each index of `uniques` that has none or whose
+    /// filter churned, from the spans the workers' index stores hold.
+    ///
+    /// A churned filter is rebuilt under half the cap, so the scan of at most
+    /// half the cap is paid once per at least half the cap of spans admitted
+    /// after it. A filter that caps while it is built stays capped for the boot.
     pub(super) async fn ensure_unique_filters_warm(
         &self,
         disp: &MasterDispatcher,
@@ -125,16 +130,23 @@ impl Checks {
         uniques: &[(PkColList, KeySpec)],
     ) -> Result<(), WireFault> {
         for &(cols, ref spec) in uniques {
-            if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
-                continue;
-            }
+            let rewarm = match self.unique_filters.borrow().get(&(table_id, cols)) {
+                None => false,
+                Some(UniqueFilter::Churned) => true,
+                Some(_) => continue,
+            };
             let mut lease = disp.scan(Read::KeySpans { tid: table_id, cols, claim: false }).await?;
             let train = lease.next_train().await;
+            let cap = if rewarm {
+                self.unique_filter_cap / 2
+            } else {
+                self.unique_filter_cap
+            };
             let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
             // A capped filter reads no further; the lease drop discards the rest.
             while let Some(frame) = train.next().await? {
                 let spans = frame.rows(&span_schema).pk().chunks_exact(span_schema.pk_stride());
-                if !filter.insert_all(spans) {
+                if !filter.insert_all(spans, cap) {
                     break;
                 }
             }

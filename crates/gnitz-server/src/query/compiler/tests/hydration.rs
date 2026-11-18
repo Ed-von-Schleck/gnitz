@@ -13,7 +13,7 @@ fn a_shape_outside_the_equation_is_refused() {
     let refused = |c: &Circuit, why: &str| {
         assert_eq!(rejection(compile(c, &registry, true)), UNSUPPORTED, "{why}");
     };
-    let cases: [(&str, Build); 4] = [
+    let cases: [(&str, Build); 5] = [
         ("a delta joins another integral than the other delta's", |c| {
             let [da, db] = [100, 200].map(|s| reindexed_on_col1(c, s, TypeCode::I64));
             let other = c.negate(db);
@@ -34,23 +34,16 @@ fn a_shape_outside_the_equation_is_refused() {
             let a = scan(c, 1);
             c.shard(a);
         }),
+        ("a reduce as the output", |c| {
+            let a = scan(c, 1);
+            c.reduce_local(a, count_by(&[0]));
+        }),
     ];
     for (why, build) in cases {
         let mut c = Circuit::default();
         build(&mut c);
         refused(&c, why);
     }
-}
-
-/// A reduce as the output would read the view's own store, skeleton rows and
-/// all, as its trace.
-#[test]
-fn a_reduce_as_the_output_is_refused() {
-    let registry = sources([(1, make_schema_u64_i64())]);
-    let mut c = Circuit::default();
-    let a = scan(&mut c, 1);
-    c.reduce_local(a, count_by(&[0]));
-    assert_eq!(rejection(compile(&c, &registry, true)), READS_OWN_STORE);
 }
 
 /// A bounded view's replay seeds from its source table's store behind a linear

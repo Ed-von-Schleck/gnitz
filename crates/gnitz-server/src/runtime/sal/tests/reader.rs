@@ -322,7 +322,7 @@ fn rows_on_a_group_that_carries_none_abort() {
     assert_fail_stops(
         module_path!(),
         "rows_on_a_group_that_carries_none_abort_internal",
-        "a Tick group carries no rows",
+        "a Flush group carries no rows",
     );
 }
 
@@ -334,14 +334,14 @@ fn rows_on_a_group_that_carries_none_abort_internal() {
     }
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let record = encode_schema_record(batch.schema());
-    let sent = Some((&record[..], batch.wire_whole().unwrap()));
-    let mut rows = vec![0; payload_size(&[], sent)];
-    payload_encode(&mut rows, &[], sent);
+    let sent = batch.wire_whole();
+    let mut rows = vec![0; payload_size(&record, sent)];
+    payload_encode(&mut rows, &record, sent);
     assert!(payload_rows(&rows, |_| None).expect("the payload decodes").1.is_some());
 
     let log = test_log(1 << 20, 1, 1);
     log.forge(7, false, SalMessageKind::Push, &[&rows]);
-    log.forge(7, false, SalMessageKind::Tick, &[&rows]);
+    log.forge(7, false, SalMessageKind::Flush, &[&rows]);
     let mut reader = log.reader(0);
     assert!(
         matches!(
@@ -351,5 +351,5 @@ fn rows_on_a_group_that_carries_none_abort_internal() {
         "the same payload decodes on a push"
     );
     let _ = reader.next_request(|_, _| None);
-    unreachable!("rows on a tick must fail-stop");
+    unreachable!("rows on a flush must fail-stop");
 }

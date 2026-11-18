@@ -138,6 +138,17 @@ impl CatalogEngine {
 
     // -- Checkpoint generation -------------------------------------------------
 
+    /// Make the system tables durable ahead of a base round. When `pushes`, the
+    /// round moves the base stores past what the checkpointed views integrate,
+    /// so the generation is advanced in the same flush.
+    pub(crate) fn flush_ahead_of_base_round(&mut self, pushes: bool) -> Result<(), String> {
+        if pushes {
+            self.advance_durable_generation().map(drop)
+        } else {
+            self.flush_all_system_tables()
+        }
+    }
+
     /// Advance the checkpoint generation and flush it durable. Returns it.
     pub(crate) fn advance_durable_generation(&mut self) -> Result<u64, String> {
         let counter = self.generation_counter() + 1;
