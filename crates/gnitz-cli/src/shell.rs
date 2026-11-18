@@ -59,6 +59,9 @@ pub struct Shell {
     sink: Sink,
     /// Whether a command has failed, for the exit status of a script.
     failed: bool,
+    /// Whether the piece running has dialed, so a failure of it is not
+    /// answered by dialing again.
+    dialed: bool,
     /// The last statement run, which `\e` opens.
     pub(crate) last_statement: String,
     /// Text for the next prompt's buffer, from `\e`.
@@ -84,6 +87,7 @@ impl Shell {
             options,
             sink: Sink::Stdout,
             failed: false,
+            dialed: false,
             last_statement: String::new(),
             prefill: None,
             scratch: None,
@@ -110,6 +114,7 @@ impl Shell {
     /// Dial `target` in place of the current connection, whose open
     /// transaction, if any, is lost.
     pub(crate) fn reconnect(&mut self, target: &str) -> Result<(), Failed> {
+        self.dialed = true;
         let client = dial(target, self.options.interrupt.as_ref())
             .or_else(|e| self.fail(format!("could not connect to {target}: {e}")))?;
         if self.client.txn_active() {
@@ -159,12 +164,13 @@ impl Shell {
 
     fn run_piece(&mut self, piece: Piece) -> Result<Flow, Failed> {
         self.clear_interrupt();
+        self.dialed = false;
         let r = match piece {
             Piece::Meta(line) => self.meta(&line),
             Piece::Sql(stmt) if lex::is_exit_word(&stmt) => Ok(Flow::Quit),
             Piece::Sql(stmt) => self.run_statement(&stmt).map(|()| Flow::Continue),
         };
-        if r.is_err() && self.client.is_closed() {
+        if r.is_err() && !self.dialed && self.client.is_closed() {
             let target = self.options.target.clone();
             if self.reconnect(&target).is_ok() {
                 self.note("reconnected");
@@ -356,7 +362,8 @@ pub(crate) fn command_from_env(vars: &[&str], default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Show `text` in `$PAGER`, else `less`; whether it started.
+/// Show `text` in `$PAGER`, else `less`; whether the pager ran: not where
+/// `/bin/sh` could not start, or could not find or execute it (126, 127).
 fn paged(text: &str) -> bool {
     let Ok(mut child) = Command::new("/bin/sh")
         .arg("-c")
@@ -371,8 +378,7 @@ fn paged(text: &str) -> bool {
         // the user being done, not an error.
         let _ = stdin.write_all(text.as_bytes());
     }
-    let _ = child.wait();
-    true
+    child.wait().is_ok_and(|s| !matches!(s.code(), Some(126 | 127)))
 }
 
 fn format_elapsed(d: Duration) -> String {

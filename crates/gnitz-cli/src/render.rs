@@ -3,14 +3,14 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use comfy_table::{Cell, CellAlignment, ContentArrangement, Table, presets};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets};
 use console::measure_text_width;
 use nu_ansi_term::{Color, Style};
 
-use gnitz_wire::TypeCode;
+use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::settings::{Expanded, Format, Settings};
-use crate::value::{Rows, Value, json_string};
+use crate::value::Rows;
 
 /// What a render shows of each row's weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,107 +57,59 @@ pub fn paint(color: bool, style: Style, text: &str) -> Cow<'_, str> {
 /// The column a [`Weights::Column`] render adds.
 const WEIGHT_HEADER: &str = "weight";
 
-/// A printed line's cells: each one's text, `None` for NULL.
-type Line<'a> = Vec<Option<Cow<'a, str>>>;
-
-/// The header a render prints: the weight's where it shows one, then each
-/// column's name.
-fn header(rows: &Rows, weights: Weights) -> impl Iterator<Item = &str> {
+/// The columns a render prints, each's name and type: the weight's where it
+/// shows one, then each column's.
+fn printed_columns(rows: &Rows, weights: Weights) -> impl Iterator<Item = (&str, TypeCode)> {
     (weights == Weights::Column)
-        .then_some(WEIGHT_HEADER)
+        .then_some((WEIGHT_HEADER, TypeCode::I64))
         .into_iter()
-        .chain(rows.columns.iter().map(|c| c.name.as_str()))
+        .chain(rows.columns.iter().map(|c| (c.name.as_str(), c.tc)))
 }
 
-/// A row's fields as a text format prints them: its weight `w` where the
+/// The header a render prints.
+fn header(rows: &Rows, weights: Weights) -> impl Iterator<Item = &str> {
+    printed_columns(rows, weights).map(|(name, _)| name)
+}
+
+/// Row `row`'s fields as a text format prints them: its weight where the
 /// render shows it, then each cell's text, `None` for NULL.
-fn fields(cells: &[Value], w: Option<i64>) -> impl Iterator<Item = Option<Cow<'_, str>>> {
-    w.map(|w| Some(Cow::Owned(format!("{w:+}"))))
+fn fields(rows: &Rows, row: usize, weights: Weights) -> impl Iterator<Item = Option<Cow<'_, str>>> {
+    let w = rows.weights[row];
+    (weights == Weights::Column)
+        .then(|| Some(Cow::Owned(format!("{w:+}"))))
         .into_iter()
-        .chain(cells.iter().map(Value::text))
+        .chain(rows.row(row).map(|c| c.map(Cow::Borrowed)))
+}
+
+/// Every printed line: each row's index, as many times as it is printed.
+fn printed(rows: &Rows, weights: Weights) -> impl Iterator<Item = usize> + '_ {
+    (0..rows.weights.len()).flat_map(move |r| std::iter::repeat_n(r, weights.copies(rows.weights[r])))
 }
 
 /// Append each printed line of a script format to `out`: `line` writes a
-/// row's once, given its weight where the render shows it, and the line is
-/// copied as many times as the row is printed.
-fn script_lines(
-    rows: &Rows,
-    weights: Weights,
-    out: &mut String,
-    mut line: impl FnMut(&mut String, &[Value], Option<i64>),
-) {
+/// row's once, and the line is copied as many times as the row is printed.
+fn script_lines(rows: &Rows, weights: Weights, out: &mut String, mut line: impl FnMut(&mut String, usize)) {
     let mut buf = String::new();
-    for (cells, w) in &rows.rows {
+    for (r, &w) in rows.weights.iter().enumerate() {
         buf.clear();
-        line(&mut buf, cells, (weights == Weights::Column).then_some(*w));
-        for _ in 0..weights.copies(*w) {
+        line(&mut buf, r);
+        for _ in 0..weights.copies(w) {
             out.push_str(&buf);
         }
     }
 }
 
-/// The rows the aligned format prints, each as its cells' text and the number
-/// of times it is printed, and the header.
-struct Grid<'a> {
-    header: Vec<&'a str>,
-    numeric: Vec<bool>,
-    rows: Vec<(Line<'a>, usize)>,
-}
-
-impl<'a> Grid<'a> {
-    fn of(rows: &'a Rows, weights: Weights) -> Grid<'a> {
-        let weight_col = weights == Weights::Column;
-        let numeric = weight_col
-            .then_some(true)
-            .into_iter()
-            .chain(rows.columns.iter().map(|c| is_numeric(c.tc)))
-            .collect();
-        let lines = rows
-            .rows
-            .iter()
-            .map(|(cells, w)| (fields(cells, weight_col.then_some(*w)).collect(), weights.copies(*w)))
-            .collect();
-        Grid {
-            header: header(rows, weights).collect(),
-            numeric,
-            rows: lines,
-        }
-    }
-
-    /// Every printed line: each row as many times as it is printed.
-    fn lines(&self) -> impl Iterator<Item = &[Option<Cow<'a, str>>]> {
-        self.rows
-            .iter()
-            .flat_map(|(line, n)| std::iter::repeat_n(line.as_slice(), *n))
-    }
-
-    /// The width the aligned table takes unwrapped, measured as comfy-table
-    /// measures it: each column as wide as its widest line and at least one
-    /// wide, plus a space either side and one border each.
-    fn table_width(&self, null: &str) -> usize {
-        let widest = |s: &str| s.lines().map(measure_text_width).max().unwrap_or(0);
-        let null = widest(null);
-        let content: usize = (0..self.header.len())
-            .map(|i| {
-                let cells = self
-                    .rows
-                    .iter()
-                    .map(|(line, _)| line[i].as_deref().map_or(null, widest));
-                cells.chain([widest(self.header[i]), 1]).max().unwrap_or(1)
-            })
-            .sum();
-        content + 3 * self.header.len() + 1
-    }
-
-    fn line_count(&self) -> usize {
-        self.rows.iter().map(|&(_, n)| n).sum()
-    }
+/// The width `table` takes unwrapped: each column's widest line, plus a
+/// space either side and one border each.
+fn table_width(table: &Table) -> usize {
+    let widths = table.column_max_content_widths();
+    widths.iter().map(|&w| usize::from(w)).sum::<usize>() + 3 * widths.len() + 1
 }
 
 /// `rows` in `settings`' format, for `target`.
 pub fn render(rows: &Rows, weights: Weights, settings: &Settings, target: Target) -> String {
     match settings.format {
-        Format::Aligned => table(&Grid::of(rows, weights), settings, target),
+        Format::Aligned => table(rows, weights, settings, target),
         Format::Unaligned => unaligned(rows, weights, settings),
         Format::Csv => csv(rows, weights, target),
         Format::Json => json(rows, weights),
@@ -166,39 +118,54 @@ pub fn render(rows: &Rows, weights: Weights, settings: &Settings, target: Target
 
 /// The aligned format: a table, or one record per printed line, and the
 /// footer.
-fn table(grid: &Grid<'_>, settings: &Settings, target: Target) -> String {
-    let null = paint(target.color, Style::new().dimmed(), &settings.null);
-    let expand = match settings.expanded {
-        Expanded::On => true,
-        Expanded::Off => false,
-        Expanded::Auto => target.width.is_some_and(|w| grid.table_width(&null) > usize::from(w)),
-    };
-    let mut out = match expand {
-        true => expanded(grid, &null, target),
-        false => aligned(build_table(grid, &null, target), target.width.filter(|_| target.wrap)),
+fn table(rows: &Rows, weights: Weights, settings: &Settings, target: Target) -> String {
+    let null = &settings.null;
+    let table = (settings.expanded != Expanded::On).then(|| build_table(rows, weights, null, target));
+    let mut out = match table {
+        Some(table)
+            if settings.expanded == Expanded::Off
+                || target.width.is_none_or(|w| table_width(&table) <= usize::from(w)) =>
+        {
+            aligned(table, target.width.filter(|_| target.wrap))
+        }
+        _ => expanded(rows, weights, null, target),
     };
     if settings.footer {
-        let n = grid.line_count();
+        let n: usize = rows.weights.iter().map(|&w| weights.copies(w)).sum();
         let noun = if n == 1 { "row" } else { "rows" };
         let _ = writeln!(out, "({n} {noun})");
     }
     out
 }
 
-/// The aligned table, styled by the shell alone: comfy-table's own styling,
-/// which reads whether the process's stdout is a terminal, is off.
-fn build_table(grid: &Grid<'_>, null: &str, target: Target) -> Table {
+/// The aligned table, its header and NULLs styled where `target` is: never
+/// by whether the process's stdout is a terminal, which comfy-table would
+/// read.
+fn build_table(rows: &Rows, weights: Weights, null: &str, target: Target) -> Table {
     let mut table = Table::new();
     table.load_style(presets::UTF8_FULL_CONDENSED.with_rounded_corners());
     table.force_no_tty();
-    let heading = Style::new().bold().fg(Color::Cyan);
-    table.set_header(grid.header.iter().map(|h| Cell::new(paint(target.color, heading, h))));
-    for line in grid.lines() {
-        table.add_row(line.iter().map(|c| Cell::new(c.as_deref().unwrap_or(null))));
+    if target.color {
+        table.enforce_styling();
     }
-    for (i, &numeric) in grid.numeric.iter().enumerate() {
+    table.set_header(header(rows, weights).map(|h| {
+        match target.color {
+            true => Cell::new(h)
+                .fg(comfy_table::Color::DarkCyan)
+                .add_attribute(Attribute::Bold),
+            false => Cell::new(h),
+        }
+    }));
+    for r in printed(rows, weights) {
+        table.add_row(fields(rows, r, weights).map(|c| match c {
+            Some(text) => Cell::new(text),
+            None if target.color => Cell::new(null).add_attribute(Attribute::Dim),
+            None => Cell::new(null),
+        }));
+    }
+    for (i, (_, tc)) in printed_columns(rows, weights).enumerate() {
         if let Some(col) = table.column_mut(i) {
-            col.set_cell_alignment(match numeric {
+            col.set_cell_alignment(match is_numeric(tc) {
                 true => CellAlignment::Right,
                 false => CellAlignment::Left,
             });
@@ -223,22 +190,24 @@ fn aligned(mut table: Table, width: Option<u16>) -> String {
     s
 }
 
-fn expanded(grid: &Grid<'_>, null: &str, target: Target) -> String {
-    let label_width = grid.header.iter().map(|h| measure_text_width(h)).max().unwrap_or(0);
-    let labels: Vec<String> = grid
-        .header
-        .iter()
+fn expanded(rows: &Rows, weights: Weights, null: &str, target: Target) -> String {
+    let label_width = header(rows, weights).map(measure_text_width).max().unwrap_or(0);
+    let labels: Vec<String> = header(rows, weights)
         .map(|h| {
             let pad = " ".repeat(label_width - measure_text_width(h));
             paint(target.color, Style::new().bold(), &format!("{h}{pad}")).into_owned()
         })
         .collect();
+    let widest = |s: &str| s.split('\n').map(measure_text_width).max().unwrap_or(0);
+    let painted_null = paint(target.color, Style::new().dimmed(), null);
+    let gutter = format!("{} | ", " ".repeat(label_width));
     let mut out = String::new();
-    for (i, line) in grid.lines().enumerate() {
+    for (i, r) in printed(rows, weights).enumerate() {
+        let line: Vec<_> = fields(rows, r, weights).collect();
         let banner = format!("-[ RECORD {} ]", i + 1);
         let value_width = line
             .iter()
-            .map(|c| measure_text_width(c.as_deref().unwrap_or(null)))
+            .map(|c| widest(c.as_deref().unwrap_or(null)))
             .max()
             .unwrap_or(0);
         let rule = "-".repeat((label_width + 3 + value_width).saturating_sub(banner.len()).max(1));
@@ -247,8 +216,13 @@ fn expanded(grid: &Grid<'_>, null: &str, target: Target) -> String {
             "{}",
             paint(target.color, Style::new().fg(Color::Cyan), &format!("{banner}{rule}"))
         );
-        for (label, cell) in labels.iter().zip(line) {
-            let _ = writeln!(out, "{label} | {}", cell.as_deref().unwrap_or(null));
+        // A value's later lines go under its first, past the labels.
+        for (label, cell) in labels.iter().zip(&line) {
+            let mut value = cell.as_deref().unwrap_or(&painted_null).split('\n');
+            let _ = writeln!(out, "{label} | {}", value.next().unwrap_or_default());
+            for more in value {
+                let _ = writeln!(out, "{gutter}{more}");
+            }
         }
     }
     out
@@ -257,8 +231,8 @@ fn expanded(grid: &Grid<'_>, null: &str, target: Target) -> String {
 fn unaligned(rows: &Rows, weights: Weights, settings: &Settings) -> String {
     let mut out = header(rows, weights).collect::<Vec<_>>().join("|");
     out.push('\n');
-    script_lines(rows, weights, &mut out, |line, cells, w| {
-        for (i, field) in fields(cells, w).enumerate() {
+    script_lines(rows, weights, &mut out, |line, r| {
+        for (i, field) in fields(rows, r, weights).enumerate() {
             if i > 0 {
                 line.push('|');
             }
@@ -275,8 +249,8 @@ fn csv(rows: &Rows, weights: Weights, target: Target) -> String {
     if target.header {
         csv_record(&mut out, header(rows, weights));
     }
-    script_lines(rows, weights, &mut out, |line, cells, w| {
-        csv_record(line, fields(cells, w).map(Option::unwrap_or_default));
+    script_lines(rows, weights, &mut out, |line, r| {
+        csv_record(line, fields(rows, r, weights).map(Option::unwrap_or_default));
     });
     out
 }
@@ -313,22 +287,24 @@ fn csv_record(out: &mut String, fields: impl IntoIterator<Item = impl AsRef<str>
 fn json(rows: &Rows, weights: Weights) -> String {
     let keys: Vec<String> = rows.columns.iter().map(|c| json_string(&c.name)).collect();
     let mut out = String::from("[");
-    script_lines(rows, weights, &mut out, |line, cells, w| {
+    let weighted = weights == Weights::Column;
+    script_lines(rows, weights, &mut out, |line, r| {
         line.push('\n');
-        if let Some(w) = w {
+        if weighted {
+            let w = rows.weights[r];
             let _ = write!(line, "{{\"weight\":{w},\"row\":");
         }
         line.push('{');
-        for (i, (key, cell)) in keys.iter().zip(cells).enumerate() {
+        for (i, ((key, column), cell)) in keys.iter().zip(&rows.columns).zip(rows.row(r)).enumerate() {
             if i > 0 {
                 line.push(',');
             }
             line.push_str(key);
             line.push(':');
-            cell.write_json(line);
+            write_json(line, column.tc, cell);
         }
         line.push('}');
-        if w.is_some() {
+        if weighted {
             line.push('}');
         }
         line.push(',');
@@ -338,6 +314,32 @@ fn json(rows: &Rows, weights: Weights) -> String {
         _ => out.push_str("[]\n"),
     }
     out
+}
+
+/// `s` as a JSON string.
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).expect("a string serializes")
+}
+
+/// Append a cell of a `tc` column as JSON: integers up to 64 bits and
+/// booleans as JSON's own, a float as a number where it is finite, with a
+/// fraction so it reads back as one; anything else as its text in a string,
+/// so no precision is lost.
+fn write_json(out: &mut String, tc: TypeCode, cell: Option<&str>) {
+    let Some(text) = cell else {
+        return out.push_str("null");
+    };
+    // A non-finite float, as `FloatText` spells it, has no JSON number.
+    if tc.is_float() && !matches!(text, "NaN" | "Infinity" | "-Infinity") {
+        out.push_str(text);
+        if !text.contains(['.', 'e']) {
+            out.push_str(".0");
+        }
+    } else if tc == TypeCode::Bool || FixedInt::exact(tc).is_some() {
+        out.push_str(text);
+    } else {
+        out.push_str(&json_string(text));
+    }
 }
 
 /// Whether a column of `tc` reads right-aligned: a number's.
@@ -365,3 +367,7 @@ fn is_numeric(tc: TypeCode) -> bool {
 #[cfg(test)]
 #[path = "tests/render.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/render.rs"]
+mod bench;

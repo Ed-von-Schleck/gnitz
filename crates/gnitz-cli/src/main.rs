@@ -64,13 +64,6 @@ fn schema_name(text: &str) -> Result<String, String> {
     gnitz_sql::parse_schema_name(text).ok_or_else(|| format!("\"{text}\" is not a schema name"))
 }
 
-/// A socket each SIGINT writes a byte to, from then on.
-fn cancel_on_sigint() -> std::io::Result<UnixStream> {
-    let (cancel, signalled) = UnixStream::pair()?;
-    signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, signalled)?;
-    Ok(cancel)
-}
-
 /// One input of a script run, in command-line order.
 enum Input<'a> {
     Command(&'a str),
@@ -93,16 +86,14 @@ fn main() -> ExitCode {
         && std::io::stdout().is_terminal()
         && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
 
-    // In a session Ctrl-C cancels the wait in progress; a script dies by it.
-    let interrupt = match interactive {
-        true => match cancel_on_sigint() {
-            Ok(cancel) => Some(cancel),
-            Err(e) => {
-                eprintln!("gnitz: cannot handle SIGINT: {e}");
-                None
-            }
-        },
-        false => None,
+    // In a connected session Ctrl-C cancels the wait in progress, by a byte
+    // on `interrupt`; a script, and a session still connecting, dies by it.
+    let (interrupt, signalled) = match interactive.then(UnixStream::pair).transpose() {
+        Ok(pair) => pair.unzip(),
+        Err(e) => {
+            eprintln!("gnitz: cannot handle SIGINT: {e}");
+            (None, None)
+        }
     };
 
     // An empty GNITZ_TARGET is none, and --data asks for a server of the
@@ -154,6 +145,14 @@ fn main() -> ExitCode {
     };
 
     if interactive {
+        if let Some(signalled) = signalled {
+            // Until here a Ctrl-C ends the process, stopping a server of the
+            // session's own first.
+            match signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, signalled) {
+                Ok(_) => local::cancels(),
+                Err(e) => eprintln!("gnitz: cannot handle SIGINT: {e}"),
+            }
+        }
         return gnitz_cli::repl(&mut shell, cli.vi);
     }
     if !scripted {

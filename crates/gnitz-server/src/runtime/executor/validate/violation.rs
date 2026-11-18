@@ -2,10 +2,7 @@
 
 use super::*;
 
-use gnitz_wire::{
-    FixedInt, TypeCode, VALUE_TEXT_MAX, decode_opk_i64, decode_opk_u128, write_date, write_decimal, write_timestamp,
-    write_uuid,
-};
+use gnitz_wire::{ColType, ValueText, decode_opk_u128};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// What a key collided with.
@@ -22,7 +19,6 @@ pub(super) enum Clash {
 /// the PK columns' DECIMAL scales, which only the catalog carries: a column
 /// past them renders at scale 0, as the integer it is stored as.
 fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8], scales: &[u8]) -> String {
-    let buf = &mut [0; VALUE_TEXT_MAX];
     let mut off = 0usize;
     schema
         .pk_columns()
@@ -30,25 +26,11 @@ fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8], scales: &[u8]) ->
         .map(|(i, col)| {
             let cell = &pk_bytes[off..off + col.size()];
             off += cell.len();
-            let tc = col.type_code;
-            match (tc, FixedInt::from_type_code(tc)) {
-                (TypeCode::Date, Some(fi)) => write_date(decode_opk_i64(cell, fi), buf).to_owned(),
-                (TypeCode::Timestamp, Some(fi)) => write_timestamp(decode_opk_i64(cell, fi), buf).to_owned(),
-                (TypeCode::Decimal, Some(fi)) => {
-                    let scale = scales.get(i).copied().unwrap_or(0);
-                    write_decimal(decode_opk_i64(cell, fi), scale, buf).to_owned()
-                }
-                (_, Some(fi)) if fi.is_signed() => format!("{}", decode_opk_i64(cell, fi)),
-                (_, Some(fi)) => format!("{}", decode_opk_i64(cell, fi) as u64),
-                (_, None) => {
-                    let native = decode_opk_u128(cell, tc);
-                    match tc {
-                        TypeCode::UUID => write_uuid(native, buf).to_owned(),
-                        TypeCode::I128 => format!("{}", native as i128),
-                        _ => format!("{native}"),
-                    }
-                }
-            }
+            let ty = ColType {
+                tc: col.type_code,
+                scale: scales.get(i).copied().unwrap_or(0),
+            };
+            ValueText(ty, decode_opk_u128(cell, ty.tc)).to_string()
         })
         .collect::<Vec<_>>()
         .join(", ")

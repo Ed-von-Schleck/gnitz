@@ -1,16 +1,9 @@
 use super::*;
-use crate::value::Value;
 
 /// Two rows, the second at weight 2.
 fn rows() -> Rows {
-    let mut r = Rows::of(
-        &[("id", TypeCode::I64), ("name", TypeCode::String)],
-        [
-            vec![Value::Int(1), Value::Text("a,b".into())],
-            vec![Value::Int(2), Value::Null],
-        ],
-    );
-    r.rows[1].1 = 2;
+    let mut r = Rows::of(&[("id", TypeCode::I64), ("name", TypeCode::String)], [["1", "a,b"]]);
+    r.push([Some("2"), None], 2);
     r
 }
 
@@ -41,7 +34,7 @@ fn aligned_repeats_a_row_by_its_weight_and_counts_the_bag() {
 #[test]
 fn the_weight_column_shows_signed_weights_once_per_row() {
     let mut r = rows();
-    r.rows[1].1 = -1;
+    r.weights[1] = -1;
     let out = render(&r, Weights::Column, &plain(Format::Unaligned), PLAIN);
     assert_eq!(out, "weight|id|name\n+1|1|a,b\n-1|2|NULL\n");
 }
@@ -57,8 +50,8 @@ fn json_keeps_types_and_spells_every_wide_integer_as_a_string() {
     let r = Rows::of(
         &[("big", TypeCode::U128), ("small", TypeCode::I128), ("f", TypeCode::F64)],
         [
-            vec![Value::U128(u128::MAX), Value::I128(-5), Value::F64(1.5)],
-            vec![Value::U128(5), Value::I128(i128::MIN), Value::F64(f64::NAN)],
+            [u128::MAX.to_string(), "-5".into(), "1.5".into()],
+            ["5".into(), i128::MIN.to_string(), "NaN".into()],
         ],
     );
     let out = render(&r, Weights::Repeat, &plain(Format::Json), PLAIN);
@@ -83,16 +76,15 @@ fn json_repeats_a_bag_row_by_its_weight() {
 
 #[test]
 fn an_empty_result_is_an_empty_json_array() {
-    let r = Rows { rows: vec![], ..rows() };
+    let r = Rows::of(&[("id", TypeCode::I64)], [[""; 0]; 0]);
     assert_eq!(render(&r, Weights::Repeat, &plain(Format::Json), PLAIN), "[]\n");
 }
 
 #[test]
 fn a_csv_record_with_no_text_is_an_empty_quoted_field() {
-    let r = Rows::of(
-        &[("x", TypeCode::String)],
-        [vec![Value::Text(String::new())], vec![Value::Null]],
-    );
+    let r = Rows::of(&[("x", TypeCode::String)], [[""]]);
+    let mut r = r;
+    r.push([None::<&str>], 1);
     assert_eq!(
         render(&r, Weights::Repeat, &plain(Format::Csv), PLAIN),
         "x\n\"\"\n\"\"\n"
@@ -109,10 +101,7 @@ fn expanded_prints_one_field_per_line() {
         footer: false,
         ..Settings::default()
     };
-    let r = Rows {
-        rows: rows().rows[..1].to_vec(),
-        ..rows()
-    };
+    let r = Rows::of(&[("id", TypeCode::I64), ("name", TypeCode::String)], [["1", "a,b"]]);
     let out = render(&r, Weights::Repeat, &settings, PLAIN);
     assert_eq!(out, "-[ RECORD 1 ]-\nid   | 1\nname | a,b\n");
 }
@@ -135,10 +124,7 @@ fn a_wide_character_cell_expands_auto_where_its_char_count_would_fit() {
         footer: false,
         ..Settings::default()
     };
-    let r = Rows::of(
-        &[("x", TypeCode::String)],
-        [vec![Value::Text("数据库数据库数据库数".into())]],
-    );
+    let r = Rows::of(&[("x", TypeCode::String)], [["数据库数据库数据库数"]]);
     // Ten chars take 14 columns as a table, twenty wide ones 24.
     assert!(render(&r, Weights::Repeat, &settings, wide(20)).starts_with("-[ RECORD 1 ]"));
     assert!(render(&r, Weights::Repeat, &settings, wide(24)).contains('│'));
@@ -148,14 +134,19 @@ fn a_wide_character_cell_expands_auto_where_its_char_count_would_fit() {
 fn the_measured_table_width_is_the_rendered_one() {
     let settings = Settings { footer: false, ..Settings::default() };
     let mut r = rows();
-    r.rows
-        .push((vec![Value::Int(-30), Value::Text("two\nlines".into())], 1));
-    r.rows.push((vec![Value::Int(8), Value::Text(String::new())], 1));
-    r.rows.push((vec![Value::Int(7), Value::Text("数据库".into())], 1));
+    r.push([Some("-30"), Some("two\nlines")], 1);
+    r.push([Some("8"), Some("")], 1);
+    r.push([Some("7"), Some("数据库")], 1);
+    r.push([Some("9"), Some("abcdef\r\nb")], 1);
+    r.push([Some("10"), Some("x\x1b[31mredred\x1b[0m")], 1);
     for weights in [Weights::Repeat, Weights::Column] {
         let out = render(&r, weights, &settings, PLAIN);
         let widest = out.lines().map(console::measure_text_width).max().unwrap_or(0);
-        assert_eq!(Grid::of(&r, weights).table_width(&settings.null), widest, "{out}");
+        assert_eq!(
+            table_width(&build_table(&r, weights, &settings.null, PLAIN)),
+            widest,
+            "{out}"
+        );
     }
 }
 
@@ -163,7 +154,7 @@ fn the_measured_table_width_is_the_rendered_one() {
 fn json_keys_follow_the_columns_and_a_real_is_spelled_as_itself() {
     let r = Rows::of(
         &[("zeta", TypeCode::I64), ("alpha", TypeCode::F32), ("b", TypeCode::Blob)],
-        [vec![Value::Int(1), Value::F32(0.1), Value::Bytes(vec![0xab])]],
+        [["1", "0.1", "\\xab"]],
     );
     let out = render(&r, Weights::Repeat, &plain(Format::Json), PLAIN);
     assert_eq!(out, "[\n{\"zeta\":1,\"alpha\":0.1,\"b\":\"\\\\xab\"}\n]\n");
@@ -198,10 +189,32 @@ fn styles_are_left_out_of_plain_output() {
 fn weighted_json_keeps_the_weight_apart_from_the_columns() {
     let mut r = rows();
     r.columns[1].name = "weight".into();
-    r.rows[1].1 = -1;
+    r.weights[1] = -1;
     let out = render(&r, Weights::Column, &plain(Format::Json), PLAIN);
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed[1]["weight"], serde_json::json!(-1));
     assert_eq!(parsed[1]["row"]["weight"], serde_json::Value::Null);
     assert_eq!(parsed[0]["row"]["weight"], serde_json::json!("a,b"));
+}
+
+#[test]
+fn an_expanded_value_s_later_lines_stay_under_its_first() {
+    let settings = Settings {
+        expanded: Expanded::On,
+        footer: false,
+        ..Settings::default()
+    };
+    let r = Rows::of(
+        &[("id", TypeCode::I64), ("body", TypeCode::String)],
+        [["1", "two\nlines"]],
+    );
+    let out = render(&r, Weights::Repeat, &settings, PLAIN);
+    assert_eq!(out, "-[ RECORD 1 ]-\nid   | 1\nbody | two\n     | lines\n");
+}
+
+#[test]
+fn a_json_float_is_a_number_only_where_it_is_finite() {
+    let r = Rows::of(&[("f", TypeCode::F64)], [["2.0"], ["NaN"], ["-Infinity"]]);
+    let out = render(&r, Weights::Repeat, &plain(Format::Json), PLAIN);
+    assert_eq!(out, "[\n{\"f\":2.0},\n{\"f\":\"NaN\"},\n{\"f\":\"-Infinity\"}\n]\n");
 }

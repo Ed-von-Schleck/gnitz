@@ -16,7 +16,7 @@ use crate::editor::{KEY_HELP, editor, editor_command};
 use crate::render::{Weights, render};
 use crate::settings::{Expanded, Format, Setting, Settings, choose, name_of};
 use crate::shell::{Failed, Flow, Shell, command_from_env};
-use crate::value::{Rows, Value};
+use crate::value::Rows;
 
 /// What a meta-command's argument is: what completion offers for it, whether
 /// it is highlighted as SQL, and the classes a listing keeps.
@@ -433,7 +433,7 @@ impl Shell {
         let Some(option) = rest.split_whitespace().next() else {
             let rows = Setting::value_variants()
                 .iter()
-                .map(|s| vec![Value::Text(name_of(s)), Value::Text(s.show(&self.options.settings))]);
+                .map(|s| [name_of(s), s.show(&self.options.settings)]);
             let rows = Rows::of(&[("Option", TypeCode::String), ("Value", TypeCode::String)], rows);
             self.print_rows(&rows);
             return Ok(Flow::Continue);
@@ -451,10 +451,10 @@ impl Shell {
             .filter(|r| keep(r.class()) && matches(&r.schema, &r.name))
             .map(|r| {
                 vec![
-                    Value::Text(r.schema.clone()),
-                    Value::Text(r.name.clone()),
-                    Value::Text(r.class().describe().to_string()),
-                    Value::Int(r.visible_columns().count() as i64),
+                    r.schema.clone(),
+                    r.name.clone(),
+                    r.class().describe().to_string(),
+                    r.visible_columns().count().to_string(),
                 ]
             })
             .collect();
@@ -477,11 +477,11 @@ impl Shell {
             .filter(|(r, i)| matches(&r.schema, &i.name))
             .map(|(r, i)| {
                 vec![
-                    Value::Text(r.schema.clone()),
-                    Value::Text(i.name.clone()),
-                    Value::Text(r.name.clone()),
-                    Value::Text(r.column_names(&i.cols).join(", ")),
-                    Value::Bool(i.is_unique),
+                    r.schema.clone(),
+                    i.name.clone(),
+                    r.name.clone(),
+                    r.column_names(&i.cols).join(", "),
+                    i.is_unique.to_string(),
                 ]
             })
             .collect();
@@ -500,7 +500,7 @@ impl Shell {
         &mut self,
         noun: &str,
         columns: &[(&str, TypeCode)],
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Vec<String>>,
     ) -> Result<Flow, Failed> {
         match rows.is_empty() {
             true => self.status(&format!("Did not find any matching {noun}.")),
@@ -510,12 +510,7 @@ impl Shell {
     }
 
     fn list_schemas(&mut self) -> Result<Flow, Failed> {
-        let rows = self
-            .catalog()?
-            .schemas
-            .into_iter()
-            .map(|s| vec![Value::Text(s)])
-            .collect();
+        let rows = self.catalog()?.schemas.into_iter().map(|s| vec![s]).collect();
         self.print_listing("schemas", &[("Name", TypeCode::String)], rows)
     }
 
@@ -558,10 +553,10 @@ impl Shell {
                     key.push(hidden.to_string());
                 }
                 vec![
-                    Value::Text(c.name.to_string()),
-                    Value::Text(gnitz_sql::sql_type_name(c.ty)),
-                    Value::Text(if c.is_nullable { "" } else { "not null" }.to_string()),
-                    Value::Text(key.join(", ")),
+                    c.name.to_string(),
+                    gnitz_sql::sql_type_name(c.ty),
+                    if c.is_nullable { "" } else { "not null" }.to_string(),
+                    key.join(", "),
                 ]
             });
         let columns = [

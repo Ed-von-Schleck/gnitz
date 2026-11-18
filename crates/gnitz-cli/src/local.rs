@@ -2,15 +2,25 @@
 //! beside the shell or on `PATH`, held for the session and stopped when it ends.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gnitz_core::local_server::{self, LocalServer};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
+/// Whether SIGINT cancels a wait of the session rather than ending it.
+static CANCELS: AtomicBool = AtomicBool::new(false);
+
+/// From now on SIGINT cancels a wait of the session, which has armed its own
+/// handler for it, and no longer stops the server.
+pub fn cancels() {
+    CANCELS.store(true, Ordering::Relaxed);
+}
+
 /// A [`LocalServer`] held for the session: stopped when the session ends, and
-/// also when one of the signals it was held under ends the process, which runs
-/// no destructor. So the server is gone, its throwaway data with it, by the
-/// time the shell's exit is seen.
+/// also when SIGTERM, SIGHUP or, until [`cancels`], SIGINT ends the process,
+/// which runs no destructor. So the server is gone, its throwaway data with
+/// it, by the time the shell's exit is seen.
 pub struct Held {
     server: Arc<Mutex<Option<LocalServer>>>,
     socket: PathBuf,
@@ -35,18 +45,16 @@ impl Held {
                 ),
             }
         }
-        // An interactive session's Ctrl-C cancels a statement; a script's ends it.
-        let signals: &[i32] = match interactive {
-            true => &[SIGTERM, SIGHUP],
-            false => &[SIGTERM, SIGHUP, SIGINT],
-        };
         let socket = server.socket().to_path_buf();
         let server = Arc::new(Mutex::new(Some(server)));
-        let mut caught =
-            signal_hook::iterator::Signals::new(signals).map_err(|e| format!("cannot handle signals: {e}"))?;
+        let mut caught = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGINT])
+            .map_err(|e| format!("cannot handle signals: {e}"))?;
         let held = Arc::clone(&server);
         std::thread::spawn(move || {
-            if let Some(signal) = caught.forever().next() {
+            if let Some(signal) = caught
+                .forever()
+                .find(|&s| s != SIGINT || !CANCELS.load(Ordering::Relaxed))
+            {
                 // Held across the exit, so a main that ends meanwhile waits on
                 // it in `drop` and the signal's status is the one the process
                 // exits with.

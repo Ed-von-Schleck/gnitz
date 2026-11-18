@@ -12,6 +12,7 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
         (TypeCode::I32, -70_000, "-70000"),
         (TypeCode::I64, i64::MIN as i128, "-9223372036854775808"),
         (TypeCode::U8, 200, "200"),
+        (TypeCode::Bool, 1, "true"),
         (TypeCode::U64, u64::MAX as i128, "18446744073709551615"),
         (
             TypeCode::U128,

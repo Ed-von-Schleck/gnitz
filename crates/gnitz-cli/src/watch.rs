@@ -38,17 +38,11 @@ impl Shell {
         ))
     }
 
-    /// Subscribe to `plan` from scratch: its id, and the view whole.
-    fn subscribe(&mut self, plan: &Subscription) -> Result<(SubId, ScanReply), ClientError> {
-        let (id, rows, _cursor) = block_on(self.client.subscribe(&*plan.upstream, None, &plan.schema, &plan.spec))?;
-        Ok((id, rows))
-    }
-
     /// A line naming what follows. Among the results only where they are for
     /// reading: a CSV or JSON stream stays parseable.
     fn watch_banner(&mut self, label: &str, rows: &Rows, target: Target) {
-        let plus: i64 = rows.rows.iter().map(|&(_, w)| w.max(0)).sum();
-        let minus: i64 = rows.rows.iter().map(|&(_, w)| (-w).max(0)).sum();
+        let plus: i64 = rows.weights.iter().map(|&w| w.max(0)).sum();
+        let minus: i64 = rows.weights.iter().map(|&w| (-w).max(0)).sum();
         let line = format!(
             "── {} {label}  +{plus} −{minus}",
             chrono::Local::now().format("%H:%M:%S")
@@ -80,41 +74,23 @@ impl Shell {
         self.write_result(&text);
     }
 
-    /// The end of a watch a wait ended with `e`: a Ctrl-C ends it as asked.
-    fn watch_ended(&mut self, e: ClientError) -> Result<(), Failed> {
-        match e {
-            ClientError::Interrupted(_) => {
-                // Past the `^C` the terminal echoed.
-                self.write_result("\n");
-                Ok(())
-            }
-            e => self.fail(e),
-        }
-    }
-
     /// Follow the delta feed of the view `arg` names, or of the `SELECT` over
     /// one it is, until interrupted.
     pub(crate) fn watch(&mut self, arg: &str) -> Result<(), Failed> {
         let sql = watch_query(arg, &self.options.schema);
         let mut plan = self.plan_watch(&sql).or_else(|e| self.fail(e))?;
-        let (mut id, first) = self.subscribe(&plan).or_else(|e| self.fail(e))?;
-        self.status("Watching; Ctrl-C stops.");
-        self.watch_print("snapshot", &first, true);
-        let outcome = loop {
-            let synced = match block_on(self.client.sync(HOLD)) {
-                Ok(s) => s,
-                Err(e) => break self.watch_ended(e),
-            };
-            // A sync has one entry per subscription.
-            let Some(pushed) = synced.pushed.into_iter().find(|p| p.sub == id) else {
-                continue;
-            };
-            let cause = match pushed.result {
-                Ok((reply, _cursor)) => {
-                    if !reply.batch.is_empty() {
-                        self.watch_print("delta", &reply, false);
+        let mut label = "snapshot";
+        loop {
+            let cause = match block_on(self.client.subscribe(&*plan.upstream, None, &plan.schema, &plan.spec)) {
+                Ok((id, whole, _cursor)) => {
+                    if label == "snapshot" {
+                        self.status("Watching; Ctrl-C stops.");
                     }
-                    continue;
+                    self.watch_print(label, &whole, true);
+                    label = "reseeded";
+                    let cause = self.follow(id);
+                    self.client.unsubscribe(id);
+                    cause
                 }
                 Err(e) => e,
             };
@@ -124,26 +100,39 @@ impl Shell {
             let replan = match cause.status() {
                 Some(WireStatus::StaleCatalog) => true,
                 Some(WireStatus::DeltaExpired) => false,
-                _ => break self.fail(cause),
+                // A Ctrl-C ends the watch as asked, past the `^C` the
+                // terminal echoed.
+                _ if matches!(cause, ClientError::Interrupted(_)) => {
+                    eprintln!();
+                    return Ok(());
+                }
+                _ => return self.fail(cause),
             };
-            self.client.unsubscribe(id);
             self.note(&format!("{cause}; reading the view whole again"));
             if replan {
-                plan = match self.plan_watch(&sql) {
-                    Ok(p) => p,
-                    Err(e) => break self.fail(e),
-                };
+                plan = self.plan_watch(&sql).or_else(|e| self.fail(e))?;
             }
-            match self.subscribe(&plan) {
-                Ok((new_id, whole)) => {
-                    id = new_id;
-                    self.watch_print("reseeded", &whole, true);
-                }
-                Err(e) => break self.watch_ended(e),
+        }
+    }
+
+    /// Print subscription `id`'s deltas as they come: the error that ends
+    /// them.
+    fn follow(&mut self, id: SubId) -> ClientError {
+        loop {
+            let synced = match block_on(self.client.sync(HOLD)) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            // A sync has one entry per subscription.
+            let Some(pushed) = synced.pushed.into_iter().find(|p| p.sub == id) else {
+                continue;
+            };
+            match pushed.result {
+                Ok((reply, _cursor)) if !reply.batch.is_empty() => self.watch_print("delta", &reply, false),
+                Ok(_) => {}
+                Err(e) => return e,
             }
-        };
-        self.client.unsubscribe(id);
-        outcome
+        }
     }
 }
 
