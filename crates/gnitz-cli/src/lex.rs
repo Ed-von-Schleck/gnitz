@@ -23,27 +23,80 @@ impl Lexeme {
 /// The lexemes of `src` as far as it tokenizes, and the byte the rest starts
 /// at: `src.len()` when it all does, else where an unterminated string or
 /// comment begins.
+///
+/// An `E'…'` or `U&'…'` literal whose closing quote is there is one lexeme
+/// even where the tokenizer refuses an escape in it, so the statement it is
+/// in ends at its `;` and the planner reports the literal.
 pub fn lex_prefix(src: &str) -> (Vec<Lexeme>, usize) {
+    let mut lexemes = Vec::new();
+    let mut at = 0;
+    loop {
+        let end = tokenize(src, at, &mut lexemes);
+        let Some(close) = closed_escape_literal(&src[end..]).map(|n| end + n) else {
+            return (lexemes, end);
+        };
+        lexemes.push(Lexeme {
+            token: Token::SingleQuotedString(src[end..close].to_string()),
+            range: end..close,
+        });
+        at = close;
+    }
+}
+
+/// Append the lexemes of `src[at..]` as far as it tokenizes: the byte the
+/// rest starts at.
+fn tokenize(src: &str, at: usize, out: &mut Vec<Lexeme>) -> usize {
+    let part = &src[at..];
     let mut tokens: Vec<TokenWithSpan> = Vec::new();
-    let whole = Tokenizer::new(&gnitz_sql::GnitzDialect, src)
+    let whole = Tokenizer::new(&gnitz_sql::GnitzDialect, part)
         .tokenize_with_location_into_buf(&mut tokens)
         .is_ok();
-    let mut offsets = gnitz_sql::Offsets::new(src);
-    // A span the tokenizer reports lies in `src`.
-    let mut byte = |loc| offsets.byte(loc).unwrap_or(src.len());
-    let lexemes: Vec<Lexeme> = tokens
-        .into_iter()
-        .filter(|t| t.token != Token::EOF)
-        .map(|TokenWithSpan { token, span }| Lexeme {
-            token,
-            range: byte(span.start)..byte(span.end),
-        })
-        .collect();
-    let end = match whole {
+    let mut offsets = gnitz_sql::Offsets::new(part);
+    // A span the tokenizer reports lies in `part`.
+    let mut byte = |loc| at + offsets.byte(loc).unwrap_or(part.len());
+    let first = out.len();
+    out.extend(
+        tokens
+            .into_iter()
+            .filter(|t| t.token != Token::EOF)
+            .map(|TokenWithSpan { token, span }| Lexeme {
+                token,
+                range: byte(span.start)..byte(span.end),
+            }),
+    );
+    match whole {
         true => src.len(),
-        false => lexemes.last().map_or(0, |l| l.range.end),
+        false => out[first..].last().map_or(at, |l| l.range.end),
+    }
+}
+
+/// The length of the `E'…'` or `U&'…'` literal `src` starts with, up to its
+/// closing quote, where it has one: in `E'…'` a backslash escapes the next
+/// character, in both `''` is a quote.
+fn closed_escape_literal(src: &str) -> Option<usize> {
+    let b = src.as_bytes();
+    let (start, backslash) = match b {
+        [b'e' | b'E', b'\'', ..] => (2, true),
+        [b'u' | b'U', b'&', b'\'', ..] => (3, false),
+        _ => return None,
     };
-    (lexemes, end)
+    closing_quote(&b[start..], b'\'', backslash).map(|n| start + n)
+}
+
+/// The length of `b`, read inside text quoted by `q`, up to the quote that
+/// ends it, where it has one: a doubled `q` is a quote in the text, and where
+/// `backslash` a backslash escapes the next byte.
+fn closing_quote(b: &[u8], q: u8, backslash: bool) -> Option<usize> {
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if backslash => i += 2,
+            c if c == q && b.get(i + 1) == Some(&q) => i += 2,
+            c if c == q => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// `src` tokenized, or `None` when a string or comment is left open.
@@ -244,14 +297,14 @@ pub fn is_exit_word(s: &str) -> bool {
 ///
 /// Each line is tokenized once: a token other than an open string or comment
 /// never spans a newline, so a line read after whole ones tokenizes as it
-/// would within them. Only a string or comment left open is read again, with
-/// each line that continues it.
+/// would within them. A string or comment left open is read again from its
+/// start, but only with a line that could close it.
 #[derive(Default)]
 pub struct Splitter {
     /// The input no `;` has ended yet.
     pending: String,
-    /// How much of `pending` has been tokenized: all of it, or up to an open
-    /// string or comment's line.
+    /// How much of `pending` has been tokenized: all of it, or up to the
+    /// string or comment left open.
     lexed: usize,
     /// The span of `pending` the statement read so far covers.
     stmt: Option<Range<usize>>,
@@ -274,8 +327,12 @@ impl Splitter {
             self.lexed = 0;
             return vec![Piece::Meta(line.trim().to_string())];
         }
+        let open = self.lexed < self.pending.len();
         self.pending.push_str(line);
         self.pending.push('\n');
+        if open && !could_close(&self.pending[self.lexed..], line) {
+            return Vec::new();
+        }
         let base = self.lexed;
         let (lexemes, lexed) = lex_prefix(&self.pending[base..]);
         let mut out = Vec::new();
@@ -293,12 +350,7 @@ impl Splitter {
                 stmt = Some(stmt.map_or(range.start, |s| s.start)..range.end);
             }
         }
-        if base + lexed == self.pending.len() {
-            (self.lexed, self.stmt) = (self.pending.len(), stmt);
-        } else if let Some(d) = done {
-            // What follows the `;` is read again from there with the next line.
-            (self.lexed, self.stmt) = (d, None);
-        }
+        (self.lexed, self.stmt) = (base + lexed, stmt);
         if let Some(d) = done {
             self.pending.drain(..d);
             self.lexed -= d;
@@ -324,6 +376,26 @@ impl Splitter {
     }
 }
 
+/// Whether `line` could close the string or comment `open` starts with: a
+/// comment only where it holds `*/`; a plain quoted string or identifier,
+/// which no backslash escapes, only at a quote of its own that is not
+/// doubled; any other string only where it holds its quote character, which
+/// its prefix (`E'`, `U&'`, `X'`, `q'[`, `$tag$`) writes before its text.
+fn could_close(open: &str, line: &str) -> bool {
+    if open.starts_with("/*") {
+        return line.contains("*/");
+    }
+    match open.bytes().find(|b| matches!(b, b'\'' | b'"' | b'`' | b'$')) {
+        Some(q) if q != b'$' && open.as_bytes()[0] == q => closing_quote(line.as_bytes(), q, false).is_some(),
+        Some(q) => line.as_bytes().contains(&q),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/lex.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/lex.rs"]
+mod bench;

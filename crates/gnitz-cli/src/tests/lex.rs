@@ -138,3 +138,38 @@ fn lex_prefix_stops_at_an_unterminated_comment() {
     let (_, end) = lex_prefix(src);
     assert_eq!(&src[end..], "/* open");
 }
+
+#[test]
+fn a_construct_open_over_many_lines_closes_where_its_delimiter_is() {
+    let mut lines = vec!["SELECT 1 /* it's"];
+    lines.extend(["  more text"; 3]);
+    lines.extend(["*/ , 'a", "b", "c' ;", "\\x"]);
+    assert_eq!(
+        pieces(&lines),
+        [
+            Piece::Sql("SELECT 1 /* it's\n  more text\n  more text\n  more text\n*/ , 'a\nb\nc'".into()),
+            Piece::Meta("\\x".into()),
+        ]
+    );
+    assert!(is_complete("SELECT 1 /* it's\nstill */ ;"));
+    assert!(is_complete("SELECT $$ a\n b $$;"));
+    assert!(!is_complete("SELECT \"a\nb;"));
+}
+
+#[test]
+fn a_malformed_escape_in_a_closed_literal_ends_its_statement_at_its_semicolon() {
+    for bad in [
+        "SELECT E'\\u12';",
+        "SELECT E'\\777';",
+        "SELECT U&'\\zz';",
+        "SELECT U&'a\\';",
+    ] {
+        assert_eq!(
+            pieces(&[bad, "SELECT 2;"]),
+            sql(&[bad.trim_end_matches(';'), "SELECT 2"]),
+            "{bad}"
+        );
+        assert!(is_complete(&format!("{bad}\nSELECT 1;")), "{bad}");
+    }
+    assert!(!is_complete("SELECT E'it\\'s;"));
+}

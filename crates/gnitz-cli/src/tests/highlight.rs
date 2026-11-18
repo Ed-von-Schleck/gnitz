@@ -99,3 +99,11 @@ fn every_string_literal_the_dialect_reads_is_a_string() {
         assert_eq!(style_of(src, lit), p.string, "{lit}");
     }
 }
+
+#[test]
+fn copy_data_and_a_comment_hint_are_styled_in_place() {
+    for src in ["COPY t FROM STDIN;\nSELECT 1 FROM t;", "SELECT 1 /*!+ 1*/"] {
+        let text: String = styled(src).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(text, src);
+    }
+}

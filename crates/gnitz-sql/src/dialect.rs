@@ -18,8 +18,10 @@ use std::any::TypeId;
 ///
 /// `dialect()` reports `GenericDialect`'s type id, so sqlparser's
 /// `dialect_of!` checks branch as for `GenericDialect`. Every other method
-/// that `GenericDialect` overrides forwards to it; a test checks that list
-/// against the source of the sqlparser this crate resolves.
+/// that `GenericDialect` overrides forwards to it, but the two that would let
+/// a token span lines out of source order, `COPY … FROM STDIN` data and
+/// `/*! … */` hints; a test checks that list against the source of the
+/// sqlparser this crate resolves.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GnitzDialect;
 
@@ -32,6 +34,16 @@ macro_rules! forward {
 impl Dialect for GnitzDialect {
     fn dialect(&self) -> TypeId {
         TypeId::of::<GenericDialect>()
+    }
+
+    // gnitz has no `COPY`, and a `/*! … */` is a comment: a client reading
+    // input line by line splits and styles it at tokens in source order.
+    fn supports_copy_from_stdin_data(&self) -> bool {
+        false
+    }
+
+    fn supports_multiline_comment_hints(&self) -> bool {
+        false
     }
 
     fn is_delimited_identifier_start(&self, ch: char) -> bool {
@@ -91,7 +103,6 @@ impl Dialect for GnitzDialect {
         supports_struct_literal,
         supports_empty_projections,
         supports_nested_comments,
-        supports_multiline_comment_hints,
         supports_user_host_grantee,
         supports_string_escape_constant,
         supports_array_typedef_with_brackets,
@@ -132,7 +143,6 @@ impl Dialect for GnitzDialect {
         supports_aggregate_order_by_with_empty_args,
         supports_in_table_expression,
         supports_comparison_in_between_low_bound,
-        supports_copy_from_stdin_data,
         supports_data_type_zerofill_suffix,
         supports_table_partitions,
         supports_table_inheritance_markers,
