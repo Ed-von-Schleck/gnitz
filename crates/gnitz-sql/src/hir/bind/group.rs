@@ -28,9 +28,7 @@ fn group_by_exprs(select: &Select) -> Result<&[Expr], GnitzSqlError> {
             "GROUP BY",
             "WITH ROLLUP / WITH CUBE / WITH TOTALS / GROUPING SETS",
         )),
-        _ => Err(GnitzSqlError::Rejected(
-            "GROUP BY: only expression list supported".to_string(),
-        )),
+        _ => Err(GnitzSqlError::rejected("GROUP BY: only expression list supported")),
     }
 }
 
@@ -146,15 +144,14 @@ fn distinct_arg(calls: &[HirAgg]) -> Result<Option<ColId>, GnitzSqlError> {
         return Ok(None);
     };
     if calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != arg)) {
-        return Err(GnitzSqlError::Rejected(
-            "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument".into(),
+        return Err(GnitzSqlError::rejected(
+            "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument",
         ));
     }
     if calls.iter().any(|c| !survives_dedup(c, arg)) {
-        return Err(GnitzSqlError::Rejected(
+        return Err(GnitzSqlError::rejected(
             "DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the \
-             DISTINCT argument"
-                .into(),
+             DISTINCT argument",
         ));
     }
     Ok(Some(arg))
@@ -192,8 +189,8 @@ pub(super) fn bind_grouped_suffix(
         // An ad-hoc read lowers to one stateless fold over one scan, which has no
         // room for the `Distinct` below the reduce.
         if !cx.surface.is_view() && aggs.iter().any(|a| matches!(a.arg, AggArg::Distinct(_))) {
-            return Err(GnitzSqlError::Rejected(
-                "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
+            return Err(GnitzSqlError::rejected(
+                "DISTINCT aggregates are supported in a CREATE VIEW body only",
             ));
         }
         let phys = HirAgg::physical(aggs);
@@ -291,7 +288,7 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
         let bound = self.leaf.bind_column(qual, name)?;
         match bound.as_col().filter(|id| self.group_cols.contains(id)) {
             Some(_) => Ok(bound),
-            None => Err(GnitzSqlError::Rejected(format!(
+            None => Err(GnitzSqlError::rejected(format!(
                 "column '{name}' must appear in GROUP BY or an aggregate function"
             ))),
         }

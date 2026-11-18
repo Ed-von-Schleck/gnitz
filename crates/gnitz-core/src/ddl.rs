@@ -12,9 +12,10 @@ use gnitz_wire::{
 
 use crate::catalog::{CATALOG_FAMILIES, Catalog, IndexRow, idx_rows};
 use crate::client::GnitzClient;
-use crate::connection::{RelDescriptor, Request, Target};
+use crate::connection::{RelDescriptor, Request};
 use crate::error::{ClientError, absent, not_found};
 use crate::{BatchAppender, PkColumn, ProtocolError, RelName, Schema, ZSetBatch, sys_schema};
+use gnitz_wire::Target;
 
 /// The index in `schemas`, SCHEMA_TAB's rows, of the live row named
 /// `schema_name` (already canonical).
@@ -314,9 +315,10 @@ impl GnitzClient {
     // ── Indexes and the catalog ────────────────────────────────────────────
 
     /// Index `cols` of `owner`, named `owner_name`, in that order, under the
-    /// catalog name `name`. With no name it takes the first free
-    /// [`auto_index_name`], and is refused where an index of `owner` on `cols`
-    /// already serves it, whatever that index is named: unique where `is_unique`.
+    /// catalog name `name`: the new index's id. With no name it takes the first
+    /// free [`auto_index_name`], and
+    /// is refused where an index of `owner` on `cols` already serves it, whatever
+    /// that index is named: unique where `is_unique`.
     pub async fn create_index(
         &mut self,
         owner_name: &RelName,
@@ -379,7 +381,9 @@ impl GnitzClient {
         if_exists: bool,
         matches: impl Fn(&IndexRow) -> bool,
     ) -> Result<(), ClientError> {
-        let scanned = self.sys_rows(SysFamily::Index, ReadBound::None).await?;
+        let [scanned] = self
+            .sys_cut([SysFamily::Index], &ReadSpec::all_rows(ReadBound::None))
+            .await?;
         let rows = idx_rows(&scanned)?;
         let mut b = DdlBundle::default();
         let mut retracted = Vec::new();
@@ -396,13 +400,6 @@ impl GnitzClient {
             }
         }
         self.commit_ddl(b).await
-    }
-
-    /// Every live secondary index. Names come back canonical (lowercase): every
-    /// writer folds them at store time.
-    pub async fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
-        let scanned = self.sys_rows(SysFamily::Index, ReadBound::None).await?;
-        Ok(idx_rows(&scanned)?.into_iter().map(|(_, r)| r).collect())
     }
 
     /// The whole catalog, read at one cut.
@@ -771,15 +768,6 @@ impl GnitzClient {
         }))
     }
 
-    /// System family `family`'s rows under `bound`, decoded under its own schema;
-    /// the server checks the reply against that schema's layout.
-    async fn sys_rows(&mut self, family: SysFamily, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
-        Ok(self
-            .scan_served(family, &ReadSpec::all_rows(bound), sys_schema(family))
-            .await?
-            .batch)
-    }
-
     /// The live `family` row keyed `key` — its PK columns' native values in
     /// PK-list order — by one master-local keyed read: the
     /// reply batch and the row's index in it, for a caller to copy the stored row
@@ -793,7 +781,9 @@ impl GnitzClient {
     ) -> Result<(ZSetBatch, usize), ClientError> {
         let mut keys = PkColumn::empty_for_schema(sys_schema(family));
         keys.push_natives(key);
-        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys())).await?;
+        let [batch] = self
+            .sys_cut([family], &ReadSpec::all_rows(ReadBound::PkSet(keys.keys())))
+            .await?;
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }

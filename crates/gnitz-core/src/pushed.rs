@@ -9,11 +9,12 @@ use std::time::Duration;
 use crate::Schema;
 use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, Held, RawBlock, ScanReply, SubId, Target, park, untaken};
+use crate::connection::{Held, RawBlock, ScanReply, park, untaken};
 use crate::error::ClientError;
 use crate::host::{Op, Sent, finished};
 use crate::mirror::PollOutcome;
-use gnitz_wire::multi_frame::kept_as;
+use gnitz_wire::Target;
+use gnitz_wire::multi_frame::{DeltaCursor, SubId, kept_as};
 
 /// What a sync hands a reader for one of its subscriptions.
 pub struct Pushed {
@@ -207,22 +208,32 @@ impl GnitzClient {
             received: Arc::clone(received),
         })
     }
+
+    /// The first parked sync whose answer has arrived, as the op that finishes
+    /// it and lands its delivery.
+    pub(crate) fn answered_sync(&mut self) -> Option<Op> {
+        let (i, reply) = (self.syncs.iter_mut().enumerate()).find_map(|(i, (sent, _))| Some((i, sent.try_take()?)))?;
+        let (_, land) = self.syncs.remove(i);
+        Some(Box::new(move |client| {
+            Box::pin(async move { land(client.finish_sync(reply).await) })
+        }))
+    }
 }
 
+/// Where a [`sync_op`]'s delivery goes.
+pub(crate) type Land = Box<dyn FnOnce(Result<Delivery, ClientError>) + Send>;
+
 /// A sync as one queued call of a [`serve`](crate::serve) loop: its request
-/// goes out, and the rest, finishing it and handing the [`Delivery`] to
-/// `land`, is queued on the client when the answer arrives; `serve` takes it up
-/// before it waits again, and serves on until it has. The sync is finished
+/// goes out and is parked on the client; once its answer has arrived, `serve`
+/// finishes it and hands the [`Delivery`] to `land` before it waits again, and
+/// serves on until it has. The sync is finished
 /// whether or not its caller is still there; a delivery nobody takes hands back
 /// its reseeds, and what the sync brought a reader stays with the client until
 /// one is taken.
 pub fn sync_op(wait: Duration, land: impl FnOnce(Result<Delivery, ClientError>) + Send + 'static) -> Op {
     Box::new(move |client| {
-        let resumed = Arc::clone(&client.resumed);
-        client.begin_sync(wait).then(move |reply| {
-            let rest: Op = Box::new(move |client| Box::pin(async move { land(client.finish_sync(reply).await) }));
-            resumed.lock().unwrap_or_else(PoisonError::into_inner).push_back(rest);
-        });
+        let sent = client.begin_sync(wait);
+        client.syncs.push((sent, Box::new(land)));
         finished()
     })
 }

@@ -45,8 +45,8 @@ pub(crate) fn explained_query(stmt: &Statement) -> Result<&Query, GnitzSqlError>
             return Ok(q);
         }
     }
-    Err(GnitzSqlError::Rejected(
-        "EXPLAIN describes a SELECT; this statement is not one".to_string(),
+    Err(GnitzSqlError::rejected(
+        "EXPLAIN describes a SELECT; this statement is not one",
     ))
 }
 

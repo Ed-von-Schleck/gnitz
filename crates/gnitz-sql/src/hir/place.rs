@@ -170,19 +170,17 @@ fn reject_outer_with_residual(kind: JoinType, residual: &[HirExpr]) -> Result<()
     }
     match kind {
         JoinType::Inner => Ok(()),
-        JoinType::Left | JoinType::Right | JoinType::Full => Err(GnitzSqlError::Rejected(
+        JoinType::Left | JoinType::Right | JoinType::Full => Err(GnitzSqlError::rejected(
             "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
              conjunct, or a second range conjunct) is not supported; the residual \
              would have to participate in the outer null-fill. Use INNER JOIN, or \
-             move the predicate to a WHERE over a wrapping view."
-                .into(),
+             move the predicate to a WHERE over a wrapping view.",
         )),
-        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => Err(GnitzSqlError::Rejected(
+        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => Err(GnitzSqlError::rejected(
             "EXISTS/IN correlation contains a conjunct the semi-join cannot consume \
              (a non-equality/non-range comparison, a second range conjunct, or an OR \
              group spanning both relations); it would have to participate in the \
-             match-existence decision. Filter inside the subquery or a wrapping view."
-                .into(),
+             match-existence decision. Filter inside the subquery or a wrapping view.",
         )),
     }
 }
@@ -197,21 +195,21 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType
             JoinKeyRule::Float => {
                 reject_float_keys([left, right], "JOIN ON").expect_err("a Float pair holds a float column")
             }
-            JoinKeyRule::UnitMismatch => GnitzSqlError::Rejected(format!(
+            JoinKeyRule::UnitMismatch => GnitzSqlError::rejected(format!(
                 "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
                 left.name, left.ty, right.name, right.ty
             )),
-            JoinKeyRule::StringWithNative => GnitzSqlError::Rejected(format!(
+            JoinKeyRule::StringWithNative => GnitzSqlError::rejected(format!(
                 "JOIN ON: cannot equijoin string/blob column '{}' ({}) with non-string \
              column '{}' ({}); a string content hash never matches a native key",
                 left.name, left.ty, right.name, right.ty
             )),
-            JoinKeyRule::BoolWithNumber => GnitzSqlError::Rejected(format!(
+            JoinKeyRule::BoolWithNumber => GnitzSqlError::rejected(format!(
                 "JOIN ON: cannot equijoin BOOLEAN column with a non-BOOLEAN one: '{}' ({}) and '{}' ({}); \
              CAST one side",
                 left.name, left.ty, right.name, right.ty
             )),
-            JoinKeyRule::NoSigned256 => GnitzSqlError::Rejected(format!(
+            JoinKeyRule::NoSigned256 => GnitzSqlError::rejected(format!(
                 "JOIN ON: join key columns '{}' ({}) and '{}' ({}) cannot co-partition; \
              a cross-sign pair whose unsigned side is 128-bit (e.g. UINT128/UUID \
              joined with a signed integer) needs a signed-256 type that does not exist",
@@ -219,7 +217,7 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType
             )),
         })?;
     if (left.ty.is_decimal() || right.ty.is_decimal()) && left.ty != right.ty {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ; a DECIMAL joins only a \
              DECIMAL of the same scale",
             left.name, left.ty, right.name, right.ty
@@ -236,7 +234,7 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType
 fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType, GnitzSqlError> {
     for col in [left, right] {
         if col.ty.tc.is_german_string() {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "range join key column '{}' ({:?}): a string/blob content hash is not \
                  order-preserving and cannot bound a range conjunct",
                 col.name, col.ty.tc

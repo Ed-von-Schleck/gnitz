@@ -321,7 +321,7 @@ fn source(
     };
     let node = cb
         .input_scattered(src.tid(), bound, scatter)
-        .map_err(GnitzSqlError::Rejected)?;
+        .map_err(GnitzSqlError::rejected)?;
     filter(cb, node, &conjuncts, &frame.schema)
 }
 

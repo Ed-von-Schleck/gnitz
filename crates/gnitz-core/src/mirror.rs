@@ -36,12 +36,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, RawBlock, RelDescriptor, ScanReply, Session, Target};
+use crate::connection::{RawBlock, RelDescriptor, ScanReply, Session};
 use crate::ddl::DdlBundle;
 use crate::error::ClientError;
 use crate::host::{BoxFut, Host, Pending, Sent, offload};
 use crate::{RelName, Schema, ZSetBatch};
-use gnitz_wire::multi_frame::{DeltaPollItem, SubId, kept_as};
+use gnitz_wire::Target;
+use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId, kept_as};
 use gnitz_wire::{RelClass, WireStatus};
 
 // ---------------------------------------------------------------------------
@@ -259,17 +260,13 @@ impl Store {
         }
     }
 
-    /// The store, for a call that touches a copy: a cursor move or a local
-    /// read in place, so a mirrored read costs no dispatch, and work that
-    /// writes the disk through [`Self::run`]. Refused as [`Self::refusal`] is.
-    fn touch(&self) -> Result<MutexGuard<'_, dyn MirrorStore + 'static>, ClientError> {
-        self.0.lock().map_err(|_| ClientError::MirrorPoisoned)
-    }
-
-    /// `work` on the store, in place, refused as [`Self::touch`] is; the
-    /// store's own failure is [`ClientError::Mirror`].
+    /// `work` on the store, in place — a cursor move or a local read, so a
+    /// mirrored read costs no dispatch; work that writes the disk goes through
+    /// [`Self::run`]. Refused as [`Self::refusal`] is; the store's own failure
+    /// is [`ClientError::Mirror`].
     fn with<R>(&self, work: impl FnOnce(&mut dyn MirrorStore) -> Result<R, String>) -> Result<R, ClientError> {
-        work(&mut *self.touch()?).map_err(ClientError::Mirror)
+        let mut store = self.0.lock().map_err(|_| ClientError::MirrorPoisoned)?;
+        work(&mut *store).map_err(ClientError::Mirror)
     }
 
     /// [`Self::with`], run where `host` lets work block, since `work` may touch

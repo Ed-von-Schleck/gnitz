@@ -19,7 +19,8 @@ use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
 use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch, sys_schema};
-use gnitz_wire::multi_frame::{self, FrameItem, encode_items, kept_as};
+use gnitz_wire::Target;
+use gnitz_wire::multi_frame::{self, DeltaCursor, FrameItem, SubId, encode_items, kept_as};
 use gnitz_wire::{
     CONNECT_TIMEOUT, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob, RelIndex,
     SysFamily, WireConflictMode, WireLane, WireStatus, append_frame, peek_control_block,
@@ -74,8 +75,6 @@ pub struct RelDescriptor {
     pub token: u64,
 }
 
-pub use gnitz_wire::Target;
-
 impl From<&RelDescriptor> for Target {
     fn from(rel: &RelDescriptor) -> Self {
         Target { tid: rel.tid, token: rel.token }
@@ -105,8 +104,6 @@ impl RawBlock {
         &self.frame[self.block.clone()]
     }
 }
-
-pub use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 
 // ── The request vocabulary ───────────────────────────────────────────────────
 
@@ -199,19 +196,19 @@ pub(crate) fn append_payload(out: &mut Vec<u8>, hdr: ControlHeader, blob: &[u8],
 
 /// One family of a user-table push transaction: a maximal run of same-mode
 /// writes into `target`.
-pub struct PushFamily {
+pub(crate) struct PushFamily {
     /// The relation, under the descriptor token of the first of the family's
     /// batches built from a descriptor; `0` while none was.
-    pub target: Target,
-    pub schema: Arc<Schema>,
+    pub(crate) target: Target,
+    pub(crate) schema: Arc<Schema>,
     /// May still be shared with the caller that pushed it, so it is never
     /// written in place.
-    pub batch: Arc<ZSetBatch>,
-    pub mode: WireConflictMode,
+    pub(crate) batch: Arc<ZSetBatch>,
+    pub(crate) mode: WireConflictMode,
     /// The commit fails if `target` was written after `basis`, the oldest
     /// watermark among the reads this family's writes were built from; `BLIND`
     /// when none was.
-    pub basis: u64,
+    pub(crate) basis: u64,
 }
 
 /// Append an atomic user-table push transaction frame (`ClientVerb::PushTxn`) to
@@ -257,9 +254,9 @@ fn append_ddl_txn(out: &mut Vec<u8>, families: &[(SysFamily, ZSetBatch)]) {
 }
 
 /// One request in flight, or a pushed train: how its reply decodes, the reply
-/// read so far, and where it goes. A slot is answered only while it heads its
-/// queue, so its state is the one train in progress, and it goes when the slot
-/// does.
+/// read so far, and where it goes. A request's slot is answered only while it
+/// heads its queue, and a pushed train's while it is the one being read, so its
+/// state is the one train in progress, and it goes when the slot does.
 enum Slot {
     /// A control-only ACK naming `tid`, its value in `arg0`.
     Ack { tid: u64, to: Promise<u64> },
@@ -933,14 +930,14 @@ impl Session {
         if !self.at_capacity() {
             return None;
         }
-        let why = match self.inbox.in_flight() >= MAX_IN_FLIGHT {
-            true => format!("connection has {MAX_IN_FLIGHT} requests in flight"),
-            false => format!(
+        Some(ClientError::from(if self.inbox.in_flight() >= MAX_IN_FLIGHT {
+            format!("connection has {MAX_IN_FLIGHT} requests in flight")
+        } else {
+            format!(
                 "connection has {} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap",
                 self.transport.queued_bytes()
-            ),
-        };
-        Some(ClientError::from(why))
+            )
+        }))
     }
 
     /// `READ` while any request is unanswered; `WRITE` while bytes remain queued

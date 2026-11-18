@@ -43,7 +43,7 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
             named.sort_unstable();
             pk.sort_unstable();
             if named != pk {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "ON CONFLICT target must name exactly the primary key ({})",
                     pk.iter()
                         .map(|&ci| &*schema.columns()[ci as usize].name)
@@ -77,15 +77,15 @@ fn value_slots(
     }
     for (k, name) in columns.iter().enumerate() {
         let ident = single_part_ident(name)
-            .ok_or_else(|| GnitzSqlError::Rejected("INSERT column list: column must be a simple identifier".into()))?;
+            .ok_or_else(|| GnitzSqlError::rejected("INSERT column list: column must be a simple identifier"))?;
         let ci = require_column(schema.columns(), ident).map_err(|e| e.in_clause("INSERT column list"))?;
         if Some(ci) == serial_ci {
-            return Err(GnitzSqlError::Rejected(
-                "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
+            return Err(GnitzSqlError::rejected(
+                "cannot supply a value for a SERIAL column; omit it from the INSERT",
             ));
         }
         if slot_of[ci].is_some() {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "column '{ident}' specified more than once in the INSERT column list"
             )));
         }
@@ -188,7 +188,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
         TableObject::TableName(obj_name) => extract_object_name(obj_name, cat.schema_name(), "INSERT")?,
         _ => return Err(unsupported_clause("INSERT", "a table function target")),
     };
-    let source = source.ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
+    let source = source.ok_or_else(|| GnitzSqlError::rejected("INSERT without VALUES not supported"))?;
     let values = extract_values_rows(source)?;
 
     let target = cat.probe_relation(&table_name)?;
@@ -201,10 +201,9 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
     let on_conflict = match on {
         None => None,
         Some(OnInsert::DuplicateKeyUpdate(_)) => {
-            return Err(GnitzSqlError::Rejected(
+            return Err(GnitzSqlError::rejected(
                 "ON DUPLICATE KEY UPDATE not supported — use PostgreSQL-style \
-                 ON CONFLICT (col) DO UPDATE"
-                    .to_string(),
+                 ON CONFLICT (col) DO UPDATE",
             ));
         }
         Some(OnInsert::OnConflict(OnConflict { conflict_target, action })) => {
@@ -223,7 +222,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             }
         }
         Some(_) => {
-            return Err(GnitzSqlError::Rejected("unsupported ON clause in INSERT".to_string()));
+            return Err(GnitzSqlError::rejected("unsupported ON clause in INSERT"));
         }
     };
 
@@ -239,7 +238,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             .iter()
             .map(|&pi| {
                 slot_of[pi as usize].ok_or_else(|| {
-                    GnitzSqlError::Rejected(format!(
+                    GnitzSqlError::rejected(format!(
                         "PK column '{}' missing from INSERT row",
                         schema.columns()[pi as usize].name
                     ))
@@ -266,7 +265,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             } else {
                 ""
             };
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "INSERT specifies {} value(s) but table '{}' expects {} value(s){}",
                 row.len(),
                 table_name,
@@ -339,10 +338,9 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
 fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
     let Firsts { absorbed, keep } = firsts(&rows.pks);
     if refuse_repeat && !absorbed.is_empty() {
-        return Err(GnitzSqlError::Rejected(
+        return Err(GnitzSqlError::rejected(
             "ON CONFLICT DO UPDATE cannot affect row a second time \
-             (duplicate PK in the same batch)"
-                .to_string(),
+             (duplicate PK in the same batch)",
         ));
     }
     rows.retain_ranges(&keep);
@@ -393,8 +391,8 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
         // Inert MySQL spellings of `VALUES (…)`: `VALUES ROW(…)` and `VALUE (…)`
         // parse to the same `rows`, so the row inserted is identical.
         SetExpr::Values(Values { rows, explicit_row: _, value_keyword: _ }) => Ok(rows),
-        _ => Err(GnitzSqlError::Rejected(
-            "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
+        _ => Err(GnitzSqlError::rejected(
+            "INSERT only supports VALUES (not INSERT INTO ... SELECT)",
         )),
     }
 }
@@ -409,7 +407,7 @@ pub(super) fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<PkColu
         .1;
     if i128::from(base) + n as i128 - 1 > max {
         let next = i128::from(base).max(max + 1);
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "SERIAL primary key exhausted: next value {next} exceeds the column type maximum {max}"
         )));
     }

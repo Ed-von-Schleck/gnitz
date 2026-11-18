@@ -14,7 +14,7 @@ use crate::{client_err, sql_err};
 /// A connection whose waits check for Ctrl-C.
 fn connect(py: Python<'_>, target: &str) -> PyResult<GnitzClient> {
     let host = BlockingHost::with_hook(|| Python::attach(|py| py.check_signals()).map_err(Into::into));
-    py.detach(|| GnitzClient::connect_on(target, Box::new(host)))
+    py.detach(|| block_on(GnitzClient::connect_with(target, Box::new(host))))
         .map_err(client_err)
 }
 

@@ -95,7 +95,7 @@ fn object_name_parts<'a>(name: &'a sqlparser::ast::ObjectName, context: &str) ->
         .map(|i| i.value.as_str())
         .collect();
     if parts.is_empty() || parts.len() != name.0.len() {
-        return Err(GnitzSqlError::Rejected(format!("empty name in {context}")));
+        return Err(GnitzSqlError::rejected(format!("empty name in {context}")));
     }
     Ok(parts)
 }
@@ -112,7 +112,7 @@ pub(crate) fn extract_object_name(
         // `object_name_parts` rejects the empty name, so this is 3+ parts.
         _ => Err(format!("{context}: '{name}' has too many name parts")),
     }
-    .map_err(GnitzSqlError::Rejected)
+    .map_err(GnitzSqlError::rejected)
 }
 
 /// A schema or an index name, canonical. Both are global, so neither takes a
@@ -124,7 +124,7 @@ pub(crate) fn extract_global_name(
 ) -> Result<String, GnitzSqlError> {
     match object_name_parts(name, context)?.as_slice() {
         [n] => canonical_user_name(n),
-        _ => Err(GnitzSqlError::Rejected(format!(
+        _ => Err(GnitzSqlError::rejected(format!(
             "{context}: a {noun} name is global, so it takes no qualifier"
         ))),
     }
@@ -164,7 +164,7 @@ pub(crate) fn extract_table_ref<'a>(
         sample,
     } = tf
     else {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{context}: only simple table references supported"
         )));
     };

@@ -213,7 +213,7 @@ pub(crate) fn as_plain_select<'a>(
 ) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
     match body {
         sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
-        _ => Err(GnitzSqlError::Rejected(format!(
+        _ => Err(GnitzSqlError::rejected(format!(
             "{ctx}: only a plain SELECT body is supported"
         ))),
     }

@@ -1,7 +1,8 @@
 //! A copy's registration and feed position, published in the manifest beside
 //! the copy's rows.
 
-use gnitz_core::{DeltaCursor, RelDescriptor, RelName};
+use gnitz_core::{RelDescriptor, RelName};
+use gnitz_wire::multi_frame::DeltaCursor;
 use gnitz_wire::{MAX_LIST_LEN, PkColList, Writer, decode_all};
 use gnitz_zset::schema::{SchemaDescriptor, decode_schema_record};
 

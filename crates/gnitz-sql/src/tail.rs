@@ -13,11 +13,11 @@ use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, Order
 /// Parse `e` as a non-negative integer literal, or error — silently degrading a
 /// LIMIT returns every row. `what` names the clause for the message.
 pub(crate) fn expr_usize_literal(e: &Expr, what: &str) -> Result<usize, GnitzSqlError> {
-    let not_a_literal = || GnitzSqlError::Rejected(format!("{what} must be an integer literal, not an expression"));
+    let not_a_literal = || GnitzSqlError::rejected(format!("{what} must be an integer literal, not an expression"));
     let c = bind_constant(e).map_err(|_| not_a_literal())?;
     match c {
         BExpr::LitInt(n) if n >= 0 => Ok(n as usize),
-        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Rejected(format!(
+        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::rejected(format!(
             "{what} must be a non-negative integer literal, got '{}'",
             c.literal_text()
         ))),
@@ -44,7 +44,7 @@ pub(crate) fn clause_position(e: &Expr, what: &str) -> Result<Option<usize>, Gni
 /// but out of range reads the same either way, so it is worded once.
 pub(crate) fn reject_position_out_of_range(pos: usize, len: usize, what: &str) -> Result<(), GnitzSqlError> {
     if pos == 0 || pos > len {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{what} position {pos} is out of range (1..={len})"
         )));
     }
@@ -66,12 +66,12 @@ pub(crate) fn group_by_target<'a>(
     };
     reject_position_out_of_range(pos, select.projection.len(), "GROUP BY")?;
     let target = projection_item_expr(&select.projection[pos - 1]).ok_or_else(|| {
-        GnitzSqlError::Rejected(format!(
+        GnitzSqlError::rejected(format!(
             "GROUP BY position {pos} names a wildcard, which is not a group key"
         ))
     })?;
     if expr_has_aggregate(target) {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "GROUP BY position {pos} names an aggregate, which cannot be a group key"
         )));
     }
@@ -141,7 +141,7 @@ pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<
 /// and a window's effective order alike.
 pub(crate) fn reject_order_key_count(n: usize) -> Result<(), GnitzSqlError> {
     if n > gnitz_wire::MAX_ORDER_KEYS {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "ORDER BY has more than {} keys",
             gnitz_wire::MAX_ORDER_KEYS
         )));

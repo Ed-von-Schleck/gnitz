@@ -441,12 +441,12 @@ fn bounded_view_eligibility_is_the_engines() {
         "SELECT t.id, u.w FROM t CROSS JOIN u",
         "SELECT id FROM t ORDER BY v LIMIT 1",
     ] {
-        db.refuses(&bounded(body), Refused(Error), "capacity-bounded view:");
+        db.refuses(&bounded(body), Error, "capacity-bounded view:");
     }
     // A body the planner splits into a chain never reaches the engine's rule.
     db.refuses(
         &bounded("SELECT v FROM t UNION ALL SELECT tid FROM u GROUP BY tid"),
-        Rejected,
+        Error,
         "more than one view",
     );
     for body in [
@@ -490,11 +490,11 @@ fn a_column_alias_list_renames_a_tables_columns() {
     db.exec("INSERT INTO t VALUES (4, 30, 400)");
     assert_eq!(db.scan("joined", &["k", "uid"]), [[2, 7, 1], [3, 8, 1], [4, 8, 1]]);
 
-    db.refuses("SELECT g FROM t AS x(k, grp, val)", Rejected, "not found");
-    db.refuses("SELECT * FROM t AS x(k, grp)", Rejected, "defines 2 column aliases");
+    db.refuses("SELECT g FROM t AS x(k, grp, val)", Error, "not found");
+    db.refuses("SELECT * FROM t AS x(k, grp)", Error, "defines 2 column aliases");
     db.refuses(
         "DELETE FROM t AS x(k, grp, val) WHERE k = 1",
-        Rejected,
+        Error,
         "positional column aliases",
     );
 }
@@ -504,8 +504,8 @@ fn a_column_alias_list_renames_a_tables_columns() {
 fn create_schema_and_a_blob_column_are_sql() {
     let mut db = Db::boot(2);
     db.exec("CREATE SCHEMA archive; CREATE SCHEMA IF NOT EXISTS archive");
-    db.refuses("CREATE SCHEMA archive", Refused(Error), "");
-    db.refuses("CREATE SCHEMA a.b", Rejected, "no qualifier");
+    db.refuses("CREATE SCHEMA archive", Error, "");
+    db.refuses("CREATE SCHEMA a.b", Error, "no qualifier");
     db.exec("CREATE TABLE archive.files (id BIGINT PRIMARY KEY, body BLOB, note BYTEA NOT NULL)");
     let files = block_on(db.client.resolve_relation(&rel("archive", "files"))).unwrap();
     let types: Vec<TypeCode> = files.schema.columns().iter().map(|c| c.ty.tc).collect();
@@ -518,35 +518,31 @@ fn create_schema_and_a_blob_column_are_sql() {
 fn drop_schema_restricts_unless_cascaded() {
     let mut db = Db::boot(2);
     db.exec("CREATE SCHEMA empty; DROP SCHEMA empty RESTRICT; DROP SCHEMA IF EXISTS empty, empty");
-    db.refuses(
-        "DROP SCHEMA empty",
-        Refused(gnitz_wire::WireStatus::NotFound),
-        "not found",
-    );
+    db.refuses("DROP SCHEMA empty", gnitz_wire::WireStatus::NotFound, "not found");
 
     db.exec(
         "CREATE SCHEMA full;
          CREATE TABLE full.t (id BIGINT PRIMARY KEY, v BIGINT);
          CREATE VIEW full.v AS SELECT id FROM full.t",
     );
-    db.refuses("DROP SCHEMA full", Refused(Error), "not empty");
-    db.refuses("DROP SCHEMA full RESTRICT", Refused(Error), "not empty");
-    db.refuses("DROP SCHEMA full CASCADE PURGE", Rejected, "PURGE");
+    db.refuses("DROP SCHEMA full", Error, "not empty");
+    db.refuses("DROP SCHEMA full RESTRICT", Error, "not empty");
+    db.refuses("DROP SCHEMA full CASCADE PURGE", Error, "PURGE");
     db.refuses(
         "DROP SCHEMA full, empty CASCADE",
-        Refused(gnitz_wire::WireStatus::NotFound),
+        gnitz_wire::WireStatus::NotFound,
         "not found",
     );
-    db.refuses("DROP SCHEMA a.b CASCADE", Rejected, "no qualifier");
+    db.refuses("DROP SCHEMA a.b CASCADE", Error, "no qualifier");
     assert!(block_on(db.client.resolve_relation(&rel("full", "t"))).is_ok());
 
     db.exec("DROP SCHEMA full CASCADE");
-    db.refuses("SELECT * FROM full.t", Refused(gnitz_wire::WireStatus::NotFound), "");
+    db.refuses("SELECT * FROM full.t", gnitz_wire::WireStatus::NotFound, "");
     db.exec("CREATE SCHEMA full; CREATE TABLE full.t (id BIGINT PRIMARY KEY)");
 
     // Several schemas go in one bundle, a name given twice once.
     db.exec("CREATE SCHEMA other; DROP SCHEMA full, other, full CASCADE");
-    db.refuses("SELECT * FROM full.t", Refused(gnitz_wire::WireStatus::NotFound), "");
+    db.refuses("SELECT * FROM full.t", gnitz_wire::WireStatus::NotFound, "");
     db.exec("CREATE SCHEMA other");
 
     // RESTRICT is every drop's default, so no kind refuses it.

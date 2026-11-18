@@ -188,21 +188,18 @@ pub fn finished<'a>() -> BoxFut<'a, ()> {
 }
 
 /// Run the ops `next` yields on `client`, in order and one at a time, after
-/// any a reply queued on the client. Steps the session while none is ready,
+/// finishing any parked sync whose answer has arrived. Steps the session while none is ready,
 /// and once `next` yields `None` until nothing is outstanding; then drops the
 /// client.
 pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) {
     loop {
         let op = poll_fn(|cx| {
             loop {
-                // Queued only from inside a step or an op, both run below, so
-                // nothing has to wake this.
-                if let Some(op) = client
-                    .resumed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .pop_front()
-                {
+                // A sync's answer arrives only inside a step or an op, both run
+                // below, so nothing has to wake this. Not only the oldest: a
+                // sync with nothing to hold is answered at once, ahead of one
+                // the server is holding.
+                if let Some(op) = client.answered_sync() {
                     return Poll::Ready(Some(op));
                 }
                 let drained = match next(cx) {

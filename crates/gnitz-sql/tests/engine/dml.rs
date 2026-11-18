@@ -21,7 +21,7 @@ fn a_refused_write_writes_nothing() {
         ("DELETE FROM t LIMIT 1", "LIMIT"),
         ("INSERT INTO sr VALUES (1), (NULL)", "NOT NULL"),
     ] {
-        db.refuses(sql, Rejected, needle);
+        db.refuses(sql, Error, needle);
     }
     assert_eq!(db.scan("t", &["id", "v"]), [[1, 10, 1]]);
     // The refused statement drew no SERIAL id.
@@ -46,15 +46,15 @@ fn transaction_control_refuses_what_it_cannot_honour() {
     ];
     let mut db = Db::boot(1);
     db.exec("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
-    db.refuses("COMMIT", Refused(Error), "no transaction open");
-    db.refuses("ROLLBACK", Refused(Error), "no transaction open");
+    db.refuses("COMMIT", Error, "no transaction open");
+    db.refuses("ROLLBACK", Error, "no transaction open");
     for (sql, needle) in CLAUSES {
-        db.refuses(sql, Rejected, needle);
+        db.refuses(sql, Error, needle);
         assert!(!db.client.txn_active(), "`{sql}` opened a transaction");
     }
 
     db.exec("BEGIN; INSERT INTO t VALUES (1, 10)");
-    db.refuses("BEGIN", Refused(Error), "already open");
+    db.refuses("BEGIN", Error, "already open");
     for (sql, needle) in CLAUSES.into_iter().chain([
         (
             "CREATE TABLE t2 (id BIGINT PRIMARY KEY)",
@@ -72,7 +72,7 @@ fn transaction_control_refuses_what_it_cannot_honour() {
         ),
         ("DELETE FROM _system.tables WHERE table_id = 2", "is a system table"),
     ]) {
-        db.refuses(sql, Rejected, needle);
+        db.refuses(sql, Error, needle);
         assert!(db.client.txn_active(), "`{sql}` closed the transaction");
     }
     let (schema, plan) = db.read("EXPLAIN SELECT v FROM t WHERE id = 5");
@@ -116,7 +116,7 @@ fn a_concurrent_add_column_fails_the_commit_cleanly() {
     );
     b.exec("ALTER TABLE t ADD COLUMN c BIGINT");
     a.exec("INSERT INTO t (id, v) VALUES (3, 30)");
-    a.refuses("COMMIT", Refused(WireStatus::TxnConflict), "no longer resolves");
+    a.refuses("COMMIT", WireStatus::TxnConflict, "no longer resolves");
     assert!(!a.client.txn_active());
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 10, 1]]);
 }

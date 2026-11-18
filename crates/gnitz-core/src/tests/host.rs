@@ -1,7 +1,11 @@
 use super::*;
 use crate::ProtocolError;
 use crate::connection::Request;
-use crate::test_support::{client_pair, interrupt_self_until, kv_schema, reply_ctrl, session_pair};
+use crate::sync_op;
+use crate::test_support::{
+    await_reply, client_pair, delta_terminal, interrupt_self_until, kv_schema, reply_ctrl, session_pair, sub_id,
+    sync_answer,
+};
 use crate::transport::poll_fd;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use std::collections::VecDeque;
@@ -321,31 +325,70 @@ fn serve_ends_the_session_as_the_hosts_failure() {
     );
 }
 
-/// An op a reply queues on the client runs, though `next` yielded `None`
-/// before that reply arrived.
+/// A sync a serve loop sent is finished and its delivery landed, though `next`
+/// yielded `None` before its answer arrived.
 #[test]
-fn serve_runs_an_op_a_reply_queues_after_the_calls_ended() {
-    let (s, peer) = session_pair();
+fn serve_lands_a_sync_answered_after_the_calls_ended() {
+    let (mut s, peer) = session_pair();
+    // A kept read answered, so the server holds a subscription and the sync is a request.
+    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let read = s.submit_delta_read(40.into(), None, &schema, &[], Some(sub_id(5)));
+    peer.send(&delta_terminal(40, 1, 3));
+    await_reply(&mut s, read).unwrap();
+    peer.recv();
     // Its own descriptor of the socket, which outlives the session moved into the client.
     let fd = s.as_fd().try_clone_to_owned().unwrap();
-    let peer = numbering_peer(peer);
+    let peer = std::thread::spawn(move || {
+        peer.recv();
+        peer.send(&sync_answer(None));
+        peer
+    });
     let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
-    let ran = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&ran);
-    let mut call: Option<Op> = Some(Box::new(move |c| {
-        let resumed = Arc::clone(&c.resumed);
-        c.ack(Request::AllocIds(1)).detach().then(move |_| {
-            resumed.lock().unwrap().push_back(Box::new(move |_: &mut GnitzClient| {
-                done.store(true, Ordering::Relaxed);
-                finished()
-            }))
-        });
-        finished()
+    let landed = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&landed);
+    let mut call = Some(sync_op(std::time::Duration::ZERO, move |d| {
+        done.store(d.is_ok(), Ordering::Relaxed)
     }));
     drive(fd.as_fd(), serve(c, |_| Poll::Ready(call.take())));
-    assert!(ran.load(Ordering::Relaxed), "the op the reply queued ran");
+    assert!(landed.load(Ordering::Relaxed), "the sync's delivery landed");
     drop(fd);
-    peer.join().unwrap();
+    let _peer = peer.join().unwrap();
+}
+
+/// A sync answered at once lands while an older one the server holds is still
+/// unanswered: the one sent while a subscription was held goes on the wire, and
+/// the next, with nothing left held, is answered in place.
+#[test]
+fn serve_lands_a_sync_answered_in_place_ahead_of_a_held_one() {
+    let (mut s, peer) = session_pair();
+    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let read = s.submit_delta_read(40.into(), None, &schema, &[], Some(sub_id(5)));
+    peer.send(&delta_terminal(40, 1, 3));
+    await_reply(&mut s, read).unwrap();
+    peer.recv();
+    let fd = s.as_fd().try_clone_to_owned().unwrap();
+    let landed = Arc::new(Mutex::new(Vec::new()));
+    let (second_landed, wait_second) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        peer.recv();
+        // Answered only once the later sync has landed, or never would be.
+        let _ = wait_second.recv_timeout(std::time::Duration::from_secs(5));
+        peer.send(&sync_answer(None));
+        peer
+    });
+    let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
+    let (first, second) = (Arc::clone(&landed), Arc::clone(&landed));
+    let mut calls: VecDeque<Op> = VecDeque::from([
+        sync_op(std::time::Duration::ZERO, move |_| first.lock().unwrap().push("held")),
+        sync_op(std::time::Duration::ZERO, move |_| {
+            second.lock().unwrap().push("in place");
+            second_landed.send(()).unwrap();
+        }),
+    ]);
+    drive(fd.as_fd(), serve(c, |_| Poll::Ready(calls.pop_front())));
+    assert_eq!(*landed.lock().unwrap(), ["in place", "held"]);
+    drop(fd);
+    let _peer = peer.join().unwrap();
 }
 
 /// Waits like a [`BlockingHost`], and pends every step that waits on nothing

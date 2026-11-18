@@ -15,10 +15,11 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use gnitz_core::{
-    BatchAppender, ClientError, DeltaCursor, GnitzClient, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, ScanReply, Schema, Sent,
-    Target, ZSetBatch,
+    BatchAppender, ClientError, GnitzClient, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, ScanReply, Schema, Sent, ZSetBatch,
 };
 use gnitz_tokio::{AsyncClient, Connection};
+use gnitz_wire::Target;
+use gnitz_wire::multi_frame::DeltaCursor;
 use gnitz_wire::{
     ClientVerb, ColumnDef, ControlHeader, FRAME_LEN_PREFIX_BYTES, ReadBound, ReadSpec, TypeCode, WireConflictMode,
     WireFlags, WireLane, append_frame, frame_len_prefix, peek_control_block,

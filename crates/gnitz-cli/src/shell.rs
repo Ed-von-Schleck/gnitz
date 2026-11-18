@@ -77,7 +77,7 @@ fn dial(target: &str, interrupt: Option<&UnixStream>) -> Result<GnitzClient, Cli
         Some(cancel) => BlockingHost::cancelled_by(cancel.try_clone()?)?,
         None => BlockingHost::default(),
     };
-    GnitzClient::connect_on(target, Box::new(host))
+    block_on(GnitzClient::connect_with(target, Box::new(host)))
 }
 
 impl Shell {

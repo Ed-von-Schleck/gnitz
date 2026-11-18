@@ -8,12 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gnitz_expr::{LogicalProgram, RowFilter, leading_pk};
+use gnitz_wire::Target;
 use gnitz_wire::multi_frame::BLIND;
 use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
 
 use crate::client::GnitzClient;
 use crate::connection::PushFamily;
-use crate::connection::{RelDescriptor, Request, ScanReply, Target};
+use crate::connection::{RelDescriptor, Request, ScanReply};
 use crate::error::ClientError;
 use crate::{Schema, ZSetBatch};
 
@@ -275,11 +276,7 @@ impl TxnBuffer {
         if batch.is_empty() {
             return Ok(());
         }
-        // A batch in this very schema is in the layout the first family holds.
-        self.check_layout(tid, |held| match Arc::ptr_eq(&held.schema, schema) {
-            true => Ok(()),
-            false => batch.layout_matches(&held.schema),
-        })?;
+        self.check_layout(tid, schema)?;
         let last = self.tids.get(&tid).and_then(|t| t.fams.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
             Some(i) => {
@@ -306,17 +303,21 @@ impl TxnBuffer {
         Ok(())
     }
 
-    /// `matches` over `tid`'s first family; every later one shares its layout.
-    fn check_layout(
-        &self,
-        tid: u64,
-        matches: impl FnOnce(&PushFamily) -> Result<(), String>,
-    ) -> Result<(), ClientError> {
+    /// `schema` has the layout of `tid`'s first family, which every later one shares.
+    fn check_layout(&self, tid: u64, schema: &Schema) -> Result<(), ClientError> {
         let Some(t) = self.tids.get(&tid) else {
             return Ok(());
         };
-        matches(&self.families[t.fams[0]])
-            .map_err(|e| ClientError::from(format!("relation {tid} changed layout during this transaction: {e}")))
+        match self.families[t.fams[0]]
+            .schema
+            .layout()
+            .same_region_types(schema.layout())
+        {
+            true => Ok(()),
+            false => Err(ClientError::from(format!(
+                "relation {tid} changed layout during this transaction"
+            ))),
+        }
     }
 
     /// The keys of `set` this transaction has not written — what a read of
@@ -343,7 +344,7 @@ impl TxnBuffer {
         keys: bool,
         committed: ZSetBatch,
     ) -> Result<ZSetBatch, ClientError> {
-        self.check_layout(tid, |held| held.batch.layout_matches(schema))?;
+        self.check_layout(tid, schema)?;
         let families = &self.families;
         let Some(index) = self.tids.get_mut(&tid).map(|t| t.index(families)) else {
             return Ok(committed);

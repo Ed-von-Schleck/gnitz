@@ -136,7 +136,7 @@ fn parse<'a>(
             // A rename keeps the relation in its schema.
             let new = extract_object_name(target, source.schema(), "ALTER TABLE")?;
             if new.schema() != source.schema() {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "{CTX}: a cross-schema rename is not supported \
                      ('{new}' is not in schema '{}')",
                     source.schema()
@@ -241,14 +241,14 @@ fn parse<'a>(
                 }
                 Op::GenericOptions { .. } => "ALTER COLUMN OPTIONS is not supported (no foreign tables in gnitz)",
             };
-            Err(GnitzSqlError::Rejected(msg.to_string()))
+            Err(GnitzSqlError::rejected(msg.to_string()))
         }
         AlterTableOperation::AddConstraint { constraint, not_valid } => {
             const CTX: &str = "ALTER TABLE ADD CONSTRAINT";
             reject_if(*not_valid, CTX, "NOT VALID")?;
             let TableConstraint::Unique(u) = constraint else {
-                return Err(GnitzSqlError::Rejected(
-                    "ADD CONSTRAINT: only UNIQUE constraints are supported".to_string(),
+                return Err(GnitzSqlError::rejected(
+                    "ADD CONSTRAINT: only UNIQUE constraints are supported",
                 ));
             };
             // Same field rejections as an inline CREATE TABLE … UNIQUE.

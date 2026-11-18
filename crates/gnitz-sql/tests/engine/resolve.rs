@@ -317,7 +317,7 @@ fn an_interrupted_resolve_ends_the_statement() {
         host: BlockingHost::default(),
         armed: Arc::clone(&armed),
     };
-    let mut client = GnitzClient::connect_on(db.srv.sock_path(), Box::new(host)).unwrap();
+    let mut client = block_on(GnitzClient::connect_with(db.srv.sock_path(), Box::new(host))).unwrap();
     block_on(gnitz_sql::execute(&mut client, &db.sn, "SELECT * FROM t1")).unwrap();
 
     let before = client.requests_sent();
@@ -480,6 +480,6 @@ fn ddl_elsewhere_refuses_nothing() {
 
     b.exec("BEGIN; INSERT INTO t VALUES (3, 300)");
     a.exec("CREATE INDEX ix ON t(v)");
-    b.refuses("COMMIT", Refused(WireStatus::TxnConflict), "no longer resolves");
+    b.refuses("COMMIT", WireStatus::TxnConflict, "no longer resolves");
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 100, 1], [2, 200, 1]]);
 }

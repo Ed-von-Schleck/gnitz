@@ -156,18 +156,16 @@ fn reject_nullable_in(kind: JoinType, s: &SubqueryRef) -> Result<(), GnitzSqlErr
         return Ok(());
     }
     match kind {
-        JoinType::Anti => Err(GnitzSqlError::Rejected(
+        JoinType::Anti => Err(GnitzSqlError::rejected(
             "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
              NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
-             use NOT EXISTS with an explicit equality instead"
-                .into(),
+             use NOT EXISTS with an explicit equality instead",
         )),
-        JoinType::Mark(_) => Err(GnitzSqlError::Rejected(
+        JoinType::Mark(_) => Err(GnitzSqlError::rejected(
             "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
              the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
              from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \
-             NOT EXISTS with an explicit equality"
-                .into(),
+             NOT EXISTS with an explicit equality",
         )),
         _ => Ok(()),
     }

@@ -26,10 +26,9 @@ pub(super) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(&JoinCo
         JoinOperator::FullOuter(c) => (c, JoinType::Full),
         JoinOperator::CrossJoin(c) => (c, JoinType::Inner),
         _ => {
-            return Err(GnitzSqlError::Rejected(
+            return Err(GnitzSqlError::rejected(
                 "JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
-                 NATURAL, are supported"
-                    .into(),
+                 NATURAL, are supported",
             ));
         }
     })
@@ -55,7 +54,7 @@ pub(super) fn fold_join_step(
             let mut names = Vec::with_capacity(cols.len());
             for c in cols {
                 let name = crate::ast_util::single_part_ident(c)
-                    .ok_or_else(|| GnitzSqlError::Rejected("JOIN USING: column must be a simple identifier".into()))?;
+                    .ok_or_else(|| GnitzSqlError::rejected("JOIN USING: column must be a simple identifier"))?;
                 names.push(name.to_string());
             }
             crate::rules::reject_duplicate_names(names.iter().map(String::as_str), "JOIN USING")?;
@@ -89,7 +88,7 @@ pub(super) fn fold_join_step(
     };
 
     if kind == JoinType::Full && !pairs.is_empty() {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "FULL JOIN … {merge_clause} is not supported: the merged column would be \
              COALESCE(left, right), which the join scope cannot name — the merge \
              retargets the shared name to one side's column, and a column reference \
@@ -127,12 +126,12 @@ fn merge_pairs(
         // scope's own wording says so — reporting it as "not found" would send
         // the reader looking for a column that is right there, twice.
         let l = scope.find_unqualified(name)?.ok_or_else(|| {
-            GnitzSqlError::Rejected(format!(
+            GnitzSqlError::rejected(format!(
                 "JOIN {clause}: column '{name}' not found on the left of the join"
             ))
         })?;
         let idx = find_unique_column(rcols.iter().map(|c| &c.def), name)?.ok_or_else(|| {
-            GnitzSqlError::Rejected(format!(
+            GnitzSqlError::rejected(format!(
                 "JOIN {clause}: column '{name}' not found on the right of the join"
             ))
         })?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::assert_rejects;
 use gnitz_wire::TypeCode;
 
 /// A child adopts the referenced type: identity, or an integer domain that fits
@@ -32,14 +33,10 @@ fn an_fk_child_type_must_fit_the_parent_type() {
         (t(T::I64), d(0), false),
     ] {
         let r = check_fk_type_compat(child, parent);
-        assert!(
-            if ok {
-                r.is_ok()
-            } else {
-                matches!(&r, Err(GnitzSqlError::Rejected(m)) if m.contains("FK type mismatch"))
-            },
-            "{child} → {parent}: {r:?}"
-        );
+        match ok {
+            true => assert!(r.is_ok(), "{child} → {parent}: {r:?}"),
+            false => assert_rejects(&format!("{child} → {parent}"), r, "FK type mismatch"),
+        }
     }
 }
 
@@ -62,9 +59,9 @@ fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
     assert!(check(&[0, 1], &[1, 0]).is_err(), "wrong order");
     assert!(check(&[0, 1], &[]).is_err(), "empty");
     assert!(check(&[0, 1], &[0, 1, 2]).is_err(), "longer than PK");
-    let e = check(&[0, 1], &[3]).unwrap_err();
-    assert!(
-        matches!(&e, GnitzSqlError::Rejected(m) if m.contains("column 'd' is not a PRIMARY KEY column")),
-        "{e:?}"
+    assert_rejects(
+        "cluster by d",
+        check(&[0, 1], &[3]),
+        "column 'd' is not a PRIMARY KEY column",
     );
 }

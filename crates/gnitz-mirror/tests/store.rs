@@ -12,8 +12,9 @@
 
 use std::collections::BTreeMap;
 
-use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
+use gnitz_wire::multi_frame::DeltaCursor;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
 use gnitz_zset::schema::{SchemaDescriptor, encode_schema_record};
 use gnitz_zset_testkit::{make_batch, make_schema_u64_i64, make_schema_u128_i64};

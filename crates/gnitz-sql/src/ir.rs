@@ -561,7 +561,7 @@ pub(crate) fn range_step(from: ColType, to: ColType, never_negative: bool) -> Ra
 /// overflows `i64`.
 pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), crate::error::GnitzSqlError> {
     if scale > MAX_DECIMAL_SCALE {
-        return Err(crate::error::GnitzSqlError::Rejected(format!(
+        return Err(crate::error::GnitzSqlError::rejected(format!(
             "DECIMAL scale {scale} exceeds {MAX_DECIMAL_SCALE}; CAST an operand to a narrower scale"
         )));
     }

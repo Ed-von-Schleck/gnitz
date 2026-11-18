@@ -132,9 +132,7 @@ pub async fn plan_subscription(
             "a subscription",
             "a statement other than SELECT",
         )),
-        [] => Err(GnitzSqlError::Rejected(
-            "a subscription needs a SELECT over a view".into(),
-        )),
+        [] => Err(GnitzSqlError::rejected("a subscription needs a SELECT over a view")),
         _ => Err(error::unsupported_clause("a subscription", "more than one statement")),
     }
 }

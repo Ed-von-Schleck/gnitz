@@ -22,11 +22,12 @@ mod support;
 mod bench;
 
 use gnitz_core::block_on;
-use gnitz_core::{ClientError, GnitzClient, PollOutcome, PollResult, RelName, Schema, SubId, TableDef};
+use gnitz_core::{ClientError, GnitzClient, PollOutcome, PollResult, RelName, Schema, TableDef};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::WireStatus;
+use gnitz_wire::multi_frame::SubId;
 use gnitz_zset_testkit::{assert_child_ok, run_test_in_child};
 use std::time::Duration;
 use support::common::{block_copy, has_copy, has_manifest, manifest_inode, unblock_copy};
@@ -999,7 +1000,7 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
     assert!(from.is_some(), "a settled copy");
     let desc = block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
     let item = DeltaPollItem {
-        view: gnitz_core::Target::from(&*desc),
+        view: gnitz_wire::Target::from(&*desc),
         from,
         reply_layout: desc.schema.layout().layout_digest(),
         spec: &whole,
@@ -1115,7 +1116,7 @@ struct Reader {
     desc: std::sync::Arc<gnitz_core::RelDescriptor>,
     whole: Vec<u8>,
     copy: std::collections::BTreeMap<gnitz_zset_testkit::RowKey, i64>,
-    cursor: gnitz_core::DeltaCursor,
+    cursor: gnitz_wire::multi_frame::DeltaCursor,
 }
 
 impl Reader {
@@ -1138,7 +1139,7 @@ impl Reader {
     }
 
     /// Add one delta to the copy, weights and all; its row count.
-    fn apply(&mut self, (rows, cursor): (gnitz_core::ScanReply, gnitz_core::DeltaCursor)) -> usize {
+    fn apply(&mut self, (rows, cursor): (gnitz_core::ScanReply, gnitz_wire::multi_frame::DeltaCursor)) -> usize {
         let n = rows.batch.len();
         for (row, w) in canonical_rows(&(rows.schema, rows.batch)) {
             *self.copy.entry(row).or_insert(0) += w;
@@ -1317,7 +1318,7 @@ fn a_refused_subscription_is_its_error_alone() {
     churn(&mut fx.direct, 1, 40);
     let mut reader = Reader::bootstrap(&mut fx.direct);
     let held = reader.subscribe(&mut fx.direct);
-    let foreign = gnitz_core::DeltaCursor {
+    let foreign = gnitz_wire::multi_frame::DeltaCursor {
         tag: reader.cursor.tag ^ 1,
         ..reader.cursor
     };
@@ -2951,7 +2952,7 @@ mod cut_short {
             inner: BlockingHost::default(),
             s: s.clone(),
         };
-        let mut client = GnitzClient::connect_on(target, Box::new(host)).unwrap();
+        let mut client = block_on(GnitzClient::connect_with(target, Box::new(host))).unwrap();
         block_on(client.attach_mirror(opener(dir, MirrorConfig::default()))).unwrap();
         (client, s)
     }

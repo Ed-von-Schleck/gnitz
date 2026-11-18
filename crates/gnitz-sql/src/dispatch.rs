@@ -254,15 +254,15 @@ pub(crate) async fn execute_statement(
         | Statement::AlterView(_) => {
             // Refused, not failed: the transaction stays open.
             if client.txn_active() {
-                return Err(GnitzSqlError::Rejected(
-                    "this statement is not allowed inside a transaction".to_string(),
+                return Err(GnitzSqlError::rejected(
+                    "this statement is not allowed inside a transaction",
                 ));
             }
             Ok(SqlResult::Ddl {
                 tag: execute_ddl(client, schema_name, stmt, text).await?,
             })
         }
-        _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
+        _ => Err(GnitzSqlError::rejected(format!("unsupported SQL statement: {stmt}"))),
     }
 }
 

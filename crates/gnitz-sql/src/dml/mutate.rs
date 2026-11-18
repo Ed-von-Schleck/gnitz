@@ -102,7 +102,7 @@ fn plan_mutation(
     // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
     // update all of `a`.
     let FromShape::SinglePlainRelation(factor) = classify_from(from) else {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{verb}: exactly one simple FROM table required"
         )));
     };

@@ -30,9 +30,7 @@ mod txn;
 pub use batch::{BatchAppender, PayloadColumn, PkColumn, RowMark, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{GnitzClient, env_target};
-pub use connection::{
-    DeltaCursor, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply, SubId, Target, encode_ddl_txn,
-};
+pub use connection::{MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply, encode_ddl_txn};
 pub use ddl::{ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle, segment_id};
 pub use error::{ClientError, ProtocolError, not_found};
 pub use host::{

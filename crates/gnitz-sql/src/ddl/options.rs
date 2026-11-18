@@ -30,7 +30,7 @@ fn bool_option(key: &str, value: Option<&sqlparser::ast::Expr>) -> Result<bool, 
     match value.map(bind_constant) {
         None => Ok(false),
         Some(Ok(BExpr::LitBool(b))) => Ok(b),
-        Some(_) => Err(GnitzSqlError::Rejected(format!(
+        Some(_) => Err(GnitzSqlError::rejected(format!(
             "WITH ({key} = …) expects a boolean (true/false)"
         ))),
     }
@@ -48,7 +48,7 @@ fn kv_options<'a, const N: usize>(
         CreateTableOptions::With(opts) => {
             for opt in opts {
                 let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
-                    return Err(GnitzSqlError::Rejected(format!(
+                    return Err(GnitzSqlError::rejected(format!(
                         "unsupported {context} option `{opt}` in WITH (…), which takes `key = value` entries"
                     )));
                 };
@@ -58,13 +58,13 @@ fn kv_options<'a, const N: usize>(
                     .position(|k| name.is_some_and(|n| n.eq_ignore_ascii_case(k)))
                 else {
                     let listed: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
-                    return Err(GnitzSqlError::Rejected(format!(
+                    return Err(GnitzSqlError::rejected(format!(
                         "unknown {context} option '{key}'; the supported options are {}",
                         listed.join(", ")
                     )));
                 };
                 if slots[at].replace(value).is_some() {
-                    return Err(GnitzSqlError::Rejected(format!(
+                    return Err(GnitzSqlError::rejected(format!(
                         "{context} option `{}` is given more than once",
                         keys[at]
                     )));
@@ -77,7 +77,7 @@ fn kv_options<'a, const N: usize>(
         CreateTableOptions::Plain(_) => "space-separated options",
         CreateTableOptions::TableProperties(_) => "TBLPROPERTIES (…)",
     };
-    Err(GnitzSqlError::Rejected(format!(
+    Err(GnitzSqlError::rejected(format!(
         "{form} is not supported; options must be given as WITH (…)"
     )))
 }
@@ -130,7 +130,7 @@ pub(super) fn decode_view_options(options: &CreateTableOptions) -> Result<ViewPr
         capacity.map(|v| size_option("capacity", v)).transpose()?,
         delta.map(|v| size_option("delta", v)).transpose()?,
     )
-    .map_err(|e| GnitzSqlError::Rejected(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))?;
+    .map_err(|e| GnitzSqlError::rejected(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))?;
     Ok(ViewProps {
         budget,
         compress: bool_option("compress", compress)?,
@@ -168,7 +168,7 @@ fn size_text(bytes: u64) -> String {
 /// The byte count of one size-valued `CREATE VIEW` option.
 fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64, GnitzSqlError> {
     let Ok(BExpr::LitStr(text)) = bind_constant(value) else {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "CREATE VIEW option `{option}` takes a single-quoted size string, e.g. '256 MB'"
         )));
     };
@@ -181,7 +181,7 @@ fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64,
 /// budget one that retains nothing.
 fn parse_size(option: &str, text: &str) -> Result<NonZeroU64, GnitzSqlError> {
     let bad = || {
-        GnitzSqlError::Rejected(format!(
+        GnitzSqlError::rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is not a size like '256 MB' \
              (a positive integer followed by B, KB, MB or GB)"
         ))
@@ -197,7 +197,7 @@ fn parse_size(option: &str, text: &str) -> Result<NonZeroU64, GnitzSqlError> {
         .map(|&(_, m)| m)
         .ok_or_else(bad)?;
     num.checked_mul(mult).and_then(NonZeroU64::new).ok_or_else(|| {
-        GnitzSqlError::Rejected(format!(
+        GnitzSqlError::rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
         ))
     })

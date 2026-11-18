@@ -15,7 +15,7 @@ fn a_foreign_key_refuses_an_orphan_until_its_parent_lands() {
         "CREATE TABLE parent (id BIGINT PRIMARY KEY, name TEXT);
          CREATE TABLE child (cid INT PRIMARY KEY, p_id INT REFERENCES parent(id))",
     );
-    db.refuses("INSERT INTO child VALUES (1, 99)", Refused(IntegrityViolation), "");
+    db.refuses("INSERT INTO child VALUES (1, 99)", IntegrityViolation, "");
     db.exec("INSERT INTO parent VALUES (99, 'p'); INSERT INTO child VALUES (1, 99)");
     assert_eq!(db.rows("SELECT cid, p_id FROM child", &["cid", "p_id"]), [[1, 99, 1]]);
 }
@@ -136,11 +136,7 @@ fn relation_names_are_case_insensitive() {
     let mut db = Db::boot(1);
     db.exec("CREATE TABLE Foo (id BIGINT PRIMARY KEY); INSERT INTO FOO (id) VALUES (1)");
     assert_eq!(db.rows("SELECT id FROM foo", &["id"]), [[1, 1]]);
-    db.refuses(
-        "CREATE TABLE foo (id BIGINT PRIMARY KEY)",
-        Refused(Error),
-        "already exists",
-    );
+    db.refuses("CREATE TABLE foo (id BIGINT PRIMARY KEY)", Error, "already exists");
     db.exec("DROP TABLE fOO");
     assert!(!db.exists("foo"));
 }
@@ -159,7 +155,7 @@ fn an_absent_relation_is_one_not_found_everywhere() {
         ("DELETE FROM NoPe", "NoPe"),
         ("DROP TABLE NoPe", "NoPe"),
     ] {
-        db.refuses(sql, Refused(NotFound), &format!("'{name}' not found"));
+        db.refuses(sql, NotFound, &format!("'{name}' not found"));
     }
 }
 
@@ -197,15 +193,15 @@ fn create_index_naming_and_rejections() {
     );
     // An unnamed request is refused by whatever index already serves it,
     // whatever that index is named.
-    db.refuses(&format!("DROP INDEX {sn}__t__idx_a"), Refused(NotFound), "not found");
-    db.refuses("CREATE INDEX ON t(a)", Refused(Error), "already exists as 'my_idx'");
-    db.refuses("CREATE INDEX my_idx ON t(c)", Refused(Error), "already exists");
+    db.refuses(&format!("DROP INDEX {sn}__t__idx_a"), NotFound, "not found");
+    db.refuses("CREATE INDEX ON t(a)", Error, "already exists as 'my_idx'");
+    db.refuses("CREATE INDEX my_idx ON t(c)", Error, "already exists");
     // `(a, b_c)` and `(a_b, c)` render the same base; the second gets `_2`, and
     // is found under it when it is asked for again.
     db.exec("DROP INDEX my_idx; CREATE INDEX ON t(a, b_c); CREATE INDEX ON t(a_b, c)");
     db.refuses(
         "CREATE INDEX ON t(a_b, c)",
-        Refused(Error),
+        Error,
         &format!("already exists as '{sn}__t__idx_a_b_c_2'"),
     );
     db.exec(&format!(
@@ -219,12 +215,8 @@ fn create_index_naming_and_rejections() {
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
     db.exec("ALTER TABLE t ADD UNIQUE (c)");
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], true)]);
-    db.refuses(
-        "ALTER TABLE t ADD UNIQUE (c)",
-        Refused(Error),
-        &format!("'{sn}__t__idx_c_2'"),
-    );
-    db.refuses("CREATE INDEX ON t(c)", Refused(Error), &format!("'{sn}__t__idx_c'"));
+    db.refuses("ALTER TABLE t ADD UNIQUE (c)", Error, &format!("'{sn}__t__idx_c_2'"));
+    db.refuses("CREATE INDEX ON t(c)", Error, &format!("'{sn}__t__idx_c'"));
     db.exec(&format!("DROP INDEX {sn}__t__idx_c; DROP INDEX {sn}__t__idx_c_2"));
     assert!(db.indexes("t").is_empty());
 
@@ -235,7 +227,7 @@ fn create_index_naming_and_rejections() {
     );
     db.refuses(
         "CREATE INDEX ON r2(e)",
-        Refused(Error),
+        Error,
         &format!("already exists as '{sn}__r__idx_a'"),
     );
     db.exec("DROP TABLE r2");
@@ -267,17 +259,17 @@ fn create_index_naming_and_rejections() {
         ("CREATE INDEX ON st(v)", "is a stream"),
         ("CREATE INDEX ON _seg999999 (v)", "cannot start with '_'"),
     ] {
-        db.refuses(sql, Rejected, needle);
+        db.refuses(sql, Error, needle);
     }
     // BTREE is the one index method, so naming it is accepted.
     db.exec("CREATE INDEX ixb ON t USING BTREE (c)");
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
 }
 
-/// `IF NOT EXISTS` tests the index name alone: under a taken name the owner,
-/// its kind and the column list are never resolved.
+/// `IF NOT EXISTS` tests the index name alone: a taken name is skipped whatever
+/// the owner, its kind or the column list would have refused.
 #[test]
-fn create_index_if_not_exists_skips_a_taken_name_before_resolving() {
+fn create_index_if_not_exists_skips_a_taken_name_whatever_else_refuses() {
     let mut db = Db::boot(1);
     db.exec(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT);
@@ -292,7 +284,7 @@ fn create_index_if_not_exists_skips_a_taken_name_before_resolving() {
     );
     assert_eq!(db.indexes("t"), [(vec!["a".to_string()], false)]);
     // A free name is still resolved and refused.
-    db.refuses("CREATE INDEX IF NOT EXISTS ix_z ON t(nosuch)", Rejected, "nosuch");
+    db.refuses("CREATE INDEX IF NOT EXISTS ix_z ON t(nosuch)", Error, "nosuch");
 }
 
 /// A view whose store holds each of its keys once, in full, takes an index; one
@@ -311,7 +303,7 @@ fn create_index_owner_rules() {
          CREATE INDEX pv_v ON pv(v);
          CREATE INDEX ON fv(v)",
     );
-    db.refuses("CREATE INDEX ON bv(v)", Rejected, "without a capacity");
+    db.refuses("CREATE INDEX ON bv(v)", Error, "without a capacity");
     // A view that projects its source's key away is keyed on a hidden slot, and
     // an index entry names its row by that slot.
     db.exec("CREATE VIEW hv AS SELECT v, w FROM t; CREATE INDEX ON hv(w)");
@@ -322,7 +314,7 @@ fn create_index_owner_rules() {
         ("CREATE OR REPLACE VIEW pv AS SELECT id, w AS v FROM t", "owns an index"),
         ("ALTER VIEW pv AS SELECT id, w AS v FROM t", "owns an index"),
     ] {
-        db.refuses(sql, Refused(Error), needle);
+        db.refuses(sql, Error, needle);
     }
 
     db.exec(
@@ -350,7 +342,7 @@ fn alter_results_and_if_exists_no_ops() {
          CREATE VIEW vw AS SELECT id, v FROM t WHERE v >= 20;
          ALTER TABLE t RENAME TO t2",
     );
-    db.refuses("SELECT * FROM t", Refused(NotFound), "not found");
+    db.refuses("SELECT * FROM t", NotFound, "not found");
     assert_eq!(
         db.scan("t2", &["id", "v"]),
         at_weight_one(&[vec![1, 10], vec![2, 20], vec![3, 30]])
@@ -366,7 +358,7 @@ fn alter_results_and_if_exists_no_ops() {
     db.exec("ALTER TABLE t2 ADD CONSTRAINT uq UNIQUE (b)");
     db.refuses(
         "INSERT INTO t2 VALUES (4, 40, 4, 100)",
-        Refused(IntegrityViolation),
+        IntegrityViolation,
         "Unique index violation",
     );
     db.exec("ALTER TABLE t2 DROP CONSTRAINT uq; INSERT INTO t2 VALUES (4, 40, 4, 100)");
@@ -382,7 +374,7 @@ fn alter_results_and_if_exists_no_ops() {
         db.rows("SELECT id, w, a FROM t2 WHERE id >= 4", &["id", "w", "a"]),
         at_weight_one(&[vec![4, 40, 4], vec![5, 50, 5]])
     );
-    db.refuses("SELECT b FROM t2", Rejected, "not found");
+    db.refuses("SELECT b FROM t2", Error, "not found");
 
     db.exec("ALTER TABLE t2 ALTER COLUMN a DROP NOT NULL; INSERT INTO t2 VALUES (6, 60, NULL)");
     assert_eq!(
@@ -401,7 +393,7 @@ fn alter_results_and_if_exists_no_ops() {
 
     // A bounded view keeps its capacity across a rename, so it stays a leaf.
     db.exec("CREATE VIEW bv WITH (capacity = '1 MB') AS SELECT id, w FROM t2; ALTER TABLE bv RENAME TO bv2");
-    db.refuses("CREATE VIEW over AS SELECT id FROM bv2", Rejected, "capacity-bounded");
+    db.refuses("CREATE VIEW over AS SELECT id FROM bv2", Error, "capacity-bounded");
 
     db.exec(
         "ALTER TABLE IF EXISTS nope RENAME TO x;
@@ -429,110 +421,82 @@ fn alter_rejection_matrix() {
         // ADD COLUMN honours a bare nullable append; each refused clause would
         // need a value for the rows already there, a second catalog object, or a
         // physical move, and names what to write instead where there is one.
-        ("ALTER TABLE t ADD COLUMN x BIGINT NOT NULL", Rejected, "NOT NULL"),
-        ("ALTER TABLE t ADD COLUMN x SERIAL", Rejected, "SERIAL"),
-        ("ALTER TABLE t ADD COLUMN x BIGINT DEFAULT 0", Rejected, "DEFAULT"),
-        ("ALTER TABLE t ADD COLUMN x BIGINT PRIMARY KEY", Rejected, "PRIMARY KEY"),
-        (
-            "ALTER TABLE t ADD COLUMN x BIGINT UNIQUE",
-            Rejected,
-            "CREATE UNIQUE INDEX",
-        ),
+        ("ALTER TABLE t ADD COLUMN x BIGINT NOT NULL", Error, "NOT NULL"),
+        ("ALTER TABLE t ADD COLUMN x SERIAL", Error, "SERIAL"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT DEFAULT 0", Error, "DEFAULT"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT PRIMARY KEY", Error, "PRIMARY KEY"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT UNIQUE", Error, "CREATE UNIQUE INDEX"),
         (
             "ALTER TABLE t ADD COLUMN x BIGINT REFERENCES t (id)",
-            Rejected,
+            Error,
             "only at CREATE TABLE",
         ),
-        ("ALTER TABLE t ADD COLUMN x BIGINT CHECK (x > 0)", Rejected, "CHECK"),
-        ("ALTER TABLE t ADD COLUMN x BIGINT COLLATE utf8", Rejected, "COLLATE"),
-        ("ALTER TABLE t ADD COLUMN x BIGINT FIRST", Rejected, "FIRST/AFTER"),
-        ("ALTER TABLE t ADD COLUMN x BIGINT AFTER a", Rejected, "FIRST/AFTER"),
-        (
-            "ALTER TABLE t ADD COLUMN a BIGINT",
-            Refused(Error),
-            "duplicate column name",
-        ),
-        ("ALTER TABLE st ADD COLUMN x BIGINT", Rejected, "is a stream"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT CHECK (x > 0)", Error, "CHECK"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT COLLATE utf8", Error, "COLLATE"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT FIRST", Error, "FIRST/AFTER"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT AFTER a", Error, "FIRST/AFTER"),
+        ("ALTER TABLE t ADD COLUMN a BIGINT", Error, "duplicate column name"),
+        ("ALTER TABLE st ADD COLUMN x BIGINT", Error, "is a stream"),
         // The class and the clauses are checked before the IF NOT EXISTS no-op.
-        (
-            "ALTER TABLE st ADD COLUMN IF NOT EXISTS v BIGINT",
-            Rejected,
-            "is a stream",
-        ),
+        ("ALTER TABLE st ADD COLUMN IF NOT EXISTS v BIGINT", Error, "is a stream"),
         (
             "ALTER TABLE t ADD COLUMN IF NOT EXISTS a BIGINT NOT NULL",
-            Rejected,
+            Error,
             "NOT NULL",
         ),
-        ("ALTER TABLE st ADD CONSTRAINT su UNIQUE (v)", Rejected, "is a stream"),
-        ("ALTER TABLE t RENAME TO otherschema.t2", Rejected, "cross-schema"),
+        ("ALTER TABLE st ADD CONSTRAINT su UNIQUE (v)", Error, "is a stream"),
+        ("ALTER TABLE t RENAME TO otherschema.t2", Error, "cross-schema"),
         // The new name is checked before the IF EXISTS no-op.
         (
             "ALTER TABLE IF EXISTS nope RENAME TO _x",
-            Rejected,
+            Error,
             "cannot start with '_'",
         ),
-        (
-            "ALTER TABLE t RENAME COLUMN a TO b",
-            Refused(Error),
-            "duplicate column name",
-        ),
-        ("ALTER TABLE t RENAME COLUMN nope TO z", Rejected, "not found"),
-        ("ALTER TABLE vw RENAME COLUMN b TO w", Rejected, "base table"),
+        ("ALTER TABLE t RENAME COLUMN a TO b", Error, "duplicate column name"),
+        ("ALTER TABLE t RENAME COLUMN nope TO z", Error, "not found"),
+        ("ALTER TABLE vw RENAME COLUMN b TO w", Error, "base table"),
         (
             "ALTER TABLE t ADD CONSTRAINT cq UNIQUE (b) NOT VALID",
-            Rejected,
+            Error,
             "NOT VALID",
         ),
-        ("ALTER TABLE t ADD CONSTRAINT cq CHECK (b > 0)", Rejected, "UNIQUE"),
-        ("ALTER TABLE t DROP CONSTRAINT nope", Refused(NotFound), "not found"),
-        ("ALTER TABLE t DROP CONSTRAINT ix CASCADE", Rejected, "CASCADE"),
-        ("ALTER TABLE t DROP CONSTRAINT _x", Rejected, "reserved"),
+        ("ALTER TABLE t ADD CONSTRAINT cq CHECK (b > 0)", Error, "UNIQUE"),
+        ("ALTER TABLE t DROP CONSTRAINT nope", NotFound, "not found"),
+        ("ALTER TABLE t DROP CONSTRAINT ix CASCADE", Error, "CASCADE"),
+        ("ALTER TABLE t DROP CONSTRAINT _x", Error, "reserved"),
         // DROP CONSTRAINT drops a UNIQUE index of its own table only.
         (
             "ALTER TABLE t DROP CONSTRAINT ix",
-            Refused(NotFound),
+            NotFound,
             "constraint 'ix' not found",
         ),
-        ("ALTER TABLE t DROP CONSTRAINT uq", Refused(NotFound), "not found"),
+        ("ALTER TABLE t DROP CONSTRAINT uq", NotFound, "not found"),
         (
             "ALTER VIEW base AS SELECT id, c FROM t WHERE c > 0",
-            Refused(Error),
+            Error,
             "cannot replace '",
         ),
-        ("ALTER TABLE t ALTER COLUMN b SET NOT NULL", Rejected, "SET NOT NULL"),
-        (
-            "ALTER TABLE t ALTER COLUMN b SET DATA TYPE INT",
-            Rejected,
-            "SET DATA TYPE",
-        ),
+        ("ALTER TABLE t ALTER COLUMN b SET NOT NULL", Error, "SET NOT NULL"),
+        ("ALTER TABLE t ALTER COLUMN b SET DATA TYPE INT", Error, "SET DATA TYPE"),
         (
             "ALTER TABLE t ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY",
-            Rejected,
+            Error,
             "GENERATED",
         ),
         (
             "ALTER TABLE t RENAME COLUMN a TO a2, RENAME COLUMN b TO b2",
-            Rejected,
+            Error,
             "more than one operation",
         ),
-        ("ALTER TABLE ONLY t RENAME TO t2", Rejected, "ONLY"),
-        ("ALTER TABLE t DROP COLUMN id", Refused(Error), "primary-key"),
-        ("ALTER TABLE t DROP COLUMN b CASCADE", Rejected, "CASCADE"),
-        ("ALTER TABLE t DROP COLUMN c", Refused(Error), "secondary index"),
-        (
-            "ALTER TABLE t ALTER COLUMN id DROP NOT NULL",
-            Refused(Error),
-            "primary-key",
-        ),
+        ("ALTER TABLE ONLY t RENAME TO t2", Error, "ONLY"),
+        ("ALTER TABLE t DROP COLUMN id", Error, "primary-key"),
+        ("ALTER TABLE t DROP COLUMN b CASCADE", Error, "CASCADE"),
+        ("ALTER TABLE t DROP COLUMN c", Error, "secondary index"),
+        ("ALTER TABLE t ALTER COLUMN id DROP NOT NULL", Error, "primary-key"),
         // A dependent view blocks a column drop and a nullability change of any
         // column: its traces hold rows under the old comparator.
-        ("ALTER TABLE t DROP COLUMN b", Refused(Error), "dependent view"),
-        (
-            "ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
-            Refused(Error),
-            "dependent view",
-        ),
+        ("ALTER TABLE t DROP COLUMN b", Error, "dependent view"),
+        ("ALTER TABLE t ALTER COLUMN a DROP NOT NULL", Error, "dependent view"),
     ] {
         db.refuses(sql, want, needle);
     }
@@ -556,7 +520,7 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     );
 
     // `b` is read by a view, so its drop refuses — and `a` survives with it.
-    db.refuses("DROP TABLE a, b", Refused(Error), ".keeper) — drop them first");
+    db.refuses("DROP TABLE a, b", Error, ".keeper) — drop them first");
     assert!(db.exists("a"), "a is untouched");
 
     // A name written twice retires once.
@@ -582,7 +546,7 @@ fn if_exists_skips_a_drop_in_a_missing_schema() {
     assert!(!db.exists("t"), "the batch's other name still drops");
     db.exec("DROP VIEW IF EXISTS nosuchschema.v");
     for sql in ["DROP TABLE nosuchschema.t", "DROP VIEW nosuchschema.v"] {
-        db.refuses(sql, Refused(NotFound), "schema 'nosuchschema' not found");
+        db.refuses(sql, NotFound, "schema 'nosuchschema' not found");
     }
 }
 
@@ -638,9 +602,10 @@ fn a_qualified_name_reaches_another_schema() {
          INSERT INTO child VALUES (1, 2);
          CREATE INDEX ON {other}.t (v)"
     ));
-    db.refuses("INSERT INTO child VALUES (2, 9)", Refused(IntegrityViolation), "");
-    let indexes = block_on(db.client.index_rows()).unwrap();
-    assert!(indexes.iter().any(|r| r.name == format!("{other}__t__idx_v")));
+    db.refuses("INSERT INTO child VALUES (2, 9)", IntegrityViolation, "");
+    let catalog = block_on(db.client.catalog()).unwrap();
+    let indexes = catalog.relations.iter().flat_map(|r| &r.indexes);
+    assert!(indexes.into_iter().any(|r| r.name == format!("{other}__t__idx_v")));
 
     // A rename keeps the relation where it is.
     db.exec(&format!("ALTER TABLE {other}.doubled RENAME TO twice"));
@@ -650,117 +615,101 @@ fn a_qualified_name_reaches_another_schema() {
     );
     db.refuses(
         &format!("ALTER TABLE {other}.twice RENAME TO {sn}.twice"),
-        Rejected,
+        Error,
         "cross-schema",
     );
 
     for (sql, want, needle) in [
-        (
-            "SELECT id FROM nosuch.t",
-            Refused(NotFound),
-            "schema 'nosuch' not found",
-        ),
-        (&*format!("SELECT id FROM {other}.nope"), Refused(NotFound), "not found"),
-        (
-            "INSERT INTO nosuch.t VALUES (2, 20)",
-            Refused(NotFound),
-            "schema 'nosuch'",
-        ),
-        ("SELECT id FROM db.s.t", Rejected, "too many name parts"),
-        ("SELECT id FROM _other.t", Rejected, "cannot start with '_'"),
+        ("SELECT id FROM nosuch.t", NotFound, "schema 'nosuch' not found"),
+        (&*format!("SELECT id FROM {other}.nope"), NotFound, "not found"),
+        ("INSERT INTO nosuch.t VALUES (2, 20)", NotFound, "schema 'nosuch'"),
+        ("SELECT id FROM db.s.t", Error, "too many name parts"),
+        ("SELECT id FROM _other.t", Error, "cannot start with '_'"),
         // `_system` is spelled, and holds the families alone.
-        ("SELECT id FROM _system.t", Refused(NotFound), "not found"),
-        ("SELECT name FROM _system._tables", Rejected, "cannot start with '_'"),
+        ("SELECT id FROM _system.t", NotFound, "not found"),
+        ("SELECT name FROM _system._tables", Error, "cannot start with '_'"),
         (
             "CREATE TABLE _system.mine (id BIGINT PRIMARY KEY)",
-            Refused(Error),
+            Error,
             "the system schema takes no relation",
         ),
         (
             "CREATE VIEW _system.mine AS SELECT table_id, name FROM _system.tables",
-            Refused(Error),
+            Error,
             "the system schema takes no relation",
         ),
         // `sequences` holds positions rather than a set, and no worker holds it.
         (
             "CREATE VIEW sv AS SELECT * FROM _system.sequences",
-            Refused(Error),
+            Error,
             "holds no set a view can scan",
         ),
-        (
-            "DROP TABLE _system.tables",
-            Refused(Error),
-            "cannot DROP a system table",
-        ),
+        ("DROP TABLE _system.tables", Error, "cannot DROP a system table"),
         (
             "ALTER TABLE _system.tables RENAME TO relations",
-            Refused(Error),
+            Error,
             "cannot ALTER a system table",
         ),
         // A family is no base table to the statements that need one, refused
         // before any row is read.
         (
             "ALTER TABLE _system.tables ADD COLUMN extra BIGINT",
-            Rejected,
+            Error,
             "is a system table",
         ),
         (
             "ALTER TABLE _system.tables DROP COLUMN stream",
-            Rejected,
+            Error,
             "is a system table",
         ),
         (
             "ALTER TABLE _system.tables RENAME COLUMN name TO label",
-            Rejected,
+            Error,
             "is a system table",
         ),
-        (
-            "CREATE INDEX ON _system.tables (schema_id)",
-            Rejected,
-            "is a system table",
-        ),
+        ("CREATE INDEX ON _system.tables (schema_id)", Error, "is a system table"),
         (
             "CREATE INDEX sysix ON _system.tables (schema_id)",
-            Rejected,
+            Error,
             "is a system table",
         ),
         (
             "CREATE UNIQUE INDEX sysux ON _system.tables (name)",
-            Rejected,
+            Error,
             "is a system table",
         ),
         (
             "CREATE TABLE fk_sys (id BIGINT PRIMARY KEY, \
              t BIGINT UNSIGNED NOT NULL REFERENCES _system.tables(table_id))",
-            Refused(Error),
+            Error,
             "which is a system table; a FOREIGN KEY must reference a base table",
         ),
         (
             "INSERT INTO _system.schemas VALUES (99, 'forged')",
-            Rejected,
+            Error,
             "is a system table",
         ),
         (
             "UPDATE _system.tables SET name = 'x' WHERE table_id = 2",
-            Rejected,
+            Error,
             "is a system table",
         ),
         (
             "DELETE FROM _system.tables WHERE table_id = 2",
-            Rejected,
+            Error,
             "is a system table",
         ),
         // An index name is global, so a qualifier on one scopes nothing.
-        ("CREATE INDEX other.ix ON t (v)", Rejected, "no qualifier"),
-        ("DROP INDEX other.ix", Rejected, "no qualifier"),
-        (&*format!("DROP INDEX {sn}.ix"), Rejected, "no qualifier"),
+        ("CREATE INDEX other.ix ON t (v)", Error, "no qualifier"),
+        ("DROP INDEX other.ix", Error, "no qualifier"),
+        (&*format!("DROP INDEX {sn}.ix"), Error, "no qualifier"),
     ] {
         db.refuses(sql, want, needle);
     }
 
     // One statement retires relations of both schemas, or none of them: the
     // parent still has its FK child.
-    db.refuses(&format!("DROP TABLE t, {other}.t"), Refused(Error), "");
+    db.refuses(&format!("DROP TABLE t, {other}.t"), Error, "");
     assert_eq!(db.scan("t", &id_v), mine);
     db.exec(&format!(
         "DROP VIEW j, c, {other}.twice;

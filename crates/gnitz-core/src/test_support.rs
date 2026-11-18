@@ -21,8 +21,9 @@ use crate::connection::Session;
 use crate::transport::poll_fd;
 use crate::{
     BatchAppender, BlockingHost, ClientError, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema,
-    Sent, SubId, ZSetBatch,
+    Sent, ZSetBatch,
 };
+use gnitz_wire::multi_frame::SubId;
 
 /// `schema.name`.
 pub(crate) fn rel(schema: &str, name: &str) -> RelName {

@@ -47,7 +47,7 @@ impl Lowering<'_> {
             BoundExpr::LitWide(lit) => match lit.to_u64() {
                 Some(v) => self.eb.emit(L::LoadConst { val: v as i64, unsigned: true }),
                 None => {
-                    return Err(GnitzSqlError::Rejected(format!(
+                    return Err(GnitzSqlError::rejected(format!(
                         "integer literal {lit} does not fit a 64-bit register; it is usable only in a comparison \
                          or IN list against an integer column, an INSERT value or an UPDATE SET value"
                     )));
@@ -93,14 +93,14 @@ impl Lowering<'_> {
         // Both rejections exist for their wording: the engine refuses these
         // columns too, but names them by position only.
         if c.ty.tc.is_wide_int() {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "column {:?} is {}; 128-bit columns cannot be used in expressions",
                 c.name, c.ty,
             )));
         }
         Ok(match c.ty.tc {
             TypeCode::Blob => {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "column {:?} is {}; blob columns support only =, <>, <, <=, >, >= \
                      against another blob/string column or a string literal",
                     c.name, c.ty,
@@ -133,7 +133,7 @@ impl Lowering<'_> {
         let r = self.lower(expr)?;
         let ty = self.ty(expr);
         if ty != BOOL && !matches!(expr, BoundExpr::LitNull) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "{} is {ty}; a condition must be BOOLEAN — compare it, or CAST it AS BOOLEAN",
                 self.describe(expr)
             )));
@@ -142,7 +142,7 @@ impl Lowering<'_> {
     }
 
     fn not_scalar(&self, e: &BoundExpr) -> GnitzSqlError {
-        GnitzSqlError::Rejected(format!(
+        GnitzSqlError::rejected(format!(
             "{} is a string; strings support comparison, LIKE/ILIKE, CONCAT/||, \
              CASE/COALESCE/NULLIF, the string functions and CAST — not this",
             self.describe(e)
@@ -173,7 +173,7 @@ impl Lowering<'_> {
             (BoundExpr::LitNull, RegClass::Str) => return Ok(self.eb.emit(L::LoadNullStr)),
             (BoundExpr::LitNull, _) => return Ok(self.eb.emit(L::LoadNull)),
             (_, RegClass::Dec(_)) if matches!(e, BoundExpr::LitStr(_)) || e.decimal_literal().is_some() => {
-                let val = FixedInt::I64.unpack(assign(e, to).map_err(GnitzSqlError::Rejected)?);
+                let val = FixedInt::I64.unpack(assign(e, to).map_err(GnitzSqlError::rejected)?);
                 return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
             }
             // A computed float is whatever binary64 makes of the literal, an
@@ -204,13 +204,13 @@ impl Lowering<'_> {
             // A BOOLEAN is combined with nothing but a BOOLEAN, and no node
             // combines a fraction at an integer type; only CAST narrows one.
             (RegClass::Bool, _) | (_, RegClass::Bool) | (RegClass::Float | RegClass::Dec(_), RegClass::Int) => {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "{} is {from}; CAST it to use it as {to}",
                     self.describe(e)
                 )));
             }
             (RegClass::Str, _) => return Err(self.not_scalar(e)),
-            (_, RegClass::Str) => return Err(GnitzSqlError::Rejected("expected a string value here".to_string())),
+            (_, RegClass::Str) => return Err(GnitzSqlError::rejected("expected a string value here")),
             (RegClass::Int | RegClass::Dec(0), RegClass::Float) => self.eb.emit(L::IntToFloat { a: r }),
             // Divided back by its scale, which is exact for every power of ten
             // an `i64` scale names.
@@ -238,7 +238,7 @@ impl Lowering<'_> {
     fn lower_blended(&mut self, e: &BoundExpr, blend: ColType) -> Result<Reg, GnitzSqlError> {
         let src = self.ty(e).tc;
         if src.is_temporal() && src != blend.tc && blend.tc != TypeCode::Timestamp {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "cannot mix {src} with {blend} in one CASE/COALESCE/GREATEST/LEAST"
             )));
         }
@@ -331,7 +331,7 @@ impl Lowering<'_> {
         match RegClass::of(arg_ty) {
             RegClass::Str => return Err(self.not_scalar(arg)),
             RegClass::Bool => {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "{} is BOOLEAN; a numeric function takes a number",
                     self.describe(arg)
                 )));
@@ -392,7 +392,7 @@ impl Lowering<'_> {
             TypeCode::Timestamp => true,
             TypeCode::Date => false,
             t => {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "a calendar function takes a DATE or TIMESTAMP; {} is {t}",
                     self.describe(arg)
                 )));
@@ -411,7 +411,7 @@ impl Lowering<'_> {
                 // an error rather than a silent truncation.
                 StrArg::Int | StrArg::IntOpt => {
                     if RegClass::of(self.ty(a)) != RegClass::Int {
-                        return Err(GnitzSqlError::Rejected(format!(
+                        return Err(GnitzSqlError::rejected(format!(
                             "{}: argument {} must be an integer expression",
                             f.sql_name(),
                             k + 1
@@ -479,7 +479,7 @@ impl Lowering<'_> {
         let from = self.ty(expr);
         let from_class = RegClass::of(from);
         if from_class == RegClass::Str && (to.tc.is_temporal() || to == BOOL) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "CAST of a string to {to} is supported for a literal only"
             )));
         }
@@ -492,7 +492,7 @@ impl Lowering<'_> {
             (_, RegClass::Bool) if plain_int(from) => return self.binop(expr, BinOp::Ne, &BoundExpr::LitInt(0)),
             (RegClass::Bool, _) if plain_int(to) => {}
             (RegClass::Bool, _) | (_, RegClass::Bool) => {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "CAST of {from} to {to} is not supported"
                 )));
             }
@@ -522,7 +522,7 @@ impl Lowering<'_> {
         // Any other integer into a temporal type is already its storage value,
         // which the range check below admits.
         let Some(fi) = FixedInt::from_type_code(to.tc) else {
-            return Err(GnitzSqlError::Rejected(format!("CAST to {to} is not supported")));
+            return Err(GnitzSqlError::rejected(format!("CAST to {to} is not supported")));
         };
         Ok(match from_class {
             RegClass::Str => self.eb.emit(L::StrToInt { a, fi }),
@@ -632,7 +632,7 @@ impl Lowering<'_> {
         let Some(p) = place(lit, ty) else {
             // A string `place` cannot read spells no value of the type.
             return match lit {
-                BExpr::LitStr(s) => Err(GnitzSqlError::Rejected(invalid_literal(ty, s))),
+                BExpr::LitStr(s) => Err(GnitzSqlError::rejected(invalid_literal(ty, s))),
                 _ => Ok(None),
             };
         };
@@ -711,7 +711,7 @@ impl Lowering<'_> {
             return Ok(reg);
         }
         let (lt, rt) = operand_ty_pair(left, right, self.cols);
-        let t = bin_types(op, lt, rt).map_err(GnitzSqlError::Rejected)?;
+        let t = bin_types(op, lt, rt).map_err(GnitzSqlError::rejected)?;
         if t.out.is_decimal() {
             check_decimal_scale(t.out.scale)?;
         }

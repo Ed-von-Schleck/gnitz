@@ -191,26 +191,32 @@ fn region_append_bench() {
     }
 }
 
-/// Instructions to decode a one-row reply into a fresh batch and into one that
-/// already owns its buffers, by column count.
+/// Instructions to decode a reply ([`decode_wal_blocks`] plus the batch's drop),
+/// against the allocation it does alone ([`ZSetBatch::with_capacity`] plus drop)
+/// and the copy into a batch that already owns its buffers, by column and row count.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reply_alloc_cost_bench() {
     const ROUNDS: u64 = 2000;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    for ncols in [4usize, 16, 64] {
+    for (ncols, rows) in [(4usize, 1usize), (16, 1), (64, 1), (4, 1000), (16, 1000)] {
         let schema = wide_schema(ncols, false);
-        let block = encode_wal_block(&wide_rows(&schema, 1, 0));
-        let (mut fresh, mut warm) = (0, 0);
+        let block = encode_wal_block(&wide_rows(&schema, rows, 0));
+        let (mut whole, mut alloc, mut warm) = (0, 0, 0);
         for _ in 0..ROUNDS {
-            fresh += counter
+            whole += counter
                 .measure(|| {
-                    let mut sink = ZSetBatch::new(&schema);
-                    decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
-                    black_box(&sink);
+                    let b = decode_wal_blocks(std::iter::once(black_box(&block[..])), &schema).unwrap();
+                    black_box(&b);
                 })
                 .1;
-            let mut sink = ZSetBatch::with_capacity(&schema, 4);
+            alloc += counter
+                .measure(|| {
+                    let b = ZSetBatch::with_capacity(black_box(&schema), black_box(rows));
+                    black_box(&b);
+                })
+                .1;
+            let mut sink = ZSetBatch::with_capacity(&schema, rows);
             warm += counter
                 .measure(|| {
                     decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
@@ -219,8 +225,9 @@ fn reply_alloc_cost_bench() {
                 .1;
         }
         println!(
-            "reply_alloc_cost_bench {ncols} cols: new + decode + drop {} instr, decode into owned buffers {}",
-            fresh / ROUNDS,
+            "reply_alloc_cost_bench {ncols:>2} cols {rows:>4} rows: decode + drop {:>6} instr, alloc + drop {:>6}, decode into owned buffers {:>6}",
+            whole / ROUNDS,
+            alloc / ROUNDS,
             warm / ROUNDS
         );
     }

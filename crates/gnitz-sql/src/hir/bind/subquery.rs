@@ -84,8 +84,8 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
     let inner_select = as_plain_select(reject_query_envelope_body(subquery, ctx)?, ctx)?;
     reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, ctx)?;
     let FromShape::SinglePlainRelation(factor) = classify_from(&inner_select.from) else {
-        return Err(GnitzSqlError::Rejected(
-            "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
+        return Err(GnitzSqlError::rejected(
+            "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views",
         ));
     };
     let tref = extract_table_ref(factor, cx.cx.cat.schema_name(), "subquery")?;
@@ -101,8 +101,8 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
         let leaf = ScopeLeaf {
             scope: &scope,
             sub: SubPolicy::Reject(|_| {
-                GnitzSqlError::Rejected(
-                    "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views".into(),
+                GnitzSqlError::rejected(
+                    "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views",
                 )
             }),
         };
@@ -110,10 +110,9 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
             match side(&bound, &inner_cols, &cx.outer.combined) {
                 Side::One(0) | Side::Neither => local_preds.push(bound),
                 Side::One(_) => {
-                    return Err(GnitzSqlError::Rejected(
+                    return Err(GnitzSqlError::rejected(
                         "a subquery WHERE conjunct references only the outer relation; \
-                         hoist it into the view's own WHERE clause"
-                            .into(),
+                         hoist it into the view's own WHERE clause",
                     ));
                 }
                 Side::Both => correlation.push(bound),
@@ -133,7 +132,7 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
 fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr, GnitzSqlError> {
     match select.projection.as_slice() {
         [SelectItem::UnnamedExpr(e)] | [SelectItem::ExprWithAlias { expr: e, .. }] => Ok(e),
-        _ => Err(GnitzSqlError::Rejected(err.into())),
+        _ => Err(GnitzSqlError::rejected(err)),
     }
 }
 
@@ -178,15 +177,15 @@ fn bind_exists_sub(
     if in_operand.is_none() && body_is_grouped(ir.inner_select) {
         // An ungrouped aggregate yields one row over any input, so the subquery
         // always has a row; a semi-join would test for a match.
-        return Err(GnitzSqlError::Rejected(
-            "EXISTS (SELECT <aggregate> …) is always true: an aggregate subquery returns one row".into(),
+        return Err(GnitzSqlError::rejected(
+            "EXISTS (SELECT <aggregate> …) is always true: an aggregate subquery returns one row",
         ));
     }
     if let Some(operand) = in_operand {
         // IN shape: reject a tuple / non-plain-column LHS before extracting the pair.
         if matches!(operand, Expr::Tuple(_)) {
-            return Err(GnitzSqlError::Rejected(
-                "IN (SELECT …): tuple operands are not supported".into(),
+            return Err(GnitzSqlError::rejected(
+                "IN (SELECT …): tuple operands are not supported",
             ));
         }
         let outer = bind_plain_col(
@@ -238,28 +237,28 @@ fn bind_quantifier_sub(
     is_any: bool,
 ) -> Result<HirExpr, GnitzSqlError> {
     let Expr::Subquery(q) = right else {
-        return Err(GnitzSqlError::Rejected(
-            "an ANY/ALL operator's right operand must be a subquery".into(),
+        return Err(GnitzSqlError::rejected(
+            "an ANY/ALL operator's right operand must be a subquery",
         ));
     };
     let bop = match (is_any, compare_op) {
         (true, BinaryOperator::Eq) => return bind_exists_sub(cx, q, Some(left), false),
         (false, BinaryOperator::NotEq) => return bind_exists_sub(cx, q, Some(left), true),
         (true, BinaryOperator::NotEq) => {
-            return Err(GnitzSqlError::Rejected(
-                "`<> ANY (SELECT …)` is not supported (use NOT (x = ALL …) semantics via a wrapping view)".into(),
+            return Err(GnitzSqlError::rejected(
+                "`<> ANY (SELECT …)` is not supported (use NOT (x = ALL …) semantics via a wrapping view)",
             ));
         }
         (false, BinaryOperator::Eq) => {
-            return Err(GnitzSqlError::Rejected("`= ALL (SELECT …)` is not supported".into()));
+            return Err(GnitzSqlError::rejected("`= ALL (SELECT …)` is not supported"));
         }
         (_, BinaryOperator::Lt) => BinOp::Lt,
         (_, BinaryOperator::LtEq) => BinOp::Le,
         (_, BinaryOperator::Gt) => BinOp::Gt,
         (_, BinaryOperator::GtEq) => BinOp::Ge,
         _ => {
-            return Err(GnitzSqlError::Rejected(
-                "only range (<, <=, >, >=), `= ANY`, and `<> ALL` quantified comparisons are supported".into(),
+            return Err(GnitzSqlError::rejected(
+                "only range (<, <=, >, >=), `= ANY`, and `<> ALL` quantified comparisons are supported",
             ));
         }
     };
@@ -275,10 +274,9 @@ fn bind_quantifier_sub(
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
     let inner_col = bind_plain_col(proj_expr, &ir.inner, err)?;
     if hircol_of(&ir.inner.combined, inner_col).def.is_nullable {
-        return Err(GnitzSqlError::Rejected(
+        return Err(GnitzSqlError::rejected(
             "a range ANY/ALL subquery's column must be NOT NULL — a NULL in the set makes ANY/ALL \
-             three-valued in a way the MIN/MAX rewrite cannot reproduce"
-                .into(),
+             three-valued in a way the MIN/MAX rewrite cannot reproduce",
         ));
     }
     let m = cx.record(scalar_leaf(cx, ir, agg_func, Some(inner_col))?);
@@ -297,16 +295,16 @@ fn bind_quantifier_sub(
 fn bind_plain_col(e: &Expr, scope: &JoinScope, err: &str) -> Result<ColId, GnitzSqlError> {
     col_ref_parts(e)
         .and_then(|(qual, name)| scope.resolve(qual, name).ok())
-        .ok_or_else(|| GnitzSqlError::Rejected(err.into()))
+        .ok_or_else(|| GnitzSqlError::rejected(err))
 }
 
 /// Classify a scalar subquery's single-aggregate projection into `(func, arg)`.
 fn classify_scalar_agg(e: &Expr, inner: &JoinScope, non_agg: &str) -> Result<(AggFunc, Option<ColId>), GnitzSqlError> {
     let Expr::Function(f) = peel_nested(e) else {
-        return Err(GnitzSqlError::Rejected(non_agg.into()));
+        return Err(GnitzSqlError::rejected(non_agg));
     };
     if !is_agg_call(f) {
-        return Err(GnitzSqlError::Rejected(non_agg.into()));
+        return Err(GnitzSqlError::rejected(non_agg));
     }
     let (func, arg_expr) = classify_agg_call(f)?;
     let arg = match arg_expr.reject_distinct("a scalar subquery aggregate")? {
@@ -329,17 +327,15 @@ fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]
         match cross_comparison(conj, outer, inner) {
             Some((_, inner, BinOp::Eq)) => cols.push(inner.id),
             Some((_, _, op)) if op.as_range_rel().is_some() => {
-                return Err(GnitzSqlError::Rejected(
+                return Err(GnitzSqlError::rejected(
                     "a scalar/quantifier subquery cannot use a range correlation (only equality \
-                     `inner_col = outer_col` conjuncts are supported)"
-                        .into(),
+                     `inner_col = outer_col` conjuncts are supported)",
                 ));
             }
             _ => {
-                return Err(GnitzSqlError::Rejected(
+                return Err(GnitzSqlError::rejected(
                     "a scalar/quantifier subquery's correlation contains a conjunct that is not an \
-                     `inner_col = outer_col` equality; filter inside the subquery or a wrapping view"
-                        .into(),
+                     `inner_col = outer_col` equality; filter inside the subquery or a wrapping view",
                 ));
             }
         }

@@ -56,7 +56,7 @@ fn reject_unhonored_create_view_clauses(cv: &CreateView) -> Result<(), GnitzSqlE
     }
     // `sqlparser` parses the pair; no dialect defines it.
     if *or_replace && *if_not_exists {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{CTX}: OR REPLACE and IF NOT EXISTS ask for opposite outcomes — replace what \
              is there, or leave what is there alone. Write one of them."
         )));
@@ -117,7 +117,7 @@ pub(crate) fn plan_alter_view(
         operation,
     } = av;
     let AlterViewOperation::As { columns, query, with_options } = operation else {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{CTX}: only `AS <query>` is supported"
         )));
     };
@@ -154,7 +154,7 @@ fn plan_segments<'a>(
     let LoweredView { segments, view, refs, body_columns } = crate::hir::bind_and_lower(cat, query, view, aliases)?;
     // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && !segments.is_empty() {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{stmt}: a capacity-bounded view's body that compiles to more than one view is not supported"
         )));
     }
@@ -177,7 +177,7 @@ fn record_definition(
     refs: Vec<BoundRef>,
     body_columns: Vec<String>,
 ) -> Result<ViewDefinition, GnitzSqlError> {
-    let unrecorded = |why: &str| GnitzSqlError::Rejected(format!("cannot record the view's definition: {why}"));
+    let unrecorded = |why: &str| GnitzSqlError::rejected(format!("cannot record the view's definition: {why}"));
     let body = text
         .body_after_as()
         .ok_or_else(|| unrecorded("no AS ahead of the body"))?;

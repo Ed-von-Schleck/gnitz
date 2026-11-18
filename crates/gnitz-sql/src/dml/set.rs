@@ -70,15 +70,15 @@ pub(super) fn bind_set_list(
             AssignmentTarget::ColumnName(name) => single_part_ident(name),
             _ => None,
         }
-        .ok_or_else(|| GnitzSqlError::Rejected(format!("{clause_name}: column must be a simple identifier")))?;
+        .ok_or_else(|| GnitzSqlError::rejected(format!("{clause_name}: column must be a simple identifier")))?;
         let ci = require_column(schema.columns(), name).map_err(|e| e.in_clause(clause_name))?;
         if schema.layout().is_pk_col(ci) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "cannot assign to primary key column in {clause_name}"
             )));
         }
         if set.iter().any(|s| s.ci == ci) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "multiple assignments to column '{name}' in {clause_name}"
             )));
         }
@@ -108,10 +108,9 @@ fn bind_set_rhs(
         // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
         // relation in scope); this says why, which its message cannot.
         if expr_any(expr, &|e| excluded_col(e).is_some()) {
-            return Err(GnitzSqlError::Rejected(
+            return Err(GnitzSqlError::rejected(
                 "EXCLUDED column references inside compound expressions are not \
-                 supported; use a simple `col = EXCLUDED.col` assignment"
-                    .to_string(),
+                 supported; use a simple `col = EXCLUDED.col` assignment",
             ));
         }
     }
@@ -153,8 +152,8 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
     // downstream can tell its bit pattern from an integer's.
     let (from, to) = (RegClass::of(src), RegClass::of(ty));
     if from == RegClass::Float && !ty.is_decimal() {
-        return Err(GnitzSqlError::Rejected(
-            "SET from a floating-point expression is not supported".to_string(),
+        return Err(GnitzSqlError::rejected(
+            "SET from a floating-point expression is not supported",
         ));
     }
     // A string and a BOOLEAN are assigned only to a column of their own class,
@@ -164,7 +163,7 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
         _ => FixedInt::from_type_code(ty.tc).is_some(),
     };
     if !admits {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "cannot assign a value of type {src} to column '{}' ({ty})",
             col.name
         )));
@@ -247,7 +246,7 @@ pub(super) fn apply_set(
                     null_word_set(w, pi, false);
                 }
                 ev.write_slot(scoped(*scope), &mut new, pi, def.ty.tc).map_err(|v| {
-                    GnitzSqlError::Rejected(format!("column '{}': {} value out of range: {v}", def.name, def.ty))
+                    GnitzSqlError::rejected(format!("column '{}': {} value out of range: {v}", def.name, def.ty))
                 })?;
             }
         }

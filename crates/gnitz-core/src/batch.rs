@@ -188,13 +188,7 @@ pub struct ZSetBatch {
 
 impl ZSetBatch {
     pub fn new(schema: &Schema) -> Self {
-        ZSetBatch {
-            pks: PkColumn::empty_for_schema(schema),
-            weights: vec![],
-            nulls: vec![],
-            payload: Self::filler_columns(schema, 0),
-            blob: vec![],
-        }
+        Self::with_capacity(schema, 0)
     }
 
     /// The `-1` retraction batch for `pks`: the server's unique-PK rule
@@ -268,9 +262,23 @@ impl ZSetBatch {
     /// An empty batch with every growth stream sized for `n` rows: the PK buffer,
     /// the weights, the null words and each payload column.
     pub fn with_capacity(schema: &Schema, n: usize) -> Self {
-        let mut b = Self::new(schema);
-        b.reserve(n);
-        b
+        // Each region is allocated at its exact size: `reserve` on an empty `Vec`
+        // goes through the amortized-growth path once per region, which costs more
+        // than the decode of a one-row reply.
+        let mut pks = PkColumn::empty_for_schema(schema);
+        pks.buf = Vec::with_capacity(n * pks.stride());
+        ZSetBatch {
+            pks,
+            weights: Vec::with_capacity(n),
+            nulls: Vec::with_capacity(n),
+            payload: (schema.payload_columns())
+                .map(|(_, _, c)| PayloadColumn {
+                    tc: c.ty.tc,
+                    bytes: Vec::with_capacity(n * c.ty.tc.wire_stride()),
+                })
+                .collect(),
+            blob: Vec::new(),
+        }
     }
 
     /// Room for `n` more rows in every growth stream. Additive, as
@@ -416,7 +424,7 @@ impl ZSetBatch {
 
     /// The batch has `schema`'s layout and every vector is sized for its row
     /// count. O(columns): no row is read.
-    pub fn check_shape(&self, schema: &Schema) -> Result<(), String> {
+    pub(crate) fn check_shape(&self, schema: &Schema) -> Result<(), String> {
         self.layout_matches(schema)?;
         self.check_region_lengths(&self.wire_regions())
     }
@@ -906,7 +914,7 @@ pub(crate) fn decode_wal_blocks<'a>(
         heap += parsed.heap.len();
     }
     let mut batch = ZSetBatch::with_capacity(schema, rows);
-    batch.blob.reserve(heap);
+    batch.blob = Vec::with_capacity(heap);
     blocks.try_for_each(|block| decode_wal_block_into(&mut batch, block, schema))?;
     Ok(batch)
 }

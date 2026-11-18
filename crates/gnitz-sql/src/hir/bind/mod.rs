@@ -85,7 +85,7 @@ pub(super) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzS
         let canonical = canonical_user_name(name)?;
         let ctx = format!("CTE '{name}'");
         if cx.ctes.contains_key(&canonical) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "WITH query name '{name}' is specified more than once"
             )));
         }
@@ -133,7 +133,7 @@ pub(super) fn apply_positional_aliases<'a, 'b>(
     }
     let mut visible: Vec<&mut ColumnDef> = defs.into_iter().filter(|c| !c.is_hidden).collect();
     if n_aliases != visible.len() {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{ctx} defines {n_aliases} column aliases but body returns {} columns",
             visible.len(),
         )));
@@ -292,7 +292,7 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
         Surface::Adhoc => (ClassWant::Readable, cx.surface.stmt()),
         // The replaced view is retracted in the same bundle, taking the body's input with it.
         Surface::View(ViewBody { stmt, replacing, .. }) if replacing == Some(rel.tid) => {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "{stmt} '{name}' AS a query referencing the view itself is not supported"
             )));
         }
@@ -332,14 +332,14 @@ impl<'a> QueryTail<'a> {
         match (keys.is_empty(), limit, offset) {
             (true, None, Some(_)) => Err(unsupported_clause(stmt, "OFFSET without ORDER BY … LIMIT")),
             (true, None, None) => Ok(None),
-            (false, None, _) => Err(GnitzSqlError::Rejected(format!(
+            (false, None, _) => Err(GnitzSqlError::rejected(format!(
                 "{stmt}: ORDER BY without LIMIT — a view holds an unordered set, so an order alone \
                  maintains nothing; add LIMIT n to maintain the top n rows"
             ))),
-            (true, Some(_), _) => Err(GnitzSqlError::Rejected(format!(
+            (true, Some(_), _) => Err(GnitzSqlError::rejected(format!(
                 "{stmt}: LIMIT without ORDER BY names no rows in particular; add ORDER BY"
             ))),
-            (false, Some(0), _) => Err(GnitzSqlError::Rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
+            (false, Some(0), _) => Err(GnitzSqlError::rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
             (false, Some(limit), offset) => Ok(Some(QueryTail {
                 keys,
                 slots: WeightSlots {
@@ -362,7 +362,7 @@ impl<'a> QueryTail<'a> {
         let order = (self.keys.iter())
             .map(|key| {
                 let col = output_key(&key.target, cols.iter())?.map_err(|_| {
-                    GnitzSqlError::Rejected(format!(
+                    GnitzSqlError::rejected(format!(
                         "{stmt}: ORDER BY over a set operation names an output column or position"
                     ))
                 })?;
@@ -407,7 +407,7 @@ fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlErr
         SetExpr::Select(select) => Ok(bind_select(cx, select, &[])?.0),
         SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
         SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
-        _ => Err(GnitzSqlError::Rejected(format!(
+        _ => Err(GnitzSqlError::rejected(format!(
             "{} only supports SELECT and set operations",
             cx.surface.stmt()
         ))),
@@ -425,8 +425,8 @@ fn resolve_table_factor(
 ) -> Result<(Rc<RelExpr>, String, Vec<HirCol>), GnitzSqlError> {
     if let TableFactor::Derived { lateral, subquery, alias, sample } = factor {
         let Some(alias) = alias else {
-            return Err(GnitzSqlError::Rejected(
-                "a derived table (subquery in FROM) needs an alias".to_string(),
+            return Err(GnitzSqlError::rejected(
+                "a derived table (subquery in FROM) needs an alias",
             ));
         };
         let ctx = format!("derived table '{}'", alias.name.value);
@@ -482,7 +482,7 @@ pub(super) fn bind_select(
         // No relation is in scope, so every written name is unresolvable.
         (None, Surface::Adhoc) => (Rc::new(RelExpr::Unit), JoinScope::default()),
         (None, Surface::View(_)) => {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "{stmt}: a view body reads at least one relation; this one has no FROM clause"
             )));
         }
@@ -508,14 +508,13 @@ pub(super) fn bind_select(
     let sub = match (surface, scope.relations.len()) {
         (Surface::Adhoc, _) => SubPolicy::Reject(adhoc_subquery),
         (Surface::View(_), 1) if grouped => SubPolicy::Reject(|_| {
-            GnitzSqlError::Rejected(
-                "a subquery is not supported together with GROUP BY/aggregates; put the subquery in an inner view"
-                    .into(),
+            GnitzSqlError::rejected(
+                "a subquery is not supported together with GROUP BY/aggregates; put the subquery in an inner view",
             )
         }),
         (Surface::View(_), 1) if distinct => SubPolicy::Reject(|_| {
-            GnitzSqlError::Rejected(
-                "a subquery is not supported together with SELECT DISTINCT; put the subquery in an inner view".into(),
+            GnitzSqlError::rejected(
+                "a subquery is not supported together with SELECT DISTINCT; put the subquery in an inner view",
             )
         }),
         (Surface::View(_), 1) => SubPolicy::Bind { cx, subs: &subs },
@@ -580,7 +579,7 @@ fn bind_select_list<L: ItemLeaf>(
 fn reject_unselected_distinct_keys(projected: &RelExpr, order: &[OrderCol], ctx: &str) -> Result<(), GnitzSqlError> {
     let cols = projected.cols();
     if order.iter().any(|o| hircol_of(&cols, o.col).def.is_hidden) {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
         )));
     }
@@ -651,13 +650,13 @@ fn scalar_projection_item<'a>(item: &'a SelectItem, ctx: &str) -> Result<(&'a Ex
     match item {
         SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
         SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
-        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::Rejected(format!(
+        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::rejected(format!(
             "{ctx}: a multi-alias (`AS (a, b)`) SELECT item is not a supported SELECT item"
         ))),
-        SelectItem::Wildcard(_) => Err(GnitzSqlError::Rejected(format!(
+        SelectItem::Wildcard(_) => Err(GnitzSqlError::rejected(format!(
             "{ctx}: SELECT * is not a supported SELECT item"
         ))),
-        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::Rejected(format!(
+        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::rejected(format!(
             "{ctx}: SELECT <table>.* is not a supported SELECT item"
         ))),
     }
@@ -827,7 +826,7 @@ impl JoinScope {
     /// a column of either relation, so a taken alias is refused.
     fn push(&mut self, alias: &str, cols: Vec<HirCol>) -> Result<(), GnitzSqlError> {
         if self.relations.iter().any(|(a, _)| a.eq_ignore_ascii_case(alias)) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "relation alias '{alias}' is used by two relations in one scope; rename one"
             )));
         }
@@ -858,14 +857,14 @@ impl JoinScope {
             .relations
             .iter()
             .find(|(a, _)| a.eq_ignore_ascii_case(alias))
-            .ok_or_else(|| GnitzSqlError::Rejected(format!("table alias '{alias}' not found")))?;
+            .ok_or_else(|| GnitzSqlError::rejected(format!("table alias '{alias}' not found")))?;
         Ok(&self.combined[span.clone()])
     }
 
     fn resolve_qualified(&self, alias: &str, name: &str) -> Result<ColId, GnitzSqlError> {
         let cols = self.relation(alias)?;
         let idx = find_unique_column(cols.iter().map(|c| &c.def), name)?
-            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found in table '{alias}'")))?;
+            .ok_or_else(|| GnitzSqlError::rejected(format!("column '{name}' not found in table '{alias}'")))?;
         Ok(cols[idx].id)
     }
 
@@ -881,7 +880,7 @@ impl JoinScope {
     fn resolve_unqualified(&self, name: &str) -> Result<ColId, GnitzSqlError> {
         let scope = if self.relations.is_empty() { "" } else { " in any table" };
         self.find_unqualified(name)?
-            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found{scope}")))
+            .ok_or_else(|| GnitzSqlError::rejected(format!("column '{name}' not found{scope}")))
     }
 
     /// Resolve a column reference, qualified by `qual` or not.

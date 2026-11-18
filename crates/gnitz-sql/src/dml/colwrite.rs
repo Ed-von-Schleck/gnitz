@@ -33,21 +33,21 @@ pub(crate) fn append_value_to_col<R>(
 
 /// A literal as the native image of a column's cell, refused naming the column.
 pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, GnitzSqlError> {
-    assign(lit, def.ty).map_err(|m| GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)))
+    assign(lit, def.ty).map_err(|m| GnitzSqlError::rejected(format!("column '{}': {m}", def.name)))
 }
 
 /// Reject a NULL destined for a NOT NULL column, naming it.
 ///
-/// Both DML write paths check here rather than leaning on `ZSetBatch::validate`
-/// at the wire, because neither reaches the wire in time: `ON CONFLICT DO
-/// UPDATE` reads its incoming VALUES batch to build the merged row and never
-/// pushes it, and a transaction's buffered row is read back by later statements
-/// long before COMMIT validates it. Either reader is a program that believes the
+/// Both DML write paths check here rather than leaning on the server's check of
+/// each row it is sent, because neither row reaches the server in time: `ON
+/// CONFLICT DO UPDATE` reads its incoming VALUES batch to build the merged row
+/// and never pushes it, and a transaction's buffered row is read back by later
+/// statements long before COMMIT sends it. Either reader is a program that believes the
 /// column's NOT NULL flag over its null bit, so it would take the filler zero for
 /// a real value.
 pub(crate) fn check_not_null(col_def: &ColumnDef, is_null: bool) -> Result<(), GnitzSqlError> {
     if is_null && !col_def.is_nullable {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "NULL value in column '{}' violates NOT NULL",
             col_def.name
         )));

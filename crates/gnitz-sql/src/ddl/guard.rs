@@ -182,7 +182,7 @@ pub(super) fn read_column<'a>(
     // `Some(true)` once NOT NULL is written, `Some(false)` once NULL is.
     let mut not_null: Option<bool> = None;
     let conflicting = || {
-        GnitzSqlError::Rejected(format!(
+        GnitzSqlError::rejected(format!(
             "{context}: conflicting NULL/NOT NULL declarations for column '{}'",
             name.value
         ))

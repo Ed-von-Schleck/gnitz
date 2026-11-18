@@ -7,8 +7,9 @@ use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 
-use gnitz_core::{DeltaCursor, PollOutcome, PollResult, Pushed, ScanReply, Synced};
+use gnitz_core::{PollOutcome, PollResult, Pushed, ScanReply, Synced};
 use gnitz_sql::SqlResult;
+use gnitz_wire::multi_frame::DeltaCursor;
 
 use crate::client_err;
 use crate::read::{PyScanResult, scan_result};

@@ -92,7 +92,7 @@ impl RelName {
     }
 
     /// The same schema's relation `name`.
-    pub fn sibling(&self, name: &str) -> Result<Self, String> {
+    pub(crate) fn sibling(&self, name: &str) -> Result<Self, String> {
         Self::build(&self.spelled[..self.dot], name, self.qualified)
     }
 }

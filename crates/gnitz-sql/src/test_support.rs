@@ -343,12 +343,14 @@ pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> BoundExpr {
     crate::bind::bind_single_table(&parse_expr_sql(sql), schema, "t").unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
-/// The message of the `Rejected` error `r` must be.
+/// The message of the rejection `r` must be.
 pub(crate) fn rejected<T>(r: Result<T, GnitzSqlError>) -> String {
     match r {
-        Err(GnitzSqlError::Rejected(m)) => m,
-        Err(e) => panic!("expected Rejected, got {e:?}"),
-        Ok(_) => panic!("expected Rejected, got Ok"),
+        Err(e) => e
+            .rejection()
+            .unwrap_or_else(|| panic!("expected a rejection, got {e:?}"))
+            .to_owned(),
+        Ok(_) => panic!("expected a rejection, got Ok"),
     }
 }
 
@@ -356,8 +358,10 @@ pub(crate) fn rejected<T>(r: Result<T, GnitzSqlError>) -> String {
 /// identity, not its wording. `what` labels the failure (the SQL, usually).
 pub(crate) fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want: &str) {
     let msg = match r {
-        Err(GnitzSqlError::Rejected(m)) => m,
-        Err(e) => panic!("`{what}`: expected a rejection, got {e:?}"),
+        Err(e) => match e.rejection() {
+            Some(m) => m.to_owned(),
+            None => panic!("`{what}`: expected a rejection, got {e:?}"),
+        },
         Ok(_) => panic!("`{what}` was accepted"),
     };
     assert!(

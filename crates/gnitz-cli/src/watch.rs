@@ -5,9 +5,10 @@
 
 use std::time::Duration;
 
-use gnitz_core::{ClientError, ScanReply, SubId, Subscription, block_on};
+use gnitz_core::{ClientError, ScanReply, Subscription, block_on};
 use gnitz_sql::GnitzSqlError;
 use gnitz_wire::WireStatus;
+use gnitz_wire::multi_frame::SubId;
 use nu_ansi_term::{Color, Style};
 
 use crate::render::{Target, Weights, paint, render};

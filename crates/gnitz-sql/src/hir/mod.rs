@@ -706,18 +706,16 @@ impl JoinClass {
     /// written.
     pub(crate) fn admit(&self, kind: JoinType) -> Result<(), GnitzSqlError> {
         match (self.plan(), kind) {
-            (JoinPlan::Cross, k) if k != JoinType::Inner => Err(GnitzSqlError::Rejected(
+            (JoinPlan::Cross, k) if k != JoinType::Inner => Err(GnitzSqlError::rejected(
                 "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
                  or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
-                 comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
-                    .into(),
+                 comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless.",
             )),
-            (JoinPlan::PureRange(_), JoinType::Right | JoinType::Full) => Err(GnitzSqlError::Rejected(
+            (JoinPlan::PureRange(_), JoinType::Right | JoinType::Full) => Err(GnitzSqlError::rejected(
                 "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
                  equality prefix) is not supported; its mirror null-fill has no inner-join \
                  witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
-                 conjunct to make it a band join."
-                    .into(),
+                 conjunct to make it a band join.",
             )),
             _ => Ok(()),
         }
@@ -882,7 +880,7 @@ impl RelExpr {
         let lcols = left.cols();
         let rcols = right.cols();
         if lcols.len() != rcols.len() {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "set operation: column count mismatch ({} vs {})",
                 lcols.len(),
                 rcols.len()
@@ -891,7 +889,7 @@ impl RelExpr {
         let mut out = Vec::with_capacity(lcols.len());
         for (i, (l, r)) in lcols.iter().zip(rcols.iter()).enumerate() {
             let ty = set_op_common_type(l.def.ty, r.def.ty).ok_or_else(|| {
-                GnitzSqlError::Rejected(format!(
+                GnitzSqlError::rejected(format!(
                     "set operation: column {} type mismatch ({} vs {})",
                     i, l.def.ty, r.def.ty
                 ))

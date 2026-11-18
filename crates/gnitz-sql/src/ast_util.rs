@@ -41,8 +41,8 @@ pub(crate) fn classify_agg_call(
         (false, Some(e)) => AggArg::All(e),
         (true, Some(e)) => AggArg::Distinct(e),
         (true, None) => {
-            return Err(GnitzSqlError::Rejected(
-                "COUNT(DISTINCT *): DISTINCT needs a column argument".into(),
+            return Err(GnitzSqlError::rejected(
+                "COUNT(DISTINCT *): DISTINCT needs a column argument",
             ));
         }
     };
@@ -145,7 +145,7 @@ impl<'f> PlainCall<'f> {
     ) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
         use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
         let FunctionArguments::List(list) = &self.0.args else {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "{name}: requires a parenthesized argument list"
             )));
         };
@@ -154,7 +154,7 @@ impl<'f> PlainCall<'f> {
             .iter()
             .map(|arg| match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
-                _ => Err(GnitzSqlError::Rejected(format!(
+                _ => Err(GnitzSqlError::rejected(format!(
                     "{name}: expects plain positional arguments (no `*`, named args)"
                 ))),
             })
@@ -171,12 +171,12 @@ fn wrong_arity(name: &str, min: usize, max: Option<usize>) -> GnitzSqlError {
     let word = |n: usize| WORDS.get(n).map_or_else(|| n.to_string(), |w| (*w).to_string());
     let plural = |n: usize| if n == 1 { "argument" } else { "arguments" };
     let want = match max {
-        Some(0) if min == 0 => return GnitzSqlError::Rejected(format!("{name}: takes no arguments")),
+        Some(0) if min == 0 => return GnitzSqlError::rejected(format!("{name}: takes no arguments")),
         Some(max) if max == min => format!("exactly {} {}", word(min), plural(min)),
         Some(max) => format!("{} or {} arguments", word(min), word(max)),
         None => format!("at least {} {}", word(min), plural(min)),
     };
-    GnitzSqlError::Rejected(format!("{name}: requires {want}"))
+    GnitzSqlError::rejected(format!("{name}: requires {want}"))
 }
 
 /// True when a SELECT body is grouped — the one disjunction every "route this to
@@ -237,7 +237,7 @@ pub(crate) fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
 /// The rejection for a call whose name is not one this crate implements. Shared
 /// so every binder that turns a function away spells it the same way.
 pub(crate) fn unknown_function(f: &sqlparser::ast::Function) -> GnitzSqlError {
-    GnitzSqlError::Rejected(format!(
+    GnitzSqlError::rejected(format!(
         "function '{}' not supported",
         f.name.to_string().to_ascii_lowercase()
     ))

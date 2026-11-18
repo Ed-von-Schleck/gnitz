@@ -14,11 +14,12 @@ use std::future::Future;
 
 use gnitz_core::{
     BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema, Sent,
-    SubId, TableDef, ViewBundle, ZSetBatch, block_on,
+    TableDef, ViewBundle, ZSetBatch, block_on,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{ServerHandle, strace_test, unique_schema};
 use gnitz_tokio::AsyncClient;
+use gnitz_wire::multi_frame::SubId;
 use gnitz_wire::{
     Circuit, ColumnDef, ReadBound, ReadSpec, TypeCode, ViewBudget, ViewProps, WireConflictMode, read_i64_le,
 };

@@ -39,7 +39,7 @@ impl Frame {
     pub(crate) fn new(slots: impl IntoIterator<Item = Slot>, npk: usize) -> Result<Frame, GnitzSqlError> {
         let (layout, columns): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
         let schema = Schema::from_parts(columns, gnitz_expr::leading_pk(npk))
-            .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
+            .map_err(|e| GnitzSqlError::rejected(format!("output schema: {e}")))?;
         Ok(Frame { layout, schema: Arc::new(schema) })
     }
 
@@ -144,7 +144,7 @@ impl Frame {
         }
         let pk: Vec<u32> = self.schema.pk_cols().iter().map(|&s| moved_to[s as usize]).collect();
         let schema = Schema::from_parts(order.iter().map(|&s| self.schema.columns()[s].clone()).collect(), &pk)
-            .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
+            .map_err(|e| GnitzSqlError::rejected(format!("output schema: {e}")))?;
         Ok((Arc::new(schema), moved_to))
     }
 

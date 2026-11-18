@@ -74,7 +74,7 @@ pub(super) fn bind_view_select_list<L: ItemLeaf>(
     order: &[OrderKey<'_>],
 ) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
     if let Some(name) = gnitz_wire::first_duplicate(select.named_window.iter().map(|d| d.0.value.as_str())) {
-        return Err(GnitzSqlError::Rejected(format!("WINDOW clause defines '{name}' twice")));
+        return Err(GnitzSqlError::rejected(format!("WINDOW clause defines '{name}' twice")));
     }
     let state = RefCell::new(Windows::default());
     let over = WindowLeaf {
@@ -94,8 +94,8 @@ pub(super) fn bind_view_select_list<L: ItemLeaf>(
     let rel = rel()?;
     if win.calls.is_empty() {
         if select.qualify.is_some() {
-            return Err(GnitzSqlError::Rejected(
-                "QUALIFY needs a window function in the SELECT list or in the QUALIFY predicate".into(),
+            return Err(GnitzSqlError::rejected(
+                "QUALIFY needs a window function in the SELECT list or in the QUALIFY predicate",
             ));
         }
         return Ok((leaf.project(rel, items)?, order));
@@ -216,8 +216,8 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                 window_frame,
             } = s;
             if window_name.is_some() {
-                return Err(GnitzSqlError::Rejected(
-                    "a window specification extending a named window (OVER (w …)) is not supported".into(),
+                return Err(GnitzSqlError::rejected(
+                    "a window specification extending a named window (OVER (w …)) is not supported",
                 ));
             }
             Ok((partition_by.as_slice(), order_by.as_slice(), window_frame.as_ref()))
@@ -234,14 +234,14 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                 .iter()
                 .find(|d| d.0.value.eq_ignore_ascii_case(&name.value))
                 .ok_or_else(|| {
-                    GnitzSqlError::Rejected(format!("window '{}' is not defined in the WINDOW clause", name.value))
+                    GnitzSqlError::rejected(format!("window '{}' is not defined in the WINDOW clause", name.value))
                 })?;
             match &def.1 {
                 NamedWindowExpr::WindowSpec(s) => return inline(s),
                 NamedWindowExpr::NamedWindow(next) => name = next,
             }
         }
-        Err(GnitzSqlError::Rejected(format!(
+        Err(GnitzSqlError::rejected(format!(
             "window '{}' is defined in terms of itself",
             name.value
         )))
@@ -270,8 +270,8 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             order.clear();
         }
         if matches!(func, WinFunc::Rank | WinFunc::DenseRank) && order.is_empty() {
-            return Err(GnitzSqlError::Rejected(
-                "RANK / DENSE_RANK need an ORDER BY in their window specification".into(),
+            return Err(GnitzSqlError::rejected(
+                "RANK / DENSE_RANK need an ORDER BY in their window specification",
             ));
         }
         // Over an argument that is never NULL, COUNT(e) is COUNT(*).
@@ -417,7 +417,7 @@ fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>), GnitzS
             let (agg, arg) = classify_agg_shape(call)?;
             Ok((WinFunc::Agg(agg), arg))
         }
-        None => Err(GnitzSqlError::Rejected(format!(
+        None => Err(GnitzSqlError::rejected(format!(
             "{}: not supported as a window function",
             name.to_ascii_uppercase()
         ))),
@@ -437,16 +437,14 @@ fn frame_is_whole(frame: Option<&WindowFrame>) -> Result<bool, GnitzSqlError> {
         (WindowFrameBound::Preceding(None), WindowFrameBound::Following(None)) => Ok(true),
         (WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow) => match units {
             WindowFrameUnits::Range => Ok(false),
-            WindowFrameUnits::Rows | WindowFrameUnits::Groups => Err(GnitzSqlError::Rejected(
+            WindowFrameUnits::Rows | WindowFrameUnits::Groups => Err(GnitzSqlError::rejected(
                 "window frames: ROWS / GROUPS … CURRENT ROW excludes the current row's peers, which \
-                 needs a total row order; use RANGE (the default frame)"
-                    .into(),
+                 needs a total row order; use RANGE (the default frame)",
             )),
         },
-        _ => Err(GnitzSqlError::Rejected(
+        _ => Err(GnitzSqlError::rejected(
             "window frames: only RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (the default) and \
-             BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING are supported"
-                .into(),
+             BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING are supported",
         )),
     }
 }
@@ -555,11 +553,10 @@ fn desugar<L: ItemLeaf>(
             // A partition is a reduce group key: GROUP BY's rule.
             reject_float_key(def.ty.tc, None, "window PARTITION BY")?;
             if call.order.is_empty() && def.is_nullable {
-                return Err(GnitzSqlError::Rejected(
+                return Err(GnitzSqlError::rejected(
                     "window PARTITION BY: the key must be provably NOT NULL (a NOT NULL column, or an \
                      expression over NOT NULL columns) — a window over its whole partition is joined on \
-                     it, and a NULL key neither groups nor matches"
-                        .into(),
+                     it, and a NULL key neither groups nor matches",
                 ));
             }
         }
@@ -573,12 +570,11 @@ fn desugar<L: ItemLeaf>(
     let mut specs: Vec<Spec> = Vec::new();
     for call in calls {
         if call.func == WinFunc::RowNumber && key.is_none() {
-            return Err(GnitzSqlError::Rejected(
+            return Err(GnitzSqlError::rejected(
                 "ROW_NUMBER needs an input with a unique row key (a table, or a grouped or DISTINCT \
                  body); over a join body, a stream, a UNION ALL or a view keyed by a join key its rows \
                  have no total order — use RANK or DENSE_RANK, give it an ORDER BY and bound it in \
-                 QUALIFY without selecting it, or window over a view of the join"
-                    .into(),
+                 QUALIFY without selecting it, or window over a view of the join",
             ));
         }
         match specs

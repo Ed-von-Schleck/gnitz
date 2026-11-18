@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{parse_stmt, rejected};
+use crate::test_support::{assert_rejects, parse_stmt, rejected};
 use sqlparser::ast::Statement;
 
 /// One slot per named key, filled case-insensitively; any other key, a repeat
@@ -54,10 +54,7 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
         assert_eq!(parse_size("capacity", lit).unwrap().get(), bytes, "{lit:?}");
     }
     for lit in ["lots", "5", "5 TB", "-5 MB", "0 MB", "18446744073709551615 GB", ""] {
-        assert!(
-            matches!(parse_size("capacity", lit), Err(GnitzSqlError::Rejected(_))),
-            "{lit:?}"
-        );
+        rejected(parse_size("capacity", lit));
     }
 }
 
@@ -138,10 +135,10 @@ fn with_options_carry_replicated_and_stream_independently() {
         };
         assert_eq!(parse_table_options(&table_options_of(with)).unwrap(), want, "{with}");
     }
-    let e = parse_table_options(&table_options_of("WITH (stream = 1)")).unwrap_err();
-    assert!(
-        matches!(&e, GnitzSqlError::Rejected(m) if m.contains("WITH (stream = …) expects a boolean")),
-        "{e:?}"
+    assert_rejects(
+        "WITH (stream = 1)",
+        parse_table_options(&table_options_of("WITH (stream = 1)")),
+        "WITH (stream = …) expects a boolean",
     );
 }
 

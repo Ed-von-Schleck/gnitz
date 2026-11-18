@@ -102,7 +102,6 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
 pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
     match e {
         gnitz_sql::GnitzSqlError::Client(inner) => client_err(inner),
-        gnitz_sql::GnitzSqlError::Rejected(text) => GnitzRefusedError::new_err(text),
         internal @ gnitz_sql::GnitzSqlError::Internal(_) => gnitz_err(internal),
     }
 }

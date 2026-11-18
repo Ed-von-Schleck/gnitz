@@ -14,9 +14,10 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 
-use gnitz_core::{BoxFut, ClientError, DeltaCursor, GnitzClient, RelName, Sent, SubId, TableDef, ZSetBatch};
+use gnitz_core::{BoxFut, ClientError, GnitzClient, RelName, Sent, TableDef, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
+use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 use gnitz_wire::{KeyRange, PkColList, PkListRole, ReadBound, ReadSpec, WireConflictMode};
 
 use crate::aio::{LoopCore, LoopHandle};

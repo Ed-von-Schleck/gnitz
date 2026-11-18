@@ -98,8 +98,8 @@ impl Linear<'_> {
                 Err(derivation("an aggregate over a grouped CTE"))
             }
             // A DISTINCT over no relation is a set already, so only an aggregate meets it.
-            _ => Err(GnitzSqlError::Rejected(
-                "an aggregate over a SELECT without FROM is not supported".into(),
+            _ => Err(GnitzSqlError::rejected(
+                "an aggregate over a SELECT without FROM is not supported",
             )),
         }
     }
@@ -128,7 +128,7 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
                 map.insert(it.out.id, e);
             }
             if refs > MAX_EXPANDED_REFS {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "the query's CTEs expand to {refs} column references, over the limit of {MAX_EXPANDED_REFS}.\n\
                      CREATE VIEW <name> AS <the CTE body> — the engine maintains it incrementally — then SELECT from it."
                 )));
@@ -208,8 +208,8 @@ pub(crate) fn lower_read(
 /// `_group_pk`, keyed by the global group key.
 fn constant(lin: &Linear<'_>, items: Vec<ProjEntry>, order: Vec<OrderCol>) -> Result<AdhocRead, GnitzSqlError> {
     if !lin.preds.is_empty() {
-        return Err(GnitzSqlError::Rejected(
-            "a WHERE over a SELECT without FROM is not supported".into(),
+        return Err(GnitzSqlError::rejected(
+            "a WHERE over a SELECT without FROM is not supported",
         ));
     }
     let ground = Frame::keyed(vec![crate::agg::group_pk_def()], [])?;

@@ -103,18 +103,18 @@ where
     // say nothing.
     for &n in drop.iter().chain(rename.iter().map(|(f, _)| f)) {
         if !has_visible_column(cols.clone(), n) {
-            return Err(GnitzSqlError::Rejected(format!(
+            return Err(GnitzSqlError::rejected(format!(
                 "{ctx}: SELECT * EXCEPT/EXCLUDE/RENAME names unknown column '{n}'"
             )));
         }
     }
     if let Some((f, _)) = rename.iter().find(|(f, _)| excludes(f)) {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{ctx}: SELECT * RENAME names excluded column '{f}'"
         )));
     }
     if let Some(f) = gnitz_wire::first_duplicate(rename.iter().map(|&(f, _)| f)) {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{ctx}: SELECT * RENAME names column '{f}' twice"
         )));
     }

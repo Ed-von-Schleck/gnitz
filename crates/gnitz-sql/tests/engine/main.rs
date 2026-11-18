@@ -29,15 +29,6 @@ pub fn rel(schema: &str, name: &str) -> RelName {
     RelName::new(schema, name).unwrap()
 }
 
-/// Who refused a statement: the planner, or the client or engine under the
-/// status a caller branches on.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Refusal {
-    Rejected,
-    Refused(WireStatus),
-}
-pub use Refusal::*;
-
 /// What [`Db::rows`] reads a NULL cell as.
 pub const NULL: i64 = i64::MIN;
 
@@ -85,16 +76,13 @@ impl Db {
 
     /// Assert `sql` is refused by `want` with a message containing `needle` —
     /// the guard's identity, not its wording.
-    pub fn refuses(&mut self, sql: &str, want: Refusal, needle: &str) {
+    pub fn refuses(&mut self, sql: &str, want: WireStatus, needle: &str) {
         let e = self
             .try_exec(sql)
             .err()
             .unwrap_or_else(|| panic!("`{sql}` was accepted"));
         let (got, msg) = match &e {
-            GnitzSqlError::Rejected(m) => (Rejected, m.as_str()),
-            GnitzSqlError::Client(ClientError::Refused(WireFault { status, text })) => {
-                (Refused(*status), text.as_str())
-            }
+            GnitzSqlError::Client(ClientError::Refused(WireFault { status, text })) => (*status, text.as_str()),
             other => panic!("`{sql}`: {other:?}"),
         };
         assert_eq!(got, want, "`{sql}`: {e:?}");

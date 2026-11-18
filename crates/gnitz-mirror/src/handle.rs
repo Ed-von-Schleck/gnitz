@@ -2,13 +2,14 @@
 //! it through.
 use std::collections::{HashMap, HashSet};
 
-use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Switch;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
     DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig, lock_data_dir,
 };
+use gnitz_wire::multi_frame::DeltaCursor;
 use gnitz_wire::{PkColList, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;

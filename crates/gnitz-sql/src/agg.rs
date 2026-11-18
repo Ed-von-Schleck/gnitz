@@ -130,7 +130,7 @@ pub(crate) fn agg_ops(
     if let Some(c) = arg
         && ops.0.output_type(c.ty.tc).is_none()
     {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{}: not supported on {} column '{}'",
             agg_func_name(func).to_ascii_uppercase(),
             c.ty,

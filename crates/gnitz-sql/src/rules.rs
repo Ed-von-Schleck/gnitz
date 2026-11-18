@@ -11,7 +11,7 @@ pub(crate) fn reject_duplicate_names<'a>(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     match gnitz_wire::first_duplicate(names) {
-        Some(name) => Err(GnitzSqlError::Rejected(format!(
+        Some(name) => Err(GnitzSqlError::rejected(format!(
             "duplicate column name '{name}' in {context}"
         ))),
         None => Ok(()),
@@ -21,7 +21,7 @@ pub(crate) fn reject_duplicate_names<'a>(
 /// Reject a name the user may not give a relation, an index or a constraint;
 /// otherwise return its canonical form.
 pub(crate) fn canonical_user_name(name: &str) -> Result<String, GnitzSqlError> {
-    gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::Rejected)
+    gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::rejected)
 }
 
 /// Reject a float as a hashed key of clause `role`. `name` is the column the user
@@ -34,7 +34,7 @@ pub(crate) fn reject_float_key(tc: TypeCode, name: Option<&str>, role: &str) -> 
         Some(name) => format!("float column '{name}'"),
         None => "a float-valued expression".to_string(),
     };
-    Err(GnitzSqlError::Rejected(format!(
+    Err(GnitzSqlError::rejected(format!(
         "{role}: {what} cannot be a key (IEEE-754 -0.0/+0.0 and NaN break key equality)"
     )))
 }
@@ -119,7 +119,7 @@ pub(crate) fn require_class(
     if want.accepts(rel.class) {
         return Ok(());
     }
-    Err(GnitzSqlError::Rejected(format!(
+    Err(GnitzSqlError::rejected(format!(
         "'{name}' is a {}; {op} requires {}",
         rel.class.describe(),
         want.noun()
@@ -129,7 +129,7 @@ pub(crate) fn require_class(
 /// Reject a counted column list wider than `cap`. `what` names the list.
 pub(crate) fn reject_arity(what: &str, cols: usize, cap: usize) -> Result<(), GnitzSqlError> {
     if cols > cap {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "{what} has {cols} columns, exceeding the {cap}-column limit"
         )));
     }
@@ -158,7 +158,7 @@ pub(crate) fn find_unique_column<'a>(
     for (i, c) in columns.into_iter().enumerate() {
         if !c.is_hidden && c.name.eq_ignore_ascii_case(col_name) {
             if found.is_some() {
-                return Err(GnitzSqlError::Rejected(format!(
+                return Err(GnitzSqlError::rejected(format!(
                     "column reference '{col_name}' is ambiguous"
                 )));
             }
@@ -174,7 +174,7 @@ pub(crate) fn require_column<'a>(
     col_name: &str,
 ) -> Result<usize, GnitzSqlError> {
     find_unique_column(columns, col_name)?
-        .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{col_name}' not found")))
+        .ok_or_else(|| GnitzSqlError::rejected(format!("column '{col_name}' not found")))
 }
 
 /// The column of the one relation in scope, under `alias`, that a reference
@@ -187,7 +187,7 @@ pub(crate) fn single_relation_col_idx<'a>(
     name: &str,
 ) -> Result<usize, GnitzSqlError> {
     if let Some(qual) = qual.filter(|q| !q.eq_ignore_ascii_case(alias)) {
-        return Err(GnitzSqlError::Rejected(format!(
+        return Err(GnitzSqlError::rejected(format!(
             "table alias '{qual}' not found (the relation in scope is '{alias}')"
         )));
     }

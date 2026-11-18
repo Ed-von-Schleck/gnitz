@@ -2,19 +2,20 @@
 //! every other `impl GnitzClient` file builds on — waiting, ids, requests and
 //! relation resolution.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::poll_fn;
 use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use gnitz_wire::multi_frame::BLIND;
+use gnitz_wire::Target;
+use gnitz_wire::multi_frame::{BLIND, DeltaCursor, SubId};
 use gnitz_wire::{ReadSpec, WireConflictMode};
 
-use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session, SubId, Target};
+use crate::connection::{RelDescriptor, Request, ScanReply, Session};
 use crate::error::{ClientError, not_found};
-use crate::host::{BlockingHost, Host, Op, Pending, Sent, offload, serve};
+use crate::host::{BlockingHost, Host, Pending, Sent, block_on, offload, serve};
 use crate::txn::TxnBuffer;
 use crate::{PushBatch, RelName, Schema, ZSetBatch};
 
@@ -48,9 +49,10 @@ pub struct GnitzClient {
     /// of a connection since replaced is told that one ended, never handed
     /// another's trains.
     pub(crate) next_sub: SubId,
-    /// Ops a reply queued, as a sync's second half is when its answer
-    /// arrives. A [`serve`] loop runs them ahead of the calls it is handed.
-    pub(crate) resumed: Arc<Mutex<VecDeque<Op>>>,
+    /// The syncs a [`crate::sync_op`] sent, each with where its delivery lands,
+    /// in send order. A [`serve`] loop finishes one whose answer has arrived
+    /// ahead of the calls it is handed.
+    pub(crate) syncs: Vec<(Sent<()>, crate::pushed::Land)>,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -87,19 +89,14 @@ pub fn env_target() -> Result<Option<String>, String> {
 impl GnitzClient {
     /// A blocking client: its verbs' futures complete under [`block_on`](crate::block_on).
     pub fn connect(target: &str) -> Result<Self, ClientError> {
-        Self::connect_on(target, Box::new(BlockingHost::default()))
+        block_on(Self::connect_with(target, Box::new(BlockingHost::default())))
     }
 
-    /// A client that waits the way `host` does, connected on the calling
-    /// thread, which blocks — a TLS handshake included.
-    pub fn connect_on(target: &str, host: Box<dyn Host>) -> Result<Self, ClientError> {
-        Self::over(Session::connect(target)?, host)
-    }
-
-    /// [`Self::connect_on`] with the connect run as a job on `host`, where it
-    /// may block — for a host whose own thread must not, as an event loop's
-    /// does, and as [`Self::reconnect`] does. A panic in the connect resumes here; a job the host dropped is
-    /// `Closed`.
+    /// A client that waits the way `host` does. The connect, a TLS handshake
+    /// included, runs as a job on `host`, as [`Self::reconnect`]'s does: in
+    /// place on a blocking host, whose caller drives this with
+    /// [`block_on`](crate::block_on). A panic in the connect resumes here; a job
+    /// the host dropped is `Closed`.
     pub async fn connect_with(target: &str, mut host: Box<dyn Host>) -> Result<Self, ClientError> {
         let target = target.to_owned();
         let session = offload(&mut *host, move || Session::connect(&target)).await??;
@@ -118,7 +115,7 @@ impl GnitzClient {
             received: Default::default(),
             kept: HashMap::new(),
             next_sub: SubId::FIRST,
-            resumed: Default::default(),
+            syncs: Vec::new(),
         })
     }
 
@@ -149,7 +146,7 @@ impl GnitzClient {
             received: _,
             kept,
             next_sub: _,
-            resumed: _,
+            syncs: _,
         } = self;
         host.attach(fresh.as_fd().try_clone_to_owned()?)?;
         *session = fresh;
