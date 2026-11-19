@@ -89,7 +89,7 @@ impl FoldFinish {
         let mut out = Batch::with_capacity(v.schema(), n);
         out.append_ranges(&v, &firsts.keep);
         out.rewrite(|w| vals.emit_at(w, (0..n).map(|g| (g, g))));
-        out.into()
+        ZSetBatch::of(partial.schema(), out)
     }
 }
 

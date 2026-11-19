@@ -413,7 +413,7 @@ impl TableReader {
                 w.col_mut(pi).copy_from_slice(cells);
             }
         });
-        Ok(Some(batch.into()))
+        Ok(Some(ZSetBatch::of(schema, batch)))
     }
 }
 

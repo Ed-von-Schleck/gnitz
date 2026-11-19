@@ -219,7 +219,7 @@ fn index_candidates(ctx: &Context) -> Vec<Candidate> {
         .flat_map(|r| {
             r.indexes.iter().map(|i| Candidate {
                 kind: Kind::Value,
-                value: i.name.clone(),
+                value: i.name.to_string(),
                 description: Some(format!("index on {}", r.name)),
             })
         })

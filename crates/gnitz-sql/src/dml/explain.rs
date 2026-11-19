@@ -9,6 +9,8 @@
 use crate::SqlResult;
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::error::{GnitzSqlError, reject_if};
+use std::sync::Arc;
+
 use gnitz_core::{GnitzClient, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{AggFunc, GroupAggs, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -255,14 +257,16 @@ fn fold_line(agg: &GroupAggs, reduce_schema: &Schema, has_having: bool, is_disti
 /// needs one and STRING is not PK-eligible; it also fixes the row order) plus the
 /// visible `plan` column every presentation surface shows.
 fn plan_rows(lines: &[String]) -> SqlResult {
-    let schema = Schema::from_parts(
-        vec![
-            ColumnDef::new("_line", TypeCode::U64, false).hidden(),
-            ColumnDef::new("plan", TypeCode::String, false),
-        ],
-        &[0],
-    )
-    .expect("the EXPLAIN reply schema is a valid two-column schema");
+    let schema = Arc::new(
+        Schema::from_parts(
+            vec![
+                ColumnDef::new("_line", TypeCode::U64, false).hidden(),
+                ColumnDef::new("plan", TypeCode::String, false),
+            ],
+            &[0],
+        )
+        .expect("the EXPLAIN reply schema is a valid two-column schema"),
+    );
     let mut batch = ZSetBatch::new(&schema);
     {
         let mut a = batch.builder();
@@ -270,9 +274,5 @@ fn plan_rows(lines: &[String]) -> SqlResult {
             a.begin_row(i as u128 + 1, 1).put_string(line);
         }
     }
-    SqlResult::Rows(ScanReply {
-        schema: std::sync::Arc::new(schema),
-        batch,
-        lsn: None,
-    })
+    SqlResult::Rows(ScanReply { batch, lsn: None })
 }

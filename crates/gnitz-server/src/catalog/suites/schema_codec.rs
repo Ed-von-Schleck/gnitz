@@ -1,8 +1,5 @@
-//! The meta-schema record as this catalog builds and decodes it, and the client
-//! halves the engine is paired with: the layout digest and the DDL bundle.
-//!
-//! It lives on this side because nothing links this crate, so the client is the
-//! half that can be pulled in — as a dev-dependency.
+//! The meta-schema record as this catalog builds and decodes it, the layout
+//! digest, and a DDL bundle as the wire encodes it and this side reads it.
 
 use crate::catalog::sys_tables::encode_record;
 use crate::catalog::{SysFamily, SysFamilyExt};
@@ -62,7 +59,7 @@ proptest! {
 }
 
 /// A DDL bundle the client builds, as the engine reads it: each family's block,
-/// written through the client's sink, decodes against the catalog's own schema
+/// written through the kernel's row sink and framed by the wire's encoder, decodes against the catalog's own schema
 /// for that family to the rows the client wrote, weights included — STRING and
 /// BLOB cells past the inline bytes, an empty BLOB and the pair-keyed family's
 /// two key words among them.
@@ -71,13 +68,13 @@ proptest! {
 /// crate.
 #[test]
 fn a_client_bundle_decodes_to_the_rows_it_wrote() {
-    use gnitz_core::ZSetBatch;
-    use gnitz_wire::multi_frame::decode_items;
+    use gnitz_wire::multi_frame::{decode_items, encode_ddl_txn};
     use gnitz_wire::{CircuitRow, ColTabRow, IdxTabRow, SchemaTabRow, SeqTabRow, SysRow, TableTabRow, ViewTabRow};
+    use gnitz_zset::repr::BatchBuilder;
 
-    fn block<R: SysRow>(rows: &[(R, i64)]) -> (SysFamily, ZSetBatch) {
-        let mut b = ZSetBatch::new(gnitz_core::sys_schema(R::FAMILY));
-        let mut sink = b.builder();
+    fn block<R: SysRow>(rows: &[(R, i64)]) -> (SysFamily, Batch) {
+        let mut b = Batch::empty_with_schema(R::FAMILY.schema());
+        let mut sink = BatchBuilder::onto(&mut b);
         for (row, weight) in rows {
             row.write(&mut sink, *weight);
         }
@@ -176,7 +173,8 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
         block(&sequences),
         block(&circuits),
     ];
-    let payload = gnitz_core::encode_ddl_txn(&bundle);
+    let mut payload = Vec::new();
+    encode_ddl_txn(&mut payload, bundle.iter().map(|(f, b)| (*f, b.wire_regions())));
     let ctrl = gnitz_wire::peek_control_block(&payload).expect("control header");
     let items = decode_items(&payload, ctrl.body, gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
     let ids: Vec<u64> = items.iter().map(|item| item.hdr.target_id).collect();

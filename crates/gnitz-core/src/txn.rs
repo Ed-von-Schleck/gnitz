@@ -11,7 +11,7 @@ use gnitz_expr::{LogicalProgram, RowFilter, leading_pk};
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::BLIND;
 use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
-use gnitz_zset::repr::{Batch, MemBatch, Pick, gather_rows};
+use gnitz_zset::repr::{MemBatch, Pick, gather_rows};
 
 use crate::client::GnitzClient;
 use crate::connection::PushFamily;
@@ -132,7 +132,7 @@ impl GnitzClient {
         let txn = self.txn.as_mut().unwrap_or(&mut own);
         let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
         let count = batch.len();
-        txn.push(target, schema, batch, WireConflictMode::Update, basis)?;
+        txn.push(target, batch, WireConflictMode::Update, basis)?;
         if self.txn.is_none() {
             // Autocommit: the statement is a transaction of its own.
             self.push_txn(&own).await?;
@@ -143,54 +143,6 @@ impl GnitzClient {
 
 fn no_transaction() -> ClientError {
     ClientError::from("no transaction open")
-}
-
-/// A batch handed to [`crate::GnitzClient::push`]: borrowed, or shared with
-/// its caller (a batch moved in is shared with no one). A transaction buffers a
-/// shared one without copying it and copies it only when the family it opened
-/// is extended while the caller still holds it.
-pub enum PushBatch<'a> {
-    Borrowed(&'a ZSetBatch),
-    Shared(Arc<ZSetBatch>),
-}
-
-impl From<ZSetBatch> for PushBatch<'_> {
-    fn from(batch: ZSetBatch) -> Self {
-        PushBatch::Shared(Arc::new(batch))
-    }
-}
-
-impl<'a> From<&'a ZSetBatch> for PushBatch<'a> {
-    fn from(batch: &'a ZSetBatch) -> Self {
-        PushBatch::Borrowed(batch)
-    }
-}
-
-impl From<Arc<ZSetBatch>> for PushBatch<'_> {
-    fn from(batch: Arc<ZSetBatch>) -> Self {
-        PushBatch::Shared(batch)
-    }
-}
-
-impl std::ops::Deref for PushBatch<'_> {
-    type Target = ZSetBatch;
-
-    fn deref(&self) -> &ZSetBatch {
-        match self {
-            PushBatch::Borrowed(b) => b,
-            PushBatch::Shared(b) => b,
-        }
-    }
-}
-
-impl PushBatch<'_> {
-    /// The batch as a shareable handle: a borrowed one is copied here.
-    pub(crate) fn into_arc(self) -> Arc<ZSetBatch> {
-        match self {
-            PushBatch::Borrowed(b) => Arc::new(b.clone()),
-            PushBatch::Shared(b) => b,
-        }
-    }
 }
 
 /// A transaction's buffered writes, which [`GnitzClient::push_txn`] ships as one
@@ -218,7 +170,7 @@ struct TidWrites {
     /// grows, so this is a watermark.
     at: usize,
     rows: usize,
-    /// PK → `(family index, row index)` of the LAST op buffered on that PK.
+    /// PK → `(position in fams, row index)` of the LAST op buffered on that PK.
     /// Row indices are stable: `push` only ever extends a family batch or
     /// pushes a new one. Weight-0 rows are not indexed — they are inert,
     /// exactly as the engine's fold treats them.
@@ -238,7 +190,7 @@ impl TidWrites {
             let start = if p == from { *rows } else { 0 };
             for row in start..batch.len() {
                 if batch.get_weight(row) != 0 {
-                    last_op.insert(PkBuf::from_bytes(batch.get_pk_bytes(row)), (fam, row));
+                    last_op.insert(PkBuf::from_bytes(batch.get_pk_bytes(row)), (p, row));
                 }
             }
             (*at, *rows) = (p, batch.len());
@@ -260,24 +212,22 @@ impl TxnBuffer {
     /// "delete k; insert k" emits an Update family `[D(k)]` then an Error family
     /// `[I(k)]`, in that order.
     ///
-    /// Refused when `batch` is not in the layout `tid` already holds.
-    pub(crate) fn push<'b>(
+    /// Refused when `batch` is not in the layout `tid` already holds. A batch shared
+    /// with its caller is buffered without a copy, and copied only when the family it
+    /// opened is extended while the caller still holds it.
+    pub(crate) fn push(
         &mut self,
         target: impl Into<Target>,
-        schema: &Arc<Schema>,
-        batch: impl Into<PushBatch<'b>>,
+        batch: impl Into<Arc<ZSetBatch>>,
         mode: WireConflictMode,
         basis: u64,
     ) -> Result<(), ClientError> {
         let (target, batch) = (target.into(), batch.into());
         let tid = target.tid;
-        batch
-            .layout_matches(schema)
-            .map_err(|e| ClientError::from(format!("relation {tid}: the batch is not in its schema's layout: {e}")))?;
         if batch.is_empty() {
             return Ok(());
         }
-        self.check_layout(tid, schema)?;
+        self.check_layout(tid, batch.schema())?;
         let last = self.tids.get(&tid).and_then(|t| t.fams.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
             Some(i) => {
@@ -292,13 +242,7 @@ impl TxnBuffer {
             }
             None => {
                 self.tids.entry(tid).or_default().fams.push(self.families.len());
-                self.families.push(PushFamily {
-                    target,
-                    schema: Arc::clone(schema),
-                    batch: batch.into_arc(),
-                    mode,
-                    basis,
-                });
+                self.families.push(PushFamily { target, batch, mode, basis });
             }
         }
         Ok(())
@@ -310,7 +254,8 @@ impl TxnBuffer {
             return Ok(());
         };
         match self.families[t.fams[0]]
-            .schema
+            .batch
+            .schema()
             .layout()
             .same_region_types(schema.layout())
         {
@@ -340,16 +285,19 @@ impl TxnBuffer {
     fn overlay(
         &mut self,
         tid: u64,
-        schema: &Schema,
+        schema: &Arc<Schema>,
         spec: &ReadSpec,
         keys: bool,
         committed: ZSetBatch,
     ) -> Result<ZSetBatch, ClientError> {
         self.check_layout(tid, schema)?;
         let families = &self.families;
-        let Some(index) = self.tids.get_mut(&tid).map(|t| t.index(families)) else {
+        let Some(t) = self.tids.get_mut(&tid) else {
             return Ok(committed);
         };
+        // This tid's families alone: a gather's sources all share its layout.
+        let views: Vec<MemBatch<'_>> = t.fams.iter().map(|&f| families[f].batch.view()).collect();
+        let index = t.index(families);
         let held = committed.view();
         let keep: Vec<u32> = (0..held.len())
             .filter(|&i| !index.contains_key(held.get_pk_bytes(i)))
@@ -359,7 +307,6 @@ impl TxnBuffer {
         let mut out = committed.gather(&keep);
 
         // The families' live rows, gathered column by column in one pass.
-        let views: Vec<MemBatch<'_>> = families.iter().map(|f| f.batch.view()).collect();
         let mut picks: Vec<Pick> = Vec::new();
         let take = |&(fam, row): &(usize, usize)| {
             if views[fam].get_weight(row) > 0 {
@@ -370,7 +317,7 @@ impl TxnBuffer {
             ReadBound::PkSet(set) => set.iter().filter_map(|k| index.get(k)).for_each(take),
             _ => index.values().for_each(take),
         }
-        let mut live: ZSetBatch = gather_rows(&views, schema.layout(), &picks, 0).into();
+        let mut live = ZSetBatch::of(schema, gather_rows(&views, schema.layout(), &picks, 0));
         if live.is_empty() {
             return Ok(out);
         }
@@ -386,7 +333,8 @@ impl TxnBuffer {
                     .flat_map(|&(s, e)| &v.pk()[s * stride..e * stride])
                     .copied()
                     .collect();
-                out.extend_from_owned(Batch::key_rows(out.view().schema(), &kept, 1).into());
+                let added = ZSetBatch::key_rows(out.schema(), &kept, 1);
+                out.extend_from_owned(added);
             }
             false => {
                 live.retain_ranges(ranges);

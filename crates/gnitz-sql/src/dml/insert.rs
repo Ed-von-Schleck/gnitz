@@ -357,7 +357,6 @@ pub(super) fn resolve_conflicts(
     rows: ZSetBatch,
     held: ZSetBatch,
     set: Option<&mut [SetCol]>,
-    schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let (v, held_rows) = (rows.view(), held.view());
     let at: FxHashMap<&[u8], usize> = (0..v.len()).map(|i| (v.get_pk_bytes(i), i)).collect();
@@ -377,7 +376,7 @@ pub(super) fn resolve_conflicts(
     // transaction buffered; `excluded` is the VALUES row each one collided with.
     let excluded = rows.gathered(&collided);
     let mut out = rows.gather(&kept);
-    out.extend_from_owned(apply_set(set, held, Some(&excluded), schema)?);
+    out.extend_from_owned(apply_set(set, held, Some(&excluded))?);
     Ok(out)
 }
 

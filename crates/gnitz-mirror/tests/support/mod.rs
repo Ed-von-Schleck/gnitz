@@ -2,10 +2,9 @@
 
 use gnitz_core::block_on;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use gnitz_core::{GnitzClient, PollOutcome, PollResult, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, PollOutcome, PollResult, ScanReply, ZSetBatch};
 use gnitz_sql::SqlResult;
 use gnitz_zset_testkit::{RowKey, row_key};
 
@@ -16,19 +15,16 @@ pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
     block_on(gnitz_sql::execute(client, schema, statements)).unwrap_or_else(|e| panic!("{statements}: {e}"));
 }
 
-/// Run one `SELECT` and return `(schema, rows)`. Local-first: a client holding a
+/// Run one `SELECT` and return its rows. Local-first: a client holding a
 /// valid copy of the relation answers off it.
-pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> Reply {
+pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> ZSetBatch {
     let mut results = block_on(gnitz_sql::execute(client, schema, s)).unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");
     match results.remove(0) {
-        SqlResult::Rows(ScanReply { schema, batch, .. }) => (schema, batch),
+        SqlResult::Rows(ScanReply { batch, .. }) => batch,
         other => panic!("{s} did not return rows: {other:?}"),
     }
 }
-
-/// One `SELECT`'s reply: its schema and its rows.
-pub type Reply = (Arc<Schema>, ZSetBatch);
 
 /// The Z-set a reply denotes: `(OPK image, cells) → summed weight`, net-zero
 /// entries dropped.
@@ -39,7 +35,7 @@ pub type Reply = (Arc<Schema>, ZSetBatch);
 /// **Weight-exact because that is what correctness means here.** A row-set
 /// comparison would accept a replicated view read as if it were keyed, which
 /// returns W copies and inflates every weight W-fold while replying OK.
-pub fn canonical(reply: &Reply) -> BTreeMap<RowKey, i64> {
+pub fn canonical(reply: &ZSetBatch) -> BTreeMap<RowKey, i64> {
     let mut out: BTreeMap<RowKey, i64> = BTreeMap::new();
     for (row, w) in canonical_rows(reply) {
         *out.entry(row).or_insert(0) += w;
@@ -51,15 +47,10 @@ pub fn canonical(reply: &Reply) -> BTreeMap<RowKey, i64> {
 /// The same canonical rows **in reply order**, weights beside them — what an
 /// `ORDER BY` comparison needs, since the multiset above is order-blind and so
 /// accepts the right rows in the wrong order.
-pub fn canonical_rows((schema, batch): &Reply) -> Vec<(RowKey, i64)> {
+pub fn canonical_rows(batch: &ZSetBatch) -> Vec<(RowKey, i64)> {
     let rows = batch.view();
-    (0..batch.len())
-        .map(|row| {
-            (
-                row_key(&rows, schema.as_ref().layout(), row),
-                batch.view().get_weight(row),
-            )
-        })
+    (0..rows.len())
+        .map(|row| (row_key(&rows, batch.schema().layout(), row), rows.get_weight(row)))
         .collect()
 }
 
@@ -130,7 +121,11 @@ pub fn agreement(
         Answer::Upstream => assert!(sent > 0, "{local_sql}: must be delegated, not answered off a copy"),
     }
     let remote = query(server, schema, served_sql);
-    assert_eq!(local.0, remote.0, "{local_sql}: the two replies have different schemas");
+    assert_eq!(
+        local.schema(),
+        remote.schema(),
+        "{local_sql}: the two replies have different schemas"
+    );
     if local_sql.contains("ORDER BY") {
         assert_same_sequence(local_sql, &local, &remote)
     } else {
@@ -140,7 +135,7 @@ pub fn agreement(
 
 /// Assert two replies denote the same Z-set, naming the first difference, and
 /// refuse a vacuous pass: two empty replies agree about nothing.
-fn assert_same_zset(what: &str, a: &Reply, b: &Reply) -> usize {
+fn assert_same_zset(what: &str, a: &ZSetBatch, b: &ZSetBatch) -> usize {
     let (ca, cb) = (canonical(a), canonical(b));
     assert!(
         !(ca.is_empty() && cb.is_empty()),
@@ -164,7 +159,7 @@ fn assert_same_zset(what: &str, a: &Reply, b: &Reply) -> usize {
 
 /// Assert two replies are the same rows in the same order, and refuse the
 /// vacuous pass.
-fn assert_same_sequence(what: &str, a: &Reply, b: &Reply) -> usize {
+fn assert_same_sequence(what: &str, a: &ZSetBatch, b: &ZSetBatch) -> usize {
     let (ra, rb) = (canonical_rows(a), canonical_rows(b));
     assert!(
         !ra.is_empty(),

@@ -3,6 +3,7 @@ use crate::value::Rows;
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_wire::ColumnDef;
 use std::hint::black_box;
+use std::sync::Arc;
 
 /// Instructions to decode a reply and render it in each format: an integer
 /// key, a nullable integer, a float and a string per row.
@@ -10,16 +11,18 @@ use std::hint::black_box;
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn decode_render_bench() {
     const ROWS: u64 = 200_000;
-    let schema = Schema::from_parts(
-        vec![
-            ColumnDef::new("id", TypeCode::U64, false),
-            ColumnDef::new("n", TypeCode::I64, true),
-            ColumnDef::new("f", TypeCode::F64, false),
-            ColumnDef::new("s", TypeCode::String, false),
-        ],
-        &[0],
-    )
-    .unwrap();
+    let schema = Arc::new(
+        Schema::from_parts(
+            vec![
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("n", TypeCode::I64, true),
+                ColumnDef::new("f", TypeCode::F64, false),
+                ColumnDef::new("s", TypeCode::String, false),
+            ],
+            &[0],
+        )
+        .unwrap(),
+    );
     let mut batch = ZSetBatch::new(&schema);
     {
         let mut a = batch.builder();
@@ -36,11 +39,7 @@ fn decode_render_bench() {
             });
         }
     }
-    let reply = ScanReply {
-        schema: std::sync::Arc::new(schema),
-        batch,
-        lsn: None,
-    };
+    let reply = ScanReply { batch, lsn: None };
     let counter = gnitz_foundation::perf::Counter::instructions();
     for format in [Format::Csv, Format::Json, Format::Unaligned, Format::Aligned] {
         let settings = Settings { format, ..Settings::default() };

@@ -2,7 +2,7 @@
 //! precedence between the passes, the constraint spellings that are rejected,
 //! and the bundle a plan carries.
 
-use gnitz_core::{FkTarget, InlineUniqueIndex};
+use gnitz_core::{InlineUniqueIndex, pending_id};
 use gnitz_wire::{FkAction, FkRef, PkColList, RelClass, TableDistribution, TypeCode};
 
 use super::*;
@@ -182,7 +182,15 @@ fn primary_key_precedence() {
     assert_eq!(c.schema.pk_cols(), vec![1]);
     assert_eq!(
         c.fks,
-        [(0, FkTarget::SelfTable { col: 1, on_delete: FkAction::Restrict })].into()
+        [(
+            0,
+            FkRef {
+                table_id: pending_id(0),
+                col: 1,
+                on_delete: FkAction::Restrict
+            }
+        )]
+        .into()
     );
 }
 
@@ -483,11 +491,11 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         TypeCode::I64,
         "widened to the parent's type"
     );
-    let want = FkTarget::Table(FkRef {
+    let want = FkRef {
         table_id: 41,
         col: 0,
         on_delete: FkAction::Restrict,
-    });
+    };
     assert_eq!(c.fks, [(1, want)].into());
     assert_eq!(c.unique_indexes, vec![unique(&[1], None)]);
 
@@ -497,11 +505,11 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         &cat,
         "CREATE TABLE c2 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(u))",
     );
-    let want = FkTarget::Table(FkRef {
+    let want = FkRef {
         table_id: 41,
         col: 1,
         on_delete: FkAction::Restrict,
-    });
+    };
     assert_eq!(c.fks, [(1, want)].into());
 }
 
@@ -517,8 +525,12 @@ fn an_fk_carries_its_on_delete_action() {
         (" ON DELETE RESTRICT", FkAction::Restrict),
         (" ON DELETE CASCADE", FkAction::Cascade),
     ] {
-        let to_p = FkTarget::Table(FkRef { table_id: 41, col: 0, on_delete });
-        let to_self = FkTarget::SelfTable { col: 0, on_delete };
+        let to_p = FkRef { table_id: 41, col: 0, on_delete };
+        let to_self = FkRef {
+            table_id: pending_id(0),
+            col: 0,
+            on_delete,
+        };
         for (sql, want) in [
             (
                 format!("CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id){clause})"),
@@ -557,7 +569,11 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
         ("CREATE TABLE tree (id BIGINT PRIMARY KEY REFERENCES tree(id))", 0),
     ] {
         let c = created(&cat, sql);
-        let want = FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict };
+        let want = FkRef {
+            table_id: pending_id(0),
+            col: 0,
+            on_delete: FkAction::Restrict,
+        };
         assert_eq!(c.fks, [(col_idx, want)].into(), "{sql}");
         assert_eq!(c.schema.columns()[col_idx].ty.tc, TypeCode::I64, "{sql}");
     }
@@ -710,23 +726,27 @@ fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
         // Two tables named `t`: the session's own and `other`'s.
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
-            FkTarget::Table(FkRef {
+            FkRef {
                 table_id: 42,
                 col: 0,
                 on_delete: FkAction::Restrict,
-            }),
+            },
         ),
         (
             "CREATE TABLE other.t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
-            FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict },
+            FkRef {
+                table_id: pending_id(0),
+                col: 0,
+                on_delete: FkAction::Restrict,
+            },
         ),
         (
             "CREATE TABLE other.x (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id))",
-            FkTarget::Table(FkRef {
+            FkRef {
                 table_id: 41,
                 col: 0,
                 on_delete: FkAction::Restrict,
-            }),
+            },
         ),
     ] {
         assert_eq!(created(&cat, sql).fks.get(&1), Some(&want), "`{sql}`");

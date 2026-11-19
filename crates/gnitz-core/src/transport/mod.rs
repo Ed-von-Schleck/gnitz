@@ -247,13 +247,9 @@ impl ClientTransport {
     /// this is also where the handshake completes and certificate failures
     /// surface.
     fn hello(&mut self, token: &[u8], until: Instant) -> Result<(), ClientError> {
+        // A token is capped at `MAX_TOKEN_BYTES` before it gets here.
         let hello = gnitz_wire::client_hello(token);
-        self.enqueue(&hello).map_err(|len| {
-            ClientError::from(format!(
-                "the HELLO is {len} bytes, past the {}-byte frame ceiling; use a shorter access token",
-                gnitz_wire::MAX_FRAME_PAYLOAD
-            ))
-        })?;
+        self.enqueue(&hello).expect("a HELLO is far below the frame ceiling");
         loop {
             // Every round: a read queues the TLS handshake's next flight.
             self.flush()?;

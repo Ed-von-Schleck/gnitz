@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType};
 
-use gnitz_core::{ScanReply, Schema, ZSetBatch};
+use gnitz_core::{ScanReply, ZSetBatch};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{ColType, ColumnDef, RowSource, TypeCode, VALUE_TEXT_MAX, write_decimal, write_uuid};
 
@@ -339,34 +339,33 @@ fn cell_to_py(
 // ScanResult
 // ---------------------------------------------------------------------------
 
-/// The visible columns of `schema` over `batch`, or every column when
+/// The visible columns of `batch`'s schema over it, or every column when
 /// `include_hidden`.
 pub(crate) fn present(
     py: Python<'_>,
-    schema: Arc<Schema>,
     batch: Arc<ZSetBatch>,
     include_hidden: bool,
     lsn: Option<u64>,
 ) -> PyResult<PyScanResult> {
+    let schema = batch.schema();
     // One filter for both, so the row type names exactly the columns `cols` reads.
     let shown = || (schema.columns().iter().enumerate()).filter(move |(_, c)| include_hidden || !c.is_hidden);
     // Sized up front: a filtered iterator's size hint has no lower bound.
     let mut cols = Vec::with_capacity(schema.columns().len());
     cols.extend(shown().map(|(ci, c)| (schema.layout().locate(ci), c.ty)));
     let row_type = RowType::of(py, shown().map(|(_, c)| c))?;
-    Ok(PyScanResult { schema, batch, cols, row_type, lsn })
+    Ok(PyScanResult { batch, cols, row_type, lsn })
 }
 
 /// A reply's `ScanResult`: read verbs, SQL rows, delta rows.
 pub(crate) fn scan_result(py: Python<'_>, reply: ScanReply) -> PyResult<Py<PyScanResult>> {
-    Py::new(py, present(py, reply.schema, Arc::new(reply.batch), false, reply.lsn)?)
+    Py::new(py, present(py, Arc::new(reply.batch), false, reply.lsn)?)
 }
 
 /// One result's presentation over a shared batch: the columns shown, in order,
 /// and the `Row` subclass that names them.
 #[pyclass(name = "ScanResult", frozen, module = "gnitz")]
 pub struct PyScanResult {
-    schema: Arc<Schema>,
     batch: Arc<ZSetBatch>,
     cols: Vec<(ColumnLocator, ColType)>,
     row_type: RowType,
@@ -381,7 +380,7 @@ pub struct PyScanResult {
 impl PyScanResult {
     #[getter]
     fn schema(&self) -> PySchema {
-        PySchema { rust: Arc::clone(&self.schema) }
+        PySchema { rust: Arc::clone(self.batch.schema()) }
     }
 
     /// The names of the columns this result presents, in order — its rows'
@@ -403,7 +402,7 @@ impl PyScanResult {
 
     /// The same rows presenting every column, hidden ones included.
     fn including_hidden(&self, py: Python<'_>) -> PyResult<PyScanResult> {
-        present(py, Arc::clone(&self.schema), Arc::clone(&self.batch), true, self.lsn)
+        present(py, Arc::clone(&self.batch), true, self.lsn)
     }
 }
 

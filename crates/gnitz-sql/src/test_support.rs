@@ -152,14 +152,14 @@ pub(crate) fn two_col(val_tc: TypeCode) -> Schema {
 }
 
 /// `(pk U64 PK, c1, c2, …)`, the payload columns of types `tys`, all nullable.
-pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Schema {
+pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Arc<Schema> {
     let mut columns = vec![col("pk", TypeCode::U64)];
     columns.extend(
         tys.iter()
             .enumerate()
             .map(|(i, &ty)| ColumnDef::new(format!("c{}", i + 1), ty, true)),
     );
-    schema(columns, &[0])
+    Arc::new(schema(columns, &[0]))
 }
 
 /// Each comparison as SQL spells it, beside the operator that holds with the
@@ -288,7 +288,7 @@ impl Cell<'_> {
 /// A batch of `schema`: one row per `(key, weight, cells)`, the key as its columns'
 /// natives, one cell per payload slot.
 pub(crate) fn keyed_batch(schema: &Schema, rows: &[(&[u128], i64, &[Cell])]) -> ZSetBatch {
-    let mut b = ZSetBatch::new(schema);
+    let mut b = ZSetBatch::new(&Arc::new(schema.clone()));
     let mut app = b.builder();
     for &(key, w, cells) in rows {
         app.begin_row_natives(key, w);
@@ -309,10 +309,10 @@ pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
     keyed_batch(schema, &rows)
 }
 
-/// Each row of `b` (in `schema`) as its payload cells and weight — what
-/// [`batch_of`] wrote, read back.
-pub(crate) fn rows_of<'a>(schema: &Schema, batch: &'a ZSetBatch) -> Vec<(Vec<Cell<'a>>, i64)> {
-    let locs = schema.layout().payload_locators();
+/// Each row of `batch` as its payload cells and weight — what [`batch_of`]
+/// wrote, read back.
+pub(crate) fn rows_of(batch: &ZSetBatch) -> Vec<(Vec<Cell<'_>>, i64)> {
+    let locs = batch.schema().layout().payload_locators();
     let b = &batch.view();
     let cell = |r: usize, pi: usize, loc: &ColumnLocator| {
         let tc = loc.type_code();

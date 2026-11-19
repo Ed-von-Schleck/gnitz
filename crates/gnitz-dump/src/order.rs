@@ -5,18 +5,19 @@
 
 use std::collections::HashMap;
 
-use gnitz_core::{Schema, ZSetBatch};
+use gnitz_core::ZSetBatch;
 
 /// Rows of `batch`, each after every row it references through one of `refs` —
-/// columns of `schema` that reference its lone key column — except where rows
+/// columns of its schema that reference its lone key column — except where rows
 /// reference one another round a cycle: those come together and go in one
 /// push. Each row comes with whether a push may end after it, which is false
 /// inside such a set. With no `refs`, the rows in their own order.
-pub(crate) fn order(batch: &ZSetBatch, schema: &Schema, refs: &[usize]) -> Vec<(u32, bool)> {
+pub(crate) fn order(batch: &ZSetBatch, refs: &[usize]) -> Vec<(u32, bool)> {
     let n = batch.len();
     if refs.is_empty() {
         return (0..n as u32).map(|r| (r, true)).collect();
     }
+    let schema = batch.schema();
     let layout = schema.layout();
     let batch = &batch.view();
     let ref_locs: Vec<_> = refs.iter().map(|&c| layout.locate(c)).collect();

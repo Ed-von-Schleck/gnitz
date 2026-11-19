@@ -136,7 +136,7 @@ fn an_mtls_server_admits_only_a_leaf_its_client_ca_signed() {
     let srv = ServerHandle::start_mtls(1);
     let (mut client, _, tid, schema) = client_with_table(&srv.mtls_target());
     let pushed = rows(&schema, 0..500);
-    block_on(client.push(tid, &schema, &pushed, WireConflictMode::Update)).unwrap();
+    block_on(client.push(tid, pushed.clone(), WireConflictMode::Update)).unwrap();
     assert_eq!(
         weighted_rows(&scan_all(&mut client, tid, &schema)),
         weighted_rows(&pushed)
@@ -193,7 +193,7 @@ fn a_token_server_admits_only_a_held_token() {
 
     let (mut client, _, tid, schema) = client_with_table(&srv.token_target(&token));
     let pushed = rows(&schema, 0..300);
-    block_on(client.push(tid, &schema, &pushed, WireConflictMode::Update)).unwrap();
+    block_on(client.push(tid, pushed.clone(), WireConflictMode::Update)).unwrap();
     let mut local = GnitzClient::connect(srv.sock_path()).expect("the AF_UNIX socket asks for no token");
     assert_eq!(
         weighted_rows(&scan_all(&mut local, tid, &schema)),
@@ -224,7 +224,7 @@ fn a_sighup_reloads_the_token_file() {
     srv.sighup();
     assert_refused(&srv.token_target(&first), "does not recognise");
     let pushed = rows(&schema, 0..200);
-    block_on(held.push(tid, &schema, &pushed, WireConflictMode::Update)).expect("a held connection stays");
+    block_on(held.push(tid, pushed.clone(), WireConflictMode::Update)).expect("a held connection stays");
     assert_eq!(
         weighted_rows(&scan_all(&mut held, tid, &schema)),
         weighted_rows(&pushed)
@@ -332,10 +332,10 @@ fn both_transports_carry_every_cell_at_its_net_weight() {
     let (mut tls, _, tid, schema) = client_with_table(&srv.tls_target());
     let mut unix = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    block_on(tls.push(tid, &schema, rows(&schema, 0..700_000), WireConflictMode::Update)).unwrap();
+    block_on(tls.push(tid, rows(&schema, 0..700_000), WireConflictMode::Update)).unwrap();
     let mut retract = rows(&schema, [500]);
     retract.rewrite(|w| w.weight_mut()[..8].copy_from_slice(&(-1i64).to_le_bytes()));
-    block_on(unix.push(tid, &schema, &retract, WireConflictMode::Update)).unwrap();
+    block_on(unix.push(tid, retract, WireConflictMode::Update)).unwrap();
 
     let want = weighted_rows(&rows(&schema, (0..700_000).filter(|&pk| pk != 500)));
     for client in [&mut tls, &mut unix] {
@@ -383,7 +383,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         let pushes: Vec<_> = (0..n_pushes)
             .map(|i| {
                 let batch = rows(&schema, i * per..(i + 1) * per);
-                s.submit(push_req(tid, &schema, &batch))
+                s.submit(push_req(tid, &batch))
             })
             .collect();
         let all = ReadSpec::all_rows(ReadBound::None);
@@ -411,7 +411,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
     for target in [srv.sock_path().to_string(), srv.tls_target()] {
         with_watchdog(120, move || {
             let (mut setup, _, tid, schema) = client_with_table(&target);
-            block_on(setup.push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
+            block_on(setup.push(tid, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
 
             let mut s = Session::connect(&target).unwrap();
             set_small_bufs(s.as_fd().as_raw_fd());
@@ -422,7 +422,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
             assert!(evicted_within(&mut s, 8_000), "{target}: not evicted");
 
             // Everyone else kept going.
-            block_on(setup.push(tid, &schema, rows(&schema, [200_000]), WireConflictMode::Update)).unwrap();
+            block_on(setup.push(tid, rows(&schema, [200_000]), WireConflictMode::Update)).unwrap();
             assert_eq!(scan_all(&mut setup, tid, &schema).len(), 200_001);
         });
     }
@@ -443,7 +443,7 @@ fn a_stalled_client_flooding_pushes_is_held_off_and_evicted() {
     let target = srv.tls_target();
     with_watchdog(120, move || {
         let (mut setup, _, tid, schema) = client_with_table(&target);
-        block_on(setup.push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
+        block_on(setup.push(tid, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
 
         let mut s = Session::connect(&target).unwrap();
         set_small_bufs(s.as_fd().as_raw_fd());
@@ -453,7 +453,7 @@ fn a_stalled_client_flooding_pushes_is_held_off_and_evicted() {
         // ~140 MB of rows the table does not hold, ~1 MB a frame.
         let flood = rows(&schema, 200_000..225_000);
         let mut sent = 0;
-        while sent < 140 && s.submit(push_req(tid, &schema, &flood)).try_take().is_none() && write_out(&mut s) {
+        while sent < 140 && s.submit(push_req(tid, &flood)).try_take().is_none() && write_out(&mut s) {
             sent += 1;
         }
         assert!(

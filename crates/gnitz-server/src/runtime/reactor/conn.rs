@@ -129,10 +129,6 @@ impl RecvBuf {
         &self.buf
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buf
-    }
-
     /// `bytes` as a frame charged to a budget of its own, which nothing else
     /// draws on.
     #[cfg(all(test, fuzzing))]

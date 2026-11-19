@@ -10,7 +10,7 @@ use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::names::{extract_global_name, extract_object_name};
 use crate::rules::{ClassWant, canonical_user_name, reject_duplicate_names, require_class, require_column};
-use gnitz_core::{ClientError, FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
+use gnitz_core::{ClientError, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
 use sqlparser::ast::{
     Expr, ForeignKeyConstraint, IndexColumn, ObjectType, OrderByExpr, OrderByOptions, TableConstraint,
@@ -106,7 +106,7 @@ fn resolve_fk_target(
     self_ref: bool,
     cols: &[ColumnDef],
     pk: &[u32],
-) -> Result<(FkTarget, ColType), GnitzSqlError> {
+) -> Result<(FkRef, ColType), GnitzSqlError> {
     let probed;
     let (parent_cols, pk_single, parent) = match self_ref {
         true => (cols, (pk.len() == 1).then(|| pk[0] as usize), None),
@@ -123,10 +123,8 @@ fn resolve_fk_target(
     let parent_ty = parent_cols[col].ty;
     check_fk_type_compat(cols[site.col_idx].ty, parent_ty)?;
     let (col, on_delete) = (col as u32, site.on_delete);
-    let target = match parent {
-        None => FkTarget::SelfTable { col, on_delete },
-        Some(table_id) => FkTarget::Table(FkRef { table_id, col, on_delete }),
-    };
+    let table_id = parent.unwrap_or(gnitz_core::pending_id(0));
+    let target = FkRef { table_id, col, on_delete };
     Ok((target, parent_ty))
 }
 

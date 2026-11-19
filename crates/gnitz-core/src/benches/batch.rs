@@ -13,11 +13,13 @@ fn pk_keys_bench() {
     const ROWS: usize = 1_000_000;
     let counter = gnitz_foundation::perf::Counter::instructions();
     let key_schema = |types: &[TypeCode]| {
-        Schema::from_parts(
-            types.iter().map(|&tc| ColumnDef::new("k", tc, false)).collect(),
-            &(0..types.len() as u32).collect::<Vec<u32>>(),
+        Arc::new(
+            Schema::from_parts(
+                types.iter().map(|&tc| ColumnDef::new("k", tc, false)).collect(),
+                &(0..types.len() as u32).collect::<Vec<u32>>(),
+            )
+            .unwrap(),
         )
-        .unwrap()
     };
     for types in [&[TypeCode::I64][..], &[TypeCode::I32, TypeCode::U128, TypeCode::I16]] {
         let schema = black_box(key_schema(types));
@@ -47,7 +49,7 @@ fn gather_bench() {
         let mut columns = vec![ColumnDef::new("id", TypeCode::U64, false)];
         columns.extend((0..ints).map(|_| ColumnDef::new("v", TypeCode::I64, false)));
         columns.extend(string.then(|| ColumnDef::new("s", TypeCode::String, false)));
-        let schema = Schema::from_parts(columns, &[0]).unwrap();
+        let schema = Arc::new(Schema::from_parts(columns, &[0]).unwrap());
         let mut b = ZSetBatch::new(&schema);
         let mut app = b.builder();
         for i in 0..ROWS {
@@ -88,7 +90,7 @@ fn gather_bench() {
         let mut columns = vec![ColumnDef::new("id", TypeCode::U64, false)];
         columns.extend((0..ints).map(|_| ColumnDef::new("v", TypeCode::I64, false)));
         columns.extend(string.then(|| ColumnDef::new("s", TypeCode::String, false)));
-        let schema = Schema::from_parts(columns, &[0]).unwrap();
+        let schema = Arc::new(Schema::from_parts(columns, &[0]).unwrap());
         let mut b = ZSetBatch::new(&schema);
         let mut app = b.builder();
         for i in 0..ROWS {

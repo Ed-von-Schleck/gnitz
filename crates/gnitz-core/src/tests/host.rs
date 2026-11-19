@@ -3,8 +3,7 @@ use crate::ProtocolError;
 use crate::connection::Request;
 use crate::sync_op;
 use crate::test_support::{
-    await_reply, client_pair, delta_terminal, interrupt_self_until, kv_schema, reply_ctrl, session_pair, sub_id,
-    sync_answer,
+    client_pair, hold_subscription, interrupt_self_until, kv_schema, reply_ctrl, session_pair, sub_id, sync_answer,
 };
 use crate::transport::poll_fd;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
@@ -32,7 +31,7 @@ fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
 
     // The peer never answers, so the scan parks; the signal makes the park
     // return `EINTR`, which is the one place the hook runs.
-    let (sa, spec) = (Arc::new(kv_schema(TypeCode::I64)), ReadSpec::all_rows(ReadBound::None));
+    let (sa, spec) = (kv_schema(TypeCode::I64), ReadSpec::all_rows(ReadBound::None));
     let r = block_on(c.scan_served(1, &spec, &sa));
     assert!(matches!(r, Err(ClientError::Interrupted(ref e)) if e.to_string() == "interrupted"));
     stop.store(true, Ordering::Relaxed);
@@ -59,7 +58,7 @@ fn a_cancellable_wait_gives_up_on_a_readable_cancel_socket_and_drains_it() {
     let (s, peer) = session_pair();
     let (cancel, mut canceller) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut c = GnitzClient::over(s, Box::new(BlockingHost::cancelled_by(cancel).unwrap())).unwrap();
-    let (sa, spec) = (Arc::new(kv_schema(TypeCode::I64)), ReadSpec::all_rows(ReadBound::None));
+    let (sa, spec) = (kv_schema(TypeCode::I64), ReadSpec::all_rows(ReadBound::None));
     std::io::Write::write_all(&mut canceller, b"xx").unwrap();
     let r = block_on(c.scan_served(1, &spec, &sa));
     assert!(matches!(r, Err(ClientError::Interrupted(_))));
@@ -331,10 +330,8 @@ fn serve_ends_the_session_as_the_hosts_failure() {
 fn serve_lands_a_sync_answered_after_the_calls_ended() {
     let (mut s, peer) = session_pair();
     // A kept read answered, so the server holds a subscription and the sync is a request.
-    let schema = Arc::new(kv_schema(TypeCode::I64));
-    let read = s.submit_delta_read(40.into(), None, &schema, &[], Some(sub_id(5)));
-    peer.send(&delta_terminal(40, 1, 3));
-    await_reply(&mut s, read).unwrap();
+    let schema = kv_schema(TypeCode::I64);
+    hold_subscription(&mut s, &peer, sub_id(5), &schema, 3);
     peer.recv();
     // Its own descriptor of the socket, which outlives the session moved into the client.
     let fd = s.as_fd().try_clone_to_owned().unwrap();
@@ -361,10 +358,8 @@ fn serve_lands_a_sync_answered_after_the_calls_ended() {
 #[test]
 fn serve_lands_a_sync_answered_in_place_ahead_of_a_held_one() {
     let (mut s, peer) = session_pair();
-    let schema = Arc::new(kv_schema(TypeCode::I64));
-    let read = s.submit_delta_read(40.into(), None, &schema, &[], Some(sub_id(5)));
-    peer.send(&delta_terminal(40, 1, 3));
-    await_reply(&mut s, read).unwrap();
+    let schema = kv_schema(TypeCode::I64);
+    hold_subscription(&mut s, &peer, sub_id(5), &schema, 3);
     peer.recv();
     let fd = s.as_fd().try_clone_to_owned().unwrap();
     let landed = Arc::new(Mutex::new(Vec::new()));

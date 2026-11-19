@@ -15,7 +15,7 @@ fn apply_set_bench() {
     let mut columns = vec![ColumnDef::new("id", TypeCode::U64, false)];
     columns.extend((1..=8).map(|i| ColumnDef::new(format!("i{i}"), TypeCode::I64, false)));
     columns.extend((1..=2).map(|i| ColumnDef::new(format!("t{i}"), TypeCode::String, false)));
-    let schema = Schema::from_parts(columns, &[0]).unwrap();
+    let schema = std::sync::Arc::new(Schema::from_parts(columns, &[0]).unwrap());
     let mut rows = ZSetBatch::new(&schema);
     let mut app = rows.builder();
     let mut rng = gnitz_foundation::rng::Rng::new(0x9E37_79B9_7F4A_7C15);
@@ -44,10 +44,10 @@ fn apply_set_bench() {
             panic!("`{sql}` is an UPDATE")
         };
         let mut set = bind_set_list(&u.assignments, &schema, "t", SetClause::Update).unwrap();
-        black_box(apply_set(&mut set, rows.clone(), None, &schema).unwrap());
+        black_box(apply_set(&mut set, rows.clone(), None).unwrap());
         // `apply_set` consumes its batch, so the clone it is handed is measured and subtracted.
         let (copy, clone) = counter.measure(|| rows.clone());
-        let (out, total) = counter.measure(|| apply_set(&mut set, rows.clone(), None, &schema).unwrap());
+        let (out, total) = counter.measure(|| apply_set(&mut set, rows.clone(), None).unwrap());
         black_box((copy, out));
         println!(
             "apply_set_bench {name:<20} {:7.1} instr/row",

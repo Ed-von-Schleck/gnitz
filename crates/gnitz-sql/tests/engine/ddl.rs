@@ -350,7 +350,10 @@ fn alter_results_and_if_exists_no_ops() {
     // RENAME COLUMN is allowed under a dependent view: views bind columns by
     // ordinal.
     db.exec("ALTER TABLE t2 RENAME COLUMN v TO w; ALTER TABLE vw RENAME TO vw2");
-    assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a", "b"]);
+    assert_eq!(
+        visible_names(db.read("SELECT * FROM t2").schema()),
+        ["id", "w", "a", "b"]
+    );
     assert_eq!(db.scan("vw2", &["id", "v"]), at_weight_one(&[vec![2, 20], vec![3, 30]]));
 
     // A constraint name resolves case-insensitively.
@@ -368,7 +371,7 @@ fn alter_results_and_if_exists_no_ops() {
     // An existing column ends the statement before the dependent view's RESTRICT.
     db.exec("ALTER TABLE t2 ADD COLUMN IF NOT EXISTS w TEXT");
     db.exec("DROP VIEW vw2; ALTER TABLE t2 DROP COLUMN b");
-    assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a"]);
+    assert_eq!(visible_names(db.read("SELECT * FROM t2").schema()), ["id", "w", "a"]);
     db.exec("INSERT INTO t2 VALUES (5, 50, 5)");
     assert_eq!(
         db.rows("SELECT id, w, a FROM t2 WHERE id >= 4", &["id", "w", "a"]),
@@ -384,7 +387,10 @@ fn alter_results_and_if_exists_no_ops() {
 
     // A dropped column's name is free: IF NOT EXISTS appends a new column under it.
     db.exec("ALTER TABLE t2 ADD COLUMN IF NOT EXISTS b BIGINT; ALTER TABLE t2 ADD COLUMN IF NOT EXISTS b TEXT");
-    assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a", "b"]);
+    assert_eq!(
+        visible_names(db.read("SELECT * FROM t2").schema()),
+        ["id", "w", "a", "b"]
+    );
     db.exec("INSERT INTO t2 VALUES (7, 70, 7, 700)");
     assert_eq!(
         db.rows("SELECT id, b FROM t2 WHERE id >= 6", &["id", "b"]),

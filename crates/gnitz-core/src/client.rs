@@ -17,7 +17,7 @@ use crate::connection::{RelDescriptor, Request, ScanReply, Session};
 use crate::error::{ClientError, not_found};
 use crate::host::{BlockingHost, Host, Pending, Sent, block_on, offload, serve};
 use crate::txn::TxnBuffer;
-use crate::{PushBatch, RelName, Schema, ZSetBatch};
+use crate::{RelName, Schema, ZSetBatch};
 
 /// The ids one SERIAL reservation takes when the statement asks for fewer. Each
 /// reservation is a round trip to the master.
@@ -62,10 +62,10 @@ const _: fn() = || {
     fn assert_send_value<T: Send>(_: T) {}
     assert_send::<GnitzClient>();
     assert_send::<Sent<ScanReply>>();
-    let _ = |mut c: GnitzClient, schema: &Arc<Schema>, batch: &ZSetBatch| {
+    let _ = |mut c: GnitzClient, batch: ZSetBatch| {
         assert_send_value(c.sync(Duration::ZERO));
         assert_send_value(c.create_schema("", false));
-        assert_send_value(c.push(0, schema, batch, WireConflictMode::Update));
+        assert_send_value(c.push(0, batch, WireConflictMode::Update));
         assert_send_value(serve(c, |_| Poll::Ready(None)));
     };
     assert_send::<ZSetBatch>();
@@ -238,22 +238,19 @@ impl GnitzClient {
     /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns
     /// the one zone LSN covering the whole bundle. A batch passed by value moves
     /// into the buffer; a shared one is held as it is until a later push to the
-    /// same family extends it, which copies it if the caller still holds it; a
-    /// borrowed one is copied into the buffer once.
-    pub fn push<'a>(
+    /// same family extends it, which copies it if the caller still holds it.
+    pub fn push(
         &mut self,
         target: impl Into<Target>,
-        schema: &Arc<Schema>,
-        batch: impl Into<PushBatch<'a>>,
+        batch: impl Into<Arc<ZSetBatch>>,
         mode: WireConflictMode,
     ) -> Pending<'_, u64> {
         let (target, batch) = (target.into(), batch.into());
         if let Some(txn) = &mut self.txn {
-            let buffered = txn.push(target, schema, batch, mode, BLIND);
+            let buffered = txn.push(target, batch, mode, BLIND);
             return self.wait(Sent::ready(buffered.map(|()| 0)));
         }
-        let batch = &*batch;
-        self.ack(Request::Push { target, schema, batch, mode })
+        self.ack(Request::Push { target, batch: &batch, mode })
     }
 
     /// Run a parameterized bounded read on the server, replied in
@@ -304,9 +301,7 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        let sent = self
-            .session
-            .submit_delta_read(view.into(), from, reply_schema, spec, None);
+        let sent = self.session.submit_delta_read(view.into(), from, reply_schema, spec);
         self.wait(sent)
     }
 

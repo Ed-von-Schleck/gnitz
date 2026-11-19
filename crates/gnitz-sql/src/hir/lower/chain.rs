@@ -5,7 +5,7 @@
 use super::super::RelExpr;
 use super::super::physical::Frame;
 use super::{SegInput, SegSource};
-use gnitz_core::{PlannedView, Schema, segment_id};
+use gnitz_core::{PlannedView, Schema, pending_id};
 use gnitz_wire::Circuit;
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
@@ -75,7 +75,7 @@ impl ViewChain {
     pub(super) fn add_segment(&mut self, p: EmitPieces) -> SegInput {
         let EmitPieces { circuit, out: frame, pk_repeats } = p;
         let src = SegSource::Segment {
-            tid: segment_id(self.segments.len() as u64),
+            tid: pending_id(self.segments.len() as u64),
             pk_repeats,
         };
         self.segments.push(PlannedView {

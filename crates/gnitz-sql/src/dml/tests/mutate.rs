@@ -32,7 +32,7 @@ fn updated(schema: &Schema, set: &str, held: &[&[Cell]]) -> Result<ZSetBatch, Gn
     let mut set = set_list(plan(&cat, &format!("UPDATE t SET {set}"))?);
     let mut rows = batch_of(schema, held);
     rows.fill_weights(3);
-    apply_set(&mut set, rows, None, schema)
+    apply_set(&mut set, rows, None)
 }
 
 const I: ColType = ColType::of(TypeCode::I64);
@@ -109,7 +109,7 @@ fn a_set_list_rewrites_the_row_it_read() {
     for (tys, set, before, after) in cases {
         let schema = typed_schema(tys);
         let out = updated(&schema, set, &[before]).unwrap_or_else(|e| panic!("{set}: {e:?}"));
-        assert_eq!(rows_of(&schema, &out), [(after.to_vec(), 1)], "{set} over {before:?}");
+        assert_eq!(rows_of(&out), [(after.to_vec(), 1)], "{set} over {before:?}");
     }
 }
 
@@ -121,7 +121,7 @@ fn a_uuid_column_is_copied() {
     rows.builder().begin_row(1, 1).put_int(0).put_int(u128::MAX - 7);
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut set = set_list(plan(&cat, "UPDATE t SET c1 = c2").unwrap());
-    let out = apply_set(&mut set, rows, None, &schema).unwrap();
+    let out = apply_set(&mut set, rows, None).unwrap();
     assert_eq!(out.view().col_data(0), (u128::MAX - 7).to_le_bytes());
 }
 
@@ -151,11 +151,7 @@ fn a_computed_value_is_range_checked_at_the_column_width() {
         let schema = typed_schema(&[src, dst]);
         let out = updated(&schema, "c2 = c1 + 0", &[&[Int(v), Null]]);
         match fits {
-            true => assert_eq!(
-                rows_of(&schema, &out.unwrap()),
-                [(vec![Int(v), Int(v)], 1)],
-                "{dst:?} {v}"
-            ),
+            true => assert_eq!(rows_of(&out.unwrap()), [(vec![Int(v), Int(v)], 1)], "{dst:?} {v}"),
             false => assert_rejects(&format!("{dst:?} {v}"), out, "out of range"),
         }
     }
@@ -170,7 +166,7 @@ fn a_computed_value_is_written_across_morsels() {
     let held: Vec<[Cell; 2]> = (0..700).map(|i| [src(i), Null]).collect();
     let held: Vec<&[Cell]> = held.iter().map(|r| &r[..]).collect();
     let want: Vec<_> = (0..700).map(|i| (vec![src(i), src(i)], 1)).collect();
-    assert_eq!(rows_of(&schema, &updated(&schema, "c2 = c1 + 0", &held).unwrap()), want);
+    assert_eq!(rows_of(&updated(&schema, "c2 = c1 + 0", &held).unwrap()), want);
     let mut bad: Vec<[Cell; 2]> = (0..700).map(|i| [src(i), Null]).collect();
     bad[650][0] = Int(300);
     let bad: Vec<&[Cell]> = bad.iter().map(|r| &r[..]).collect();
@@ -228,7 +224,7 @@ fn the_arena_holds_only_referenced_spill() {
     for (tys, set, before, n, after, blob_len) in cases {
         let schema = typed_schema(tys);
         let out = updated(&schema, set, &vec![*before; *n]).unwrap();
-        assert_eq!(rows_of(&schema, &out), vec![(after.to_vec(), 1); *n], "{set}");
+        assert_eq!(rows_of(&out), vec![(after.to_vec(), 1); *n], "{set}");
         assert_eq!(out.view().blob().len(), *blob_len, "{set}");
     }
 }

@@ -2,9 +2,9 @@
 
 use std::num::NonZeroU64;
 
-use gnitz_core::{ZSetBatch, encode_ddl_txn, sys_schema};
+use gnitz_core::{ZSetBatch, sys_schema};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, Sink};
-use gnitz_wire::multi_frame::{ScanItem, encode_scan_multi};
+use gnitz_wire::multi_frame::{ScanItem, encode_ddl_txn, encode_scan_multi};
 use gnitz_wire::{
     Circuit, CircuitRow, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, SysFamily,
     SysRow, Target,
@@ -37,7 +37,9 @@ pub(crate) fn circuit(predicate: &[u8]) -> Vec<u8> {
 pub(crate) fn ddl_frame(circuit: &[u8]) -> Vec<u8> {
     let mut batch = ZSetBatch::new(sys_schema(SysFamily::Circuit));
     CircuitRow { view_id: 100, circuit: circuit.into() }.write(&mut batch.builder(), 1);
-    encode_ddl_txn(&[(SysFamily::Circuit, batch)])
+    let mut out = Vec::new();
+    encode_ddl_txn(&mut out, [(SysFamily::Circuit, batch.view().wire_regions())]);
+    out
 }
 
 /// A `SCAN_MULTI` of relation 9 under `spec`.

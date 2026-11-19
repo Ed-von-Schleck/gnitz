@@ -11,6 +11,7 @@
 //! of it fails.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use gnitz_core::{MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
@@ -34,13 +35,13 @@ const OTHER_TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID + 1;
 const FIRST_GENERATION: u64 = 1;
 
 /// The client-side schema whose record denotes `layout`.
-fn schema_of(layout: &SchemaDescriptor) -> Schema {
-    Schema::from_record(&encode_schema_record(layout)).unwrap()
+fn schema_of(layout: &SchemaDescriptor) -> Arc<Schema> {
+    Arc::new(Schema::from_record(&encode_schema_record(layout)).unwrap())
 }
 
 /// The shape every copy here is registered under: [`make_schema_u64_i64`]'s, so
 /// a batch built on the engine side decodes against a copy registered from here.
-fn view_schema() -> Schema {
+fn view_schema() -> Arc<Schema> {
     schema_of(&make_schema_u64_i64())
 }
 

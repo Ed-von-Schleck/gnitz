@@ -41,10 +41,6 @@ ring = "0.17"
 slab = "0.4"
 
 [dev-dependencies]
-# Dev-only, and deliberately not a real dependency: the client half of the
-# DDL-bundle client→server pairing and of the layout-digest agreement (the
-# schema-codec suite).
-gnitz-core = { path = "../gnitz-core" }
 gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
 proptest.workspace = true
 tempfile.workspace = true

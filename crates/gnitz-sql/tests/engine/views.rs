@@ -265,8 +265,8 @@ fn adhoc_fold_matches_view() {
     ] {
         assert_eq!(db.rows(sql, cols), at_weight_one(&expected), "{sql}");
         assert_eq!(db.scan(view, cols), at_weight_one(&expected), "{view}");
-        assert_eq!(visible_names(&db.read(sql).0), cols);
-        assert_eq!(visible_names(&db.read(&format!("SELECT * FROM {view}")).0), cols);
+        assert_eq!(visible_names(db.read(sql).schema()), cols);
+        assert_eq!(visible_names(db.read(&format!("SELECT * FROM {view}")).schema()), cols);
     }
     assert_eq!(
         db.rows(&format!("{gb} ORDER BY g DESC LIMIT 2 OFFSET 1"), &["g", "n"]),

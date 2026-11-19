@@ -850,7 +850,6 @@ name = "gnitz-server"
 version = "0.1.8"
 dependencies = [
  "bolero",
- "gnitz-core",
  "gnitz-expr",
  "gnitz-foundation",
  "gnitz-fuzz",

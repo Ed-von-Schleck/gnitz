@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use gnitz_core::local_server::{self, LocalServer};
+use gnitz_foundation::local_server::{self, LocalServer};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 /// Whether SIGINT cancels a wait of the session rather than ending it.

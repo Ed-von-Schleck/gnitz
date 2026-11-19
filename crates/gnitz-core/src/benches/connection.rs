@@ -2,36 +2,32 @@ use super::*;
 use crate::test_support::{session_pair, wide_rows, wide_schema};
 use std::hint::black_box;
 
-/// Instructions to validate a push request of four nullable columns and to
-/// encode it into a buffer the rounds reuse, at one row and at 100k, with no
-/// NULL and with one NULL per row.
+/// Instructions to encode a push request of four nullable columns into a buffer
+/// the rounds reuse, at one row and at 100k, with no NULL and with one NULL per
+/// row.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn push_validate_bench() {
+fn push_encode_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     for (nrows, iters) in [(1usize, 2000u64), (100_000, 20)] {
         for null_every in [0usize, 4] {
             let schema = wide_schema(5, true);
             let batch = wide_rows(&schema, nrows, null_every);
             let target = Target { tid: 7, token: 1 };
-            let (mut v, mut e) = (0, 0);
+            let mut e = 0;
             let mut out = Vec::new();
             for _ in 0..iters {
                 let push = || Request::Push {
                     target,
-                    schema: &schema,
                     batch: &batch,
                     mode: WireConflictMode::Update,
                 };
-                v += counter.measure(|| black_box(black_box(push()).validate()).unwrap()).1;
                 out.clear();
                 e += counter.measure(|| push().append(black_box(&mut out))).1;
             }
-            let per_row = |x: u64| x as f64 / (iters * nrows as u64) as f64;
             println!(
-                "push_validate_bench {nrows} rows, null every {null_every}: validate {:.2} instr/row, encode {:.2}",
-                per_row(v),
-                per_row(e),
+                "push_encode_bench {nrows} rows, null every {null_every}: {:.2} instr/row",
+                e as f64 / (iters * nrows as u64) as f64,
             );
         }
     }
@@ -50,7 +46,6 @@ fn submit_write_bench() {
     submit_write("1-row push", |s| {
         drop(s.submit(Request::Push {
             target: Target { tid: 7, token: 1 },
-            schema: &schema,
             batch: &batch,
             mode: WireConflictMode::Update,
         }))

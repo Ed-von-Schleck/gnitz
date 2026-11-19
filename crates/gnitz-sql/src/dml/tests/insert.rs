@@ -124,13 +124,12 @@ fn values_land_in_the_columns_the_list_names() {
         ("INSERT INTO sr (name) VALUES ('x')", vec![], one(&[Str("x")])),
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        let schema = &plan.target.schema;
         match want_keys.is_empty() {
             // A SERIAL key is reserved at execute: planned, it is zero bytes.
             true => assert!(rows(&plan).view().pk().iter().all(|&b| b == 0), "`{sql}`"),
             false => assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`"),
         }
-        assert_eq!(rows_of(schema, rows(&plan)), want_rows, "`{sql}`");
+        assert_eq!(rows_of(rows(&plan)), want_rows, "`{sql}`");
     }
 }
 
@@ -404,10 +403,10 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
             panic!("`{sql}` has no ON CONFLICT");
         };
         let schema = &target.schema;
-        let out = resolve_conflicts(rows, batch_of(schema, held), set.as_deref_mut(), schema).unwrap();
+        let out = resolve_conflicts(rows, batch_of(schema, held), set.as_deref_mut()).unwrap();
         assert_eq!(&keys(&out), want_keys, "`{sql}`");
         let want: Vec<_> = want_rows.iter().map(|cells| (cells.to_vec(), 1)).collect();
-        assert_eq!(rows_of(schema, &out), want, "`{sql}`");
+        assert_eq!(rows_of(&out), want, "`{sql}`");
     }
 }
 
@@ -432,7 +431,7 @@ fn on_conflict_refuses_a_reply_outside_the_read_keys() {
         let foreign = batch_of(schema, &[&[Int(10), Null], &[Int(20), Null]]);
         let twice = keyed_batch(schema, &[(&[1], 1, &[Int(10), Null]), (&[1], 1, &[Int(20), Null])]);
         for (held, what) in [(foreign, "a key that was not read"), (twice, "a key held twice")] {
-            match resolve_conflicts(rows.clone(), held, set.as_deref_mut(), schema) {
+            match resolve_conflicts(rows.clone(), held, set.as_deref_mut()) {
                 Err(GnitzSqlError::Client(ClientError::Protocol(e))) => {
                     assert!(e.to_string().contains(what), "`{sql}`: {e}")
                 }

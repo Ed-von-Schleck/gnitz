@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::Cell::{self, Int, Null, Str};
 use crate::test_support::{col, ncol, schema};
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
+use std::sync::Arc;
 
 /// A wire key over column `col`.
 const fn key(col: u32, desc: bool, nulls_first: bool) -> OrderKey {
@@ -12,15 +13,15 @@ const fn key(col: u32, desc: bool, nulls_first: bool) -> OrderKey {
 const BY_V: [OrderKey; 1] = [key(1, false, false)];
 
 /// `(id U64 pk, v I64 nullable, s STRING nullable)`.
-fn kv_schema() -> Schema {
-    schema(
+fn kv_schema() -> Arc<Schema> {
+    Arc::new(schema(
         vec![
             col("id", TypeCode::U64),
             ncol("v", TypeCode::I64),
             ncol("s", TypeCode::String),
         ],
         &[0],
-    )
+    ))
 }
 
 /// A `kv_schema` batch of `(id, v, s, weight)` rows.
@@ -37,13 +38,13 @@ fn kv(rows: &[(u128, Cell, Cell, i64)]) -> ZSetBatch {
 
 /// `order` and `slice` over `kv_schema`.
 fn cut_of(order: &[OrderKey], slice: WeightSlots) -> ResultCut {
-    ResultCut::new(std::sync::Arc::new(kv_schema()), order, slice).unwrap()
+    ResultCut::new(kv_schema(), order, slice).unwrap()
 }
 
 /// The sort and cut of `b`, checked to be a well-formed batch.
 fn run(b: &ZSetBatch, order: &[OrderKey], slice: WeightSlots) -> ZSetBatch {
     let out = cut_of(order, slice).apply(b.clone());
-    out.validate(&kv_schema()).unwrap();
+    out.validate().unwrap();
     out
 }
 

@@ -227,13 +227,9 @@ impl PyClient {
     #[pyo3(signature = (target_id, batch, mode = "update"))]
     fn push(slf: &Bound<'_, Self>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<Py<PyAny>> {
         let mode: WireConflictMode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
-        let (schema, rows) = (Arc::clone(batch.schema()), Arc::clone(&batch.batch));
+        let rows = Arc::clone(&batch.batch);
         drop(batch);
-        Self::run(
-            slf,
-            single!(|c| c.push(target_id, &schema, Arc::clone(&rows), mode)),
-            value,
-        )
+        Self::run(slf, single!(|c| c.push(target_id, Arc::clone(&rows), mode)), value)
     }
 
     /// delete(target_id, schema, pks) — `pks` is a sequence where each element
@@ -245,10 +241,10 @@ impl PyClient {
         schema: PySchema,
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let batch = ZSetBatch::retraction(&schema.rust, py_pk_keys(&schema.rust, &pks)?.as_bytes());
+        let batch = ZSetBatch::key_rows(&schema.rust, py_pk_keys(&schema.rust, &pks)?.as_bytes(), -1);
         Self::run(
             slf,
-            single!(|c| c.push(target_id, &schema.rust, batch, WireConflictMode::Update)),
+            single!(|c| c.push(target_id, batch, WireConflictMode::Update)),
             none,
         )
     }

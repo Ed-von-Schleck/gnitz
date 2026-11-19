@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::client::GnitzClient;
-use crate::connection::{RawBlock, RelDescriptor, ScanReply, Session};
+use crate::connection::{DeltaPoll, RawBlock, RelDescriptor, ScanReply};
 use crate::ddl::DdlBundle;
 use crate::error::ClientError;
 use crate::host::{BoxFut, Host, Pending, Sent, offload};
@@ -93,7 +93,12 @@ pub trait MirrorStore: Send {
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), String>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
-    fn scan_spec(&mut self, tid: u64, spec: gnitz_wire::ReadSpec, reply_schema: &Schema) -> Result<ZSetBatch, String>;
+    fn scan_spec(
+        &mut self,
+        tid: u64,
+        spec: gnitz_wire::ReadSpec,
+        reply_schema: &Arc<Schema>,
+    ) -> Result<ZSetBatch, String>;
 
     /// The round `tid`'s copy answers at, and by its presence that the copy is
     /// valid at all — the store half of the readability gate.
@@ -636,6 +641,9 @@ impl GnitzClient {
                         s.fill(tid, &taken, sealed_at)
                     };
                     failed = store.clone().run(host, fill).await?.err();
+                } else if froms[i].is_none() && failed.is_some() {
+                    // The refused copy takes nothing more of its train.
+                    blocks.clear();
                 }
                 let Some(end) = end else {
                     // The item is still being read.
@@ -945,11 +953,7 @@ impl GnitzClient {
                         .map_err(ClientError::Mirror)
                 });
                 drop(store);
-                let reply = scanned.map(|batch| ScanReply {
-                    batch,
-                    schema: Arc::clone(reply_schema),
-                    lsn: None,
-                });
+                let reply = scanned.map(|batch| ScanReply { batch, lsn: None });
                 return self.wait(Sent::ready(reply));
             }
         }
@@ -990,40 +994,6 @@ impl GnitzClient {
     /// diagnosing one is what it is for.
     pub fn mirror_poisoned(&self) -> bool {
         self.mirror.as_deref().is_some_and(|m| m.store.refusal().is_err())
-    }
-}
-
-/// A delta poll in flight: `items` in one request, item `i` parked in the
-/// session as `kept_as(first, i)` and taken in order. Dropping it releases
-/// every item not yet taken whole, which drops what is left of its train. A
-/// subscription it kept is its caller's only once recorded where the next
-/// sync names it from.
-struct DeltaPoll<'s> {
-    session: &'s mut Session,
-    first: SubId,
-    /// The item being answered: every one before it was taken whole.
-    at: usize,
-    items: usize,
-}
-
-impl Drop for DeltaPoll<'_> {
-    fn drop(&mut self) {
-        for i in self.at..self.items {
-            self.session.release(kept_as(self.first, i));
-        }
-    }
-}
-
-impl<'s> DeltaPoll<'s> {
-    /// Poll `items`, item `i` kept as the subscription `kept_as(first, i)`.
-    fn start(session: &'s mut Session, first: SubId, items: &[DeltaPollItem]) -> Self {
-        session.submit_delta_poll(first, items);
-        DeltaPoll {
-            session,
-            first,
-            at: 0,
-            items: items.len(),
-        }
     }
 }
 

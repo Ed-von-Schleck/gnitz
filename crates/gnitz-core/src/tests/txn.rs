@@ -1,12 +1,11 @@
 use super::*;
-use crate::block_on;
-use crate::test_support::{client_pair, kv_rows, kv_schema};
+use crate::test_support::{kv_rows, kv_schema, wide_rows, wide_schema};
 use WireConflictMode::{Error, Update};
 use gnitz_wire::{ColumnDef, TypeCode, payload_u64};
 
 fn del(pk: u64) -> ZSetBatch {
-    let s = Arc::new(kv_schema(TypeCode::I64));
-    ZSetBatch::retraction(&s, s.pk_keys([[pk as u128]]).as_bytes())
+    let s = kv_schema(TypeCode::I64);
+    ZSetBatch::key_rows(&s, s.pk_keys([[pk as u128]]).as_bytes(), -1)
 }
 
 /// `(pk, v, weight)` of a `kv_schema(I64)` batch, sorted.
@@ -56,7 +55,6 @@ fn overlaid(buf: &mut TxnBuffer, tid: u64) -> Vec<(u64, i64, i64)> {
 /// insert_error k" is the Update-then-Error pair.
 #[test]
 fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
     let mut buf = TxnBuffer::default();
     for (tid, batch, mode, basis) in [
         (16, kv_rows(&[(1, 11, 1)]), Update, BLIND), // family 0, row 0
@@ -69,7 +67,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
         (16, del(1), Update, 9),                     // family 3: back to Update, in call order
         (16, kv_rows(&[(1, 13, 1)]), Error, BLIND),  // family 4: the Error re-insert
     ] {
-        buf.push(tid, &s, batch, mode, basis).unwrap();
+        buf.push(tid, batch, mode, basis).unwrap();
     }
 
     let shape: Vec<_> = buf
@@ -111,10 +109,9 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
 /// indexes the family before its copy; the index stays valid after it.
 #[test]
 fn a_shared_batch_is_buffered_as_it_was_at_each_push() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
     let mut buf = TxnBuffer::default();
     let mut rows = Arc::new(kv_rows(&[(1, 11, 1)]));
-    buf.push(7, &s, Arc::clone(&rows), Update, BLIND).unwrap();
+    buf.push(7, Arc::clone(&rows), Update, BLIND).unwrap();
     assert!(
         Arc::ptr_eq(&buf.families[0].batch, &rows),
         "a new family shares the batch"
@@ -124,7 +121,7 @@ fn a_shared_batch_is_buffered_as_it_was_at_each_push() {
     Arc::make_mut(&mut rows).extend_from(&kv_rows(&[(2, 21, 1)]));
     assert_eq!(contents(&buf.families[0].batch), [(1, 11, 1)]);
 
-    buf.push(7, &s, Arc::clone(&rows), Update, BLIND).unwrap();
+    buf.push(7, Arc::clone(&rows), Update, BLIND).unwrap();
     assert_eq!(buf.families.len(), 1);
     assert_eq!(contents(&buf.families[0].batch), [(1, 11, 1), (1, 11, 1), (2, 21, 1)]);
     assert_eq!(
@@ -139,9 +136,8 @@ fn a_shared_batch_is_buffered_as_it_was_at_each_push() {
 /// stand, whatever weight it was pushed at.
 #[test]
 fn the_overlay_adds_a_buffered_row_at_weight_one() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
     let mut buf = TxnBuffer::default();
-    buf.push(7, &s, kv_rows(&[(1, 11, 2)]), Update, 3).unwrap();
+    buf.push(7, kv_rows(&[(1, 11, 2)]), Update, 3).unwrap();
     let got = overlay_of(&mut buf, 7, ReadBound::None, Vec::new(), kv_rows(&[(2, 20, 1)]));
     assert_eq!(got, [(1, 11, 1), (2, 20, 1)]);
 }
@@ -153,7 +149,7 @@ fn the_overlay_adds_a_buffered_row_at_weight_one() {
 fn the_overlay_replaces_committed_rows_with_the_last_buffered_op() {
     // `v > 15`, over the source schema's column indices.
     let over_15 = gnitz_zset_testkit::cmp_all(&[(gnitz_expr::CmpOp::Gt, 1, 15)]).to_blob_bytes();
-    let s = Arc::new(kv_schema(TypeCode::I64));
+    let s = kv_schema(TypeCode::I64);
     let committed = [(1, 10, 1), (2, 20, 1), (5, 50, 1)];
 
     for (what, ops, bound, predicate, committed, want) in [
@@ -200,7 +196,7 @@ fn the_overlay_replaces_committed_rows_with_the_last_buffered_op() {
     ] {
         let mut buf = TxnBuffer::default();
         for (batch, mode) in ops {
-            buf.push(7, &s, batch, mode, 3).unwrap();
+            buf.push(7, batch, mode, 3).unwrap();
         }
         let got = overlay_of(&mut buf, 7, bound, predicate, kv_rows(committed));
         assert_eq!(got, want, "{what}");
@@ -212,14 +208,14 @@ fn the_overlay_replaces_committed_rows_with_the_last_buffered_op() {
 /// rows.
 #[test]
 fn overlay_is_the_committed_read_without_a_live_op() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
+    let s = kv_schema(TypeCode::I64);
     let spec = ReadSpec::all_rows(ReadBound::None);
     let committed = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
     let mut buf = TxnBuffer::default();
     let out = buf.overlay(16, &s, &spec, false, committed.clone()).unwrap();
     assert_eq!(out, committed, "an untouched relation");
 
-    buf.push(16, &s, kv_rows(&[(1, 10, 0)]), Update, BLIND).unwrap();
+    buf.push(16, kv_rows(&[(1, 10, 0)]), Update, BLIND).unwrap();
     let out = buf.overlay(16, &s, &spec, false, committed.clone()).unwrap();
     assert_eq!(out, committed, "only a weight-0 op");
 }
@@ -229,19 +225,18 @@ fn overlay_is_the_committed_read_without_a_live_op() {
 /// read waits for the next read.
 #[test]
 fn the_read_index_is_built_on_read() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
     let indexed = |buf: &TxnBuffer| buf.tids.values().map(|t| t.last_op.len()).sum::<usize>();
     let mut buf = TxnBuffer::default();
-    buf.push(17, &s, kv_rows(&[(9, 90, 1)]), Error, BLIND).unwrap();
+    buf.push(17, kv_rows(&[(9, 90, 1)]), Error, BLIND).unwrap();
     for pk in 1..=4 {
-        buf.push(16, &s, kv_rows(&[(pk, 10, 1)]), Error, BLIND).unwrap();
+        buf.push(16, kv_rows(&[(pk, 10, 1)]), Error, BLIND).unwrap();
     }
     assert_eq!(indexed(&buf), 0, "a blind transaction indexes nothing");
 
     assert_eq!(overlaid(&mut buf, 16).len(), 4);
     assert_eq!(indexed(&buf), 4, "another relation is not indexed by this read");
 
-    buf.push(16, &s, kv_rows(&[(5, 10, 1)]), Error, BLIND).unwrap();
+    buf.push(16, kv_rows(&[(5, 10, 1)]), Error, BLIND).unwrap();
     assert_eq!(indexed(&buf), 4, "the write itself indexes nothing");
     assert_eq!(overlaid(&mut buf, 16).len(), 5);
     assert_eq!(indexed(&buf), 5);
@@ -251,7 +246,7 @@ fn the_read_index_is_built_on_read() {
 /// leaves the buffer as it was, and a read under another layout is refused too.
 #[test]
 fn a_tid_refuses_a_second_layout() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
+    let s = kv_schema(TypeCode::I64);
     let mut wide_cols = s.columns().to_vec();
     wide_cols.push(ColumnDef::new("w", TypeCode::I64, false));
     let wide = Arc::new(Schema::from_parts(wide_cols, s.pk_cols()).unwrap());
@@ -261,54 +256,24 @@ fn a_tid_refuses_a_second_layout() {
         b
     };
     let mut buf = TxnBuffer::default();
-    buf.push(16, &s, kv_rows(&[(1, 10, 1)]), Update, BLIND).unwrap();
+    buf.push(16, kv_rows(&[(1, 10, 1)]), Update, BLIND).unwrap();
 
-    assert!(buf.push(16, &wide, wide_row(), Error, BLIND).is_err());
+    assert!(buf.push(16, wide_row(), Error, BLIND).is_err());
     let shape: Vec<_> = buf.families.iter().map(|f| (f.target.tid, f.batch.len())).collect();
     assert_eq!(shape, [(16, 1)], "the refused batch left no trace");
     let spec = ReadSpec::all_rows(ReadBound::None);
     assert!(buf.overlay(16, &wide, &spec, false, ZSetBatch::new(&wide)).is_err());
 
     // Another tid is independent.
-    buf.push(17, &wide, wide_row(), Error, BLIND).unwrap();
-}
-
-/// A batch built under another schema is refused at the push, a tid's first
-/// included, and the transaction stays open.
-#[test]
-fn a_transaction_refuses_a_batch_of_another_schema_and_stays_open() {
-    let (mut c, _peer) = client_pair();
-    c.txn_begin().unwrap();
-    let signed = Arc::new(
-        Schema::from_parts(
-            vec![
-                ColumnDef::new("pk", TypeCode::I64, false),
-                ColumnDef::new("v", TypeCode::I64, false),
-            ],
-            &[0],
-        )
-        .unwrap(),
-    );
-    let batch = kv_rows(&[(1, 10, 1)]);
-    for push in [
-        block_on(c.push(16, &signed, &batch, Update)),
-        block_on(c.push(16, &signed, batch.clone(), Update)),
-    ] {
-        let err = push.unwrap_err().to_string();
-        assert!(err.contains("mismatched key column types"), "{err}");
-    }
-    assert!(c.txn_active());
-    assert!(c.txn.as_ref().unwrap().families.is_empty());
-    block_on(c.push(16, &Arc::new(kv_schema(TypeCode::I64)), &batch, Update)).unwrap();
-    assert_eq!(c.txn.as_ref().unwrap().families.len(), 1);
+    buf.push(17, wide_row(), Error, BLIND).unwrap();
 }
 
 /// A keys reply carries no payload, so a buffered row joins it as its key alone.
 #[test]
 fn a_keys_reply_appends_keys_only() {
-    let s = Arc::new(kv_schema(TypeCode::I64));
+    let s = kv_schema(TypeCode::I64);
     let mut buf = TxnBuffer::default();
-    buf.push(7, &s, kv_rows(&[(3, 30, 1)]), Update, 3).unwrap();
+    buf.push(7, kv_rows(&[(3, 30, 1)]), Update, 3).unwrap();
     let (reply, sink) = key_reply(&s);
     let spec = ReadSpec {
         bound: ReadBound::None,
@@ -324,4 +289,17 @@ fn a_keys_reply_appends_keys_only() {
     app.begin_row(1, 1);
     app.begin_row(3, 1);
     assert_eq!(out, want);
+}
+
+/// A read of one relation gathers from that relation's writes alone: another
+/// relation's narrower batches in the same transaction are no source of it.
+#[test]
+fn an_overlay_reads_only_its_own_relations_writes() {
+    let wide = wide_schema(4, false);
+    let mut buf = TxnBuffer::default();
+    buf.push(16, kv_rows(&[(1, 10, 1)]), Update, BLIND).unwrap();
+    buf.push(17, wide_rows(&wide, 64, 0), Update, BLIND).unwrap();
+    let spec = ReadSpec::all_rows(ReadBound::None);
+    let out = buf.overlay(17, &wide, &spec, false, ZSetBatch::new(&wide)).unwrap();
+    assert_eq!(out.len(), 64);
 }

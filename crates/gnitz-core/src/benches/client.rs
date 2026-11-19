@@ -20,7 +20,7 @@ fn point_read_bench() {
         let sn = unique_schema("t");
         block_on(client.create_schema(&sn, false)).unwrap();
         let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), (*schema).clone()))).unwrap();
-        block_on(client.push(tid, &schema, wide_rows(&schema, 100, 0), WireConflictMode::Update)).unwrap();
+        block_on(client.push(tid, wide_rows(&schema, 100, 0), WireConflictMode::Update)).unwrap();
         let spec = ReadSpec::all_rows(ReadBound::PkSet(schema.pk_keys([[5]])));
         let mut read = || block_on(client.scan_served(tid, &spec, &schema)).unwrap();
         assert_eq!(read().batch.len(), 1);
@@ -45,7 +45,7 @@ fn scan_reply_bench() {
         let sn = unique_schema("t");
         block_on(client.create_schema(&sn, false)).unwrap();
         let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), (*schema).clone()))).unwrap();
-        block_on(client.push(tid, &schema, wide_rows(&schema, ROWS, 0), WireConflictMode::Update)).unwrap();
+        block_on(client.push(tid, wide_rows(&schema, ROWS, 0), WireConflictMode::Update)).unwrap();
         let spec = ReadSpec::all_rows(ReadBound::None);
         let mut read = || block_on(client.scan_served(tid, &spec, &schema)).unwrap();
         assert_eq!(read().batch.len(), ROWS);

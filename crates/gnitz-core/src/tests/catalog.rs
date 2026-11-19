@@ -135,8 +135,8 @@ fn a_table_carries_its_columns_key_fks_and_indexes() {
     let [ix] = &child.indexes[..] else {
         panic!("{:?}", child.indexes)
     };
-    assert_eq!((ix.name.as_str(), ix.is_unique), ("child_note", true));
-    assert_eq!(child.column_names(&ix.cols), ["note", "parent_id"]);
+    assert_eq!((&*ix.name, ix.is_unique), ("child_note", true));
+    assert_eq!(child.column_names(&ix.source_col_idx), ["note", "parent_id"]);
     assert!(catalog.get(&rel("app", "parent")).unwrap().indexes.is_empty());
 }
 

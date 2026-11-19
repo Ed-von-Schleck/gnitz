@@ -41,12 +41,6 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
     total
 }
 
-/// Overwrite the dead-heap bound in the header of `block`, which
-/// [`parse_block`] accepts, with `heap_dead`: at most its heap's length.
-pub fn set_heap_dead(block: &mut [u8], heap_dead: usize) {
-    write_u32_le(block, WAL_OFF_HEAP_DEAD, heap_dead as u32);
-}
-
 /// The row count of the canonical region list `regions`, read off its weight
 /// region.
 fn region_rows(regions: &[&[u8]]) -> usize {

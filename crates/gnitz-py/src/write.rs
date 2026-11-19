@@ -90,11 +90,6 @@ impl PyZSetBatch {
         let mark = batch.mark();
         body(batch, writer).inspect_err(|_| batch.truncate_to(mark))
     }
-
-    /// The schema the rows are written in.
-    pub(crate) fn schema(&self) -> &Arc<Schema> {
-        &self.writer.schema
-    }
 }
 
 /// Write one non-null payload cell of type `tc`, spilling a German string into
@@ -520,7 +515,7 @@ impl PyZSetBatch {
     /// The rows appended so far, as a `ScanResult`: a snapshot, since a later
     /// append copies the batch it shares.
     pub fn rows(&self, py: Python<'_>) -> PyResult<PyScanResult> {
-        present(py, Arc::clone(self.schema()), Arc::clone(&self.batch), false, None)
+        present(py, Arc::clone(&self.batch), false, None)
     }
 
     pub fn __len__(&self) -> usize {

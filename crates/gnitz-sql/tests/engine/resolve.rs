@@ -342,7 +342,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     let rel = b.rel("t");
     let mut batch = ZSetBatch::new(&rel.schema);
     batch.builder().begin_row(1, 1).put_int(10);
-    block_on(b.client.push(rel.tid, &rel.schema, &batch, Update)).unwrap();
+    block_on(b.client.push(rel.tid, batch, Update)).unwrap();
 
     a.exec("ALTER TABLE t ALTER COLUMN v DROP NOT NULL");
 
@@ -351,7 +351,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     assert!(rel2.schema.columns()[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&rel2.schema);
     batch.builder().begin_row(2, 1).put_null();
-    block_on(b.client.push(rel2.tid, &rel2.schema, &batch, Update)).unwrap();
+    block_on(b.client.push(rel2.tid, batch, Update)).unwrap();
 
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 10, 1], [2, NULL, 1]]);
 }
@@ -442,12 +442,12 @@ fn a_kept_descriptor_answers_nothing_without_a_request() {
     assert_eq!(a.scan("t", &["id", "d"]), [[1, NULL, 1], [2, 7, 1]]);
 
     a.exec("ALTER TABLE t ADD COLUMN e BIGINT");
-    let (schema, batch) = b.read("SELECT * FROM t LIMIT 0");
-    assert_eq!(visible_names(&schema), ["id", "v", "c", "d", "e"]);
+    let batch = b.read("SELECT * FROM t LIMIT 0");
+    assert_eq!(visible_names(batch.schema()), ["id", "v", "c", "d", "e"]);
     assert!(batch.is_empty());
 
     let plan = |db: &mut Db| {
-        let (_, batch) = db.read("EXPLAIN SELECT * FROM t WHERE v = 100");
+        let batch = db.read("EXPLAIN SELECT * FROM t WHERE v = 100");
         format!("{batch:?}")
     };
     let unindexed = plan(&mut b);

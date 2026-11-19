@@ -1,8 +1,8 @@
 use super::*;
 use std::num::NonZeroU64;
 
-use gnitz_core::{IndexRow, RelProps};
-use gnitz_wire::{CatalogColumn, ColumnDef, PkColList, TableProps, TypeCode, ViewBudget, ViewProps};
+use gnitz_core::RelProps;
+use gnitz_wire::{CatalogColumn, ColumnDef, IdxTabRow, PkColList, TableProps, TypeCode, ViewBudget, ViewProps};
 
 fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> CatalogRelation {
     CatalogRelation {
@@ -30,10 +30,11 @@ fn ctx() -> Context {
             schemas: vec!["public".into(), "sales".into()],
             relations: vec![
                 CatalogRelation {
-                    indexes: vec![IndexRow {
-                        owner: 1,
+                    indexes: vec![IdxTabRow {
+                        index_id: 4,
+                        owner_id: 1,
                         name: "orders_customer".into(),
-                        cols: PkColList::from_slice(&[1]),
+                        source_col_idx: PkColList::from_slice(&[1]),
                         is_unique: false,
                     }],
                     ..rel(1, "public", "orders", &["id", "customer", "amount"])

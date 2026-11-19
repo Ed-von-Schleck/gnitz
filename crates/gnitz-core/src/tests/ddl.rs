@@ -24,16 +24,16 @@ fn create_table_refuses_an_fk_it_cannot_write() {
     let (mut c, peer) = client_pair();
     drop(peer);
     let schema = kv_schema(TypeCode::I64);
-    let fk = FkTarget::Table(FkRef {
+    let fk = FkRef {
         table_id: 16,
         col: 0,
         on_delete: gnitz_wire::FkAction::Restrict,
-    });
+    };
     for col in [2, 5] {
         let want = format!("a foreign key on column {col}, past the table's 2 columns");
         let def = TableDef {
             fks: [(col, fk)].into(),
-            ..TableDef::new(rel("public", "t"), schema.clone())
+            ..TableDef::new(rel("public", "t"), (*schema).clone())
         };
         let err = block_on(c.create_table(&def)).unwrap_err().to_string();
         assert!(err.contains(&want), "{err}");

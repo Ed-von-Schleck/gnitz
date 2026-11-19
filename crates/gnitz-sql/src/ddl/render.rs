@@ -76,7 +76,7 @@ pub fn create_table_statement(catalog: &Catalog, rel: &CatalogRelation) -> Resul
         lines.push(format!(
             "CONSTRAINT {} UNIQUE ({})",
             column_text(&index.name),
-            column_list(rel.column_names(&index.cols))
+            column_list(rel.column_names(&index.source_col_idx))
         ));
     }
     let mut out = format!(
@@ -107,7 +107,7 @@ pub fn create_index_statements(rel: &CatalogRelation) -> impl Iterator<Item = St
                 if index.is_unique { "UNIQUE " } else { "" },
                 column_text(&index.name),
                 qualified_name(rel),
-                column_list(rel.column_names(&index.cols))
+                column_list(rel.column_names(&index.source_col_idx))
             )
         })
 }

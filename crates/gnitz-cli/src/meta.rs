@@ -478,9 +478,9 @@ impl Shell {
             .map(|(r, i)| {
                 vec![
                     r.schema.clone(),
-                    i.name.clone(),
+                    i.name.to_string(),
                     r.name.clone(),
-                    r.column_names(&i.cols).join(", "),
+                    r.column_names(&i.source_col_idx).join(", "),
                     i.is_unique.to_string(),
                 ]
             })
@@ -589,7 +589,11 @@ impl Shell {
         };
         let indexes = rel.indexes.iter().map(|i| {
             let unique = if i.is_unique { " UNIQUE" } else { "" };
-            format!("\"{}\"{unique} ({})", i.name, rel.column_names(&i.cols).join(", "))
+            format!(
+                "\"{}\"{unique} ({})",
+                i.name,
+                rel.column_names(&i.source_col_idx).join(", ")
+            )
         });
         section("Indexes", indexes.collect());
         let fks = rel.columns.iter().filter_map(|c| {

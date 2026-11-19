@@ -3,18 +3,19 @@
 //! advances every mirrored view.
 
 use std::collections::BTreeMap;
+use std::future::poll_fn;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::Schema;
 use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
-use crate::connection::{Held, ScanReply, park, untaken};
+use crate::connection::{DeltaPoll, Held, ScanReply, park, untaken};
 use crate::error::ClientError;
 use crate::host::{Op, Sent, finished};
 use crate::mirror::PollOutcome;
 use gnitz_wire::Target;
-use gnitz_wire::multi_frame::{DeltaCursor, SubId, kept_as};
+use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId, kept_as};
 
 /// What a sync hands a reader for one of its subscriptions.
 pub struct Pushed {
@@ -63,7 +64,7 @@ impl Delivery {
                 sub,
                 result: taken.and_then(|(schema, blocks, cursor)| {
                     let batch = decode_wal_blocks(blocks, None, &schema)?;
-                    Ok((ScanReply { schema, batch, lsn: None }, cursor))
+                    Ok((ScanReply { batch, lsn: None }, cursor))
                 }),
             })
             .collect();
@@ -132,10 +133,22 @@ impl GnitzClient {
     ) -> Result<(SubId, ScanReply, DeltaCursor), ClientError> {
         let id = self.next_sub;
         self.next_sub = kept_as(id, 1);
-        let sent = self
-            .session
-            .submit_delta_read(view.into(), from, reply_schema, spec, Some(id));
-        let (rows, cursor) = self.wait(sent).await?;
+        let item = DeltaPollItem {
+            view: view.into(),
+            from,
+            reply_layout: reply_schema.layout().layout_digest(),
+            spec,
+        };
+        // Released unless taken whole: a failed or abandoned read keeps no subscription.
+        let mut poll = DeltaPoll::start(&mut self.session, id, &[item]);
+        let host = &mut *self.host;
+        let (blocks, cursor) = poll_fn(|cx| poll.session.poll_until(host, cx, |s| s.take_ended(id))).await??;
+        let rows = ScanReply {
+            batch: decode_wal_blocks(blocks, None, reply_schema)?,
+            lsn: None,
+        };
+        poll.at = 1;
+        drop(poll);
         let schema = Arc::clone(reply_schema);
         let held = Ok((Vec::new(), cursor));
         lock(&self.received).readers.insert(id, Reader { schema, held });
@@ -160,6 +173,8 @@ impl GnitzClient {
     /// `Err` fails the sync as a whole; what failed one subscription or view
     /// is in its entry.
     pub async fn sync(&mut self, wait: Duration) -> Result<Synced, ClientError> {
+        // A refused sync would end every subscription; a cap is waited out.
+        self.make_room().await?;
         let synced = self.begin_sync(wait);
         let synced = self.wait(synced).await;
         if let Err(e @ ClientError::Interrupted(_)) = synced {

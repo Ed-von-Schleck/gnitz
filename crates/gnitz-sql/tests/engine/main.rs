@@ -96,9 +96,9 @@ impl Db {
         }
     }
 
-    pub fn read(&mut self, sql: &str) -> (Arc<Schema>, ZSetBatch) {
+    pub fn read(&mut self, sql: &str) -> ZSetBatch {
         match self.exec(sql) {
-            SqlResult::Rows(ScanReply { schema, batch, .. }) => (schema, batch),
+            SqlResult::Rows(ScanReply { batch, .. }) => batch,
             other => panic!("expected Rows from `{sql}`, got {other:?}"),
         }
     }
@@ -107,11 +107,11 @@ impl Db {
     /// its summed weight appended, zero-weight rows dropped, sorted. A NULL cell
     /// reads as [`NULL`]; a float cell must hold an integer.
     pub fn rows(&mut self, sql: &str, cols: &[&str]) -> Vec<Vec<i64>> {
-        let (schema, batch) = self.read(sql);
-        let idxs: Vec<usize> = cols.iter().map(|c| col_idx(&schema, c)).collect();
+        let batch = self.read(sql);
+        let idxs: Vec<usize> = cols.iter().map(|c| col_idx(batch.schema(), c)).collect();
         let mut zset = std::collections::BTreeMap::<Vec<i64>, i64>::new();
         for r in 0..batch.len() {
-            let row = idxs.iter().map(|&ci| cell(&schema, &batch, ci, r)).collect();
+            let row = idxs.iter().map(|&ci| cell(&batch, ci, r)).collect();
             *zset.entry(row).or_default() += batch.view().get_weight(r);
         }
         zset.into_iter()
@@ -186,7 +186,8 @@ pub fn visible_names(s: &Schema) -> Vec<String> {
 }
 
 /// Column `ci` of `row` as [`Db::rows`] reads it.
-pub fn cell(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
+pub fn cell(batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
+    let schema = batch.schema();
     let loc = schema.layout().locate(ci);
     let batch = &batch.view();
     if loc.is_null(batch, row) {

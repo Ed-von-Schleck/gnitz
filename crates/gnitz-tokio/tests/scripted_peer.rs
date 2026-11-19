@@ -31,7 +31,7 @@ fn schema() -> Arc<Schema> {
 }
 
 /// `rows` keys at weight 1. A row is its key, its weight and its null word.
-fn batch(schema: &Schema, rows: usize) -> ZSetBatch {
+fn batch(schema: &Arc<Schema>, rows: usize) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
     let mut app = batch.builder();
     for pk in 0..rows {
@@ -50,7 +50,7 @@ fn scan(c: &AsyncClient, tid: u64) -> Sent<ScanReply> {
 
 /// A push of `batch` to `tid`, submitted when called.
 fn push(c: &AsyncClient, tid: u64, batch: ZSetBatch) -> Sent<u64> {
-    c.send(move |c| c.push(tid, &schema(), batch, WireConflictMode::Update))
+    c.send(move |c| c.push(tid, batch, WireConflictMode::Update))
 }
 
 /// A listener on a socket of its own, and the path to it.
@@ -219,9 +219,17 @@ fn a_refused_verb_reaches_no_wire() {
     let (client, conn, mut peer) = connect_to_peer(&rt);
     rt.spawn(conn);
 
-    // A key of another type than the table's.
-    let other = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::I32, false)], &[0]).unwrap();
-    let refused = settled(&rt, push(&client, 1, batch(&other, 1)));
+    // Inside a transaction, a batch with a key of another type than the one the
+    // relation's buffered rows have.
+    let other = Arc::new(Schema::from_parts(vec![ColumnDef::new("k", TypeCode::I32, false)], &[0]).unwrap());
+    let refused = settled(
+        &rt,
+        client.send(move |c| {
+            c.txn_begin().unwrap();
+            drop(c.push(1, batch(&schema(), 1), WireConflictMode::Update));
+            c.push(1, batch(&other, 1), WireConflictMode::Update)
+        }),
+    );
     assert!(matches!(refused, Err(ClientError::Refused(_))), "{refused:?}");
 
     let next = scan(&client, 2);

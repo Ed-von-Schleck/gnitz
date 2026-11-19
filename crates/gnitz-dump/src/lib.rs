@@ -194,7 +194,7 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
                 });
             }
         }
-        manifest.indexes.extend(rel.indexes.iter().map(|i| i.name.clone()));
+        manifest.indexes.extend(rel.indexes.iter().map(|i| i.name.to_string()));
     }
     post.extend(views);
     for (entry, rel) in manifest.tables.iter_mut().zip(tables) {
@@ -288,7 +288,7 @@ pub async fn restore(client: &mut GnitzClient, dir: &Path) -> Result<Summary, Du
         }
     }
     let mut held = existing.relations.iter().flat_map(|r| &r.indexes);
-    if let Some(i) = held.find(|i| manifest.indexes.contains(&i.name)) {
+    if let Some(i) = held.find(|i| manifest.indexes.iter().any(|n| *n == i.name)) {
         return Err(DumpError(format!("the database already holds index {}", i.name)));
     }
 
@@ -344,21 +344,21 @@ async fn restore_rows(client: &mut GnitzClient, rel: &CatalogRelation, path: &Pa
             }
         }
         rows += group.len() as u64;
-        if push_bytes(schema, &chunk) + push_bytes(schema, &group) > PUSH_BYTES {
-            flush(client, rel.id, schema, &mut chunk).await?;
+        if push_bytes(&chunk) + push_bytes(&group) > PUSH_BYTES {
+            flush(client, rel.id, &mut chunk).await?;
         }
-        if push_bytes(schema, &group) <= PUSH_BYTES {
+        if push_bytes(&group) <= PUSH_BYTES {
             chunk.extend_from_owned(group);
         } else {
-            for (r, may_end) in order::order(&group, schema, &refs) {
+            for (r, may_end) in order::order(&group, &refs) {
                 chunk.copy_row_at(&group, r as usize, 1);
-                if may_end && push_bytes(schema, &chunk) >= PUSH_BYTES {
-                    flush(client, rel.id, schema, &mut chunk).await?;
+                if may_end && push_bytes(&chunk) >= PUSH_BYTES {
+                    flush(client, rel.id, &mut chunk).await?;
                 }
             }
         }
     }
-    flush(client, rel.id, schema, &mut chunk).await?;
+    flush(client, rel.id, &mut chunk).await?;
     // The table was new, so a key the file holds twice replaced a row rather than being refused.
     let held = held_rows(client, rel).await?;
     if held != rows {
@@ -367,21 +367,17 @@ async fn restore_rows(client: &mut GnitzClient, rel: &CatalogRelation, path: &Pa
     Ok(rows)
 }
 
-/// The bytes `batch` takes in a push in `schema`'s layout.
-fn push_bytes(schema: &Schema, batch: &ZSetBatch) -> usize {
-    batch.view().blob().len() + batch.len() * schema.layout().row_width()
+/// The bytes `batch` takes in a push.
+fn push_bytes(batch: &ZSetBatch) -> usize {
+    batch.view().blob().len() + batch.len() * batch.schema().layout().row_width()
 }
 
-/// Push `chunk`, of `schema`, into table `tid` when it holds rows, and leave it empty.
-async fn flush(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Arc<Schema>,
-    chunk: &mut ZSetBatch,
-) -> Result<(), DumpError> {
+/// Push `chunk` into table `tid` when it holds rows, and leave it empty.
+async fn flush(client: &mut GnitzClient, tid: u64, chunk: &mut ZSetBatch) -> Result<(), DumpError> {
     if !chunk.is_empty() {
-        let full = std::mem::replace(chunk, ZSetBatch::new(schema));
-        client.push(tid, schema, full, WireConflictMode::Update).await?;
+        let empty = ZSetBatch::new(chunk.schema());
+        let full = std::mem::replace(chunk, empty);
+        client.push(tid, full, WireConflictMode::Update).await?;
     }
     Ok(())
 }
@@ -393,11 +389,11 @@ async fn held_rows(client: &mut GnitzClient, rel: &CatalogRelation) -> Result<u6
     let [gnitz_sql::SqlResult::Rows(reply)] = &results[..] else {
         return Err(DumpError::from("a count that answered no rows"));
     };
-    let mut cells = reply.schema.visible_columns();
+    let schema = reply.batch.schema();
+    let mut cells = schema.visible_columns();
     match (cells.next(), cells.next(), reply.batch.len()) {
         (Some((ci, _)), None, 1) => {
-            let count = reply
-                .schema
+            let count = schema
                 .layout()
                 .locate(ci)
                 .decode_i64(&reply.batch.view(), 0, FixedInt::I64);

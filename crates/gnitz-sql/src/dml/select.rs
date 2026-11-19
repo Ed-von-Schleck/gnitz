@@ -159,10 +159,10 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
     let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query)? {
         AdhocRead::Relation { desc, name, conjuncts, shape } => (desc, name, conjuncts, shape),
         AdhocRead::Constant(rows) => {
-            let (schema, row) = plan_constant(rows)?;
+            let row = plan_constant(rows)?;
             return Ok(ReadPlan {
+                cut: ResultCut::new(Arc::clone(row.schema()), &[], slice)?,
                 case: ReadCase::Constant { row },
-                cut: ResultCut::new(schema, &[], slice)?,
             });
         }
     };
@@ -242,11 +242,11 @@ fn walks_in_pk_order(bound: &ReadBound, pk_cols: &[u32]) -> bool {
 
 /// A FROM-less SELECT's one row, finished at plan time: `rows` over the global ground
 /// row. One row sorts to itself, so its order is dropped.
-fn plan_constant(rows: RowsReply) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
+fn plan_constant(rows: RowsReply) -> Result<ZSetBatch, GnitzSqlError> {
     let (mut map, _) = ClientMap::over(rows)?;
     let mut ground_row = ZSetBatch::with_capacity(map.src(), 1);
     ground_row.builder().begin_row(gnitz_wire::global_group_key(), 1);
-    Ok((Arc::clone(map.out_schema()), map.apply(ground_row)))
+    Ok(map.apply(ground_row))
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +261,6 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
     if cut.keeps_nothing() {
         return Ok(SqlResult::Rows(ScanReply {
             batch: ZSetBatch::new(&schema),
-            schema,
             lsn: None,
         }));
     }
@@ -280,5 +279,5 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
             (finish.finish(partial.batch), partial.lsn)
         }
     };
-    Ok(SqlResult::Rows(ScanReply { batch: cut.apply(batch), schema, lsn }))
+    Ok(SqlResult::Rows(ScanReply { batch: cut.apply(batch), lsn }))
 }

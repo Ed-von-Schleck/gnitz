@@ -120,11 +120,7 @@ fn resident_footprint_bench() {
             // Distinct per row, or a shard stores the column as one value.
             rows.begin_row(id, 1).put_string(&format!("{id:0>200}"));
         }
-        block_on(
-            fx.direct
-                .push(big.tid, &big.schema, &batch, gnitz_wire::WireConflictMode::Update),
-        )
-        .expect("push");
+        block_on(fx.direct.push(big.tid, batch, gnitz_wire::WireConflictMode::Update)).expect("push");
     }
     fed_view(&mut fx.direct, "s", "v_big", "SELECT id, body FROM big WHERE id >= 0");
 

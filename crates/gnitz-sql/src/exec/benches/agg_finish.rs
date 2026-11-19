@@ -30,7 +30,7 @@ fn agg_combine_bench() {
         ("20-byte key", by_pk, &wide(), |i| i % REPLY, REPLY),
     ] {
         let f = plan(sql, rel);
-        let schema = f.partial_schema().as_ref();
+        let schema = f.partial_schema();
         let mut b = ZSetBatch::new(schema);
         let mut app = b.builder();
         for i in 0..N {

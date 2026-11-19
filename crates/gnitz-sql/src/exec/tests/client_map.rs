@@ -75,7 +75,7 @@ fn a_map_keeps_key_and_weight_and_fills_each_slot() {
         let out = map.apply(b);
         assert_eq!(out.view().pk(), pks, "{items:?}");
         let want: Vec<_> = want.into_iter().map(Vec::from).zip([1, 2]).collect();
-        assert_eq!(rows_of(map.out_schema(), &out), want, "{items:?}");
+        assert_eq!(rows_of(&out), want, "{items:?}");
         if let Some(n) = want_blob {
             assert_eq!(out.view().blob().len(), n, "{items:?}");
         }

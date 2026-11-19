@@ -32,7 +32,7 @@ mod writer;
 
 pub use batch::{Batch, MemBatch};
 pub use batch_builder::BatchBuilder;
-pub use batch_wire::WireRows;
+pub use batch_wire::{CertifiedBlock, WireRows};
 pub use codebook::Codebook;
 pub use merge::merge_consolidated;
 pub use pool::PooledBuf;

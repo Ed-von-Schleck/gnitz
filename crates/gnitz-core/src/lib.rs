@@ -13,7 +13,6 @@ mod connection;
 mod ddl;
 mod error;
 mod host;
-pub mod local_server;
 mod mirror;
 mod pushed;
 pub mod recording;
@@ -28,10 +27,10 @@ mod transport;
 mod txn;
 
 pub use batch::{RowMark, ZSetBatch};
-pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
+pub use catalog::{Catalog, CatalogRelation, RelProps};
 pub use client::{GnitzClient, env_target};
-pub use connection::{MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply, encode_ddl_txn};
-pub use ddl::{ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle, segment_id};
+pub use connection::{MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply};
+pub use ddl::{ColumnChange, InlineUniqueIndex, PlannedView, TableDef, ViewBundle, pending_id};
 pub use error::{ClientError, ProtocolError, not_found};
 pub use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
 pub use host::{
@@ -43,4 +42,3 @@ pub use rel_name::RelName;
 pub use schema::{Schema, sys_schema};
 pub use snapshot::DEFAULT_PAGE_ROWS;
 pub use transport::{ClientTransport, Interest};
-pub use txn::PushBatch;

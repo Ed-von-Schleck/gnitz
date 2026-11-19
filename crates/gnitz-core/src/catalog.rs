@@ -26,16 +26,6 @@ pub(crate) const CATALOG_FAMILIES: [SysFamily; 6] = [
     SysFamily::Circuit,
 ];
 
-/// One live secondary index, as its IDX_TAB row states it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexRow {
-    /// The id of the relation it indexes: a table or a view.
-    pub owner: u64,
-    pub name: String,
-    pub cols: PkColList,
-    pub is_unique: bool,
-}
-
 /// What a relation's own row states about it beyond its name and key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelProps {
@@ -56,7 +46,7 @@ pub struct CatalogRelation {
     pub columns: Vec<CatalogColumn>,
     pub pk: PkColList,
     /// The secondary indexes declared on it.
-    pub indexes: Vec<IndexRow>,
+    pub indexes: Vec<IdxTabRow<'static>>,
     /// The relations a view's chain scans, ascending; empty for any other
     /// relation.
     pub reads: Vec<u64>,
@@ -215,7 +205,7 @@ impl Catalog {
             }
         }
         for (_, index) in idx_rows(indices)? {
-            if let Some(&at) = slot_of.get(&index.owner) {
+            if let Some(&at) = slot_of.get(&index.owner_id) {
                 relations[at].indexes.push(index);
             }
         }
@@ -248,18 +238,12 @@ impl Catalog {
 }
 
 /// The live rows of `batch`, a read of IDX_TAB, each with its index in `batch`.
-pub(crate) fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ProtocolError> {
+pub(crate) fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IdxTabRow<'static>)>, ProtocolError> {
     let rows = batch.view();
     rows.live_rows()
         .map(|i| {
             let r = IdxTabRow::read(&rows, i).map_err(|e| bad(format_args!("index row {i}"), e))?;
-            let index = IndexRow {
-                owner: r.owner_id,
-                name: r.name.into_owned(),
-                cols: r.source_col_idx,
-                is_unique: r.is_unique,
-            };
-            Ok((i, index))
+            Ok((i, IdxTabRow { name: r.name.into_owned().into(), ..r }))
         })
         .collect()
 }

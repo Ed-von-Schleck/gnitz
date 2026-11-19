@@ -76,7 +76,7 @@ impl Rows {
 
     /// `reply`'s visible cells.
     pub fn decode(reply: &ScanReply) -> Rows {
-        let schema = &reply.schema;
+        let schema = reply.batch.schema();
         let (shown, columns): (Vec<(ColumnLocator, ColType)>, Vec<Column>) = schema
             .visible_columns()
             .map(|(ci, c)| {

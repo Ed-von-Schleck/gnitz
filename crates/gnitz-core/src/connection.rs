@@ -18,7 +18,7 @@ use crate::batch::{FrameBlock, decode_wal_blocks};
 use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
-use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch, sys_schema};
+use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch};
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::{self, DeltaCursor, FrameItem, SubId, encode_items, kept_as};
 use gnitz_wire::{
@@ -40,7 +40,7 @@ pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 /// One relation's read result.
 #[derive(Debug)]
 pub struct ScanReply {
-    pub schema: Arc<Schema>,
+    /// The rows, under the schema they are presented in.
     pub batch: ZSetBatch,
     /// The server LSN the read was served at. `None` where the rows are no
     /// point read of the log: a delta read or a pushed train, whose position is
@@ -105,14 +105,13 @@ pub(crate) enum Request<'a> {
     AllocSerial { table: Target, count: u64 },
     /// An atomic DDL transaction: system-family batches under one durable SAL
     /// zone.
-    DdlTxn(&'a [(SysFamily, ZSetBatch)]),
+    DdlTxn(&'a [(SysFamily, &'a ZSetBatch)]),
     /// An atomic user-table push transaction: the server refuses it if some
     /// family's relation was written after that family's `basis`.
     PushTxn(&'a [PushFamily]),
-    /// PUSH. Its blob is always `schema`'s record.
+    /// PUSH. Its blob is always the batch's schema's record.
     Push {
         target: Target,
-        schema: &'a Schema,
         batch: &'a ZSetBatch,
         mode: WireConflictMode,
     },
@@ -125,29 +124,16 @@ pub(crate) enum Request<'a> {
 }
 
 impl Request<'_> {
-    /// Validate: the relation its ACK names.
-    fn validate(&self) -> Result<u64, ClientError> {
+    /// The relation its ACK names.
+    fn acked_tid(&self) -> u64 {
         match *self {
-            Request::AllocSerial { table, .. } => Ok(table.tid),
-            Request::DdlTxn(families) => {
-                for (family, batch) in families {
-                    batch.layout_matches(sys_schema(*family))?;
-                }
-                Ok(0)
-            }
-            Request::PushTxn(families) => {
-                for f in families {
-                    f.batch.layout_matches(&f.schema)?;
-                }
-                Ok(0)
-            }
-            Request::Push { target, schema, batch, .. } => {
-                // Layout only: the server certifies every row's NULL bits and
-                // cells against the relation's own schema.
-                batch.layout_matches(schema)?;
-                Ok(target.tid)
-            }
-            Request::AllocIds(_) | Request::SnapshotOpen | Request::SnapshotClose(_) | Request::Backup(_) => Ok(0),
+            Request::AllocSerial { table, .. } | Request::Push { target: table, .. } => table.tid,
+            Request::AllocIds(_)
+            | Request::DdlTxn(_)
+            | Request::PushTxn(_)
+            | Request::SnapshotOpen
+            | Request::SnapshotClose(_)
+            | Request::Backup(_) => 0,
         }
     }
 
@@ -160,12 +146,15 @@ impl Request<'_> {
             Request::SnapshotOpen => (ClientVerb::SnapshotOpen, Target::from(0), 0, &[]),
             Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, Target::from(0), id, &[]),
             Request::Backup(name) => (ClientVerb::Backup, Target::from(0), 0, name.as_bytes()),
-            Request::DdlTxn(families) => return append_ddl_txn(out, families),
+            Request::DdlTxn(families) => {
+                let blocks = families.iter().map(|(family, b)| (*family, b.wire_regions()));
+                return multi_frame::encode_ddl_txn(out, blocks);
+            }
             Request::PushTxn(families) => return append_push_txn(out, families),
-            Request::Push { target, schema, batch, mode } => {
+            Request::Push { target, batch, mode } => {
                 let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
                 hdr.flags.conflict_mode = mode;
-                return append_payload(out, hdr, schema.to_record(), Some(batch));
+                return append_payload(out, hdr, batch.schema().to_record(), Some(batch));
             }
         };
         append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None)
@@ -189,7 +178,6 @@ pub(crate) struct PushFamily {
     /// The relation, under the descriptor token of the first of the family's
     /// batches built from a descriptor; `0` while none was.
     pub(crate) target: Target,
-    pub(crate) schema: Arc<Schema>,
     /// May still be shared with the caller that pushed it, so it is never
     /// written in place.
     pub(crate) batch: Arc<ZSetBatch>,
@@ -201,8 +189,8 @@ pub(crate) struct PushFamily {
 }
 
 /// Append an atomic user-table push transaction frame (`ClientVerb::PushTxn`) to
-/// `out` (without the 4-byte frame header). Every family carries its schema
-/// record, which the master validates it against.
+/// `out` (without the 4-byte frame header). Every family carries its batch's
+/// schema record, which the master validates it against.
 pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
     let items: Vec<FrameItem> = families
         .iter()
@@ -210,36 +198,11 @@ pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
             target: f.target,
             conflict_mode: f.mode,
             basis: f.basis,
-            blob: f.schema.to_record(),
+            blob: f.batch.schema().to_record(),
             data: f.batch.wire_regions(),
         })
         .collect();
     encode_items(out, ClientVerb::PushTxn, &items)
-}
-
-/// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes
-/// (without the 4-byte frame header). Each family is named by its system table id
-/// alone; its batch carries its own layout, which `Session::submit` validates
-/// against that family's schema.
-pub fn encode_ddl_txn(families: &[(SysFamily, ZSetBatch)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    append_ddl_txn(&mut out, families);
-    out
-}
-
-/// Append the frame [`encode_ddl_txn`] encodes to `out`.
-fn append_ddl_txn(out: &mut Vec<u8>, families: &[(SysFamily, ZSetBatch)]) {
-    let items: Vec<FrameItem> = families
-        .iter()
-        .map(|(family, b)| FrameItem {
-            target: Target::from(*family),
-            conflict_mode: WireConflictMode::default(),
-            basis: 0,
-            blob: &[],
-            data: b.wire_regions(),
-        })
-        .collect();
-    encode_items(out, ClientVerb::DdlTxn, &items)
 }
 
 /// One request in flight, or a pushed train: how its reply decodes, the reply
@@ -284,11 +247,8 @@ enum RowsTo {
         to: Promise<Vec<ScanReply>>,
     },
     /// One view's delta read, whose terminal carries the cursor to read from
-    /// next; with `keep`, the subscription id the view is kept as from it.
-    Delta {
-        keep: Option<SubId>,
-        to: Promise<(ScanReply, DeltaCursor)>,
-    },
+    /// next.
+    Delta(Promise<(ScanReply, DeltaCursor)>),
     /// SNAPSHOT_PAGE: every worker's rows as one train, with the row count at
     /// the end of each worker's so far.
     Page {
@@ -345,11 +305,7 @@ impl Train {
     }
 
     fn reply(&mut self, last: Option<FrameBlock<'_>>, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
-        Ok(ScanReply {
-            batch: self.finish(last)?,
-            schema: Arc::clone(&self.schema),
-            lsn,
-        })
+        Ok(ScanReply { batch: self.finish(last)?, lsn })
     }
 }
 
@@ -397,13 +353,6 @@ pub(crate) fn park(held: &mut Held, taken: Held) {
 }
 
 impl Polls {
-    /// Hold subscription `id` at `cursor` before the reader takes the reply:
-    /// a train pushed for the id may be right behind it.
-    fn hold(&mut self, id: SubId, cursor: DeltaCursor) {
-        self.server_holds = true;
-        self.subs.insert(id, Ok((Vec::new(), cursor)));
-    }
-
     /// The delta poll's item kept as `id` ended with `end`: its train is held
     /// at the cursor, or the item ended. An id no longer read is left as it is.
     fn poll_end(&mut self, id: SubId, end: PollEnd) {
@@ -573,14 +522,12 @@ impl Session {
 
     // ── Submitting and stepping ────────────────────────────────────────────
 
-    /// Encode and queue `req`. A request this session refuses — one that
-    /// does not validate, or at either cap — is answered with the refusal, as
-    /// every submit's is.
+    /// Encode and queue `req`. A request this session refuses — at either cap,
+    /// or past the frame ceiling — is answered with the refusal, as every
+    /// submit's is; the server certifies a pushed batch's schema record, and
+    /// every row's NULL bits and cells, against the relation's own schema.
     pub(crate) fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
-        let tid = match req.validate() {
-            Ok(tid) => tid,
-            Err(why) => return Sent::ready(Err(why)),
-        };
+        let tid = req.acked_tid();
         let (to, sent) = promise();
         self.enqueue(|out| req.append(out), Slot::Ack { tid, to });
         sent
@@ -675,20 +622,18 @@ impl Session {
     }
 
     /// DELTA_POLL of one view after `from` — the view whole with none — under
-    /// `spec`, replied in `reply_schema`'s layout. With `keep`, a view answered
-    /// with a cursor stays subscribed from it under that id.
+    /// `spec`, replied in `reply_schema`'s layout. It keeps no subscription.
     pub(crate) fn submit_delta_read(
         &mut self,
         view: Target,
         from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-        keep: Option<SubId>,
     ) -> Sent<(ScanReply, DeltaCursor)> {
         let (to, sent) = promise();
         let slot = Slot::Rows {
             train: Train::new(view.tid, reply_schema),
-            to: RowsTo::Delta { keep, to },
+            to: RowsTo::Delta(to),
         };
         let item = multi_frame::DeltaPollItem {
             view,
@@ -696,7 +641,7 @@ impl Session {
             reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
-        self.enqueue(|out| multi_frame::encode_delta_poll(out, &[item], keep), slot);
+        self.enqueue(|out| multi_frame::encode_delta_poll(out, &[item], None), slot);
         sent
     }
 
@@ -751,6 +696,13 @@ impl Session {
     /// and end then taken by [`Self::take_pushed`].
     pub(crate) fn take_reading(&mut self, id: SubId) -> Option<Vec<RawBlock>> {
         self.inbox.polls.reading.get_mut(&id).map(std::mem::take)
+    }
+
+    /// The delta poll's item kept as `id`, once it ended: its whole train under
+    /// the cursor past it, or the fault that ended it; `None` while its train
+    /// is read.
+    pub(crate) fn take_ended(&mut self, id: SubId) -> Option<Held> {
+        (!self.inbox.polls.reading.contains_key(&id)).then(|| self.take_pushed(id))
     }
 
     /// Stop holding subscription `id`: what is pushed for it from now on is
@@ -1061,13 +1013,9 @@ impl Slot {
                         let worker_ends = std::mem::take(worker_ends);
                         to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
                     }
-                    RowsTo::Delta { keep, to } => {
+                    RowsTo::Delta(to) => {
                         let cursor = cursor()?;
-                        let reply = train.reply(last, None)?;
-                        if let Some(id) = *keep {
-                            polls.hold(id, cursor);
-                        }
-                        to.fulfil(Ok((reply, cursor)))
+                        to.fulfil(Ok((train.reply(last, None)?, cursor)))
                     }
                 }
             }
@@ -1092,7 +1040,7 @@ impl Slot {
             Slot::Rows { to, .. } => match to {
                 RowsTo::Scan(to) => to.fulfil(Err(why)),
                 RowsTo::Scans { to, .. } => to.fulfil(Err(why)),
-                RowsTo::Delta { to, .. } => to.fulfil(Err(why)),
+                RowsTo::Delta(to) => to.fulfil(Err(why)),
                 RowsTo::Page { to, .. } => to.fulfil(Err(why)),
             },
             Slot::DeltaPoll { views, at, first } => {
@@ -1135,6 +1083,40 @@ fn resolve_descriptor(ctrl: &DecodedControl, frame: &[u8]) -> Result<Option<Arc<
         indexes: desc.indexes,
         token: ctrl.hdr.arg0,
     })))
+}
+
+/// A delta poll in flight: `items` in one request, item `i` parked in the
+/// session as `kept_as(first, i)` and taken in order. Dropping it releases
+/// every item not yet taken whole, which drops what is left of its train. A
+/// subscription it kept is its caller's only once recorded where the next
+/// sync names it from.
+pub(crate) struct DeltaPoll<'s> {
+    pub(crate) session: &'s mut Session,
+    first: SubId,
+    /// The item being answered: every one before it was taken whole.
+    pub(crate) at: usize,
+    items: usize,
+}
+
+impl Drop for DeltaPoll<'_> {
+    fn drop(&mut self) {
+        for i in self.at..self.items {
+            self.session.release(kept_as(self.first, i));
+        }
+    }
+}
+
+impl<'s> DeltaPoll<'s> {
+    /// Poll `items`, item `i` kept as the subscription `kept_as(first, i)`.
+    pub(crate) fn start(session: &'s mut Session, first: SubId, items: &[multi_frame::DeltaPollItem]) -> Self {
+        session.submit_delta_poll(first, items);
+        DeltaPoll {
+            session,
+            first,
+            at: 0,
+            items: items.len(),
+        }
+    }
 }
 
 #[cfg(test)]

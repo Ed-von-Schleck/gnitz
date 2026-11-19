@@ -14,19 +14,19 @@ use gnitz_wire::{SysFamily, ViewTabSlot};
 /// `(schema name, tid, schema)`.
 fn make_base(client: &mut GnitzClient) -> (String, u64, Arc<Schema>) {
     let (sn, tid, schema) = create_table(client, schema_of(&[("pk", TypeCode::I64), ("v", TypeCode::I64)]));
-    block_on(client.push(tid, &schema, base_rows(&schema), WireConflictMode::Update)).unwrap();
+    block_on(client.push(tid, base_rows(&schema), WireConflictMode::Update)).unwrap();
     (sn, tid, schema)
 }
 
-fn base_rows(schema: &Schema) -> ZSetBatch {
+fn base_rows(schema: &Arc<Schema>) -> ZSetBatch {
     rows(schema, 1..=3)
 }
 
 /// A three-view bundle: segment `h` reads base, segment `g` reads `h`, and `f`
 /// (the user-named view) reads `g`.
 fn chain(name: RelName, base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
-    let segments = vec![segment(base_tid, schema), segment(crate::segment_id(0), schema)];
-    bundle(name, segments, segment(crate::segment_id(1), schema))
+    let segments = vec![segment(base_tid, schema), segment(crate::pending_id(0), schema)];
+    bundle(name, segments, segment(crate::pending_id(1), schema))
 }
 
 /// `(vid, owner_view_id)` of every VIEW_TAB row, sorted; each row is held at
@@ -130,8 +130,8 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     // A segment naming a later segment scans a relation no older than itself.
     let forward = bundle(
         rel(&sn, "fwd"),
-        vec![segment(crate::segment_id(1), &schema), segment(base_tid, &schema)],
-        segment(crate::segment_id(0), &schema),
+        vec![segment(crate::pending_id(1), &schema), segment(base_tid, &schema)],
+        segment(crate::pending_id(0), &schema),
     );
     let err = block_on(client.create_view_chain(forward)).unwrap_err().to_string();
     assert!(err.contains("not older"), "got: {err}");

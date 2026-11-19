@@ -55,7 +55,7 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
 }
 
 /// `pks` at weight 1.
-fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
+fn rows(schema: &Arc<Schema>, pks: Range<i64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
     let mut app = batch.builder();
     for pk in pks {
@@ -103,9 +103,8 @@ fn all_rows() -> ReadSpec {
 }
 
 /// Push `batch`, submitted when called.
-fn push(c: &AsyncClient, tid: u64, schema: &Arc<Schema>, batch: ZSetBatch) -> Sent<u64> {
-    let schema = Arc::clone(schema);
-    c.send(move |c| c.push(tid, &schema, batch, WireConflictMode::Update))
+fn push(c: &AsyncClient, tid: u64, batch: ZSetBatch) -> Sent<u64> {
+    c.send(move |c| c.push(tid, batch, WireConflictMode::Update))
 }
 
 /// Read `tid` under `spec`, submitted when called.
@@ -136,7 +135,7 @@ fn pipelined_verbs() {
             let rounds: Vec<_> = (0..n)
                 .map(|i| {
                     (
-                        push(&client, tid, &schema, rows(&schema, i * per..(i + 1) * per)),
+                        push(&client, tid, rows(&schema, i * per..(i + 1) * per)),
                         scan(&client, tid, all_rows(), &schema),
                     )
                 })
@@ -161,7 +160,7 @@ fn pipelined_verbs() {
                 client.run(move |c| Box::pin(async move { c.resolve(&rel(&sn, name)).await }))
             };
             let (_, one, many, found, missing) = tokio::join!(
-                push(&client, tid, &schema, replaced),
+                push(&client, tid, replaced),
                 scan(&client, tid, ReadSpec::all_rows(ReadBound::PkSet(key.clone())), &schema),
                 client.send(move |c| c.scan_many(&[(tid.into(), &all, &reply), (empty.into(), &all, &reply)])),
                 resolve("t"),
@@ -209,7 +208,7 @@ fn syscall_count_child() {
     settled(&rt, async {
         let (client, conn) = gnitz_tokio::share(gnitz_tokio::connect(&target).await.unwrap());
         let pushes: Vec<_> = (0..BURST)
-            .map(|pk| push(&client, tid, &schema, rows(&schema, pk..pk + 1)))
+            .map(|pk| push(&client, tid, rows(&schema, pk..pk + 1)))
             .collect();
         // The last handle goes, which is what lets the driver finish.
         drop(client);
@@ -259,7 +258,7 @@ fn a_shared_client_mirrors() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, vid, schema, sn) = fed_table(srv.sock_path());
     let mut push = |pks| {
-        block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
+        block_on(blocking.push(tid, rows(&schema, pks), WireConflictMode::Update)).unwrap();
     };
     push(0..50);
 
@@ -374,7 +373,7 @@ fn a_held_sync_leaves_the_shared_handle_free() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, vid, schema, _) = fed_table(srv.sock_path());
     let mut push = |pks| {
-        block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
+        block_on(blocking.push(tid, rows(&schema, pks), WireConflictMode::Update)).unwrap();
     };
     push(0..50);
 
@@ -404,7 +403,7 @@ fn a_dropped_held_sync_loses_nothing() {
     let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, vid, schema, _) = fed_table(srv.sock_path());
     let mut push = |pks| {
-        block_on(blocking.push(tid, &schema, rows(&schema, pks), WireConflictMode::Update)).unwrap();
+        block_on(blocking.push(tid, rows(&schema, pks), WireConflictMode::Update)).unwrap();
     };
     push(0..50);
 

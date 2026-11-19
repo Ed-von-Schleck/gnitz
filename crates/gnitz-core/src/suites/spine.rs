@@ -40,7 +40,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     let (mut pushes, mut scans) = (Vec::new(), Vec::new());
     for i in 0..n {
         let batch = rows(&schema, i * per..(i + 1) * per);
-        pushes.push(s.submit(push_req(tid, &schema, &batch)));
+        pushes.push(s.submit(push_req(tid, &batch)));
         scans.push(s.submit_scan(tid.into(), &all, &schema));
     }
     assert_eq!(s.requests_sent() - sent_before, 2 * n, "counted on enqueue");
@@ -112,7 +112,7 @@ fn syscall_count_child() {
     let mut client = GnitzClient::connect(&target).unwrap();
     let schema = Arc::new(pk_a());
     for i in 0..n {
-        block_on(client.push(tid, &schema, rows(&schema, [i]), WireConflictMode::Update)).unwrap();
+        block_on(client.push(tid, rows(&schema, [i]), WireConflictMode::Update)).unwrap();
     }
 }
 

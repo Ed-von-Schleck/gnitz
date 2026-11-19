@@ -35,7 +35,7 @@ fn standin(dir: &Path) -> PathBuf {
 
 #[test]
 fn a_throwaway_server_runs_in_a_scratch_directory_it_takes_with_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ScratchDir::new("gnitz-test-").unwrap();
     let mut server = LocalServer::start(&standin(dir.path()), None, 2).unwrap();
     let scratch = server.socket().parent().unwrap().to_path_buf();
     assert_eq!(server.data_dir(), scratch.join("data"));
@@ -55,7 +55,7 @@ fn a_throwaway_server_runs_in_a_scratch_directory_it_takes_with_it() {
 
 #[test]
 fn a_kept_server_keeps_its_data_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ScratchDir::new("gnitz-test-").unwrap();
     let data = dir.path().join("db");
     let server = LocalServer::start(&standin(dir.path()), Some(&data), 1).unwrap();
     assert_eq!(server.data_dir(), data);
@@ -67,7 +67,7 @@ fn a_kept_server_keeps_its_data_directory() {
 
 #[test]
 fn a_server_that_exits_before_it_serves_is_reported_with_its_log() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ScratchDir::new("gnitz-test-").unwrap();
     let bin = script(dir.path(), "failing", "echo 'the data directory is locked' >&2\nexit 3");
     let err = LocalServer::start(&bin, None, 1).err().unwrap();
     assert!(err.contains("exited"), "{err}");
@@ -76,7 +76,7 @@ fn a_server_that_exits_before_it_serves_is_reported_with_its_log() {
 
 #[test]
 fn a_server_that_exits_while_it_serves_is_reported_when_stopped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ScratchDir::new("gnitz-test-").unwrap();
     let bin = script(
         dir.path(),
         "crashing",
@@ -93,7 +93,7 @@ fn a_server_that_exits_while_it_serves_is_reported_when_stopped() {
 
 #[test]
 fn only_an_executable_file_is_a_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ScratchDir::new("gnitz-test-").unwrap();
     let plain = dir.path().join("plain");
     fs::write(&plain, "").unwrap();
     assert!(!is_executable(&plain));

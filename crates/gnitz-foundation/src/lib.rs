@@ -11,6 +11,8 @@
 //!   - `perf`       — cost probes for benchmarks: hardware events, context
 //!     switches and resident-set bytes. Linux only
 //!   - `process`    — a child process: tied to the thread that spawns it, awaited on its log
+//!   - `local_server` — a `gnitz-server` this process runs for its own use: the
+//!     shell's session server and Python's `gnitz.local_server`
 //!   - `rng`        — the deterministic PRNG of tests and benchmarks, and `u64` bijections
 //!
 //! The server is Linux-only; a client is not. What a client links of this crate
@@ -24,6 +26,7 @@
 pub mod env;
 pub mod fault;
 pub mod host;
+pub mod local_server;
 pub mod log;
 #[cfg(target_os = "linux")]
 pub mod perf;

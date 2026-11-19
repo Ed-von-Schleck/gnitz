@@ -317,15 +317,16 @@ fn partials_finish_to_one_row_per_group() {
             &[(&[1, 2, 3], &[Int(1), Null]), (&[1, 2, 4], &[Int(2), Int(9)])],
         ),
     ];
-    let batch =
-        |schema: &Schema, rows: Rows| keyed_batch(schema, &rows.iter().map(|&(k, c)| (k, 1, c)).collect::<Vec<_>>());
+    let batch = |schema: &Arc<Schema>, rows: Rows| {
+        keyed_batch(schema, &rows.iter().map(|&(k, c)| (k, 1, c)).collect::<Vec<_>>())
+    };
     for (sql, rel, partials, want) in cases {
         let mut f = plan(sql, rel);
         let got = f.finish(batch(f.partial_schema(), partials));
         let want = batch(f.out_schema(), want);
-        got.validate(f.out_schema()).unwrap();
+        got.validate().unwrap();
         assert_eq!(got.view().pk(), want.view().pk(), "{sql}");
-        assert_eq!(rows_of(f.out_schema(), &got), rows_of(f.out_schema(), &want), "{sql}");
+        assert_eq!(rows_of(&got), rows_of(&want), "{sql}");
     }
 }
 
@@ -341,7 +342,7 @@ fn float_extremes_follow_the_total_order() {
         (v0, 1, &[Null, Null]),
     ];
     let got = f.finish(keyed_batch(f.partial_schema(), &rows));
-    let bits: Vec<_> = rows_of(f.out_schema(), &got)
+    let bits: Vec<_> = rows_of(&got)
         .into_iter()
         .map(|(cells, w)| {
             let bits = cells.iter().map(|c| match c {

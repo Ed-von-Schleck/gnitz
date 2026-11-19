@@ -29,7 +29,7 @@ fn commit(client: &mut GnitzClient, target: &RelDescriptor, pk: u128, val: i64) 
     let s = &target.schema;
     let mut batch = ZSetBatch::new(s);
     batch.builder().begin_row(pk, 1).put_int(val as u128);
-    block_on(client.push(target.tid, s, &batch, WireConflictMode::Update)).unwrap();
+    block_on(client.push(target.tid, batch, WireConflictMode::Update)).unwrap();
 }
 
 /// `a`'s read of pk 1 and its `val + 1` build, which calls `side` first.

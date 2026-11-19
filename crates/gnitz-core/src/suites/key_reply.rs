@@ -15,7 +15,7 @@ use gnitz_zset_testkit::cmp_all;
 
 /// The key reply of `schema`'s rows matching `predicate`, checked to carry no
 /// payload slot and no blob heap, every row at weight 1.
-fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec<u8>) -> (Arc<Schema>, ZSetBatch) {
+fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec<u8>) -> ZSetBatch {
     let (reply_schema, sink) = key_reply(schema);
     assert_eq!(
         reply_schema.layout().num_payload_cols(),
@@ -28,12 +28,10 @@ fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec
         .expect("a PK-only reply must not be rejected")
         .batch;
     assert!(reply.view().schema().num_payload_cols() == 0 && reply.view().blob().is_empty());
-    reply
-        .validate(&reply_schema)
-        .expect("the reply validates under its schema");
+    reply.validate().expect("the reply validates under its schema");
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.view().weights().all(|w| w == 1), "per-row weights preserved");
-    (reply_schema, reply)
+    reply
 }
 
 /// A U64 PK, a TEXT column wide enough that an unprojected reply would carry a
@@ -54,9 +52,9 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
             .put_int((i as i64) as u128)
             .put_string(&"x".repeat(300));
     }
-    block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
+    block_on(client.push(tid, batch, WireConflictMode::Update)).unwrap();
 
-    let (_, reply) = read_keys(
+    let reply = read_keys(
         &mut client,
         tid,
         &schema,
@@ -94,10 +92,10 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
             .put_string("payload")
             .put_int(c2 as u128);
     }
-    block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
+    block_on(client.push(tid, batch, WireConflictMode::Update)).unwrap();
 
     // c2 > 15 → every row but the first
-    let (_, reply) = read_keys(
+    let reply = read_keys(
         &mut client,
         tid,
         &schema,

@@ -172,7 +172,7 @@ impl AdmittedPush {
 /// through its commit, so no DDL lands between the judgement and the write.
 pub(super) fn admit_push(
     cat: &CatalogEngine,
-    data: &mut [u8],
+    data: &[u8],
     ctrl: DecodedControl,
     access: Access,
 ) -> Result<Option<AdmittedPush>, WireFault> {
@@ -201,9 +201,9 @@ pub(super) fn admit_push(
 /// client bug that happens to produce an empty batch (a `delete` with an empty
 /// pk list) fails the way a non-empty one would instead of being masked by a
 /// no-op ACK.
-pub(super) async fn handle_push(shared: &Shared, mut buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
+pub(super) async fn handle_push(shared: &Shared, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
     let catalog = shared.catalog_rwlock.read().await;
-    let Some(push) = admit_push(&shared.cat(), buf.as_mut_slice(), ctrl, Access::Write)? else {
+    let Some(push) = admit_push(&shared.cat(), buf.as_slice(), ctrl, Access::Write)? else {
         return Ok(0);
     };
     commit(shared, &catalog, vec![push.family(&Rc::new(buf))], &[]).await
@@ -211,9 +211,9 @@ pub(super) async fn handle_push(shared: &Shared, mut buf: RecvBuf, ctrl: Decoded
 
 /// PUSH_TXN: admit every family under the catalog read lock and [`commit`] them
 /// as one zone. Every family reads its rows from the one frame.
-pub(super) async fn handle_push_txn(shared: &Shared, mut buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
+pub(super) async fn handle_push_txn(shared: &Shared, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
     let catalog = shared.catalog_rwlock.read().await;
-    let items = admit_push_txn(&shared.cat(), buf.as_mut_slice(), ctrl.body)?;
+    let items = admit_push_txn(&shared.cat(), buf.as_slice(), ctrl.body)?;
     let frame = Rc::new(buf);
     let mut occ = Vec::new();
     let mut families = Vec::with_capacity(items.len());
@@ -297,7 +297,7 @@ async fn commit(
 /// read basis. Each answer holds its data block's range in `frame`.
 pub(super) fn admit_push_txn(
     cat: &CatalogEngine,
-    frame: &mut [u8],
+    frame: &[u8],
     body: Range<usize>,
 ) -> Result<Vec<(u64, AdmittedPush)>, WireFault> {
     let items = gnitz_wire::multi_frame::decode_items(frame, body, ClientVerb::PushTxn).map_err(decode_fault)?;

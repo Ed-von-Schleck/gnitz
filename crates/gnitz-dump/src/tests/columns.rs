@@ -21,7 +21,7 @@ fn every_type() -> Arc<Schema> {
 }
 
 /// Six rows of `schema`, each column's values its type's extremes and odd ones.
-fn rows(schema: &Schema) -> ZSetBatch {
+fn rows(schema: &Arc<Schema>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
     let mut app = batch.builder();
     for row in 0..6usize {

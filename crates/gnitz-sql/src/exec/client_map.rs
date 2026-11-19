@@ -63,8 +63,8 @@ impl ClientMap {
     /// The map over every row of `src`, each row keeping its PK and weight.
     pub(crate) fn apply(&mut self, src: ZSetBatch) -> ZSetBatch {
         match &mut self.plan {
-            None => src,
-            Some(plan) => plan.evaluate_map_batch(&src.view()).into(),
+            None => src.with_schema(Arc::clone(&self.out_schema)),
+            Some(plan) => ZSetBatch::of(&self.out_schema, plan.evaluate_map_batch(&src.view())),
         }
     }
 }

@@ -14,9 +14,7 @@ fn txn_buffer_push_bench() {
         let schema = wide_schema(ncols, false);
         let push = |buf: &mut TxnBuffer| {
             let batch = wide_rows(&schema, 1, 0);
-            counter
-                .measure(|| buf.push(1, &schema, batch, Update, BLIND).unwrap())
-                .1
+            counter.measure(|| buf.push(1, batch, Update, BLIND).unwrap()).1
         };
         let mut buf = TxnBuffer::default();
         let mut first = push(&mut buf);

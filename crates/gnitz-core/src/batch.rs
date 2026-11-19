@@ -6,80 +6,93 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gnitz_expr::SchemaDescriptor;
-use gnitz_wire::wal::{ParsedBlock, WAL_HEADER_SIZE};
 use gnitz_wire::{PkKeys, Regions};
-use gnitz_zset::repr::{Batch, BatchBuilder, DirectWriter, MemBatch, Pick, materialize_carrying};
+use gnitz_zset::repr::{Batch, BatchBuilder, CertifiedBlock, DirectWriter, MemBatch, Pick, materialize_carrying};
 
 use crate::{ProtocolError, Schema};
 
-/// A Z-set batch as the engine keeps one, in the canonical region order: every payload
-/// slot is its own region, and a STRING/BLOB slot holds 16-byte German cells against
-/// [`Self::heap`]. It is a reply decoded, or rows a client builds to push.
+/// A Z-set batch as the engine keeps one, in the canonical region order, under the client
+/// [`Schema`] it is rows of: every payload slot is its own region, and a STRING/BLOB slot
+/// holds 16-byte German cells against the heap. It is a reply decoded, or rows a client
+/// builds to push.
 ///
 /// A reply's lone block is read where it arrived, as the engine reads a block it is sent:
 /// through a [`MemBatch`] over the frame. The first write makes the rows a batch of their
 /// own.
 #[derive(Clone)]
-pub struct ZSetBatch(Rows);
+pub struct ZSetBatch {
+    rows: Rows,
+    schema: Arc<Schema>,
+}
 
 #[derive(Clone)]
 enum Rows {
     /// Boxed, so a batch moves as a pointer: a reply moves several times on its way to the
     /// caller.
     Owned(Box<Batch>),
-    /// The WAL block at `block` of `frame`, its header read: `rows` rows of `schema` and
-    /// the writer's bound on its heap's unreferenced bytes.
-    Block {
-        frame: Vec<u8>,
-        block: Range<usize>,
-        rows: usize,
-        heap_dead: usize,
-        schema: Arc<Schema>,
-    },
-}
-
-impl From<Batch> for ZSetBatch {
-    fn from(batch: Batch) -> Self {
-        ZSetBatch(Rows::Owned(Box::new(batch)))
-    }
+    /// A WAL block of `frame`, certified under the batch's schema.
+    Block { frame: Vec<u8>, block: CertifiedBlock },
 }
 
 impl ZSetBatch {
-    pub fn new(schema: &Schema) -> Self {
-        Batch::empty_with_schema(schema.layout()).into()
+    pub fn new(schema: &Arc<Schema>) -> Self {
+        Self::of(schema, Batch::empty_with_schema(schema.layout()))
     }
 
     /// An empty batch with room for `n` rows.
-    pub fn with_capacity(schema: &Schema, n: usize) -> Self {
-        Batch::with_capacity(schema.layout(), n).into()
+    pub fn with_capacity(schema: &Arc<Schema>, n: usize) -> Self {
+        Self::of(schema, Batch::with_capacity(schema.layout(), n))
+    }
+
+    /// The rows of `batch` as rows of `schema`, whose region types they are in: the rows
+    /// are relabelled to `schema`'s layout, so they read as the batch's schema states.
+    pub fn of(schema: &Arc<Schema>, mut batch: Batch) -> Self {
+        batch.set_schema(schema.layout());
+        ZSetBatch {
+            rows: Rows::Owned(Box::new(batch)),
+            schema: Arc::clone(schema),
+        }
+    }
+
+    /// The rows of `batch`, under this batch's schema.
+    fn again(&self, batch: Batch) -> Self {
+        Self::of(&self.schema, batch)
+    }
+
+    /// The schema the rows are rows of.
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    /// The same rows under `schema`, which names the columns of this batch's region types
+    /// afresh.
+    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
+        assert!(
+            self.layout().same_region_types(schema.layout()),
+            "with_schema: the schema's region types are not the batch's"
+        );
+        if let Rows::Owned(b) = &mut self.rows {
+            b.set_schema(schema.layout());
+        }
+        self.schema = schema;
+        self
     }
 
     /// The rows, read in place.
     #[inline(always)]
     pub fn view(&self) -> MemBatch<'_> {
-        match &self.0 {
+        match &self.rows {
             Rows::Owned(b) => b.as_mem_batch(),
-            Rows::Block { frame, block, rows, heap_dead, schema } => {
-                let layout = schema.layout();
-                let fixed = block.start + WAL_HEADER_SIZE;
-                let heap = fixed + rows * layout.row_width();
-                let parsed = ParsedBlock {
-                    rows: *rows,
-                    fixed: &frame[fixed..heap],
-                    heap: &frame[heap..block.end],
-                    heap_dead: *heap_dead,
-                };
-                MemBatch::of_block(&parsed, layout)
-            }
+            Rows::Block { frame, block } => block.view(frame, self.schema.layout()),
         }
     }
 
     /// The rows as a batch of their own, to write: a received block is copied out first.
     fn owned(&mut self) -> &mut Batch {
-        if let Rows::Block { .. } = self.0 {
-            self.0 = Rows::Owned(Box::new(self.view().to_batch()));
+        if let Rows::Block { .. } = self.rows {
+            self.rows = Rows::Owned(Box::new(self.view().to_batch()));
         }
-        match &mut self.0 {
+        match &mut self.rows {
             Rows::Owned(b) => b,
             Rows::Block { .. } => unreachable!("the block was just copied out"),
         }
@@ -87,7 +100,7 @@ impl ZSetBatch {
 
     /// The rows as an engine batch.
     pub fn into_batch(self) -> Batch {
-        match self.0 {
+        match self.rows {
             Rows::Owned(b) => *b,
             Rows::Block { .. } => self.view().to_batch(),
         }
@@ -95,21 +108,19 @@ impl ZSetBatch {
 
     /// The layout the rows are in.
     fn layout(&self) -> &SchemaDescriptor {
-        match &self.0 {
-            Rows::Owned(b) => b.schema(),
-            Rows::Block { schema, .. } => schema.layout(),
-        }
+        self.schema.layout()
     }
 
-    /// The `-1` retraction batch for `keys`, keys of `schema` as OPK bytes back to back: the
-    /// server's unique-PK rule retracts by PK alone, so the payload columns are inert filler.
-    pub fn retraction(schema: &Schema, keys: &[u8]) -> Self {
+    /// One row per key of `keys`, keys of `schema` as OPK bytes back to back, each at
+    /// `weight`, its payload columns inert filler: a `-1` retraction, which the server's
+    /// unique-PK rule applies by PK alone, or a keys-only read's rows.
+    pub fn key_rows(schema: &Arc<Schema>, keys: &[u8], weight: i64) -> Self {
         assert_eq!(
             keys.len() % schema.layout().pk_stride(),
             0,
-            "retraction: key width mismatch"
+            "key_rows: key width mismatch"
         );
-        Batch::key_rows(schema.layout(), keys, -1).into()
+        Self::of(schema, Batch::key_rows(schema.layout(), keys, weight))
     }
 
     /// Room for `n` more rows.
@@ -156,20 +167,6 @@ impl ZSetBatch {
         self.owned().map_weights(|_| w);
     }
 
-    /// Overwrite the STRING cell at `(row, pi)`. The replaced cell's long value, if
-    /// any, stays in the heap unreferenced.
-    pub(crate) fn set_string_cell(&mut self, row: usize, pi: usize, v: &str) {
-        self.rewrite(|d| {
-            let (cells, heap, _) = d.string_col_mut(pi);
-            cells[row * 16..(row + 1) * 16].copy_from_slice(&gnitz_wire::encode_german_string(v.as_bytes(), heap));
-        });
-    }
-
-    /// Overwrite the 8-byte fixed-width cell at `(row, pi)` with `v`, little-endian.
-    pub(crate) fn set_u64_cell(&mut self, row: usize, pi: usize, v: u64) {
-        self.rewrite(|d| gnitz_wire::write_u64_le(d.col_mut(pi), row * 8, v));
-    }
-
     /// A builder appending rows onto this batch, one checked value per payload column.
     pub fn builder(&mut self) -> BatchBuilder<&mut Batch> {
         BatchBuilder::onto(self.owned())
@@ -194,10 +191,10 @@ impl ZSetBatch {
     pub(crate) fn extend_from(&mut self, other: &ZSetBatch) {
         assert!(self.same_layout(other), "extend_from: layout mismatch");
         let from = other.view();
-        if let Rows::Block { .. } = self.0 {
+        if let Rows::Block { .. } = self.rows {
             // Copied out and grown at once, rather than copied out to its own size first.
             let joined = Batch::concat(self.layout(), [self.view(), from].into_iter());
-            *self = joined.into();
+            *self = self.again(joined);
         } else {
             self.owned().append_ranges(&from, &[(0, from.len())]);
         }
@@ -206,8 +203,7 @@ impl ZSetBatch {
     /// `extend_from`, taking `other` whole when `self` is empty.
     pub fn extend_from_owned(&mut self, other: ZSetBatch) {
         if self.is_empty() {
-            assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
-            *self = other;
+            *self = other.with_schema(Arc::clone(&self.schema));
         } else {
             self.extend_from(&other);
         }
@@ -230,7 +226,7 @@ impl ZSetBatch {
         if ranges != [(0, self.len())] {
             let mut kept = Batch::empty_with_schema(self.layout());
             kept.append_ranges(&self.view(), ranges);
-            *self = kept.into();
+            *self = self.again(kept);
         }
     }
 
@@ -246,55 +242,24 @@ impl ZSetBatch {
             return self.gathered(rows);
         }
         let picks: Vec<Pick> = rows.iter().map(|&r| (0, r, v.get_weight(r as usize))).collect();
-        materialize_carrying(&[v], v.schema(), &picks).into()
+        self.again(materialize_carrying(&[v], v.schema(), &picks))
     }
 
     /// The rows `rows` names, in order, each at most once, onto a fresh heap holding only
     /// their strings; `self` is left as it was.
     pub fn gathered(&self, rows: &[u32]) -> ZSetBatch {
-        self.view().indexed_rows(rows).into()
+        self.again(self.view().indexed_rows(rows))
     }
 
     // ── Shape checks ────────────────────────────────────────────────────────
 
-    /// The batch's layout is `schema`'s: key column types, payload slot count,
-    /// and each slot's type.
-    pub(crate) fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
-        let layout = self.layout();
-        if !layout.same_key_types(schema.layout()) {
-            let types = |l: &SchemaDescriptor| l.pk_columns().map(|c| c.type_code).collect::<Vec<_>>();
-            return Err(format!(
-                "mismatched key column types: expected {:?}, got {:?}",
-                types(schema.layout()),
-                types(layout)
-            ));
-        }
-        if layout.num_payload_cols() != schema.layout().num_payload_cols() {
-            return Err(format!(
-                "payload slot count {} != schema payload column count {}",
-                layout.num_payload_cols(),
-                schema.layout().num_payload_cols()
-            ));
-        }
-        for (pi, _, def) in schema.payload_columns() {
-            let tc = layout.columns()[layout.payload_col_idx(pi)].type_code;
-            if tc != def.ty.tc {
-                return Err(format!(
-                    "payload slot {pi} ('{}'): type {tc:?} != schema type {:?}",
-                    def.name, def.ty.tc
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// [`Self::layout_matches`], and the null rule the server certifies of each row it
-    /// is sent, here with the row and column named.
-    pub fn validate(&self, schema: &Schema) -> Result<(), String> {
-        self.layout_matches(schema)?;
+    /// The null rule the server certifies of each row it is sent, here with the row and
+    /// column named.
+    pub fn validate(&self) -> Result<(), String> {
         let Some((breach, (row, slot))) = self.view().null_breach() else {
             return Ok(());
         };
+        let schema = &self.schema;
         let layout = schema.layout();
         Err(match slot < layout.num_payload_cols() {
             true => format!(
@@ -344,7 +309,12 @@ pub struct RowMark {
 /// The rows of the WAL block `data` a server wrote, under `schema`, read in place and
 /// validated as the engine validates a block a peer wrote.
 fn checked_wal_block<'a>(data: &'a [u8], schema: &'a Schema) -> Result<MemBatch<'a>, ProtocolError> {
-    MemBatch::of_foreign_wal_block(data, schema.layout()).map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))
+    MemBatch::of_foreign_wal_block(data, schema.layout()).map_err(wal_error)
+}
+
+/// A WAL block's validation failure as a reply's decode error.
+fn wal_error(e: &str) -> ProtocolError {
+    ProtocolError::DecodeError(format!("WAL {e}"))
 }
 
 /// One WAL block of a reply and the frame it lies in at `block`: owned where the transport
@@ -379,24 +349,28 @@ pub(crate) fn decode_wal_blocks(
             let views = (held.iter().chain(last.as_ref()))
                 .map(|b| checked_wal_block(b.bytes(), schema))
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(Batch::concat(schema.layout(), views.iter().copied()).into());
+            return Ok(ZSetBatch::of(
+                schema,
+                Batch::concat(schema.layout(), views.iter().copied()),
+            ));
         }
     };
-    let (rows, heap_dead) = {
-        let mb = checked_wal_block(lone.bytes(), schema)?;
-        (mb.len(), mb.dead_heap())
-    };
+    let certify = |data: &[u8], range| CertifiedBlock::certify(data, range, schema.layout()).map_err(wal_error);
     let (frame, block) = match lone.frame {
-        Cow::Owned(frame) => (frame, lone.block),
-        Cow::Borrowed(frame) => (frame[lone.block.clone()].to_vec(), 0..lone.block.len()),
+        Cow::Owned(frame) => {
+            let block = certify(&frame, lone.block)?;
+            (frame, block)
+        }
+        Cow::Borrowed(frame) => {
+            let bytes = &frame[lone.block];
+            let block = certify(bytes, 0..bytes.len())?;
+            (bytes.to_vec(), block)
+        }
     };
-    Ok(ZSetBatch(Rows::Block {
-        frame,
-        block,
-        rows,
-        heap_dead,
+    Ok(ZSetBatch {
+        rows: Rows::Block { frame, block },
         schema: Arc::clone(schema),
-    }))
+    })
 }
 
 #[cfg(test)]

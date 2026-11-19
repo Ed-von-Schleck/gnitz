@@ -127,7 +127,7 @@ impl MirrorStore for StubStore {
         &mut self,
         _tid: u64,
         _spec: gnitz_wire::ReadSpec,
-        reply_schema: &Schema,
+        reply_schema: &Arc<Schema>,
     ) -> Result<ZSetBatch, String> {
         Ok(ZSetBatch::new(reply_schema))
     }
@@ -235,7 +235,7 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
         .collect();
     let store = StubStore { cursors, log: log.clone() };
     block_on(client.attach_mirror(move || Ok(store))).unwrap();
-    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let schema = kv_schema(TypeCode::I64);
     for &(tid, name, _) in views {
         let desc = RelDescriptor {
             tid,
@@ -987,7 +987,7 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
         drop(peer);
         if lost_before {
             let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
-            let r = block_on(client.scan_served(1, &spec, &Arc::new(kv_schema(TypeCode::I64))));
+            let r = block_on(client.scan_served(1, &spec, &kv_schema(TypeCode::I64)));
             assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
         }
 
@@ -1113,7 +1113,7 @@ fn subscribe_reader(client: &mut GnitzClient, peer: Peer) -> (SubId, Peer) {
         peer.reply_watermark(40, from.tag, from.tick.get());
         (peer, kept)
     });
-    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let schema = kv_schema(TypeCode::I64);
     let (sub, rows, at) = block_on(client.subscribe(Target::from(40), Some(from), &schema, &whole)).expect("subscribe");
     let (peer, kept) = h.join().unwrap();
     assert_eq!((kept, rows.batch.len(), at), (vec![(40, sub)], 0, from));
@@ -1369,4 +1369,44 @@ fn a_forgotten_view_ends_its_subscription() {
     block_on(client.forget_view(7)).unwrap();
     poll(&mut client);
     h.join().unwrap();
+}
+
+/// A sync made while the connection is at its in-flight cap waits for room
+/// rather than being refused, which would end every subscription.
+#[test]
+fn a_sync_at_the_in_flight_cap_waits_for_room() {
+    let (mut client, peer, log, subs) = subscribed();
+    let (sub, peer) = subscribe_reader(&mut client, peer);
+    let detached: Vec<_> = (0..crate::connection::MAX_IN_FLIGHT)
+        .map(|_| client.ack(crate::connection::Request::AllocIds(1)).detach())
+        .collect();
+    assert!(client.session.at_capacity());
+    let h = std::thread::spawn(move || {
+        for i in 0..crate::connection::MAX_IN_FLIGHT {
+            assert_eq!(peer.expect_request("an id allocation"), 0);
+            peer.send(&reply_ctrl(0, i as u64));
+        }
+        peer.expect_sync("the sync");
+        peer.push_train(7, subs[&7], &[(1, 10, 1)], Some(11));
+        peer.push_train(40, sub, &[(2, 20, 1)], Some(11));
+        peer.send(&sync_answer(None));
+        peer
+    });
+    let synced = block_on(client.sync(Duration::ZERO)).expect("the sync");
+    let [pushed] = &synced.pushed[..] else {
+        panic!("one entry per subscription")
+    };
+    assert!(
+        pushed.result.is_ok(),
+        "the reader's subscription ended: {:?}",
+        pushed.result
+    );
+    assert!(
+        synced.mirrored.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "{:?}",
+        synced.mirrored
+    );
+    let _peer = h.join().unwrap();
+    assert_eq!(log.take(), [Ev::Advance(7, 11)]);
+    drop(detached);
 }

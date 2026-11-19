@@ -84,7 +84,7 @@ fn push_files(client: &mut GnitzClient) {
     let mut app = batch.builder();
     app.begin_row(1, 1).put_blob(&[0, 255, 7]).put_blob(b"");
     app.begin_row(2, 1).put_null().put_blob(&[0xab; 40]);
-    block_on(client.push(&*desc, &desc.schema, batch, WireConflictMode::Error)).unwrap();
+    block_on(client.push(&*desc, batch, WireConflictMode::Error)).unwrap();
 }
 
 fn exec(client: &mut GnitzClient, sql: &str) -> Vec<SqlResult> {
@@ -96,7 +96,7 @@ fn rows(client: &mut GnitzClient, sql: &str) -> Vec<(Vec<Option<Vec<u8>>>, i64)>
     let Some(SqlResult::Rows(reply)) = exec(client, sql).pop() else {
         panic!("{sql} answered no rows")
     };
-    let (schema, batch) = (&reply.schema, &reply.batch.view());
+    let (schema, batch) = (reply.batch.schema(), &reply.batch.view());
     let mut out: Vec<_> = (0..batch.len())
         .map(|i| {
             let cells = schema
@@ -336,7 +336,7 @@ fn tables_larger_than_a_push_restore() {
             };
             r.put_string(&format!("{id:0>1000}"));
         }
-        block_on(a.push(&*desc, &desc.schema, batch, WireConflictMode::Error)).unwrap();
+        block_on(a.push(&*desc, batch, WireConflictMode::Error)).unwrap();
     }
 
     let dir = tempfile::tempdir().unwrap();

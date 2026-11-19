@@ -96,7 +96,7 @@ impl ResultCut {
                 break;
             }
         }
-        materialize_carrying(&[view], view.schema(), &picks).into()
+        ZSetBatch::of(batch.schema(), materialize_carrying(&[view], view.schema(), &picks))
     }
 }
 

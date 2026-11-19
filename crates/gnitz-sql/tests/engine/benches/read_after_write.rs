@@ -62,7 +62,7 @@ fn view_read_after_write_bench() {
                 .builder()
                 .begin_row(i as u128, 1)
                 .put_int(((i % 8) as i64) as u128);
-            block_on(db.client.push(t.tid, &t.schema, batch, WireConflictMode::Update)).unwrap();
+            block_on(db.client.push(t.tid, batch, WireConflictMode::Update)).unwrap();
             let got = block_on(db.client.scan_spec(v.tid, all.clone(), &v.schema))
                 .unwrap()
                 .batch;

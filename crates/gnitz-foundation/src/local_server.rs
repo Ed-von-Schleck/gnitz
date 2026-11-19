@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gnitz_foundation::log::READY_LINE;
-use gnitz_foundation::posix_io::ScratchDir;
-use gnitz_foundation::process::{await_log, default_env, die_with_parent, log_tail};
+use crate::log::READY_LINE;
+use crate::posix_io::ScratchDir;
+use crate::process::{await_log, default_env, die_with_parent, log_tail};
 
 /// The server's binary name.
 pub const SERVER: &str = "gnitz-server";

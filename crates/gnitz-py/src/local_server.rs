@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError};
 use pyo3::prelude::*;
 
-use gnitz_core::local_server::{self, LocalServer};
+use gnitz_foundation::local_server::{self, LocalServer};
 
 /// A running gnitz-server. `target` is what `gnitz.connect` takes; `stop`, or
 /// leaving a `with` block, stops it.

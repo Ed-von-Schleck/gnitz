@@ -9,6 +9,7 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::{BoundExpr, RegClass};
 use crate::rules::require_column;
+
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::ScalarEval;
 use gnitz_wire::{ColType, FixedInt, Heap, TypeCode, null_word_get, null_word_set, relocate_german_string};
@@ -200,9 +201,9 @@ pub(super) fn apply_set(
     set: &mut [SetCol],
     rows: ZSetBatch,
     excluded: Option<&ZSetBatch>,
-    schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let mut new: ZSetBatch = rows.view().to_batch().into();
+    let schema = rows.schema();
+    let mut new = ZSetBatch::of(schema, rows.view().to_batch());
     for a in set.iter_mut() {
         let def = &schema.columns()[a.ci];
         let pi = schema
@@ -258,7 +259,7 @@ pub(super) fn apply_set(
         }
     }
     if set.iter().any(|a| (schema.columns()[a.ci].ty.tc).is_german_string()) {
-        new = new.into_batch().trimmed().into();
+        new = ZSetBatch::of(schema, new.into_batch().trimmed());
     }
     new.fill_weights(1);
     Ok(new)

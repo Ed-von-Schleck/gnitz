@@ -13,6 +13,7 @@ use crate::schema::SchemaDescriptor;
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::wal;
 use gnitz_wire::{Regions, RowSource, TypeCode};
+use std::ops::Range;
 
 /// One or more rows of a batch as one WAL block: which rows, and the heap
 /// bytes the block holds for them. Its size and its bytes are read off the
@@ -404,8 +405,9 @@ impl<'a> MemBatch<'a> {
     /// arena of exactly its row count.
     ///
     /// Its string cells and dead-heap bound are taken as the engine wrote
-    /// them; a block a peer wrote goes through [`Batch::decode_foreign_wal_block`],
-    /// [`Batch::decode_foreign_wal_blocks`] or [`Self::certify_foreign`] first.
+    /// them; a block a peer wrote is read through [`Self::of_foreign_wal_block`],
+    /// [`Batch::decode_foreign_wal_block`], [`Batch::decode_foreign_wal_blocks`]
+    /// or a [`CertifiedBlock`].
     pub fn of_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
         let block = wal::parse_block(data, schema.row_width())?;
         Ok(MemBatch::of_block(&block, schema))
@@ -414,7 +416,7 @@ impl<'a> MemBatch<'a> {
     /// The rows of a WAL block whose header [`wal::parse_block`] read, under `schema`,
     /// taken as [`Self::of_wal_block`] takes them.
     #[inline]
-    pub fn of_block(block: &wal::ParsedBlock<'a>, schema: &'a SchemaDescriptor) -> Self {
+    fn of_block(block: &wal::ParsedBlock<'a>, schema: &'a SchemaDescriptor) -> Self {
         debug_assert_eq!(block.fixed.len(), block.rows * schema.row_width());
         MemBatch {
             data: block.fixed,
@@ -440,15 +442,44 @@ impl<'a> MemBatch<'a> {
         }
         Ok(mb)
     }
+}
 
-    /// Validate the block `data` a peer wrote as [`Batch::decode_foreign_wal_block`]
-    /// validates one, then write the heap's measured dead-byte bound into its
-    /// header: from then on [`Self::of_wal_block`] reads `data` as a block the
-    /// engine wrote.
-    pub fn certify_foreign(data: &mut [u8], schema: &SchemaDescriptor) -> Result<(), &'static str> {
-        let dead = MemBatch::of_foreign_wal_block(data, schema)?.dead_heap;
-        gnitz_wire::wal::set_heap_dead(data, dead);
-        Ok(())
+/// A WAL block a peer wrote, validated once where it lies: at `range` of the
+/// bytes it was certified in, `rows` rows, and its heap's measured count of
+/// unreferenced bytes. Its rows are read from those bytes without parsing the
+/// header again.
+#[derive(Clone, Debug)]
+pub struct CertifiedBlock {
+    range: Range<usize>,
+    rows: usize,
+    heap_dead: usize,
+}
+
+impl CertifiedBlock {
+    /// Validate the block at `range` of `data` under `schema` as
+    /// [`Batch::decode_foreign_wal_block`] validates one. Inline: compiled out of
+    /// line, with the validation inlined into it, the cell loop measured slower
+    /// per row.
+    #[inline]
+    pub fn certify(data: &[u8], range: Range<usize>, schema: &SchemaDescriptor) -> Result<Self, &'static str> {
+        let mb = MemBatch::of_foreign_wal_block(&data[range.clone()], schema)?;
+        let (rows, heap_dead) = (mb.count, mb.dead_heap);
+        Ok(CertifiedBlock { range, rows, heap_dead })
+    }
+
+    /// The block's rows, read from `data` under `schema`: the bytes and the
+    /// schema it was certified under.
+    #[inline]
+    pub fn view<'a>(&self, data: &'a [u8], schema: &'a SchemaDescriptor) -> MemBatch<'a> {
+        let fixed = self.range.start + wal::WAL_HEADER_SIZE;
+        let heap = fixed + self.rows * schema.row_width();
+        let block = wal::ParsedBlock {
+            rows: self.rows,
+            fixed: &data[fixed..heap],
+            heap: &data[heap..self.range.end],
+            heap_dead: self.heap_dead,
+        };
+        MemBatch::of_block(&block, schema)
     }
 }
 

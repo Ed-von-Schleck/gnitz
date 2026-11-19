@@ -365,6 +365,13 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
             MemBatch::of_wal_block(&block, &schema).unwrap().to_batch().dead_heap(),
             claimed
         );
+        // Certified where it lies in a frame, the block reads as its decode,
+        // with the measured bound.
+        let frame = [&[0xAA; 7][..], &block, &[0xBB; 5]].concat();
+        let certified = CertifiedBlock::certify(&frame, 7..7 + block.len(), &schema).unwrap();
+        let view = certified.view(&frame, &schema);
+        assert_eq!(view.dead_heap(), 70);
+        assert_eq!(view.wire_regions(), decoded.wire_regions());
     }
 }
 

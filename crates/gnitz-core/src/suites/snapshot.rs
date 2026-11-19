@@ -19,12 +19,12 @@ fn read(client: &mut GnitzClient, id: u64, tid: u64, schema: &Arc<Schema>, page_
     all
 }
 
-fn push(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>, batch: ZSetBatch) {
-    block_on(client.push(tid, schema, batch, WireConflictMode::Update)).unwrap();
+fn push(client: &mut GnitzClient, tid: u64, batch: ZSetBatch) {
+    block_on(client.push(tid, batch, WireConflictMode::Update)).unwrap();
 }
 
 /// Rows `pks` retracted at the payload [`rows`] gives them.
-fn retractions(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
+fn retractions(schema: &Arc<Schema>, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     let mut b = rows(schema, pks);
     b.fill_weights(-1);
     b
@@ -35,11 +35,11 @@ fn a_snapshot_reads_the_cut_it_pinned_while_writes_go_on() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (_, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    push(&mut client, tid, &schema, rows(&schema, 0..3000));
+    push(&mut client, tid, rows(&schema, 0..3000));
 
     let id = block_on(client.snapshot_open()).unwrap();
-    push(&mut client, tid, &schema, retractions(&schema, 0..1000));
-    push(&mut client, tid, &schema, rows(&schema, 5000..6000));
+    push(&mut client, tid, retractions(&schema, 0..1000));
+    push(&mut client, tid, rows(&schema, 5000..6000));
 
     let pinned = weighted_rows(&rows(&schema, 0..3000));
     for page_rows in [1, 7, 1000, DEFAULT_PAGE_ROWS] {
@@ -83,7 +83,7 @@ fn pages_of_a_compound_key_return_every_row_once() {
             want.push(a as i64 * 1000 + b as i64);
         }
     }
-    push(&mut client, tid, &schema, batch);
+    push(&mut client, tid, batch);
     let id = block_on(client.snapshot_open()).unwrap();
     for page_rows in [1, 3, 64] {
         let got = read(&mut client, id, tid, &schema, page_rows);
@@ -115,7 +115,7 @@ fn a_replicated_table_is_read_once() {
         ..TableDef::new(rel(&sn, "t"), Schema::clone(&schema))
     }))
     .unwrap();
-    push(&mut client, tid, &schema, rows(&schema, 0..100));
+    push(&mut client, tid, rows(&schema, 0..100));
     let id = block_on(client.snapshot_open()).unwrap();
     let page = block_on(client.snapshot_page(id, tid, &[], 40, &schema)).unwrap();
     assert_eq!(page.worker_ends.len(), WORKERS);
@@ -162,7 +162,7 @@ fn a_page_takes_every_workers_share_however_its_keys_interleave() {
             app.begin_row_natives(&[a as i128 as u128, b as i128 as u128], 1);
         }
     }
-    push(&mut client, tid, &schema, batch);
+    push(&mut client, tid, batch);
     let id = block_on(client.snapshot_open()).unwrap();
 
     let whole = block_on(client.snapshot_page(id, tid, &[], 4000, &schema)).unwrap();
@@ -191,7 +191,7 @@ fn a_snapshot_holds_the_catalog_and_the_tables_of_its_cut() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    push(&mut client, tid, &schema, rows(&schema, 0..100));
+    push(&mut client, tid, rows(&schema, 0..100));
     let id = block_on(client.snapshot_open()).unwrap();
 
     block_on(client.drop_table(&[rel(&sn, "t")], false)).unwrap();
@@ -234,7 +234,7 @@ fn a_snapshot_is_its_connections_alone_and_ends_with_it() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut owner = GnitzClient::connect(srv.sock_path()).unwrap();
     let (_, tid, schema) = create_table(&mut owner, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    push(&mut owner, tid, &schema, rows(&schema, 0..10));
+    push(&mut owner, tid, rows(&schema, 0..10));
     let id = block_on(owner.snapshot_open()).unwrap();
 
     let mut other = GnitzClient::connect(srv.sock_path()).unwrap();
@@ -282,11 +282,11 @@ fn a_backup_boots_as_the_server_stood_at_its_checkpoint() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
     block_on(client.create_view_chain(bundle(rel(&sn, "v"), Vec::new(), segment(tid, &schema)))).unwrap();
-    push(&mut client, tid, &schema, rows(&schema, 0..2000));
-    push(&mut client, tid, &schema, retractions(&schema, 0..10));
+    push(&mut client, tid, rows(&schema, 0..2000));
+    push(&mut client, tid, retractions(&schema, 0..10));
 
     block_on(client.backup("first")).unwrap();
-    push(&mut client, tid, &schema, rows(&schema, 9000..9100));
+    push(&mut client, tid, rows(&schema, 9000..9100));
     let err = block_on(client.backup("first")).unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
     for bad in ["", "../x", ".hidden", "a/b"] {
@@ -302,7 +302,7 @@ fn a_backup_boots_as_the_server_stood_at_its_checkpoint() {
     let view = block_on(client.resolve_relation(&rel(&sn, "v"))).unwrap();
     assert_eq!(weighted_rows(&scan_all(&mut client, view.tid, &view.schema)), want);
     // The restored server is a live one.
-    push(&mut client, tid, &schema, rows(&schema, 7000..7001));
+    push(&mut client, tid, rows(&schema, 7000..7001));
     assert_eq!(scan_all(&mut client, tid, &schema).len(), 1991);
 }
 
@@ -313,13 +313,13 @@ fn a_restored_backup_recovers_what_it_acknowledged() {
     let srv = ServerHandle::start_with_backups(WORKERS, &[]);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (_, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    push(&mut client, tid, &schema, rows(&schema, 0..2000));
+    push(&mut client, tid, rows(&schema, 0..2000));
     block_on(client.backup("cut")).unwrap();
 
     let mut restored = ServerHandle::start_on(&srv.backups().join("cut"), WORKERS);
     let mut client = GnitzClient::connect(restored.sock_path()).unwrap();
     let (sn, created, _) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    push(&mut client, created, &schema, rows(&schema, 0..10));
+    push(&mut client, created, rows(&schema, 0..10));
     drop(client);
 
     restored.restart().unwrap();
@@ -339,7 +339,7 @@ fn an_interrupted_backup_leaves_no_entry() {
     let srv = ServerHandle::start_with_backups(WORKERS, &[("GNITZ_INJECT_BACKUP_ABORT", "1")]);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (_, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    push(&mut client, tid, &schema, rows(&schema, 0..100));
+    push(&mut client, tid, rows(&schema, 0..100));
 
     assert!(block_on(client.backup("first")).is_err(), "the master dies part-way");
     let backups = srv.backups();

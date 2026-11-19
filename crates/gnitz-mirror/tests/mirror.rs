@@ -31,9 +31,7 @@ use gnitz_wire::multi_frame::SubId;
 use gnitz_zset_testkit::{assert_child_ok, run_test_in_child};
 use std::time::Duration;
 use support::common::{block_copy, has_copy, has_manifest, manifest_inode, unblock_copy};
-use support::{
-    Answer, Reply, agreement, assert_advanced, canonical, canonical_rows, cost, differential, poll, query, sql,
-};
+use support::{Answer, agreement, assert_advanced, canonical, canonical_rows, cost, differential, poll, query, sql};
 
 /// `schema.name`.
 fn rel(schema: &str, name: &str) -> RelName {
@@ -205,7 +203,7 @@ impl Fixture {
     }
 
     /// Run one `SELECT` through the mirroring client.
-    fn local(&mut self, sql_text: &str) -> Reply {
+    fn local(&mut self, sql_text: &str) -> gnitz_core::ZSetBatch {
         query(self.mirror(), "s", sql_text)
     }
 
@@ -1124,7 +1122,7 @@ impl Reader {
         let desc = block_on(client.resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
         let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
         let (rows, cursor) = block_on(client.delta_read(&*desc, None, &desc.schema, &whole)).expect("bootstrap");
-        let copy = canonical(&(rows.schema, rows.batch));
+        let copy = canonical(&rows.batch);
         Reader { desc, whole, copy, cursor }
     }
 
@@ -1141,7 +1139,7 @@ impl Reader {
     /// Add one delta to the copy, weights and all; its row count.
     fn apply(&mut self, (rows, cursor): (gnitz_core::ScanReply, gnitz_wire::multi_frame::DeltaCursor)) -> usize {
         let n = rows.batch.len();
-        for (row, w) in canonical_rows(&(rows.schema, rows.batch)) {
+        for (row, w) in canonical_rows(&rows.batch) {
             *self.copy.entry(row).or_insert(0) += w;
         }
         self.copy.retain(|_, w| *w != 0);
@@ -1347,7 +1345,7 @@ fn a_subscribe_with_no_cursor_is_one_request() {
     let before = fx.direct.requests_sent();
     let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
     let (sub, rows, cursor) = block_on(fx.direct.subscribe(&*desc, None, &desc.schema, &whole)).expect("subscribe");
-    assert_eq!(canonical(&(rows.schema, rows.batch)), reader.copy, "the view whole");
+    assert_eq!(canonical(&rows.batch), reader.copy, "the view whole");
     reader.cursor = cursor;
     assert_eq!(reader.sync(&mut fx.direct, sub, Duration::ZERO), 0);
     assert_eq!(
@@ -1505,7 +1503,7 @@ fn churn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
             }
         }
     }
-    block_on(client.push(rel.tid, &rel.schema, &batch, gnitz_wire::WireConflictMode::Update)).expect("push blobs");
+    block_on(client.push(rel.tid, batch, gnitz_wire::WireConflictMode::Update)).expect("push blobs");
 }
 
 /// A round that touches only keys the copies already hold — the retract/insert
@@ -1860,7 +1858,7 @@ fn a_recreated_view_is_followed_to_its_new_id() {
         );
         assert!(fx.mirror().cursor_of(new).is_some());
         assert_eq!(
-            fx.local("SELECT * FROM v_keyed").0.columns().len(),
+            fx.local("SELECT * FROM v_keyed").schema().columns().len(),
             cols.len(),
             "round {round}: the copy reads under the new column set",
         );
@@ -2186,7 +2184,7 @@ fn a_view_renamed_by_another_client_fails_until_its_new_name_is_mirrored() {
 }
 
 /// The lines of an `EXPLAIN` reply.
-fn plan_lines(plan: &Reply) -> Vec<String> {
+fn plan_lines(plan: &gnitz_core::ZSetBatch) -> Vec<String> {
     canonical_rows(plan)
         .into_iter()
         .filter_map(|((_, cells), _)| Some(String::from_utf8_lossy(cells.first()?.as_ref()?).into_owned()))

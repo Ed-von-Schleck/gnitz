@@ -15,7 +15,7 @@ fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
 }
 
 /// The refusal of `families` sent as one DDL bundle.
-fn refusal(s: &mut Session, families: &[(SysFamily, ZSetBatch)]) -> String {
+fn refusal(s: &mut Session, families: &[(SysFamily, &ZSetBatch)]) -> String {
     let sent = s.submit(Request::DdlTxn(families));
     drive(s, sent).0.unwrap_err().to_string()
 }
@@ -37,8 +37,8 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     let err = refusal(
         &mut s,
         &[
-            (SysFamily::Schema, schema_row(a, "one")),
-            (SysFamily::Schema, schema_row(b, "two")),
+            (SysFamily::Schema, &schema_row(a, "one")),
+            (SysFamily::Schema, &schema_row(b, "two")),
         ],
     );
     assert!(err.contains("two blocks"), "{err}");
@@ -46,7 +46,7 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     let seq = sys_schema(SysFamily::Sequence);
     let mut forged = ZSetBatch::new(seq);
     forged.builder().begin_row(2, 1).put_int((1u64 << 40) as u128);
-    let err = refusal(&mut s, &[(SysFamily::Sequence, forged)]);
+    let err = refusal(&mut s, &[(SysFamily::Sequence, &forged)]);
     assert!(err.contains("not writable from the wire"), "{err}");
 
     // Neither wrote anything: both names are still free.
@@ -65,7 +65,7 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     let mut app = dup.builder();
     app.begin_row(1, 1).put_int(5);
     app.begin_row(2, 1).put_int(5);
-    block_on(client.push(tid, &schema, &dup, WireConflictMode::Update)).unwrap();
+    block_on(client.push(tid, dup, WireConflictMode::Update)).unwrap();
 
     let unique_on_v = |client: &mut GnitzClient, owner: &RelName| {
         let desc = block_on(client.resolve_relation(owner)).unwrap();

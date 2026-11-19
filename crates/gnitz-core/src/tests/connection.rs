@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::test_support::{
-    Peer, await_reply, decode_wal_block, delta_frame, delta_terminal, encode_frame, kv_rows, kv_schema, pushed_marker,
-    pushed_train, reply_ctrl, reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer,
-    sync_header, sync_held,
+    Peer, await_reply, decode_wal_block, delta_frame, delta_terminal, encode_frame, hold_subscription, kv_rows,
+    kv_schema, pushed_marker, pushed_train, reply_ctrl, reply_rows, reply_status, session_pair as pair,
+    step_until_idle, sub_id, sync_answer, sync_header, sync_held,
 };
 use crate::transport::poll_fd;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus, framed};
@@ -19,7 +19,7 @@ fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanRepl
 const COMMIT: Request<'static> = Request::PushTxn(&[]);
 
 fn schema_a() -> Arc<Schema> {
-    Arc::new(kv_schema(TypeCode::I64))
+    kv_schema(TypeCode::I64)
 }
 
 fn schema_b() -> Arc<Schema> {
@@ -75,7 +75,7 @@ fn train_split_across_continuation_frames_completes_once() {
     s.step(Interest::READ);
     let r = sent.try_take().unwrap().unwrap();
     assert_eq!(r.batch, batch_a(&[1, 2, 3, 4, 5]));
-    assert!(Arc::ptr_eq(&r.schema, &schema), "the schema the request named");
+    assert!(Arc::ptr_eq(r.batch.schema(), &schema), "the schema the request named");
     assert_eq!(s.interest(), Interest::NONE);
 }
 
@@ -118,8 +118,8 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     assert_eq!(replies[0].batch, batch_a(&[10, 11]));
     assert_eq!(replies[1].batch, batch_b(&[20, 21]));
     // Each reply carries the schema its relation was paired with.
-    assert!(Arc::ptr_eq(&replies[0].schema, &sa));
-    assert!(Arc::ptr_eq(&replies[1].schema, &sb));
+    assert!(Arc::ptr_eq(replies[0].batch.schema(), &sa));
+    assert!(Arc::ptr_eq(replies[1].batch.schema(), &sb));
     assert_eq!(s.interest(), Interest::NONE);
 }
 
@@ -175,9 +175,6 @@ fn a_status_frame_fails_its_slot_alone() {
 #[test]
 fn a_refused_submit_leaves_the_session_as_it_was() {
     let (mut s, _peer) = pair();
-    let sa = schema_a();
-    let ddl = [(gnitz_wire::SysFamily::Schema, ZSetBatch::new(&sa))];
-    let wrong_layout = batch_b(&[1]);
     // One cell alone past the server's ingress cap, refused before it is sent.
     let sb = schema_b();
     let mut oversize = ZSetBatch::new(&sb);
@@ -193,30 +190,13 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     };
     assert!(matches!(s.submit_scan_multi(&[]).try_take(), Some(Err(_))));
     untouched(&s, "an empty multi-read");
-    for (what, req) in [
-        ("a DDL batch not in its family's layout", Request::DdlTxn(&ddl)),
-        (
-            "a push whose batch is not in its schema's layout",
-            Request::Push {
-                target: 4.into(),
-                schema: &sa,
-                batch: &wrong_layout,
-                mode: WireConflictMode::Update,
-            },
-        ),
-        (
-            "a push whose frame is past the server's ingress cap",
-            Request::Push {
-                target: 4.into(),
-                schema: &sb,
-                batch: &oversize,
-                mode: WireConflictMode::Update,
-            },
-        ),
-    ] {
-        assert!(matches!(s.submit(req).try_take(), Some(Err(_))), "{what}");
-        untouched(&s, what);
-    }
+    let req = Request::Push {
+        target: 4.into(),
+        batch: &oversize,
+        mode: WireConflictMode::Update,
+    };
+    assert!(matches!(s.submit(req).try_take(), Some(Err(_))));
+    untouched(&s, "a push whose frame is past the server's ingress cap");
 }
 
 #[test]
@@ -249,7 +229,6 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
     let mut a = s.submit(COMMIT);
     let push = Request::Push {
         target: 5.into(),
-        schema: &sa,
         batch: &rows,
         mode: WireConflictMode::Update,
     };
@@ -341,13 +320,11 @@ fn end_abandons_every_pending_slot_and_refuses_further_work() {
 #[test]
 fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     let (mut s, _peer) = pair();
-    let sa = schema_a();
     // Large enough that a few dozen of them reach the cap.
     let b = batch_a(&(0..32_768).collect::<Vec<_>>());
     let push = |s: &mut Session| {
         let push = Request::Push {
             target: 4.into(),
-            schema: &sa,
             batch: &b,
             mode: WireConflictMode::Update,
         };
@@ -524,7 +501,7 @@ fn a_poll_released_mid_train_drops_the_rest() {
 
 /// A read of view 7's delta feed after `(tag 1, tick 4)`.
 fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>) -> Sent<(ScanReply, DeltaCursor)> {
-    s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[], None)
+    s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[])
 }
 
 #[test]
@@ -540,7 +517,7 @@ fn a_delta_read_yields_its_trains_rows_and_the_terminals_cursor() {
     let (reply, cursor) = await_reply(&mut s, sent).unwrap();
     assert_eq!(reply.batch, batch_a(&[1, 2, 3]));
     assert_eq!(reply.lsn, None);
-    assert!(Arc::ptr_eq(&reply.schema, &schema));
+    assert!(Arc::ptr_eq(reply.batch.schema(), &schema));
     assert_eq!(cursor.pair(), (1, 9));
     assert_eq!(s.interest(), Interest::NONE);
 }
@@ -734,17 +711,9 @@ fn cursor(tick: u64) -> DeltaCursor {
     DeltaCursor::from_pair(1, tick).unwrap()
 }
 
-/// A read of view 40 that keeps it as subscription `id`.
-fn submit_kept_read(s: &mut Session, id: SubId) -> Sent<(ScanReply, DeltaCursor)> {
-    s.submit_delta_read(40.into(), None, &schema_a(), &[], Some(id))
-}
-
-/// Subscribe to view 40 as subscription `id`: a kept read, answered here with
-/// no row and round 3.
+/// Subscribe to view 40 as subscription `id`, answered with no row and round 3.
 fn subscribe_as(s: &mut Session, peer: &Peer, id: SubId) {
-    let sent = submit_kept_read(s, id);
-    peer.send(&delta_terminal(40, 1, 3));
-    assert_eq!(await_reply(s, sent).unwrap().1, cursor(3));
+    hold_subscription(s, peer, id, &schema_a(), 3);
 }
 
 /// [`subscribe_as`] subscription 5; that id.
@@ -797,32 +766,6 @@ fn a_released_subscription_parks_no_pushed_train() {
     let hdr = peek_control_block(&request).unwrap().hdr;
     assert_eq!(hdr.flags.verb, Some(gnitz_wire::ClientVerb::SyncPushed));
     assert_eq!(hdr.arg0, 60_000, "the sync waits");
-}
-
-/// A kept read is answered as any delta read is, and its terminal leaves the
-/// session holding the subscription at the cursor it carries: a train pushed
-/// right behind the reply is the subscription's.
-#[test]
-fn a_kept_reads_terminal_parks_its_cursor() {
-    let (mut s, peer) = pair();
-    let sent = submit_kept_read(&mut s, sub_id(5));
-    assert!(s.take_pushed(sub_id(5)).is_err(), "unanswered, nothing is held");
-    let mut bytes = framed(&delta_frame(40, Some(&batch_a(&[1, 2])), None));
-    bytes.extend(framed(&delta_terminal(40, 1, 9)));
-    bytes.extend(pushed_train(40, sub_id(5), &batch_a(&[3]), Ok((1, 11))));
-    peer.send_bytes(&bytes);
-    let (reply, at) = await_reply(&mut s, sent).unwrap();
-    assert_eq!((reply.batch, at), (batch_a(&[1, 2]), cursor(9)));
-    let synced = s.submit_sync(&[sub_id(5)], Duration::ZERO);
-    assert_eq!(s.requests_sent(), 2, "the server holds one, so the sync is a request");
-    peer.send(&sync_answer(None));
-    await_reply(&mut s, synced).unwrap();
-    let (blocks, next) = s.take_pushed(sub_id(5)).unwrap();
-    assert_eq!(
-        (blocks.len(), next),
-        (1, cursor(11)),
-        "what was pushed, not the read's rows"
-    );
 }
 
 /// A kept poll whose reader went sends nothing more. A subscription it was
@@ -1008,15 +951,21 @@ fn a_pushed_fault_ends_its_subscription_and_no_request() {
 }
 
 /// A kept read the server refuses — the request whole, or its view alone —
-/// is a refused read and nothing else: the session holds nothing under the
-/// id, and has no subscription to sync.
+/// ends its item with the refusal and nothing else: the session holds nothing
+/// more under the id, and has no subscription to sync.
 #[test]
 fn a_refused_kept_read_parks_nothing() {
     for named in [0, 40] {
         let (mut s, peer) = pair();
-        let sent = submit_kept_read(&mut s, sub_id(5));
+        s.submit_delta_poll(
+            sub_id(5),
+            &[multi_frame::DeltaPollItem { from: None, ..delta_item(40) }],
+        );
         peer.send(&reply_status(named, WireStatus::DeltaExpired, "refused"));
-        let refused = await_reply(&mut s, sent);
+        while s.take_reading(sub_id(5)).is_some() {
+            s.step(poll_fd(s.as_fd(), s.interest(), None).unwrap());
+        }
+        let refused = s.take_pushed(sub_id(5));
         assert!(
             matches!(&refused, Err(e) if e.status() == Some(WireStatus::DeltaExpired)),
             "naming {named}: {refused:?}"
@@ -1092,7 +1041,7 @@ fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Schema {
 }
 
 /// A frame's data block, decoded under `schema`.
-fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Schema) -> Option<ZSetBatch> {
+fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Arc<Schema>) -> Option<ZSetBatch> {
     ctrl.data
         .clone()
         .map(|r| decode_wal_block(&buf[r], schema).expect("a data block decodes"))
@@ -1104,14 +1053,13 @@ fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Schema) -> Option<ZSet
 /// from *that* family's schema, batch, tid and basis, in that order.
 #[test]
 fn push_txn_families_carry_their_own_schema_and_batch() {
-    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let schema = kv_schema(TypeCode::I64);
     let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
     let b1 = kv_rows(&[(3, 30, 1)]);
-    let b2 = ZSetBatch::retraction(&schema, schema.pk_keys([[4]]).as_bytes());
+    let b2 = ZSetBatch::key_rows(&schema, schema.pk_keys([[4]]).as_bytes(), -1);
 
     let family = |tid: u64, batch, mode, basis| PushFamily {
         target: tid.into(),
-        schema: Arc::clone(&schema),
         batch: Arc::new(batch),
         mode,
         basis,
@@ -1131,8 +1079,8 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     for (fam, want) in decoded.iter().zip(&families) {
         let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
         assert_eq!(got, (want.target.tid, want.mode, want.basis));
-        let block_schema = frame_schema(&payload, fam);
-        assert_eq!(block_schema, *schema);
+        let block_schema = Arc::new(frame_schema(&payload, fam));
+        assert_eq!(*block_schema, *schema);
         assert_eq!(frame_data(&payload, fam, &block_schema).as_ref(), Some(&*want.batch));
     }
 }
@@ -1150,7 +1098,7 @@ fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
         let buf = encode_frame(hdr, schema.to_record(), Some(&batch));
         let ctrl = peek_control_block(&buf).unwrap();
         assert_eq!(ctrl.hdr, hdr);
-        assert_eq!(frame_schema(&buf, &ctrl), schema);
+        assert_eq!(frame_schema(&buf, &ctrl), *schema);
         let want = (!batch.is_empty()).then_some(&batch);
         assert_eq!(frame_data(&buf, &ctrl, &schema).as_ref(), want);
     }

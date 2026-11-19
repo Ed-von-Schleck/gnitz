@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -495,10 +496,18 @@ impl LoopCore {
                 return;
             }
         };
-        if let Some(serving) = actor.as_mut()
-            && serving.as_mut().poll(&mut Context::from_waker(&self.waker)).is_ready()
-        {
-            self.end(py, &mut actor);
+        if let Some(serving) = actor.as_mut() {
+            // A panic in the `serve` loop ends it: polled again it would only
+            // panic again, and the calls it owes would never resolve.
+            let cx = &mut Context::from_waker(&self.waker);
+            match std::panic::catch_unwind(AssertUnwindSafe(|| serving.as_mut().poll(cx))) {
+                Ok(Poll::Pending) => {}
+                Ok(Poll::Ready(())) => self.end(py, &mut actor),
+                Err(panic) => {
+                    self.end(py, &mut actor);
+                    std::panic::resume_unwind(panic);
+                }
+            }
         }
         // Readiness nothing used: the `serve` loop is not stepping, and a
         // level-triggered loop would call back again at once.

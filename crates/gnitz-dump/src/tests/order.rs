@@ -2,12 +2,12 @@ use super::*;
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// `(id PK, p0 NULL, p1 NULL, …)` rows, one `p` column per parent cell given.
-fn tree(rows: &[(u64, &[Option<u64>])]) -> (ZSetBatch, Schema) {
+fn tree(rows: &[(u64, &[Option<u64>])]) -> ZSetBatch {
     let mut cols = vec![ColumnDef::new("id", TypeCode::U64, false)];
     for i in 0..rows[0].1.len() {
         cols.push(ColumnDef::new(format!("p{i}"), TypeCode::U64, true));
     }
-    let schema = Schema::from_parts(cols, &[0]).unwrap();
+    let schema = std::sync::Arc::new(gnitz_core::Schema::from_parts(cols, &[0]).unwrap());
     let mut batch = ZSetBatch::new(&schema);
     let mut app = batch.builder();
     for &(id, parents) in rows {
@@ -19,7 +19,7 @@ fn tree(rows: &[(u64, &[Option<u64>])]) -> (ZSetBatch, Schema) {
             };
         }
     }
-    (batch, schema)
+    batch
 }
 
 /// Every row after its parents, the rows that reference one another round a
@@ -92,9 +92,9 @@ fn every_row_comes_after_its_parents() {
         ),
     ];
     for (rows, cycles) in cases {
-        let (batch, schema) = tree(rows);
+        let batch = tree(rows);
         let refs: Vec<usize> = (1..=rows[0].1.len()).collect();
-        let order = order(&batch, &schema, &refs);
+        let order = order(&batch, &refs);
         assert_eq!(order.len(), rows.len(), "{rows:?}");
         assert!(order.last().unwrap().1, "the last row may end a push: {order:?}");
         // The rows between one push end and the next.
@@ -122,6 +122,6 @@ fn every_row_comes_after_its_parents() {
 /// With no referencing column, the rows in their own order, each free to end a push.
 #[test]
 fn rows_with_no_reference_keep_their_order() {
-    let (batch, schema) = tree(&[(2, &[]), (1, &[]), (3, &[])]);
-    assert_eq!(order(&batch, &schema, &[]), [(0, true), (1, true), (2, true)]);
+    let batch = tree(&[(2, &[]), (1, &[]), (3, &[])]);
+    assert_eq!(order(&batch, &[]), [(0, true), (1, true), (2, true)]);
 }

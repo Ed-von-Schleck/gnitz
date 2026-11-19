@@ -140,7 +140,7 @@ impl AsyncClient {
     /// a round trip.
     ///
     /// ```ignore
-    /// let lsn = client.send(move |c| c.push(tid, &schema, batch, mode)).await?;
+    /// let lsn = client.send(move |c| c.push(tid, batch, mode)).await?;
     /// ```
     pub fn send<T, F>(&self, f: F) -> Sent<T>
     where

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::runtime::reactor::RecvBuf;
 use gnitz_store::relation::PkRule;
 use gnitz_wire::WireConflictMode;
-use gnitz_zset::repr::{Batch, MemBatch};
+use gnitz_zset::repr::{Batch, CertifiedBlock, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// One decoded, shape-validated transaction family: the target `tid`, its
@@ -57,26 +57,22 @@ impl FamilyRows {
     }
 }
 
-/// A client's data block that [`MemBatch::certify_foreign`] accepted, at
-/// `range` of the bytes it certified, under the schema it was certified under.
+/// A client's data block, certified where it lies, under the schema it was
+/// certified under.
 pub(super) struct PushedBlock {
-    range: Range<usize>,
+    block: CertifiedBlock,
     schema: SchemaDescriptor,
 }
 
 impl PushedBlock {
     /// Certify the block at `range` of `data` under `schema`.
-    pub(super) fn certify(
-        data: &mut [u8],
-        range: Range<usize>,
-        schema: SchemaDescriptor,
-    ) -> Result<Self, &'static str> {
-        MemBatch::certify_foreign(&mut data[range.clone()], &schema)?;
-        Ok(PushedBlock { range, schema })
+    pub(super) fn certify(data: &[u8], range: Range<usize>, schema: SchemaDescriptor) -> Result<Self, &'static str> {
+        let block = CertifiedBlock::certify(data, range, &schema)?;
+        Ok(PushedBlock { block, schema })
     }
 
     /// The block's rows, read from `data`: the bytes it was certified in.
     pub(super) fn view<'a>(&'a self, data: &'a [u8]) -> MemBatch<'a> {
-        MemBatch::of_wal_block(&data[self.range.clone()], &self.schema).expect("a certified block parses")
+        self.block.view(data, &self.schema)
     }
 }

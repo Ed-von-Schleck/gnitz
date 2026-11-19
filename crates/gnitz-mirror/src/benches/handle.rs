@@ -35,7 +35,7 @@ fn scatter(seq: u64) -> u64 {
 fn copy_index_bench() {
     const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
     let layout = make_schema_u64_i64();
-    let schema = Schema::from_record(&encode_schema_record(&layout)).unwrap();
+    let schema = Arc::new(Schema::from_record(&encode_schema_record(&layout)).unwrap());
     let block = |rows: &[(u64, i64, i64)]| encode_to_wire_vec(&make_batch(&layout, rows));
     let cursor = |tick| DeltaCursor::from_pair(7, tick).unwrap();
     let counter = Counter::instructions();
@@ -51,7 +51,7 @@ fn copy_index_bench() {
             class: RelClass::FedView,
             pk_repeats: false,
             serial: false,
-            schema: Arc::new(schema.clone()),
+            schema: Arc::clone(&schema),
             indexes: indexed.then_some(index).into_iter().collect(),
             token: 1,
         };

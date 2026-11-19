@@ -28,8 +28,8 @@
 use crate::control::{Section, VerbShape, frame_size};
 use crate::region::Regions;
 use crate::{
-    CTRL_HEADER_SIZE, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireConflictMode, WireFlags, Writer,
-    append_frame, peek_control_block,
+    CTRL_HEADER_SIZE, ClientVerb, ControlHeader, DecodedControl, Reader, SysFamily, Target, WireConflictMode,
+    WireFlags, Writer, append_frame, peek_control_block,
 };
 use std::fmt;
 use std::num::NonZeroU64;
@@ -82,6 +82,22 @@ pub fn encode_items(out: &mut Vec<u8>, verb: ClientVerb, items: &[FrameItem<'_>]
             append_frame(out, &hdr, it.blob, Some(&it.data[..]));
         }
     })
+}
+
+/// Append a `DDL_TXN` frame to `out`: one item per system family, named by its
+/// table id alone, its block in `rows`.
+pub fn encode_ddl_txn<'a>(out: &mut Vec<u8>, families: impl IntoIterator<Item = (SysFamily, Regions<'a>)>) {
+    let items: Vec<FrameItem<'a>> = families
+        .into_iter()
+        .map(|(family, data)| FrameItem {
+            target: Target::from(family),
+            conflict_mode: WireConflictMode::default(),
+            basis: 0,
+            blob: &[],
+            data,
+        })
+        .collect();
+    encode_items(out, ClientVerb::DdlTxn, &items)
 }
 
 /// Split the item list at `body` of the multi-item `verb` frame `frame` into

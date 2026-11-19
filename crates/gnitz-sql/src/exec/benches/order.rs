@@ -3,11 +3,12 @@ use crate::test_support::{col, ncol, schema};
 use gnitz_core::{Batch, BatchBuilder};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
+use std::sync::Arc;
 
 /// `rows` rows of `(id U64 pk, v)`, ids ascending, each `v` written by `write` from a
 /// pseudo-random word.
-fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchBuilder<&mut Batch>, u64)) -> (Schema, ZSetBatch) {
-    let sch = schema(vec![col("id", TypeCode::U64), ncol("v", tc)], &[0]);
+fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchBuilder<&mut Batch>, u64)) -> (Arc<Schema>, ZSetBatch) {
+    let sch = Arc::new(schema(vec![col("id", TypeCode::U64), ncol("v", tc)], &[0]));
     let mut b = ZSetBatch::new(&sch);
     let mut app = b.builder();
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
@@ -20,13 +21,13 @@ fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchBuilder<&mut Batch>
 
 /// `rows` rows of `(id U64 pk, v I64)`, the ids `w` concatenated ascending runs of
 /// pseudo-random values: a multi-worker PK walk's reply, one worker after another.
-fn runs(rows: usize, w: usize) -> (Schema, ZSetBatch) {
+fn runs(rows: usize, w: usize) -> (Arc<Schema>, ZSetBatch) {
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
     let mut ids: Vec<u64> = (0..rows).map(|_| rng.next_u64()).collect();
     for run in ids.chunks_mut(rows.div_ceil(w)) {
         run.sort_unstable();
     }
-    let sch = schema(vec![col("id", TypeCode::U64), ncol("v", TypeCode::I64)], &[0]);
+    let sch = Arc::new(schema(vec![col("id", TypeCode::U64), ncol("v", TypeCode::I64)], &[0]));
     let mut b = ZSetBatch::new(&sch);
     let mut app = b.builder();
     for (i, &id) in ids.iter().enumerate() {
@@ -88,7 +89,7 @@ fn order_slice_bench() {
         ("16 values, LIMIT 10", ints(16), &by_v[..], top10),
         ("pk, LIMIT 10", ints(0), &by_id[..], top10),
     ] {
-        let cut = ResultCut::new(std::sync::Arc::new(sch), order, slice).unwrap();
+        let cut = ResultCut::new(sch, order, slice).unwrap();
         let (out, sort) = counter.measure(|| cut.apply(b));
         assert_eq!(out.len(), slice.keep.min(ROWS as u64) as usize, "{name}");
         std::hint::black_box(out);

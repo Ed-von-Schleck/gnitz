@@ -75,8 +75,8 @@ fn transaction_control_refuses_what_it_cannot_honour() {
         db.refuses(sql, Error, needle);
         assert!(db.client.txn_active(), "`{sql}` closed the transaction");
     }
-    let (schema, plan) = db.read("EXPLAIN SELECT v FROM t WHERE id = 5");
-    assert_eq!(visible_names(&schema), ["plan"]);
+    let plan = db.read("EXPLAIN SELECT v FROM t WHERE id = 5");
+    assert_eq!(visible_names(plan.schema()), ["plan"]);
     assert!(!plan.is_empty() && db.client.txn_active());
     db.exec("COMMIT");
     assert_eq!(db.scan("t", &["id", "v"]), [[1, 10, 1]]);
@@ -143,27 +143,24 @@ fn a_text_table_past_one_frame_reads_back_whole() {
             .put_int((id % GROUPS) as u128)
             .put_string(&text);
     }
-    block_on(
-        db.client
-            .push(rel.tid, &rel.schema, &batch, gnitz_wire::WireConflictMode::Update),
-    )
-    .unwrap();
+    block_on(db.client.push(rel.tid, batch, gnitz_wire::WireConflictMode::Update)).unwrap();
 
     // Checked by content, not by count: each frame's rows are appended into one
     // batch, and the null words and German cells of a frame are indexed by its
     // own row numbers, so a wrong offset moves values without losing any.
-    let (schema, batch) = db.read("SELECT * FROM t");
+    let batch = db.read("SELECT * FROM t");
+    let schema = batch.schema();
     assert_eq!(batch.len(), ROWS as usize);
-    let (id_ci, v_ci) = (col_idx(&schema, "id"), col_idx(&schema, "v"));
-    let s = schema.layout().locate(col_idx(&schema, "s"));
+    let (id_ci, v_ci) = (col_idx(schema, "id"), col_idx(schema, "v"));
+    let s = schema.layout().locate(col_idx(schema, "s"));
     let mut seen = vec![false; ROWS as usize];
     for row in 0..batch.len() {
-        let id = cell(&schema, &batch, id_ci, row) as u64;
+        let id = cell(&batch, id_ci, row) as u64;
         assert!(
             id < ROWS && !std::mem::replace(&mut seen[id as usize], true),
             "row {row}: id {id}"
         );
-        assert_eq!(cell(&schema, &batch, v_ci, row) as u64, id % GROUPS, "row {row}");
+        assert_eq!(cell(&batch, v_ci, row) as u64, id % GROUPS, "row {row}");
         assert_eq!(
             gnitz_wire::german_string_content(s.german_cell(&batch.view(), row), batch.view().blob()),
             text.as_bytes(),

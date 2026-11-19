@@ -96,11 +96,11 @@ impl Session {
         };
         let Ok(verb) = ctrl.client_verb() else { return };
         let body = &frame[ctrl.body.clone()];
-        let mut buf = RecvBuf::detached(frame);
+        let buf = RecvBuf::detached(frame);
         match verb {
             ClientVerb::DdlTxn => self.ddl(body),
             ClientVerb::Push => {
-                let Ok(Some(push)) = admit_push(&self.cat, buf.as_mut_slice(), ctrl, Access::Write) else {
+                let Ok(Some(push)) = admit_push(&self.cat, buf.as_slice(), ctrl, Access::Write) else {
                     return;
                 };
                 let family = push.family(&Rc::new(buf));
@@ -114,7 +114,7 @@ impl Session {
                 }
             }
             ClientVerb::PushTxn => {
-                let Ok(items) = admit_push_txn(&self.cat, buf.as_mut_slice(), ctrl.body.clone()) else {
+                let Ok(items) = admit_push_txn(&self.cat, buf.as_slice(), ctrl.body.clone()) else {
                     return;
                 };
                 let buf = Rc::new(buf);

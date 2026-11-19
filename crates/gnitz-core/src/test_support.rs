@@ -22,7 +22,7 @@ use crate::transport::poll_fd;
 use crate::{
     BlockingHost, ClientError, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema, Sent, ZSetBatch,
 };
-use gnitz_wire::multi_frame::SubId;
+use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId};
 
 /// `schema.name`.
 pub(crate) fn rel(schema: &str, name: &str) -> RelName {
@@ -30,15 +30,12 @@ pub(crate) fn rel(schema: &str, name: &str) -> RelName {
 }
 
 /// `(pk U64, v <v>)`.
-pub(crate) fn kv_schema(v: TypeCode) -> Schema {
-    Schema::from_parts(
-        vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("v", v, false),
-        ],
-        &[0],
-    )
-    .unwrap()
+pub(crate) fn kv_schema(v: TypeCode) -> Arc<Schema> {
+    let columns = vec![
+        ColumnDef::new("pk", TypeCode::U64, false),
+        ColumnDef::new("v", v, false),
+    ];
+    Arc::new(Schema::from_parts(columns, &[0]).unwrap())
 }
 
 /// `(pk, v, weight)` rows of `kv_schema(I64)`.
@@ -61,7 +58,7 @@ pub(crate) fn wide_schema(ncols: usize, nullable: bool) -> Arc<Schema> {
 
 /// `n` rows of a [`wide_schema`]; with `null_every`, every that-many-th cell
 /// is NULL.
-pub(crate) fn wide_rows(schema: &Schema, n: usize, null_every: usize) -> ZSetBatch {
+pub(crate) fn wide_rows(schema: &Arc<Schema>, n: usize, null_every: usize) -> ZSetBatch {
     let mut b = ZSetBatch::with_capacity(schema, n);
     let mut app = b.builder();
     for r in 0..n {
@@ -269,6 +266,27 @@ pub(crate) fn step_until_idle(s: &mut Session) {
     }
 }
 
+/// Hold subscription `id` of view 40 on `s`, replied in `schema`'s layout: a
+/// one-item DELTA_POLL kept as `id`, whose terminal `peer` answers with no row
+/// at round `(1, tick)`.
+pub(crate) fn hold_subscription(s: &mut Session, peer: &Peer, id: SubId, schema: &Schema, tick: u64) {
+    let item = DeltaPollItem {
+        view: 40.into(),
+        from: None,
+        reply_layout: schema.layout().layout_digest(),
+        spec: &[],
+    };
+    s.submit_delta_poll(id, &[item]);
+    peer.send(&delta_terminal(40, 1, tick));
+    let (blocks, at) = loop {
+        match s.take_ended(id) {
+            Some(held) => break held.unwrap(),
+            None => s.step(poll_fd(s.as_fd(), s.interest(), None).unwrap()),
+        }
+    };
+    assert_eq!((blocks.len(), at), (0, DeltaCursor::from_pair(1, tick).unwrap()));
+}
+
 /// One frame payload, without the 4-byte length prefix, as
 /// `append_payload` writes it.
 pub(crate) fn encode_frame(hdr: ControlHeader, blob: &[u8], data: Option<&ZSetBatch>) -> Vec<u8> {
@@ -455,10 +473,10 @@ pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
 }
 
 /// A WAL block decoded under `schema` into a fresh batch.
-pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<ZSetBatch, ProtocolError> {
+pub(crate) fn decode_wal_block(data: &[u8], schema: &Arc<Schema>) -> Result<ZSetBatch, ProtocolError> {
     let block = crate::batch::FrameBlock {
         frame: std::borrow::Cow::Borrowed(data),
         block: 0..data.len(),
     };
-    crate::batch::decode_wal_blocks(Vec::new(), Some(block), &std::sync::Arc::new(schema.clone()))
+    crate::batch::decode_wal_blocks(Vec::new(), Some(block), schema)
 }

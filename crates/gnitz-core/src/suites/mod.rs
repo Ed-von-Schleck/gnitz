@@ -69,7 +69,7 @@ fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewB
 
 /// `pks` at weight 1, payload slot `j` of each holding `pk * 3 + j`; every
 /// payload column of `schema` is an I64.
-fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
+fn rows(schema: &Arc<Schema>, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
     let mut app = batch.builder();
     for pk in pks {
@@ -104,10 +104,9 @@ fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
 }
 
 /// `batch` pushed into `tid` as an upsert.
-fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'a> {
+fn push_req(tid: u64, batch: &ZSetBatch) -> Request<'_> {
     Request::Push {
         target: tid.into(),
-        schema,
         batch,
         mode: WireConflictMode::Update,
     }

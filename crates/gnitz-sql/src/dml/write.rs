@@ -94,37 +94,34 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
             // project it, saving a deep clone inside a transaction.
             let Some(mut map) = returning else {
                 let count = rows.len();
-                client.push(&*target, schema, rows, mode).await?;
+                client.push(&*target, rows, mode).await?;
                 return Ok(SqlResult::RowsAffected { tag: "INSERT", count });
             };
-            client.push(&*target, schema, &rows, mode).await?;
-            return Ok(SqlResult::Rows(ScanReply {
-                schema: Arc::clone(map.out_schema()),
-                batch: map.apply(rows),
-                lsn: None,
-            }));
+            // Unshared again once the push is sent; a transaction holding it costs a copy.
+            let rows = Arc::new(rows);
+            client.push(&*target, Arc::clone(&rows), mode).await?;
+            let batch = map.apply(Arc::unwrap_or_clone(rows));
+            return Ok(SqlResult::Rows(ScanReply { batch, lsn: None }));
         }
         Write::Upsert { rows, mut set } => {
             let bound = ReadBound::PkSet(rows.pk_keys());
             let count = client
                 .read_modify_write(&target, bound, Vec::new(), set.is_none(), |held| {
-                    resolve_conflicts(rows, held, set.as_deref_mut(), schema)
+                    resolve_conflicts(rows, held, set.as_deref_mut())
                 })
                 .await?;
             ("INSERT", count)
         }
         Write::Update { bound, predicate, mut set } => {
             let count = client
-                .read_modify_write(&target, bound, predicate, false, |held| {
-                    apply_set(&mut set, held, None, schema)
-                })
+                .read_modify_write(&target, bound, predicate, false, |held| apply_set(&mut set, held, None))
                 .await?;
             ("UPDATE", count)
         }
         Write::Delete { bound, predicate } => {
             let count = client
                 .read_modify_write(&target, bound, predicate, true, |held| {
-                    Ok::<_, GnitzSqlError>(ZSetBatch::retraction(schema, held.view().pk()))
+                    Ok::<_, GnitzSqlError>(ZSetBatch::key_rows(schema, held.view().pk(), -1))
                 })
                 .await?;
             ("DELETE", count)
