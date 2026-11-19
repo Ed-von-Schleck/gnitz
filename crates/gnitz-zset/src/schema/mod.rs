@@ -1,7 +1,7 @@
-//! The key and payload-order kernels over a schema, the shaping of a derived
-//! schema (an operator's output or an index's layout), and a descriptor read
-//! from and written as a meta-schema record. The descriptor
-//! itself is `gnitz-expr`'s.
+//! The key and payload-order kernels over a schema, the radix sort under every
+//! key sort, the shaping of a derived schema (an operator's output, a reduce's
+//! output key and layout, or an index's layout), and a descriptor read from and
+//! written as a meta-schema record. The descriptor itself is `gnitz-expr`'s.
 
 use gnitz_expr::{SchemaRefusal, leading_pk};
 use gnitz_wire::schema_record::RecordCol;
@@ -10,6 +10,8 @@ use smallvec::SmallVec;
 
 mod key;
 mod payload_order;
+mod radix;
+mod reduce_out;
 mod sort_key;
 
 /// The schema descriptor, homed in `gnitz-expr` because its evaluator reads
@@ -19,6 +21,10 @@ pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range
 
 pub use key::{band, compare_pk_ordering, group_floor};
 pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
+pub(crate) use radix::stable_radix_sort_by_key;
+pub use radix::{RadixKey, radix_sort_by_key};
+pub(crate) use reduce_out::{ReduceOutKey, reduce_out_key};
+pub use reduce_out::{ReduceOutSlot, reduce_out_layout};
 pub(crate) use sort_key::{PkSortKey, pack_pk_be, pk_width_dispatch};
 pub use sort_key::{pk_keys, pk_keys_of_images};
 

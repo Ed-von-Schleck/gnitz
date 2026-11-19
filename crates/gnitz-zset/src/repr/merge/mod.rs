@@ -13,7 +13,6 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
-use gnitz_expr::{RadixKey, radix_sort_by_key};
 use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
@@ -23,7 +22,8 @@ use super::seek::gallop_from;
 use super::string_heap::{BlobCache, rebase_string_cells, row_long_bytes};
 use super::writer::DirectWriter;
 use crate::schema::{
-    PayloadOrder, PkSortKey, SchemaColumn, SchemaDescriptor, pack_pk_be, pk_width_dispatch, with_payload_cmp,
+    PayloadOrder, PkSortKey, RadixKey, SchemaColumn, SchemaDescriptor, pack_pk_be, pk_width_dispatch,
+    radix_sort_by_key, with_payload_cmp,
 };
 use gnitz_wire::{Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT, RowSource, ScalarKind, native_key_image};
 

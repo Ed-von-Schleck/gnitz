@@ -28,8 +28,8 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
-use gnitz_expr::ReduceOutSlot;
 use gnitz_wire::{AggDescriptor, ColumnDef, GroupAggs};
+use gnitz_zset::schema::{ReduceOutSlot, reduce_out_layout};
 use spine::{Level, Top};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ fn keyed_frame(
     row: impl IntoIterator<Item = u32>,
     tail: Vec<Slot>,
 ) -> Result<Frame, GnitzSqlError> {
-    let slots = input.schema.layout().reduce_out_layout(group, row);
+    let slots = reduce_out_layout(input.schema.layout(), group, row);
     let npk = slots.iter().filter(|s| !matches!(s, ReduceOutSlot::Carried(_))).count();
     let lead = slots.into_iter().map(|s| match s {
         ReduceOutSlot::SyntheticKey => (None, group_pk_def()),

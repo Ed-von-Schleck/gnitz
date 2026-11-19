@@ -30,7 +30,7 @@ fn program_fuzz() {
                 })
             });
         }
-        if let Ok(mut map) = program.resolve_map(&schema, &schema) {
+        if let Ok((mut map, _)) = program.resolve_map(&schema, &schema) {
             arms_agree(&mut map, &rows, |m, mb| map_cells(m, &schema, mb));
         }
     });

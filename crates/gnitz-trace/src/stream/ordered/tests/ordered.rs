@@ -11,13 +11,13 @@ use proptest::prelude::*;
 use super::{OrderIndex, OrderedEpoch, OrderedPlan};
 use crate::test_support::stream_input::{Cells, Row, batch, schema};
 use crate::test_support::{TestTrace, cell};
-use gnitz_expr::{OrderLocator, ReduceOutSlot, cmp_order_keys, order_locators};
 use gnitz_foundation::perf::Counter;
 use gnitz_foundation::rng::mix;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 use gnitz_zset::algebra::copy_columns;
+use gnitz_zset::algebra::{OrderLocator, cmp_order_keys, order_locators};
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{ReduceOutSlot, SchemaColumn, SchemaDescriptor, reduce_out_layout};
 
 /// One to three order keys, over any column of [`schema`].
 pub(super) fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
@@ -83,7 +83,7 @@ impl Harness {
     /// columns the operator adds.
     pub(super) fn state(&self, group_cols: &[u32]) -> BTreeMap<(Cells, Cells), i64> {
         let n = schema().num_columns();
-        let layout = schema().reduce_out_layout(group_cols, 0..n as u32);
+        let layout = reduce_out_layout(&schema(), group_cols, 0..n as u32);
         let b = self.out.cursor().materialize();
         let mb = b.as_mem_batch();
         let out = self.plan.output_schema();
@@ -212,8 +212,7 @@ fn entries_by_row(index: &OrderIndex, delta: &Batch) -> Batch {
             }
         }
         w.weight_mut().copy_from_slice(delta.weight());
-        index.moves.write_null_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
-        copy_columns(&mb, w, index.moves.copies(), n, heap_at);
+        copy_columns(&mb, w, &index.moves, n, heap_at);
     });
     out
 }

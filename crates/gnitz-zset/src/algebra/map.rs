@@ -2,25 +2,16 @@
 //!
 //! A filter needs nothing on top of the resolved program and is a bare
 //! `gnitz_expr::RowFilter` wherever one is held; a map is this plan, which adds
-//! the PK, weight and column moves around the computed columns
+//! the PK, weight and column copies around the computed columns
 //! `gnitz_expr::MapEval` writes.
 
-use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
+use gnitz_expr::{ColCopy, ColumnLocator, ExprValidateErr, LogicalProgram, MapEval};
 
-use super::int_cell;
+use super::copy::{ColMoves, RowWindow, copy_window, rebase_copied_strings};
 use super::key_pack::{FOLD_CHUNK, FoldCols, KeyPacker, locate_key_col, pk_run};
 use crate::repr::{Batch, DirectWriter, MemBatch, copy_runs};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
-use gnitz_wire::{FixedInt, TypeCode, zip_cells};
-
-/// One map step's row window: source rows `[src, src + n)` onto destination rows
-/// `[dst, dst + n)`.
-#[derive(Clone, Copy)]
-struct RowWindow {
-    src: usize,
-    dst: usize,
-    n: usize,
-}
+use gnitz_wire::TypeCode;
 
 /// Average survivor-run length below which a map that computes, or that copies
 /// fixed-width columns alone, copies its survivors into one range first: below
@@ -48,125 +39,26 @@ enum PkSource {
     HashRow(FoldCols),
 }
 
-/// Rebase the string columns [`copy_window`] wrote for `copies`, their cells
-/// read from `src_blob`, onto the heap [`Batch::carry_heap`] left at `heap_at`.
-fn rebase_copied_strings(copies: &[ColCopy], output: &mut DirectWriter<'_>, src_blob: &[u8], heap_at: Option<usize>) {
-    for c in copies {
-        if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
-            output.rebase_string_col(c.slot, gnitz_wire::Heap::Plain(src_blob), heap_at.into());
-        }
-    }
-}
-
-/// Copy `copies` of `src` rows `0..n` onto `out` rows `0..n`, each German-string
-/// column rebased onto the heap [`Batch::carry_heap`] left at `heap_at`.
-pub fn copy_columns(src: &MemBatch, out: &mut DirectWriter<'_>, copies: &[ColCopy], n: usize, heap_at: Option<usize>) {
-    copy_window(src, out, copies, RowWindow { src: 0, dst: 0, n });
-    rebase_copied_strings(copies, out, src.blob(), heap_at);
-}
-
-/// Copy `copies` of `in_batch` onto `output` over `w`, a German-string cell
-/// verbatim: the caller rebases those columns.
-fn copy_window(in_batch: &MemBatch, output: &mut DirectWriter<'_>, copies: &[ColCopy], w: RowWindow) {
-    for c in copies {
-        copy_column(in_batch, output, c, w);
-    }
-}
-
-/// [`copy_window`] for one column. The source is read at its own type's width and
-/// sign/zero-extended into a wider (promoted) destination slot. Out of line:
-/// inlined into the loop over copies, the PK arm's setup is hoisted into a
-/// prologue every window pays, payload-only ones included.
-#[inline(never)]
-fn copy_column(
-    in_batch: &MemBatch,
-    output: &mut DirectWriter<'_>,
-    &ColCopy {
-        src: src_loc,
-        slot: dst_payload,
-        width: dw,
-    }: &ColCopy,
-    w: RowWindow,
-) {
-    let RowWindow { src: src_start, dst: dst_base, n } = w;
-    let dst = &mut output.col_mut(dst_payload)[dst_base * dw..(dst_base + n) * dw];
-    match src_loc {
-        ColumnLocator::Pk { byte_off, size, type_code } => {
-            // The PK region holds OPK bytes, decoded back to native LE at the
-            // source column's own width.
-            let pk_stride = in_batch.schema().pk_stride();
-            let pk = &in_batch.pk()[src_start * pk_stride..(src_start + n) * pk_stride];
-            let (off, src_stride) = (byte_off as usize, size as usize);
-            if src_stride == dw {
-                gnitz_wire::decode_pk_cells(pk, pk_stride, off, type_code, dst);
-            } else {
-                widen_column::<true>(pk, pk_stride, off, type_code, dw, dst);
-            }
-        }
-        ColumnLocator::Payload { slot, size, type_code } => {
-            let in_pi = slot as usize;
-            let src_stride = size as usize;
-            debug_assert!(
-                !type_code.is_german_string() || (src_stride, dw) == (16, 16),
-                "German-string column moved at a non-16-byte stride",
-            );
-            debug_assert!(
-                (src_start + n) * src_stride <= in_batch.col_data(in_pi).len(),
-                "copy_column: source column {in_pi} is shorter than rows [{src_start}, {}) at stride {src_stride}",
-                src_start + n
-            );
-            let src = &in_batch.col_data(in_pi)[src_start * src_stride..(src_start + n) * src_stride];
-            if src_stride == dw {
-                dst.copy_from_slice(src);
-            } else {
-                widen_column::<false>(src, src_stride, 0, type_code, dw, dst);
-            }
-        }
-    }
-}
-
-/// [`widen_cells`] at the slot width `dw`: 2, 4 or 8, a widened slot being a fixed int.
-fn widen_column<const PK: bool>(src: &[u8], src_stride: usize, off: usize, tc: TypeCode, dw: usize, dst: &mut [u8]) {
-    let fi = FixedInt::from_type_code(tc).expect("a widened column is a fixed int");
-    match dw {
-        2 => widen_cells::<2, PK>(src, src_stride, off, fi, dst),
-        4 => widen_cells::<4, PK>(src, src_stride, off, fi, dst),
-        8 => widen_cells::<8, PK>(src, src_stride, off, fi, dst),
-        other => unreachable!("a widened slot is 2/4/8 bytes, got {other}"),
-    }
-}
-
-/// Widen each `fi` cell at byte `off` of `src`'s `src_stride`-byte rows — a PK column's
-/// OPK cell under `PK`, else a native one — into `dst`'s `DW`-byte native cells.
-/// Out of line: inlined into [`copy_column`], its loop compiles to more
-/// instructions per row.
-#[inline(never)]
-fn widen_cells<const DW: usize, const PK: bool>(
-    src: &[u8],
-    src_stride: usize,
-    off: usize,
-    fi: FixedInt,
-    dst: &mut [u8],
-) {
-    let out = dst.as_chunks_mut::<DW>().0.iter_mut();
-    gnitz_wire::for_each_fixed_int!(fi, |FI| {
-        const W: usize = FI.width();
-        zip_cells::<W, _>(src, src_stride, off, out, |c, d| {
-            *d = int_cell::<PK>(FI, c).to_le_bytes()[..DW].try_into().unwrap()
-        })
-    });
-}
-
 // ---------------------------------------------------------------------------
 // MapPlan
 // ---------------------------------------------------------------------------
 
-/// Map/projection: the resolved program's column moves and computed columns,
+/// Map/projection: the resolved program's column copies and computed columns,
 /// where the output PK comes from, and the output schema it stamps.
 pub struct MapPlan {
     ev: MapEval,
+    /// The copied columns of `ev`'s map.
+    moves: ColMoves,
     pk_source: PkSource,
     output_schema: SchemaDescriptor,
+    /// The map reproduces its input, given the input's PK carried through.
+    reproduces_input: bool,
+}
+
+/// A map program `resolve_map` refuses against its two schemas, as a circuit
+/// node's refusal.
+fn map_mismatch(e: ExprValidateErr) -> String {
+    format!("map: program/schema mismatch: {e}")
 }
 
 /// Set the PK of each of `output`'s rows, whose payload and null words are
@@ -238,7 +130,7 @@ impl MapPlan {
                 (out_schema, LogicalProgram::copy_cols(&proj), PkSource::HashRow(fold))
             }
         };
-        Self::from_map(prog, in_schema, out_schema, pk_source)
+        Self::from_map(prog, in_schema, out_schema, pk_source).map_err(map_mismatch)
     }
 
     /// A computed projection: [`gnitz_wire::MapKind::Compute`]'s whole body, and
@@ -257,17 +149,17 @@ impl MapPlan {
         // The only map whose program is client bytes; every other kind builds
         // one from a column list.
         let prog = LogicalProgram::from_blob(&map.program).map_err(|e| format!("map: invalid program: {e}"))?;
-        Self::from_map(prog, in_schema, out_schema, PkSource::Inherit)
+        Self::from_map(prog, in_schema, out_schema, PkSource::Inherit).map_err(map_mismatch)
     }
 
-    /// The map `ev` resolves onto `output_schema`, every row keeping its key:
-    /// `output_schema`'s key columns are its input's.
-    pub fn inheriting(ev: MapEval, output_schema: SchemaDescriptor) -> Self {
-        MapPlan {
-            ev,
-            pk_source: PkSource::Inherit,
-            output_schema,
-        }
+    /// The map `prog` from `in_schema` onto `output_schema`, every row keeping
+    /// its key: `output_schema`'s key columns are its input's.
+    pub fn inheriting(
+        prog: LogicalProgram,
+        in_schema: &SchemaDescriptor,
+        output_schema: SchemaDescriptor,
+    ) -> Result<Self, ExprValidateErr> {
+        Self::from_map(prog, in_schema, output_schema, PkSource::Inherit)
     }
 
     /// Map plan from a logical expression program. A pure projection is the
@@ -279,11 +171,23 @@ impl MapPlan {
         in_schema: &SchemaDescriptor,
         output_schema: SchemaDescriptor,
         pk_source: PkSource,
-    ) -> Result<Self, String> {
-        let ev = logical
-            .resolve_map(in_schema, &output_schema)
-            .map_err(|e| format!("map: program/schema mismatch: {e}"))?;
-        Ok(MapPlan { ev, pk_source, output_schema })
+    ) -> Result<Self, ExprValidateErr> {
+        let (ev, copies) = logical.resolve_map(in_schema, &output_schema)?;
+        // One layout on both sides, which fixes equal payload counts and types,
+        // and every slot copied from its own input slot. With no emits copy `i`
+        // writes slot `i`, and the program is never run, so instructions no
+        // sink reads do not count against it.
+        let reproduces_input = !ev.emits_anything()
+            && in_schema.same_layout(&output_schema)
+            && copies.iter().enumerate().all(|(i, c)| c.src.payload_slot() == Some(i));
+        let moves = ColMoves::new(copies, in_schema);
+        Ok(MapPlan {
+            ev,
+            moves,
+            pk_source,
+            output_schema,
+            reproduces_input,
+        })
     }
 
     /// The schema this plan stamps on its output.
@@ -307,13 +211,13 @@ impl MapPlan {
         // A PK column is never NULL, and a reindex copies each kept column at
         // its own type.
         debug_assert!(*drop_nulls == 0 && !self.ev.emits_anything());
-        debug_assert!(self.ev.moves().copies().iter().all(|c| c.width == c.src.size()));
-        Some(self.ev.moves().copies().iter().map(|c| c.src).collect())
+        debug_assert!(self.copies().iter().all(|c| c.width == c.src.size()));
+        Some(self.copies().iter().map(|c| c.src).collect())
     }
 
     /// The input columns this map copies into output payload slots.
     pub fn copies(&self) -> &[ColCopy] {
-        self.ev.moves().copies()
+        self.moves.copies()
     }
 
     /// True iff this map copies its input's PK region verbatim, and so keeps
@@ -325,7 +229,7 @@ impl MapPlan {
     /// True iff running this map would reproduce its input batch. A compiler
     /// elides such a node entirely and lets its consumers read the input.
     pub fn is_identity(&self) -> bool {
-        self.inherits_pk() && self.ev.is_identity()
+        self.inherits_pk() && self.reproduces_input
     }
 
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
@@ -384,7 +288,7 @@ impl MapPlan {
         };
         let src = &mb;
         // Declined, the carry reserves for relocated copies and string emits alike.
-        let heap_at = out.carry_heap(&mb, self.ev.moves().string_slots(), ranges, 0);
+        let heap_at = out.carry_heap(&mb, self.moves.string_slots(), ranges, 0);
         // The reserved rows are uninitialized: `resolve_map` gives every output
         // payload slot one sink, and the writes below cover the PK, weight and
         // null regions.
@@ -406,11 +310,12 @@ impl MapPlan {
             let mut dst = 0;
             for &(start, end) in ranges {
                 let w = RowWindow { src: start, dst, n: end - start };
-                copy_window(src, out, self.ev.moves().copies(), w);
+                // The window's null words first: an emit sets its NULL bits on them.
+                copy_window(src, out, &self.moves, w);
                 self.ev.write_computed(&mb, start, w.n, out, dst);
                 dst += w.n;
             }
-            rebase_copied_strings(self.ev.moves().copies(), out, src.blob(), heap_at);
+            rebase_copied_strings(&self.moves, out, src.blob(), heap_at);
             if let PkSource::HashRow(fold) = &self.pk_source {
                 stamp_hash_row_pks(out, fold);
             }

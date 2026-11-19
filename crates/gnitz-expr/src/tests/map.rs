@@ -1,9 +1,7 @@
 use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::test_support::{result_prog, schema_pk};
-use crate::{
-    CmpOp, ExprValidateErr, IntUnaryOp, LogicalInstr, LogicalProgram, Reg, SchemaColumn, SchemaDescriptor, Sink,
-};
+use crate::{CmpOp, ExprValidateErr, IntUnaryOp, LogicalInstr, LogicalProgram, Reg, Sink};
 
 /// A map's sinks against its output slots. A copy byte-copies at equal width
 /// and otherwise widens a narrower integer: no narrowing, no representation
@@ -97,81 +95,4 @@ fn each_map_sink_is_held_to_its_output_slot() {
         let got = prog.resolve_map(&schema_pk(&input, true), &schema_pk(&output, true));
         assert_eq!(got.map(drop), want, "{label}");
     }
-}
-
-/// A map reproduces its input only when it copies every payload column into its
-/// own slot, computes no output slot, and the two schemas locate every column
-/// alike. Every case resolves, so each of the three conditions decides one.
-#[test]
-fn is_identity_requires_an_in_order_copy_over_one_layout() {
-    let ident = |p: LogicalProgram, a: &SchemaDescriptor, b: &SchemaDescriptor| {
-        p.resolve_map(a, b).expect("the map resolves").is_identity()
-    };
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    assert!(ident(LogicalProgram::copy_cols(&[1, 2]), &schema, &schema));
-    assert!(
-        !ident(LogicalProgram::copy_cols(&[2, 1]), &schema, &schema),
-        "reordered copy"
-    );
-    let computed = LogicalProgram::new(
-        vec![LogicalInstr::LoadCol { col: 2 }],
-        vec![Sink::Col(1), Sink::Reg(Reg(0))],
-        vec![],
-    )
-    .unwrap();
-    assert!(!ident(computed, &schema, &schema), "computed sink");
-    // An instruction no sink reads is never run.
-    let dead = LogicalProgram::new(
-        vec![LogicalInstr::LoadCol { col: 2 }],
-        vec![Sink::Col(1), Sink::Col(2)],
-        vec![],
-    )
-    .unwrap();
-    assert!(ident(dead, &schema, &schema), "dead instruction");
-    // A copy widened into a wider payload type.
-    let narrow_in = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::I32, false),
-        ],
-        &[0],
-    );
-    assert!(
-        !ident(LogicalProgram::copy_cols(&[1, 2]), &narrow_in, &schema),
-        "different payload type"
-    );
-    // Slot for slot the same copy, but the PK sits at another column.
-    let ints = |pk: u32| {
-        let cols = [0, 1, 2].map(|ci| SchemaColumn::new(TypeCode::I64, ci != pk));
-        SchemaDescriptor::new(&cols, &[pk])
-    };
-    assert!(
-        !ident(LogicalProgram::copy_cols(&[1, 2]), &ints(0), &ints(1)),
-        "different PK layout"
-    );
-    // A PK that does not lead: the payload columns are 0 and 2.
-    let mid_pk = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[1],
-    );
-    assert!(ident(LogicalProgram::copy_cols(&[0, 2]), &mid_pk, &mid_pk));
-    assert!(
-        !ident(LogicalProgram::copy_cols(&[1, 2]), &mid_pk, &mid_pk),
-        "a PK column copied into a payload slot"
-    );
-    // A PK-only schema: nothing to copy, so the empty program is its identity.
-    let pk_only = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
-    assert!(ident(LogicalProgram::copy_cols(&[]), &pk_only, &pk_only));
 }

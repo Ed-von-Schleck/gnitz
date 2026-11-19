@@ -8,8 +8,6 @@ use std::ops::Range;
 
 use gnitz_wire::{FixedInt, KeyRange, TypeCode};
 
-#[cfg(test)]
-use crate::ResolvedProgram;
 use crate::map::{Emit, EmitStore};
 use crate::morsel::Evaluator;
 use crate::program::ReadAs;
@@ -241,17 +239,13 @@ impl ScalarEval {
     }
 }
 
-/// The evaluator behind each public type, for tests that read its resolved
-/// program or switch its arm and level. A filter without a predicate has no
+/// The evaluator behind each public type, for tests that read its nullable
+/// registers or switch its arm and level. A filter without a predicate has no
 /// evaluator.
 #[cfg(test)]
 pub(crate) trait Resolved {
     fn ev(&self) -> Option<&Evaluator>;
     fn ev_mut(&mut self) -> Option<&mut Evaluator>;
-
-    fn prog(&self) -> &ResolvedProgram {
-        self.ev().expect("an evaluated program").prog()
-    }
 
     fn null_regs(&self) -> u64 {
         self.ev().map_or(0, |ev| ev.prog().null_regs)

@@ -1,12 +1,14 @@
 //! Z-set algebra: the functions of one Z-set, and the key encoders they share.
 //!
 //!   - `linear`      — filter and union (Theorem 3.3: no state added), and the output schemas of a union and a null-extend
+//!   - `copy`        — columns copied verbatim between batches: their cells, null bits and string heap offsets
 //!   - `map`         — `MapPlan`, the columnar driver behind every map and projection
 //!   - `exchange`    — the scatter plan of a worker exchange
 //!   - `aggregate`   — the aggregates, a reduce's row shape, and the ad-hoc fold
 //!   - `group_key`   — the key a row is grouped or routed by, the output PK a reduce stamps, and a batch's groups numbered
 //!   - `key_pack`    — the packed keys of a join, a group and an index span, and the row digest
 //!   - `index_entry` — a secondary index's key span, its entries, and their spans alone
+//!   - `order`       — the order of rows under ORDER BY keys: the ranking the client sort and the worker top-k share
 //!   - `order_image` — the byte images an ordered index keys by
 //!   - `route`       — which worker owns a key, and where a relation's rows live
 //!   - `sink`        — the sink of an ad-hoc read: map, then forward, a prefix cut, a top-k or a fold
@@ -16,18 +18,20 @@
 //! `gnitz-store` and the circuit VM in `gnitz-server` call the same kernels; the
 //! ad-hoc fold and the top-k sink are one-shot folds only a read runs. The
 //! operators that do read a trace are `gnitz-trace`'s `stream`, which builds on
-//! the aggregate, group-key, key-packing, image and map machinery here.
+//! the aggregate, group-key, key-packing, image, copy and map machinery here.
 //!
 //! A `pub use` below is named by another crate; a `pub(crate) use` is this
 //! crate's own facade. The submodules stay private.
 
 mod aggregate;
+mod copy;
 mod exchange;
 mod group_key;
 mod index_entry;
 mod key_pack;
 mod linear;
 mod map;
+mod order;
 mod order_image;
 mod route;
 mod sink;
@@ -40,9 +44,10 @@ pub use route::{Placement, Slot, ground_owner};
 pub use sink::SinkPlan;
 
 pub use aggregate::{Agg, AggValues, FoldGroups, RangeGroups, ReduceShape, resolve_aggs};
+pub use copy::{ColMoves, copy_columns};
 pub use group_key::{GroupOrdinals, GroupOutKey, GroupScratch, OutPk, ground_pk};
 pub use key_pack::KeyPacker;
-pub use map::copy_columns;
+pub use order::{OrderLocator, RowRanking, cmp_order_keys, order_locators};
 pub use order_image::{IMAGE_COL, ImageCol, image_slot_col};
 
 /// An integer column's cell as its value: under `OPK` a PK column's OPK image,

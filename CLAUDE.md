@@ -339,14 +339,14 @@ nothing can link.
 |-------|------|
 | `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and CPU quota, the syscall idioms `std` lacks, and the cost probes and PRNG tests and benchmarks share — independent leaves every other crate may name |
 | `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests |
-| `gnitz-expr` | The one expression evaluator, the schema descriptor, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
+| `gnitz-expr` | The one expression evaluator, the schema descriptor, and the resolved column addressing it reads through |
 | `gnitz-core` | Client core: connection, protocol, the client schema and batch — the kernel's batch under a client schema — and the mirror state machine |
 | `gnitz-sql` | SQL front end: parser, binder, query planner |
 | `gnitz-tokio` | The Rust async client: `gnitz-core`'s client waiting on tokio's reactor — owned by one task, or shared among tasks through the `AsyncClient` handle and the `Connection` future that serves it |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
 | `gnitz-cli` | The interactive SQL shell, whose cargo package and binary are `gnitz`: a line editor over `gnitz-sql`, with psql-style meta-commands and `\watch` over a delta feed. Given no server, it runs a separately installed `gnitz-server` for the session |
 | `gnitz-dump` | Logical dump and restore: a database as SQL and Parquet, read from one snapshot, restored into a build of the same formats or a later one |
-| `gnitz-zset` | The Z-set kernel, which a client links too: the key and payload-order kernels, columnar batches and their wire form, and the functions of one Z-set |
+| `gnitz-zset` | The Z-set kernel, which a client links too: the key and payload-order kernels, columnar batches and their wire form, the functions of one Z-set, and the order-key ranking the client sort and the worker top-k share |
 | `gnitz-trace` | The traces: sorted runs, the shard image, the cursor that merges runs, and the operators that read a trace |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
 | `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |

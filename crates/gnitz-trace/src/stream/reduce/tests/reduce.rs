@@ -12,9 +12,10 @@ use crate::test_support::stream_input::{
     Cells, GROUPS, Row, agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, shard,
 };
 use crate::test_support::{TestTrace, assert_folds, cell, weighted_rows};
-use gnitz_expr::{CmpOp, ReduceOutKey, RowFilter};
+use gnitz_expr::{CmpOp, RowFilter};
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadSink, SinkKind, TypeCode};
 use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{ReduceOutSlot, reduce_out_layout};
 
 use super::{ReducePlan, op_reduce};
 use gnitz_zset::algebra::SinkPlan;
@@ -100,7 +101,8 @@ impl Harness {
 fn output_rows(b: &Batch, group_cols: &[u32]) -> BTreeMap<Cells, i64> {
     let mb = b.as_mem_batch();
     let out = b.schema();
-    let skip = usize::from(schema().reduce_out_key(group_cols) == ReduceOutKey::SyntheticFold);
+    let layout = reduce_out_layout(&schema(), group_cols, []);
+    let skip = usize::from(layout.first() == Some(&ReduceOutSlot::SyntheticKey));
     let mut z = BTreeMap::new();
     for r in 0..b.len() {
         let row: Cells = (skip..out.num_columns()).map(|c| cell(&mb, out.locate(c), r)).collect();

@@ -1,8 +1,8 @@
 //! Resolved-addressing reads, driven through a non-engine [`crate::BatchView`].
 
 use crate::test_support::{PATTERNS, TestView};
-use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor, order_bits};
-use gnitz_wire::{FixedInt, ScalarKind, TypeCode};
+use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor};
+use gnitz_wire::{FixedInt, TypeCode};
 
 /// Every locator read of every key type, from a key column and from a payload
 /// slot holding the same values, against the value's own encoding.
@@ -43,12 +43,6 @@ fn every_locator_read_agrees_with_the_values_encoding() {
                     continue;
                 };
                 assert_eq!(loc.decode_i64(&v, row, fi), fi.decode_le_i64(native), "{label}");
-                let kind = ScalarKind::Int(fi);
-                assert_eq!(
-                    order_bits(&loc, &v, row, kind),
-                    kind.order_image(fi.decode_le_i64(native) as u64),
-                    "{label}"
-                );
             }
             for i in 0..natives.len() {
                 for j in 0..natives.len() {

@@ -1,6 +1,6 @@
 //! The descriptor's layout facts, checked against absolute answers.
 
-use crate::{ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn, SchemaDescriptor, SchemaRefusal, leading_pk};
+use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaRefusal, leading_pk};
 use gnitz_wire::{MAX_COLUMNS, TypeCode};
 
 fn col(tc: TypeCode) -> SchemaColumn {
@@ -270,76 +270,6 @@ fn admission_refuses_what_the_constructor_aborts_on() {
         Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 2))
     );
     assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
-}
-
-/// The reduce output key: the source PK list keys on itself, and so does a
-/// single NOT NULL PK-eligible column (eligibility is `TypeCode::is_pk_eligible`'s,
-/// swept there); anything else — no column, a nullable, float or string column,
-/// a partial, reordered or wider set — folds into a synthetic key. Each schema
-/// has three columns, the PK ones `U64 NOT NULL` and the rest of the case's type.
-#[test]
-#[allow(clippy::type_complexity)]
-fn reduce_out_key_picks_the_output_key() {
-    use ReduceOutKey::*;
-    use TypeCode as T;
-    // (pk, group, (non-PK type code, nullable), key)
-    let rows: &[(&[u32], &[u32], (TypeCode, bool), ReduceOutKey)] = &[
-        (&[0], &[], (T::U64, false), SyntheticFold),
-        (&[0], &[1], (T::U64, true), SyntheticFold),
-        (&[0], &[1], (T::U64, false), Natural),
-        (&[0], &[1], (T::F64, false), SyntheticFold),
-        (&[0], &[1], (T::String, false), SyntheticFold),
-        (&[0], &[0], (T::String, true), Natural),
-        (&[0, 1], &[0, 1], (T::String, true), Natural),
-        (&[0, 1], &[1, 0], (T::String, true), SyntheticFold),
-        (&[0, 1], &[0], (T::String, true), Natural),
-        (&[0, 1], &[0, 1, 2], (T::U64, false), SyntheticFold),
-        (&[0, 1], &[1, 2], (T::U64, false), SyntheticFold),
-    ];
-    for &(pk, group, (tc, nullable), want) in rows {
-        let cols: Vec<SchemaColumn> = (0..3)
-            .map(|c| match pk.contains(&c) {
-                true => col(T::U64),
-                false => SchemaColumn::new(tc, nullable),
-            })
-            .collect();
-        let schema = SchemaDescriptor::new(&cols, pk);
-        assert_eq!(schema.reduce_out_key(group), want, "{pk:?} {group:?} {tc:?} {nullable}");
-    }
-}
-
-#[test]
-fn reduce_out_layout_is_the_key_region_then_the_unspelled_row() {
-    use ReduceOutSlot::{Carried, Key, SyntheticKey};
-    let schema = |c2_nullable: bool, pk: &[u32]| {
-        let u64_col = |nullable| SchemaColumn::new(TypeCode::U64, nullable);
-        SchemaDescriptor::new(
-            &[col(TypeCode::U64), u64_col(true), u64_col(c2_nullable), u64_col(true)],
-            pk,
-        )
-    };
-    // A nullable column takes the fold key, which spells no input column, so the whole row
-    // rides behind it — group columns included, since the synthetic key is not one of them.
-    let fold = schema(true, &[0]);
-    assert_eq!(
-        fold.reduce_out_layout(&[2], 0..4),
-        vec![SyntheticKey, Carried(0), Carried(1), Carried(2), Carried(3)]
-    );
-    // A fold's row is its group set, a repeated column carried once per occurrence.
-    assert_eq!(
-        fold.reduce_out_layout(&[1, 1], [1, 1]),
-        vec![SyntheticKey, Carried(1), Carried(1)]
-    );
-    // A natural key column is in the PK region, so it is not carried again.
-    assert_eq!(
-        schema(false, &[0]).reduce_out_layout(&[2], 0..4),
-        vec![Key(2), Carried(0), Carried(1), Carried(3)]
-    );
-    // The PK list keys on every PK column.
-    assert_eq!(
-        schema(false, &[0, 2]).reduce_out_layout(&[0, 2], 0..4),
-        vec![Key(0), Key(2), Carried(1), Carried(3)]
-    );
 }
 
 /// A layout digest moves with the column count, how many columns the PK holds,

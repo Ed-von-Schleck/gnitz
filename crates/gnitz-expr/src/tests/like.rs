@@ -150,25 +150,28 @@ fn each_pattern_specializes_to_its_shape() {
     }
 }
 
-/// The text a pattern matches exactly, and the text it matches as a prefix.
+/// The literal a wildcard-free or `%`-anchored pattern reduces to.
 #[test]
-fn a_pattern_names_its_literal_and_its_prefix() {
-    for (pattern, literal, prefix) in [
-        ("", Some(""), None),
-        ("abc", Some("abc"), None),
-        (r"a\%b", Some("a%b"), None),
-        ("lit%", None, Some("lit")),
-        ("lit%%", None, Some("lit")),
-        ("%", None, Some("")),
-        (r"a\%%", None, Some("a%")),
-        ("é%", None, Some("é")),
-        ("%lit", None, None),
-        ("a%b%", None, None),
-        ("a_%", None, None),
-        ("_", None, None),
+fn a_pattern_names_its_shape() {
+    use LikeShape::*;
+    for (pattern, want) in [
+        ("", Exact("")),
+        ("abc", Exact("abc")),
+        (r"a\%b", Exact("a%b")),
+        ("lit%", Prefix("lit")),
+        ("lit%%", Prefix("lit")),
+        ("%", Prefix("")),
+        ("%%", Prefix("")),
+        (r"a\%%", Prefix("a%")),
+        ("é%", Prefix("é")),
+        ("%lit", Suffix("lit")),
+        ("%%lit%%", Contains("lit")),
+        ("a%b%", Generic),
+        ("a_%", Generic),
+        ("_", Generic),
     ] {
         let p = LikePattern::encode(pattern, Some('\\')).unwrap();
-        assert_eq!((p.literal(), p.prefix()), (literal, prefix), "{pattern:?}");
+        assert_eq!(p.shape(), want, "{pattern:?}");
     }
 }
 

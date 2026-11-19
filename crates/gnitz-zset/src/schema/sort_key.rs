@@ -1,9 +1,10 @@
 //! The fixed-width sort keys of an OPK region: the key a merge, a group walk and
 //! a seek order rows by, and the sort that builds a [`PkKeys`] list.
 
-use gnitz_expr::{RadixKey, radix_sort_by_key};
 use gnitz_wire::{MAX_PK_BYTES, NARROW_PK_MAX_BYTES, PkKeys};
 use smallvec::SmallVec;
+
+use super::radix::{RadixKey, radix_sort_by_key};
 
 // ---------------------------------------------------------------------------
 // Narrow-region PK key packing

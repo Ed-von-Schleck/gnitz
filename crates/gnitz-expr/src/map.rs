@@ -1,14 +1,24 @@
-//! Maps: where each output payload slot comes from — a column copied verbatim or
-//! a register the program computes — and [`MapEval`], which writes them.
+//! Maps: where each output payload slot comes from — a column copied verbatim
+//! ([`ColCopy`]) or a register the program computes — and [`MapEval`], which
+//! writes the computed ones.
 
 use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::morsel::Evaluator;
 use crate::program::{ReadAs, locate_col};
 use crate::{
-    BatchView, ColCopy, ColKind, ColMoves, ExprValidateErr, LogicalInstr, LogicalProgram, MapTarget, SchemaDescriptor,
-    Sink,
+    BatchView, ColKind, ColumnLocator, ExprValidateErr, LogicalInstr, LogicalProgram, MapTarget, SchemaDescriptor, Sink,
 };
+
+/// A column copied verbatim into another row layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColCopy {
+    pub src: ColumnLocator,
+    /// The output payload slot.
+    pub slot: usize,
+    /// The output slot's width: wider than the source only for a promoted integer.
+    pub width: usize,
+}
 
 /// A computed output slot written from a register.
 #[derive(Debug, PartialEq)]
@@ -81,43 +91,27 @@ impl LogicalProgram {
     }
 
     /// A map from `in_schema` to `out_schema`, covering every output payload slot
-    /// exactly once.
+    /// exactly once: the computed columns, and the copied ones in slot order for
+    /// the caller to run.
     pub fn resolve_map(
         &self,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
-    ) -> Result<MapEval, ExprValidateErr> {
+    ) -> Result<(MapEval, Vec<ColCopy>), ExprValidateErr> {
         let prog = self.resolve_program(in_schema, ReadAs::Value)?;
-        let (moves, emits) = self.map_sinks(in_schema, out_schema)?;
-        // The map reproduces its input, with the input PK carried through: one
-        // layout on both sides, which fixes equal payload counts and types, and
-        // every slot copied from its own input slot. With no emits copy `i`
-        // writes slot `i`, and the program is never run, so instructions no
-        // sink reads do not count against it.
-        let is_identity = emits.is_empty()
-            && in_schema.same_layout(out_schema)
-            && moves
-                .copies()
-                .iter()
-                .enumerate()
-                .all(|(i, c)| c.src.payload_slot() == Some(i));
-        Ok(MapEval {
-            ev: Evaluator::new(prog),
-            moves,
-            emits,
-            is_identity,
-        })
+        let (copies, emits) = self.map_sinks(in_schema, out_schema)?;
+        Ok((MapEval { ev: Evaluator::new(prog), emits }, copies))
     }
 
     /// Hold this map's sinks to its two schemas and say where each output slot
-    /// comes from: the copied ones as moves, the computed ones as emits in slot
+    /// comes from: the copied ones as [`ColCopy`]s, the computed ones as emits in slot
     /// order. Sink `i` writes slot `i`, so covering every declared payload slot
     /// is a count.
     fn map_sinks(
         &self,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
-    ) -> Result<(ColMoves, Vec<Emit>), ExprValidateErr> {
+    ) -> Result<(Vec<ColCopy>, Vec<Emit>), ExprValidateErr> {
         use ExprValidateErr as E;
         let num_payload_cols = out_schema.num_payload_cols();
         if self.sinks().len() != num_payload_cols {
@@ -155,38 +149,27 @@ impl LogicalProgram {
                 }
             }
         }
-        Ok((ColMoves::new(copies, in_schema), emits))
+        Ok((copies, emits))
     }
 }
 
-/// A map: column moves the caller runs, and the null words and computed columns
-/// [`Self::write_computed`] writes.
+/// A map's computed columns, which [`Self::write_computed`] writes. Its copied
+/// columns are the caller's to run.
 pub struct MapEval {
     ev: Evaluator,
-    moves: ColMoves,
     /// The computed slots, in slot order.
     emits: Vec<Emit>,
-    is_identity: bool,
 }
 
 impl MapEval {
-    /// The columns this map copies verbatim.
-    pub fn moves(&self) -> &ColMoves {
-        &self.moves
-    }
-
     /// True iff some output slot is computed rather than copied.
     pub fn emits_anything(&self) -> bool {
         !self.emits.is_empty()
     }
 
-    /// True iff the map reproduces its input, given the input's PK carried through.
-    pub fn is_identity(&self) -> bool {
-        self.is_identity
-    }
-
-    /// Write the null words and computed columns of source rows
-    /// `src_start..src_start + n` into `dst` rows from `dst_start`.
+    /// Write the computed columns of source rows `src_start..src_start + n` into
+    /// `dst` rows from `dst_start`: each cell, and the NULL bit of each NULL one.
+    /// The bits are set on null words `dst` already holds, and none is cleared.
     pub fn write_computed(
         &mut self,
         src: &dyn BatchView,
@@ -195,8 +178,7 @@ impl MapEval {
         dst: &mut dyn MapTarget,
         dst_start: usize,
     ) {
-        let MapEval { ev, moves, emits, .. } = self;
-        moves.write_null_rows(src.null_bmp(), src_start, dst.null_bmp_mut(), dst_start, n);
+        let MapEval { ev, emits, .. } = self;
         if emits.is_empty() {
             return;
         }
@@ -222,7 +204,3 @@ impl crate::eval::Resolved for MapEval {
 #[cfg(test)]
 #[path = "tests/map.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "benches/map.rs"]
-mod bench;

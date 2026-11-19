@@ -1580,9 +1580,10 @@ impl<'a> MemBatch<'a> {
 
 /// Each method forwards via UFCS to the inherent accessor of the same name, so
 /// the call binds to the concrete read rather than recursing into the trait.
-/// The forwarder and the accessor it calls are both `#[inline(always)]`: at
-/// `-O0`, which the E2E suite's debug build runs at, a plain `#[inline]` is
-/// not inlined.
+/// The forwarder and the accessor it calls are both `#[inline(always)]`: a
+/// generic caller is instantiated in its consuming crate, and in the E2E
+/// suite's debug build crates such as gnitz-trace run at `-O0`, where a plain
+/// `#[inline]` is not inlined.
 impl<'a> RowSource for MemBatch<'a> {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {

@@ -43,7 +43,7 @@ pub(crate) fn build(pk_region: &[u8], stride: usize) -> Option<Vec<u8>> {
         keys.push(gnitz_zset::schema::probe_key(chunk));
     }
     if stride > PROBE_KEY_INJECTIVE_BYTES {
-        gnitz_expr::radix_sort_by_key(&mut keys, |&k| k);
+        gnitz_zset::schema::radix_sort_by_key(&mut keys, |&k| k);
         keys.dedup();
     }
     let filter = match BinaryFuse8::try_from(keys.as_slice()) {

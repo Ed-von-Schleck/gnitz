@@ -1,11 +1,58 @@
-//! The order of rows under ORDER BY keys, driven through a non-engine [`crate::BatchView`].
+//! The order of rows under ORDER BY keys, over batches built row by row.
 
 use std::cmp::Ordering;
 
 use super::{OrderLocator, RowRanking, cmp_order_keys, order_bits, order_locators};
-use crate::test_support::{PATTERNS, TestView, schema_pk_ints};
-use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor};
-use gnitz_wire::{OrderKey, RowSource, ScalarKind, TypeCode};
+use crate::repr::{Batch, BatchBuilder};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_expr::ColumnLocator;
+use gnitz_wire::{FixedInt, Heap, OrderKey, RowSource, ScalarKind, TypeCode, image_mask};
+
+/// Key values that tie, that differ only in the low half of 16 bytes, that cross
+/// each width's sign bit, and one whose every byte differs.
+const PATTERNS: &[u128] = &[
+    0,
+    1,
+    0x7F,
+    0x80,
+    0xFF,
+    0x7FFF,
+    0x8000,
+    1 << 31,
+    i64::MAX as u128,
+    1 << 63,
+    u64::MAX as u128,
+    0x0123_4567_89AB_CDEF,
+    1 << 64,
+    (1 << 64) + 1,
+    i128::MAX as u128,
+    1 << 127,
+    u128::MAX,
+];
+
+/// `v` cut to the low bytes a `tc` cell holds.
+fn native(tc: TypeCode, v: u128) -> u128 {
+    v & image_mask(tc.wire_stride())
+}
+
+/// A `U64` PK plus `n` `I64` payload columns.
+fn schema_pk_ints(n: usize, nullable: bool) -> SchemaDescriptor {
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend((0..n).map(|_| SchemaColumn::new(TypeCode::I64, nullable)));
+    SchemaDescriptor::new(&cols, &[0])
+}
+
+/// `rows` over a `U64` PK plus `I64` payload columns, row `r` keyed `r + 1`.
+fn int_rows(schema: &SchemaDescriptor, rows: &[&[Option<i64>]]) -> Batch {
+    let mut b = BatchBuilder::new(schema);
+    for (row, cells) in rows.iter().enumerate() {
+        b.begin_row(row as u128 + 1, 1);
+        for &c in cells.iter() {
+            b.put_opt_int(c.map(|v| v as u128));
+        }
+    }
+    b.finish()
+}
 
 /// `order_bits` of a float payload slot is the order image of the slot's bits.
 #[test]
@@ -16,17 +63,54 @@ fn order_bits_reads_a_float_slot_as_its_image() {
             &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
             &[0],
         );
-        let mut v = TestView::new(&schema, FLOATS.len());
         let bits = |f: f64| match kind {
             ScalarKind::F32 => (f as f32).to_bits() as u64,
             _ => f.to_bits(),
         };
+        let mut b = BatchBuilder::new(&schema);
         for (row, &f) in FLOATS.iter().enumerate() {
-            v.set(row, 1, bits(f) as u128);
+            b.begin_row(row as u128 + 1, 1).put_float(f);
         }
+        let b = b.finish();
         let loc = schema.locate(1);
         for (row, &f) in FLOATS.iter().enumerate() {
-            assert_eq!(order_bits(&loc, &v, row, kind), kind.order_image(bits(f)), "{tc} {f}");
+            assert_eq!(order_bits(&loc, &b, row, kind), kind.order_image(bits(f)), "{tc} {f}");
+        }
+    }
+}
+
+/// `order_bits` of an integer column, from a key column and from a payload slot
+/// holding the same values, is the order image of the value it decodes to.
+#[test]
+fn order_bits_reads_an_integer_as_its_image() {
+    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let Some(fi) = FixedInt::from_type_code(tc) else {
+            continue;
+        };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TypeCode::U16, false), // key column 0
+                SchemaColumn::new(tc, false),            // key column 1, at byte 2
+                SchemaColumn::new(tc, true),             // payload slot 0
+            ],
+            &[0, 1],
+        );
+        let mut b = BatchBuilder::new(&schema);
+        for (row, &p) in PATTERNS.iter().enumerate() {
+            let v = native(tc, p);
+            b.begin_row_natives(&[row as u128 + 1, v], 1).put_int(v);
+        }
+        let b = b.finish();
+        let kind = ScalarKind::Int(fi);
+        for loc in [schema.locate(1), schema.locate(2)] {
+            for (row, &p) in PATTERNS.iter().enumerate() {
+                let le = native(tc, p).to_le_bytes();
+                assert_eq!(
+                    order_bits(&loc, &b, row, kind),
+                    kind.order_image(fi.decode_le_i64(&le[..tc.wire_stride()]) as u64),
+                    "{tc} {loc:?} row {row}"
+                );
+            }
         }
     }
 }
@@ -91,10 +175,7 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
 #[test]
 fn null_placement_ignores_the_direction() {
     let schema = schema_pk_ints(1, true);
-    let mut v = TestView::new(&schema, 3);
-    v.set(1, 1, 5i64);
-    v.set_null(0, 1);
-    v.set_null(2, 1);
+    let v = int_rows(&schema, &[&[None], &[Some(5)], &[None]]);
     let loc = schema.locate(1);
     for nulls_first in [false, true] {
         let want = if nulls_first { Ordering::Less } else { Ordering::Greater };
@@ -115,16 +196,35 @@ fn null_placement_ignores_the_direction() {
     }
 }
 
+/// A batch's rows with every null bit set.
+struct AllNull<'a>(&'a Batch);
+
+impl RowSource for AllNull<'_> {
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        self.0.get_pk_bytes(row)
+    }
+    fn get_null_word(&self, _row: usize) -> u64 {
+        u64::MAX
+    }
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        self.0.get_col_ptr(row, payload_col, col_size)
+    }
+    fn heap(&self) -> Heap<'_> {
+        RowSource::heap(self.0)
+    }
+    fn row_count(&self) -> usize {
+        RowSource::row_count(self.0)
+    }
+}
+
 /// A PK key never reads the null word: with every bit set, it still orders by
 /// value, where a NULL arm would call the rows tied.
 #[test]
 fn a_pk_key_never_takes_the_null_arm() {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     // Keys 1 and 2.
-    let mut v = TestView::new(&schema, 2);
-    for row in 0..2 {
-        v.set_null_word(row, u64::MAX);
-    }
+    let b = int_rows(&schema, &[&[], &[]]);
+    let v = AllNull(&b);
     let loc = schema.locate(0);
     for desc in [false, true] {
         let keys = [OrderLocator { loc, desc, nulls_first: true, shift: 0 }];
@@ -135,16 +235,17 @@ fn a_pk_key_never_takes_the_null_arm() {
 
 /// `RowRanking` against the comparator it stands in for, over `keys` on `v`: `sorted` is the
 /// stable comparator sort, and under a total order `keep_smallest` keeps that sort's prefix.
-fn assert_ranks_as_the_comparator(keys: &[OrderLocator], total: bool, v: &TestView, label: &str) {
-    let n = v.row_count();
+fn assert_ranks_as_the_comparator(keys: &[OrderLocator], total: bool, v: &Batch, label: &str) {
+    let n = v.len();
     let mut want: Vec<u32> = (0..n as u32).collect();
     want.sort_by(|&a, &b| cmp_order_keys(keys, v, a as usize, b as usize));
-    assert_eq!(RowRanking::new(keys, v).sorted(), want, "{label}");
+    let mb = v.as_mem_batch();
+    assert_eq!(RowRanking::new(keys, &mb).sorted(), want, "{label}");
     if !total {
         return;
     }
     for k in [0, 1, n / 3, n - 1, n, n + 1] {
-        let mut ranking = RowRanking::new(keys, v);
+        let mut ranking = RowRanking::new(keys, &mb);
         ranking.keep_smallest(k);
         let mut kept: Vec<u32> = ranking.rows().collect();
         kept.sort_unstable();
@@ -183,18 +284,19 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
             ],
             &[0],
         );
-        let mut v = TestView::new(&schema, ROWS);
+        let mut b = BatchBuilder::new(&schema);
         for row in 0..ROWS {
-            match tc.is_german_string() {
-                true => v.set(row, 1, rng.pick(STRINGS)),
-                false => v.set(row, 1, rng.pick(PATTERNS)),
-            }
+            b.begin_row(row as u128 + 1, 1);
             if rng.gen_range(5) == 0 {
-                v.set_null(row, 1);
+                b.put_null();
+            } else if tc.is_german_string() {
+                b.put_blob(rng.pick(STRINGS));
+            } else {
+                b.put_int(native(tc, rng.pick(PATTERNS)));
             }
-            v.set(row, 2, rng.gen_range(3) as i64);
+            b.put_int(rng.gen_range(3) as u128);
         }
-        let mut cases = vec![(schema, v, 1u32)];
+        let mut cases = vec![(schema, b.finish(), 1u32)];
         if tc.is_pk_eligible() {
             // The leading key the first of two key columns, the second telling its ties apart.
             let schema = SchemaDescriptor::new(
@@ -205,11 +307,12 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
                 ],
                 &[0, 1],
             );
-            let mut v = TestView::new(&schema, ROWS);
+            let mut b = BatchBuilder::new(&schema);
             for row in 0..ROWS {
-                v.set(row, 0, rng.pick(PATTERNS));
+                let lead = native(tc, rng.pick(PATTERNS));
+                b.begin_row_natives(&[lead, row as u128 + 1], 1).put_int(0);
             }
-            cases.push((schema, v, 0));
+            cases.push((schema, b.finish(), 0));
         }
         for (schema, v, col) in &cases {
             for (desc, nulls_first) in [(false, false), (false, true), (true, false), (true, true)] {
@@ -236,18 +339,18 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
 fn max_lead_after_a_sort_is_the_leading_keys() {
     // `(id, v, w)`: v ties on rows 0 and 1, which w tells apart far above any v.
     let schema = schema_pk_ints(2, false);
-    let mut v = TestView::new(&schema, 3);
-    for (row, (lead, next)) in [(1i64, 100i64), (1, 50), (0, 7)].into_iter().enumerate() {
-        v.set(row, 1, lead);
-        v.set(row, 2, next);
-    }
+    let v = int_rows(
+        &schema,
+        &[&[Some(1), Some(100)], &[Some(1), Some(50)], &[Some(0), Some(7)]],
+    );
     let order = [
         OrderKey { col: 1, desc: false, nulls_first: false },
         OrderKey { col: 2, desc: false, nulls_first: false },
     ];
     let keys = order_locators(&order, &schema, false).unwrap();
-    let want = RowRanking::new(&keys, &v).max_lead();
-    let mut ranking = RowRanking::new(&keys, &v);
+    let mb = v.as_mem_batch();
+    let want = RowRanking::new(&keys, &mb).max_lead();
+    let mut ranking = RowRanking::new(&keys, &mb);
     ranking.sort();
     assert_eq!(ranking.rows().collect::<Vec<_>>(), [2, 1, 0]);
     assert!(want == ranking.max_lead());

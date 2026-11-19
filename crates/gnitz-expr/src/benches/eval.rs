@@ -424,7 +424,7 @@ fn expr_kernel_bench() {
     let n = bench_rows();
     let run = |schema: &SchemaDescriptor, view: &TestView, shapes: Vec<Shape>| {
         for (name, prog, out) in shapes {
-            let mut ev = prog.resolve_map(schema, &out).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (mut ev, _) = prog.resolve_map(schema, &out).unwrap_or_else(|e| panic!("{name}: {e}"));
             let mut dst = TestView::new(&out, n);
             meter.levels("expr_kernel_bench", &name, n, &mut ev, |ev| {
                 dst.clear_blob();

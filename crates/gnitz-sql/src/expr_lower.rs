@@ -13,8 +13,8 @@ use crate::ir::{
 use crate::literal::{Compared, Placed, assign, invalid_literal, place};
 use gnitz_core::Schema;
 use gnitz_expr::{
-    CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
-    LogicalProgram, Reg, ScalarEval, Sink,
+    CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LikeShape,
+    LogicalInstr as L, LogicalProgram, Reg, ScalarEval, Sink,
 };
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 
@@ -682,12 +682,13 @@ impl Lowering<'_> {
     /// over the operand's string register.
     fn like(&mut self, s: &BoundExpr, pattern: &LikePattern, ci: bool) -> Result<Reg, GnitzSqlError> {
         if !ci && self.ty(s).tc == TypeCode::String {
-            if let Some(lit) = pattern.literal() {
-                return self.binop(s, BinOp::Eq, &BoundExpr::LitStr(lit.to_owned()));
-            }
-            if let (BoundExpr::ColRef(c), Some(lit)) = (s, pattern.prefix()) {
-                let const_idx = self.eb.add_const_bytes(lit.as_bytes());
-                return Ok(self.eb.emit(L::StrColPrefix { col: *c as u32, const_idx }));
+            match (pattern.shape(), s) {
+                (LikeShape::Exact(lit), _) => return self.binop(s, BinOp::Eq, &BoundExpr::LitStr(lit.to_owned())),
+                (LikeShape::Prefix(lit), BoundExpr::ColRef(c)) => {
+                    let const_idx = self.eb.add_const_bytes(lit.as_bytes());
+                    return Ok(self.eb.emit(L::StrColPrefix { col: *c as u32, const_idx }));
+                }
+                _ => {}
             }
         }
         let src = self.lower_to(s, STRING)?;

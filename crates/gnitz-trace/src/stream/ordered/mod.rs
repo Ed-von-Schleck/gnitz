@@ -29,8 +29,8 @@ use gnitz_zset::algebra::{GroupOutKey, KeyPacker};
 use gnitz_zset::repr::{Batch, MemBatch, pk_group_end};
 use gnitz_zset::schema::{DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, compare_pk_ordering};
 
-use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
-use gnitz_zset::algebra::{IMAGE_COL, ImageCol, copy_columns, image_slot_col};
+use gnitz_expr::{ColCopy, ColumnLocator};
+use gnitz_zset::algebra::{ColMoves, IMAGE_COL, ImageCol, copy_columns, image_slot_col};
 
 use window::{Running, Window};
 
@@ -58,7 +58,7 @@ impl OrderSpec {
     }
 
     /// The rank byte that places a row of a nullable key. `desc` does not flip
-    /// it, exactly as [`gnitz_expr::cmp_order_keys`] orders NULLs.
+    /// it, exactly as [`gnitz_zset::algebra::cmp_order_keys`] orders NULLs.
     #[inline]
     fn rank(&self, is_null: bool) -> u8 {
         (is_null != self.nulls_first) as u8
@@ -574,8 +574,7 @@ impl OrderIndex {
                 }
             }
             w.weight_mut().copy_from_slice(delta.weight());
-            self.moves.write_null_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
-            copy_columns(&mb, w, self.moves.copies(), n, heap_at);
+            copy_columns(&mb, w, &self.moves, n, heap_at);
         });
         out
     }

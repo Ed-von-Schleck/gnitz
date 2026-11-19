@@ -15,11 +15,11 @@ use crate::test_support::{
 };
 use crate::{CmpOp, IntArithOp, LogicalInstr};
 
-/// A map writes each computed slot — zeroing a NULL result's cell — and moves
-/// each copied column's null bit into its slot. A BOOLEAN slot stores 1 for any
-/// non-zero register value.
+/// A map writes each computed slot — zeroing a NULL result's cell and setting its
+/// null bit — and leaves each copied slot, cell and null bit, to its caller. A
+/// BOOLEAN slot stores 1 for any non-zero register value.
 #[test]
-fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
+fn a_map_writes_its_computed_slots_and_leaves_the_copied_ones() {
     let n = MORSEL + 7;
     let int = |row: usize| row as i64 - 100;
     let int_null = |row: usize| row.is_multiple_of(5);
@@ -63,11 +63,13 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
         Sink::Reg(Reg(9)),
         Sink::Reg(Reg(2)),
     ];
-    let mut ev = map_prog(&in_schema, &out_schema, instrs, sinks, vec![]);
+    let (mut ev, copies) = crate::LogicalProgram::new(instrs, sinks, vec![])
+        .and_then(|p| p.resolve_map(&in_schema, &out_schema))
+        .expect("the map resolves");
     assert!(ev.emits_anything());
     assert_eq!(
-        ev.moves().copies(),
-        &[crate::ColCopy {
+        copies,
+        [crate::ColCopy {
             src: in_schema.locate(1),
             slot: 0,
             width: 8
@@ -76,7 +78,11 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
 
     for (row, (word, cells)) in map_rows(&mut ev, &out_schema, &mb).into_iter().enumerate() {
         let bit = |slot: usize| word >> slot & 1 != 0;
-        assert_eq!(bit(0), int_null(row), "row {row}: the copied column's bit");
+        assert_eq!(
+            (&cells[0][..], bit(0)),
+            (&[0; 8][..], false),
+            "row {row}: the copied slot"
+        );
 
         let cast = (!int_null(row)).then(|| i16::try_from(int(row) * 300).ok()).flatten();
         assert_eq!(

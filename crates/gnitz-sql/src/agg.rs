@@ -2,9 +2,9 @@
 //! desugar share, and the one SQL-name ↔ aggregate map. It reads no SQL text.
 
 use crate::error::{GnitzSqlError, unsupported_clause};
-use gnitz_expr::ReduceOutSlot;
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
+use gnitz_zset::schema::ReduceOutSlot;
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub(crate) enum AggFunc {

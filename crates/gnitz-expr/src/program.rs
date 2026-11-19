@@ -440,7 +440,7 @@ crate::blob::expr_instrs! {
         /// Integer register to decimal text, read signed or unsigned per the
         /// resolve-time U64 tracking of `a`. A non-zero `scale` reads `a` as a
         /// signed DECIMAL of that scale and spells it as
-        /// [`gnitz_wire::write_decimal`] does; resolve refuses a scale past
+        /// [`gnitz_wire::write_decimal`] does; construction refuses a scale past
         /// [`gnitz_wire::MAX_DECIMAL_SCALE`].
         IntToStr = 35 { a @ A1: Reg, scale @ A2: u8 },
         /// Float register to text, as [`gnitz_wire::FloatText`] spells it. `f32`: `a`
@@ -807,6 +807,15 @@ impl LogicalProgram {
             if let Some((idx, want)) = ops.pool {
                 check_pool_entry(idx, want, &const_strings)?;
             }
+            // `scaled_bytes` asserts its scale, so a forged one stops here.
+            if let LogicalInstr::IntToStr { scale, .. } = *instr
+                && scale > MAX_DECIMAL_SCALE
+            {
+                return Err(E::BadSelector {
+                    op: ExprOp::IntToStr.as_wire(),
+                    selector: scale.into(),
+                });
+            }
             for &(reg, read) in ops.reads.iter().flatten() {
                 // Reading a not-yet-written lane would take whatever the
                 // previous morsel left there — another row's value, or for a
@@ -883,7 +892,7 @@ impl LogicalProgram {
         // The per-register masks, built in stream order off the operand table:
         // every register an instruction reads is a lower one, so each bit the
         // lowering asks for is already final.
-        let (mut bool_produced, mut non_bool_read, mut bool_input) = (0u64, 0u64, 0u64);
+        let (mut non_bool_read, mut bool_input) = (0u64, 0u64);
         let mut read_as = |reg: Reg, read: ReadAs| match read {
             ReadAs::Bool => bool_input |= 1u64 << reg.0,
             // A null-lane read needs neither the value nor the truth bit.
@@ -892,12 +901,11 @@ impl LogicalProgram {
         };
         let (mut null_regs, mut reg_u64) = (0u64, 0u64);
         let mut instrs = Vec::with_capacity(self.instrs.len());
-        // By pool index, each built when an opcode first names it.
-        let n_pool = self.const_strings.len();
-        let mut int_sets: Vec<Option<Vec<i64>>> = vec![None; n_pool];
-        let mut trim_sets: Vec<Option<[u64; 4]>> = vec![None; n_pool];
-        let mut const_cells: Vec<Option<[u8; 16]>> = vec![None; n_pool];
-        let mut const_spans: Vec<Option<(u32, u32)>> = vec![None; n_pool];
+        // One entry per instruction that reads it, pushed in stream order; the
+        // instruction carries the entry's index.
+        let mut int_sets: Vec<Vec<i64>> = Vec::new();
+        let mut trim_sets: Vec<[u64; 4]> = Vec::new();
+        let mut const_cells: Vec<[u8; 16]> = Vec::new();
         let mut like_matchers: Vec<LikeMatcher> = Vec::new();
         let mut const_arena: Vec<u8> = Vec::new();
         // Off the instruction stream: a constant register names no computation,
@@ -908,14 +916,12 @@ impl LogicalProgram {
         let nullable_slots = schema.nullable_payload_slots();
         // By payload slot, the cell width an instruction reads it at; 0 if none.
         let mut read_width = [0u8; PAYLOAD_SLOTS];
-        // Pool entry `ci`'s span of `const_arena`, copied in on first reference.
-        fn const_span(spans: &mut [Option<(u32, u32)>], arena: &mut Vec<u8>, pool: &[Vec<u8>], ci: u32) -> (u32, u32) {
-            *spans[ci as usize].get_or_insert_with(|| {
-                let bytes = &pool[ci as usize];
-                let span = (arena.len() as u32, bytes.len() as u32);
-                arena.extend_from_slice(bytes);
-                span
-            })
+        // Pool entry `ci` appended to `const_arena`, as its span there.
+        fn const_span(arena: &mut Vec<u8>, pool: &[Vec<u8>], ci: u32) -> (u32, u32) {
+            let bytes = &pool[ci as usize];
+            let span = (arena.len() as u32, bytes.len() as u32);
+            arena.extend_from_slice(bytes);
+            span
         }
         // A string column's payload slot; the operand pass admitted it as one.
         let str_slot = |col: u32| {
@@ -942,19 +948,15 @@ impl LogicalProgram {
                     may_null |= loc.is_null_word(nullable_slots);
                 }
             }
-            match ops.write {
-                WriteAs::Bool => bool_produced |= 1u64 << i,
-                WriteAs::Value(rule) => {
-                    let is_u64 = match rule {
-                        U64Rule::Fixed(v) => v,
-                        // In stream order: `reg_u64` holds every register this one reads.
-                        U64Rule::FromOperands => (ops.reads.iter().flatten())
-                            .any(|&(reg, read)| read == ReadAs::Value && (reg_u64 >> reg.0) & 1 != 0),
-                        U64Rule::FromColType => col_is_u64,
-                    };
-                    reg_u64 |= (is_u64 as u64) << i;
-                }
-                WriteAs::Str => {}
+            if let WriteAs::Value(rule) = ops.write {
+                let is_u64 = match rule {
+                    U64Rule::Fixed(v) => v,
+                    // In stream order: `reg_u64` holds every register this one reads.
+                    U64Rule::FromOperands => (ops.reads.iter().flatten())
+                        .any(|&(reg, read)| read == ReadAs::Value && (reg_u64 >> reg.0) & 1 != 0),
+                    U64Rule::FromColType => col_is_u64,
+                };
+                reg_u64 |= (is_u64 as u64) << i;
             }
             for &(reg, read) in ops.reads.iter().flatten() {
                 // A null test reads the NULL away; every other read carries it.
@@ -1036,9 +1038,9 @@ impl LogicalProgram {
                 },
                 L::IsNullReg { a: Reg(a), invert } => I::IsNullReg { a, invert },
                 L::StrColConst { op, col, const_idx: ConstIdx(const_idx) } => {
-                    let ci = const_idx as usize;
-                    const_cells[ci]
-                        .get_or_insert_with(|| encode_german_string(&self.const_strings[ci], &mut const_arena));
+                    let cell = encode_german_string(&self.const_strings[const_idx as usize], &mut const_arena);
+                    let const_idx = const_cells.len() as u32;
+                    const_cells.push(cell);
                     I::StrColConst { op, pi: str_slot(col), const_idx }
                 }
                 L::StrColCol { op, col_a, col_b } => I::StrColCol {
@@ -1047,20 +1049,21 @@ impl LogicalProgram {
                     pi_b: str_slot(col_b),
                 },
                 L::StrColPrefix { col, const_idx: ConstIdx(const_idx) } => {
-                    let (off, len) = const_span(&mut const_spans, &mut const_arena, &self.const_strings, const_idx);
+                    let (off, len) = const_span(&mut const_arena, &self.const_strings, const_idx);
                     I::StrColPrefix { pi: str_slot(col), off, len }
                 }
                 L::IntInSet {
                     value_reg: Reg(value_reg),
                     set_idx: ConstIdx(set_idx),
                 } => {
-                    let si = set_idx as usize;
-                    int_sets[si].get_or_insert_with(|| decode_int_set(&self.const_strings[si]));
+                    let set = decode_int_set(&self.const_strings[set_idx as usize]);
+                    let set_idx = int_sets.len() as u32;
+                    int_sets.push(set);
                     I::IntInSet { value_reg, set_idx }
                 }
                 L::LoadColStr { col } => I::LoadColStr { pi: str_slot(col) },
                 L::LoadConstStr { const_idx: ConstIdx(const_idx) } => {
-                    let (off, len) = const_span(&mut const_spans, &mut const_arena, &self.const_strings, const_idx);
+                    let (off, len) = const_span(&mut const_arena, &self.const_strings, const_idx);
                     const_str_regs.push((dst, off, len));
                     continue;
                 }
@@ -1078,14 +1081,12 @@ impl LogicalProgram {
                     mode,
                     set_idx: ConstIdx(set_idx),
                 } => {
-                    let si = set_idx as usize;
-                    trim_sets[si].get_or_insert_with(|| {
-                        let mut table = [0u64; 4];
-                        for &byte in &self.const_strings[si] {
-                            table[(byte >> 6) as usize] |= 1u64 << (byte & 63);
-                        }
-                        table
-                    });
+                    let mut table = [0u64; 4];
+                    for &byte in &self.const_strings[set_idx as usize] {
+                        table[(byte >> 6) as usize] |= 1u64 << (byte & 63);
+                    }
+                    let set_idx = trim_sets.len() as u32;
+                    trim_sets.push(table);
                     I::StrTrim { a, mode, set_idx }
                 }
                 L::StrLike {
@@ -1099,13 +1100,6 @@ impl LogicalProgram {
                     I::StrLike { src, matcher_idx }
                 }
                 L::StrConcat { a: Reg(a), b: Reg(b), skip_null } => I::StrConcat { a, b, skip_null },
-                // `scaled_bytes` asserts its scale, so a forged one stops here.
-                L::IntToStr { scale, .. } if scale > MAX_DECIMAL_SCALE => {
-                    return Err(ExprValidateErr::BadSelector {
-                        op: ExprOp::IntToStr.as_wire(),
-                        selector: scale.into(),
-                    });
-                }
                 L::IntToStr { a, scale } => I::IntToStr { a: int_reg(a), scale },
                 L::TemporalToStr { a: Reg(a), micros } => I::TemporalToStr { a, micros },
                 L::FloatToStr { a: Reg(a), f32 } => I::FloatToStr { a, f32 },
@@ -1127,7 +1121,7 @@ impl LogicalProgram {
             read_as(reg, sink_read);
         }
         Ok(ResolvedProgram {
-            bit_only: bool_produced & !non_bool_read,
+            bit_only: !non_bool_read,
             // `bool_input` alone: a register in `bit_only \ bool_input` has
             // `IsNullReg` as its only possible reader, which reads the null
             // words and never the packed bit.
@@ -1143,9 +1137,9 @@ impl LogicalProgram {
             const_regs,
             const_str_regs,
             const_nulls,
-            const_cells: dense(const_cells),
-            int_sets: dense(int_sets),
-            trim_sets: dense(trim_sets),
+            const_cells,
+            int_sets,
+            trim_sets,
             like_matchers,
             const_arena,
             // A register file is exactly one entry per instruction.
@@ -1479,11 +1473,6 @@ pub(crate) fn locate_col(s: &SchemaDescriptor, col: u32, need: ColKind) -> Resul
     Ok(loc)
 }
 
-/// One slot per entry, the entries nothing built left at their default.
-fn dense<T: Default>(slots: Vec<Option<T>>) -> Vec<T> {
-    slots.into_iter().map(Option::unwrap_or_default).collect()
-}
-
 /// The `LogicalInstr::IntInSet` const-pool form: `N × 8-byte LE` i64s, strictly
 /// ascending.
 fn int_set_is_canonical(bytes: &[u8]) -> bool {
@@ -1517,12 +1506,14 @@ pub(crate) struct ResolvedProgram {
     /// Bit `r` set iff register `r` is a NULL constant of either class: its
     /// null words are set once per evaluator, beside the other constants.
     pub(crate) const_nulls: u64,
-    /// `StrColConst`'s constants as German-string cells, by pool index; a long
-    /// one's heap half is in `const_arena`.
+    /// One German-string cell per `StrColConst` instruction, at its
+    /// `const_idx`; a long one's heap half is in `const_arena`.
     pub(crate) const_cells: Vec<[u8; 16]>,
-    /// `IntInSet`'s value pools, strictly ascending, by pool index.
+    /// One value set per `IntInSet` instruction, at its `set_idx`, strictly
+    /// ascending.
     pub(crate) int_sets: Vec<Vec<i64>>,
-    /// `StrTrim`'s byte sets as 256-bit membership tables, by pool index.
+    /// One 256-bit byte-membership table per `StrTrim` instruction, at its
+    /// `set_idx`.
     pub(crate) trim_sets: Vec<[u64; 4]>,
     /// One per `StrLike` instruction, at its `matcher_idx`: `ci` is compiled
     /// in, so two instructions over one pattern get one each.
@@ -1543,8 +1534,8 @@ pub(crate) struct ResolvedProgram {
     // The per-register masks below are meaningful only for the schema this
     // program was resolved against, since the payload indices in `instrs` were
     // assigned from it.
-    /// Bit `r` set iff register `r` is only consumed by boolean ops, so nothing
-    /// reads its lanes. A permission, not an obligation: the integer and float
+    /// Bit `r` set iff nothing reads register `r`'s lanes. Asked only of a
+    /// `WriteAs::Bool` producer, and a permission, not an obligation: the integer and float
     /// compares, the IN scan over a small set, the column string compares
     /// (`StrColConst`, `StrColCol`, `StrColPrefix`), `BoolBinary`, `BoolNot` and
     /// the null tests skip the lanes and write the packed truth bits natively.

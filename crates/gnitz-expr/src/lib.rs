@@ -1,5 +1,6 @@
 //! The one expression evaluator GnitzDB runs — on the engine and in the SQL
-//! client alike.
+//! client alike — and the vocabulary it resolves against and reads rows
+//! through.
 //!
 //! A leaf crate below the entire engine: its only in-workspace dependency is
 //! `gnitz-wire` (type codes, the OPK codec, the German-string layout, and the
@@ -30,6 +31,12 @@
 //! its `SYS_SCHEMA_DIGEST` const fold must see — it cannot depend on this crate
 //! to reach one.
 //!
+//! A map's sinks are each a column copied verbatim or a register the program
+//! computes; [`LogicalProgram::copy_cols`] builds a map of copies alone, and
+//! resolving a map yields its [`MapEval`] beside its copies as [`ColCopy`]s,
+//! which `gnitz-zset` carries out. A program carries a LIKE pattern as a
+//! [`LikePattern`], compiled per instruction into a [`LikeMatcher`].
+//!
 //! # Rows
 //!
 //! The evaluator reads rows through [`BatchView`], a [`gnitz_wire::RowSource`]
@@ -37,20 +44,6 @@
 //! value sits), and describes them with [`SchemaDescriptor`] (what the schema
 //! says about it). A map writes into a [`MapTarget`]. The batch types implementing
 //! them are `gnitz-zset`'s, a crate above this one.
-//!
-//! # Rules shared outside an expression
-//!
-//! Client and engine compute these alike because they call the same code:
-//!
-//! - the ORDER BY ranking ([`RowRanking`], [`order_locators`]);
-//! - a column copy and the null bits it moves ([`ColCopy`], [`ColMoves`]), and
-//!   a copy-only map ([`LogicalProgram::copy_cols`]);
-//! - a reduce's output key and layout ([`SchemaDescriptor::reduce_out_key`],
-//!   [`SchemaDescriptor::reduce_out_layout`]);
-//! - LIKE patterns ([`LikePattern`], [`LikeMatcher`]).
-//!
-//! Beside them, [`radix_sort_by_key`] is the sort under the ranking and under
-//! the engine's key sorts.
 //!
 //! # Layout
 //!
@@ -68,14 +61,14 @@
 //!
 //! > A non-generic item is codegen'd in this crate's rlib, at opt-level 1. A
 //! > generic one is re-instantiated in the *consuming* crate, at that crate's
-//! > opt-level — 0 for gnitz-zset, gnitz-store and gnitz-server in dev.
+//! > opt-level — 1 for gnitz-zset, 0 for gnitz-trace, gnitz-store and
+//! > gnitz-server in dev.
 //!
 //! So moving a body out of a generic function into a non-generic one *improves*
 //! the debug build, and the reverse costs. `nm -C` on the rlibs is what shows
 //! which: a generic body appears as a local (`t`) symbol in each consuming
 //! crate's. Anything a generic entry point reaches per row is
-//! `#[inline(always)]`, unless it is deliberately out of line, as
-//! [`RowRanking`]'s tie-break comparison is.
+//! `#[inline(always)]`, unless it is deliberately out of line.
 //!
 //! Judge an inlining or kernel change on retired instructions — what the
 //! benches print — never on wall-clock: timings on the development machines
@@ -85,15 +78,12 @@ mod blob;
 mod builder;
 mod calendar;
 mod chars;
-mod copy;
 mod eval;
 mod like;
 mod locator;
 mod map;
 mod morsel;
-mod order;
 mod program;
-mod radix;
 mod range;
 mod schema;
 mod search;
@@ -102,14 +92,11 @@ mod view;
 
 pub use builder::*;
 pub use calendar::CalendarOp;
-pub use copy::{ColCopy, ColMoves};
 pub use eval::*;
 pub use like::*;
 pub use locator::*;
-pub use map::MapEval;
-pub use order::*;
+pub use map::{ColCopy, MapEval};
 pub use program::*;
-pub use radix::{RadixKey, radix_sort_by_key};
 pub use schema::*;
 pub use simd::{Level, null_bits};
 pub use view::*;

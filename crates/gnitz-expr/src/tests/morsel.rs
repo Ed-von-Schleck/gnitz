@@ -2,8 +2,7 @@ use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{FixedInt, Heap, TypeCode};
 
 use super::{MORSEL, decode_f64, encode_f64};
-use crate::eval::Resolved;
-use crate::program::{FloatUnaryOp, IntUnaryOp, ResolvedProgram};
+use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
     Col, PATTERNS, TestView, f64s, fill, filter_prog, i64s, int, pairs, passing_rows, row_strs, row_values,
     scalar_prog, schema_pk_strings, text, verdicts, view,
@@ -542,14 +541,13 @@ fn calendar_ops_read_their_columns_representation() {
 // String registers
 // ---------------------------------------------------------------------------
 
-/// Every loaded string column is addressed in place — a short cell in its
-/// column region, a long one in the blob — never copied into the arena.
+/// Every loaded string column reads its own cells, short ones inline and long
+/// ones in the blob.
 #[test]
-fn every_string_column_addresses_its_own_region_in_place() {
+fn every_string_column_loads_its_own_cells() {
     const N: usize = 12;
     let schema = schema_pk_strings(N, false);
-    // Mixed widths: a short cell is addressed inline in its column region, a
-    // long one in the blob.
+    // Mixed widths: even columns hold inline cells, odd ones heap cells.
     let vals: Vec<String> = (0..N)
         .map(|c| match c % 2 {
             0 => format!("c{c}"),
@@ -569,62 +567,7 @@ fn every_string_column_addresses_its_own_region_in_place() {
         });
     }
     let mut ev = scalar_prog(&schema, instrs, vec![]);
-    let evaluator = ev.ev_mut().expect("an evaluated program");
-
-    assert_eq!(
-        payload_reads(evaluator.prog()),
-        (0..N).map(|c| (c as u8, 16)).collect::<Vec<_>>(),
-        "every string column the program loads is read at its own slot",
-    );
-    // Drive the loads alone and read back which buffer each lane resolved
-    // against — the claim the concatenation below cannot make, since its own
-    // result always lands in the arena.
-    evaluator.eval_morsels(&view, 0, 1, |_, _| {});
-    let lanes = &evaluator.scratch.str_views;
-    for (c, val) in vals.iter().enumerate() {
-        let want =
-            match gnitz_wire::german_string_inline(crate::BatchView::col_data(&view, c, 16).first_chunk().unwrap()) {
-                Some(_) => super::SRC_COL_BASE + c as u32,
-                None => super::SRC_BLOB,
-            };
-        assert_eq!(
-            lanes[c][0].src,
-            want,
-            "column {c} ({} bytes) loaded through the wrong buffer",
-            val.len(),
-        );
-    }
-
     assert_eq!(text_rows(&mut ev, &view), [Some(vals.concat())]);
-}
-
-/// `(slot, cell width)` for each slot in the program's read mask, lowest first.
-fn payload_reads(prog: &ResolvedProgram) -> Vec<(u8, u8)> {
-    gnitz_wire::BitIter(prog.read_mask)
-        .map(|pi| (pi as u8, prog.read_widths[pi]))
-        .collect()
-}
-
-/// Each payload slot an instruction reads comes once, with the width its kernel
-/// reads it at, and a slot only a null test reads does not come.
-#[test]
-fn payload_reads_name_each_slot_at_its_cell_width() {
-    let cols = [
-        int(TypeCode::I16, [1]),
-        int(TypeCode::F32, [0]),
-        text(["s"]),
-        i64s([None::<i64>]),
-    ];
-    let (schema, _) = view(&cols);
-    let instrs = vec![
-        LogicalInstr::LoadCol { col: 1 },
-        LogicalInstr::LoadCol { col: 2 },
-        LogicalInstr::LoadColStr { col: 3 },
-        LogicalInstr::IsNull { col: 4, invert: false },
-    ];
-    let ev = scalar_prog(&schema, instrs, vec![]);
-    let prog = ev.prog();
-    assert_eq!(payload_reads(prog), [(0, 2), (1, 4), (2, 16)]);
 }
 
 /// UPPER and LOWER fold ASCII only: the neighbours of `a-z`/`A-Z` pass through,

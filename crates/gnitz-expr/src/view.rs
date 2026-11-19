@@ -53,8 +53,6 @@ pub(crate) fn debug_assert_coherent(
 
 /// The batch a map writes its computed columns into.
 pub trait MapTarget {
-    /// The row-major null bitmap, 8 bytes per row.
-    fn null_bmp_mut(&mut self) -> &mut [u8];
     /// Payload slot `pi`'s cell region, the null bitmap, and the blob heap a string cell spills into.
     fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>);
 }

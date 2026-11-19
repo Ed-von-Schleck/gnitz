@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use super::int_cell;
 use crate::repr::MemBatch;
 use crate::schema::SchemaColumn;
-use gnitz_expr::{ColumnLocator, order_bits};
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::{RowSource, TypeCode};
 use gnitz_wire::{ScalarKind, ValueForm, WideForm, for_each_fixed_int};
 
@@ -219,6 +219,18 @@ pub(super) fn wide_native_of_image(kind: WideForm, invert: bool, v: &mut [u8]) -
             }
             w
         }
+    }
+}
+
+/// The [`ScalarKind::order_image`] of the column's value in `row`. `kind` is the column's own.
+#[inline(always)]
+pub(super) fn order_bits(loc: &ColumnLocator, src: &impl RowSource, row: usize, kind: ScalarKind) -> u64 {
+    debug_assert_eq!(ScalarKind::from_type_code(loc.type_code()), Some(kind));
+    match kind {
+        ScalarKind::Int(fi) => kind.order_image(loc.decode_i64(src, row, fi) as u64),
+        // Floats are never PK columns, so these bytes are native.
+        ScalarKind::F32 => kind.order_image(u32::from_le_bytes(loc.bytes(src, row).try_into().unwrap()) as u64),
+        ScalarKind::F64 => kind.order_image(u64::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
     }
 }
 

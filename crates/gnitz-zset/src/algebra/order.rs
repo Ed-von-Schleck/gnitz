@@ -4,8 +4,11 @@ use std::cmp::Ordering;
 
 use gnitz_wire::{OrderKey, RowSource, ScalarKind, ValueForm, WideForm};
 
-use crate::radix::stable_radix_sort_by_key;
-use crate::{ColumnLocator, RadixKey, SchemaDescriptor};
+use gnitz_expr::ColumnLocator;
+
+use super::order_image::order_bits;
+use crate::repr::MemBatch;
+use crate::schema::{SchemaDescriptor, stable_radix_sort_by_key};
 
 /// One resolved ORDER BY key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,18 +89,6 @@ pub fn cmp_order_keys<S: RowSource>(keys: &[OrderLocator], src: &S, ra: usize, r
     Ordering::Equal
 }
 
-/// The [`ScalarKind::order_image`] of the column's value in `row`. `kind` is the column's own.
-#[inline(always)]
-pub fn order_bits(loc: &ColumnLocator, src: &impl RowSource, row: usize, kind: ScalarKind) -> u64 {
-    debug_assert_eq!(ScalarKind::from_type_code(loc.type_code()), Some(kind));
-    match kind {
-        ScalarKind::Int(fi) => kind.order_image(loc.decode_i64(src, row, fi) as u64),
-        // Floats are never PK columns, so these bytes are native.
-        ScalarKind::F32 => kind.order_image(u32::from_le_bytes(loc.bytes(src, row).try_into().unwrap()) as u64),
-        ScalarKind::F64 => kind.order_image(u64::from_le_bytes(loc.bytes(src, row).try_into().unwrap())),
-    }
-}
-
 /// A row with one of its order keys as integers.
 #[derive(Clone, Copy, Default)]
 struct Ranked {
@@ -107,26 +98,12 @@ struct Ranked {
     rank: u8,
 }
 
-/// A row's place under its leading order key alone: the rank above the image,
-/// one integer, which compares in fewer instructions than the pair.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Lead(u128);
-
-impl RadixKey for Lead {
-    #[inline(always)]
-    fn byte(self, i: usize) -> u8 {
-        self.0.byte(i)
-    }
-    #[inline]
-    fn varying(first: Self, keys: impl Iterator<Item = Self>) -> u128 {
-        u128::varying(first.0, keys.map(|l| l.0))
-    }
-}
-
 impl Ranked {
+    /// The row's place under its leading order key alone: the rank above the image, one
+    /// integer, which compares in fewer instructions than the pair.
     #[inline(always)]
-    fn lead(&self) -> Lead {
-        Lead((self.rank as u128) << 64 | self.image as u128)
+    fn lead(&self) -> u128 {
+        (self.rank as u128) << 64 | self.image as u128
     }
 }
 
@@ -139,9 +116,9 @@ enum Rows<'a> {
 
 /// `rows` of `src`, each with its image under `key`: an integer whose order never contradicts
 /// the key's.
-fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>) {
+fn rank_rows(key: &OrderLocator, src: &MemBatch, rows: Rows<'_>) {
     #[inline(always)]
-    fn fill<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>, image: impl Fn(usize) -> u64) {
+    fn fill(key: &OrderLocator, src: &MemBatch, rows: Rows<'_>, image: impl Fn(usize) -> u64) {
         let (loc, desc, nulls_first) = (key.loc, key.desc, key.nulls_first);
         let rank = |row: u32| {
             let r = row as usize;
@@ -193,7 +170,7 @@ fn sort_by_lead(run: &mut [Ranked]) {
 
 /// Sort `run`, whose images are `keys[0]`'s, by `keys`; rows the keys do not tell apart keep
 /// their order. The images sort first, and each run they leave tied is sorted by the rest.
-fn sort_run<S: RowSource>(keys: &[OrderLocator], src: &S, run: &mut [Ranked]) {
+fn sort_run(keys: &[OrderLocator], src: &MemBatch, run: &mut [Ranked]) {
     sort_by_lead(run);
     let whole = keys[0].image_is_whole();
     if whole && keys.len() == 1 {
@@ -212,16 +189,16 @@ fn sort_run<S: RowSource>(keys: &[OrderLocator], src: &S, run: &mut [Ranked]) {
 
 /// The rows of `src` under order keys, each carrying its leading key's image, so that ranking
 /// them reads the batch only for rows the image leaves tied.
-pub struct RowRanking<'a, S> {
+pub struct RowRanking<'a> {
     keys: &'a [OrderLocator],
-    src: &'a S,
+    src: &'a MemBatch<'a>,
     rows: Vec<Ranked>,
 }
 
-impl<'a, S: RowSource> RowRanking<'a, S> {
+impl<'a> RowRanking<'a> {
     /// Panics on no key.
     #[inline(never)]
-    pub fn new(keys: &'a [OrderLocator], src: &'a S) -> Self {
+    pub fn new(keys: &'a [OrderLocator], src: &'a MemBatch<'a>) -> Self {
         let n = src.row_count();
         assert!(n <= u32::MAX as usize, "row count exceeds u32");
         let mut rows = Vec::with_capacity(n);
@@ -236,7 +213,7 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
             if k > 0 {
                 let tail = &keys[keys[0].image_is_whole() as usize..];
                 rows.select_nth_unstable_by(k - 1, |a, b| match a.lead().cmp(&b.lead()) {
-                    Ordering::Equal if !tail.is_empty() => cmp_tail(tail, *src, a.row, b.row),
+                    Ordering::Equal if !tail.is_empty() => cmp_tail(tail, src, a.row, b.row),
                     ord => ord,
                 });
             }
@@ -245,29 +222,29 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
     }
 
     /// Drop every row whose lead is above `bound`.
-    pub fn drop_above(&mut self, bound: Lead) {
+    pub(crate) fn drop_above(&mut self, bound: u128) {
         self.rows.retain(|r| r.lead() <= bound);
     }
 
     /// The largest lead among the rows. A sort leaves a tie its later keys' images, so the
     /// leading key ranks the rows again first.
-    pub fn max_lead(&mut self) -> Option<Lead> {
+    pub(crate) fn max_lead(&mut self) -> Option<u128> {
         rank_rows(&self.keys[0], self.src, Rows::Run(&mut self.rows));
         self.rows.iter().map(Ranked::lead).max()
     }
 
     /// The rows, in no particular order.
-    pub fn rows(&self) -> impl ExactSizeIterator<Item = u32> {
+    pub(crate) fn rows(&self) -> impl ExactSizeIterator<Item = u32> {
         self.rows.iter().map(|r| r.row)
     }
 
     /// Order the rows ascending; rows the keys do not tell apart keep their order.
-    pub fn sort(&mut self) {
+    pub(crate) fn sort(&mut self) {
         sort_run(self.keys, self.src, &mut self.rows);
     }
 
     /// Keep the first `n` rows.
-    pub fn truncate(&mut self, n: usize) {
+    pub(crate) fn truncate(&mut self, n: usize) {
         self.rows.truncate(n);
     }
 
@@ -280,7 +257,7 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
 
 /// Out of line: the images decide most comparisons, and this body inlined would crowd them.
 #[inline(never)]
-fn cmp_tail<S: RowSource>(tail: &[OrderLocator], src: &S, a: u32, b: u32) -> Ordering {
+fn cmp_tail(tail: &[OrderLocator], src: &MemBatch, a: u32, b: u32) -> Ordering {
     cmp_order_keys(tail, src, a as usize, b as usize)
 }
 

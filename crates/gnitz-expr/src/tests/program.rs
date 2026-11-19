@@ -4,8 +4,8 @@ use super::{ColKind, FloatUnaryOp, IntUnaryOp, ReadAs};
 use crate::SchemaDescriptor;
 use crate::eval::Resolved;
 use crate::test_support::{
-    fill, in_set, is_not_null_op, is_null_op, result_prog, row_values, scalar_prog, schema_pk, schema_pk_ints,
-    schema_pk_strings, verdicts,
+    fill, in_set, is_not_null_op, is_null_op, passing_rows, result_prog, row_values, scalar_prog, schema_pk,
+    schema_pk_ints, schema_pk_strings, verdicts,
 };
 use crate::{
     CalendarOp, CmpOp, ConstIdx, ExprValidateErr, IntArithOp, LogicalInstr, LogicalProgram, PoolEntry, Reg, Sink,
@@ -503,17 +503,21 @@ fn operand_class_is_enforced_in_both_directions() {
     assert_eq!(refused(vec![text, text, substr(Reg(1))]), mismatch(1));
 }
 
-/// The DECIMAL text writer asserts its scale, so resolve refuses a scale past
-/// the largest a column may declare instead of letting a forged one reach eval.
+/// The DECIMAL text writer asserts its scale, so construction refuses a scale
+/// past the largest a column may declare instead of letting a forged one reach
+/// eval.
 #[test]
 fn int_to_text_refuses_a_scale_past_the_decimal_maximum() {
     use LogicalInstr as L;
     let schema = schema_pk_ints(1, true);
-    let to_text = |scale| result_prog(vec![L::LoadCol { col: 1 }, L::IntToStr { a: Reg(0), scale }], vec![]);
+    let to_text = |scale| {
+        let instrs = vec![L::LoadCol { col: 1 }, L::IntToStr { a: Reg(0), scale }];
+        LogicalProgram::new(instrs, vec![Sink::Reg(Reg(1))], vec![])
+    };
     let max = gnitz_wire::MAX_DECIMAL_SCALE;
-    assert!(to_text(max).resolve_scalar(&schema).is_ok());
+    assert!(to_text(max).unwrap().resolve_scalar(&schema).is_ok());
     assert_eq!(
-        to_text(max + 1).resolve_scalar(&schema).err(),
+        to_text(max + 1).err(),
         Some(ExprValidateErr::BadSelector {
             op: super::ExprOp::IntToStr.as_wire(),
             selector: u32::from(max) + 1,
@@ -550,11 +554,11 @@ fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     }
 }
 
-/// Two IN lists over the same values, in any order, share one pool entry and one
-/// decoded pool.
+/// Two IN lists over the same values, in any order, intern to one pool entry
+/// holding the sorted, deduplicated set, and both operands of the OR read it.
 #[test]
-fn two_in_sets_over_one_pool_index_share_one_decoded_pool() {
-    let schema = schema_pk_ints(2, true);
+fn two_in_sets_over_one_pool_index_read_its_canonical_entry() {
+    let schema = schema_pk_ints(2, false);
     let mut b = crate::ExprBuilder::new();
     let set = b.add_const_int_set(vec![3, 1, 2, 1]);
     let a = b.emit(LogicalInstr::LoadCol { col: 1 });
@@ -563,10 +567,16 @@ fn two_in_sets_over_one_pool_index_share_one_decoded_pool() {
     let c_in = b.emit(LogicalInstr::IntInSet { value_reg: c, set_idx: set });
     let or = b.emit(LogicalInstr::BoolBinary { a: a_in, b: c_in, is_or: true });
     let prog = b.build(vec![Sink::Reg(or)]).expect("a well-formed program");
-    assert_eq!(prog.const_strings().len(), 1, "the two lists intern to one pool entry");
+    assert_eq!(
+        prog.const_strings(),
+        [gnitz_wire::as_le_bytes(&[1i64, 2, 3]).to_vec()],
+        "the two lists intern to one sorted, deduplicated pool entry",
+    );
 
-    let ev = prog.resolve_filter(&schema).expect("resolves");
-    assert_eq!(ev.prog().int_sets[0], vec![1, 2, 3]);
+    let rows = [[3i64, 0], [0, 2], [0, 0], [9, 1]];
+    let view = fill(&schema, rows.len(), |r, c| rows[r][c], |_, _| false);
+    let mut ev = prog.resolve_filter(&schema).expect("resolves");
+    assert_eq!(passing_rows(&mut ev, &view), [true, true, false, true]);
 }
 
 /// The scratch's i64 lanes are sized by the highest *non*-string register, so a

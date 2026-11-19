@@ -56,24 +56,50 @@ impl LikePattern {
         &self.0
     }
 
-    /// The text a pattern without wildcards matches exactly. A wildcard byte is
-    /// never UTF-8, so the text is the pattern exactly when it decodes.
-    pub fn literal(&self) -> Option<&str> {
-        std::str::from_utf8(&self.0).ok()
-    }
-
-    /// The text a `'lit%'` pattern matches as a prefix: a trailing run of `%`
-    /// and no other wildcard.
-    pub fn prefix(&self) -> Option<&str> {
-        let lit = self.0.strip_suffix(&[ANY_MANY])?;
-        let lit = &lit[..lit.iter().rposition(|&b| b != ANY_MANY).map_or(0, |i| i + 1)];
-        std::str::from_utf8(lit).ok()
+    /// What the pattern's wildcards leave of it.
+    pub fn shape(&self) -> LikeShape<'_> {
+        shape(&self.0)
     }
 
     /// Whether `bytes` is a pattern [`Self::encode`] could produce: UTF-8 text
     /// between the wildcard bytes.
     pub(crate) fn is_encoding(bytes: &[u8]) -> bool {
         bytes.split(is_wildcard).all(|text| std::str::from_utf8(text).is_ok())
+    }
+}
+
+/// A pattern's shape: one literal anchored at both ends, one end or neither,
+/// which needs no backtracking walk, or `Generic`. The planner's byte-compare
+/// fusions and [`LikeMatcher::compile`] both read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LikeShape<'a> {
+    /// No wildcard: `'abc'`, and `''`.
+    Exact(&'a str),
+    /// `'lit%'`, and `'%'` → `Prefix("")`.
+    Prefix(&'a str),
+    /// `'%lit'`.
+    Suffix(&'a str),
+    /// `'%lit%'`.
+    Contains(&'a str),
+    /// Any other pattern, including one whose literal bytes are not UTF-8.
+    Generic,
+}
+
+/// A run of `%` is stripped from the end first, so an all-`%` pattern is
+/// `Prefix("")`. A wildcard is never UTF-8, so the literal left between the
+/// runs is one exactly when it decodes.
+fn shape(p: &[u8]) -> LikeShape<'_> {
+    let many = |b: &&u8| **b == ANY_MANY;
+    let body = &p[..p.len() - p.iter().rev().take_while(many).count()];
+    let lead = body.iter().take_while(many).count();
+    let Ok(lit) = std::str::from_utf8(&body[lead..]) else {
+        return LikeShape::Generic;
+    };
+    match (lead > 0, body.len() < p.len()) {
+        (false, false) => LikeShape::Exact(lit),
+        (false, true) => LikeShape::Prefix(lit),
+        (true, false) => LikeShape::Suffix(lit),
+        (true, true) => LikeShape::Contains(lit),
     }
 }
 
@@ -87,16 +113,13 @@ pub struct LikeMatcher {
     ci: bool,
 }
 
+/// A [`LikeShape`] compiled, its literal ASCII-lowercased under ILIKE.
 // One per LIKE instruction, so the variants' size is immaterial.
 #[allow(clippy::large_enum_variant)]
 enum LikeKind {
-    /// No wildcards: `'abc'`, and `''`.
     Exact(Vec<u8>),
-    /// `'lit%'`, and `'%'` → `Prefix(b"")`.
     Prefix(Vec<u8>),
-    /// `'%lit'`.
     Suffix(Vec<u8>),
-    /// `'%lit%'`.
     Contains(Finder<'static>),
     Generic(Vec<LikeTok>),
 }
@@ -137,26 +160,18 @@ fn tokenize(pattern: &[u8], ci: bool) -> Vec<LikeTok> {
     toks
 }
 
-fn specialize(toks: Vec<LikeTok>) -> LikeKind {
-    use LikeTok::{AnyRest, Lit, SkipTo};
-    match toks.as_slice() {
-        [] => LikeKind::Exact(Vec::new()),
-        [Lit(l)] => LikeKind::Exact(l.needle().to_vec()),
-        [Lit(l), AnyRest] => LikeKind::Prefix(l.needle().to_vec()),
-        [AnyRest] => LikeKind::Prefix(Vec::new()),
-        [SkipTo(l)] => LikeKind::Suffix(l.needle().to_vec()),
-        [SkipTo(l), AnyRest] => LikeKind::Contains(l.clone()),
-        _ => LikeKind::Generic(toks),
-    }
-}
-
 impl LikeMatcher {
     /// Total: any bytes are a pattern.
     pub fn compile(pattern: &[u8], ci: bool) -> Self {
-        LikeMatcher {
-            kind: specialize(tokenize(pattern, ci)),
-            ci,
-        }
+        let lit = |l: &str| if ci { l.to_ascii_lowercase() } else { l.to_owned() }.into_bytes();
+        let kind = match shape(pattern) {
+            LikeShape::Exact(l) => LikeKind::Exact(lit(l)),
+            LikeShape::Prefix(l) => LikeKind::Prefix(lit(l)),
+            LikeShape::Suffix(l) => LikeKind::Suffix(lit(l)),
+            LikeShape::Contains(l) => LikeKind::Contains(Finder::new(&lit(l)).into_owned()),
+            LikeShape::Generic => LikeKind::Generic(tokenize(pattern, ci)),
+        };
+        LikeMatcher { kind, ci }
     }
 
     /// `folded` is scratch for ILIKE's lowercased haystack, reused across rows.
@@ -189,10 +204,8 @@ fn fold<'a>(ci: bool, h: &'a [u8], folded: &'a mut Vec<u8>) -> &'a [u8] {
     if !ci {
         return h;
     }
-    folded.resize(h.len(), 0);
-    for (d, s) in folded.iter_mut().zip(h) {
-        *d = s.to_ascii_lowercase();
-    }
+    folded.clear();
+    folded.extend(h.iter().map(u8::to_ascii_lowercase));
     folded
 }
 

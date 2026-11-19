@@ -10,8 +10,8 @@ use crate::stream::ordered::tests::{Harness, arb_keys, ordered_groups};
 use crate::test_support::stream_input::{
     Cells, GROUPS, Row, agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema,
 };
-use gnitz_expr::cmp_order_keys;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
+use gnitz_zset::algebra::cmp_order_keys;
 
 use crate::stream::ordered::{OrderedKind, OrderedPlan};
 

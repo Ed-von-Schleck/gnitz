@@ -3,12 +3,13 @@
 
 use std::borrow::Cow;
 
-use gnitz_expr::{Lead, OrderLocator, RowFilter, RowRanking, order_locators};
+use gnitz_expr::RowFilter;
 
 use gnitz_wire::{ReadSink, RowsCut, SinkKind};
 
 use super::aggregate::AdhocFold;
 use super::map::MapPlan;
+use super::order::{OrderLocator, RowRanking, order_locators};
 use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 
@@ -44,7 +45,7 @@ struct TopK {
     /// The weight the keeper holds.
     summed: i64,
     /// The largest lead the last trim kept: a later row above it is outside the window.
-    bound: Option<Lead>,
+    bound: Option<u128>,
 }
 
 impl SinkPlan {
@@ -208,7 +209,8 @@ impl TopK {
     /// the window, in no particular order. The boundary row stays whole: only
     /// the client, which sees every worker's rows, may clip it.
     fn trim(&mut self, keeper: &mut Batch) {
-        let mut ranking = RowRanking::new(&self.order, &*keeper);
+        let mb = keeper.as_mem_batch();
+        let mut ranking = RowRanking::new(&self.order, &mb);
         if let Some(bound) = self.bound {
             ranking.drop_above(bound);
         }

@@ -237,10 +237,6 @@ impl<'a> DirectWriter<'a> {
 
 impl gnitz_expr::MapTarget for DirectWriter<'_> {
     #[inline(always)]
-    fn null_bmp_mut(&mut self) -> &mut [u8] {
-        DirectWriter::null_bmp_mut(self)
-    }
-    #[inline(always)]
     fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         self.strings_touched = true;
         let (cells, nulls) = (self.span(REG_PAYLOAD_START + pi), self.span(REG_NULL_BMP));

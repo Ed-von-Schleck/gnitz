@@ -166,9 +166,6 @@ impl BatchView for TestView {
 }
 
 impl MapTarget for TestView {
-    fn null_bmp_mut(&mut self) -> &mut [u8] {
-        &mut self.nulls
-    }
     fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         (&mut self.cols[pi], &mut self.nulls, &mut self.blob)
     }
@@ -364,6 +361,7 @@ pub fn map_prog(
     LogicalProgram::new(instrs, sinks, const_strings)
         .and_then(|p| p.resolve_map(in_schema, out_schema))
         .expect("test map must validate")
+        .0
 }
 
 /// Which of `n` rows each row of a longer batch copies: the rows cycled across
@@ -499,7 +497,8 @@ fn runs(verdicts: &[bool]) -> Vec<(usize, usize)> {
 
 /// Each row a map writes into `out`, three rows into it, on the arm it is on:
 /// the row's null word and every payload slot's cell, a string slot read as
-/// its bytes. A copied slot is the caller's to move, so its cell reads zero.
+/// its bytes. A copied slot is the caller's to move, so its cell and null bit
+/// read zero.
 pub fn map_cells(ev: &mut MapEval, out: &SchemaDescriptor, mb: &TestView) -> Vec<(u64, Vec<Vec<u8>>)> {
     const DST_START: usize = 3;
     let n = mb.row_count();

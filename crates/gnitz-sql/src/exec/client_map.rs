@@ -39,9 +39,8 @@ impl ClientMap {
             "a client map keeps its source's key"
         );
         let plan = program
-            .map(|p| p.resolve_map(src.layout(), out_schema.layout()))
-            .transpose()?
-            .map(|ev| MapPlan::inheriting(ev, *out_schema.layout()));
+            .map(|p| MapPlan::inheriting(p, src.layout(), *out_schema.layout()))
+            .transpose()?;
         // Each copy keeps its source's width: only a set operation's common type widens a
         // column, and an ad-hoc read has none.
         debug_assert!(

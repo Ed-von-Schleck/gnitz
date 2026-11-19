@@ -1,5 +1,5 @@
 use super::*;
-use crate::SchemaColumn;
+use crate::schema::SchemaColumn;
 use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 

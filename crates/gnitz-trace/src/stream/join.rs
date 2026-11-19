@@ -19,9 +19,9 @@ use gnitz_zset::schema::{DerivedSchema, SchemaDescriptor, band, compare_pk_order
 
 use crate::stream::OpenAt;
 use crate::stream::clamp::clamp_cap;
-use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
+use gnitz_expr::{ColCopy, ColumnLocator};
 use gnitz_wire::{ClampKind, Heap, JoinKind, PkBuf, RangeRel, RowSource, null_word_at};
-use gnitz_zset::algebra::MapPlan;
+use gnitz_zset::algebra::{ColMoves, MapPlan};
 
 // ---------------------------------------------------------------------------
 // The plan

@@ -14,8 +14,11 @@
 use super::key_pack::{FOLD_CHUNK_MIN_ROWS, KeyPacker, locate_key_col, pk_run};
 use super::zeroed;
 use crate::repr::{Batch, MemBatch, vec_bytes};
-use crate::schema::{DerivedSchema, PkSortKey, SchemaDescriptor, pk_width_dispatch};
-use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot, radix_sort_by_key};
+use crate::schema::{
+    DerivedSchema, PkSortKey, ReduceOutKey, ReduceOutSlot, SchemaDescriptor, pk_width_dispatch, radix_sort_by_key,
+    reduce_out_key, reduce_out_layout,
+};
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::{NARROW_PK_MAX_BYTES, TypeCode};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -44,7 +47,7 @@ impl GroupKey {
             .iter()
             .map(|&c| locate_key_col(schema, c, "group key").map(|(_, loc)| loc))
             .collect::<Result<_, _>>()?;
-        Ok(match schema.reduce_out_key(group_cols) {
+        Ok(match reduce_out_key(schema, group_cols) {
             // The group's own columns: one PK run, or one payload column.
             ReduceOutKey::Natural => Self::in_place(&locs).expect("a natural group key reads in place"),
             // A `_group_pk` holds the group itself where its packed key fits one.
@@ -246,8 +249,9 @@ impl GroupOutKey {
         let key = GroupKey::new(input, group_cols)?;
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
-        let synthetic = input.reduce_out_key(group_cols) == ReduceOutKey::SyntheticFold;
-        for slot in input.reduce_out_layout(group_cols, row) {
+        let layout = reduce_out_layout(input, group_cols, row);
+        let synthetic = layout.first() == Some(&ReduceOutSlot::SyntheticKey);
+        for slot in layout {
             match slot {
                 ReduceOutSlot::SyntheticKey => b.push_pk(ReduceOutSlot::SYNTHETIC_KEY_COL),
                 ReduceOutSlot::Key(c) => b.push_pk(input.columns()[c as usize]),
