@@ -125,9 +125,15 @@ proptest::proptest! {
             b.begin_row(*pk as u128, *w);
             for ((_, col), cell) in schema.payload_columns().zip(cells) {
                 match cell {
-                    Some(i) => b.put_int(packed_cell(col.type_code, *i)),
-                    None if col.nullable => b.put_null(),
-                    None => b.put_int(packed_cell(col.type_code, 4)),
+                    Some(i) => {
+b.put_int(packed_cell(col.type_code, *i));
+}
+                    None if col.nullable => {
+b.put_null();
+}
+                    None => {
+b.put_int(packed_cell(col.type_code, 4));
+}
                 }
             }
             b.end_row();

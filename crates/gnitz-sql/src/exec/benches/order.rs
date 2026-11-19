@@ -1,18 +1,18 @@
 use super::*;
 use crate::test_support::{col, ncol, schema};
-use gnitz_core::BatchAppender;
+use gnitz_core::{Batch, BatchBuilder};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 /// `rows` rows of `(id U64 pk, v)`, ids ascending, each `v` written by `write` from a
 /// pseudo-random word.
-fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchAppender<'_>, u64)) -> (Schema, ZSetBatch) {
+fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchBuilder<&mut Batch>, u64)) -> (Schema, ZSetBatch) {
     let sch = schema(vec![col("id", TypeCode::U64), ncol("v", tc)], &[0]);
     let mut b = ZSetBatch::new(&sch);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
     for i in 0..rows {
-        app.add_row(i as u128, 1);
+        app.begin_row(i as u128, 1);
         write(&mut app, rng.next_u64());
     }
     (sch, b)
@@ -28,10 +28,10 @@ fn runs(rows: usize, w: usize) -> (Schema, ZSetBatch) {
     }
     let sch = schema(vec![col("id", TypeCode::U64), ncol("v", TypeCode::I64)], &[0]);
     let mut b = ZSetBatch::new(&sch);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for (i, &id) in ids.iter().enumerate() {
-        app.add_row(id as u128, 1);
-        app.int_val(i as i64);
+        app.begin_row(id as u128, 1);
+        app.put_int((i as i64) as u128);
     }
     (sch, b)
 }
@@ -53,22 +53,22 @@ fn order_slice_bench() {
     let top10 = WeightSlots { skip: 0, keep: 10 };
     let ints = |card: u64| {
         keyed(ROWS, TypeCode::I64, move |app, r| {
-            app.int_val(if card == 0 { r as i64 } else { (r % card) as i64 });
+            app.put_int((if card == 0 { r as i64 } else { (r % card) as i64 }) as u128);
         })
     };
     let float = || {
         keyed(ROWS, TypeCode::F64, |app, r| {
-            app.f64_val(r as i64 as f64 / 3.0);
+            app.put_float(r as i64 as f64 / 3.0);
         })
     };
     let string = |prefix: &'static str| {
         keyed(ROWS, TypeCode::String, move |app, r| {
-            app.str_val(&format!("{prefix}{r:016x}"));
+            app.put_string(&format!("{prefix}{r:016x}"));
         })
     };
     let wide = || {
         keyed(ROWS, TypeCode::U128, |app, r| {
-            app.u128_val((r >> 1) as u128);
+            app.put_int((r >> 1) as u128);
         })
     };
     for (name, (sch, b), order, slice) in [

@@ -182,7 +182,7 @@ pub(crate) use for_key_cells;
 const GROUP_PK_BYTES: usize = ReduceOutSlot::SYNTHETIC_KEY_COL.size();
 
 /// One row's group output PK: borrowed out of the batch, or held inline.
-pub(crate) enum OutPk<'a> {
+pub enum OutPk<'a> {
     Borrowed(&'a [u8]),
     /// A narrow key's big-endian image, its OPK bytes from `at`.
     Inline {
@@ -205,7 +205,7 @@ impl OutPk<'_> {
 
     /// The `pk_stride` OPK bytes of the key.
     #[inline]
-    pub(crate) fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         match self {
             OutPk::Borrowed(b) => b,
             OutPk::Inline { be, at } => &be[*at..],
@@ -221,13 +221,13 @@ pub(crate) trait IdentityLoop {
 
 /// V₀, the output PK of the empty group set's one group.
 #[inline]
-pub(crate) fn ground_pk() -> [u8; GROUP_PK_BYTES] {
+pub fn ground_pk() -> [u8; GROUP_PK_BYTES] {
     gnitz_wire::global_group_key().to_be_bytes()
 }
 
 /// How an operator keyed like a reduce (the reduce itself, the ad-hoc fold, the
 /// top-N, the window) groups its input and keys its output. A group is its output PK.
-pub(crate) struct GroupOutKey {
+pub struct GroupOutKey {
     key: GroupKey,
     /// The output PK is a hidden `_group_pk`, which the key is widened to.
     synthetic: bool,
@@ -238,7 +238,7 @@ pub(crate) struct GroupOutKey {
 impl GroupOutKey {
     /// `group_cols` over `input`, and the output's leading columns: the key
     /// region, then each `row` column the key region does not spell.
-    pub(crate) fn new(
+    pub fn new(
         input: &SchemaDescriptor,
         group_cols: &[u32],
         row: impl IntoIterator<Item = u32>,
@@ -268,7 +268,7 @@ impl GroupOutKey {
 
     /// The output PK of `row`'s group.
     #[inline]
-    pub(crate) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
+    pub fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
         let group_pk = |image| OutPk::inline(image, GROUP_PK_BYTES);
         match &self.key {
             &GroupKey::PkRange { at, n } if self.synthetic => {
@@ -288,7 +288,7 @@ impl GroupOutKey {
     /// identity — where one is given and the key's output PK is that identity;
     /// a PK range is borrowed or widened from `row` whatever `id` holds.
     #[inline]
-    pub(crate) fn out_pk_with<'a>(&self, mb: &'a MemBatch, row: usize, id: Option<u128>) -> OutPk<'a> {
+    pub fn out_pk_with<'a>(&self, mb: &'a MemBatch, row: usize, id: Option<u128>) -> OutPk<'a> {
         match (&self.key, id) {
             (GroupKey::Packed(_) | GroupKey::Global, Some(id)) => OutPk::inline(id, GROUP_PK_BYTES),
             (&GroupKey::Image { size, .. }, Some(id)) => OutPk::inline(id, size as usize),
@@ -315,13 +315,13 @@ impl GroupOutKey {
 
     /// The input columns the output carries after its key.
     #[inline(always)]
-    pub(crate) fn carried(&self) -> &[ColumnLocator] {
+    pub fn carried(&self) -> &[ColumnLocator] {
         &self.carried
     }
 
     /// `batch`'s groups as row runs into `out`, where its rows already stand in
     /// ascending output-PK order; false, `out` unspecified, where they need not.
-    pub(crate) fn runs_into(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) -> bool {
+    pub fn runs_into(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) -> bool {
         let mb = &batch.as_mem_batch();
         let n = mb.len();
         match &self.key {
@@ -339,7 +339,7 @@ impl GroupOutKey {
     /// The groups of a batch [`Self::runs_into`] does not answer for, as one
     /// ordinal per row, into `s.groups`, whatever `s` held: its rows hashed into
     /// groups while those are few for the rows, else sorted.
-    pub(crate) fn numbered_into(&self, batch: &Batch, s: &mut GroupScratch) {
+    pub fn numbered_into(&self, batch: &Batch, s: &mut GroupScratch) {
         let mb = &batch.as_mem_batch();
         let n = mb.len();
         // Too few rows do not pay for a hash table. A wide PK's identity is a
@@ -382,9 +382,9 @@ impl GroupOutKey {
 /// The buffers [`GroupOutKey::numbered_into`] numbers a batch's groups with,
 /// kept by a caller that numbers batch after batch.
 #[derive(Default)]
-pub(crate) struct GroupScratch {
+pub struct GroupScratch {
     /// The last numbering.
-    pub(crate) groups: GroupOrdinals,
+    pub groups: GroupOrdinals,
     numbers: GroupNumbers,
     /// Every row's packed key as its identity, for a packed group key.
     identities: Vec<u128>,
@@ -392,7 +392,7 @@ pub(crate) struct GroupScratch {
 
 impl GroupScratch {
     /// The bytes this holds allocated.
-    pub(crate) fn held_bytes(&self) -> usize {
+    pub fn held_bytes(&self) -> usize {
         let GroupOrdinals { ord, first, by_pk, ids } = &self.groups;
         let map = self.numbers.by_identity.capacity() * size_of::<(u128, u32)>();
         vec_bytes(ord) + vec_bytes(first) + vec_bytes(by_pk) + vec_bytes(ids) + vec_bytes(&self.identities) + map
@@ -458,22 +458,27 @@ const HASH_MIN_ROWS: usize = 16;
 /// A batch's groups as one ordinal per row: no row moves, and a fold over the
 /// groups is one pass per column.
 #[derive(Default)]
-pub(crate) struct GroupOrdinals {
+pub struct GroupOrdinals {
     /// Row → group ordinal; empty after [`Self::fill_heads`].
-    pub(crate) ord: Vec<u32>,
+    pub ord: Vec<u32>,
     /// Group ordinal → its first row.
-    pub(crate) first: Vec<u32>,
+    pub first: Vec<u32>,
     /// The group ordinals in ascending output-PK order.
-    pub(crate) by_pk: Vec<u32>,
+    pub by_pk: Vec<u32>,
     /// Group ordinal → its [`GroupOutKey::with_identity`] identity, where the
     /// numbering computed one; else empty.
-    pub(crate) ids: Vec<u128>,
+    pub ids: Vec<u128>,
 }
 
 impl GroupOrdinals {
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.first.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.first.is_empty()
     }
 
     /// The buffers, emptied, taken out of `self`. A fill destructures them into
@@ -490,7 +495,7 @@ impl GroupOrdinals {
 
     /// Run `g` is group `g`, its rows not numbered: `ord` is left empty, for a
     /// fold over the runs themselves.
-    pub(crate) fn fill_heads(&mut self, runs: &[(usize, usize)]) {
+    pub fn fill_heads(&mut self, runs: &[(usize, usize)]) {
         let GroupOrdinals { ord, mut first, mut by_pk, ids } = self.take_cleared();
         first.extend(runs.iter().map(|&(start, _)| start as u32));
         by_pk.extend(0..runs.len() as u32);
@@ -498,7 +503,7 @@ impl GroupOrdinals {
     }
 
     /// Run `g` is group `g`.
-    pub(crate) fn fill_runs(&mut self, runs: &[(usize, usize)]) {
+    pub fn fill_runs(&mut self, runs: &[(usize, usize)]) {
         self.fill_heads(runs);
         let ord = &mut self.ord;
         ord.reserve(runs.last().map_or(0, |&(_, end)| end));

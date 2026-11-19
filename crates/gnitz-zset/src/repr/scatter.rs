@@ -35,7 +35,7 @@ use smallvec::{SmallVec, smallvec};
 /// the source the row is read from, its row there, and the weight it is copied
 /// out at, which overrides that row's own weight. A merge emits one per surviving
 /// (PK, payload) group, at the group's net weight.
-pub(crate) type Pick = (u32, u32, i64);
+pub type Pick = (u32, u32, i64);
 
 thread_local! {
     /// Pick lists of materializes whose caller keeps none, reused across calls.
@@ -43,7 +43,7 @@ thread_local! {
 }
 
 /// Run `f` over the thread's pick scratch, emptied, as [`with_scratch`] runs it.
-pub(crate) fn with_picks<R>(f: impl FnOnce(&mut Vec<Pick>) -> R) -> R {
+pub fn with_picks<R>(f: impl FnOnce(&mut Vec<Pick>) -> R) -> R {
     with_scratch(&PICKS, f)
 }
 
@@ -51,6 +51,8 @@ pub(crate) fn with_picks<R>(f: impl FnOnce(&mut Vec<Pick>) -> R) -> R {
 /// is also passed on. The literal width keeps the per-row copy a load/store
 /// instead of a `memcpy` call. `N = 0` is the runtime arm, which a compound PK
 /// stride (U64+U32 = 12) reaches; a target reads its width through [`stride`].
+#[macro_export]
+#[doc(hidden)]
 macro_rules! stride_dispatch {
     ($w:expr, $f:ident, $($arg:expr),* $(,)?) => {{
         let w = $w;
@@ -64,24 +66,19 @@ macro_rules! stride_dispatch {
         }
     }};
 }
-pub(crate) use stride_dispatch;
+pub use crate::stride_dispatch;
 
 /// The width a const-width copier runs at: `N`, or `width` in the runtime arm
 /// `N = 0`.
 #[inline(always)]
-pub(crate) const fn stride<const N: usize>(width: usize) -> usize {
+pub const fn stride<const N: usize>(width: usize) -> usize {
     if N == 0 { width } else { N }
 }
 
 /// Each `[start, end)` run of `width`-byte cells of `src`, copied onto `dst`
 /// back to back.
 #[inline(always)]
-pub(crate) fn copy_runs<const N: usize>(
-    src: &[u8],
-    dst: &mut [u8],
-    runs: impl Iterator<Item = (usize, usize)>,
-    width: usize,
-) {
+pub fn copy_runs<const N: usize>(src: &[u8], dst: &mut [u8], runs: impl Iterator<Item = (usize, usize)>, width: usize) {
     let w = stride::<N>(width);
     let mut at = 0usize;
     for (start, end) in runs {
@@ -254,7 +251,7 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
 /// A `RowSource` that also carries the Z-set weight: a storage row the N-way
 /// merge folds. Its regions are read as [`ColPtr`]s, in place or decoded for a
 /// window of rows.
-pub(crate) trait ColumnarSource: RowSource {
+pub trait ColumnarSource: RowSource {
     /// The row's signed Z-set weight / multiplicity (region 1).
     fn get_weight(&self, row: usize) -> i64;
 
@@ -467,17 +464,12 @@ fn copy_col_picks<const N: usize>(tbl: &[ColPtr], picks: &[Pick], dst: &mut [u8]
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
 /// The payload columns `skip` names are not read: each cell is written as a
 /// zero that is not NULL.
-pub(crate) fn gather_rows(
-    sources: &[impl ColumnarSource],
-    schema: &SchemaDescriptor,
-    picks: &[Pick],
-    skip: u64,
-) -> Batch {
+pub fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick], skip: u64) -> Batch {
     Batch::write_new(schema, picks.len(), 0, |w| gather_into(sources, schema, picks, skip, w))
 }
 
 /// [`gather_rows`] into the rows `w` writes, one per pick.
-pub(crate) fn gather_into(
+pub fn gather_into(
     sources: &[impl ColumnarSource],
     schema: &SchemaDescriptor,
     picks: &[Pick],
@@ -578,12 +570,12 @@ fn gather_cells<const N: usize>(sources: &[impl ColumnarSource], picks: &[Pick],
 /// The columns a source decoded to be viewed at a window of its rows, freed
 /// with the [`UnifiedSet`] or the window that views them.
 #[derive(Default)]
-pub(crate) struct DecodedColumns(Vec<PooledBuf>);
+pub struct DecodedColumns(Vec<PooledBuf>);
 
 impl DecodedColumns {
     /// A column of `width`-byte cells readable at `window`, which `decode`
     /// writes whole given the window's bytes.
-    pub(crate) fn column(&mut self, window: &Range<usize>, width: usize, decode: impl FnOnce(&mut [u8])) -> ColPtr {
+    pub fn column(&mut self, window: &Range<usize>, width: usize, decode: impl FnOnce(&mut [u8])) -> ColPtr {
         // SAFETY: `decode` writes every cell of `column`.
         let mut column = unsafe { PooledBuf::uninit(window.len() * width) };
         decode(&mut column);
@@ -620,7 +612,7 @@ fn reserve<A: smallvec::Array>(v: &mut SmallVec<A>, n: usize) {
 
 /// [`scatter_unified_sources`]'s source side: every source's regions under the
 /// set's schema, the heaps they read, and the columns they decoded.
-pub(crate) struct UnifiedSet<'a> {
+pub struct UnifiedSet<'a> {
     /// One [`ColPtr`] per source for each slot of the set's schema, slot `k`'s
     /// at `table[k * n..(k + 1) * n]` for `n` sources: slot 0 the PK, slot 1 the
     /// null words, slot `2 + pi` payload column `pi`.
@@ -645,7 +637,7 @@ impl<'a> UnifiedSet<'a> {
     /// at rows in the `si`-th window, the payload columns `skip` names left
     /// undecoded and written as zeroes. The set is built in this frame and lent
     /// to `f`, so its inline tables are never copied out by a return.
-    pub(crate) fn with<S: ColumnarSource, R>(
+    pub fn with<S: ColumnarSource, R>(
         sources: &'a [S],
         schema: &SchemaDescriptor,
         windows: impl IntoIterator<Item = Range<usize>>,
@@ -712,7 +704,7 @@ impl<'a> UnifiedSet<'a> {
     }
 
     /// [`with`](Self::with) with every source readable at every row.
-    pub(crate) fn with_whole<S: ColumnarSource, R>(
+    pub fn with_whole<S: ColumnarSource, R>(
         sources: &'a [S],
         schema: &SchemaDescriptor,
         f: impl FnOnce(&mut Self) -> R,
@@ -727,7 +719,7 @@ impl<'a> UnifiedSet<'a> {
     /// sources, and none where the set writes no string column: under a
     /// schema without one, such as a skeleton merge's PK-only one over sources
     /// that hold strings, or where every one is skipped.
-    pub(crate) fn materialize(&self, rows: &[Pick], codebook: Option<&Codebook>) -> Batch {
+    pub fn materialize(&self, rows: &[Pick], codebook: Option<&Codebook>) -> Batch {
         let blob_cap = match self.schema.string_payload_slots() & !self.skip {
             0 => 0,
             _ => prorated_blob_cap(self.src_blob, self.src_rows, rows.len()),
@@ -760,7 +752,7 @@ impl<'a> UnifiedSet<'a> {
 
 /// [`UnifiedSet::materialize`] over whole `sources`, each heap carried whole
 /// when [`carried_dead`] prefers it for the rows `rows` keeps of that source.
-pub(crate) fn materialize_carrying(sources: &[MemBatch<'_>], schema: &SchemaDescriptor, rows: &[Pick]) -> Batch {
+pub fn materialize_carrying(sources: &[MemBatch<'_>], schema: &SchemaDescriptor, rows: &[Pick]) -> Batch {
     UnifiedSet::with_whole(sources, schema, |set| carry_and_write(set, sources, schema, rows))
 }
 

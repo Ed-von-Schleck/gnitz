@@ -15,12 +15,13 @@ use super::{
     MIN_GUARD_BYTES, SWEEP_STEPS, ShardEntry, ShardIndex, TERMINAL, UPKEEP_LEVY, extent, fold_destinations,
 };
 use crate::storage::pk_ranges_overlap;
+use gnitz_trace::runs::ShardWriteOpts;
+use gnitz_trace::runs::StorageError;
+use gnitz_trace::runs::{GuardMerge, MappedShard, write_shard};
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::ShardWriteOpts;
-use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{Codebook, GuardMerge, MappedShard};
+use gnitz_zset::repr::Codebook;
 
 /// One fold the tree owes: the shards it merges and where the merge goes.
 struct Fold {
@@ -109,7 +110,7 @@ impl ShardIndex {
     /// picks for it, if any.
     fn write_shard(&mut self, run: &Batch) -> Result<ShardEntry, StorageError> {
         let codebook = self.codebook_for(run);
-        self.write_with(None, codebook.as_deref(), |path, opts| run.write_as_shard(path, opts))
+        self.write_with(None, codebook.as_deref(), |path, opts| write_shard(run, path, opts))
     }
 
     /// Write a shard named by a fresh seq through `write`, handed its path and

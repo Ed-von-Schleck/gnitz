@@ -11,13 +11,13 @@ use smallvec::SmallVec;
 mod key;
 mod payload_order;
 
-/// The schema descriptor, homed in `gnitz-expr` so the client links the same
-/// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
+/// The schema descriptor, homed in `gnitz-expr` because its evaluator reads
+/// through it. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{SchemaColumn, SchemaDescriptor};
 pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range_band};
 
-pub(crate) use key::{band, compare_pk_ordering, group_floor};
-pub(crate) use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
+pub use key::{band, compare_pk_ordering, group_floor};
+pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
 /// carried on the wire but nothing engine-side reads one.
@@ -44,18 +44,19 @@ pub fn encode_schema_record(schema: &SchemaDescriptor) -> Vec<u8> {
 
 /// Builder for a derived schema: its PK columns, then its payload columns.
 /// Inline up to `MAX_COLUMNS`; a longer list spills and `finish` refuses it.
-pub(crate) struct DerivedSchema {
+#[derive(Default)]
+pub struct DerivedSchema {
     cols: SmallVec<[SchemaColumn; MAX_COLUMNS]>,
     pk_len: usize,
 }
 
 impl DerivedSchema {
-    pub(crate) fn new() -> Self {
-        DerivedSchema { cols: SmallVec::new(), pk_len: 0 }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Append one payload column.
-    pub(crate) fn push(&mut self, col: SchemaColumn) {
+    pub fn push(&mut self, col: SchemaColumn) {
         self.cols.push(col);
     }
 
@@ -72,22 +73,22 @@ impl DerivedSchema {
     }
 
     /// Append `schema`'s PK columns in PK-list order.
-    pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) {
+    pub fn push_pk_of(&mut self, schema: &SchemaDescriptor) {
         schema.pk_columns().for_each(|c| self.push_pk(*c));
     }
 
     /// Append `schema`'s payload columns in schema order.
-    pub(crate) fn push_payload_of(&mut self, schema: &SchemaDescriptor) {
+    pub fn push_payload_of(&mut self, schema: &SchemaDescriptor) {
         schema.payload_columns().for_each(|(_, c)| self.push(*c));
     }
 
     /// The payload columns pushed so far, in order.
-    pub(crate) fn payload(&self) -> &[SchemaColumn] {
+    pub fn payload(&self) -> &[SchemaColumn] {
         &self.cols[self.pk_len..]
     }
 
     /// The schema pushed so far, as [`SchemaDescriptor::try_new`] admits it.
-    pub(crate) fn finish(&self) -> Result<SchemaDescriptor, SchemaRefusal> {
+    pub fn finish(&self) -> Result<SchemaDescriptor, SchemaRefusal> {
         SchemaDescriptor::try_new(&self.cols, leading_pk(self.pk_len))
     }
 }

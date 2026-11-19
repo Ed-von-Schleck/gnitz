@@ -6,6 +6,7 @@ use std::sync::Arc;
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{OrderLocator, RowRanking, order_locators};
 use gnitz_wire::{OrderKey, WeightSlots};
+use gnitz_zset::repr::{Pick, materialize_carrying};
 
 use crate::error::GnitzSqlError;
 
@@ -64,17 +65,18 @@ impl ResultCut {
         if self.is_identity() {
             return batch;
         }
+        let view = batch.view();
         debug_assert!(
-            batch.weights().all(|w| w > 0),
+            view.weights().all(|w| w > 0),
             "client cut: non-positive weight violates the bag invariant"
         );
         let as_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         let end = self.slice.end().map_or(usize::MAX, as_usize);
-        let mut rows: Vec<u32> = if self.keys.is_empty() {
+        let rows: Vec<u32> = if self.keys.is_empty() {
             // Every entry holds at least one logical row, so the first `end` entries cover the slice.
-            (0..batch.len().min(end) as u32).collect()
+            (0..view.len().min(end) as u32).collect()
         } else {
-            let mut ranking = RowRanking::new(&self.keys, &batch);
+            let mut ranking = RowRanking::new(&self.keys, &view);
             ranking.keep_smallest(end);
             ranking.sorted()
         };
@@ -82,28 +84,19 @@ impl ResultCut {
             return batch.gather(&rows);
         }
         let mut slots = self.slice;
-        // Kept rows compact to the front of `rows`: the write slot never passes the read.
-        // Every kept row takes at least one of the `keep` slots.
-        let mut takes = Vec::with_capacity(rows.len().min(as_usize(slots.keep)));
-        let mut n = 0;
-        for i in 0..rows.len() {
-            let r = rows[i];
-            let take = slots.take(batch.weight(r as usize));
+        // Each kept row at the logical rows it takes; every kept row takes at least one of
+        // the `keep` slots.
+        let mut picks: Vec<Pick> = Vec::with_capacity(rows.len().min(as_usize(slots.keep)));
+        for &r in &rows {
+            let take = slots.take(view.get_weight(r as usize));
             if take > 0 {
-                rows[n] = r;
-                n += 1;
-                takes.push(take);
+                picks.push((0, r, take));
             }
             if slots.keep == 0 {
                 break;
             }
         }
-        rows.truncate(n);
-        let mut out = batch.gather(&rows);
-        for (r, w) in takes.into_iter().enumerate() {
-            out.set_weight(r, w);
-        }
-        out
+        materialize_carrying(&[view], view.schema(), &picks).into()
     }
 }
 

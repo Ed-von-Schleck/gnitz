@@ -1,6 +1,5 @@
 use super::tests::{plan, t, wide};
 use super::*;
-use gnitz_core::BatchAppender;
 
 /// Instructions per partial row of `combine` over four workers' replies, each holding a
 /// group at most once.
@@ -33,14 +32,14 @@ fn agg_combine_bench() {
         let f = plan(sql, rel);
         let schema = f.partial_schema().as_ref();
         let mut b = ZSetBatch::new(schema);
-        let mut app = BatchAppender::new(&mut b);
+        let mut app = b.builder();
         for i in 0..N {
-            app.add_row_natives(&[key(i) as u128, 0, 0][..schema.pk_cols().len()], 1);
+            app.begin_row_natives(&[key(i) as u128, 0, 0][..schema.pk_cols().len()], 1);
             // By row, so a group's partials differ and an extreme is replaced.
             for (_, _, c) in schema.payload_columns() {
                 match c.ty.tc.is_float() {
-                    true => app.f64_val((i % 1000) as f64),
-                    false => app.int_val((i % 1000) as i128),
+                    true => app.put_float((i % 1000) as f64),
+                    false => app.put_int(((i % 1000) as i128) as u128),
                 };
             }
         }

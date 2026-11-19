@@ -1,14 +1,14 @@
 //! GnitzDB's Z-set store: the LSM that keeps a relation on disk, the relation
 //! registry and the `ReadSpec` executor.
 //!
-//! The Z-sets it stores — the schema, the columnar batch, the shard image, the
-//! cursor and every operator over them — are `gnitz-zset`, the kernel crate
-//! beneath this one. This crate owns their lifecycle: which runs a store holds,
+//! The Z-sets it stores — the schema, the columnar batch and every operator of
+//! one Z-set — are `gnitz-zset`, the kernel crate; the shard image and the cursor
+//! over runs are `gnitz-trace`, the crate between it and this one. This crate owns their lifecycle: which runs a store holds,
 //! when they flush, compact and publish a manifest, which relations a process
 //! registered, and how one is read.
 //!
-//! This and the kernel are what a **client** links. A host holding a mirrored
-//! view drives `relation` and `read` directly and links neither the circuit
+//! This, the traces and the kernel are what a **client** holding a mirror links:
+//! it drives `relation` and `read` directly and links neither the circuit
 //! compiler, the DBSP VM, epoch execution nor the system-table catalog — all of
 //! which live in `gnitz-server`, the binary that depends on this crate. The seam
 //! is the crate graph, not a comment: nothing here can name anything there, and

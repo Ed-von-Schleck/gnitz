@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::Cell::{self, Int, Null, Str};
 use crate::test_support::{col, ncol, schema};
-use gnitz_core::BatchAppender;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 
 /// A wire key over column `col`.
@@ -27,9 +26,9 @@ fn kv_schema() -> Schema {
 /// A `kv_schema` batch of `(id, v, s, weight)` rows.
 fn kv(rows: &[(u128, Cell, Cell, i64)]) -> ZSetBatch {
     let mut b = ZSetBatch::new(&kv_schema());
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for &(id, v, s, w) in rows {
-        app.add_row(id, w);
+        app.begin_row(id, w);
         v.push(&mut app);
         s.push(&mut app);
     }
@@ -85,7 +84,7 @@ fn orders_by_the_written_keys() {
 /// whichever of several same-identity entries carries it.
 fn bag(out: &ZSetBatch) -> Vec<(u64, i64)> {
     let mut bag: Vec<(u64, i64)> = Vec::new();
-    for (id, w) in ids(out).into_iter().zip(out.weights()) {
+    for (id, w) in ids(out).into_iter().zip(out.view().weights()) {
         match bag.last_mut() {
             Some((last, n)) if *last == id => *n += w,
             _ => bag.push((id, w)),

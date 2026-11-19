@@ -10,11 +10,12 @@ use crate::relation::{
 };
 use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table};
 use gnitz_expr::LogicalProgram;
+use gnitz_trace::runs::{MappedShard, Run};
 use gnitz_wire::{
     ComputeMap, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
 };
 use gnitz_zset::algebra::{Placement, Slot};
-use gnitz_zset::repr::{Batch, BatchBuilder, MappedShard, Run};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Every shard `t` holds, the pending ones included, in read order.
@@ -265,8 +266,12 @@ pub(crate) fn wide_on_disk(kind: RelationKind, rows: u64, shards: usize) -> Rela
             }
             for k in 0..2 {
                 match id % 2 == 0 {
-                    true => bb.put_string(&format!("an out-of-line string value {k} of row {id}")),
-                    false => bb.put_string("short"),
+                    true => {
+                        bb.put_string(&format!("an out-of-line string value {k} of row {id}"));
+                    }
+                    false => {
+                        bb.put_string("short");
+                    }
                 }
             }
         });

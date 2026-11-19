@@ -1,5 +1,4 @@
 use super::*;
-use gnitz_core::BatchAppender;
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::FixedLenByteArray;
 
@@ -24,28 +23,28 @@ fn every_type() -> Arc<Schema> {
 /// Six rows of `schema`, each column's values its type's extremes and odd ones.
 fn rows(schema: &Schema) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for row in 0..6usize {
         let pick = |lo: i128, hi: i128| [lo, hi, (-1).clamp(lo, hi)][row % 3];
         let k2 = [row as u128, u128::from(u32::MAX) - row as u128, (1 << 31) + row as u128][row % 3];
-        let r = app.add_row_natives(&[pick(-32768, 32767) as u128, k2], 1);
+        let r = app.begin_row_natives(&[pick(-32768, 32767) as u128, k2], 1);
         for (_, _, def) in schema.payload_columns() {
             if def.is_nullable && row % 2 == 1 {
-                r.null();
+                r.put_null();
                 continue;
             }
             match def.ty.tc {
-                TypeCode::Bool => r.int_val(((row / 2) % 2) as i128),
-                TypeCode::F32 => r.f32_val([f32::NAN, -0.0, f32::MAX][row % 3]),
-                TypeCode::F64 => r.f64_val([f64::from_bits(0x7ff8_dead_beef_0001), -0.0, f64::MIN_POSITIVE][row % 3]),
-                TypeCode::U128 => r.u128_val([0, u128::MAX, 1][row % 3]),
-                TypeCode::I128 => r.u128_val([i128::MIN, i128::MAX, -1][row % 3] as u128),
-                TypeCode::UUID => r.u128_val(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef ^ row as u128),
-                TypeCode::String => r.str_val(["", "héllo", "a string longer than a German inline"][row % 3]),
-                TypeCode::Blob => r.bytes_val(&[0, 255, row as u8]),
+                TypeCode::Bool => r.put_int((((row / 2) % 2) as i128) as u128),
+                TypeCode::F32 => r.put_float(f64::from([f32::NAN, -0.0, f32::MAX][row % 3])),
+                TypeCode::F64 => r.put_float([f64::from_bits(0x7ff8_dead_beef_0001), -0.0, f64::MIN_POSITIVE][row % 3]),
+                TypeCode::U128 => r.put_int([0, u128::MAX, 1][row % 3]),
+                TypeCode::I128 => r.put_int([i128::MIN, i128::MAX, -1][row % 3] as u128),
+                TypeCode::UUID => r.put_int(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef ^ row as u128),
+                TypeCode::String => r.put_string(["", "héllo", "a string longer than a German inline"][row % 3]),
+                TypeCode::Blob => r.put_blob(&[0, 255, row as u8]),
                 tc => {
                     let (lo, hi) = FixedInt::from_type_code(tc).expect("an integer type").range();
-                    r.int_val(pick(lo, hi))
+                    r.put_int((pick(lo, hi)) as u128)
                 }
             };
         }
@@ -81,7 +80,7 @@ fn a_row_not_at_weight_one_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = TableWriter::create(&dir.path().join("t.parquet"), &schema).unwrap();
     let mut batch = rows(&schema);
-    batch.set_weight(2, 2);
+    batch.rewrite(|d| d.weight_mut()[16..24].copy_from_slice(&2i64.to_le_bytes()));
     let err = w.write(&batch).unwrap_err();
     assert!(err.0.contains("weight 2"), "{err}");
 }

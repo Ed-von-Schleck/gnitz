@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_core::BatchAppender;
+use gnitz_core::{Batch, BatchBuilder};
 use gnitz_foundation::rng::mix;
 
 /// Rows a bench table holds.
@@ -18,14 +18,14 @@ fn table(ty: ColType, nullable: bool) -> Arc<Schema> {
 }
 
 /// `ROWS` rows of `schema` in row groups of `GROUP`, `v` from `cell`.
-fn groups(schema: &Arc<Schema>, cell: impl Fn(&mut BatchAppender<'_>, usize)) -> Vec<ZSetBatch> {
+fn groups(schema: &Arc<Schema>, cell: impl Fn(&mut BatchBuilder<&mut Batch>, usize)) -> Vec<ZSetBatch> {
     (0..ROWS)
         .step_by(GROUP)
         .map(|start| {
             let mut batch = ZSetBatch::with_capacity(schema, GROUP);
-            let mut app = BatchAppender::new(&mut batch);
+            let mut app = batch.builder();
             for i in start..start + GROUP {
-                let r = app.add_row_natives(&[i as u128], 1);
+                let r = app.begin_row_natives(&[i as u128], 1);
                 cell(r, i);
             }
             batch
@@ -40,37 +40,37 @@ fn groups(schema: &Arc<Schema>, cell: impl Fn(&mut BatchAppender<'_>, usize)) ->
 fn columns_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     let dir = tempfile::tempdir().unwrap();
-    type Fill = fn(&mut BatchAppender<'_>, usize);
+    type Fill = fn(&mut BatchBuilder<&mut Batch>, usize);
     let cases: [(&str, ColType, bool, Fill); 9] = [
         ("BOOLEAN", ColType::of(TypeCode::Bool), false, |r, i| {
-            r.int_val(i128::from(mix(i as u64) & 1));
+            r.put_int((i128::from(mix(i as u64) & 1)) as u128);
         }),
         ("SMALLINT", ColType::of(TypeCode::I16), false, |r, i| {
-            r.int_val(i128::from(mix(i as u64) as i16));
+            r.put_int((i128::from(mix(i as u64) as i16)) as u128);
         }),
         ("INT", ColType::of(TypeCode::I32), false, |r, i| {
-            r.int_val(i128::from(mix(i as u64) as i32));
+            r.put_int((i128::from(mix(i as u64) as i32)) as u128);
         }),
         ("BIGINT", ColType::of(TypeCode::I64), false, |r, i| {
-            r.int_val(i128::from(mix(i as u64) as i64));
+            r.put_int((i128::from(mix(i as u64) as i64)) as u128);
         }),
         ("DOUBLE", ColType::of(TypeCode::F64), false, |r, i| {
-            r.f64_val(mix(i as u64) as f64 / 3.0);
+            r.put_float(mix(i as u64) as f64 / 3.0);
         }),
         ("TEXT", ColType::of(TypeCode::String), false, |r, i| {
-            r.str_val(&format!("row-{:016x}", mix(i as u64)));
+            r.put_string(&format!("row-{:016x}", mix(i as u64)));
         }),
         ("BIGINT NULL", ColType::of(TypeCode::I64), true, |r, i| {
             match i % 10 {
-                0 => r.null(),
-                _ => r.int_val(i128::from(mix(i as u64) as i64)),
+                0 => r.put_null(),
+                _ => r.put_int((i128::from(mix(i as u64) as i64)) as u128),
             };
         }),
         ("DECIMAL", ColType::decimal(2), false, |r, i| {
-            r.int_val(i128::from((mix(i as u64) >> 8) as i64));
+            r.put_int((i128::from((mix(i as u64) >> 8) as i64)) as u128);
         }),
         ("UUID", ColType::of(TypeCode::UUID), false, |r, i| {
-            r.u128_val(u128::from(mix(i as u64)) << 64 | u128::from(mix(i as u64 + 1)));
+            r.put_int(u128::from(mix(i as u64)) << 64 | u128::from(mix(i as u64 + 1)));
         }),
     ];
     for (name, ty, nullable, fill) in cases {

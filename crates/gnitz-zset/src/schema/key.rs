@@ -17,7 +17,7 @@ use crate::schema::SchemaDescriptor;
 /// tie is already a byte-equal PK; only `len > 16` can tie on the prefix while
 /// differing later, and the slice compare runs only there.
 #[inline(always)]
-pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
+pub fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
     match pack_pk_be(a).cmp(&pack_pk_be(b)) {
         Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => a.cmp(b),
@@ -73,7 +73,7 @@ pub fn group_band(first: &[u8], last: &[u8], stride: usize) -> Option<(PkBuf, Op
 
 /// The least `stride`-wide key beginning with `group`: the group zero-padded.
 #[inline(always)]
-pub(crate) fn group_floor(group: &[u8], stride: usize) -> PkBuf {
+pub fn group_floor(group: &[u8], stride: usize) -> PkBuf {
     PkBuf::from_bytes(group).widened(stride)
 }
 
@@ -89,7 +89,7 @@ pub fn key_above(group: &[u8], stride: usize) -> Option<PkBuf> {
 
 /// The half-open key range `[start, end)`, `end == None` running to the top of
 /// the key space; `None` when `start >= end`.
-pub(crate) fn band(start: PkBuf, end: Option<PkBuf>) -> Option<(PkBuf, Option<PkBuf>)> {
+pub fn band(start: PkBuf, end: Option<PkBuf>) -> Option<(PkBuf, Option<PkBuf>)> {
     end.as_ref().is_none_or(|e| start < *e).then_some((start, end))
 }
 

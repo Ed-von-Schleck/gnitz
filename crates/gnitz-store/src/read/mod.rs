@@ -50,6 +50,17 @@ impl Deref for ReadRows {
     }
 }
 
+impl ReadRows {
+    /// The rows as a batch of their own: a shared one is copied unless this was its last
+    /// holder.
+    pub fn into_batch(self) -> Batch {
+        match self {
+            ReadRows::Shared(rows) => Rc::unwrap_or_clone(rows),
+            ReadRows::Own(rows) => rows,
+        }
+    }
+}
+
 /// Refuses a reply in `produced` unless its layout digest is the client's
 /// `reply_layout`: a reply in any other layout would ship its regions under the
 /// client's strides.

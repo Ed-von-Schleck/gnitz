@@ -2,9 +2,10 @@
 //! after a key, in key order — what a paged read of a snapshot asks each worker
 //! for.
 
+use gnitz_trace::runs::{from_runs, from_runs_in_band};
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_zset::algebra::Slot;
-use gnitz_zset::repr::{Batch, from_runs, from_runs_in_band};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::key_above;
 
 use super::{check_layout, check_stride};

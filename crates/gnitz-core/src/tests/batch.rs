@@ -1,8 +1,7 @@
 use super::*;
-use crate::BatchAppender;
 use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
 use gnitz_expr::{BatchView, CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarCell, ScalarEval, Sink};
-use gnitz_wire::{ColumnDef, payload_str, payload_u64};
+use gnitz_wire::{ColumnDef, PkKeys, TypeCode, payload_str, payload_u64};
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
@@ -16,7 +15,7 @@ fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> {
 /// in its schema column's type, against `heap`.
 fn batch_of(
     schema: &Schema,
-    pks: &PkColumn,
+    keys: &PkKeys,
     weights: &[i64],
     nulls: &[u64],
     payload: &[Vec<u8>],
@@ -27,11 +26,16 @@ fn batch_of(
         schema.layout().num_payload_cols(),
         "one region per payload slot"
     );
-    let (w, n) = (gnitz_wire::as_le_bytes(weights), gnitz_wire::as_le_bytes(nulls));
-    let mut regions: Vec<&[u8]> = vec![pks.region(), w, n];
-    regions.extend(payload.iter().map(Vec::as_slice));
-    regions.push(heap);
-    ZSetBatch::from_own_regions(schema, &regions).unwrap()
+    Batch::write_new_carrying(schema.layout(), weights.len(), 0, &[(heap, 0, 0)], |w| {
+        let (pk, weight, null_bmp) = w.fixed_mut();
+        pk.copy_from_slice(keys.as_bytes());
+        weight.copy_from_slice(gnitz_wire::as_le_bytes(weights));
+        null_bmp.copy_from_slice(gnitz_wire::as_le_bytes(nulls));
+        for (pi, cells) in payload.iter().enumerate() {
+            w.col_mut(pi).copy_from_slice(cells);
+        }
+    })
+    .into()
 }
 
 /// Each way a batch can disagree with its schema is refused and named; a NULL over a
@@ -51,22 +55,23 @@ fn validate_refuses_each_malformed_batch() {
     .unwrap();
     let mut base = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut base);
-        a.add_row(1, 1).int_val(10).str_val("x");
-        a.add_row(2, -1).int_val(20).null();
+        let mut a = base.builder();
+        a.begin_row(1, 1).put_int(10).put_string("x");
+        a.begin_row(2, -1).put_int(20).put_null();
     }
     base.validate(&schema)
         .expect("a NULL over a zeroed nullable cell validates");
 
     // (null bits set on row 0, the refusal)
     let cases: [(u64, &str); 3] = [
-        (1, "NOT NULL column 'v'"),
-        (2, "holds a value under NULL"),
+        (1, "a null bit on a NOT NULL column ('v')"),
+        (2, "a non-zero cell under a NULL ('s')"),
         (1 << 2, "past the last payload column"),
     ];
     for (bits, want) in cases {
         let mut b = base.clone();
-        b.set_null_word(0, b.null_word(0) | bits);
+        let word = b.view().get_null_word(0) | bits;
+        set_null_word(&mut b, 0, word);
         let err = b.validate(&schema).unwrap_err();
         assert!(err.contains(want), "{err:?} does not mention {want:?}");
         b.layout_matches(&schema).expect("a null bit is no layout error");
@@ -142,57 +147,15 @@ fn a_compound_key_has_no_scalar_form() {
     let mut b = ZSetBatch::new(&schema);
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            BatchAppender::new(&mut b).add_row(1, 1);
+            b.builder().begin_row(1, 1);
         }))
         .is_err()
     );
     assert!(b.is_empty(), "a refused key leaves no partial row");
     assert!(panics(&|| _ = fixture_a_batch().pk(0)));
-    assert!(panics(&|| _ = PkColumn::from_natives(&schema, [1])));
     for arity in [&[1][..], &[1, 2, 3]] {
-        assert!(
-            panics(&|| PkColumn::empty_for_schema(&schema).push_natives(arity)),
-            "{arity:?}"
-        );
+        assert!(panics(&|| _ = schema.pk_keys([arity])), "{arity:?}");
     }
-}
-
-/// A key column built from whole native columns is the one `push_natives` builds
-/// a row at a time, for a compound key of mixed sign and for a lone wide key; a
-/// column shorter than the others is refused.
-#[test]
-fn from_native_columns_is_push_natives_over_every_row() {
-    let compound = Schema::from_parts(
-        vec![
-            ColumnDef::new("a", TypeCode::I16, false),
-            ColumnDef::new("b", TypeCode::U32, false),
-        ],
-        &[0, 1],
-    )
-    .unwrap();
-    let a: [i16; 5] = [i16::MIN, -1, 0, 1, i16::MAX];
-    let b: [u32; 5] = [0, 1, 0x8000_0000, 7, u32::MAX];
-    let mut want = PkColumn::empty_for_schema(&compound);
-    for (&x, &y) in a.iter().zip(&b) {
-        want.push_natives(&[u128::from(x as u16), u128::from(y)]);
-    }
-    let cols = vec![
-        a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
-        b.iter().flat_map(|y| y.to_le_bytes()).collect(),
-    ];
-    assert_eq!(PkColumn::from_native_columns(&compound, &cols), want);
-
-    let wide = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U128, false)], &[0]).unwrap();
-    let vals = [0, 1, u128::MAX, 1 << 127, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210];
-    let cells: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-    assert_eq!(
-        PkColumn::from_native_columns(&wide, &[cells]),
-        PkColumn::from_natives(&wide, vals)
-    );
-
-    let short = vec![cols[0].clone(), cols[1][..16].to_vec()];
-    let refused = std::panic::catch_unwind(|| PkColumn::from_native_columns(&compound, &short));
-    assert!(refused.is_err(), "a short key column must panic");
 }
 
 /// `extend_from_owned` concatenates rows across String and Bytes columns, and
@@ -213,9 +176,9 @@ fn extend_from_owned_concatenates() {
     let build = |base: u128| {
         let mut z = ZSetBatch::new(&schema);
         {
-            let mut a = BatchAppender::new(&mut z);
-            a.add_row(base, 1).str_val(&long(base)).bytes_val(&[1, 2, 3, 4, 5]);
-            a.add_row(base + 1, -1).str_val("short").bytes_val(&[9, 9]);
+            let mut a = z.builder();
+            a.begin_row(base, 1).put_string(&long(base)).put_blob(&[1, 2, 3, 4, 5]);
+            a.begin_row(base + 1, -1).put_string("short").put_blob(&[9, 9]);
         }
         z
     };
@@ -225,9 +188,9 @@ fn extend_from_owned_concatenates() {
 
     let pks: Vec<u128> = (0..acc.len()).map(|r| acc.pk(r)).collect();
     assert_eq!(pks, [1, 2, 10, 11]);
-    assert_eq!(acc.weights().collect::<Vec<_>>(), [1, -1, 1, -1]);
+    assert_eq!(acc.view().weights().collect::<Vec<_>>(), [1, -1, 1, -1]);
     let strs: Vec<String> = (0..acc.len())
-        .map(|r| payload_str(&acc, r, 0).unwrap().into_owned())
+        .map(|r| payload_str(&acc.view(), r, 0).unwrap().into_owned())
         .collect();
     assert_eq!(strs, [long(1).as_str(), "short", long(10).as_str(), "short"]);
     acc.validate(&schema).unwrap();
@@ -254,22 +217,24 @@ fn the_appender_writes_each_value_into_its_slot() {
     let spilled = "a string long enough to spill";
     let wide = (0xBEEF_u128 << 64) | 0xDEAD;
     let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch)
-        .add_row(7, 1)
-        .int_val(100)
-        .str_val(spilled)
-        .int_val(-5)
-        .f64_val(1.5)
-        .u128_val(wide)
-        .bytes_val(b"xy");
-    BatchAppender::new(&mut batch)
-        .add_row(8, -1)
-        .int_val(200)
-        .str_val("short")
-        .int_val(6)
-        .f64_val(-2.5)
-        .u128_val(1)
-        .null();
+    batch
+        .builder()
+        .begin_row(7, 1)
+        .put_int(100)
+        .put_string(spilled)
+        .put_int((-5i128) as u128)
+        .put_float(1.5)
+        .put_int(wide)
+        .put_blob(b"xy");
+    batch
+        .builder()
+        .begin_row(8, -1)
+        .put_int(200)
+        .put_string("short")
+        .put_int(6)
+        .put_float(-2.5)
+        .put_int(1)
+        .put_null();
 
     let le = |cells: &[[u8; 8]]| cells.concat();
     let mut blob = Vec::new();
@@ -283,7 +248,7 @@ fn the_appender_writes_each_value_into_its_slot() {
     ];
     let want = batch_of(
         &schema,
-        &PkColumn::from_natives(&schema, [7, 8]),
+        &schema.pk_keys([[7], [8]]),
         &[1, -1],
         &[0, 1 << 5],
         &payload,
@@ -291,115 +256,6 @@ fn the_appender_writes_each_value_into_its_slot() {
     );
     assert_eq!(batch, want);
     batch.validate(&schema).unwrap();
-}
-
-/// `int_val` writes each integer at its own column's width — two's complement
-/// for a signed one, DATE as its I32 day count.
-#[test]
-fn int_val_writes_at_the_column_width() {
-    let schema = Schema::from_parts(
-        vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("n", TypeCode::I16, false),
-            ColumnDef::new("d", TypeCode::Date, false),
-            ColumnDef::new("u", TypeCode::U8, false),
-        ],
-        &[0],
-    )
-    .unwrap();
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch)
-        .add_row(1, 1)
-        .int_val(-2)
-        .int_val(-1)
-        .int_val(255);
-    assert_eq!(batch.col(0), (-2i16).to_le_bytes());
-    assert_eq!(batch.col(1), (-1i32).to_le_bytes());
-    assert_eq!(batch.col(2), [255]);
-    batch.validate(&schema).unwrap();
-}
-
-#[test]
-#[should_panic(expected = "256 is out of range for U8")]
-fn int_val_refuses_a_value_its_column_cannot_hold() {
-    let schema = Schema::from_parts(
-        vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("u", TypeCode::U8, false),
-        ],
-        &[0],
-    )
-    .unwrap();
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).int_val(256);
-}
-
-/// A fixed-width value written into a German-string column panics before the
-/// region can go out of shape — one message for `f64_val`/`f32_val`/`u128_val`,
-/// since they share one body.
-#[test]
-#[should_panic(expected = "a fixed-width value cannot be written to the String column")]
-fn a_fixed_value_in_a_string_column_panics() {
-    let schema = kv_schema(TypeCode::String);
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).u128_val(42);
-}
-
-#[test]
-#[should_panic(expected = "a String value cannot be written to the U64 column")]
-fn a_string_in_a_fixed_column_panics() {
-    let schema = kv_schema(TypeCode::U64);
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).str_val("oops");
-}
-
-/// A 16-byte write into an 8-byte column lands in a fixed-width column, so only
-/// the declared stride can catch it — and it is caught at the write, not
-/// deferred to `validate`'s region-length check.
-#[test]
-#[should_panic(expected = "U64 column at payload slot 0 takes 8 bytes")]
-fn a_wide_value_in_a_narrow_column_panics() {
-    let schema = kv_schema(TypeCode::U64);
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).u128_val(1);
-}
-
-#[test]
-#[should_panic(expected = "BatchAppender: row got")]
-fn closing_an_under_pushed_row_panics() {
-    use gnitz_wire::SysRowSink;
-    let schema = Schema::from_parts(
-        vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("s", TypeCode::String, true),
-            ColumnDef::new("b", TypeCode::Blob, true),
-        ],
-        &[0],
-    )
-    .unwrap();
-    let mut batch = ZSetBatch::new(&schema);
-    let mut a = BatchAppender::new(&mut batch);
-    a.begin_row(&[1], 1);
-    a.null(); // only 1 of 2 payload cols pushed
-    a.end_row();
-}
-
-#[test]
-#[should_panic(expected = "BatchAppender: row got 1 of 2")]
-fn starting_a_row_after_an_under_pushed_one_panics() {
-    let schema = Schema::from_parts(
-        vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("v", TypeCode::I64, false),
-            ColumnDef::new("w", TypeCode::I64, false),
-        ],
-        &[0],
-    )
-    .unwrap();
-    let mut batch = ZSetBatch::new(&schema);
-    let mut a = BatchAppender::new(&mut batch);
-    a.add_row(1, 1).int_val(1);
-    a.add_row(2, 1);
 }
 
 // ── Row selection: retain_ranges and gather ──────────────────────────────
@@ -425,9 +281,11 @@ fn string_batch() -> (Schema, ZSetBatch) {
     .unwrap();
     let mut b = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut b);
+        let mut a = b.builder();
         for (i, v) in GATHER_VALS.iter().enumerate() {
-            a.add_row(i as u128, i as i64 + 1).str_val(v).int_val(i as i64 * 10);
+            a.begin_row(i as u128, i as i64 + 1)
+                .put_string(v)
+                .put_int((i as i64 * 10) as u128);
         }
     }
     (schema, b)
@@ -437,13 +295,14 @@ fn string_batch() -> (Schema, ZSetBatch) {
 type Row = (u128, i64, String, u64);
 
 fn rows(b: &ZSetBatch) -> Vec<Row> {
+    let v = b.view();
     (0..b.len())
         .map(|r| {
             (
                 b.pk(r),
-                b.weight(r),
-                payload_str(b, r, 0).unwrap().into_owned(),
-                payload_u64(b, r, 1),
+                b.view().get_weight(r),
+                payload_str(&v, r, 0).unwrap().into_owned(),
+                payload_u64(&v, r, 1),
             )
         })
         .collect()
@@ -476,28 +335,23 @@ fn truncate_to_drops_the_rows_and_heap_since_the_mark() {
     let (_, want) = string_batch();
     let mut b = want.clone();
     let m = b.mark();
-    BatchAppender::new(&mut b)
-        .add_row(9, 1)
-        .str_val(GATHER_VALS[0])
-        .int_val(0);
-    b.open_row().key_natives(&[10]);
+    b.builder().begin_row(9, 1).put_string(GATHER_VALS[0]).put_int(0);
+    b.builder().begin_row(10, 1);
     b.truncate_to(m);
     assert_eq!(b, want);
 }
 
-/// A cut gather is the named rows at their weights, and its arena holds exactly
-/// the survivors' spilled bytes — which a row-by-row rebuild also holds.
+/// A cut gather is the named rows at their weights, as a row-by-row rebuild holds them.
 #[test]
 fn a_cut_gather_matches_a_row_by_row_rebuild() {
     let (schema, b) = string_batch();
     let picks = [2u32, 0, 3];
     let mut want = ZSetBatch::new(&schema);
     for &r in &picks {
-        want.copy_row_at(&b, r as usize, b.weight(r as usize));
+        want.copy_row_at(&b, r as usize, b.view().get_weight(r as usize));
     }
     let got = b.gather(&picks);
     assert_eq!(rows(&got), rows(&want));
-    assert_eq!(got.heap().len(), want.heap().len(), "only the survivors' heap bytes");
     got.validate(&schema).unwrap();
 }
 
@@ -523,22 +377,20 @@ fn a_copied_row_differs_only_where_it_is_patched() {
 fn an_in_place_gather_is_the_batch() {
     let (schema, b) = string_batch();
     let in_place: Vec<u32> = (0..b.len() as u32).collect();
-    let arena = b.pk_region().as_ptr();
+    let arena = b.view().pk().as_ptr();
     let got = b.gather(&in_place);
-    assert_eq!(got.pk_region().as_ptr(), arena);
+    assert_eq!(got.view().pk().as_ptr(), arena);
     got.validate(&schema).unwrap();
 }
 
-/// A gather keeping every row moves the heap whole: every cell keeps its offset.
+/// A gather keeping every row reorders it, every string read back as it was.
 #[test]
-fn a_whole_gather_moves_the_arena() {
+fn a_whole_gather_reorders_every_row() {
     let (schema, b) = string_batch();
     let perm = [3u32, 1, 0, 2];
     let all = rows(&b);
     let want: Vec<Row> = perm.iter().map(|&r| all[r as usize].clone()).collect();
-    let heap = b.heap().as_ptr();
     let got = b.gather(&perm);
-    assert_eq!(got.heap().as_ptr(), heap);
     assert_eq!(rows(&got), want);
     got.validate(&schema).unwrap();
 }
@@ -557,26 +409,26 @@ fn mixed_batch(strings: usize) -> (Schema, ZSetBatch) {
     columns.extend((0..strings).map(|_| ColumnDef::new("s", TypeCode::String, true)));
     let schema = Schema::from_parts(columns, &[2, 0]).unwrap();
     let mut b = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for r in 0..40u128 {
-        let row = app.add_row_natives(&[r * 7 % 5, r], if r % 4 == 0 { -2 } else { 1 + r as i64 % 3 });
+        let row = app.begin_row_natives(&[r * 7 % 5, r], if r % 4 == 0 { -2 } else { 1 + r as i64 % 3 });
         if r % 3 == 0 {
-            row.null();
+            row.put_null();
         } else {
-            row.int_val(r as i64 % 200);
+            row.put_int((r as i64 % 200) as u128);
         }
-        row.int_val(-(r as i64));
+        row.put_int((-(r as i64)) as u128);
         if r % 5 == 0 {
-            row.null();
+            row.put_null();
         } else {
-            row.int_val(r as i64 * 1000);
+            row.put_int((r as i64 * 1000) as u128);
         }
-        row.u128_val(r << 100 | r);
+        row.put_int(r << 100 | r);
         for s in 0..strings as u128 {
             match (r + s) % 3 {
-                0 => row.null(),
-                1 => row.str_val("short"),
-                _ => row.str_val(GATHER_VALS[(r + s) as usize % GATHER_VALS.len()]),
+                0 => row.put_null(),
+                1 => row.put_string("short"),
+                _ => row.put_string(GATHER_VALS[(r + s) as usize % GATHER_VALS.len()]),
             };
         }
     }
@@ -591,17 +443,27 @@ type RowCells = (Vec<u8>, i64, u64, Vec<Vec<u8>>);
 fn cells_of(b: &ZSetBatch) -> Vec<RowCells> {
     (0..b.len())
         .map(|r| {
-            let cells = (0..b.payload_count())
+            let cells = (0..b.view().schema().num_payload_cols())
                 .map(|pi| {
-                    let tc = b.payload_tc(pi);
+                    let layout = b.view().schema();
+                    let tc = layout.columns()[layout.payload_col_idx(pi)].type_code;
                     if tc.is_german_string() {
-                        gnitz_wire::german_string_content(&b.col(pi).as_chunks::<16>().0[r], b.heap()).to_vec()
+                        gnitz_wire::german_string_content(
+                            &b.view().col_data(pi).as_chunks::<16>().0[r],
+                            b.view().blob(),
+                        )
+                        .to_vec()
                     } else {
-                        b.col(pi)[r * tc.wire_stride()..][..tc.wire_stride()].to_vec()
+                        b.view().col_data(pi)[r * tc.wire_stride()..][..tc.wire_stride()].to_vec()
                     }
                 })
                 .collect();
-            (b.pk_bytes(r).to_vec(), b.weight(r), b.null_word(r), cells)
+            (
+                b.view().get_pk_bytes(r).to_vec(),
+                b.view().get_weight(r),
+                b.view().get_null_word(r),
+                cells,
+            )
         })
         .collect()
 }
@@ -622,7 +484,7 @@ fn a_borrowing_gather_matches_a_row_by_row_copy() {
         ] {
             let mut want = ZSetBatch::new(&schema);
             for &r in &picks {
-                want.copy_row_at(&b, r as usize, b.weight(r as usize));
+                want.copy_row_at(&b, r as usize, b.view().get_weight(r as usize));
             }
             let got = b.gathered(&picks);
             got.validate(&schema).unwrap();
@@ -630,7 +492,7 @@ fn a_borrowing_gather_matches_a_row_by_row_copy() {
                 assert_eq!(got, want, "{strings} strings, {picks:?}");
             } else {
                 assert_eq!(cells_of(&got), cells_of(&want), "{picks:?}");
-                assert_eq!(got.heap().len(), want.heap().len(), "{picks:?}");
+                assert_eq!(got.view().blob().len(), want.view().blob().len(), "{picks:?}");
             }
             assert_eq!(
                 cells_of(&b.clone().gather(&picks)),
@@ -638,25 +500,6 @@ fn a_borrowing_gather_matches_a_row_by_row_copy() {
                 "{strings} strings, {picks:?}"
             );
         }
-    }
-}
-
-/// Copying every column whole, in slot order, onto a zeroed batch builds what a borrowing
-/// gather of every row builds, byte for byte.
-#[test]
-fn copying_columns_whole_matches_a_full_gather() {
-    for strings in [0, 1, 2] {
-        let (schema, b) = mixed_batch(strings);
-        let mut got = ZSetBatch::zeroed(&schema, b.len());
-        for r in [REG_PK, REG_WEIGHT, REG_NULL_BMP] {
-            got.region_mut(r).copy_from_slice(b.region(r));
-        }
-        for pi in 0..b.payload_count() {
-            got.copy_column_from(pi, &b, pi);
-        }
-        let all: Vec<u32> = (0..b.len() as u32).collect();
-        assert_eq!(got, b.gathered(&all), "{strings} strings");
-        got.validate(&schema).unwrap();
     }
 }
 
@@ -703,10 +546,7 @@ fn fixture_a_schema() -> Schema {
 
 fn fixture_a_batch() -> ZSetBatch {
     let schema = fixture_a_schema();
-    let mut pks = PkColumn::empty_for_schema(&schema);
-    for row in 0..3 {
-        pks.push_natives(&[PK3[row] as u128, PK0[row] as u128]);
-    }
+    let pks = schema.pk_keys((0..3).map(|row| [PK3[row] as u128, PK0[row] as u128]));
     let mut blob = Vec::new();
     let payload = [
         C1.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -737,9 +577,9 @@ const B_PK: [u64; 3] = [1, 2, u32::MAX as u64];
 fn fixture_b_batch() -> ZSetBatch {
     let schema = fixture_b_schema();
     let mut b = ZSetBatch::new(&schema);
-    let mut a = BatchAppender::new(&mut b);
+    let mut a = b.builder();
     for (pk, v) in B_PK.into_iter().zip([7i64, -8, 9]) {
-        a.add_row(pk as u128, 1).int_val(v);
+        a.begin_row(pk as u128, 1).put_int(v as u128);
     }
     b
 }
@@ -756,9 +596,10 @@ fn locate_addresses_the_pk_region_the_builder_hands_out() {
                 "column {ci} is a PK column"
             );
             assert_eq!(batch.len(), vals.len());
+            let rows = batch.view();
             for (row, &v) in vals.iter().enumerate() {
                 let mut scratch = [0u8; 16];
-                let got = loc.native_le_bytes(batch, row, &mut scratch);
+                let got = loc.native_le_bytes(&rows, row, &mut scratch);
                 assert_eq!(got, &v.to_le_bytes()[..got.len()], "col {ci} row {row}");
             }
         }
@@ -799,7 +640,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
         .and_then(|p| p.resolve_scalar(schema.layout()))
         .expect("program resolves against the client schema");
         let want: Vec<Option<i128>> = (0..3).map(|r| col[r].map(|v| i128::from(PK3[r] + v))).collect();
-        assert_eq!(row_values(&mut ev, &batch), want, "ci3 + ci{ci}");
+        assert_eq!(row_values(&mut ev, &batch.view()), want, "ci3 + ci{ci}");
     }
 }
 
@@ -814,7 +655,7 @@ fn filter_over_the_region_path() {
         .resolve_filter(schema.layout())
         .expect("predicate resolves against the client schema");
 
-    assert_eq!(ev.ranges(&batch), [(0, 1)]);
+    assert_eq!(ev.ranges(&batch.view()), [(0, 1)]);
 }
 
 #[test]
@@ -833,7 +674,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
 
     // Row 0 spills both columns into the batch's one heap; row 2 nulls both.
     let lt = |r: usize| Some(i128::from(C4[r].as_bytes() < C5[r]));
-    assert_eq!(row_values(&mut ev, &batch), [lt(0), lt(1), None]);
+    assert_eq!(row_values(&mut ev, &batch.view()), [lt(0), lt(1), None]);
 }
 
 // ── Encode/decode round trip ─────────────────────────────────────────────
@@ -861,17 +702,11 @@ fn batches_round_trip_through_a_wal_block() {
         ([u128::MAX, 1 << 64, 42, (1 << 64) + 7], 1, -1i64),
         ([9, 8, 7, 6], -2, 123),
     ] {
-        let mut row = wide_batch.open_row();
-        row.key_natives(&key).weight(w);
-        row.cell(0).copy_from_slice(&v.to_le_bytes());
-        row.commit();
+        wide_batch.builder().begin_row_natives(&key, w).put_int(v as u128);
     }
 
     let a = fixture_a_schema();
-    let mut a_keys = PkColumn::empty_for_schema(&a);
-    a_keys.push_natives(&[10, 0]);
-    a_keys.push_natives(&[20, 0]);
-    let a_retraction = ZSetBatch::retraction(&a, &a_keys);
+    let a_retraction = ZSetBatch::retraction(&a, a.pk_keys([[10, 0], [20, 0]]).as_bytes());
     for (schema, batch) in [
         (fixture_a_schema(), fixture_a_batch()),
         (fixture_b_schema(), fixture_b_batch()),
@@ -889,99 +724,63 @@ fn batches_round_trip_through_a_wal_block() {
     }
 }
 
-// ── WAL blocks and region lists ─────────────────────────────────────────
+// ── WAL blocks ─────────────────────────────────────────
 
 /// A German cell whose heap offset overruns the heap is a `DecodeError`.
 #[test]
 fn a_string_cell_pointing_past_the_blob_is_refused() {
     let schema = kv_schema(TypeCode::String);
     let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch)
-        .add_row(1, 1)
-        .str_val("a value well past the inline cell");
+    batch
+        .builder()
+        .begin_row(1, 1)
+        .put_string("a value well past the inline cell");
     let mut forged = batch.clone();
     // A German cell's bytes 8..16 are its heap offset; the block copies it verbatim.
-    forged.col_mut(0)[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    forged.rewrite(|w| w.col_mut(0)[8..16].copy_from_slice(&u64::MAX.to_le_bytes()));
 
     match decode_wal_block(&encode_wal_block(&forged), &schema) {
         Err(ProtocolError::DecodeError(m)) => assert!(m.contains("not in canonical form"), "{m}"),
         other => panic!("expected a decode error, got {other:?}"),
     }
-    assert!(
-        decode_owned(&encode_wal_block(&forged), &schema).is_err(),
-        "nor is it adopted"
-    );
 }
 
-/// A process's own regions are appended behind the rows a batch already holds,
-/// each long cell reading its content at the heap's new place.
-#[test]
-fn own_regions_are_appended_with_their_long_cells_rebased() {
-    let schema = kv_schema(TypeCode::String);
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch)
-        .add_row(1, 1)
-        .str_val("ab")
-        .add_row(2, -1)
-        .str_val("a value well past the inline cell");
-    let regions = batch.wire_regions();
-
-    let mut sink = batch.clone();
-    sink.extend_from(&ZSetBatch::from_own_regions(&schema, &regions).unwrap());
-    assert_eq!(sink.len(), 4);
-    assert_eq!(sink.weights().collect::<Vec<_>>(), [1, -1, 1, -1]);
-    let cells = sink.col(0).as_chunks::<16>().0;
-    let content = |i: usize| gnitz_wire::german_string_content(&cells[i], sink.heap());
-    assert_eq!(content(1), content(3));
-    assert_eq!(content(3), b"a value well past the inline cell");
-    assert_eq!(content(2), b"ab");
-}
-
-/// A region list that does not lay out its schema — a region short, or one
-/// not as long as its rows — is a `DecodeError`.
-#[test]
-fn a_region_list_that_does_not_lay_out_its_schema_is_refused() {
-    let schema = kv_schema(TypeCode::I64);
-    let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).int_val(7);
-    let regions = batch.wire_regions();
-    let decode = |regions: &[&[u8]]| ZSetBatch::from_own_regions(&schema, regions);
-    decode(&regions).expect("the batch's own regions decode");
-
-    let short = &regions[..regions.len() - 1];
-    let mut ragged = regions.to_vec();
-    ragged[gnitz_wire::REG_PAYLOAD_START] = &[0; 4];
-    for (case, list) in [
-        ("a region short", short),
-        ("a ragged region", &ragged[..]),
-        ("no regions", &[]),
-    ] {
-        assert!(matches!(decode(list), Err(ProtocolError::DecodeError(_))), "{case}");
-    }
-}
-
-/// A null bit under a NOT NULL column is refused at decode, naming the column, whether the
-/// block is copied or adopted.
+/// A null bit under a NOT NULL column is refused at decode.
 #[test]
 fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
     let schema = kv_schema(TypeCode::I64);
     let mut b = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut b);
-        a.add_row(1, 1).int_val(7);
-        a.add_row(2, 1).int_val(8);
+        let mut a = b.builder();
+        a.begin_row(1, 1).put_int(7);
+        a.begin_row(2, 1).put_int(8);
     }
-    b.set_null_word(1, 1);
+    set_null_word(&mut b, 1, 1);
     let block = encode_wal_block(&b);
-    for got in [decode_wal_block(&block, &schema), decode_owned(&block, &schema)] {
-        match got {
-            Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column 'v'"), "{m}"),
-            other => panic!("expected a NOT NULL decode error, got {other:?}"),
-        }
+    match decode_wal_block(&block, &schema) {
+        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column"), "{m}"),
+        other => panic!("expected a NOT NULL decode error, got {other:?}"),
     }
 }
 
-// ── A reply frame as the batch ───────────────────────────────────────────
+// ── Decoding several blocks ─────────────────────────────────────────────
+
+/// A decoded batch takes every write.
+#[test]
+fn a_decoded_batch_takes_every_write() {
+    let (schema, batch) = string_batch();
+    let mut got = decode_wal_block(&encode_wal_block(&batch), &schema).unwrap();
+    let mut want = batch.clone();
+    for b in [&mut got, &mut want] {
+        b.set_u64_cell(1, 1, 99);
+        b.rewrite(|w| w.weight_mut()[..8].copy_from_slice(&(-7i64).to_le_bytes()));
+        b.set_string_cell(2, 0, "a replacement long enough to spill as well");
+        b.builder().begin_row(9, 2).put_string(GATHER_VALS[2]).put_int(3);
+        b.retain_ranges(&[(1, 5)]);
+    }
+    assert_eq!(rows(&got), rows(&want));
+    got.validate(&schema).unwrap();
+}
 
 /// Bytes a frame carries in front of its data block and behind it.
 const FRAME_HEAD: usize = 37;
@@ -996,15 +795,10 @@ fn owned_frame(block: &[u8]) -> FrameBlock<'static> {
     }
 }
 
-/// `block` decoded out of an owned frame.
-fn decode_owned(block: &[u8], schema: &Schema) -> Result<ZSetBatch, ProtocolError> {
-    decode_wal_blocks(Vec::new(), Some(owned_frame(block)), schema)
-}
-
-/// A lone block of an owned frame becomes the batch where it lies, held or terminal: the
-/// arena is the block's fixed bytes and the heap the block's own, read in place.
+/// A lone block of an owned frame is read where it lies, held or terminal: the regions and
+/// the heap are the frame's bytes.
 #[test]
-fn a_lone_owned_block_is_adopted_in_place() {
+fn a_lone_owned_block_is_read_in_its_frame() {
     for (schema, batch) in [
         (fixture_a_schema(), fixture_a_batch()),
         (fixture_b_schema(), fixture_b_batch()),
@@ -1013,63 +807,21 @@ fn a_lone_owned_block_is_adopted_in_place() {
         let block = encode_wal_block(&batch);
         for held in [false, true] {
             let frame = owned_frame(&block);
-            let fixed = frame.frame.as_ptr() as usize + FRAME_HEAD + gnitz_wire::wal::WAL_HEADER_SIZE;
+            let at = frame.frame.as_ptr() as usize + FRAME_HEAD + gnitz_wire::wal::WAL_HEADER_SIZE;
             let got = match held {
-                false => decode_wal_blocks(Vec::new(), Some(frame), &schema),
-                true => decode_wal_blocks(vec![frame], None, &schema),
+                false => decode_wal_blocks(Vec::new(), Some(frame), &Arc::new(schema.clone())),
+                true => decode_wal_blocks(vec![frame], None, &Arc::new(schema.clone())),
             }
             .unwrap();
             assert_eq!(got, batch);
-            assert_eq!(got.pk_region().as_ptr() as usize, fixed, "the arena is the frame's");
-            let heap = got.heap();
-            if !heap.is_empty() {
-                let at = fixed + batch.len() * schema.layout().row_width();
-                assert_eq!(heap.as_ptr() as usize, at, "the heap is the frame's");
-            }
+            assert_eq!(got.view().pk().as_ptr() as usize, at, "the regions are the frame's");
             got.validate(&schema).unwrap();
         }
     }
 }
 
-/// An adopted batch takes every write: in place where it fits the arena, a heap write moving
-/// the heap out first, and a row past the arena moving every region out.
-#[test]
-fn an_adopted_batch_takes_every_write() {
-    let (schema, batch) = string_batch();
-    let mut got = decode_owned(&encode_wal_block(&batch), &schema).unwrap();
-    let mut want = batch.clone();
-    for b in [&mut got, &mut want] {
-        b.set_u64_cell(1, 1, 99);
-        b.set_weight(0, -7);
-        b.set_string_cell(2, 0, "a replacement long enough to spill as well");
-        BatchAppender::new(b).add_row(9, 2).str_val(GATHER_VALS[2]).int_val(3);
-        b.retain_ranges(&[(1, 5)]);
-    }
-    assert_eq!(rows(&got), rows(&want));
-    assert_eq!(got.base, 0, "a row past the arena moved it");
-    got.validate(&schema).unwrap();
-}
-
-/// A truncation back over an adopted batch's own rows shortens its received heap in place.
-#[test]
-fn an_adopted_batch_truncates_in_place() {
-    let (schema, batch) = string_batch();
-    let mut got = decode_owned(&encode_wal_block(&batch), &schema).unwrap();
-    let all = rows(&got);
-    // Row 0 spills the first heap bytes; row 1 is inline.
-    let spill = GATHER_VALS[0].len();
-    got.truncate_to(RowMark { rows: 2, heap: spill });
-    assert_eq!(rows(&got), all[..2]);
-    assert_eq!(got.heap().len(), spill);
-    assert_eq!(
-        got.base,
-        FRAME_HEAD + gnitz_wire::wal::WAL_HEADER_SIZE,
-        "still the frame's arena"
-    );
-}
-
-/// Several blocks concatenate into one arena of their summed rows, each block's German
-/// cells moved onto its heap's place behind the earlier ones, borrowed and owned alike.
+/// Several blocks concatenate into one batch of their summed rows, each block's German
+/// cells moved onto its heap's place behind the earlier ones.
 #[test]
 fn several_blocks_concatenate_into_one_arena() {
     let (schema, a) = string_batch();
@@ -1080,19 +832,30 @@ fn several_blocks_concatenate_into_one_arena() {
         frame: Cow::Borrowed(&bc[..]),
         block: 0..bc.len(),
     };
-    let got = decode_wal_blocks(vec![owned_frame(&ba), owned_frame(&bb)], Some(last), &schema).unwrap();
+    let got = decode_wal_blocks(
+        vec![owned_frame(&ba), owned_frame(&bb)],
+        Some(last),
+        &Arc::new(schema.clone()),
+    )
+    .unwrap();
     let mut want = a.clone();
     want.extend_from(&b);
     want.extend_from(&c);
     assert_eq!(got, want);
-    assert_eq!(got.cap, got.len(), "an arena of exactly the rows");
     got.validate(&schema).unwrap();
 
     // One bad block refuses the whole train.
     let mut forged = c.clone();
-    forged.col_mut(0)[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    forged.rewrite(|w| w.col_mut(0)[8..16].copy_from_slice(&u64::MAX.to_le_bytes()));
     let bf = encode_wal_block(&forged);
-    assert!(decode_wal_blocks(vec![owned_frame(&ba)], Some(owned_frame(&bf)), &schema).is_err());
+    assert!(
+        decode_wal_blocks(
+            vec![owned_frame(&ba)],
+            Some(owned_frame(&bf)),
+            &Arc::new(schema.clone())
+        )
+        .is_err()
+    );
 }
 
 /// No block is the empty batch.
@@ -1100,7 +863,12 @@ fn several_blocks_concatenate_into_one_arena() {
 fn no_block_is_the_empty_batch() {
     let schema = fixture_b_schema();
     assert_eq!(
-        decode_wal_blocks(Vec::new(), None, &schema).unwrap(),
+        decode_wal_blocks(Vec::new(), None, &Arc::new(schema.clone())).unwrap(),
         ZSetBatch::new(&schema)
     );
+}
+
+/// Overwrite row `row`'s null word with `w`.
+fn set_null_word(b: &mut ZSetBatch, row: usize, w: u64) {
+    b.rewrite(|d| d.null_bmp_mut()[row * 8..(row + 1) * 8].copy_from_slice(&w.to_le_bytes()));
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::value::Rows;
-use gnitz_core::{BatchAppender, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_wire::ColumnDef;
 use std::hint::black_box;
 
@@ -22,14 +22,14 @@ fn decode_render_bench() {
     .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut batch);
+        let mut a = batch.builder();
         for i in 0..ROWS {
-            let r = a.add_row(u128::from(i), 1);
+            let r = a.begin_row(u128::from(i), 1);
             match i % 7 {
-                0 => r.null(),
-                _ => r.int_val(i as i64 * 31 - 5000),
+                0 => r.put_null(),
+                _ => r.put_int((i as i64 * 31 - 5000) as u128),
             };
-            r.f64_val(i as f64 / 3.0).str_val(if i % 2 == 0 {
+            r.put_float(i as f64 / 3.0).put_string(if i % 2 == 0 {
                 "short"
             } else {
                 "a somewhat longer string value"

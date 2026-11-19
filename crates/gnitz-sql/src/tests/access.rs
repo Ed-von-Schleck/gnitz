@@ -4,7 +4,7 @@ use crate::test_support::{
     CMP, EXACT_CASES, bind_conjunct, bind_where, col, holds_exact, ix, pk_schema, schema, two_col, typed_schema, uq,
 };
 use Tier as T;
-use gnitz_wire::{ColType, ColumnDef, PkBuf};
+use gnitz_wire::{ColType, ColumnDef};
 
 const U64_MAX: u128 = u64::MAX as u128;
 const UUID_LIT: &str = "'550e8400-e29b-41d4-a716-446655440000'";
@@ -39,11 +39,7 @@ fn rng(cols: &[u32], eq: &[u128], lo: u128, hi: u128) -> ReadBound {
 
 /// The key set of `keys`, each the PK columns' native values in PK-list order.
 fn keys(schema: &Schema, keys: &[&[u128]]) -> ReadBound {
-    let bufs: Vec<PkBuf> = keys.iter().map(|k| schema.layout().opk_key_cols(k)).collect();
-    ReadBound::PkSet(PkKeys::from_keys(
-        schema.layout().pk_stride(),
-        bufs.iter().map(|b| b.pk_bytes()),
-    ))
+    ReadBound::PkSet(schema.pk_keys(keys))
 }
 
 /// `(id U64 pk, a tc, b tc)`, `b` nullable per the flag.

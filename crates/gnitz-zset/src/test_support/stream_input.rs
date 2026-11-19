@@ -8,14 +8,14 @@ use std::fmt::Debug;
 
 use proptest::prelude::*;
 
-use super::internal::{FLOATS, STRS};
-use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use super::{FLOATS, STRS};
 use gnitz_wire::{AggDescriptor, AggFunc, FixedInt, TypeCode, cmp_col_window};
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// `[I64 val NULL, U64 id (pk), STRING s NULL, I64 grp (pk), F64 f, F32 x,
 /// U128 w, I16 n NULL]`, keyed `(id, grp)`.
-pub(crate) fn schema() -> SchemaDescriptor {
+pub fn schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::I64, true),
@@ -33,29 +33,29 @@ pub(crate) fn schema() -> SchemaDescriptor {
 
 /// One input row, a field per column in schema order; `f` and `x` as their bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Row {
-    pub(crate) val: Option<i64>,
-    pub(crate) id: u64,
-    pub(crate) s: Option<&'static str>,
-    pub(crate) grp: i64,
-    pub(crate) f: u64,
-    pub(crate) x: u32,
-    pub(crate) w: u128,
-    pub(crate) n: Option<i16>,
+pub struct Row {
+    pub val: Option<i64>,
+    pub id: u64,
+    pub s: Option<&'static str>,
+    pub grp: i64,
+    pub f: u64,
+    pub x: u32,
+    pub w: u128,
+    pub n: Option<i16>,
 }
 
 /// One native cell per column, `None` for NULL.
-pub(crate) type Cells = Vec<Option<Vec<u8>>>;
+pub type Cells = Vec<Option<Vec<u8>>>;
 
 impl Row {
     /// The row's cells of `group_cols`, in that order.
-    pub(crate) fn group_key(&self, group_cols: &[u32]) -> Cells {
+    pub fn group_key(&self, group_cols: &[u32]) -> Cells {
         let row = cells(self);
         group_cols.iter().map(|&c| row[c as usize].clone()).collect()
     }
 }
 
-pub(crate) fn cells(r: &Row) -> Cells {
+pub fn cells(r: &Row) -> Cells {
     vec![
         r.val.map(|v| v.to_le_bytes().to_vec()),
         Some(r.id.to_le_bytes().to_vec()),
@@ -68,14 +68,18 @@ pub(crate) fn cells(r: &Row) -> Cells {
     ]
 }
 
-pub(crate) fn batch(rows: &[(Row, i64)]) -> Batch {
+pub fn batch(rows: &[(Row, i64)]) -> Batch {
     let mut b = BatchBuilder::new(&schema());
     for &(r, w) in rows {
         b.begin_row_natives(&[r.id as u128, r.grp as u128], w);
         b.put_opt_int(r.val.map(|v| v as u128));
         match r.s {
-            Some(s) => b.put_string(s),
-            None => b.put_null(),
+            Some(s) => {
+                b.put_string(s);
+            }
+            None => {
+                b.put_null();
+            }
         }
         b.put_int(r.f as u128);
         b.put_int(r.x as u128);
@@ -88,7 +92,7 @@ pub(crate) fn batch(rows: &[(Row, i64)]) -> Batch {
 
 /// Worker `w`'s share of `delta` over two workers: its rows sharded by id, as
 /// the exchange routes a keyed input.
-pub(crate) fn shard(delta: &[(Row, i64)], w: u64) -> Batch {
+pub fn shard(delta: &[(Row, i64)], w: u64) -> Batch {
     let mine: Vec<(Row, i64)> = delta.iter().copied().filter(|(r, _)| r.id % 2 == w).collect();
     batch(&mine)
 }
@@ -97,7 +101,7 @@ pub(crate) fn shard(delta: &[(Row, i64)], w: u64) -> Batch {
 /// signed PK column's image, a 16-byte payload column's image, the fold of a
 /// nullable column, of a column and a string, and of a set one column wider
 /// than a value index's key packs.
-pub(crate) const GROUPS: [&[u32]; 8] = [&[], &[1, 3], &[1], &[3], &[6], &[0], &[3, 2], &[0, 1, 3]];
+pub const GROUPS: [&[u32]; 8] = [&[], &[1, 3], &[1], &[3], &[6], &[0], &[3, 2], &[0, 1, 3]];
 
 const VALS: [i64; 5] = [i64::MIN, -1, 0, 1, i64::MAX];
 const IDS: [u64; 4] = [0, 1, 1 << 63, u64::MAX];
@@ -107,7 +111,7 @@ const DYADICS: [f32; 4] = [-1.5, 0.25, 2.0, 4.5];
 const WIDES: [u128; 4] = [1, 1 << 64, (1 << 64) + 1, u128::MAX];
 const NARROWS: [i16; 4] = [i16::MIN, -1, 1, i16::MAX];
 
-pub(crate) fn arb_row() -> impl Strategy<Value = Row> {
+pub fn arb_row() -> impl Strategy<Value = Row> {
     (
         prop::option::of(prop::sample::select(&VALS[..])),
         prop::sample::select(&IDS[..]),
@@ -138,7 +142,7 @@ fn cmp_cells(tc: TypeCode, a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
-pub(crate) const fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
+pub const fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
     AggDescriptor { agg_op, col_idx }
 }
 
@@ -146,7 +150,7 @@ pub(crate) const fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
 /// float sum is each value widened to `f64` times its weight, added in row
 /// order, a finite sum the same over the finite values alone, and an infinity
 /// count counts NaN under both signs.
-pub(crate) fn agg_of(agg: AggDescriptor, rows: &[(Cells, i64)]) -> Option<Vec<u8>> {
+pub fn agg_of(agg: AggDescriptor, rows: &[(Cells, i64)]) -> Option<Vec<u8>> {
     let col = agg.col_idx as usize;
     let tc = schema().columns()[col].type_code;
     let live = || rows.iter().filter_map(|(r, w)| r[col].as_deref().map(|c| (c, *w)));
@@ -193,7 +197,7 @@ pub(crate) fn agg_of(agg: AggDescriptor, rows: &[(Cells, i64)]) -> Option<Vec<u8
 /// Ticks of `(row, target multiplicity)`: each moves some rows of a small pool
 /// to a new multiplicity in `0..=3`, so a row recurs across ticks and most
 /// ticks retract.
-pub(crate) fn arb_ticks<R: Copy + Debug + 'static>(
+pub fn arb_ticks<R: Copy + Debug + 'static>(
     row: impl Strategy<Value = R>,
 ) -> impl Strategy<Value = Vec<Vec<(R, i64)>>> {
     use proptest::collection::vec;
@@ -203,7 +207,7 @@ pub(crate) fn arb_ticks<R: Copy + Debug + 'static>(
 /// The retractions and insertions moving `model` to each `target` — so a delta
 /// carries cancelling pairs and weight-0 rows, and the integrated input stays
 /// a relation.
-pub(crate) fn delta_to<R: Ord + Copy>(model: &mut BTreeMap<R, i64>, targets: &[(R, i64)]) -> Vec<(R, i64)> {
+pub fn delta_to<R: Ord + Copy>(model: &mut BTreeMap<R, i64>, targets: &[(R, i64)]) -> Vec<(R, i64)> {
     let mut delta = Vec::new();
     for &(row, target) in targets {
         let cur = model.insert(row, target).unwrap_or(0);

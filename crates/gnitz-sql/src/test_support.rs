@@ -4,10 +4,11 @@
 use crate::catalog::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{Batch, BatchBuilder};
+use gnitz_core::{PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_expr::{CmpOp, ColumnLocator};
+use gnitz_wire::payload_u64;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
-use gnitz_wire::{RowSource, payload_u64};
 use sqlparser::ast::Expr;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -274,12 +275,12 @@ pub(crate) enum Cell<'a> {
 
 impl Cell<'_> {
     /// Append this cell as the row's next payload column.
-    pub(crate) fn push(self, app: &mut BatchAppender<'_>) {
+    pub(crate) fn push(self, app: &mut BatchBuilder<&mut Batch>) {
         match self {
-            Cell::Int(v) => app.int_val(v),
-            Cell::F64(v) => app.f64_val(v),
-            Cell::Str(s) => app.str_val(s),
-            Cell::Null => app.null(),
+            Cell::Int(v) => app.put_int(v as u128),
+            Cell::F64(v) => app.put_float(v),
+            Cell::Str(s) => app.put_string(s),
+            Cell::Null => app.put_null(),
         };
     }
 }
@@ -288,9 +289,9 @@ impl Cell<'_> {
 /// natives, one cell per payload slot.
 pub(crate) fn keyed_batch(schema: &Schema, rows: &[(&[u128], i64, &[Cell])]) -> ZSetBatch {
     let mut b = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for &(key, w, cells) in rows {
-        app.add_row_natives(key, w);
+        app.begin_row_natives(key, w);
         cells.iter().for_each(|c| c.push(&mut app));
     }
     b
@@ -310,15 +311,18 @@ pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
 
 /// Each row of `b` (in `schema`) as its payload cells and weight — what
 /// [`batch_of`] wrote, read back.
-pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a>>, i64)> {
+pub(crate) fn rows_of<'a>(schema: &Schema, batch: &'a ZSetBatch) -> Vec<(Vec<Cell<'a>>, i64)> {
     let locs = schema.layout().payload_locators();
+    let b = &batch.view();
     let cell = |r: usize, pi: usize, loc: &ColumnLocator| {
         let tc = loc.type_code();
         if loc.is_null(b, r) {
             Cell::Null
         } else if tc.is_german_string() {
-            let cell = b.german_cell(r, pi);
-            Cell::Str(std::str::from_utf8(gnitz_wire::german_string_content(cell, b.heap())).unwrap())
+            let cell = b.col_data(pi)[r * 16..(r + 1) * 16]
+                .try_into()
+                .expect("a German cell is 16 bytes");
+            Cell::Str(std::str::from_utf8(gnitz_wire::german_string_content(cell, b.blob())).unwrap())
         } else if tc == TypeCode::F64 {
             Cell::F64(f64::from_bits(payload_u64(b, r, pi)))
         } else {
@@ -331,7 +335,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
         .map(|r| {
             (
                 locs.iter().enumerate().map(|(pi, loc)| cell(r, pi, loc)).collect(),
-                b.weight(r),
+                b.get_weight(r),
             )
         })
         .collect()

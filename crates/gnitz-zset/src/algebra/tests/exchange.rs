@@ -34,10 +34,18 @@ fn batch(schema: &SchemaDescriptor) -> Batch {
         b.put_int(neg(9) as u128);
         b.put_opt_int((i % 5 != 0).then(|| neg(3) as u128));
         match i % 4 {
-            0 => b.put_null(),
-            1 => b.put_string(""),
-            2 => b.put_string("inline"),
-            _ => b.put_string("a string past the inline length"),
+            0 => {
+                b.put_null();
+            }
+            1 => {
+                b.put_string("");
+            }
+            2 => {
+                b.put_string("inline");
+            }
+            _ => {
+                b.put_string("a string past the inline length");
+            }
         }
         b.put_int(u128::from(i % 7) << 100 | 1);
         b.put_int(neg(11) as u128);
@@ -165,7 +173,10 @@ fn a_join_scatter_routes_each_row_to_its_reindexed_owner() {
             nulls: NullKeys::Keep,
         };
         let mut map = MapPlan::from_wire(&schema, &reindex).expect("the fixture key packs");
-        let (keyed, at) = (map.evaluate_map_batch(&b), Placement::full_pk(map.output_schema()));
+        let (keyed, at) = (
+            map.evaluate_map_batch(&b.as_mem_batch()),
+            Placement::full_pk(map.output_schema()),
+        );
         assert_routes(&plan, &b, &format!("join {slots:?}"), |_, row, nw| {
             at.owner(keyed.get_pk_bytes(row), nw).unwrap()
         });

@@ -32,10 +32,11 @@
 //!
 //! # Rows
 //!
-//! Both sides read rows through [`BatchView`], a [`gnitz_wire::RowSource`] that
-//! also hands out whole regions, addressed by [`ColumnLocator`] (where a value
-//! sits), and describe them with [`SchemaDescriptor`] (what the schema says about
-//! it). A map writes into a [`MapTarget`].
+//! The evaluator reads rows through [`BatchView`], a [`gnitz_wire::RowSource`]
+//! that also hands out whole regions, addressed by [`ColumnLocator`] (where a
+//! value sits), and describes them with [`SchemaDescriptor`] (what the schema
+//! says about it). A map writes into a [`MapTarget`]. The batch types implementing
+//! them are `gnitz-zset`'s, a crate above this one.
 //!
 //! # Rules shared outside an expression
 //!

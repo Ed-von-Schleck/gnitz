@@ -55,10 +55,18 @@ fn pushes(schema: &SchemaDescriptor, per: u64, row: Row) -> Vec<Batch> {
                 bb.begin_row(pk as u128, w);
                 for (_, col) in schema.payload_columns() {
                     match col.type_code {
-                        TypeCode::String => bb.put_string(&format!("a payload that lives on the heap #{v:>10}")),
-                        TypeCode::I16 => bb.put_int((v & 0x7fff) as u128),
-                        TypeCode::I32 => bb.put_int((v & 0x7fff_ffff) as u128),
-                        _ => bb.put_int(v as u128),
+                        TypeCode::String => {
+                            bb.put_string(&format!("a payload that lives on the heap #{v:>10}"));
+                        }
+                        TypeCode::I16 => {
+                            bb.put_int((v & 0x7fff) as u128);
+                        }
+                        TypeCode::I32 => {
+                            bb.put_int((v & 0x7fff_ffff) as u128);
+                        }
+                        _ => {
+                            bb.put_int(v as u128);
+                        }
                     }
                 }
                 bb.end_row();

@@ -34,8 +34,12 @@ fn fixture(keys: usize, string: bool, rounds: u64, per_round: u64) -> (RelationF
             bb.put_u64(round);
             if string {
                 match id % 2 {
-                    0 => bb.put_string(&format!("a-fairly-long-out-of-line-value-{id}")),
-                    _ => bb.put_string("short"),
+                    0 => {
+                        bb.put_string(&format!("a-fairly-long-out-of-line-value-{id}"));
+                    }
+                    _ => {
+                        bb.put_string("short");
+                    }
                 }
             }
             bb.end_row();

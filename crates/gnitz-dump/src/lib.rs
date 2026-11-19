@@ -369,7 +369,7 @@ async fn restore_rows(client: &mut GnitzClient, rel: &CatalogRelation, path: &Pa
 
 /// The bytes `batch` takes in a push in `schema`'s layout.
 fn push_bytes(schema: &Schema, batch: &ZSetBatch) -> usize {
-    batch.heap().len() + batch.len() * schema.layout().row_width()
+    batch.view().blob().len() + batch.len() * schema.layout().row_width()
 }
 
 /// Push `chunk`, of `schema`, into table `tid` when it holds rows, and leave it empty.
@@ -400,7 +400,7 @@ async fn held_rows(client: &mut GnitzClient, rel: &CatalogRelation) -> Result<u6
                 .schema
                 .layout()
                 .locate(ci)
-                .decode_i64(&reply.batch, 0, FixedInt::I64);
+                .decode_i64(&reply.batch.view(), 0, FixedInt::I64);
             Ok(count as u64)
         }
         _ => Err(DumpError::from("a count that is not one cell")),

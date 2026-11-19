@@ -9,11 +9,11 @@ use std::thread::LocalKey;
 /// Items retained per pool.
 const MAX_POOLED: usize = 64;
 /// The largest item a pool retains, in bytes.
-pub(super) const MAX_POOLED_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_POOLED_BYTES: usize = 2 * 1024 * 1024;
 
 /// The most recently returned item `fits` accepts. `None` when there is none,
 /// or the thread-local is being torn down.
-pub(super) fn take<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, fits: impl Fn(&T) -> bool) -> Option<T> {
+pub fn take<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, fits: impl Fn(&T) -> bool) -> Option<T> {
     pool.try_with(|p| {
         let mut items = p.take();
         let item = items.iter().rposition(fits).and_then(|i| items.remove(i));
@@ -26,7 +26,7 @@ pub(super) fn take<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, fits: impl Fn(
 
 /// Return `item`, which holds `bytes` of heap. Dropped when that is zero or
 /// above `MAX_POOLED_BYTES`; a full pool drops its oldest item instead.
-pub(super) fn recycle<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, item: T, bytes: usize) {
+pub fn recycle<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, item: T, bytes: usize) {
     if bytes == 0 || bytes > MAX_POOLED_BYTES {
         return;
     }
@@ -51,14 +51,14 @@ fn put_back<T>(p: &Cell<VecDeque<T>>, items: VecDeque<T>) {
 
 /// The bytes `v` holds allocated.
 #[inline]
-pub(crate) fn vec_bytes<T>(v: &Vec<T>) -> usize {
+pub fn vec_bytes<T>(v: &Vec<T>) -> usize {
     v.capacity() * size_of::<T>()
 }
 
 /// Run `f` over the thread's scratch list in `slot`, emptied. A list grown past
 /// `MAX_POOLED_BYTES` goes back to the allocator. The list is taken out of its
 /// slot while `f` runs, so a nested call gets a fresh one.
-pub(crate) fn with_scratch<T, R>(slot: &'static LocalKey<Cell<Vec<T>>>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
+pub fn with_scratch<T, R>(slot: &'static LocalKey<Cell<Vec<T>>>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
     let mut v = slot.try_with(Cell::take).unwrap_or_default();
     v.clear();
     let r = f(&mut v);
@@ -119,7 +119,7 @@ impl PooledBuf {
     /// # Safety
     /// The caller writes each byte before reading it.
     #[allow(clippy::uninit_vec)]
-    pub(super) unsafe fn uninit(size: usize) -> Self {
+    pub unsafe fn uninit(size: usize) -> Self {
         let mut buf = Self::with_capacity(size);
         // SAFETY: `capacity >= size`.
         unsafe { buf.0.set_len(size) };

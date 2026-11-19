@@ -291,7 +291,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         };
         lowered += 1;
         let mut nulls = 0;
-        ev.for_each(&batch, |cell| {
+        ev.for_each(&batch.view(), |cell| {
             nulls += matches!(cell, ScalarCell::Int(None) | ScalarCell::Str(None)) as usize;
         });
         assert_eq!(nulls, 0, "{sql} is proven never NULL");

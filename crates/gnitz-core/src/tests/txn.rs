@@ -1,18 +1,24 @@
 use super::*;
+use crate::block_on;
 use crate::test_support::{client_pair, kv_rows, kv_schema};
-use crate::{BatchAppender, PkColumn, block_on};
 use WireConflictMode::{Error, Update};
 use gnitz_wire::{ColumnDef, TypeCode, payload_u64};
 
 fn del(pk: u64) -> ZSetBatch {
     let s = Arc::new(kv_schema(TypeCode::I64));
-    ZSetBatch::retraction(&s, &PkColumn::from_natives(&s, [pk as u128]))
+    ZSetBatch::retraction(&s, s.pk_keys([[pk as u128]]).as_bytes())
 }
 
 /// `(pk, v, weight)` of a `kv_schema(I64)` batch, sorted.
 fn contents(b: &ZSetBatch) -> Vec<(u64, i64, i64)> {
     let mut out: Vec<_> = (0..b.len())
-        .map(|i| (b.pk(i) as u64, payload_u64(b, i, 0) as i64, b.weight(i)))
+        .map(|i| {
+            (
+                b.pk(i) as u64,
+                payload_u64(&b.view(), i, 0) as i64,
+                b.view().get_weight(i),
+            )
+        })
         .collect();
     out.sort();
     out
@@ -69,7 +75,14 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     let shape: Vec<_> = buf
         .families
         .iter()
-        .map(|f| (f.target.tid, f.mode, f.basis, f.batch.weights().collect::<Vec<_>>()))
+        .map(|f| {
+            (
+                f.target.tid,
+                f.mode,
+                f.basis,
+                f.batch.view().weights().collect::<Vec<_>>(),
+            )
+        })
         .collect();
     assert_eq!(
         shape,
@@ -171,7 +184,7 @@ fn the_overlay_replaces_committed_rows_with_the_last_buffered_op() {
         (
             "a PK set restricts the buffered side to its keys",
             vec![(kv_rows(&[(1, 11, 1), (2, 22, 1)]), Update)],
-            ReadBound::PkSet(PkColumn::from_natives(&s, [1]).keys()),
+            ReadBound::PkSet(s.pk_keys([[1]])),
             Vec::new(),
             &[(1, 10, 1)][..],
             &[(1, 11, 1)][..],
@@ -244,7 +257,7 @@ fn a_tid_refuses_a_second_layout() {
     let wide = Arc::new(Schema::from_parts(wide_cols, s.pk_cols()).unwrap());
     let wide_row = || {
         let mut b = ZSetBatch::new(&wide);
-        BatchAppender::new(&mut b).add_row(2, 1).int_val(20).int_val(30);
+        b.builder().begin_row(2, 1).put_int(20).put_int(30);
         b
     };
     let mut buf = TxnBuffer::default();
@@ -303,12 +316,12 @@ fn a_keys_reply_appends_keys_only() {
         sink,
     };
     let mut committed = ZSetBatch::new(&reply);
-    BatchAppender::new(&mut committed).add_row(1, 1);
+    committed.builder().begin_row(1, 1);
     let out = buf.overlay(7, &s, &spec, true, committed).unwrap();
 
     let mut want = ZSetBatch::new(&reply);
-    let mut app = BatchAppender::new(&mut want);
-    app.add_row(1, 1);
-    app.add_row(3, 1);
+    let mut app = want.builder();
+    app.begin_row(1, 1);
+    app.begin_row(3, 1);
     assert_eq!(out, want);
 }

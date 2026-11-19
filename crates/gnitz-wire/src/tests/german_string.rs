@@ -124,19 +124,6 @@ fn relocate_moves_only_a_long_cells_offset() {
     assert_eq!((&placed[..8], read_u64_le(&placed, 8)), (&src[..8], 77));
 }
 
-/// The region check is the cell check over every cell.
-#[test]
-fn region_ok_refuses_one_bad_cell() {
-    let mut blob = Vec::new();
-    let mut region = [
-        encode_german_string(b"abc", &mut blob),
-        encode_german_string(b"abcdefghijklmnopqrst", &mut blob),
-    ];
-    assert!(german_string_region_ok(region.as_flattened(), &blob));
-    region[0][15] = 1;
-    assert!(!german_string_region_ok(region.as_flattened(), &blob));
-}
-
 #[test]
 fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
     // Two long-string cells with out-of-range heap offsets. Both contents

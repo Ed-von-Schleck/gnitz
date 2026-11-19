@@ -2,7 +2,6 @@
 //! over it", per iteration, master and workers apart: one park each.
 
 use super::*;
-use gnitz_core::BatchAppender;
 use gnitz_wire::{ReadBound, ReadSpec, WireConflictMode};
 
 const WORKERS: usize = 4;
@@ -59,14 +58,15 @@ fn view_read_after_write_bench() {
         let (m0, w0) = sample();
         for i in 0..ITERS {
             let mut batch = ZSetBatch::new(&t.schema);
-            BatchAppender::new(&mut batch)
-                .add_row(i as u128, 1)
-                .int_val((i % 8) as i64);
+            batch
+                .builder()
+                .begin_row(i as u128, 1)
+                .put_int(((i % 8) as i64) as u128);
             block_on(db.client.push(t.tid, &t.schema, batch, WireConflictMode::Update)).unwrap();
             let got = block_on(db.client.scan_spec(v.tid, all.clone(), &v.schema))
                 .unwrap()
                 .batch;
-            let rows: i64 = got.weights().sum();
+            let rows: i64 = got.view().weights().sum();
             assert_eq!(
                 rows as u64,
                 (i + 1).min(if shape == "filter" { u64::MAX } else { 8 }),

@@ -41,7 +41,9 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
         let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
         let mut b = BatchBuilder::new(&schema);
         match col1_is_pk {
-            true => b.begin_row_natives(&[0, le_cell(le)], 1),
+            true => {
+                b.begin_row_natives(&[0, le_cell(le)], 1);
+            }
             false => {
                 b.begin_row(0, 1);
                 b.put_int(le_cell(le));
@@ -275,7 +277,9 @@ fn packed_identities_over_runs_are_their_whole_batch_identities() {
                     b.put_opt_int((i % 7 != 0).then(|| mix(i) as i64 as u128));
                     b.put_int(mix(i ^ 1) as u32 as u128);
                 }
-                _ => b.put_string(&format!("a group key of some length {}", mix(i) % 97)),
+                _ => {
+                    b.put_string(&format!("a group key of some length {}", mix(i) % 97));
+                }
             }
             b.end_row();
         }

@@ -132,16 +132,16 @@ pub fn null_word_at(word: u64, at: usize) -> u64 {
 /// A whole-batch consumer that resolves the regions once per morsel is not one
 /// of those, and the evaluator's kernels take `&dyn BatchView`.
 ///
-/// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
-/// buffers it materializes and can only lend them for `&self`.
+/// All lifetimes are tied to `&self`, NOT decoupled — a run or a shard mapping
+/// lends the bytes it holds only for `&self`.
 ///
 /// Every implementor marks every method `#[inline(always)]`: the per-row
 /// callers are generic code instantiated in gnitz-zset, which builds at
 /// opt-level 0 in dev, where a plain `#[inline]` stays a call.
 pub trait RowSource {
     /// The row's packed PK-region bytes (`pk_stride` wide), **order-preserving
-    /// at-rest (OPK)** at every source, a client `ZSetBatch` included. That is
-    /// what the OPK-inverting readers on `ColumnLocator` assume.
+    /// at-rest (OPK)** at every source. That is what the OPK-inverting readers on
+    /// `ColumnLocator` assume.
     fn get_pk_bytes(&self, row: usize) -> &[u8];
     /// The row's null-bitmap word (bit N = payload slot N is NULL).
     fn get_null_word(&self, row: usize) -> u64;

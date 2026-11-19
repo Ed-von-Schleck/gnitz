@@ -27,7 +27,7 @@ pub(super) fn blob_span_key(content: &[u8]) -> SpanKey {
 /// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
 /// source whose heap is `src_blob` bytes: that slice's row-proportional share,
 /// rounded up, and at most the whole heap.
-pub(crate) fn prorated_blob_cap(src_blob: usize, src_rows: usize, out_rows: usize) -> usize {
+pub fn prorated_blob_cap(src_blob: usize, src_rows: usize, out_rows: usize) -> usize {
     if src_blob == 0 || src_rows == 0 {
         return 0;
     }
@@ -41,7 +41,7 @@ const RELOCATE_CELL_COST_BYTES: usize = 500;
 
 /// Whether relocating `out_rows` rows' cells — a cell rewrite plus a row's share
 /// of the heap each — costs less than copying the whole `src_blob`-byte heap.
-pub(crate) fn should_relocate_blob(src_blob: usize, src_rows: usize, out_rows: usize) -> bool {
+pub fn should_relocate_blob(src_blob: usize, src_rows: usize, out_rows: usize) -> bool {
     src_rows > 0 && src_blob > out_rows.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob / src_rows)
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn heap_is_wasteful(dead: usize, heap: usize) -> bool {
 /// `dead`, to keep `kept_rows` of its `src_rows` rows; `None` when relocating
 /// them is cheaper or the carried heap would be wasteful. `excluded`, the long
 /// bytes of the rows left behind, runs only once the prorated estimate passes.
-pub(super) fn carried_dead(
+pub fn carried_dead(
     heap: usize,
     dead: usize,
     src_rows: usize,
@@ -123,7 +123,7 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
 /// The heap bytes the long cells of rows `rows` of `src` name in the
 /// German-string slots `mask` name, a column at a time. A span two cells share
 /// counts twice.
-pub(super) fn long_bytes(src: &MemBatch<'_>, mask: u64, rows: std::ops::Range<usize>) -> usize {
+pub fn long_bytes(src: &MemBatch<'_>, mask: u64, rows: std::ops::Range<usize>) -> usize {
     gnitz_wire::BitIter(mask)
         .map(|pi| {
             let cells = &src.col_data(pi).as_chunks::<16>().0[rows.clone()];
@@ -134,7 +134,7 @@ pub(super) fn long_bytes(src: &MemBatch<'_>, mask: u64, rows: std::ops::Range<us
 
 /// [`row_long_bytes`] summed over every row of `src` outside the ascending,
 /// disjoint `kept` ranges.
-pub(super) fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usize, usize)]) -> usize {
+pub fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usize, usize)]) -> usize {
     let bounds = kept.iter().copied().chain([(src.row_count(), src.row_count())]);
     let gaps = bounds.scan(0, |next, (start, end)| {
         let gap = *next..start;
@@ -147,7 +147,7 @@ pub(super) fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usiz
 /// The heap bytes `row`'s long cells in the German-string slots `mask` name.
 /// A span two cells share counts twice.
 #[inline]
-pub(crate) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
+pub fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
     gnitz_wire::BitIter(mask)
         .map(|pi| gnitz_wire::german_string_long_len(src.german_cell(row, pi)))
         .sum()
@@ -156,7 +156,7 @@ pub(crate) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> us
 /// Where a long value of a German-string cell copied verbatim from a source
 /// lands in the destination heap.
 #[derive(Clone, Copy)]
-pub(crate) enum StringDest<'b> {
+pub enum StringDest<'b> {
     /// The source heap was carried whole onto the destination's at this base:
     /// each cell's offset is shifted by it.
     Carried(usize),
@@ -250,7 +250,7 @@ fn relocate_coded_cells(
 /// `cell` rebased onto `dst_blob`: [`gnitz_wire::relocate_german_string`],
 /// copying each source value once when `cache` is `Some`.
 #[inline]
-pub(crate) fn relocated_cell(
+pub fn relocated_cell(
     cell: &[u8; 16],
     src: Heap<'_>,
     dst_blob: &mut Vec<u8>,
@@ -316,7 +316,7 @@ fn place_value(
 
 /// Append `value` to `dst_blob`: decoded, or coded under `book`.
 #[inline(always)]
-pub(crate) fn append_value(value: HeapValue<'_>, dst_blob: &mut Vec<u8>, book: Option<&Codebook>) {
+pub fn append_value(value: HeapValue<'_>, dst_blob: &mut Vec<u8>, book: Option<&Codebook>) {
     match book {
         None => value.append_to(dst_blob),
         Some(book) => book.append(value, dst_blob),
@@ -337,7 +337,7 @@ thread_local! {
 
 /// Dedups long-string spans relocated into one destination heap, so each is
 /// copied once. Its map is pooled, and taken at the first relocation.
-pub(crate) struct BlobCache {
+pub struct BlobCache {
     map: Option<SpanMap>,
     /// String cells the cache relocates at most: what its map is sized and
     /// chosen by.
@@ -351,7 +351,7 @@ impl BlobCache {
 
     /// A cache sized for `rows` rows of `schema`: the most string cells they
     /// hold.
-    pub(crate) fn for_rows(schema: &SchemaDescriptor, rows: usize) -> Self {
+    pub fn for_rows(schema: &SchemaDescriptor, rows: usize) -> Self {
         BlobCache::new(rows * schema.string_payload_slots().count_ones() as usize)
     }
 
@@ -383,7 +383,7 @@ impl Drop for BlobCache {
 
 /// The exact count of `mb`'s heap bytes no long string cell references, a cell
 /// overrunning the heap referencing none.
-pub(super) fn measure_dead_heap(mb: &MemBatch<'_>) -> usize {
+pub(crate) fn measure_dead_heap(mb: &MemBatch<'_>) -> usize {
     walk_heap_spans(mb, |_, _| true).expect("an accepting walk")
 }
 

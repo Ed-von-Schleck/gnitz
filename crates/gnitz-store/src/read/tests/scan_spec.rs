@@ -433,7 +433,11 @@ fn a_copy_of_64_payload_columns_covers_every_slot() {
     const P: u64 = 64;
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend((0..P).map(|_| SchemaColumn::new(TypeCode::I64, false)));
-    let put_row = |bb: &mut BatchBuilder, id: u64| (0..P).for_each(|k| bb.put_u64(id * 100 + k));
+    let put_row = |bb: &mut BatchBuilder, id: u64| {
+        (0..P).for_each(|k| {
+            bb.put_u64(id * 100 + k);
+        })
+    };
     let r = map_fixture(&cols, 40, 16, put_row);
     let reply = SchemaDescriptor::new(&cols, &[0]);
     let copies: Vec<u32> = (1..=P as u32).collect();
@@ -449,12 +453,20 @@ fn a_pk_sourced_map_zeroes_every_null_word() {
         SchemaColumn::new(TypeCode::U64, false),
         SchemaColumn::new(TypeCode::I64, false),
     ];
-    let r = map_fixture(&cols, 300, 32, |bb, id| bb.put_u64(id * 7));
+    let r = map_fixture(&cols, 300, 32, |bb, id| {
+        bb.put_u64(id * 7);
+    });
     let reply = crate::test_support::u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false)]);
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), None);
     let got = run(&r, spec.clone()).unwrap();
     assert!((0..got.len()).all(|row| got.get_null_word(row) == 0));
-    assert_reply(&r, spec, id_rows(&reply, weighted(0..300), |bb, id| bb.put_u64(id)));
+    assert_reply(
+        &r,
+        spec,
+        id_rows(&reply, weighted(0..300), |bb, id| {
+            bb.put_u64(id);
+        }),
+    );
 }
 
 /// A permuted copy of a nullable column, an out-of-line string and the PK: the

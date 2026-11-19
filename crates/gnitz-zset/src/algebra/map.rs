@@ -9,7 +9,7 @@ use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
 use super::int_cell;
 use super::key_pack::{FOLD_CHUNK, FoldCols, KeyPacker, locate_key_col, pk_run};
-use crate::repr::{Batch, DirectWriter, copy_runs};
+use crate::repr::{Batch, DirectWriter, MemBatch, copy_runs};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{FixedInt, TypeCode, zip_cells};
 
@@ -60,20 +60,14 @@ fn rebase_copied_strings(copies: &[ColCopy], output: &mut DirectWriter<'_>, src_
 
 /// Copy `copies` of `src` rows `0..n` onto `out` rows `0..n`, each German-string
 /// column rebased onto the heap [`Batch::carry_heap`] left at `heap_at`.
-pub(crate) fn copy_columns(
-    src: &Batch,
-    out: &mut DirectWriter<'_>,
-    copies: &[ColCopy],
-    n: usize,
-    heap_at: Option<usize>,
-) {
+pub fn copy_columns(src: &MemBatch, out: &mut DirectWriter<'_>, copies: &[ColCopy], n: usize, heap_at: Option<usize>) {
     copy_window(src, out, copies, RowWindow { src: 0, dst: 0, n });
     rebase_copied_strings(copies, out, src.blob(), heap_at);
 }
 
 /// Copy `copies` of `in_batch` onto `output` over `w`, a German-string cell
 /// verbatim: the caller rebases those columns.
-fn copy_window(in_batch: &Batch, output: &mut DirectWriter<'_>, copies: &[ColCopy], w: RowWindow) {
+fn copy_window(in_batch: &MemBatch, output: &mut DirectWriter<'_>, copies: &[ColCopy], w: RowWindow) {
     for c in copies {
         copy_column(in_batch, output, c, w);
     }
@@ -85,7 +79,7 @@ fn copy_window(in_batch: &Batch, output: &mut DirectWriter<'_>, copies: &[ColCop
 /// prologue every window pays, payload-only ones included.
 #[inline(never)]
 fn copy_column(
-    in_batch: &Batch,
+    in_batch: &MemBatch,
     output: &mut DirectWriter<'_>,
     &ColCopy {
         src: src_loc,
@@ -266,6 +260,16 @@ impl MapPlan {
         Self::from_map(prog, in_schema, out_schema, PkSource::Inherit)
     }
 
+    /// The map `ev` resolves onto `output_schema`, every row keeping its key:
+    /// `output_schema`'s key columns are its input's.
+    pub fn inheriting(ev: MapEval, output_schema: SchemaDescriptor) -> Self {
+        MapPlan {
+            ev,
+            pk_source: PkSource::Inherit,
+            output_schema,
+        }
+    }
+
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where the program computes nothing and every sink is a
     /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
@@ -326,7 +330,7 @@ impl MapPlan {
 
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
     /// NULL-keyed rows, into a fresh unconsolidated output.
-    pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
+    pub fn evaluate_map_batch(&mut self, in_batch: &MemBatch) -> Batch {
         let whole = [(0, in_batch.len())];
         let runs;
         let ranges: &[(usize, usize)] = match self.pk_source {
@@ -344,7 +348,7 @@ impl MapPlan {
 
     /// Map every `[start, end)` range of `src`, in order, onto the tail of `out`,
     /// which is in this plan's output schema.
-    pub(crate) fn append_map_ranges(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
+    pub(crate) fn append_map_ranges(&mut self, src: &MemBatch, out: &mut Batch, ranges: &[(usize, usize)]) {
         debug_assert!(
             !matches!(self.pk_source, PkSource::Pack { drop_nulls, .. } if drop_nulls != 0),
             "a NULL-dropping reindex maps through evaluate_map_batch"
@@ -354,7 +358,7 @@ impl MapPlan {
 
     /// [`Self::append_map_ranges`], every row of `ranges` mapped. Ranges too
     /// short to feed the per-window kernel are gathered into one first.
-    fn map_ranges(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
+    fn map_ranges(&mut self, src: &MemBatch, out: &mut Batch, ranges: &[(usize, usize)]) {
         let total = crate::repr::range_rows(ranges);
         if total == 0 {
             return;
@@ -368,13 +372,17 @@ impl MapPlan {
             (false, _) => 0,
         };
         let starves_kernel = ranges.len() > 1 && total < ranges.len() * compact_below;
-        let compacted = starves_kernel.then(|| Batch::from_ranges(src, ranges, 0));
+        let compacted = starves_kernel.then(|| {
+            let mut c = Batch::with_capacity(src.schema(), total);
+            c.append_ranges(src, ranges);
+            c
+        });
         let whole = [(0, total)];
-        let (src, ranges) = match &compacted {
-            Some(c) => (c, &whole[..]),
-            None => (src, ranges),
+        let (mb, ranges) = match &compacted {
+            Some(c) => (c.as_mem_batch(), &whole[..]),
+            None => (*src, ranges),
         };
-        let mb = src.as_mem_batch();
+        let src = &mb;
         // Declined, the carry reserves for relocated copies and string emits alike.
         let heap_at = out.carry_heap(&mb, self.ev.moves().string_slots(), ranges, 0);
         // The reserved rows are uninitialized: `resolve_map` gives every output

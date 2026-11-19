@@ -14,20 +14,20 @@ use crate::catalog::{CATALOG_FAMILIES, Catalog, IndexRow, idx_rows};
 use crate::client::GnitzClient;
 use crate::connection::{RelDescriptor, Request};
 use crate::error::{ClientError, absent, not_found};
-use crate::{BatchAppender, PkColumn, ProtocolError, RelName, Schema, ZSetBatch, sys_schema};
+use crate::{ProtocolError, RelName, Schema, ZSetBatch, sys_schema};
 use gnitz_wire::Target;
 
 /// The index in `schemas`, SCHEMA_TAB's rows, of the live row named
 /// `schema_name` (already canonical).
 fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Option<usize> {
-    schemas
-        .live_rows()
-        .find(|&i| payload_bytes(schemas, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
+    let rows = schemas.view();
+    rows.live_rows()
+        .find(|&i| payload_bytes(&rows, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
 }
 
 /// The id of the live schema `schema_name` (already canonical) in `schemas`.
 fn live_schema_id(schemas: &ZSetBatch, schema_name: &str) -> Option<u64> {
-    schema_row(schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.pk_bytes(at)))
+    schema_row(schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.view().get_pk_bytes(at)))
 }
 
 /// The catalog name of an unnamed index on `cols` of `table`, whose columns are
@@ -166,7 +166,7 @@ impl DdlBundle {
 
     /// `row` at `weight`, in its own family's batch.
     fn put<R: SysRow>(&mut self, row: &R, weight: i64) {
-        row.write(&mut BatchAppender::new(self.batch(R::FAMILY)), weight);
+        row.write(&mut self.batch(R::FAMILY).builder(), weight);
     }
 
     /// The relations whose descriptor the bundle changes: every row names its
@@ -174,10 +174,11 @@ impl DdlBundle {
     fn relations_written(&self) -> HashSet<u64> {
         let mut ids = HashSet::new();
         for (family, rows) in &self.0 {
+            let rows = rows.view();
             for i in 0..rows.len() {
                 ids.insert(match *family {
-                    SysFamily::Index => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
-                    _ => gnitz_wire::sys_leading_id(rows.pk_bytes(i)),
+                    SysFamily::Index => payload_u64(&rows, i, IdxTabSlot::owner_id as usize),
+                    _ => gnitz_wire::sys_leading_id(rows.get_pk_bytes(i)),
                 });
             }
         }
@@ -190,13 +191,14 @@ impl DdlBundle {
         let Some((_, b)) = self.0.iter().find(|(family, _)| *family == SysFamily::View) else {
             return Vec::new();
         };
-        let vid = |i| gnitz_wire::sys_leading_id(b.pk_bytes(i));
+        let b = b.view();
+        let vid = |i| gnitz_wire::sys_leading_id(b.get_pk_bytes(i));
         (0..b.len())
-            .filter(|&i| b.weight(i) < 0)
+            .filter(|&i| b.get_weight(i) < 0)
             .map(vid)
             .map(|v| {
                 let new = b.live_rows().find(|&j| vid(j) == v).map(|j| {
-                    payload_str(b, j, RELTAB_PAY_NAME)
+                    payload_str(&b, j, RELTAB_PAY_NAME)
                         .expect("a bundle this client built names its views")
                         .into_owned()
                 });
@@ -210,8 +212,9 @@ impl DdlBundle {
         // A German cell's offset is relative to the arena of the batch it sits
         // in, so each side is copied onto an arena laid out in key order.
         fn in_key_order(rows: &ZSetBatch) -> ZSetBatch {
-            let mut live: Vec<u32> = rows.live_rows().map(|i| i as u32).collect();
-            live.sort_unstable_by_key(|&i| rows.pk_bytes(i as usize));
+            let v = rows.view();
+            let mut live: Vec<u32> = v.live_rows().map(|i| i as u32).collect();
+            live.sort_unstable_by_key(|&i| v.get_pk_bytes(i as usize));
             rows.gathered(&live)
         }
         self.0.len() == other.0.len()
@@ -473,11 +476,12 @@ impl GnitzClient {
         if cascade {
             let ids: Vec<u64> = dropped
                 .iter()
-                .map(|&at| gnitz_wire::sys_leading_id(schemas.pk_bytes(at)))
+                .map(|&at| gnitz_wire::sys_leading_id(schemas.view().get_pk_bytes(at)))
                 .collect();
             for (family, scanned) in [(SysFamily::View, views), (SysFamily::Table, tables)] {
-                for i in scanned.live_rows() {
-                    if ids.contains(&payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID)) {
+                let scanned_rows = scanned.view();
+                for i in scanned_rows.live_rows() {
+                    if ids.contains(&payload_u64(&scanned_rows, i, RELTAB_PAY_SCHEMA_ID)) {
                         b.retract(family, &scanned, i);
                     }
                 }
@@ -570,12 +574,14 @@ impl GnitzClient {
                 let rows = self.sys_cut(families, &members).await?;
                 let standing = DdlBundle(families.into_iter().zip(rows).collect());
                 let views = &standing.0[0].1;
-                let i = views
+                let rows = views.view();
+                let i = rows
                     .live_rows()
-                    .find(|&i| gnitz_wire::sys_leading_id(views.pk_bytes(i)) == vid)
+                    .find(|&i| gnitz_wire::sys_leading_id(rows.get_pk_bytes(i)) == vid)
                     .ok_or_else(|| not_found("view", view))?;
                 let decode_err = |e| ProtocolError::DecodeError(format!("view {vid}: {e}"));
-                let row = ViewTabRow::read(views, i).map_err(decode_err)?;
+                let rows = views.view();
+                let row = ViewTabRow::read(&rows, i).map_err(decode_err)?;
                 let schema_id = row.schema_id;
                 if bundle.props.is_none() {
                     bundle.props = Some(row.parts().map_err(decode_err)?.props);
@@ -654,10 +660,11 @@ impl GnitzClient {
             let held = [(SysFamily::Table, &tables), (SysFamily::View, &views)]
                 .into_iter()
                 .find_map(|(f, rows)| {
-                    rows.live_rows()
+                    let v = rows.view();
+                    v.live_rows()
                         .find(|&i| {
-                            payload_u64(rows, i, RELTAB_PAY_SCHEMA_ID) == sid
-                                && payload_bytes(rows, i, RELTAB_PAY_NAME) == name.name().as_bytes()
+                            payload_u64(&v, i, RELTAB_PAY_SCHEMA_ID) == sid
+                                && payload_bytes(&v, i, RELTAB_PAY_NAME) == name.name().as_bytes()
                         })
                         .map(|i| (f, rows, i))
                 });
@@ -779,12 +786,11 @@ impl GnitzClient {
         key: &[u128],
         missing: impl FnOnce() -> ClientError,
     ) -> Result<(ZSetBatch, usize), ClientError> {
-        let mut keys = PkColumn::empty_for_schema(sys_schema(family));
-        keys.push_natives(key);
+        let keys = sys_schema(family).pk_keys([key]);
         let [batch] = self
-            .sys_cut([family], &ReadSpec::all_rows(ReadBound::PkSet(keys.keys())))
+            .sys_cut([family], &ReadSpec::all_rows(ReadBound::PkSet(keys)))
             .await?;
-        let i = batch.live_rows().next().ok_or_else(missing)?;
+        let i = batch.view().live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }
 }

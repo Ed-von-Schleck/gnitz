@@ -19,8 +19,12 @@ fn a_name_that_is_not_utf8_is_refused() {
         let word = gnitz_wire::PkColList::from_slice(&[0]).pack();
         for (_, col) in schema.payload_columns() {
             match col.type_code {
-                TypeCode::U64 => bb.put_u64(word),
-                _ => bb.put_blob(b"\xff\xfe"),
+                TypeCode::U64 => {
+                    bb.put_u64(word);
+                }
+                _ => {
+                    bb.put_blob(b"\xff\xfe");
+                }
             }
         }
         bb.end_row();

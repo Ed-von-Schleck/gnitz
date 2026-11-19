@@ -75,9 +75,12 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
             (3, 1, &[Some(7), Some(-5), Some(2)]),
         ],
     );
-    assert_eq!(weighted_rows(&plan.evaluate_map_batch(&input)), weighted_rows(&want));
+    assert_eq!(
+        weighted_rows(&plan.evaluate_map_batch(&input.as_mem_batch())),
+        weighted_rows(&want)
+    );
 
-    let empty = plan.evaluate_map_batch(&Batch::empty_with_schema(&in_schema));
+    let empty = plan.evaluate_map_batch(&Batch::empty_with_schema(&in_schema).as_mem_batch());
     assert_eq!((empty.len(), empty.schema()), (0, plan.output_schema()));
 }
 
@@ -94,22 +97,26 @@ fn a_string_projection_moves_content_and_leaves_a_dead_heap() {
     let mut batch = BatchBuilder::new(&in_schema);
     for (pk, strs) in rows {
         batch.begin_row(pk, 1);
-        strs.iter().for_each(|s| batch.put_string(s));
+        strs.iter().for_each(|s| {
+            batch.put_string(s);
+        });
         batch.end_row();
     }
     let batch = batch.finish();
     for cols in [&[2, 1][..], &[1]] {
         let mut plan = project(&in_schema, cols);
-        let out = plan.evaluate_map_batch(&batch);
+        let out = plan.evaluate_map_batch(&batch.as_mem_batch());
         let mut want = BatchBuilder::new(plan.output_schema());
         for (pk, strs) in rows {
             want.begin_row(pk, 1);
-            cols.iter().for_each(|&c| want.put_string(strs[c as usize - 1]));
+            cols.iter().for_each(|&c| {
+                want.put_string(strs[c as usize - 1]);
+            });
             want.end_row();
         }
         assert_eq!(weighted_rows(&out), weighted_rows(&want.finish()), "{cols:?}");
     }
-    let dropped = project(&in_schema, &[1]).evaluate_map_batch(&batch);
+    let dropped = project(&in_schema, &[1]).evaluate_map_batch(&batch.as_mem_batch());
     assert!(dropped.blob().len() < batch.blob().len(), "the dropped column's heap");
 }
 
@@ -171,11 +178,14 @@ fn a_copied_column_holds_each_rows_value_in_its_slot() {
             for (r, &v) in vals.iter().enumerate() {
                 let natives: Vec<u128> = pk.iter().map(|&ci| cell(ci, r, v)).collect();
                 batch.begin_row_natives(&natives, [1, -2, 3][r % 3]);
-                payload.iter().for_each(|&ci| batch.put_int(cell(ci, r, v)));
+                payload.iter().for_each(|&ci| {
+                    batch.put_int(cell(ci, r, v));
+                });
                 batch.end_row();
             }
             let batch = batch.finish();
-            let out = compute(&schema, LogicalProgram::copy_cols(&[c]), &[(slot, false)]).evaluate_map_batch(&batch);
+            let out = compute(&schema, LogicalProgram::copy_cols(&[c]), &[(slot, false)])
+                .evaluate_map_batch(&batch.as_mem_batch());
             let what = format!("{src} -> {slot}, PK {:?} column {c}", schema.pk_cols());
             assert_eq!(out.col_data(0), &want[..], "{what}");
             assert_eq!((out.pk(), out.weight()), (batch.pk(), batch.weight()), "{what}");
@@ -196,9 +206,15 @@ fn appended_runs_map_as_their_rows_alone() {
         b.begin_row(i as u128, [1, -1, 2][i as usize % 3]);
         b.put_opt_int((i % 5 != 0).then_some(((i * 7 % 13) as i64 - 6) as u128));
         match i % 7 {
-            0 => b.put_null(),
-            k if k % 2 == 0 => b.put_string("short"),
-            _ => b.put_string(&format!("a heap-backed string {i}")),
+            0 => {
+                b.put_null();
+            }
+            k if k % 2 == 0 => {
+                b.put_string("short");
+            }
+            _ => {
+                b.put_string(&format!("a heap-backed string {i}"));
+            }
         }
         b.put_opt_int((i % 3 != 0).then_some(i as u128));
         b.end_row();
@@ -241,10 +257,10 @@ fn appended_runs_map_as_their_rows_alone() {
         for run in [1, 20, 30, 200] {
             let ranges: Vec<(usize, usize)> = (0..N).step_by(run + 3).map(|s| (s, (s + run).min(N))).collect();
             let rows: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
-            let want = weighted_rows(&plan.evaluate_map_batch(&src.ascending_subset(&rows)));
+            let want = weighted_rows(&plan.evaluate_map_batch(&src.ascending_subset(&rows).as_mem_batch()));
             let mut out = Batch::empty_with_schema(plan.output_schema());
-            plan.append_map_ranges(&src, &mut out, &[(0, N)]);
-            plan.append_map_ranges(&src, &mut out, &ranges);
+            plan.append_map_ranges(&src.as_mem_batch(), &mut out, &[(0, N)]);
+            plan.append_map_ranges(&src.as_mem_batch(), &mut out, &ranges);
             let tail: Vec<u32> = (N as u32..out.len() as u32).collect();
             assert_eq!(
                 weighted_rows(&out.ascending_subset(&tail)),
@@ -252,7 +268,7 @@ fn appended_runs_map_as_their_rows_alone() {
                 "{name}, runs of {run}, behind held rows"
             );
             out.clear();
-            plan.append_map_ranges(&src, &mut out, &ranges);
+            plan.append_map_ranges(&src.as_mem_batch(), &mut out, &ranges);
             assert_eq!(
                 weighted_rows(&out),
                 want,
@@ -276,8 +292,12 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
     for (pk, s) in [(1u128, Some(long)), (2, Some(b"short".as_slice())), (3, None)] {
         batch.begin_row(pk, 1);
         match s {
-            Some(s) => batch.put_blob(s),
-            None => batch.put_null(),
+            Some(s) => {
+                batch.put_blob(s);
+            }
+            None => {
+                batch.put_null();
+            }
         }
         batch.end_row();
     }
@@ -295,7 +315,7 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
     )
     .unwrap();
     let mut plan = compute(&in_schema, prog, &[(TypeCode::String, true); 2]);
-    let out = plan.evaluate_map_batch(&batch);
+    let out = plan.evaluate_map_batch(&batch.as_mem_batch());
 
     let mut want = BatchBuilder::new(plan.output_schema());
     for (pk, cells) in [
@@ -331,7 +351,7 @@ fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
     let schema = make_schema_u64_i64();
     let rows = [(1, 1, 200), (2, -3, 100), (3, 1, -300)];
     let batch = make_batch(&schema, &rows);
-    let out = rekey_plan(&schema, &[1], &[1], NullKeys::Keep).evaluate_map_batch(&batch);
+    let out = rekey_plan(&schema, &[1], &[1], NullKeys::Keep).evaluate_map_batch(&batch.as_mem_batch());
     assert_eq!(out.len(), rows.len());
     for (r, &(_, w, v)) in rows.iter().enumerate() {
         assert_eq!(
@@ -385,8 +405,12 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         let (v, is_null, s, b) = rows[row % rows.len()];
         batch.begin_row(row as u128, 1);
         match is_null {
-            true => batch.put_null(),
-            false => batch.put_int(v as u128),
+            true => {
+                batch.put_null();
+            }
+            false => {
+                batch.put_int(v as u128);
+            }
         }
         batch.put_blob(s);
         batch.put_blob(b);
@@ -399,7 +423,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
     };
     let out = MapPlan::from_wire(&in_schema, &hash_row)
         .unwrap()
-        .evaluate_map_batch(&batch);
+        .evaluate_map_batch(&batch.as_mem_batch());
     assert_eq!(out.len(), batch.len());
     let pk = |row: usize| out.get_pk_bytes(row);
 
@@ -574,14 +598,17 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
         for keep in [vec![2], vec![1, 2]] {
             let run = |nulls| rekey_plan(&s, &[1], &keep, nulls);
             let mut drop = run(NullKeys::Drop);
-            let dropped = drop.evaluate_map_batch(&batch);
+            let dropped = drop.evaluate_map_batch(&batch.as_mem_batch());
             assert_eq!(dropped.schema(), drop.output_schema());
             assert_eq!(
                 weighted_rows(&dropped),
-                weighted_rows(&run(NullKeys::Keep).evaluate_map_batch(&filtered)),
+                weighted_rows(&run(NullKeys::Keep).evaluate_map_batch(&filtered.as_mem_batch())),
                 "pattern {p}"
             );
-            assert_eq!(run(NullKeys::Keep).evaluate_map_batch(&batch).len(), batch.len());
+            assert_eq!(
+                run(NullKeys::Keep).evaluate_map_batch(&batch.as_mem_batch()).len(),
+                batch.len()
+            );
         }
     }
 }

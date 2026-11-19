@@ -1,5 +1,4 @@
 use super::*;
-use gnitz_core::BatchAppender;
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// `(id PK, p0 NULL, p1 NULL, …)` rows, one `p` column per parent cell given.
@@ -10,13 +9,13 @@ fn tree(rows: &[(u64, &[Option<u64>])]) -> (ZSetBatch, Schema) {
     }
     let schema = Schema::from_parts(cols, &[0]).unwrap();
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for &(id, parents) in rows {
-        let r = app.add_row(id as u128, 1);
+        let r = app.begin_row(id as u128, 1);
         for parent in parents {
             match parent {
-                Some(p) => r.int_val(*p),
-                None => r.null(),
+                Some(p) => r.put_int((*p) as u128),
+                None => r.put_null(),
             };
         }
     }

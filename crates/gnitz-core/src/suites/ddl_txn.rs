@@ -10,7 +10,7 @@ use gnitz_wire::{PkColList, SchemaTabRow, SysFamily, SysRow};
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
     let s = sys_schema(SysFamily::Schema);
     let mut b = ZSetBatch::new(s);
-    SchemaTabRow { schema_id, name: name.into() }.write(&mut BatchAppender::new(&mut b), 1);
+    SchemaTabRow { schema_id, name: name.into() }.write(&mut b.builder(), 1);
     b
 }
 
@@ -45,7 +45,7 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
 
     let seq = sys_schema(SysFamily::Sequence);
     let mut forged = ZSetBatch::new(seq);
-    BatchAppender::new(&mut forged).add_row(2, 1).int_val(1u64 << 40);
+    forged.builder().begin_row(2, 1).put_int((1u64 << 40) as u128);
     let err = refusal(&mut s, &[(SysFamily::Sequence, forged)]);
     assert!(err.contains("not writable from the wire"), "{err}");
 
@@ -62,9 +62,9 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, tid, schema) = create_table(&mut client, schema_of(&[("id", TypeCode::U64), ("v", TypeCode::I64)]));
     let mut dup = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut dup);
-    app.add_row(1, 1).int_val(5);
-    app.add_row(2, 1).int_val(5);
+    let mut app = dup.builder();
+    app.begin_row(1, 1).put_int(5);
+    app.begin_row(2, 1).put_int(5);
     block_on(client.push(tid, &schema, &dup, WireConflictMode::Update)).unwrap();
 
     let unique_on_v = |client: &mut GnitzClient, owner: &RelName| {

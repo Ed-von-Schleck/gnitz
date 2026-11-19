@@ -47,9 +47,15 @@ fn push_group_layout_bench() {
         for pk in 0..rows as u128 {
             bb.begin_row(pk, 1);
             match cell {
-                Cell::Int => bb.put_int(pk),
-                Cell::Inline => bb.put_string(&format!("s{pk:011}")),
-                Cell::Heap => bb.put_string(&format!("a string past the inline prefix {pk:011}")),
+                Cell::Int => {
+                    bb.put_int(pk);
+                }
+                Cell::Inline => {
+                    bb.put_string(&format!("s{pk:011}"));
+                }
+                Cell::Heap => {
+                    bb.put_string(&format!("a string past the inline prefix {pk:011}"));
+                }
             }
             bb.end_row();
         }

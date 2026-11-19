@@ -70,14 +70,14 @@ fn a_map_keeps_key_and_weight_and_fills_each_slot() {
             &src,
             &[(&[(-5i64) as u128], 1, &[Int(7), Str(LONG)]), (&[3], 2, &[Null, Null])],
         );
-        let pks = b.pk_region().to_vec();
+        let pks = b.view().pk().to_vec();
         let mut map = map_of(&src, items);
         let out = map.apply(b);
-        assert_eq!(out.pk_region(), pks, "{items:?}");
+        assert_eq!(out.view().pk(), pks, "{items:?}");
         let want: Vec<_> = want.into_iter().map(Vec::from).zip([1, 2]).collect();
         assert_eq!(rows_of(map.out_schema(), &out), want, "{items:?}");
         if let Some(n) = want_blob {
-            assert_eq!(out.heap().len(), n, "{items:?}");
+            assert_eq!(out.view().blob().len(), n, "{items:?}");
         }
     }
 }

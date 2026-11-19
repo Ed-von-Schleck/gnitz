@@ -169,11 +169,11 @@ fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
 
 /// [`held`]'s fold over one reply batch.
 fn rows_of(batch: &ZSetBatch) -> BTreeMap<(u64, i64), i64> {
-    let vals = batch.col(0);
+    let vals = batch.view().col_data(0);
     let mut out = BTreeMap::new();
     for row in 0..batch.len() {
         let pk = batch.pk(row) as u64;
-        *out.entry((pk, gnitz_wire::read_i64_le(vals, row * 8))).or_insert(0) += batch.weight(row);
+        *out.entry((pk, gnitz_wire::read_i64_le(vals, row * 8))).or_insert(0) += batch.view().get_weight(row);
     }
     out.retain(|_, w| *w != 0);
     out

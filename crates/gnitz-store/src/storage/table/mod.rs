@@ -36,11 +36,11 @@ use super::Cut;
 use super::manifest::RecoverySource;
 use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
+use gnitz_trace::runs::StorageError;
+use gnitz_trace::runs::{PkSetGather, ReadCursor, empty_cursor, from_runs, from_runs_at, from_runs_in_band};
+use gnitz_trace::runs::{Run, StoredRow};
 use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{PkSetGather, ReadCursor, empty_cursor, from_runs, from_runs_at, from_runs_in_band};
-use gnitz_zset::repr::{Run, StoredRow};
 use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::schema::{group_band, probe_key, range_band};
 

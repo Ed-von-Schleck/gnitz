@@ -117,12 +117,6 @@ fn canonical_short_cell(src: &[u8; 16]) -> Option<[u8; 16]> {
     None
 }
 
-/// Every cell of German-string region `cells`, a run of whole 16-byte cells, is
-/// canonical against `blob`.
-pub fn german_string_region_ok(cells: &[u8], blob: &[u8]) -> bool {
-    cells.as_chunks::<16>().0.iter().all(|c| german_string_cell_ok(c, blob))
-}
-
 /// `cell`, re-homed from `src_blob`: a short cell with its pad zeroed, a long
 /// one pointing at the offset `place` returns for its content. A long cell
 /// overrunning `src_blob` becomes the empty string, as

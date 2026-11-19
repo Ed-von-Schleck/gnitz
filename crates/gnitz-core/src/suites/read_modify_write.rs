@@ -3,7 +3,7 @@
 //! autocommit while `b` writes around it.
 
 use super::*;
-use crate::{PkColumn, RelDescriptor};
+use crate::RelDescriptor;
 use gnitz_wire::{WireStatus, write_u64_le};
 
 struct Fixture {
@@ -28,22 +28,25 @@ fn boot() -> Fixture {
 fn commit(client: &mut GnitzClient, target: &RelDescriptor, pk: u128, val: i64) {
     let s = &target.schema;
     let mut batch = ZSetBatch::new(s);
-    BatchAppender::new(&mut batch).add_row(pk, 1).int_val(val);
+    batch.builder().begin_row(pk, 1).put_int(val as u128);
     block_on(client.push(target.tid, s, &batch, WireConflictMode::Update)).unwrap();
 }
 
 /// `a`'s read of pk 1 and its `val + 1` build, which calls `side` first.
 fn run_increment(f: &mut Fixture, side: impl FnOnce(&mut GnitzClient, &RelDescriptor)) -> Result<usize, ClientError> {
     let s = Arc::clone(&f.target.schema);
-    let keys = PkColumn::from_natives(&s, [1]).keys();
+    let keys = s.pk_keys([[1]]);
     let Fixture { a, b, target, .. } = f;
     block_on(
         a.read_modify_write(target, ReadBound::PkSet(keys), Vec::new(), false, |mut rows| {
             side(&mut *b, target);
-            for r in 0..rows.len() {
-                let v = read_i64_le(rows.col(0), r * 8);
-                write_u64_le(rows.col_mut(0), r * 8, (v + 1) as u64);
-            }
+            rows.rewrite(|w| {
+                let col = w.col_mut(0);
+                for r in 0..col.len() / 8 {
+                    let v = read_i64_le(col, r * 8);
+                    write_u64_le(col, r * 8, (v + 1) as u64);
+                }
+            });
             Ok::<_, ClientError>(rows)
         }),
     )

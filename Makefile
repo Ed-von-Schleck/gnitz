@@ -69,8 +69,8 @@ test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integrat
 	cd crates && cargo test --workspace --exclude gnitz-py --exclude gnitz-fuzz $(INTEGRATION) $(T)
 	cd crates && cargo test -p gnitz-fuzz $(T)
 
-rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-store + gnitz-server tests (faster inner loop)
-	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-store -p gnitz-server $(T)
+rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-trace + gnitz-store + gnitz-server tests (faster inner loop)
+	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-trace -p gnitz-store -p gnitz-server $(T)
 
 fmt: ## Format the whole workspace
 	cd crates && cargo fmt --all

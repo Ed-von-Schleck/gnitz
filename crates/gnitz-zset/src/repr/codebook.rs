@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::{HeapValue, MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable, push_coded, push_codes};
+use gnitz_wire::{HeapValue, MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable, push_coded, push_codes, symbols_head_len};
 
 use super::batch::Batch;
 
@@ -19,7 +19,7 @@ const _: () = assert!(
 
 /// Long-value bytes a heap must hold before a table is trained over it: below
 /// four full tables, the table alone takes a quarter of them.
-const MIN_CODED_HEAP: usize = 4 * super::shard::symbols_head_len(MAX_SYMBOLS);
+const MIN_CODED_HEAP: usize = 4 * symbols_head_len(MAX_SYMBOLS);
 
 /// Plain bytes of the values sampled to price a table against a batch.
 const PROBE_BYTES: usize = 16 << 10;
@@ -41,7 +41,7 @@ pub struct Codebook {
 impl Codebook {
     /// The codebook of a table read back, its symbols and their lengths, which
     /// coded its training values to `trained_sixteenths`.
-    pub(crate) fn rebuilt<'s>(
+    pub fn rebuilt<'s>(
         symbols: impl Iterator<Item = (&'s [u8; MAX_SYMBOL_LEN], u8)>,
         trained_sixteenths: usize,
     ) -> Self {
@@ -61,7 +61,7 @@ impl Codebook {
     }
 
     /// The table, as a decoder reads it.
-    pub(crate) fn table(&self) -> &SymbolTable {
+    pub fn table(&self) -> &SymbolTable {
         &self.table
     }
 
@@ -72,12 +72,12 @@ impl Codebook {
 
     /// How the table coded a probe of its training values, in sixteenths of
     /// their plain bytes.
-    pub(crate) fn trained_sixteenths(&self) -> usize {
+    pub fn trained_sixteenths(&self) -> usize {
         self.trained_sixteenths
     }
 
     /// Append `value`'s codes to `dst`.
-    pub(crate) fn encode_into(&self, value: &[u8], dst: &mut Vec<u8>) {
+    pub fn encode_into(&self, value: &[u8], dst: &mut Vec<u8>) {
         let at = dst.len();
         // Every byte an escape, at worst: two code bytes each.
         dst.reserve(2 * value.len());

@@ -16,7 +16,7 @@ use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{ColType, ColumnDef, TypeCode, VALUE_TEXT_MAX, write_decimal, write_uuid};
+use gnitz_wire::{ColType, ColumnDef, RowSource, TypeCode, VALUE_TEXT_MAX, write_decimal, write_uuid};
 
 use crate::schema::PySchema;
 
@@ -272,7 +272,13 @@ fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
 }
 
 /// The cell at `loc` in `row`, PK or payload.
-fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> PyResult<Py<PyAny>> {
+fn cell_to_py(
+    py: Python<'_>,
+    batch: &impl RowSource,
+    loc: ColumnLocator,
+    ty: ColType,
+    row: usize,
+) -> PyResult<Py<PyAny>> {
     if loc.is_null(batch, row) {
         return Ok(py.None());
     }
@@ -422,13 +428,14 @@ impl PyRowIterator {
             return Ok(None);
         }
         self.row_buf.clear();
+        let rows = batch.view();
         for &(loc, ty) in &data.cols {
-            self.row_buf.push(cell_to_py(py, batch, loc, ty, row)?);
+            self.row_buf.push(cell_to_py(py, &rows, loc, ty, row)?);
         }
         // `drain` hands the values over already-owned, so the tuple build costs no
         // refcount traffic, and the Vec keeps its capacity for the next row.
         let values = PyTuple::new(py, self.row_buf.drain(..))?;
-        let obj = data.row_type.row(py, values, batch.weight(row))?;
+        let obj = data.row_type.row(py, values, rows.get_weight(row))?;
         self.pos += 1;
         Ok(Some(obj))
     }

@@ -8,19 +8,19 @@ use gnitz_wire::{PkSortKey, RowSource, pk_width_dispatch};
 /// every row. `base` itself need not lie inside the column: a decoded window is
 /// rebased so that its first row lands on its first cell.
 #[derive(Clone, Copy)]
-pub(crate) struct ColPtr {
+pub struct ColPtr {
     pub base: *const u8,
     pub stride: usize,
 }
 
 /// The bytes a column of zero cells reads, any cell width up to its length.
-pub(crate) static ZERO_CELL: [u8; 16] = [0; 16];
+pub static ZERO_CELL: [u8; 16] = [0; 16];
 
 impl ColPtr {
     /// A column whose every row reads zero cells of up to `ZERO_CELL.len()`
     /// bytes.
     #[inline(always)]
-    pub(crate) fn zeroes() -> Self {
+    pub fn zeroes() -> Self {
         ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }
     }
 
@@ -36,7 +36,7 @@ impl ColPtr {
     /// Row `i` is a row of a live column this addresses, and `len` does not
     /// exceed its element width.
     #[inline(always)]
-    pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
+    pub unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
         // SAFETY: the caller's contract above.
         unsafe { std::slice::from_raw_parts(self.row_ptr(i), len) }
     }
@@ -46,7 +46,7 @@ impl ColPtr {
     ///
     /// # Safety
     /// Those rows are rows of a live column this addresses.
-    pub(crate) unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
+    pub unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
         if self.stride != 0 {
             // SAFETY: the caller's contract above.
             return dst.copy_from_slice(unsafe { std::slice::from_raw_parts(self.row_ptr(start), dst.len()) });
@@ -70,7 +70,7 @@ impl ColPtr {
 /// Lower bound over `[lo, hi)`: the first index whose row sorts at-or-after the
 /// probe, where `lt(i)` reports row `i < probe`.
 #[inline]
-pub(crate) fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) -> bool) -> usize {
+pub fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) -> bool) -> usize {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if lt(mid) {
@@ -100,7 +100,7 @@ pub(crate) fn gallop_from(count: usize, mut lo: usize, lt: impl Fn(usize) -> boo
 /// Lower bound over `[0, count)`, galloping from `hint` where there is one, which
 /// may be any row. `lt(i)` reports row `i < probe`, as in [`lower_bound_by`].
 #[inline]
-pub(crate) fn gallop_by(count: usize, hint: Option<usize>, lt: impl Fn(usize) -> bool) -> usize {
+pub fn gallop_by(count: usize, hint: Option<usize>, lt: impl Fn(usize) -> bool) -> usize {
     let Some(hint) = hint else {
         return lower_bound_by(0, count, lt);
     };
@@ -120,13 +120,7 @@ pub(crate) fn gallop_by(count: usize, hint: Option<usize>, lt: impl Fn(usize) ->
 /// # Safety
 /// `pk` must address at least `count` rows of `width` bytes.
 #[inline]
-pub(crate) unsafe fn seek_lower_bound(
-    count: usize,
-    width: usize,
-    pk: ColPtr,
-    key: &[u8],
-    hint: Option<usize>,
-) -> usize {
+pub unsafe fn seek_lower_bound(count: usize, width: usize, pk: ColPtr, key: &[u8], hint: Option<usize>) -> usize {
     debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
     pk_width_dispatch!(width, |K| {
         let p = K::from_opk(key);
@@ -141,13 +135,7 @@ pub(crate) unsafe fn seek_lower_bound(
 /// # Safety
 /// As [`seek_lower_bound`].
 #[inline]
-pub(crate) unsafe fn seek_pk_rows(
-    count: usize,
-    width: usize,
-    pk: ColPtr,
-    key: &[u8],
-    hint: Option<usize>,
-) -> Range<usize> {
+pub unsafe fn seek_pk_rows(count: usize, width: usize, pk: ColPtr, key: &[u8], hint: Option<usize>) -> Range<usize> {
     debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
     // SAFETY: the caller's contract above; every row read is below `count`.
     let row = |i| unsafe { pk.row(i, width) };
@@ -165,7 +153,7 @@ pub(crate) unsafe fn seek_pk_rows(
 /// The first row past `start` of a PK-sorted source not sharing row `start`'s
 /// leading `width` key bytes.
 #[inline]
-pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
+pub fn pk_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
     let count = src.row_count();
     debug_assert!(start < count, "pk_group_end: row {start} out of {count}");
     let k = &src.get_pk_bytes(start)[..width];

@@ -14,9 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, ScanReply, Schema, Sent, ZSetBatch,
-};
+use gnitz_core::{ClientError, GnitzClient, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, ScanReply, Schema, Sent, ZSetBatch};
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::DeltaCursor;
@@ -35,9 +33,9 @@ fn schema() -> Arc<Schema> {
 /// `rows` keys at weight 1. A row is its key, its weight and its null word.
 fn batch(schema: &Schema, rows: usize) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for pk in 0..rows {
-        app.add_row(pk as u128, 1);
+        app.begin_row(pk as u128, 1);
     }
     batch
 }
@@ -541,7 +539,7 @@ fn cancel_a_sync(delivered: bool) {
     let (rows, at) = pushed.result.as_ref().expect("the subscription is held");
     assert_eq!((pushed.sub, at.tick.get()), (sub, 12), "under the later cursor");
     let rows: Vec<(u128, i64)> = (0..rows.batch.len())
-        .map(|i| (rows.batch.pk(i), rows.batch.weight(i)))
+        .map(|i| (rows.batch.pk(i), rows.batch.view().get_weight(i)))
         .collect();
     assert_eq!(rows, [(1, 1), (2, 2), (1, -1)], "the cancelled sync's rows first");
 }

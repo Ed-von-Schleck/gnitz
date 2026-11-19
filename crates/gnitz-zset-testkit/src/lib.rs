@@ -7,5 +7,8 @@ mod zset;
 #[path = "../../gnitz-zset/src/test_support/ladder.rs"]
 mod ladder;
 
+#[path = "../../gnitz-zset/src/test_support/stream_input.rs"]
+pub mod stream_input;
+
 pub use ladder::*;
 pub use zset::*;

@@ -137,9 +137,11 @@ fn a_text_table_past_one_frame_reads_back_whole() {
     // Binary push, not `INSERT … VALUES`: the parse cost would dominate.
     let text = "x".repeat(800);
     let mut batch = ZSetBatch::new(&rel.schema);
-    let mut app = gnitz_core::BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for id in 0..ROWS {
-        app.add_row(id as u128, 1).int_val(id % GROUPS).str_val(&text);
+        app.begin_row(id as u128, 1)
+            .put_int((id % GROUPS) as u128)
+            .put_string(&text);
     }
     block_on(
         db.client
@@ -163,11 +165,11 @@ fn a_text_table_past_one_frame_reads_back_whole() {
         );
         assert_eq!(cell(&schema, &batch, v_ci, row) as u64, id % GROUPS, "row {row}");
         assert_eq!(
-            gnitz_wire::german_string_content(s.german_cell(&batch, row), batch.heap()),
+            gnitz_wire::german_string_content(s.german_cell(&batch.view(), row), batch.view().blob()),
             text.as_bytes(),
             "row {row}"
         );
-        assert_eq!(batch.weight(row), 1, "row {row}");
+        assert_eq!(batch.view().get_weight(row), 1, "row {row}");
     }
 
     let count = |db: &mut Db, pred: &str| db.rows(&format!("SELECT COUNT(*) AS n FROM t {pred}"), &["n"]);

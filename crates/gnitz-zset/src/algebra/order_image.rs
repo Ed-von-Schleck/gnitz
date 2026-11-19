@@ -54,14 +54,14 @@ impl WideKind {
 /// One column as an ordered index keys it: where it lies, how its image is
 /// encoded, and whether the image is complemented, which reverses its order.
 #[derive(Clone, Copy)]
-pub(crate) struct ImageCol {
-    pub(crate) loc: ColumnLocator,
+pub struct ImageCol {
+    pub loc: ColumnLocator,
     kind: ImageKind,
     invert: bool,
 }
 
 impl ImageCol {
-    pub(crate) fn new(loc: ColumnLocator, invert: bool) -> Self {
+    pub fn new(loc: ColumnLocator, invert: bool) -> Self {
         ImageCol {
             loc,
             kind: ImageKind::of(loc.type_code()),
@@ -70,18 +70,18 @@ impl ImageCol {
     }
 
     /// Whether the image outgrows a scalar's 8-byte slot.
-    pub(crate) fn is_wide(&self) -> bool {
+    pub fn is_wide(&self) -> bool {
         matches!(self.kind, ImageKind::Wide(_))
     }
 
     /// Whether a key slot holds the image whole: every kind's but a byte string's.
-    pub(crate) fn fits_slot(&self) -> bool {
+    pub fn fits_slot(&self) -> bool {
         self.kind != ImageKind::Wide(WideKind::Bytes)
     }
 
     /// Append `row`'s image, **known non-NULL**.
     #[inline]
-    pub(crate) fn append(&self, src: &impl RowSource, row: usize, out: &mut Vec<u8>) {
+    pub fn append(&self, src: &impl RowSource, row: usize, out: &mut Vec<u8>) {
         let ImageCol { loc, kind, invert } = self;
         match *kind {
             ImageKind::Scalar(kind) => out.extend_from_slice(&scalar_image(loc, kind, *invert, src, row).to_be_bytes()),
@@ -94,7 +94,7 @@ impl ImageCol {
     /// slot `slot`, zero-padded or cut to its width. A byte string's whole image
     /// is appended to `whole`.
     #[inline(always)]
-    pub(crate) fn write_slot(&self, src: &impl RowSource, row: usize, slot: &mut [u8], whole: &mut Vec<u8>) {
+    pub fn write_slot(&self, src: &impl RowSource, row: usize, slot: &mut [u8], whole: &mut Vec<u8>) {
         let ImageCol { loc, kind, invert } = self;
         match *kind {
             ImageKind::Scalar(kind) => {
@@ -122,7 +122,7 @@ impl ImageCol {
     /// column at a time: the `n`-th row's image into the `slot`-byte window at
     /// `at` of the `n`-th `stride`-byte key of `keys`. `false`, writing nothing,
     /// for a wide image, which takes [`Self::write_slot`] a row at a time.
-    pub(crate) fn write_slots(
+    pub fn write_slots(
         &self,
         mb: &MemBatch,
         runs: &[(usize, usize)],
@@ -179,12 +179,12 @@ impl ImageCol {
 
 /// The index PK column [`ImageCol::write_slot`] fills with an image's leading bytes:
 /// a scalar image whole, a wide one's first 16 bytes.
-pub(crate) const fn image_slot_col(wide: bool) -> SchemaColumn {
+pub const fn image_slot_col(wide: bool) -> SchemaColumn {
     SchemaColumn::new(if wide { TypeCode::U128 } else { TypeCode::U64 }, false)
 }
 
 /// A whole image as a payload column: a BLOB orders by content.
-pub(crate) const IMAGE_COL: SchemaColumn = SchemaColumn::new(TypeCode::Blob, false);
+pub const IMAGE_COL: SchemaColumn = SchemaColumn::new(TypeCode::Blob, false);
 
 /// The native bytes of the wide column at `loc` in `row`: a string's content,
 /// or the 16-byte little-endian integer.

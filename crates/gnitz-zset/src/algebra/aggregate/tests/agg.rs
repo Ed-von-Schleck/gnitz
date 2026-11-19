@@ -95,10 +95,18 @@ fn the_column_kernels_match_a_step_per_row() {
         for (pi, &tc) in tcs.iter().enumerate() {
             let v = rng.next_u64();
             match tc {
-                _ if nulls >> pi & 1 == 1 => b.put_null(),
-                TypeCode::F32 => b.put_float(f64::from((v as i32) as f32 / 7.0)),
-                TypeCode::F64 => b.put_float((v as i64) as f64 / 7.0),
-                _ => b.put_int(le_cell(&v.to_le_bytes()[..schema.columns()[pi + 1].size()])),
+                _ if nulls >> pi & 1 == 1 => {
+                    b.put_null();
+                }
+                TypeCode::F32 => {
+                    b.put_float(f64::from((v as i32) as f32 / 7.0));
+                }
+                TypeCode::F64 => {
+                    b.put_float((v as i64) as f64 / 7.0);
+                }
+                _ => {
+                    b.put_int(le_cell(&v.to_le_bytes()[..schema.columns()[pi + 1].size()]));
+                }
             }
         }
         b.end_row();

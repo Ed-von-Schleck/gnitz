@@ -2,10 +2,11 @@
 //! rows and the retraction of one, column records, schema and relation names.
 
 use gnitz_store::relation::{Cut, Relation};
+use gnitz_trace::runs::{ReadCursor, StoredRow};
 use gnitz_wire::{
     CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot, TableTabRow, payload_bytes, payload_str, payload_u64,
 };
-use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
+use gnitz_zset::repr::Batch;
 
 use super::CatalogEngine;
 use super::sys_tables::{SysFamily, SysFamilyExt};

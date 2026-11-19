@@ -7,11 +7,11 @@
 use std::rc::Rc;
 
 use gnitz_store::relation::{CircuitState, StateIdx, StateLayout};
+use gnitz_trace::stream;
 use gnitz_wire::ClampKind;
 use gnitz_zset::algebra::{MapPlan, ScatterPlan};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
-use gnitz_zset::stream;
 
 mod builder;
 mod exec;

@@ -15,18 +15,17 @@ use pyo3::impl_::extract_argument::argument_extraction_error;
 use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 
-use gnitz_core::{PkColumn, Schema, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use gnitz_sql::{Placed, place_scaled};
-use gnitz_wire::{ColType, ColumnDef, FixedInt, MAX_PK_COLUMNS, TypeCode, parse_decimal_text};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, MAX_PK_COLUMNS, PkKeys, TypeCode, parse_decimal_text};
 
 use crate::read::{PyScanResult, present};
 use crate::schema::PySchema;
 
-/// The lookup keys `pks` as a `PkColumn` for `schema`: a single-column key is
-/// its value, a compound key a tuple of its column values in PK order.
-pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
-    let mut pk_col = PkColumn::empty_for_schema(schema);
-    pk_col.reserve(pks.len());
+/// The keys `pks` names, of `schema`: a single-column key is its value, a compound key a
+/// tuple of its column values in PK order.
+pub(crate) fn py_pk_keys(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkKeys> {
+    let mut keys = Vec::with_capacity(pks.len());
     for pk in pks {
         let tuple;
         let vals = if schema.pk_cols().len() == 1 {
@@ -52,9 +51,9 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
             }
             *native = py_native(col.ty, v, Inexact::Refuse)?;
         }
-        pk_col.push_natives(&natives[..vals.len()]);
+        keys.push(natives);
     }
-    Ok(pk_col)
+    Ok(schema.pk_keys(keys.iter().map(|n| &n[..schema.pk_cols().len()])))
 }
 
 /// Rows being built for a push; `append`/`extend` encode each row as it is added.
@@ -316,33 +315,30 @@ impl RowWriter {
             }
             *native = py_native(ty, &v, Inexact::Round)?;
         }
-        // The open row's cells start zero: a filler's and a NULL's cell are left as they are.
-        let mut row = batch.open_row();
-        row.key_natives(&natives[..plan.pks.len()]);
-        let mut nulls = 0u64;
-        // `enumerate`, because the dense payload index is the null-bitmap bit
-        // position.
-        for (payload_idx, &PayloadPlan { ci, ty, nullable, src }) in plan.payload.iter().enumerate() {
+        let mut row = batch.builder();
+        row.begin_row_natives(&natives[..plan.pks.len()], weight);
+        // Slot order: the dense payload index is the null-bitmap bit position.
+        for &PayloadPlan { ci, ty, nullable, src } in &plan.payload {
             let v = match src {
-                PayloadSrc::Filler => continue,
+                PayloadSrc::Filler => {
+                    row.put_zero();
+                    continue;
+                }
                 PayloadSrc::Arg(i) => Some(arg(i)),
                 PayloadSrc::Absent => None,
             };
             match v {
                 Some(v) if !v.is_none() => {
-                    let (cell, heap) = row.cell_and_heap(payload_idx);
-                    write_column_value(cell, heap, ty, &v)?
+                    row.put_cell(|cell, heap| write_column_value(cell, heap, ty, &v))?;
                 }
                 _ => {
                     if !nullable {
                         return Err(not_nullable_err(&schema.columns()[ci].name));
                     }
-                    gnitz_wire::null_word_set(&mut nulls, payload_idx, true);
+                    row.put_null();
                 }
             }
         }
-        row.weight(weight).null_word(nulls);
-        row.commit();
         Ok(())
     }
 

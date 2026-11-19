@@ -13,8 +13,12 @@ fn run(schema: &SchemaDescriptor, rows: impl Iterator<Item = (u64, i64)>) -> Bat
     for (pk, weight) in rows {
         b.begin_row(pk as u128, weight);
         match schema.string_payload_slots() {
-            0 => b.put_int(pk as u128),
-            _ => b.put_string(&format!("{pk:040}")),
+            0 => {
+                b.put_int(pk as u128);
+            }
+            _ => {
+                b.put_string(&format!("{pk:040}"));
+            }
         }
         b.end_row();
     }

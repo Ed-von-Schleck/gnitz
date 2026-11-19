@@ -6,6 +6,7 @@ use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
 use gnitz_foundation::rng::{Rng, mix};
+use gnitz_trace::runs::write_shard;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::probe_key;
@@ -167,7 +168,7 @@ fn assert_stable(len: u64) {
 /// stamped `stamp`.
 fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
     let entry = idx
-        .write_with(Some(stamp), None, |path, opts| batch.write_as_shard(path, opts))
+        .write_with(Some(stamp), None, |path, opts| write_shard(batch, path, opts))
         .unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
     idx.dir.mark_published();
@@ -1431,7 +1432,7 @@ fn a_vertical_over_target_writes_its_parts_directly() {
 // Randomized model test
 // ---------------------------------------------------------------------------
 
-use gnitz_zset::repr::{Run, from_runs};
+use gnitz_trace::runs::{Run, from_runs};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Elem = (Vec<u8>, i64);

@@ -115,10 +115,10 @@ fn resident_footprint_bench() {
     let big = block_on(fx.direct.resolve_relation(&rel("s", "big"))).expect("resolve");
     for lo in (0..ROWS).step_by(SLICE as usize) {
         let mut batch = gnitz_core::ZSetBatch::new(&big.schema);
-        let mut rows = gnitz_core::BatchAppender::new(&mut batch);
+        let mut rows = batch.builder();
         for id in lo..lo + SLICE {
             // Distinct per row, or a shard stores the column as one value.
-            rows.add_row(id, 1).str_val(&format!("{id:0>200}"));
+            rows.begin_row(id, 1).put_string(&format!("{id:0>200}"));
         }
         block_on(
             fx.direct

@@ -31,7 +31,7 @@ use crate::hir::{AdhocRead, AdhocShape, FoldPieces, RowsReply, bind_adhoc_read};
 use crate::project::compute_map;
 use crate::tail::extract_limit_offset;
 use crate::validate::{QueryEnvelope, reject_unhonored_query_clauses};
-use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, WeightSlots};
 use sqlparser::ast::Query;
 use std::num::NonZeroU64;
@@ -245,7 +245,7 @@ fn walks_in_pk_order(bound: &ReadBound, pk_cols: &[u32]) -> bool {
 fn plan_constant(rows: RowsReply) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
     let (mut map, _) = ClientMap::over(rows)?;
     let mut ground_row = ZSetBatch::with_capacity(map.src(), 1);
-    BatchAppender::new(&mut ground_row).add_row(gnitz_wire::global_group_key(), 1);
+    ground_row.builder().begin_row(gnitz_wire::global_group_key(), 1);
     Ok((Arc::clone(map.out_schema()), map.apply(ground_row)))
 }
 

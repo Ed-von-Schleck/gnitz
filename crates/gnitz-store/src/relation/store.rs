@@ -3,7 +3,8 @@
 
 use super::feed::Feed;
 use crate::storage::Table;
-use gnitz_zset::repr::{Batch, StorageError};
+use gnitz_trace::runs::StorageError;
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// This process's rows of one relation.

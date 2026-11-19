@@ -163,15 +163,17 @@ impl Catalog {
         let [schemas, tables, views, columns, indices, circuits] = families;
 
         let mut schema_names: HashMap<u64, String> = HashMap::new();
-        for i in schemas.live_rows() {
-            let r = SchemaTabRow::read(schemas, i).map_err(|e| bad(format_args!("schema row {i}"), e))?;
+        let rows = schemas.view();
+        for i in rows.live_rows() {
+            let r = SchemaTabRow::read(&rows, i).map_err(|e| bad(format_args!("schema row {i}"), e))?;
             schema_names.insert(r.schema_id, r.name.into_owned());
         }
         let schema_of = |id: u64| schema_names.get(&id).cloned().unwrap_or_default();
 
         let mut relations = Vec::new();
-        for i in tables.live_rows() {
-            let r = TableTabRow::read(tables, i).map_err(|e| bad(format_args!("table row {i}"), e))?;
+        let rows = tables.view();
+        for i in rows.live_rows() {
+            let r = TableTabRow::read(&rows, i).map_err(|e| bad(format_args!("table row {i}"), e))?;
             let props = r.props().map_err(|e| bad(format_args!("table '{}'", r.name), e))?;
             relations.push(CatalogRelation::new(
                 r.table_id,
@@ -183,8 +185,9 @@ impl Catalog {
         }
         // Each chain member's owner: itself for a user view.
         let mut chain_of: HashMap<u64, u64> = HashMap::new();
-        for i in views.live_rows() {
-            let r = ViewTabRow::read(views, i).map_err(|e| bad(format_args!("view row {i}"), e))?;
+        let rows = views.view();
+        for i in rows.live_rows() {
+            let r = ViewTabRow::read(&rows, i).map_err(|e| bad(format_args!("view row {i}"), e))?;
             let ViewParts { props, owner, .. } = r.parts().map_err(|e| bad(format_args!("view '{}'", r.name), e))?;
             chain_of.insert(r.view_id, owner.unwrap_or(r.view_id));
             if owner.is_none() {
@@ -203,8 +206,9 @@ impl Catalog {
 
         // Key order is `(owner_id, col_idx)`, so each owner's columns arrive in
         // schema order, every position once.
-        for i in columns.live_rows() {
-            let r = ColTabRow::read(columns, i).map_err(|e| bad(format_args!("column row {i}"), e))?;
+        let rows = columns.view();
+        for i in rows.live_rows() {
+            let r = ColTabRow::read(&rows, i).map_err(|e| bad(format_args!("column row {i}"), e))?;
             let what = format_args!("column {} of {}", r.col_idx, r.owner_id);
             if let Some(&at) = slot_of.get(&r.owner_id) {
                 r.append_to(&mut relations[at].columns).map_err(|e| bad(what, e))?;
@@ -215,8 +219,9 @@ impl Catalog {
                 relations[at].indexes.push(index);
             }
         }
-        for i in circuits.live_rows() {
-            let Ok(r) = CircuitRow::read(circuits, i);
+        let rows = circuits.view();
+        for i in rows.live_rows() {
+            let Ok(r) = CircuitRow::read(&rows, i);
             let circuit =
                 Circuit::decode(&r.circuit).map_err(|e| bad(format_args!("circuit of view {}", r.view_id), e))?;
             let Some(&view) = chain_of.get(&r.view_id) else {
@@ -244,10 +249,10 @@ impl Catalog {
 
 /// The live rows of `batch`, a read of IDX_TAB, each with its index in `batch`.
 pub(crate) fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, ProtocolError> {
-    batch
-        .live_rows()
+    let rows = batch.view();
+    rows.live_rows()
         .map(|i| {
-            let r = IdxTabRow::read(batch, i).map_err(|e| bad(format_args!("index row {i}"), e))?;
+            let r = IdxTabRow::read(&rows, i).map_err(|e| bad(format_args!("index row {i}"), e))?;
             let index = IndexRow {
                 owner: r.owner_id,
                 name: r.name.into_owned(),

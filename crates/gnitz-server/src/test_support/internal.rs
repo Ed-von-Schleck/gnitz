@@ -7,12 +7,13 @@
 use crate::catalog::{CatalogEngine, DdlBundle, PUBLIC_SCHEMA_ID, SysFamily, SysFamilyExt, ZoneError};
 use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_trace::runs::ReadCursor;
 use gnitz_wire::{
     CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, PkColList, SchemaTabRow,
     SysRow, TableProps, TableTabRow, TypeCode, ViewTabRow,
 };
 use gnitz_zset::algebra::Placement;
-use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Relation `id`, a `kind` over `schema` placed by its full PK.
@@ -626,8 +627,12 @@ pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], wei
     bb.begin_row_natives(&key.map(u128::from)[..schema.pk_cols().len()], weight);
     for (pi, col) in schema.payload_columns() {
         match col.type_code {
-            TypeCode::U64 => bb.put_u64(cell(pi)),
-            _ => bb.put_string(&format!("payload_cell_{}", cell(pi))),
+            TypeCode::U64 => {
+                bb.put_u64(cell(pi));
+            }
+            _ => {
+                bb.put_string(&format!("payload_cell_{}", cell(pi)));
+            }
         }
     }
     bb.end_row();
@@ -749,7 +754,7 @@ pub fn join_chain_under_a_reduce(engine: &mut CatalogEngine, t: u64, u: u64) -> 
         AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
         AggDescriptor::COUNT_STAR,
     ];
-    let reduced = *gnitz_zset::stream::ReducePlan::from_wire(&joined_schema, &[0], &aggs, false)
+    let reduced = *gnitz_trace::stream::ReducePlan::from_wire(&joined_schema, &[0], &aggs, false)
         .unwrap()
         .output_schema();
     let reduce = |segment| {
@@ -809,10 +814,10 @@ pub fn register_count_of(
     schema: &SchemaDescriptor,
     group_cols: &[u32],
     name: &str,
-) -> (u64, gnitz_zset::stream::ReducePlan) {
+) -> (u64, gnitz_trace::stream::ReducePlan) {
     let aggs = [gnitz_wire::AggDescriptor::COUNT_STAR];
     // Only a global reduce owes a ground row; `ReducePlan` refuses one on a grouped reduce.
-    let plan = gnitz_zset::stream::ReducePlan::from_wire(schema, group_cols, &aggs, group_cols.is_empty()).unwrap();
+    let plan = gnitz_trace::stream::ReducePlan::from_wire(schema, group_cols, &aggs, group_cols.is_empty()).unwrap();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
     circuit.reduce(

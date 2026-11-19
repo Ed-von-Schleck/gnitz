@@ -48,8 +48,12 @@ fn preflight_probe_bench() {
             for &i in &ids {
                 bb.begin_row(i as u128, 1);
                 match payload {
-                    TypeCode::UUID => bb.put_int(mix(i) as u128 | (i as u128) << 64),
-                    _ => bb.put_int(i as u128),
+                    TypeCode::UUID => {
+                        bb.put_int(mix(i) as u128 | (i as u128) << 64);
+                    }
+                    _ => {
+                        bb.put_int(i as u128);
+                    }
                 }
                 bb.end_row();
             }

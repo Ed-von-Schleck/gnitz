@@ -1,28 +1,9 @@
 use super::*;
-use crate::test_support::{map_coded_shard, prose, string_batch};
+use crate::test_support::{prose, string_batch};
 use gnitz_foundation::rng::mix;
 
 fn prose_batch(range: std::ops::Range<usize>) -> Batch {
     string_batch(&range.map(|i| (i as u64, prose(i))).collect::<Vec<_>>())
-}
-
-/// A table read back from a shard codes every value as the encoder trained
-/// over it did: what lets a merge copy a value's codes.
-#[test]
-fn a_table_read_back_codes_as_the_one_trained() {
-    let dir = tempfile::tempdir().unwrap();
-    let batch = prose_batch(0..400);
-    let book = Codebook::for_batch(None, &batch).expect("enough long bytes to train");
-    let shard = map_coded_shard(&dir.path().join("s.db"), &batch, &book);
-    let read = shard.codebook().unwrap();
-    assert_eq!(read.digest(), book.digest());
-    assert_eq!(read.trained_sixteenths(), book.trained_sixteenths());
-    for i in 0..2000 {
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        book.encode_into(prose(i).as_bytes(), &mut a);
-        read.encode_into(prose(i).as_bytes(), &mut b);
-        assert_eq!(a, b, "value {i}");
-    }
 }
 
 #[test]

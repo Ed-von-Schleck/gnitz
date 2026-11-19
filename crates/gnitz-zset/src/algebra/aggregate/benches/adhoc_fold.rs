@@ -322,8 +322,12 @@ fn adhoc_fold_finish_bench() {
                 b.put_int(mix(i ^ 7) as i64 as u128);
                 b.put_opt_int((i % 5 != 0).then(|| mix(i ^ 9) as u32 as u128));
                 match i % 7 {
-                    0 => b.put_null(),
-                    _ => b.put_string(&format!("value-string-{:016x}", mix(i ^ 11))),
+                    0 => {
+                        b.put_null();
+                    }
+                    _ => {
+                        b.put_string(&format!("value-string-{:016x}", mix(i ^ 11)));
+                    }
                 }
                 b.end_row();
             }

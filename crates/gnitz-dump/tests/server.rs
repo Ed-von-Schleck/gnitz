@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use gnitz_core::{BatchAppender, Catalog, GnitzClient, RelName, ZSetBatch, block_on};
+use gnitz_core::{Catalog, GnitzClient, RelName, ZSetBatch, block_on};
 use gnitz_sql::SqlResult;
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{Circuit, OpNode, ReadBound, RelClass, WireConflictMode};
@@ -81,9 +81,9 @@ const SCRIPT: &str = "
 fn push_files(client: &mut GnitzClient) {
     let desc = block_on(client.resolve_relation(&RelName::new("public", "files").unwrap())).unwrap();
     let mut batch = ZSetBatch::new(&desc.schema);
-    let mut app = BatchAppender::new(&mut batch);
-    app.add_row(1, 1).bytes_val(&[0, 255, 7]).bytes_val(b"");
-    app.add_row(2, 1).null().bytes_val(&[0xab; 40]);
+    let mut app = batch.builder();
+    app.begin_row(1, 1).put_blob(&[0, 255, 7]).put_blob(b"");
+    app.begin_row(2, 1).put_null().put_blob(&[0xab; 40]);
     block_on(client.push(&*desc, &desc.schema, batch, WireConflictMode::Error)).unwrap();
 }
 
@@ -96,7 +96,7 @@ fn rows(client: &mut GnitzClient, sql: &str) -> Vec<(Vec<Option<Vec<u8>>>, i64)>
     let Some(SqlResult::Rows(reply)) = exec(client, sql).pop() else {
         panic!("{sql} answered no rows")
     };
-    let (schema, batch) = (&reply.schema, &reply.batch);
+    let (schema, batch) = (&reply.schema, &reply.batch.view());
     let mut out: Vec<_> = (0..batch.len())
         .map(|i| {
             let cells = schema
@@ -112,7 +112,7 @@ fn rows(client: &mut GnitzClient, sql: &str) -> Vec<(Vec<Option<Vec<u8>>>, i64)>
                     })
                 })
                 .collect();
-            (cells, batch.weight(i))
+            (cells, reply.batch.view().get_weight(i))
         })
         .collect();
     out.sort();
@@ -327,14 +327,14 @@ fn tables_larger_than_a_push_restore() {
         );
         let desc = block_on(a.resolve_relation(&RelName::new("public", name).unwrap())).unwrap();
         let mut batch = ZSetBatch::new(&desc.schema);
-        let mut app = BatchAppender::new(&mut batch);
+        let mut app = batch.builder();
         for id in 0..ROWS {
-            let r = app.add_row(id as u128, 1);
+            let r = app.begin_row(id as u128, 1);
             match parent(id) {
-                Some(p) => r.int_val(i128::from(p)),
-                None => r.null(),
+                Some(p) => r.put_int((i128::from(p)) as u128),
+                None => r.put_null(),
             };
-            r.str_val(&format!("{id:0>1000}"));
+            r.put_string(&format!("{id:0>1000}"));
         }
         block_on(a.push(&*desc, &desc.schema, batch, WireConflictMode::Error)).unwrap();
     }

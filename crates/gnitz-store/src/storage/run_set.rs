@@ -6,7 +6,8 @@ use std::rc::Rc;
 
 use super::bloom::BloomFilter;
 use super::pk_ranges_overlap;
-use gnitz_zset::repr::{Batch, MemBatch, StorageError, merge_consolidated};
+use gnitz_trace::runs::StorageError;
+use gnitz_zset::repr::{Batch, MemBatch, merge_consolidated};
 use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::schema::probe_key;
 

@@ -20,8 +20,9 @@ fn map_ranges_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     // `rows`: the rows the map keeps.
     let whole = |name: &str, mut plan: MapPlan, src: &Batch, rows: usize| {
-        black_box(plan.evaluate_map_batch(src));
-        let (out, instructions) = counter.measure(|| plan.evaluate_map_batch(black_box(src)));
+        let src = src.as_mem_batch();
+        black_box(plan.evaluate_map_batch(&src));
+        let (out, instructions) = counter.measure(|| plan.evaluate_map_batch(black_box(&src)));
         assert_eq!(out.len(), rows, "{name}");
         println!(
             "map_ranges_bench {name:<24} {:6.1} instr/row",
@@ -39,9 +40,15 @@ fn map_ranges_bench() {
             b.begin_row(i as u128, 1);
             for (pi, &tc) in (0..).zip(payload) {
                 match tc {
-                    _ if pi == 0 && null_every != 0 && i % null_every == 0 => b.put_null(),
-                    STR => b.put_string(&format!("row-{i:012}-payload")),
-                    _ => b.put_int((i.wrapping_mul(2_654_435_761 + pi) % 1000) as u128),
+                    _ if pi == 0 && null_every != 0 && i % null_every == 0 => {
+                        b.put_null();
+                    }
+                    STR => {
+                        b.put_string(&format!("row-{i:012}-payload"));
+                    }
+                    _ => {
+                        b.put_int((i.wrapping_mul(2_654_435_761 + pi) % 1000) as u128);
+                    }
                 }
             }
             b.end_row();
@@ -160,9 +167,10 @@ fn map_ranges_bench() {
         for &run in runs {
             let ranges: Vec<(usize, usize)> = (0..N).step_by(run + GAP).map(|s| (s, (s + run).min(N))).collect();
             let mut keeper = Batch::empty_with_schema(plan.output_schema());
-            plan.append_map_ranges(src, &mut keeper, &ranges);
+            let src = src.as_mem_batch();
+            plan.append_map_ranges(&src, &mut keeper, &ranges);
             keeper.clear();
-            let ((), instructions) = counter.measure(|| plan.append_map_ranges(black_box(src), &mut keeper, &ranges));
+            let ((), instructions) = counter.measure(|| plan.append_map_ranges(black_box(&src), &mut keeper, &ranges));
             assert_eq!(keeper.len(), crate::repr::range_rows(&ranges), "{name}_r{run}");
             println!(
                 "map_ranges_bench {:<24} {:6.1} instr/row ({} ranges)",

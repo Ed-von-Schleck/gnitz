@@ -112,7 +112,7 @@ impl Db {
         let mut zset = std::collections::BTreeMap::<Vec<i64>, i64>::new();
         for r in 0..batch.len() {
             let row = idxs.iter().map(|&ci| cell(&schema, &batch, ci, r)).collect();
-            *zset.entry(row).or_default() += batch.weight(r);
+            *zset.entry(row).or_default() += batch.view().get_weight(r);
         }
         zset.into_iter()
             .filter(|&(_, w)| w != 0)
@@ -188,6 +188,7 @@ pub fn visible_names(s: &Schema) -> Vec<String> {
 /// Column `ci` of `row` as [`Db::rows`] reads it.
 pub fn cell(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
     let loc = schema.layout().locate(ci);
+    let batch = &batch.view();
     if loc.is_null(batch, row) {
         return NULL;
     }

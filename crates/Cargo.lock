@@ -855,6 +855,7 @@ dependencies = [
  "gnitz-foundation",
  "gnitz-fuzz",
  "gnitz-store",
+ "gnitz-trace",
  "gnitz-wire",
  "gnitz-zset",
  "gnitz-zset-testkit",
@@ -879,6 +880,7 @@ dependencies = [
  "gnitz-foundation",
  "gnitz-test-harness",
  "gnitz-wire",
+ "gnitz-zset",
  "libc",
  "rustc-hash",
  "serde_json",
@@ -891,6 +893,7 @@ version = "0.1.8"
 dependencies = [
  "gnitz-expr",
  "gnitz-foundation",
+ "gnitz-trace",
  "gnitz-wire",
  "gnitz-zset",
  "gnitz-zset-testkit",
@@ -925,6 +928,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnitz-trace"
+version = "0.1.8"
+dependencies = [
+ "gnitz-expr",
+ "gnitz-foundation",
+ "gnitz-wire",
+ "gnitz-zset",
+ "gnitz-zset-testkit",
+ "libc",
+ "proptest",
+ "rustc-hash",
+ "smallvec",
+ "tempfile",
+ "xorf",
+]
+
+[[package]]
 name = "gnitz-wire"
 version = "0.1.8"
 dependencies = [
@@ -941,13 +961,10 @@ dependencies = [
  "gnitz-expr",
  "gnitz-foundation",
  "gnitz-wire",
- "libc",
  "proptest",
  "rustc-hash",
  "simdutf8",
  "smallvec",
- "tempfile",
- "xorf",
 ]
 
 [[package]]

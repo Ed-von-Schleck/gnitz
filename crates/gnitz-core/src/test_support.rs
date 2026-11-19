@@ -20,8 +20,7 @@ use gnitz_wire::{ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireSt
 use crate::connection::Session;
 use crate::transport::poll_fd;
 use crate::{
-    BatchAppender, BlockingHost, ClientError, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema,
-    Sent, ZSetBatch,
+    BlockingHost, ClientError, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema, Sent, ZSetBatch,
 };
 use gnitz_wire::multi_frame::SubId;
 
@@ -46,9 +45,9 @@ pub(crate) fn kv_schema(v: TypeCode) -> Schema {
 pub(crate) fn kv_rows(rows: &[(u64, i64, i64)]) -> ZSetBatch {
     let schema = kv_schema(TypeCode::I64);
     let mut b = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for &(pk, v, w) in rows {
-        app.add_row(pk as u128, w).int_val(v);
+        app.begin_row(pk as u128, w).put_int(v as u128);
     }
     b
 }
@@ -64,14 +63,14 @@ pub(crate) fn wide_schema(ncols: usize, nullable: bool) -> Arc<Schema> {
 /// is NULL.
 pub(crate) fn wide_rows(schema: &Schema, n: usize, null_every: usize) -> ZSetBatch {
     let mut b = ZSetBatch::with_capacity(schema, n);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for r in 0..n {
-        let row = app.add_row(r as u128, 1);
+        let row = app.begin_row(r as u128, 1);
         for c in 1..schema.columns().len() {
             if null_every != 0 && (r + c) % null_every == 0 {
-                row.null();
+                row.put_null();
             } else {
-                row.int_val(7);
+                row.put_int(7);
             }
         }
     }
@@ -461,5 +460,5 @@ pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<ZSetBatch
         frame: std::borrow::Cow::Borrowed(data),
         block: 0..data.len(),
     };
-    crate::batch::decode_wal_blocks(Vec::new(), Some(block), schema)
+    crate::batch::decode_wal_blocks(Vec::new(), Some(block), &std::sync::Arc::new(schema.clone()))
 }

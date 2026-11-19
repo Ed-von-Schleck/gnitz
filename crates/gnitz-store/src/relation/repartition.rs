@@ -12,8 +12,9 @@ use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind, StoreConfig};
 use crate::storage::{RecoverySource, Table, flush_barrier, link_stores, retire_stores};
 use gnitz_foundation::gnitz_info;
+use gnitz_trace::runs::{StorageError, from_runs};
 use gnitz_zset::algebra::{Placement, ScatterPlan, Slot};
-use gnitz_zset::repr::{Batch, StorageError, from_runs};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// The worker count of the complete child set to relay onto `launched`; `None`

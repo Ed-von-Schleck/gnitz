@@ -9,8 +9,7 @@ use gnitz_wire::{ColumnDef, PkColList, PkListRole, PkRule, SysFamily};
 #[derive(Clone)]
 pub struct Schema {
     columns: Vec<ColumnDef>,
-    /// Shared with every batch of this schema, which reads its region layout here.
-    layout: Arc<SchemaDescriptor>,
+    layout: SchemaDescriptor,
     /// The meta-schema record of `columns` and the PK list, encoded on first
     /// use. Every `&mut self` method that changes either resets it.
     record: OnceLock<Arc<[u8]>>,
@@ -54,11 +53,7 @@ impl Schema {
                 SchemaRefusal::Pk(rule) => pk_refusal(rule),
                 other => other.to_string(),
             })?;
-        Ok(Schema {
-            columns,
-            layout: Arc::new(layout),
-            record: OnceLock::new(),
-        })
+        Ok(Schema { columns, layout, record: OnceLock::new() })
     }
 
     pub fn columns(&self) -> &[ColumnDef] {
@@ -75,9 +70,21 @@ impl Schema {
         &self.layout
     }
 
-    /// [`Self::layout`], to share.
-    pub(crate) fn shared_layout(&self) -> &Arc<SchemaDescriptor> {
-        &self.layout
+    /// The key set of the keys `natives` lists, each one native value per PK column in
+    /// PK-list order: a read's `PkSet`, or the keys of a retraction.
+    pub fn pk_keys<N: AsRef<[u128]>>(&self, natives: impl IntoIterator<Item = N>) -> gnitz_wire::PkKeys {
+        let keys: Vec<gnitz_wire::PkBuf> = (natives.into_iter())
+            .map(|n| {
+                // Hard, not debug-only: a short list would encode a short key.
+                assert_eq!(
+                    n.as_ref().len(),
+                    self.pk_cols().len(),
+                    "pk_keys: one native value per key column"
+                );
+                self.layout.opk_key_cols(n.as_ref())
+            })
+            .collect();
+        gnitz_wire::PkKeys::from_keys(self.layout.pk_stride(), keys.iter().map(|k| k.pk_bytes()))
     }
 
     /// A name carries no layout, but the record carries it.

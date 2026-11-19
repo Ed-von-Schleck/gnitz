@@ -10,7 +10,7 @@ use std::path::Path;
 
 use super::dirs::{ChildAddr, ChildKind, parse_relation_dir_name, relation_dir, relations_dir, subdir_names};
 use crate::storage::shard_files;
-use gnitz_zset::repr::ShardDirectory;
+use gnitz_trace::runs::ShardDirectory;
 
 /// One store of one relation, summed over its slots, at one LSM level; `None`
 /// is the shards no manifest names — written and not yet published, or

@@ -9,8 +9,11 @@ use proptest::prelude::*;
 
 use gnitz_wire::RowSource;
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use std::cmp::Ordering;
+
+use gnitz_expr::ColumnLocator;
+use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
+use gnitz_zset::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
 /// I64 payload column. [`pk_only_schema`] is the no-payload counterpart.
@@ -563,8 +566,12 @@ pub fn fold_batch(schema: &SchemaDescriptor, rows: &[FoldRow]) -> Batch {
         b.begin_row_bytes(pk, *w);
         for (pc, col) in schema.payload_columns() {
             match (col.type_code.is_german_string(), s, v) {
-                (true, Some(i), _) => b.put_blob(FOLD_STRS[*i as usize]),
-                (true, None, _) | (false, _, None) if col.nullable => b.put_null(),
+                (true, Some(i), _) => {
+                    b.put_blob(FOLD_STRS[*i as usize]);
+                }
+                (true, None, _) | (false, _, None) if col.nullable => {
+                    b.put_null();
+                }
                 (false, _, v) => {
                     let bit = v.unwrap_or(0) >> (2 * pc >= n) as u8 & 1;
                     b.put_int(if bit == 1 { u128::MAX } else { 0 });
@@ -576,3 +583,105 @@ pub fn fold_batch(schema: &SchemaDescriptor, rows: &[FoldRow]) -> Batch {
     }
     b.finish()
 }
+
+/// The reindex of `source` onto its columns `key`, each at its own slot type,
+/// keeping `keep` and doing `nulls` with a NULL key: with `Drop`, the map a
+/// join's trace integrates behind.
+pub fn rekey_plan(
+    source: &SchemaDescriptor,
+    key: &[u32],
+    keep: &[u32],
+    nulls: gnitz_wire::NullKeys,
+) -> gnitz_zset::algebra::MapPlan {
+    let rekey = gnitz_wire::MapKind::Reindex {
+        keep: keep.to_vec(),
+        key: self_typed_slots(source, key),
+        nulls,
+    };
+    gnitz_zset::algebra::MapPlan::from_wire(source, &rekey).expect("fixture reindex is well-formed")
+}
+
+/// One column of one row as its native little-endian cell, a string as its
+/// content; `None` for NULL.
+pub fn cell(mb: &MemBatch, loc: ColumnLocator, row: usize) -> Option<Vec<u8>> {
+    let mut scratch = [0u8; 16];
+    (!loc.is_null(mb, row)).then(|| match loc.type_code().is_german_string() {
+        true => loc.content(mb, row).to_vec(),
+        false => loc.native_le_bytes(mb, row, &mut scratch).to_vec(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The Z-set fold oracle
+// ---------------------------------------------------------------------------
+
+/// `got` is the Z-set sum of `inputs`: one row per element, strictly ascending
+/// in (PK, payload) order.
+pub fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
+    let schema = got.schema();
+    let want = zset_sum(inputs, schema);
+    assert_eq!(zset_of(got, schema), want, "{what}: the Z-set sum");
+    assert_eq!(got.len(), want.len(), "{what}: one row per element");
+    let mb = got.as_mem_batch();
+    for r in 1..got.len() {
+        assert_eq!(
+            Generic.compare_full(schema, &mb, r - 1, &mb, r),
+            Ordering::Less,
+            "{what}: rows {} and {r} out of order",
+            r - 1
+        );
+    }
+}
+
+/// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column,
+/// in the order given.
+pub fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
+    let mut b = BatchBuilder::new(&make_schema_pk_u64_payload_string());
+    for (pk, v) in rows {
+        b.begin_row(*pk as u128, 1);
+        b.put_string(v.as_ref());
+        b.end_row();
+    }
+    b.finish()
+}
+
+/// Payload column 0's string on every row, in order.
+pub fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
+    (0..batch.len())
+        .map(|row| gnitz_wire::payload_bytes(batch, row, 0).to_vec())
+        .collect()
+}
+
+/// Row `i`'s sentence: words of a short list, so that a symbol table codes a
+/// heap of them to a fraction of its bytes, and unique to `i`.
+pub fn prose(i: usize) -> String {
+    const WORDS: [&str; 12] = [
+        "the", "river", "under", "morning", "light", "carried", "every", "lantern", "toward", "harbour", "while",
+        "sailors",
+    ];
+    let mut s = format!("{i} ");
+    for k in 0..6 + i % 9 {
+        s.push_str(WORDS[(i * 7 + k * 5) % WORDS.len()]);
+        s.push(' ');
+    }
+    s
+}
+
+/// Strings that are prefixes of one another, one escaping `0x00`, and two that
+/// share more leading bytes than an index key's lead slot holds.
+pub const STRS: [&str; 10] = [
+    "",
+    "a",
+    "ab",
+    "\0b",
+    "shared-lead-slot-prefix-x",
+    "shared-lead-slot-prefix-y",
+    "a\0",
+    "a\0\0",
+    "a\0b-a-string-past-the-inline-cell-with-a-zero",
+    "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+];
+
+/// Floats `total_cmp` tells apart though `==` does not, and the ones it places
+/// past every finite value.
+pub const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];

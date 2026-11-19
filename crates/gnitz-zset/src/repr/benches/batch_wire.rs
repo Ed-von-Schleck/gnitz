@@ -117,8 +117,12 @@ fn reply_chunk_strings_bench() {
             b.put_int(i.wrapping_mul(2_654_435_761 + c) as u128);
         }
         match i % 64 {
-            0 => b.put_string(&format!("{i:040}")),
-            _ => b.put_string(&format!("s{}", i % 1000)),
+            0 => {
+                b.put_string(&format!("{i:040}"));
+            }
+            _ => {
+                b.put_string(&format!("s{}", i % 1000));
+            }
         }
         b.end_row();
     }

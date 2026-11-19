@@ -15,11 +15,11 @@
 //! The linear ones are their own incremental form, so the read executor in
 //! `gnitz-store` and the circuit VM in `gnitz-server` call the same kernels; the
 //! ad-hoc fold and the top-k sink are one-shot folds only a read runs. The
-//! operators that do read a trace are the `stream` rung above, which builds on
+//! operators that do read a trace are `gnitz-trace`'s `stream`, which builds on
 //! the aggregate, group-key, key-packing, image and map machinery here.
 //!
-//! A `pub use` below is named by another crate; a `pub(crate) use` is what
-//! `stream` reaches. The submodules stay private.
+//! A `pub use` below is named by another crate; a `pub(crate) use` is this
+//! crate's own facade. The submodules stay private.
 
 mod aggregate;
 mod exchange;
@@ -39,11 +39,11 @@ pub use map::MapPlan;
 pub use route::{Placement, Slot, ground_owner};
 pub use sink::SinkPlan;
 
-pub(crate) use aggregate::{Agg, AggValues, RangeGroups, ReduceShape, resolve_aggs};
-pub(crate) use group_key::{GroupOrdinals, GroupOutKey, GroupScratch, OutPk, ground_pk};
-pub(crate) use key_pack::KeyPacker;
-pub(crate) use map::copy_columns;
-pub(crate) use order_image::{IMAGE_COL, ImageCol, image_slot_col};
+pub use aggregate::{Agg, AggValues, FoldGroups, RangeGroups, ReduceShape, resolve_aggs};
+pub use group_key::{GroupOrdinals, GroupOutKey, GroupScratch, OutPk, ground_pk};
+pub use key_pack::KeyPacker;
+pub use map::copy_columns;
+pub use order_image::{IMAGE_COL, ImageCol, image_slot_col};
 
 /// An integer column's cell as its value: under `OPK` a PK column's OPK image,
 /// else a payload column's native bytes.

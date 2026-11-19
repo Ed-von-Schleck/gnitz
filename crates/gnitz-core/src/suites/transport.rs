@@ -334,7 +334,7 @@ fn both_transports_carry_every_cell_at_its_net_weight() {
 
     block_on(tls.push(tid, &schema, rows(&schema, 0..700_000), WireConflictMode::Update)).unwrap();
     let mut retract = rows(&schema, [500]);
-    retract.set_weight(0, -1);
+    retract.rewrite(|w| w.weight_mut()[..8].copy_from_slice(&(-1i64).to_le_bytes()));
     block_on(unix.push(tid, &schema, &retract, WireConflictMode::Update)).unwrap();
 
     let want = weighted_rows(&rows(&schema, (0..700_000).filter(|&pk| pk != 500)));

@@ -3,7 +3,7 @@
 //! checkpoint that a server boots on.
 
 use super::*;
-use crate::{BatchAppender, DEFAULT_PAGE_ROWS, PkColumn};
+use crate::DEFAULT_PAGE_ROWS;
 use gnitz_wire::TableDistribution;
 
 const WORKERS: usize = 4;
@@ -74,12 +74,12 @@ fn pages_of_a_compound_key_return_every_row_once() {
     let schema = Arc::new(Schema::from_parts(cols, &[0, 1]).unwrap());
     let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), Schema::clone(&schema)))).unwrap();
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     let mut want = Vec::new();
     for a in -40i32..40 {
         for b in [0u8, 1, 254, 255] {
-            app.add_row_natives(&[a as i128 as u128, b as u128], 1)
-                .int_val(a as i64 * 1000 + b as i64);
+            app.begin_row_natives(&[a as i128 as u128, b as u128], 1)
+                .put_int((a as i64 * 1000 + b as i64) as u128);
             want.push(a as i64 * 1000 + b as i64);
         }
     }
@@ -87,11 +87,13 @@ fn pages_of_a_compound_key_return_every_row_once() {
     let id = block_on(client.snapshot_open()).unwrap();
     for page_rows in [1, 3, 64] {
         let got = read(&mut client, id, tid, &schema, page_rows);
-        let mut vals: Vec<i64> = (0..got.len()).map(|i| read_i64_le(got.col(0), i * 8)).collect();
+        let mut vals: Vec<i64> = (0..got.len())
+            .map(|i| read_i64_le(got.view().col_data(0), i * 8))
+            .collect();
         vals.sort_unstable();
         want.sort_unstable();
         assert_eq!(vals, want, "page_rows={page_rows}");
-        assert!(got.weights().all(|w| w == 1));
+        assert!(got.view().weights().all(|w| w == 1));
     }
 }
 
@@ -154,10 +156,10 @@ fn a_page_takes_every_workers_share_however_its_keys_interleave() {
     }))
     .unwrap();
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for a in 0i64..64 {
         for b in 0i64..20 {
-            app.add_row_natives(&[a as i128 as u128, b as i128 as u128], 1);
+            app.begin_row_natives(&[a as i128 as u128, b as i128 as u128], 1);
         }
     }
     push(&mut client, tid, &schema, batch);
@@ -362,8 +364,8 @@ fn every_worker_holds_rows_of_the_tables_these_tests_page() {
     let schema = schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]);
     let owners: std::collections::HashSet<usize> = (0u64..200)
         .map(|k| {
-            let opk = PkColumn::from_natives(&schema, [k as u128]);
-            let pk = opk.get_bytes(0);
+            let opk = schema.layout().opk_key_cols(&[k as u128]);
+            let pk = opk.pk_bytes();
             gnitz_zset::algebra::Placement::Keyed { dist_stride: pk.len() as u8 }
                 .owner(pk, WORKERS)
                 .unwrap()

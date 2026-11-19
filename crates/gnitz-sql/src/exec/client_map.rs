@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, LogicalProgram, MapEval};
+use gnitz_expr::LogicalProgram;
+use gnitz_zset::algebra::MapPlan;
 
 use crate::error::GnitzSqlError;
 use crate::hir::RowsReply;
@@ -17,7 +18,7 @@ pub(crate) struct ClientMap {
     src: Arc<Schema>,
     out_schema: Arc<Schema>,
     /// `None` when the plan shipped no program: the output is the source's own regions.
-    ev: Option<MapEval>,
+    plan: Option<MapPlan>,
 }
 
 impl ClientMap {
@@ -33,20 +34,21 @@ impl ClientMap {
         src: Arc<Schema>,
         out_schema: Arc<Schema>,
     ) -> Result<Self, GnitzSqlError> {
-        let key = |s: &Schema| s.layout().pk_columns().map(|c| c.type_code).collect::<Vec<_>>();
-        debug_assert_eq!(key(&src), key(&out_schema), "a client map keeps its source's key");
-        let ev = program
+        debug_assert!(
+            src.layout().same_key_types(out_schema.layout()),
+            "a client map keeps its source's key"
+        );
+        let plan = program
             .map(|p| p.resolve_map(src.layout(), out_schema.layout()))
-            .transpose()?;
+            .transpose()?
+            .map(|ev| MapPlan::inheriting(ev, *out_schema.layout()));
         // Each copy keeps its source's width: only a set operation's common type widens a
         // column, and an ad-hoc read has none.
         debug_assert!(
-            ev.iter()
-                .flat_map(|ev| ev.moves().copies())
-                .all(|c| c.src.size() == c.width),
+            plan.iter().flat_map(MapPlan::copies).all(|c| c.src.size() == c.width),
             "a client map copies each column at its own width"
         );
-        Ok(ClientMap { src, out_schema, ev })
+        Ok(ClientMap { src, out_schema, plan })
     }
 
     /// The schema of the batches the map reads.
@@ -59,39 +61,11 @@ impl ClientMap {
     }
 
     /// The map over every row of `src`, each row keeping its PK and weight.
-    pub(crate) fn apply(&mut self, mut src: ZSetBatch) -> ZSetBatch {
-        let Some(ev) = &mut self.ev else {
-            return src;
-        };
-        let n = src.len();
-        // Every slot starts zero for the evaluator, the key decode or a copy to write into.
-        let mut out = ZSetBatch::zeroed(&self.out_schema, n);
-        out.copy_keys_and_weights(&src);
-        // A copied German cell keeps its offset into the source heap, and a computed
-        // string is re-encoded into the output's: the source heap survives only when a
-        // copy reads it, and is cloned to start the output's when computed strings follow.
-        let (computes_a_string, copies_a_string) = (ev.emits_a_string(), ev.moves().string_slots() != 0);
-        if computes_a_string && copies_a_string {
-            out.set_heap(src.heap().to_vec());
+    pub(crate) fn apply(&mut self, src: ZSetBatch) -> ZSetBatch {
+        match &mut self.plan {
+            None => src,
+            Some(plan) => plan.evaluate_map_batch(&src.view()).into(),
         }
-        ev.write_computed(&src, 0, n, &mut out, 0);
-        // A key column's copy decodes it out of the key region; a key is never NULL.
-        for c in ev.moves().copies() {
-            match c.src {
-                ColumnLocator::Pk { byte_off, type_code, .. } => gnitz_wire::decode_pk_cells(
-                    src.pk_region(),
-                    src.pk_stride(),
-                    byte_off as usize,
-                    type_code,
-                    out.col_mut(c.slot),
-                ),
-                ColumnLocator::Payload { slot, .. } => out.col_mut(c.slot).copy_from_slice(src.col(slot as usize)),
-            }
-        }
-        if copies_a_string && !computes_a_string {
-            out.set_heap(src.take_heap());
-        }
-        out
     }
 }
 

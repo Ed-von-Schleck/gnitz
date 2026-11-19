@@ -12,9 +12,9 @@ use io_uring::types::FsyncFlags;
 
 use super::batch_fsync::Syncer;
 use gnitz_foundation::gnitz_warn;
+use gnitz_trace::runs::StorageError;
 use gnitz_wire::PkBuf;
 use gnitz_wire::{Reader, Writer};
-use gnitz_zset::repr::StorageError;
 
 const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION: u64 = 17;

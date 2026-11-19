@@ -295,12 +295,12 @@ fn pack_column<B: BatchView>(
 
 /// Packs a join key, a group key or an index span into a contiguous OPK region.
 #[derive(Clone)]
-pub(crate) struct KeyPacker {
+pub struct KeyPacker {
     /// The packed columns in key order, between the bitmap and the fold: the
     /// first `n_cols`. Inline, so a span's packer cloned per push allocates nothing.
     cols: [KeyCol; MAX_PK_COLUMNS],
     n_cols: u8,
-    pub(crate) out_stride: usize,
+    pub out_stride: usize,
     /// Group key only: a leading `U8` slot, bit *i* set iff packed column *i* is
     /// NULL.
     has_bitmap: bool,
@@ -458,7 +458,7 @@ impl KeyPacker {
     ///
     /// Leading columns pack while the PK budget lasts; the rest fold into one
     /// hash slot, so no group set is too wide.
-    pub(crate) fn new_group_key(
+    pub fn new_group_key(
         schema: &SchemaDescriptor,
         group_cols: &[u32],
         suffix: &[SchemaColumn],
@@ -503,7 +503,7 @@ impl KeyPacker {
     /// [`Self::pack_into`] over the leading `out_stride` bytes of `buf`,
     /// returning them.
     #[inline]
-    pub(crate) fn pack_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], batch: &R, row: usize) -> &'a [u8] {
+    pub fn pack_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], batch: &R, row: usize) -> &'a [u8] {
         let n = self.out_stride;
         self.pack_into(&mut buf[..n], batch, row);
         &buf[..n]
@@ -538,13 +538,13 @@ impl KeyPacker {
 
     /// Whether every slot packs without hashing, so packing all of a batch's rows costs
     /// about what packing the rows read costs.
-    pub(crate) fn packs_without_hashing(&self) -> bool {
+    pub fn packs_without_hashing(&self) -> bool {
         self.fold.is_empty() && self.cols().iter().all(|c| !c.loc.type_code().is_german_string())
     }
 
     /// [`Self::pack_into`] for the rows of `runs` — ascending `[start, end)` — in order,
     /// into the fronts of `dst`'s slots `stride` apart.
-    pub(crate) fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, runs: &[(usize, usize)]) {
+    pub fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, runs: &[(usize, usize)]) {
         let dst = &mut dst[..range_rows(runs) * stride];
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         if self.has_bitmap {

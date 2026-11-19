@@ -55,7 +55,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     let scans = scans.into_iter().map(arrived).chain([last]);
     for (data, pushed) in scans.zip((1..=n).map(|i| i * per)) {
         let batch = data.expect("no server error").batch;
-        assert!(batch.weights().all(|w| w == 1), "every row is held once");
+        assert!(batch.view().weights().all(|w| w == 1), "every row is held once");
         let mut pks: Vec<u64> = (0..batch.len()).map(|i| batch.pk(i) as u64).collect();
         pks.sort_unstable();
         assert!(

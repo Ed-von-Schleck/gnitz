@@ -16,8 +16,7 @@ use std::sync::Arc;
 use crate::connection::{Request, Session};
 use crate::test_support::{drive, park, rel};
 use crate::{
-    BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Schema, Sent, TableDef, ViewBundle,
-    ZSetBatch, block_on,
+    ClientError, GnitzClient, Interest, PlannedView, RelName, Schema, Sent, TableDef, ViewBundle, ZSetBatch, block_on,
 };
 use gnitz_test_harness::{ServerHandle, unique_schema};
 use gnitz_wire::{
@@ -72,11 +71,11 @@ fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewB
 /// payload column of `schema` is an I64.
 fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for pk in pks {
-        let row = app.add_row(pk as u128, 1);
+        let row = app.begin_row(pk as u128, 1);
         for j in 0..schema.columns().len() - 1 {
-            row.int_val(pk as i64 * 3 + j as i64);
+            row.put_int((pk as i64 * 3 + j as i64) as u128);
         }
     }
     batch
@@ -94,10 +93,10 @@ fn scan_all(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>) -> ZSetBat
 fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
     let mut out: Vec<_> = (0..batch.len())
         .map(|i| {
-            let cells = (0..batch.payload_count())
-                .map(|pi| read_i64_le(batch.col(pi), i * 8))
+            let cells = (0..batch.view().schema().num_payload_cols())
+                .map(|pi| read_i64_le(batch.view().col_data(pi), i * 8))
                 .collect();
-            (batch.pk(i) as u64, cells, batch.weight(i))
+            (batch.pk(i) as u64, cells, batch.view().get_weight(i))
         })
         .collect();
     out.sort();

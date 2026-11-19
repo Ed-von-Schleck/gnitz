@@ -1,6 +1,6 @@
 use super::*;
+use crate::sys_schema;
 use crate::test_support::rel;
-use crate::{BatchAppender, sys_schema};
 use gnitz_wire::{ColumnDef, FkAction, FkRef, ReadBound, SysRow, TableDistribution, TypeCode, ViewBudget, ViewParts};
 use std::num::NonZeroU64;
 
@@ -14,7 +14,7 @@ impl Rows {
 
     fn put<R: SysRow>(&mut self, row: &R, weight: i64) -> &mut Self {
         let at = CATALOG_FAMILIES.iter().position(|&f| f == R::FAMILY).unwrap();
-        row.write(&mut BatchAppender::new(&mut self.0[at]), weight);
+        row.write(&mut self.0[at].builder(), weight);
         self
     }
 

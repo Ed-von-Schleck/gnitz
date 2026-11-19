@@ -5,7 +5,7 @@ use crate::test_support::{
     TestCatalog, assert_rejects, batch_of, bind_where, catalog, col, ncol, parse_stmt, rel, rows_of, table,
     typed_schema,
 };
-use gnitz_core::{BatchAppender, Schema, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use gnitz_wire::{ColType, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
@@ -118,14 +118,11 @@ fn a_set_list_rewrites_the_row_it_read() {
 fn a_uuid_column_is_copied() {
     let schema = typed_schema(&[TypeCode::UUID, TypeCode::UUID]);
     let mut rows = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut rows)
-        .add_row(1, 1)
-        .u128_val(0)
-        .u128_val(u128::MAX - 7);
+    rows.builder().begin_row(1, 1).put_int(0).put_int(u128::MAX - 7);
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut set = set_list(plan(&cat, "UPDATE t SET c1 = c2").unwrap());
     let out = apply_set(&mut set, rows, None, &schema).unwrap();
-    assert_eq!(out.col(0), (u128::MAX - 7).to_le_bytes());
+    assert_eq!(out.view().col_data(0), (u128::MAX - 7).to_le_bytes());
 }
 
 /// A computed value outside its column's range is refused per row, not truncated
@@ -232,7 +229,7 @@ fn the_arena_holds_only_referenced_spill() {
         let schema = typed_schema(tys);
         let out = updated(&schema, set, &vec![*before; *n]).unwrap();
         assert_eq!(rows_of(&schema, &out), vec![(after.to_vec(), 1); *n], "{set}");
-        assert_eq!(out.heap().len(), *blob_len, "{set}");
+        assert_eq!(out.view().blob().len(), *blob_len, "{set}");
     }
 }
 

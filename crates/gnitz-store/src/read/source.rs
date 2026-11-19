@@ -3,8 +3,9 @@
 //! secondary-index range that feeds a gather each entry's key.
 
 use gnitz_expr::RowFilter;
+use gnitz_trace::runs::{PkSetGather, ReadCursor, StoredRow};
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 use crate::storage::Table;
@@ -197,7 +198,7 @@ impl UniqueGather<'_> {
             return None;
         }
         let mut out = Batch::empty_with_schema(&self.schema);
-        out.append_stored(&rows, 1, self.skip);
+        out.append_source_rows(rows.iter().map(StoredRow::source), 1, self.skip);
         out.certify_consolidated();
         Some(out)
     }

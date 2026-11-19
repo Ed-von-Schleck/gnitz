@@ -15,7 +15,7 @@ use std::ops::Range;
 /// **Whoever fills a writer writes every byte of every row it hands out, a NULL
 /// cell's included**: the arena is uninitialised, and a batch counts the rows
 /// only once the writer is done.
-pub(crate) struct DirectWriter<'a> {
+pub struct DirectWriter<'a> {
     /// An arena of `cap` rows under `schema`.
     data: &'a mut [u8],
     cap: usize,
@@ -27,6 +27,9 @@ pub(crate) struct DirectWriter<'a> {
     /// each get a copy.
     blob_cache: Option<&'a mut BlobCache>,
     pub schema: &'a SchemaDescriptor,
+    /// Some German-string cell or the heap was handed out to write: a rewrite may have
+    /// left a long value unreferenced.
+    strings_touched: bool,
 }
 
 impl<'a> DirectWriter<'a> {
@@ -52,12 +55,19 @@ impl<'a> DirectWriter<'a> {
             blob,
             blob_cache,
             schema,
+            strings_touched: false,
         }
+    }
+
+    /// Whether a German-string cell or the heap was handed out to write.
+    #[inline(always)]
+    pub(super) fn strings_touched(&self) -> bool {
+        self.strings_touched
     }
 
     /// Rows this writer fills.
     #[inline(always)]
-    pub(crate) fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.rows
     }
 
@@ -99,25 +109,25 @@ impl<'a> DirectWriter<'a> {
 
     /// The PK region, bounded to this writer's rows.
     #[inline(always)]
-    pub(crate) fn pk_mut(&mut self) -> &mut [u8] {
+    pub fn pk_mut(&mut self) -> &mut [u8] {
         self.region_mut(REG_PK)
     }
 
     /// The weight region, bounded to this writer's rows.
     #[inline(always)]
-    pub(crate) fn weight_mut(&mut self) -> &mut [u8] {
+    pub fn weight_mut(&mut self) -> &mut [u8] {
         self.region_mut(REG_WEIGHT)
     }
 
     /// The null-word region, bounded to this writer's rows.
     #[inline(always)]
-    pub(crate) fn null_bmp_mut(&mut self) -> &mut [u8] {
+    pub fn null_bmp_mut(&mut self) -> &mut [u8] {
         self.region_mut(REG_NULL_BMP)
     }
 
     /// The PK, weight and null-word regions, each bounded to this writer's rows.
     #[inline]
-    pub(crate) fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
+    pub fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
         let (pk, wt, nb) = (self.span(REG_PK), self.span(REG_WEIGHT), self.span(REG_NULL_BMP));
         debug_assert!(wt.len() == self.rows * FIXED_REGION_BYTES && nb.len() == self.rows * FIXED_REGION_BYTES);
         let (lo, hi) = self.data.split_at_mut(nb.start);
@@ -128,6 +138,7 @@ impl<'a> DirectWriter<'a> {
     /// Every region in order, each bounded to this writer's rows, with the heap
     /// a relocation appends to and the dedup cache it runs under.
     pub(crate) fn split_mut(&mut self) -> (impl Iterator<Item = &mut [u8]>, &mut Vec<u8>, Option<&mut BlobCache>) {
+        self.strings_touched = true;
         let (schema, cap, at, rows) = (self.schema, self.cap, self.at, self.rows);
         let mut rest = &mut *self.data;
         let regions = (0..schema.num_fixed_regions()).map(move |r| {
@@ -142,7 +153,7 @@ impl<'a> DirectWriter<'a> {
     /// The PK region and payload columns `cols`' regions, each bounded to this
     /// writer's rows, with the heap a string cell's bytes are appended to.
     #[inline(always)]
-    pub(crate) fn pk_and_payload_mut(
+    pub fn pk_and_payload_mut(
         &mut self,
         cols: Range<usize>,
     ) -> (&mut [u8], impl Iterator<Item = &mut [u8]>, &mut Vec<u8>) {
@@ -156,15 +167,17 @@ impl<'a> DirectWriter<'a> {
 
     /// Payload column `pi`'s region, bounded to this writer's rows.
     #[inline(always)]
-    pub(crate) fn col_mut(&mut self, pi: usize) -> &mut [u8] {
+    pub fn col_mut(&mut self, pi: usize) -> &mut [u8] {
+        self.strings_touched |= gnitz_wire::null_word_get(self.schema.string_payload_slots(), pi);
         self.region_mut(REG_PAYLOAD_START + pi)
     }
 
     /// String column `pi`'s region, with the heap a relocation into it appends
     /// to and the dedup cache it runs under.
     #[inline(always)]
-    pub(crate) fn string_col_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>, Option<&mut BlobCache>) {
+    pub fn string_col_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>, Option<&mut BlobCache>) {
         debug_assert_eq!(self.schema.region_stride(REG_PAYLOAD_START + pi), 16);
+        self.strings_touched = true;
         let s = self.span(REG_PAYLOAD_START + pi);
         (&mut self.data[s], &mut *self.blob, self.blob_cache.as_deref_mut())
     }
@@ -172,7 +185,7 @@ impl<'a> DirectWriter<'a> {
     /// Rebase string column `pi`, whose cells were copied verbatim from a source
     /// whose heap is `src`, as `dest` says; see [`rebase_string_cells`].
     #[inline]
-    pub(crate) fn rebase_string_col(&mut self, pi: usize, src: Heap<'_>, dest: StringDest<'_>) {
+    pub fn rebase_string_col(&mut self, pi: usize, src: Heap<'_>, dest: StringDest<'_>) {
         let (cells, blob, cache) = self.string_col_mut(pi);
         rebase_string_cells(cells, src, blob, dest, cache);
     }
@@ -180,7 +193,7 @@ impl<'a> DirectWriter<'a> {
     /// The columns at `locs` of `src`'s rows `rows` into payload slots `0..`, in
     /// order, a row of this writer per row of `rows`, each NULL bit set on the
     /// null words the caller zeroed. A NULL cell is copied as it is: zero.
-    pub(crate) fn gather_cells_from(
+    pub fn gather_cells_from(
         &mut self,
         locs: &[ColumnLocator],
         src: &MemBatch,
@@ -229,6 +242,7 @@ impl gnitz_expr::MapTarget for DirectWriter<'_> {
     }
     #[inline(always)]
     fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
+        self.strings_touched = true;
         let (cells, nulls) = (self.span(REG_PAYLOAD_START + pi), self.span(REG_NULL_BMP));
         // The null words lie below every payload column.
         let (lo, hi) = self.data.split_at_mut(cells.start);

@@ -1,7 +1,7 @@
 //! Aggregation over one Z-set: the aggregates, the row shape a reduce emits,
 //! and the ad-hoc hash-fold sink behind a fold `ReadSpec`.
 //!
-//! The circuit reduce in `stream` runs these same aggregates, group key and
+//! The circuit reduce in `gnitz-trace`'s `stream` runs these same aggregates, group key and
 //! row emitter, so a maintained aggregate and an ad-hoc one over the same group
 //! set agree by construction.
 
@@ -10,5 +10,5 @@ mod agg;
 mod shape;
 
 pub(crate) use adhoc_fold::AdhocFold;
-pub(crate) use agg::{Agg, AggValues, RangeGroups};
-pub(crate) use shape::{ReduceShape, resolve_aggs};
+pub use agg::{Agg, AggValues, FoldGroups, RangeGroups};
+pub use shape::{ReduceShape, resolve_aggs};

@@ -16,6 +16,7 @@ gnitz-foundation.workspace = true
 gnitz-wire.workspace = true
 gnitz-expr.workspace = true
 gnitz-zset.workspace = true
+gnitz-trace.workspace = true
 libc.workspace = true
 io-uring.workspace = true
 rustc-hash.workspace = true

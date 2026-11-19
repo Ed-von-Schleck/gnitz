@@ -34,8 +34,12 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
             b.begin_row_natives(&natives, weight);
             let v = rng.gen_u128();
             match rng.gen_range(5) {
-                0 => b.put_null(),
-                _ => b.put_int(v & gnitz_wire::image_mask(width)),
+                0 => {
+                    b.put_null();
+                }
+                _ => {
+                    b.put_int(v & gnitz_wire::image_mask(width));
+                }
             }
             b.put_int(row as u128);
             b.end_row();

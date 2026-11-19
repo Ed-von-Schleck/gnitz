@@ -173,7 +173,7 @@ impl SinkPlan {
                 match map {
                     Some(plan) => {
                         mapped.clear();
-                        plan.append_map_ranges(&chunk, mapped, ranges);
+                        plan.append_map_ranges(&chunk.as_mem_batch(), mapped, ranges);
                         // The map already dropped the non-survivors, so every
                         // row of `mapped` folds.
                         fold.fold_ranges(mapped, &[(0, mapped.len())])?;
@@ -247,6 +247,6 @@ fn append_survivors(map: Option<&mut MapPlan>, chunk: Cow<'_, Batch>, keeper: &m
             *keeper = whole;
         }
         None => keeper.append_ranges(&chunk.as_mem_batch(), ranges),
-        Some(p) => p.append_map_ranges(&chunk, keeper, ranges),
+        Some(p) => p.append_map_ranges(&chunk.as_mem_batch(), keeper, ranges),
     }
 }

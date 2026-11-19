@@ -761,7 +761,7 @@ async fn removed_references(
         .into_iter()
         .filter(|(_, c)| !c.pks.is_empty())
         .map(|(tid, c)| {
-            let rows = FamilyRows::Built(Batch::key_retractions(&c.schema, &c.pks));
+            let rows = FamilyRows::Built(Batch::key_rows(&c.schema, &c.pks, -1));
             TxnFamily::new(tid, WireConflictMode::Update, rows)
         })
         .collect();

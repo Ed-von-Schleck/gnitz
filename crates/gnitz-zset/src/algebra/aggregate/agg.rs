@@ -17,7 +17,7 @@ use crate::algebra::order_image::{
 /// One aggregate: the column it reads, the output column it fills, and what a
 /// row does to a group's value. The values live in an [`AggValues`].
 #[derive(Clone, Copy)]
-pub(crate) struct Agg {
+pub struct Agg {
     /// The aggregated column in an input row.
     src: ColumnLocator,
     /// This aggregate's column in an output row.
@@ -75,7 +75,7 @@ impl StepKind {
 
 /// The running values of an aggregate list, one per aggregate per group, each
 /// aggregate's side by side.
-pub(crate) struct AggValues {
+pub struct AggValues {
     /// A count, a sum, or a scalar extreme's image.
     acc: Vec<i64>,
     /// Whether an extreme holds a value. Empty for a list without one.
@@ -106,7 +106,7 @@ fn wides(aggs: &[Agg]) -> bool {
 
 impl AggValues {
     /// `groups` empty groups of `aggs`.
-    pub(crate) fn new(aggs: &Rc<[Agg]>, groups: usize) -> Self {
+    pub fn new(aggs: &Rc<[Agg]>, groups: usize) -> Self {
         let mut values = AggValues {
             acc: Vec::new(),
             has: Vec::new(),
@@ -121,7 +121,7 @@ impl AggValues {
     }
 
     /// `groups` empty groups, in the buffers this already holds.
-    pub(crate) fn reset(&mut self, groups: usize) {
+    pub fn reset(&mut self, groups: usize) {
         // Laid out again at `cap = groups`: every value sits at `k * cap + g`.
         let n = self.aggs.len() * groups;
         zeroed(&mut self.acc, n);
@@ -137,7 +137,7 @@ impl AggValues {
     }
 
     /// The bytes this holds allocated.
-    pub(crate) fn held_bytes(&self) -> usize {
+    pub fn held_bytes(&self) -> usize {
         vec_bytes(&self.acc) + vec_bytes(&self.has) + vec_bytes(&self.wide) + vec_bytes(&self.heap)
     }
 
@@ -372,7 +372,7 @@ pub(crate) trait Groups: Copy {
 
 /// The rows of a fold's `i`-th range in one group.
 #[derive(Clone, Copy)]
-pub(crate) enum RangeGroups {
+pub enum RangeGroups {
     /// Group `i`.
     Each,
     /// This group.
@@ -413,6 +413,38 @@ impl Groups for &[u32] {
     }
 }
 
+/// Which group each row of a fold belongs to, as a caller outside this crate
+/// names it: whole ranges, or one group per row.
+#[derive(Clone, Copy)]
+pub enum FoldGroups<'a> {
+    Ranges(RangeGroups),
+    /// Row `i` of the fold in group `self[i]`.
+    Rows(&'a [u32]),
+}
+
+impl From<RangeGroups> for FoldGroups<'_> {
+    fn from(g: RangeGroups) -> Self {
+        FoldGroups::Ranges(g)
+    }
+}
+
+impl<'a> From<&'a [u32]> for FoldGroups<'a> {
+    fn from(g: &'a [u32]) -> Self {
+        FoldGroups::Rows(g)
+    }
+}
+
+/// `$body` with `$g` the [`Groups`] `$groups` describes: one copy of it per
+/// kind, so the fold beneath is monomorphized for each.
+macro_rules! with_groups {
+    ($groups:expr, |$g:ident| $body:expr) => {
+        match $groups.into() {
+            FoldGroups::Ranges($g) => $body,
+            FoldGroups::Rows($g) => $body,
+        }
+    };
+}
+
 impl Agg {
     /// `op` over input column `src`, emitting into output column `out`.
     pub(crate) fn new(op: AggFunc, src: ColumnLocator, out: ColumnLocator) -> Self {
@@ -424,17 +456,23 @@ impl Agg {
         }
     }
 
+    /// `op` over rows that are its own partials, each read and written at `out`: one
+    /// group's values from several reduces, merged as a reduce merges its own output.
+    pub fn merging(op: AggFunc, out: ColumnLocator) -> Self {
+        Agg::new(op.merge_op(), out, out)
+    }
+
     #[inline(always)]
-    pub(crate) fn is_linear(&self) -> bool {
+    pub fn is_linear(&self) -> bool {
         !matches!(self.kind, StepKind::Extreme { .. })
     }
 
-    pub(crate) fn is_wide(&self) -> bool {
+    pub fn is_wide(&self) -> bool {
         matches!(self.kind, StepKind::Extreme { kind: ImageKind::Wide(_), .. })
     }
 
     /// A count or an integer sum: exact whatever the row order.
-    pub(crate) fn is_exact_linear(&self) -> bool {
+    pub fn is_exact_linear(&self) -> bool {
         matches!(
             self.kind,
             StepKind::Count | StepKind::CountNonNull | StepKind::CountInf { .. } | StepKind::Sum(ScalarKind::Int(_))
@@ -444,7 +482,7 @@ impl Agg {
     /// A MIN/MAX's column as the value index keys it, its extreme first; `None`
     /// for a linear aggregate.
     #[inline(always)]
-    pub(crate) fn index_image(&self) -> Option<ImageCol> {
+    pub fn index_image(&self) -> Option<ImageCol> {
         match self.kind {
             StepKind::Extreme { max, .. } => Some(ImageCol::new(self.src, max)),
             _ => None,
@@ -456,7 +494,7 @@ impl AggValues {
     /// The net row count a COUNT, or a combine's sum of partial COUNTs, holds for
     /// group `g`.
     #[inline(always)]
-    pub(crate) fn count_value(&self, k: usize, g: usize) -> i64 {
+    pub fn count_value(&self, k: usize, g: usize) -> i64 {
         debug_assert!(matches!(
             self.aggs[k].kind,
             StepKind::Count | StepKind::Sum(ScalarKind::Int(FixedInt::I64))
@@ -466,14 +504,14 @@ impl AggValues {
 
     /// Empty group `g` of extreme `k`.
     #[inline(always)]
-    pub(crate) fn clear_extreme(&mut self, k: usize, g: usize) {
+    pub fn clear_extreme(&mut self, k: usize, g: usize) {
         let at = self.at(k, g);
         self.has[at] = false;
     }
 
     /// Seed group `g` of MIN/MAX `k` with the extreme image the value index
     /// holds for it.
-    pub(crate) fn seed_from_index(&mut self, k: usize, g: usize, image: &[u8]) {
+    pub fn seed_from_index(&mut self, k: usize, g: usize, image: &[u8]) {
         let StepKind::Extreme { max, kind } = self.aggs[k].kind else {
             unreachable!("only an extreme is seeded from the value index")
         };
@@ -552,16 +590,27 @@ impl AggValues {
     /// Step aggregate `k` over rows `ranges` of `mb`, each into its group: one
     /// pass over its column, in row order. A row at a non-positive weight steps no
     /// extreme.
-    pub(crate) fn fold(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Groups) {
+    pub fn fold<'g>(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Into<FoldGroups<'g>>) {
         let Agg { kind, src, .. } = self.aggs[k];
-        self.fold_column(k, (kind, src), mb, ranges, groups);
+        with_groups!(groups, |g| self.fold_column(k, (kind, src), mb, ranges, g));
     }
 
     /// [`Self::fold`] of wide extreme `k`, stepping no row of a group `g` that
     /// `skips(g)`: one whose wide extremes the caller reads elsewhere. A wide
     /// extreme compares native bytes a row at a time, so skipping a row costs
     /// less than stepping it.
-    pub(crate) fn fold_wide(
+    pub fn fold_wide<'g>(
+        &mut self,
+        k: usize,
+        mb: &MemBatch,
+        ranges: &[(usize, usize)],
+        groups: impl Into<FoldGroups<'g>>,
+        skips: impl Fn(usize) -> bool,
+    ) {
+        with_groups!(groups, |g| self.fold_wide_by(k, mb, ranges, g, &skips));
+    }
+
+    fn fold_wide_by(
         &mut self,
         k: usize,
         mb: &MemBatch,
@@ -587,7 +636,17 @@ impl AggValues {
     /// `ranges` of `mb` retract, NULLs aside, where `inserted`, the fold of the
     /// same rows' inserts, holds none at or below it. Every other value is
     /// left empty; a list without a scalar extreme is left as it is.
-    pub(crate) fn fold_retracted(
+    pub fn fold_retracted<'g>(
+        &mut self,
+        mb: &MemBatch,
+        ranges: &[(usize, usize)],
+        groups: impl Into<FoldGroups<'g>>,
+        inserted: &AggValues,
+    ) {
+        with_groups!(groups, |g| self.fold_retracted_by(mb, ranges, g, inserted));
+    }
+
+    fn fold_retracted_by(
         &mut self,
         mb: &MemBatch,
         ranges: &[(usize, usize)],
@@ -623,7 +682,7 @@ impl AggValues {
     /// image at or below `vals`' extreme: bag positivity puts that image at the
     /// stored extreme, every instance of which may be gone.
     #[inline(always)]
-    pub(crate) fn recedes(&self, k: usize, g: usize, vals: &AggValues) -> bool {
+    pub fn recedes(&self, k: usize, g: usize, vals: &AggValues) -> bool {
         if self.aggs[k].is_wide() {
             return true;
         }
@@ -634,7 +693,7 @@ impl AggValues {
     /// Fold into group `groups[i]` the values of output row `i` of `stored`,
     /// every row of it: each aggregate over its own column, as a previously
     /// emitted row's value merges.
-    pub(crate) fn fold_stored_rows(&mut self, stored: &MemBatch, groups: &[u32]) {
+    pub fn fold_stored_rows(&mut self, stored: &MemBatch, groups: &[u32]) {
         debug_assert_eq!(stored.len(), groups.len());
         for k in 0..self.aggs.len() {
             let Agg { merge, out, .. } = self.aggs[k];
@@ -720,7 +779,7 @@ impl AggValues {
     /// What `rows`' row at `weight` does to group `g` of every aggregate. An
     /// extreme takes a positive weight only.
     #[inline(always)]
-    pub(crate) fn step(&mut self, g: usize, rows: &impl RowSource, row: usize, weight: i64) {
+    pub fn step(&mut self, g: usize, rows: &impl RowSource, row: usize, weight: i64) {
         for k in 0..self.aggs.len() {
             let Agg { kind, src, .. } = self.aggs[k];
             self.apply(k, g, (kind, src), rows, row, weight);
@@ -728,13 +787,13 @@ impl AggValues {
     }
 
     /// Empty every group.
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.acc.fill(0);
         self.has.fill(false);
     }
 
     /// Give group `to` the values group `from` holds.
-    pub(crate) fn copy(&mut self, from: usize, to: usize) {
+    pub fn copy(&mut self, from: usize, to: usize) {
         for k in 0..self.aggs.len() {
             let (from, to) = (self.at(k, from), self.at(k, to));
             self.acc[to] = self.acc[from];
@@ -751,7 +810,7 @@ impl AggValues {
 
     /// Whether groups `a` and `b` hold the same values.
     #[inline]
-    pub(crate) fn same(&self, a: usize, b: usize) -> bool {
+    pub fn same(&self, a: usize, b: usize) -> bool {
         self.aggs.iter().enumerate().all(|(k, agg)| {
             let (a, b) = (self.at(k, a), self.at(k, b));
             match agg.kind {
@@ -769,7 +828,7 @@ impl AggValues {
     }
 
     /// Fold into group `g` the values of a previously-emitted output row.
-    pub(crate) fn fold_stored(&mut self, g: usize, out_row: &impl RowSource, row: usize) {
+    pub fn fold_stored(&mut self, g: usize, out_row: &impl RowSource, row: usize) {
         let nulls = out_row.get_null_word(row);
         for k in 0..self.aggs.len() {
             let Agg { merge, out, .. } = self.aggs[k];
@@ -797,7 +856,7 @@ impl AggValues {
     /// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying
     /// the group columns from `group`'s row at its locators — the ground row has
     /// none — and the aggregates from group `g`.
-    pub(crate) fn emit_row(
+    pub fn emit_row(
         &self,
         output: &mut Batch,
         group: Option<(&MemBatch, usize, &[ColumnLocator])>,
@@ -815,7 +874,7 @@ impl AggValues {
     /// Write group `g`'s value of every aggregate into its column of the row
     /// `out` has open; an extreme with no value renders NULL.
     #[inline(always)]
-    pub(crate) fn emit(&self, g: usize, out: &mut Batch) {
+    pub fn emit(&self, g: usize, out: &mut Batch) {
         for (k, agg) in self.aggs.iter().enumerate() {
             let ColumnLocator::Payload { slot, size, .. } = agg.out else {
                 unreachable!("an aggregate is a payload column")
@@ -844,7 +903,7 @@ impl AggValues {
     /// row `row` of `w`, over whatever cells it held. An extreme renders NULL
     /// where it has no value and clears its null bit where it has one; a count
     /// or a sum, never NULL, leaves its bit as it was.
-    pub(crate) fn emit_at(&self, w: &mut DirectWriter<'_>, rows: impl Iterator<Item = (usize, usize)> + Clone) {
+    pub fn emit_at(&self, w: &mut DirectWriter<'_>, rows: impl Iterator<Item = (usize, usize)> + Clone) {
         for (k, agg) in self.aggs.iter().enumerate() {
             let ColumnLocator::Payload { slot, size, .. } = agg.out else {
                 unreachable!("an aggregate is a payload column")
@@ -900,7 +959,7 @@ impl AggValues {
     /// `stored`, an output row, each by its type's order, NULL below every
     /// value: the payload order of two output rows whose other columns are equal,
     /// as the aggregates are the trailing ones.
-    pub(crate) fn cmp_stored(&self, g: usize, stored: &impl RowSource, row: usize) -> Ordering {
+    pub fn cmp_stored(&self, g: usize, stored: &impl RowSource, row: usize) -> Ordering {
         let nulls = stored.get_null_word(row);
         for (k, agg) in self.aggs.iter().enumerate() {
             let at = self.at(k, g);

@@ -1,7 +1,6 @@
 use super::tests::map_of;
 use super::*;
 use crate::test_support::{col, ncol, schema};
-use gnitz_core::BatchAppender;
 use gnitz_wire::TypeCode;
 use gnitz_wire::payload_u64;
 
@@ -23,15 +22,15 @@ fn client_map_bench() {
     for items in [["k", "v"], ["k", "v + 1"], ["k", "COALESCE(s, 'x')"]] {
         for n in [262_144usize, 1] {
             let mut b = ZSetBatch::new(&src);
-            let mut app = BatchAppender::new(&mut b);
+            let mut app = b.builder();
             for i in 0..n as i64 {
-                app.add_row((i - n as i64 / 2) as u128, 1)
-                    .int_val(i)
-                    .str_val(&format!("a string past the inline prefix {i}"));
+                app.begin_row((i - n as i64 / 2) as u128, 1)
+                    .put_int(i as u128)
+                    .put_string(&format!("a string past the inline prefix {i}"));
             }
             let mut map = map_of(&src, &items);
             let (out, instructions) = counter.measure(|| map.apply(b));
-            assert_eq!(payload_u64(&out, 0, 0) as i64, -(n as i64 / 2), "{items:?}");
+            assert_eq!(payload_u64(&out.view(), 0, 0) as i64, -(n as i64 / 2), "{items:?}");
             std::hint::black_box(out);
             println!(
                 "client_map_bench {:<16} {n:>7} rows {instructions:>8} instr {:6.1} instr/row",

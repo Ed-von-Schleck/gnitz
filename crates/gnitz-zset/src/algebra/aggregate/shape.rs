@@ -11,17 +11,17 @@ use gnitz_wire::AggDescriptor;
 
 /// What the rows of an operator emitting aggregates behind a group key look
 /// like: the output layout, the group key, and the aggregates.
-pub(crate) struct ReduceShape {
-    pub(crate) output_schema: SchemaDescriptor,
-    pub(crate) key: GroupOutKey,
-    pub(crate) aggs: Rc<[Agg]>,
+pub struct ReduceShape {
+    pub output_schema: SchemaDescriptor,
+    pub key: GroupOutKey,
+    pub aggs: Rc<[Agg]>,
 }
 
 impl ReduceShape {
     /// `aggs` over `input` grouped by `group_cols`, behind the group key region
     /// and the group columns it does not spell — the leading columns, whose
     /// schema comes second.
-    pub(crate) fn new(
+    pub fn new(
         input: &SchemaDescriptor,
         group_cols: &[u32],
         aggs: &[AggDescriptor],
@@ -41,7 +41,7 @@ impl ReduceShape {
 /// taken over no rows, as a global reduce's is. `Err` for an aggregate column out
 /// of range or of a type its aggregate does not admit, and for columns
 /// overflowing a schema bound.
-pub(crate) fn resolve_aggs(
+pub fn resolve_aggs(
     input: &SchemaDescriptor,
     mut prefix: DerivedSchema,
     aggs: &[AggDescriptor],

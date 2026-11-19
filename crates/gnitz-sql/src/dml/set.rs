@@ -11,7 +11,8 @@ use crate::ir::{BoundExpr, RegClass};
 use crate::rules::require_column;
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::ScalarEval;
-use gnitz_wire::{ColType, FixedInt, TypeCode, null_word_get, null_word_set, relocate_german_string};
+use gnitz_wire::{ColType, FixedInt, Heap, TypeCode, null_word_get, null_word_set, relocate_german_string};
+use gnitz_zset::repr::StringDest;
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr};
 
 /// Which row a SET right-hand side reads: the row being rewritten, or (ON
@@ -191,22 +192,17 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
 /// right-hand side reads the rows as they were. `excluded` holds the incoming
 /// VALUES rows aligned with `rows` (ON CONFLICT DO UPDATE only).
 ///
-/// Each assigned column is written whole into `new`, a batch of as many rows, and copied
-/// back. Assigning a string column also rebuilds every other string column into `new`,
-/// whose heap then replaces `rows`'; otherwise nothing is encoded and `rows`' heap is
-/// kept. A computed value out of its column's range is refused as it is written; a NULL
-/// into a NOT NULL column once every column is.
+/// Each assigned column is written whole into a copy of `rows`, so no right-hand side reads
+/// another's write. Assigning a string column compacts the copy's heap once the values it
+/// replaced make it wasteful. A computed value out of its column's
+/// range is refused as it is written; a NULL into a NOT NULL column once every column is.
 pub(super) fn apply_set(
     set: &mut [SetCol],
-    mut rows: ZSetBatch,
+    rows: ZSetBatch,
     excluded: Option<&ZSetBatch>,
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let n = rows.len();
-    let rebuild = set.iter().any(|a| (schema.columns()[a.ci].ty.tc).is_german_string());
-    // `new` holds the rewritten columns and, from the rows' own, the null words.
-    let mut new = ZSetBatch::zeroed(schema, n);
-    new.copy_null_words(&rows);
+    let mut new: ZSetBatch = rows.view().to_batch().into();
     for a in set.iter_mut() {
         let def = &schema.columns()[a.ci];
         let pi = schema
@@ -218,57 +214,63 @@ pub(super) fn apply_set(
             Scope::Excluded => excluded.expect("only ON CONFLICT DO UPDATE binds EXCLUDED"),
         };
         match &mut a.rhs {
-            SetRhs::Const { cell, spill, null } => {
-                let (col, heap) = new.col_and_heap_mut(pi);
-                // One spill for every row's cell.
-                let reloc;
-                let cell: &[u8] = if def.ty.tc.is_german_string() {
-                    reloc = relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, heap);
-                    &reloc
+            SetRhs::Const { cell, spill, null } => new.rewrite(|w| {
+                if def.ty.tc.is_german_string() {
+                    // One long value for every row's cell.
+                    let (cells, heap, _) = w.string_col_mut(pi);
+                    let cell =
+                        relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, heap);
+                    cells.as_chunks_mut::<16>().0.fill(cell);
                 } else {
-                    cell
-                };
-                gnitz_wire::by_cell_width!(cell.len(), |T| {
-                    let cell: [u8; size_of::<T>()] = cell.try_into().expect("one cell");
-                    col.as_chunks_mut::<{ size_of::<T>() }>().0.fill(cell);
-                });
-                new.update_null_words(|_, w| null_word_set(w, pi, *null));
-            }
+                    gnitz_wire::by_cell_width!(cell.len(), |T| {
+                        let cell: [u8; size_of::<T>()] = cell[..].try_into().expect("one cell");
+                        w.col_mut(pi).as_chunks_mut::<{ size_of::<T>() }>().0.fill(cell);
+                    });
+                }
+                set_null_bits(w.null_bmp_mut(), pi, |_| *null);
+            }),
             SetRhs::Copy { scope, src } => {
-                let b = scoped(*scope);
-                new.update_null_words(|r, w| null_word_set(w, pi, null_word_get(b.null_word(r), *src)));
-                new.copy_column_from(pi, b, *src);
+                let b = scoped(*scope).view();
+                new.rewrite(|w| {
+                    w.col_mut(pi).copy_from_slice(b.col_data(*src));
+                    // `new` began as a copy of `rows`, its heap at the same offsets, so a cell
+                    // of `Existing` already points at its value; one of `Excluded` is moved.
+                    if def.ty.tc.is_german_string() && matches!(scope, Scope::Excluded) {
+                        w.rebase_string_col(pi, Heap::Plain(b.blob()), StringDest::Placed(None));
+                    }
+                    set_null_bits(w.null_bmp_mut(), pi, |r| null_word_get(b.get_null_word(r), *src));
+                });
             }
-            SetRhs::Expr { scope, ev } => {
-                new.col_mut(pi).fill(0);
-                new.update_null_words(|_, w| null_word_set(w, pi, false));
-                ev.write_slot(scoped(*scope), &mut new, pi, def.ty.tc).map_err(|v| {
+            SetRhs::Expr { scope, ev } => new.rewrite(|w| {
+                w.col_mut(pi).fill(0);
+                set_null_bits(w.null_bmp_mut(), pi, |_| false);
+                ev.write_slot(&scoped(*scope).view(), w, pi, def.ty.tc).map_err(|v| {
                     GnitzSqlError::rejected(format!("column '{}': {} value out of range: {v}", def.name, def.ty))
-                })?;
-            }
+                })
+            })?,
         }
     }
     // Bit `pi` set where some rewritten row is NULL in column `pi`.
-    let any_null = new.null_words().fold(0, |acc, w| acc | w);
+    let any_null = new.view().null_words().fold(0, |acc, w| acc | w);
     for (pi, ci, def) in schema.payload_columns() {
-        let assigned = set.iter().any(|a| a.ci == ci);
-        if assigned {
+        if set.iter().any(|a| a.ci == ci) {
             check_not_null(def, null_word_get(any_null, pi))?;
         }
-        let restrung = rebuild && def.ty.tc.is_german_string();
-        if restrung && !assigned {
-            new.copy_column_from(pi, &rows, pi);
-        }
-        if assigned || restrung {
-            rows.col_mut(pi).copy_from_slice(new.col(pi));
-        }
     }
-    if rebuild {
-        rows.set_heap(new.take_heap());
+    if set.iter().any(|a| (schema.columns()[a.ci].ty.tc).is_german_string()) {
+        new = new.into_batch().trimmed().into();
     }
-    rows.copy_null_words(&new);
-    rows.fill_weights(1);
-    Ok(rows)
+    new.fill_weights(1);
+    Ok(new)
+}
+
+/// Null bit `pi` of each row's word in `nulls` set to `null` of the row.
+fn set_null_bits(nulls: &mut [u8], pi: usize, null: impl Fn(usize) -> bool) {
+    for (r, word) in nulls.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let mut w = u64::from_le_bytes(*word);
+        null_word_set(&mut w, pi, null(r));
+        *word = w.to_le_bytes();
+    }
 }
 
 #[cfg(test)]

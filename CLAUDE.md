@@ -323,13 +323,15 @@ never links the planner. `gnitz-mirror` is the sole crate on both sides, and
 links no planner either; `gnitz-py` links it, so the Python extension carries the
 Z-set kernel and store too — but not the DBSP layer.
 
-Two contracts decide what goes where. **The row kernels are `gnitz-zset`'s** —
-every operator, merge, sort, encoder and cursor — and the crates above call them
-once per batch, per run or per probed key. A loop over rows above the kernel
-decides policy and reads rows through the kernel's accessors; it never computes a
-Z-set. And **a client links no compiler, no VM and no catalog** — a fact of the
-crate graph rather than a convention: a host holding a mirrored view links
-`gnitz-zset` and `gnitz-store`, and `gnitz-server` is a binary nothing can link.
+Two contracts decide what goes where. **The row kernels are `gnitz-zset`'s and
+`gnitz-trace`'s** — every operator, merge, sort, encoder and cursor — and the
+crates above call them once per batch, per run or per probed key. A loop over rows
+above the kernel decides policy and reads rows through the kernel's accessors; it
+never computes a Z-set. A client is no exception: its batch is the kernel's own. And
+**a client links no compiler, no VM and no catalog** — a fact of the crate graph
+rather than a convention: every client links `gnitz-zset`, a host holding a
+mirrored view `gnitz-trace` and `gnitz-store` too, and `gnitz-server` is a binary
+nothing can link.
 
 ### Workspace crates
 
@@ -338,13 +340,14 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and CPU quota, the syscall idioms `std` lacks, and the cost probes and PRNG tests and benchmarks share — independent leaves every other crate may name |
 | `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests |
 | `gnitz-expr` | The one expression evaluator, the schema descriptor, the resolved column addressing it reads through, and the order-key ranking the client sort and the worker top-k share |
-| `gnitz-core` | Client core: connection, protocol, the client schema and batch, and the mirror state machine |
+| `gnitz-core` | Client core: connection, protocol, the client schema and batch — the kernel's batch under a client schema — and the mirror state machine |
 | `gnitz-sql` | SQL front end: parser, binder, query planner |
 | `gnitz-tokio` | The Rust async client: `gnitz-core`'s client waiting on tokio's reactor — owned by one task, or shared among tasks through the `AsyncClient` handle and the `Connection` future that serves it |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
 | `gnitz-cli` | The interactive SQL shell, whose cargo package and binary are `gnitz`: a line editor over `gnitz-sql`, with psql-style meta-commands and `\watch` over a delta feed. Given no server, it runs a separately installed `gnitz-server` for the session |
 | `gnitz-dump` | Logical dump and restore: a database as SQL and Parquet, read from one snapshot, restored into a build of the same formats or a later one |
-| `gnitz-zset` | The Z-set kernel: the key and payload-order kernels, columnar batches and the shard image, the cursor over runs, and the operators |
+| `gnitz-zset` | The Z-set kernel, which a client links too: the key and payload-order kernels, columnar batches and their wire form, and the functions of one Z-set |
+| `gnitz-trace` | The traces: sorted runs, the shard image, the cursor that merges runs, and the operators that read a trace |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
 | `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
 | `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |
@@ -352,21 +355,23 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
 | `gnitz-fuzz` | Dev-only: fuzzing through what a network delivers — seeds from recorded traffic, edits placed by what the decoders read, and the driver that plays edited traffic into a real server |
 
-### The engine (`gnitz-zset` + `gnitz-store` + `gnitz-server`)
+### The engine (`gnitz-zset` + `gnitz-trace` + `gnitz-store` + `gnitz-server`)
 
-Strictly layered — every module depends only on those beneath it, and the two
+Strictly layered — every module depends only on those beneath it, and the three
 crate seams are rungs of the same ladder:
 
 ```
-runtime        → catalog, query, and both crates below
-catalog        → query, and both crates below
-query          → both crates below
+runtime        → catalog, query, and the crates below
+catalog        → query, and the crates below
+query          → the crates below
   ── the crate seam: everything above is `gnitz-server` ──
-read           → relation, storage, and the kernel
-relation       → storage, and the kernel
-storage        → the kernel
-  ── the crate seam: everything above is `gnitz-store`, below is `gnitz-zset` ──
-stream         → algebra, repr, schema
+read           → relation, storage, runs, and the kernel
+relation       → storage, runs, and the kernel
+storage        → runs, and the kernel
+  ── the crate seam: everything above is `gnitz-store` ──
+stream         → runs, and the kernel
+runs           → the kernel
+  ── the crate seam: everything above is `gnitz-trace`, below is `gnitz-zset` ──
 algebra        → repr, schema
 repr           → schema
 schema           — the bottom rung; names none of the others
@@ -722,7 +727,8 @@ the whole workspace in release, so iterate on a single crate with cargo directly
 ```bash
 cd crates && cargo test -p gnitz-zset --release <name>_bench \
     -- --ignored --nocapture --test-threads=1
-# LSM, registry and read-executor benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz-server
+# shards, cursors and stream operators: -p gnitz-trace; LSM, registry and read-executor
+# benchmarks: -p gnitz-store; catalog/compiler and reactor/IPC: -p gnitz-server
 ```
 
 A module's benchmarks live in `<dir>/benches/<module>.rs`, attached the way its

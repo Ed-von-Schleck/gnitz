@@ -42,7 +42,7 @@ fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]]
     // A program's results are all of one class; a string's text is owned
     // here, since a `Cell` borrows it.
     let (mut got, mut texts) = (Vec::new(), Vec::new());
-    ev.for_each(&b, |cell| match cell {
+    ev.for_each(&b.view(), |cell| match cell {
         ScalarCell::Int(v) => {
             assert_ne!(ty, T::String, "{sql}: typed a string, computed a scalar");
             got.push(match v {
@@ -1159,7 +1159,7 @@ fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
 fn residual_rows(conjuncts: &[&BoundExpr], batch: &gnitz_core::ZSetBatch, schema: &Schema) -> Vec<usize> {
     let blob = compile_wire_conjuncts(conjuncts.iter().copied(), schema.columns()).expect("residual must compile");
     let mut filter = RowFilter::for_read(&blob, None, schema.layout()).expect("the blob resolves");
-    filter.ranges(batch).iter().flat_map(|&(s, e)| s..e).collect()
+    filter.ranges(&batch.view()).iter().flat_map(|&(s, e)| s..e).collect()
 }
 
 /// A residual keeps a row only where it is TRUE: a NULL conjunct excludes the

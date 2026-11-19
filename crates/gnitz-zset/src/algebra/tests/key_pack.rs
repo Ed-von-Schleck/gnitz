@@ -55,10 +55,16 @@ fn a_fold_keys_a_row_by_its_columns() {
     let mut b = BatchBuilder::new(&schema);
     for row in &rows {
         b.begin_row(7, 1);
-        row[..4].iter().for_each(|&cell| b.put_opt_int(cell));
+        row[..4].iter().for_each(|&cell| {
+            b.put_opt_int(cell);
+        });
         match row[4] {
-            Some(i) => b.put_string(STRS[i as usize]),
-            None => b.put_null(),
+            Some(i) => {
+                b.put_string(STRS[i as usize]);
+            }
+            None => {
+                b.put_null();
+            }
         }
         b.end_row();
     }
@@ -179,14 +185,22 @@ fn pack_rows_hashes_content_slots_as_a_row_at_a_time() {
         b.begin_row(r as u128, 1);
         b.put_opt_int((r % 3 != 0).then_some((r as i64 - 150) as u64 as u128));
         match r % 4 {
-            0 => b.put_null(),
-            k => b.put_string(STRS[(r + k) % STRS.len()]),
+            0 => {
+                b.put_null();
+            }
+            k => {
+                b.put_string(STRS[(r + k) % STRS.len()]);
+            }
         }
         b.put_int(r as u128 * 7);
         b.put_string(STRS[r % STRS.len()]);
         match r % 5 {
-            0 => b.put_null(),
-            _ => b.put_blob(STRS[(r * 3) % STRS.len()].as_bytes()),
+            0 => {
+                b.put_null();
+            }
+            _ => {
+                b.put_blob(STRS[(r * 3) % STRS.len()].as_bytes());
+            }
         }
         b.end_row();
     }

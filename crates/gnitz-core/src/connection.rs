@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
-use crate::batch::{FrameBlock, decode_wal_blocks, parse_wal_block};
+use crate::batch::{FrameBlock, decode_wal_blocks};
 use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
@@ -329,7 +329,9 @@ impl Train {
         block: std::ops::Range<usize>,
         more: bool,
     ) -> Result<(), ProtocolError> {
-        self.rows += parse_wal_block(&frame[block.clone()], &self.schema)?.rows;
+        self.rows += gnitz_wire::wal::parse_block(&frame[block.clone()], self.schema.layout().row_width())
+            .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?
+            .rows;
         if more {
             self.held.push(own_block(frame, block));
         }

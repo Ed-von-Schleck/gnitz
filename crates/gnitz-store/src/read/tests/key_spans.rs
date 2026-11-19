@@ -21,7 +21,7 @@ fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
     let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let rows = |w: i64, ids: &mut dyn Iterator<Item = u64>| {
         id_rows(&schema, ids.map(|id| (id, w)), |bb, id| {
-            bb.put_opt_int(val(id).map(|v| v as u128))
+            bb.put_opt_int(val(id).map(|v| v as u128));
         })
     };
     let indexed: &[&[u32]] = if indexed { &[&[1]] } else { &[] };

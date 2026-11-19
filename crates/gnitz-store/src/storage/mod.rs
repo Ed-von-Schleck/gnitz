@@ -1,6 +1,6 @@
 //! The storage LSM — the lifecycle of one store: which runs it holds, and when
-//! they flush, compact and publish a manifest. The runs themselves, and the
-//! cursor and merges over them, are `gnitz_zset::repr`'s.
+//! they flush, compact and publish a manifest. The runs themselves and the
+//! cursor over them are `gnitz_trace::runs`'s, the merges `gnitz_zset::repr`'s.
 
 mod batch_fsync;
 mod bloom;

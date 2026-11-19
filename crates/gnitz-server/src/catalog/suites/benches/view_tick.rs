@@ -320,7 +320,7 @@ fn minmax_view_tick_bench() {
             },
         );
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-        let out = *gnitz_zset::stream::ReducePlan::from_wire(&schema, &group, &aggs, false)
+        let out = *gnitz_trace::stream::ReducePlan::from_wire(&schema, &group, &aggs, false)
             .unwrap()
             .output_schema();
         try_register_view(engine, circuit, "v", &cols_of(&out), 0, 0).unwrap()
@@ -335,7 +335,7 @@ fn top_n_view(engine: &mut CatalogEngine, t: u64, group: &[u32], limit: u64) -> 
     let slots = WeightSlots { skip: 0, keep: limit };
     circuit.top_n(scan, group, &order, slots);
     let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-    let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, group, &order, slots)
+    let out = *gnitz_trace::stream::OrderedPlan::top_n(&schema, group, &order, slots)
         .unwrap()
         .output_schema();
     try_register_view(engine, circuit, "v", &cols_of(&out), 0, 0).unwrap()
@@ -404,7 +404,7 @@ fn window_bulk_view_tick_bench() {
             (true, false),
         );
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-        let out = *gnitz_zset::stream::OrderedPlan::window(&schema, &[1], &order, &aggs, true, false)
+        let out = *gnitz_trace::stream::OrderedPlan::window(&schema, &[1], &order, &aggs, true, false)
             .unwrap()
             .output_schema();
         let v = try_register_view(&mut engine, circuit, "v", &cols_of(&out), 0, 0).unwrap();

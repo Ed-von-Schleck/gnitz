@@ -5,7 +5,8 @@ use super::store::{Rows, not_held};
 use super::unique_pk::{PkRule, under_pk_rule};
 use super::{CircuitState, Relation, RelationKind, RelationRegistry, SecondaryIndex};
 use crate::storage::Table;
-use gnitz_zset::repr::{Batch, StorageError};
+use gnitz_trace::runs::StorageError;
+use gnitz_zset::repr::Batch;
 use std::rc::Rc;
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the

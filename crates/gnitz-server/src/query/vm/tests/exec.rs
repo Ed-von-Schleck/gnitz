@@ -1,5 +1,5 @@
 //! Dispatch-loop tests: epochs of hand-built programs, one per path the VM
-//! itself owns — operator semantics are `gnitz-zset`'s to test.
+//! itself owns — operator semantics are `gnitz-zset`'s and `gnitz-trace`'s to test.
 
 use super::*;
 use crate::test_support::{

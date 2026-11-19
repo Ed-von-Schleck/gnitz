@@ -1,20 +1,20 @@
-//! GnitzDB's Z-set kernel: the schema, the columnar batch representation and its
-//! cursor, and every operator over them.
+//! GnitzDB's Z-set kernel: the schema, the columnar batch representation, and
+//! every function of one Z-set.
 //!
-//! This is the row-level half of the engine. Every row kernel lives here —
-//! operator, merge, sort, encoder, cursor; the crates above — `gnitz-store`,
-//! which keeps Z-sets in an LSM, and `gnitz-server`, which maintains circuits —
-//! call in once per batch, per run or per probed key. Nothing here opens a
-//! store, publishes a manifest or knows a relation exists.
+//! This is the row-level half of the engine that reads no trace: every row
+//! kernel over a batch lives here — the operators of one Z-set, merge, sort,
+//! encoder; the crates above — `gnitz-trace`, which keeps sorted runs and runs
+//! the operators that read a trace, `gnitz-store` and `gnitz-server` — call in
+//! once per batch, per run or per probed key. Nothing here touches a file,
+//! opens a store or knows a relation exists, so a client links it too.
 //!
 //! The public module roots below are the API. They form a layer ladder, each
 //! naming only those beneath it — `tests/rungs.rs` states that table and
 //! enforces it:
 //!
 //! ```text
-//! stream   → algebra, repr, schema    the operators that read a trace
 //! algebra  → repr, schema             functions of one Z-set · key encoders
-//! repr     → schema                   a Z-set as bytes · the cursor over runs
+//! repr     → schema                   a Z-set as bytes in memory and on the wire
 //! schema                              the bottom rung
 //! ```
 //!
@@ -41,7 +41,6 @@
 pub mod algebra;
 pub mod repr;
 pub mod schema;
-pub mod stream;
 
 /// Tests no single module owns: the rung guard over the module roots above.
 #[cfg(test)]

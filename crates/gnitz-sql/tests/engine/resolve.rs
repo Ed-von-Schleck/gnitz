@@ -335,14 +335,13 @@ fn an_interrupted_resolve_ends_the_statement() {
 /// `resolve_relation` + `push` — the surface with no SQL layer above it.
 #[test]
 fn a_second_client_pushes_after_a_column_alter() {
-    use gnitz_core::BatchAppender;
     use gnitz_wire::WireConflictMode::Update;
     let mut a = Db::boot(4);
     let mut b = a.peer();
     a.exec(T_ID_V);
     let rel = b.rel("t");
     let mut batch = ZSetBatch::new(&rel.schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).int_val(10);
+    batch.builder().begin_row(1, 1).put_int(10);
     block_on(b.client.push(rel.tid, &rel.schema, &batch, Update)).unwrap();
 
     a.exec("ALTER TABLE t ALTER COLUMN v DROP NOT NULL");
@@ -351,7 +350,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     assert_eq!(rel2.tid, rel.tid);
     assert!(rel2.schema.columns()[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&rel2.schema);
-    BatchAppender::new(&mut batch).add_row(2, 1).null();
+    batch.builder().begin_row(2, 1).put_null();
     block_on(b.client.push(rel2.tid, &rel2.schema, &batch, Update)).unwrap();
 
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 10, 1], [2, NULL, 1]]);

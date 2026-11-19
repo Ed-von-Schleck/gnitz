@@ -29,7 +29,7 @@ use gnitz_wire::{
 };
 
 mod loser_tree;
-pub(crate) use loser_tree::{LoserTree, Player};
+pub use loser_tree::{LoserTree, Player};
 
 // ---------------------------------------------------------------------------
 // Z-Set `+` over consolidated batches
@@ -59,7 +59,7 @@ pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -
 /// order, or `None` where two of them overlap or share a key. Windows of
 /// consolidated sources so laid out share no element, and are their sum
 /// concatenated in that order.
-pub(crate) fn disjoint_order<K: Ord>(windows: impl Iterator<Item = (K, K, usize)>) -> Option<SmallVec<[usize; 8]>> {
+pub fn disjoint_order<K: Ord>(windows: impl Iterator<Item = (K, K, usize)>) -> Option<SmallVec<[usize; 8]>> {
     let mut bounds: SmallVec<[(K, K, usize); 8]> = windows.collect();
     bounds.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let disjoint = bounds.is_sorted_by(|a, b| a.1 < b.0);
@@ -115,6 +115,8 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 
 /// `$body` with `$spans` a `const bool` that is `$cond`: one copy of it for
 /// each value, as [`drive`]'s `SPANS` asks.
+#[macro_export]
+#[doc(hidden)]
 macro_rules! with_spans {
     ($cond:expr, |$spans:ident| $body:expr $(,)?) => {
         if $cond {
@@ -126,7 +128,6 @@ macro_rules! with_spans {
         }
     };
 }
-pub(crate) use with_spans;
 
 /// The consolidated merge of sorted `sources`, source `i` walked over the `i`-th
 /// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
@@ -140,7 +141,7 @@ pub(crate) use with_spans;
 /// merge loop, [`merge_picks`]. Out of line, so its callers compile as they
 /// would around a call.
 #[inline(never)]
-pub(crate) fn run_merge<S: ColumnarSource>(
+pub fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
     windows: impl IntoIterator<Item = Range<usize>>,
@@ -173,7 +174,7 @@ const SPAN_SKEW: usize = 8;
 /// of all the others: the stretches of it between their rows then run long, and
 /// a merge of distinct sources gallops them. A merge whose stretches are short
 /// keeps a loop with no stretch arm, which the arm would slow.
-pub(crate) fn dominated(windows: &[Range<usize>]) -> bool {
+pub fn dominated(windows: &[Range<usize>]) -> bool {
     let (total, most) = (windows.iter()).fold((0, 0), |(t, m), w| (t + w.len(), m.max(w.len())));
     (total - most) * SPAN_SKEW <= most
 }
@@ -206,7 +207,7 @@ fn merge_picks<S: ColumnarSource, P: PayloadOrder, const SPANS: bool>(
 /// the read cursor share. Generic over the source type, so each caller
 /// monomorphizes its own branch-free copy.
 #[inline]
-pub(crate) fn merge_less<'a, S, P>(
+pub fn merge_less<'a, S, P>(
     schema: &'a SchemaDescriptor,
     sources: &'a [S],
     order: MergeOrder,
@@ -270,19 +271,19 @@ fn tie_less<const FOLD: bool, S: ColumnarSource, P: PayloadOrder>(
 /// ahead of that span are the same in every row the merge reads, and the ones
 /// behind it break a key tie.
 #[derive(Clone, Copy)]
-pub(crate) struct MergeOrder {
+pub struct MergeOrder {
     /// Where the key span starts in a wide PK; `None` for a narrow one.
     wide_at: Option<usize>,
     /// Collapse the payload axis at a skeleton row: it sorts before every
     /// hydrated row of its PK, making it the exemplar [`drive`] folds the whole
     /// PK group into. A runtime flag, not a second monomorphisation axis: it is
     /// constant for a merge's life and reached only on a PK tie.
-    pub(crate) coarsen: bool,
+    pub coarsen: bool,
 }
 
 impl MergeOrder {
     /// Keyed by the leading bytes of a `stride`-byte PK.
-    pub(crate) fn leading(stride: usize, coarsen: bool) -> Self {
+    pub fn leading(stride: usize, coarsen: bool) -> Self {
         MergeOrder {
             wide_at: (stride > NARROW_PK_MAX_BYTES).then_some(0),
             coarsen,
@@ -325,7 +326,7 @@ impl MergeOrder {
     /// The tournament leaf of source `src`'s walk `c`: its current row and that
     /// row's key, or `None` once the walk is exhausted.
     #[inline(always)]
-    pub(crate) fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &Range<usize>) -> Option<(u32, u128)> {
+    pub fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &Range<usize>) -> Option<(u32, u128)> {
         match c.start < c.end {
             true => Some((c.start as u32, self.key(&sources[src], c.start))),
             false => None,
@@ -377,7 +378,7 @@ fn span_end<S: ColumnarSource>(source: &S, order: MergeOrder, from: usize, end: 
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
 /// forced inlining folds the branch and drops the unused arm per monomorphisation.
 #[inline(always)]
-pub(crate) fn drive<S, P, const SPANS: bool>(
+pub fn drive<S, P, const SPANS: bool>(
     tree: &mut LoserTree,
     schema: &SchemaDescriptor,
     sources: &[S],

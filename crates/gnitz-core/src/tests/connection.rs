@@ -8,7 +8,6 @@ use crate::test_support::{
     sync_header, sync_held,
 };
 use crate::transport::poll_fd;
-use crate::{BatchAppender, PkColumn};
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus, framed};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
@@ -45,11 +44,11 @@ fn batch_a(pks: &[u64]) -> ZSetBatch {
 fn batch_b(pks: &[u64]) -> ZSetBatch {
     let schema = schema_b();
     let mut b = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut b);
+    let mut app = b.builder();
     for &pk in pks {
-        app.add_row(pk as u128, 1)
-            .str_val(&format!("s{pk}"))
-            .f64_val(pk as f64 * 0.5);
+        app.begin_row(pk as u128, 1)
+            .put_string(&format!("s{pk}"))
+            .put_float(pk as f64 * 0.5);
     }
     b
 }
@@ -182,10 +181,11 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     // One cell alone past the server's ingress cap, refused before it is sent.
     let sb = schema_b();
     let mut oversize = ZSetBatch::new(&sb);
-    BatchAppender::new(&mut oversize)
-        .add_row(1, 1)
-        .str_val(&"x".repeat(gnitz_wire::MAX_FRAME_PAYLOAD))
-        .f64_val(0.0);
+    oversize
+        .builder()
+        .begin_row(1, 1)
+        .put_string(&"x".repeat(gnitz_wire::MAX_FRAME_PAYLOAD))
+        .put_float(0.0);
     let untouched = |s: &Session, what: &str| {
         assert_eq!(s.requests_sent(), 0, "{what}");
         assert_eq!(s.interest(), Interest::NONE, "{what}");
@@ -653,11 +653,11 @@ fn a_multi_frame_page_decodes_in_arrival_order() {
     let schema = schema_b();
     let rows = |rows: &[(u64, i64)]| {
         let mut b = ZSetBatch::new(&schema);
-        let mut app = BatchAppender::new(&mut b);
+        let mut app = b.builder();
         for &(pk, w) in rows {
-            app.add_row(pk as u128, w)
-                .str_val(&format!("a string longer than inline {pk}"))
-                .f64_val(pk as f64);
+            app.begin_row(pk as u128, w)
+                .put_string(&format!("a string longer than inline {pk}"))
+                .put_float(pk as f64);
         }
         b
     };
@@ -1107,7 +1107,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     let schema = Arc::new(kv_schema(TypeCode::I64));
     let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
     let b1 = kv_rows(&[(3, 30, 1)]);
-    let b2 = ZSetBatch::retraction(&schema, &PkColumn::from_natives(&schema, [4]));
+    let b2 = ZSetBatch::retraction(&schema, schema.pk_keys([[4]]).as_bytes());
 
     let family = |tid: u64, batch, mode, basis| PushFamily {
         target: tid.into(),

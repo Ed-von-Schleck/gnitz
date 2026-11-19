@@ -1,6 +1,5 @@
 use super::*;
 use crate::test_support::parse_stmt;
-use gnitz_core::BatchAppender;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::Statement;
 use std::hint::black_box;
@@ -18,16 +17,16 @@ fn apply_set_bench() {
     columns.extend((1..=2).map(|i| ColumnDef::new(format!("t{i}"), TypeCode::String, false)));
     let schema = Schema::from_parts(columns, &[0]).unwrap();
     let mut rows = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut rows);
+    let mut app = rows.builder();
     let mut rng = gnitz_foundation::rng::Rng::new(0x9E37_79B9_7F4A_7C15);
     for i in 0..ROWS {
         let r = rng.next_u64();
-        app.add_row(i as u128, 1);
+        app.begin_row(i as u128, 1);
         for _ in 0..8 {
-            app.int_val(r as i64);
+            app.put_int((r as i64) as u128);
         }
         for _ in 0..2 {
-            app.str_val(if r & 1 == 0 {
+            app.put_string(if r & 1 == 0 {
                 "short"
             } else {
                 "a string long enough to spill out of line"

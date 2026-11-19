@@ -3,7 +3,7 @@
 
 use super::super::manifest::{FlushWork, StoreDir};
 use super::Table;
-use gnitz_zset::repr::StorageError;
+use gnitz_trace::runs::StorageError;
 
 /// Durably publish every table in `tables`, each manifest carrying
 /// `checkpoint_mark`.

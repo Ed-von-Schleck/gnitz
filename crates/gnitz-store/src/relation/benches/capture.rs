@@ -40,7 +40,9 @@ fn round(s: &SchemaDescriptor, strings: bool, first: u64, rows: u64) -> Batch {
                 bb.put_u64(id);
                 bb.put_u64(!id);
             }
-            true => bb.put_string(STRING),
+            true => {
+                bb.put_string(STRING);
+            }
         }
         bb.end_row();
     }

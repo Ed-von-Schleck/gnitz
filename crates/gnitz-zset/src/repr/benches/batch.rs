@@ -109,13 +109,19 @@ fn consolidate_runs_bench() {
                         for (w, value) in [(-1, i % per_pk), (1, i % per_pk + 1)] {
                             b.begin_row(pk as u128, w);
                             let put = |b: &mut BatchBuilder, v: u64| match tc {
-                                TypeCode::F64 => b.put_float(v as f64),
-                                _ => b.put_int(v as u128),
+                                TypeCode::F64 => {
+                                    b.put_float(v as f64);
+                                }
+                                _ => {
+                                    b.put_int(v as u128);
+                                }
                             };
                             put(&mut b, id);
                             for _ in 1..payload_cols {
                                 match nullable && value % 4 == 0 {
-                                    true => b.put_null(),
+                                    true => {
+                                        b.put_null();
+                                    }
                                     false => put(&mut b, value),
                                 }
                             }
@@ -217,7 +223,9 @@ fn from_ranges_run_length_bench() {
     let mut b = BatchBuilder::new(&schema);
     for i in 0..ROWS as u128 {
         b.begin_row(i, 1);
-        (1..4).for_each(|c| b.put_int(i * c));
+        (1..4).for_each(|c| {
+            b.put_int(i * c);
+        });
         b.end_row();
     }
     let src = b.finish();

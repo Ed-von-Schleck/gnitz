@@ -5,9 +5,11 @@ use std::borrow::Cow;
 
 use super::*;
 use gnitz_store::relation::{Cut, Relation, RelationRegistry};
+use gnitz_trace::runs::{PkSetGather, ReadCursor, Run, StorageError, empty_cursor, from_runs};
+use gnitz_trace::stream;
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, Run, StorageError, empty_cursor, from_runs};
-use gnitz_zset::{algebra, stream};
+use gnitz_zset::algebra;
+use gnitz_zset::repr::Batch;
 use smallvec::SmallVec;
 
 /// The stores an epoch reads and writes: the view's own children, and the
@@ -77,7 +79,7 @@ impl Stores<'_> {
                 rows = match &mut instructions[pc].op {
                     Op::Filter(pred) => algebra::op_filter(Cow::Owned(rows), pred),
                     // A map may reorder the payload a run sorts by.
-                    Op::Map(plan) => plan.evaluate_map_batch(&rows).into_consolidated(),
+                    Op::Map(plan) => plan.evaluate_map_batch(&rows.as_mem_batch()).into_consolidated(),
                     _ => unreachable!("a history step is a filter or a map"),
                 };
             }
@@ -357,7 +359,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, pass: &Pass, from: usi
 
             Op::Filter(pred) => algebra::op_filter(operand(&mut batches[in_reg.at()], takes(in_reg)), pred),
 
-            Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
+            Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()].as_mem_batch()),
 
             Op::Negate => operand(&mut batches[in_reg.at()], takes(in_reg)).into_owned().negated(),
 

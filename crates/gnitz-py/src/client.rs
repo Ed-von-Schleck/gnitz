@@ -25,7 +25,7 @@ use crate::blocking;
 use crate::read::scan_result;
 use crate::reply::{delta, none, polled, scanned, sql_results, synced, value};
 use crate::schema::PySchema;
-use crate::write::{PyZSetBatch, py_key_image, py_pks_to_column};
+use crate::write::{PyZSetBatch, py_key_image, py_pk_keys};
 use crate::{client_err, lock};
 
 /// How a client waits, which is the whole difference between its two classes.
@@ -245,7 +245,7 @@ impl PyClient {
         schema: PySchema,
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let batch = ZSetBatch::retraction(&schema.rust, &py_pks_to_column(&schema.rust, &pks)?);
+        let batch = ZSetBatch::retraction(&schema.rust, py_pk_keys(&schema.rust, &pks)?.as_bytes());
         Self::run(
             slf,
             single!(|c| c.push(target_id, &schema.rust, batch, WireConflictMode::Update)),
@@ -311,7 +311,7 @@ impl PyClient {
     /// The rows keyed `pk` — a single-column key's value, or a compound key's
     /// tuple of column values in PK order — read where `scan` reads.
     fn seek(slf: &Bound<'_, Self>, table_id: u64, schema: PySchema, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let keys = py_pks_to_column(&schema.rust, std::slice::from_ref(&pk))?.keys();
+        let keys = py_pk_keys(&schema.rust, std::slice::from_ref(&pk))?;
         Self::read(slf, table_id, schema, ReadSpec::all_rows(ReadBound::PkSet(keys)))
     }
 

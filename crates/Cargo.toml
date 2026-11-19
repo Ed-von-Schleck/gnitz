@@ -12,6 +12,7 @@ members = [
     "gnitz-dump",
     "gnitz-store",
     "gnitz-zset",
+    "gnitz-trace",
     "gnitz-mirror",
     "gnitz-server",
     "gnitz-zset-testkit",
@@ -70,6 +71,7 @@ gnitz-wire = { path = "gnitz-wire", version = "=0.1.8" }
 gnitz-expr = { path = "gnitz-expr", version = "=0.1.8" }
 gnitz-core = { path = "gnitz-core", version = "=0.1.8" }
 gnitz-zset = { path = "gnitz-zset", version = "=0.1.8" }
+gnitz-trace = { path = "gnitz-trace", version = "=0.1.8" }
 gnitz-store = { path = "gnitz-store", version = "=0.1.8" }
 gnitz-sql = { path = "gnitz-sql", version = "=0.1.8" }
 gnitz-dump = { path = "gnitz-dump", version = "=0.1.8" }
@@ -80,9 +82,10 @@ gnitz-dump = { path = "gnitz-dump", version = "=0.1.8" }
 [profile.release]
 panic = "abort"
 # Fat LTO so hot paths inline across crate/module boundaries — e.g. the
-# `repr::scatter` kernels calling `DirectWriter` in a sibling module, and the
-# operators calling into the batch. Those all live inside `gnitz-zset`; what LTO
-# adds on top is the seams above it — the store's and the server's — where it
+# `repr::scatter` kernels calling `DirectWriter` in a sibling module inside
+# `gnitz-zset`, and the operators of `gnitz-trace` calling into its batch, a row
+# kernel's seam LTO keeps inline. What LTO adds above the row kernels is the
+# seams of the store and the server, where it
 # buys per-key, per-request and per-frame work, not per-row: the row kernels run
 # below those seams, driven by one call per batch or per run. What crosses is a
 # store's point lookup into its runs, the row accessors unique-PK enforcement

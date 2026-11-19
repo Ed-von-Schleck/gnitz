@@ -71,13 +71,13 @@ proptest! {
 /// crate.
 #[test]
 fn a_client_bundle_decodes_to_the_rows_it_wrote() {
-    use gnitz_core::{BatchAppender, ZSetBatch};
+    use gnitz_core::ZSetBatch;
     use gnitz_wire::multi_frame::decode_items;
     use gnitz_wire::{CircuitRow, ColTabRow, IdxTabRow, SchemaTabRow, SeqTabRow, SysRow, TableTabRow, ViewTabRow};
 
     fn block<R: SysRow>(rows: &[(R, i64)]) -> (SysFamily, ZSetBatch) {
         let mut b = ZSetBatch::new(gnitz_core::sys_schema(R::FAMILY));
-        let mut sink = BatchAppender::new(&mut b);
+        let mut sink = b.builder();
         for (row, weight) in rows {
             row.write(&mut sink, *weight);
         }

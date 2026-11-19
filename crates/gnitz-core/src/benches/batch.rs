@@ -1,15 +1,15 @@
 use super::*;
-use crate::BatchAppender;
-use crate::test_support::{decode_wal_block, encode_wal_block, wide_rows, wide_schema};
+use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{ColumnDef, TypeCode};
 use std::hint::black_box;
+use std::sync::Arc;
 
-/// Instructions per pushed key row: one key column and three through
-/// `push_natives`, whose cost is per column, and one through `from_natives`.
+/// Instructions per key of a key set built from native values: one key column and three,
+/// whose encode cost is per column.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn pk_column_push_bench() {
+fn pk_keys_bench() {
     const ROWS: usize = 1_000_000;
     let counter = gnitz_foundation::perf::Counter::instructions();
     let key_schema = |types: &[TypeCode]| {
@@ -20,22 +20,12 @@ fn pk_column_push_bench() {
         .unwrap()
     };
     for types in [&[TypeCode::I64][..], &[TypeCode::I32, TypeCode::U128, TypeCode::I16]] {
-        let schema = std::hint::black_box(key_schema(types));
-        let mut col = PkColumn::empty_for_schema(&schema);
-        col.reserve(ROWS);
-        let ((), instr) = counter.measure(|| {
-            for i in 0..ROWS as u128 {
-                let natives = [i, i ^ 0x55, i & 0x7fff];
-                col.push_natives(&natives[..types.len()]);
-            }
-        });
-        std::hint::black_box(&col);
-        println!("push_natives {types:?}: {:.1} instr/row", instr as f64 / ROWS as f64);
+        let schema = black_box(key_schema(types));
+        let natives: Vec<[u128; 3]> = (0..ROWS as u128).map(|i| [i, i ^ 0x55, i & 0x7fff]).collect();
+        let (keys, instr) = counter.measure(|| schema.pk_keys(natives.iter().map(|n| &n[..types.len()])));
+        black_box(&keys);
+        println!("pk_keys {types:?}: {:.1} instr/key", instr as f64 / ROWS as f64);
     }
-    let schema = std::hint::black_box(key_schema(&[TypeCode::I64]));
-    let (col, instr) = counter.measure(|| PkColumn::from_natives(&schema, 0..ROWS as u128));
-    std::hint::black_box(&col);
-    println!("from_natives [I64]: {:.1} instr/row", instr as f64 / ROWS as f64);
 }
 
 /// Instructions per gathered row: a full permutation and half of one, over 1, 4 and 16 I64
@@ -59,15 +49,15 @@ fn gather_bench() {
         columns.extend(string.then(|| ColumnDef::new("s", TypeCode::String, false)));
         let schema = Schema::from_parts(columns, &[0]).unwrap();
         let mut b = ZSetBatch::new(&schema);
-        let mut app = BatchAppender::new(&mut b);
+        let mut app = b.builder();
         for i in 0..ROWS {
             let r = rng.next_u64();
-            app.add_row(i as u128, 1);
+            app.begin_row(i as u128, 1);
             for _ in 0..ints {
-                app.int_val(r as i64);
+                app.put_int((r as i64) as u128);
             }
             if string {
-                app.str_val(if r & 1 == 0 {
+                app.put_string(if r & 1 == 0 {
                     "short"
                 } else {
                     "a string long enough to spill out of line"
@@ -100,15 +90,15 @@ fn gather_bench() {
         columns.extend(string.then(|| ColumnDef::new("s", TypeCode::String, false)));
         let schema = Schema::from_parts(columns, &[0]).unwrap();
         let mut b = ZSetBatch::new(&schema);
-        let mut app = BatchAppender::new(&mut b);
+        let mut app = b.builder();
         for i in 0..ROWS {
             let r = rng.next_u64();
-            app.add_row(i as u128, 1);
+            app.begin_row(i as u128, 1);
             for _ in 0..ints {
-                app.int_val(r as i64);
+                app.put_int((r as i64) as u128);
             }
             if string {
-                app.str_val(if r & 1 == 0 {
+                app.put_string(if r & 1 == 0 {
                     "short"
                 } else {
                     "a string long enough to spill out of line"
@@ -134,9 +124,8 @@ fn gather_bench() {
 }
 
 /// Instructions per row to decode two payload columns' rows into a batch, as a WAL block
-/// copied out of a borrowed frame and as the process's own region list: what a block's parse
-/// and German cell check cost over the own-regions copy, over all-short cells, all-long cells
-/// and integer columns, which carry no cell to check.
+/// copied out of a borrowed frame: a block's parse and validation, over all-short cells,
+/// all-long cells and integer columns, which carry no cell to check.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn region_append_bench() {
@@ -149,48 +138,43 @@ fn region_append_bench() {
         ("integers", None),
     ] {
         let tc = cell.map_or(TypeCode::I64, |_| TypeCode::String);
-        let schema = Schema::from_parts(
-            vec![
-                ColumnDef::new("k", TypeCode::U64, false),
-                ColumnDef::new("a", tc, false),
-                ColumnDef::new("b", tc, false),
-            ],
-            &[0],
-        )
-        .unwrap();
+        let schema = Arc::new(
+            Schema::from_parts(
+                vec![
+                    ColumnDef::new("k", TypeCode::U64, false),
+                    ColumnDef::new("a", tc, false),
+                    ColumnDef::new("b", tc, false),
+                ],
+                &[0],
+            )
+            .unwrap(),
+        );
         let mut batch = ZSetBatch::new(&schema);
-        let mut rows = BatchAppender::new(&mut batch);
+        let mut rows = batch.builder();
         for i in 0..ROWS {
-            rows.add_row(i as u128, 1);
+            rows.begin_row(i as u128, 1);
             match cell {
-                Some(s) => rows.str_val(s).str_val(s),
-                None => rows.int_val(i as i64).int_val(7),
+                Some(s) => rows.put_string(s).put_string(s),
+                None => rows.put_int((i as i64) as u128).put_int(7),
             };
         }
-        let regions = batch.wire_regions();
         let block = encode_wal_block(&batch);
-        for (arm, wal) in [("a WAL block", true), ("own regions", false)] {
-            let ((), instr) = counter.measure(|| {
-                for _ in 0..ITERS {
-                    let b = match wal {
-                        true => decode_wal_block(black_box(&block), &schema),
-                        false => ZSetBatch::from_own_regions(&schema, black_box(&regions)),
-                    };
-                    black_box(b.unwrap());
-                }
-            });
-            println!(
-                "region_append_bench {shape}, {arm}: {:.1} instr/row",
-                instr as f64 / (ITERS * ROWS) as f64
-            );
-        }
+        let ((), instr) = counter.measure(|| {
+            for _ in 0..ITERS {
+                black_box(decode_borrowed(black_box(&block), &schema));
+            }
+        });
+        println!(
+            "region_append_bench {shape}: {:.1} instr/row",
+            instr as f64 / (ITERS * ROWS) as f64
+        );
     }
 }
 
 /// Instructions to decode a reply plus the batch's and the frame's drop: a block copied out of
 /// a frame the transport lent (a small reply, read whole in one socket read), and a block
 /// adopted with the frame the transport handed over (a reply larger than one read); against
-/// the arena's allocation alone ([`ZSetBatch::with_capacity`] plus drop), by column and row
+/// the batch's allocation alone ([`ZSetBatch::with_capacity`] plus drop), by column and row
 /// count.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -203,7 +187,7 @@ fn reply_alloc_cost_bench() {
         let (mut copied, mut alloc, mut adopted) = (0, 0, 0);
         for _ in 0..ROUNDS {
             copied += counter
-                .measure(|| drop(black_box(decode_wal_block(black_box(&block[..]), &schema).unwrap())))
+                .measure(|| drop(black_box(decode_borrowed(black_box(&block[..]), &schema))))
                 .1;
             alloc += counter
                 .measure(|| drop(black_box(ZSetBatch::with_capacity(black_box(&schema), black_box(rows)))))
@@ -227,4 +211,13 @@ fn reply_alloc_cost_bench() {
             adopted / ROUNDS
         );
     }
+}
+
+/// `block` decoded out of a frame the transport lent, as a small reply arrives.
+fn decode_borrowed(block: &[u8], schema: &Arc<Schema>) -> ZSetBatch {
+    let frame = FrameBlock {
+        frame: std::borrow::Cow::Borrowed(block),
+        block: 0..block.len(),
+    };
+    decode_wal_blocks(Vec::new(), Some(frame), schema).unwrap()
 }

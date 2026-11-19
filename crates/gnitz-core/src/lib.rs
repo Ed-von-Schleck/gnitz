@@ -27,12 +27,13 @@ mod test_support;
 mod transport;
 mod txn;
 
-pub use batch::{BatchAppender, PkColumn, RowMark, RowWriter, ZSetBatch};
+pub use batch::{RowMark, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{GnitzClient, env_target};
 pub use connection::{MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply, encode_ddl_txn};
 pub use ddl::{ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle, segment_id};
 pub use error::{ClientError, ProtocolError, not_found};
+pub use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
 pub use host::{
     BlockingHost, BoxFut, Host, Job, Op, Pending, Promise, Sent, block_on, drain_cancel, finished, promise, serve,
 };

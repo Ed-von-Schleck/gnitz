@@ -1,0 +1,31 @@
+[package]
+name = "gnitz-trace"
+description = "The traces of the gnitz database: sorted runs, the shard file, the cursor that merges runs, and the operators that read a trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+gnitz-foundation.workspace = true
+gnitz-wire.workspace = true
+gnitz-expr.workspace = true
+gnitz-zset.workspace = true
+xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
+rustc-hash.workspace = true
+# `mmap`, for the read-only file mapping.
+libc.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

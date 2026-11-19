@@ -11,9 +11,10 @@ use gnitz_zset::schema::SchemaDescriptor;
 
 pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, Table};
+use gnitz_trace::runs::{PkSetGather, ReadCursor, StorageError, StoredRow};
 use gnitz_wire::{PkColList, PkKeys, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
-use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
+use gnitz_zset::repr::Batch;
 
 mod build;
 mod circuit_state;

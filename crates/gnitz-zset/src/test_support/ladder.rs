@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The crate-root names any file may use: the roots themselves and the test
-/// scaffolding beside the rungs.
+/// scaffolding beside the rungs. A `#[macro_export]` macro is a crate-root name
+/// too, wherever it is defined, so the crate's own may be named as well.
 const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 
 /// Assert that every rung under `src_root` names only the rungs beneath it.
@@ -14,8 +15,9 @@ const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 /// of every earlier tier, and rungs sharing a tier are incomparable. Every
 /// entry of `src_root` must be a rung or one of `UNLADDERED`.
 ///
-/// It reads the name each `crate::` path leads with, so a crate-root item and a
-/// grouped `crate::{…}` import are refused along with a higher rung. It does
+/// It reads the name each `crate::` path leads with, so a crate-root item other
+/// than an exported macro and a grouped `crate::{…}` import are refused along
+/// with a higher rung. It does
 /// not see `super::`-relative reaches, so it is a regression guard and not a
 /// proof.
 pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
@@ -26,9 +28,11 @@ pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
             "{name} is a module root the ladder does not place",
         );
     }
+    let macros = exported_macros(src_root);
+    let macros: Vec<&str> = macros.iter().map(String::as_str).collect();
     for (tier, rungs) in ladder.iter().enumerate() {
         for rung in *rungs {
-            let allowed = [&[*rung], &ladder[..tier].concat()[..], &UNLADDERED[..]].concat();
+            let allowed = [&[*rung], &ladder[..tier].concat()[..], &UNLADDERED[..], &macros[..]].concat();
             assert_rungs_name_only(src_root, &[rung], "crate", &allowed);
         }
     }
@@ -71,6 +75,33 @@ pub fn rung_files(src_root: &Path, rung: &str) -> Vec<PathBuf> {
                 }
             } else if p.extension().is_some_and(|x| x == "rs") {
                 out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// The names of the `#[macro_export]` macros defined anywhere under `src_root`.
+fn exported_macros(src_root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut dirs = vec![src_root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for p in entries(&dir) {
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let src = fs::read_to_string(&p).unwrap();
+                for (at, _) in src.match_indices("#[macro_export]") {
+                    let rest = &src[at..];
+                    let Some(def) = rest.find("macro_rules! ") else {
+                        continue;
+                    };
+                    let name = &rest[def + "macro_rules! ".len()..];
+                    let name = &name[..name
+                        .find(|c: char| c != '_' && !c.is_alphanumeric())
+                        .unwrap_or(name.len())];
+                    out.push(name.to_string());
+                }
             }
         }
     }

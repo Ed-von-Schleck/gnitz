@@ -17,9 +17,15 @@ fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch 
         b.begin_row(group, 1);
         for (pi, col) in schema.payload_columns() {
             match (pi == last, col.type_code) {
-                (true, _) => b.put_int(i as u128),
-                (false, TypeCode::F64) => b.put_float(group as f64),
-                (false, _) => b.put_int(group),
+                (true, _) => {
+                    b.put_int(i as u128);
+                }
+                (false, TypeCode::F64) => {
+                    b.put_float(group as f64);
+                }
+                (false, _) => {
+                    b.put_int(group);
+                }
             }
         }
         b.end_row();
@@ -212,18 +218,32 @@ fn seeded_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, u64)]) -> Batch {
         let mut strings = 0;
         for (_, col) in schema.payload_columns() {
             match col.type_code {
-                _ if col.nullable && seed % 5 == 0 => b.put_null(),
+                _ if col.nullable && seed % 5 == 0 => {
+                    b.put_null();
+                }
                 TypeCode::String => {
                     strings += 1;
                     match strings {
-                        1 => b.put_string(&format!("{seed:028}")),
-                        _ => b.put_string(&format!("s{}", seed % 100)),
+                        1 => {
+                            b.put_string(&format!("{seed:028}"));
+                        }
+                        _ => {
+                            b.put_string(&format!("s{}", seed % 100));
+                        }
                     }
                 }
-                TypeCode::F64 => b.put_float(seed as f64),
-                TypeCode::I32 => b.put_int((seed as u32 >> 1) as u128),
-                TypeCode::I16 => b.put_int((seed as u16 >> 1) as u128),
-                _ => b.put_int((seed >> 1) as u128),
+                TypeCode::F64 => {
+                    b.put_float(seed as f64);
+                }
+                TypeCode::I32 => {
+                    b.put_int((seed as u32 >> 1) as u128);
+                }
+                TypeCode::I16 => {
+                    b.put_int((seed as u16 >> 1) as u128);
+                }
+                _ => {
+                    b.put_int((seed >> 1) as u128);
+                }
             }
         }
         b.end_row();

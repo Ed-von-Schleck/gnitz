@@ -10,7 +10,7 @@ use io_uring::types::FsyncFlags;
 use io_uring::{IoUring, opcode, types};
 
 use gnitz_foundation::gnitz_warn;
-use gnitz_zset::repr::StorageError;
+use gnitz_trace::runs::StorageError;
 
 /// The fds one sync batch opens, and the ring's SQ size.
 const FD_CHUNK: usize = 256;

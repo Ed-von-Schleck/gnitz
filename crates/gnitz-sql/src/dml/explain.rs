@@ -9,7 +9,7 @@
 use crate::SqlResult;
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::error::{GnitzSqlError, reject_if};
-use gnitz_core::{BatchAppender, GnitzClient, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{AggFunc, GroupAggs, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
 use sqlparser::ast::{Query, Statement};
@@ -265,9 +265,9 @@ fn plan_rows(lines: &[String]) -> SqlResult {
     .expect("the EXPLAIN reply schema is a valid two-column schema");
     let mut batch = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut batch);
+        let mut a = batch.builder();
         for (i, line) in lines.iter().enumerate() {
-            a.add_row(i as u128 + 1, 1).str_val(line);
+            a.begin_row(i as u128 + 1, 1).put_string(line);
         }
     }
     SqlResult::Rows(ScanReply {

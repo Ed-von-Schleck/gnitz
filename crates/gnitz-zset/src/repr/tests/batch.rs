@@ -49,8 +49,12 @@ fn mem_batch_row_accessors_match_its_regions() {
         b.put_int(i + 7);
         b.put_opt_int((i != 1).then_some((-(i as i64) * 100) as u128));
         match i {
-            0 => b.put_null(),
-            _ => b.put_string(&"a long string the heap holds".repeat(i as usize)),
+            0 => {
+                b.put_null();
+            }
+            _ => {
+                b.put_string(&"a long string the heap holds".repeat(i as usize));
+            }
         }
         b.end_row();
     }
@@ -215,10 +219,10 @@ fn put_null_leaves_a_zeroed_cell_under_its_bit() {
     b.debug_verify_null_bits();
 }
 
-/// `key_retractions` is one `-1` row per key, every payload cell a non-NULL
+/// `key_rows` at `-1` is one `-1` row per key, every payload cell a non-NULL
 /// zero, over a recycled buffer and under NOT NULL and string columns.
 #[test]
-fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
+fn key_rows_at_minus_one_are_minus_one_rows_of_zeroed_non_null_cells() {
     let schema = u64_pk_schema(&[
         SchemaColumn::new(TypeCode::String, false),
         SchemaColumn::new(TypeCode::I64, true),
@@ -230,7 +234,7 @@ fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
     drop(dirty);
 
     let pks: Vec<u8> = [7u64, 3, 9].iter().flat_map(|pk| pk.to_be_bytes()).collect();
-    let b = Batch::key_retractions(&schema, &pks);
+    let b = Batch::key_rows(&schema, &pks, -1);
     assert_eq!(b.len(), 3);
     assert_eq!(b.pk(), &pks[..]);
     for row in 0..3 {
@@ -241,7 +245,7 @@ fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
         assert_eq!(b.get_col_ptr(row, 2, 2), &[0; 2], "row {row}");
     }
     b.debug_verify_null_bits();
-    assert!(Batch::key_retractions(&schema, &[]).is_empty());
+    assert!(Batch::key_rows(&schema, &[], -1).is_empty());
 }
 
 /// A batch whose buffers hold more than twice what its rows need comes back as
@@ -279,7 +283,9 @@ fn trimmed_copies_only_oversized_batches() {
     cols.extend((0..6).map(|_| SchemaColumn::new(TypeCode::U8, false)));
     let mut narrow = BatchBuilder::new(&SchemaDescriptor::new(&cols, &[0]));
     narrow.begin_row(0, 1);
-    (0..6).for_each(|_| narrow.put_int(0));
+    (0..6).for_each(|_| {
+        narrow.put_int(0);
+    });
     narrow.end_row();
     let narrow = narrow.finish().clone();
     assert_eq!(narrow.capacity, 1);
@@ -602,8 +608,12 @@ fn a_shrunk_batch_holds_its_rows_in_no_more_than_they_take() {
         for i in 0..rows {
             b.begin_row_natives(&[i as u128, 3], 1 + i as i64 % 3);
             match i % 2 {
-                0 => b.put_blob(format!("a-fairly-long-string-value-{i}").as_bytes()),
-                _ => b.put_blob(b"hi"),
+                0 => {
+                    b.put_blob(format!("a-fairly-long-string-value-{i}").as_bytes());
+                }
+                _ => {
+                    b.put_blob(b"hi");
+                }
             }
             b.put_opt_int((i % 5 != 0).then_some(i as u128));
             b.end_row();
@@ -765,24 +775,22 @@ fn runs_where_zip_matches_a_per_position_scan_across_word_boundaries() {
     }
 }
 
-/// One row at a time through `append_stored`, each reserving its long strings:
-/// every string reads back as its source, and the heap's capacity doubles
-/// rather than growing by each reserve.
+/// One row at a time through `append_source_rows`, each reserving its long
+/// strings: every string reads back as its source, and the heap's capacity
+/// doubles rather than growing by each reserve.
 #[test]
-fn append_stored_one_row_at_a_time_grows_the_heap_geometrically() {
-    use crate::repr::{Run, StoredRow};
+fn append_source_rows_one_row_at_a_time_grows_the_heap_geometrically() {
     use crate::test_support::string_batch;
     const N: usize = 1000;
-    let src = std::rc::Rc::new(string_batch(
+    let src = string_batch(
         &(0..N as u64)
             .map(|i| (i, format!("long string number {i:>8}")))
             .collect::<Vec<_>>(),
-    ));
-    let run = Run::Mem(src.clone());
+    );
     let mut dst = Batch::empty_with_schema(src.schema());
     let mut caps = std::collections::BTreeSet::new();
     for row in 0..N {
-        dst.append_stored(&[StoredRow::new(run.clone(), row)], 1, 0);
+        dst.append_source_rows(std::iter::once((&src, row)), 1, 0);
         caps.insert(dst.blob.capacity());
     }
     assert_eq!(read_strings(&dst), read_strings(&src));

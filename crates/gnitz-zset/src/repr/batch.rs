@@ -7,7 +7,6 @@ use std::ops::Range;
 
 use super::merge;
 use super::pool::{PooledBuf, is_tight};
-use super::run::StoredRow;
 use super::scatter::{Pick, copy_ranges, with_picks};
 use super::seek::ColPtr;
 use super::string_heap::{self, BlobCache, relocated_cell};
@@ -22,13 +21,13 @@ use gnitz_wire::{
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
 /// path sizes its destination by.
 #[inline]
-pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
+pub fn range_rows(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|&(s, e)| e - s).sum()
 }
 
 /// The maximal `[start, end)` runs of `items`' positions whose item `keep`
 /// admits, ascending.
-pub(crate) fn runs_where<T>(items: &[T], keep: impl Fn(&T) -> bool) -> Vec<(usize, usize)> {
+pub fn runs_where<T>(items: &[T], keep: impl Fn(&T) -> bool) -> Vec<(usize, usize)> {
     runs_where_zip(items, items, |x, _| keep(x))
 }
 
@@ -100,7 +99,7 @@ fn arena_copy(
 
 /// Which row of a batch before [`Batch::consolidate_recording`] each row after
 /// it was.
-pub(crate) enum RowOrigins {
+pub enum RowOrigins {
     /// The rows stood where they were.
     Unmoved,
     /// The pick [`merge::consolidate_groups`] found per output row.
@@ -110,7 +109,7 @@ pub(crate) enum RowOrigins {
 impl RowOrigins {
     /// The row that output row `out_row` was.
     #[inline]
-    pub(crate) fn source_row(&self, out_row: usize) -> usize {
+    pub fn source_row(&self, out_row: usize) -> usize {
         match self {
             RowOrigins::Unmoved => out_row,
             RowOrigins::Moved(survivors) => survivors[out_row].1 as usize,
@@ -185,7 +184,7 @@ impl Batch {
     /// a [`DirectWriter`] over its uninitialized arena, with `max_blob` heap
     /// bytes reserved up front. Zero rows allocate no arena, and a heap the
     /// rows left empty is released.
-    pub(crate) fn write_new(
+    pub fn write_new(
         schema: &SchemaDescriptor,
         rows: usize,
         max_blob: usize,
@@ -198,7 +197,7 @@ impl Batch {
     /// `carried` [adopted](Self::adopt_heap) in order before any row is
     /// written, landing at base `at`: 0 for the first, each next one after
     /// those before it. Zero rows carry no heap.
-    pub(crate) fn write_new_carrying(
+    pub fn write_new_carrying(
         schema: &SchemaDescriptor,
         rows: usize,
         max_blob: usize,
@@ -224,7 +223,7 @@ impl Batch {
     /// Room for `bytes` more blob heap bytes, grown as [`PooledBuf::reserve_pooled`]
     /// grows a buffer: the bytes move verbatim, so cell offsets and `dead_heap`
     /// still hold. A schema with no string column has no heap to reserve.
-    pub(crate) fn reserve_blob(&mut self, bytes: usize) {
+    pub fn reserve_blob(&mut self, bytes: usize) {
         if self.schema.has_german_string() {
             self.blob.reserve_pooled(bytes);
         }
@@ -269,12 +268,6 @@ impl Batch {
         &self.blob
     }
 
-    /// The bytes the string heap has room for.
-    #[cfg(test)]
-    pub(in crate::repr) fn blob_capacity(&self) -> usize {
-        self.blob.capacity()
-    }
-
     /// An upper bound on the bytes of the heap no string cell references.
     #[inline]
     pub fn dead_heap(&self) -> usize {
@@ -308,27 +301,22 @@ impl Batch {
     }
     /// [`MemBatch::weight`].
     #[inline]
-    pub(crate) fn weight(&self) -> &[u8] {
+    pub fn weight(&self) -> &[u8] {
         self.as_mem_batch().weight()
     }
     /// [`MemBatch::null_bmp`].
     #[inline]
-    pub(crate) fn null_bmp(&self) -> &[u8] {
+    pub fn null_bmp(&self) -> &[u8] {
         self.as_mem_batch().null_bmp()
     }
 
-    /// The `[start, end)` runs of rows with no null bit of `mask` set.
-    pub(crate) fn runs_without_nulls(&self, mask: u64) -> Vec<(usize, usize)> {
-        let words = self.null_bmp().as_chunks::<FIXED_REGION_BYTES>().0;
-        // A batch with none of them set takes only this branch-free pass.
-        if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
-            return vec![(0, self.count)];
-        }
-        runs_where(words, |w| u64::from_le_bytes(*w) & mask == 0)
+    /// [`MemBatch::runs_without_nulls`].
+    pub fn runs_without_nulls(&self, mask: u64) -> Vec<(usize, usize)> {
+        self.as_mem_batch().runs_without_nulls(mask)
     }
     /// [`MemBatch::col_data`].
     #[inline]
-    pub(crate) fn col_data(&self, pi: usize) -> &[u8] {
+    pub fn col_data(&self, pi: usize) -> &[u8] {
         self.as_mem_batch().col_data(pi)
     }
 
@@ -398,7 +386,7 @@ impl Batch {
     /// `#[inline]` for the already-has-room test, which is the whole call on
     /// every append but the growing one.
     #[inline]
-    fn reserve_rows(&mut self, n: usize) {
+    pub fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity {
             return;
         }
@@ -458,7 +446,7 @@ impl Batch {
 
     /// Write `d`, one cell, into payload column `pi` of the open row.
     #[inline(always)]
-    pub(crate) fn extend_col(&mut self, pi: usize, d: &[u8]) {
+    pub fn extend_col(&mut self, pi: usize, d: &[u8]) {
         let r = REG_PAYLOAD_START + pi;
         debug_assert_eq!(
             d.len(),
@@ -478,11 +466,22 @@ impl Batch {
 
     /// NULL in payload column `pi` of the open row: a zeroed cell under its bit.
     #[inline]
-    pub(crate) fn put_null(&mut self, pi: usize) {
+    pub fn put_null(&mut self, pi: usize) {
         let r = REG_PAYLOAD_START + pi;
         let width = self.schema.region_stride(r);
         self.row_cell_mut(r, width).fill(0);
         self.row_cell_mut(REG_NULL_BMP, FIXED_REGION_BYTES)[pi / 8] |= 1 << (pi % 8);
+    }
+
+    /// Payload column `pi`'s cell of the open row, to write whole, and the heap a
+    /// German cell's long value lands in.
+    #[inline(always)]
+    pub(crate) fn open_cell_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>) {
+        let r = REG_PAYLOAD_START + pi;
+        debug_assert!(self.count < self.capacity, "no row is open: `begin_row` makes its room");
+        let width = self.schema.region_stride(r);
+        let off = self.region_start(r) + self.count * width;
+        (&mut self.data[off..off + width], &mut self.blob.0)
     }
 
     /// Open a row: its key (exactly `pk_stride` OPK bytes), its weight, and a
@@ -490,7 +489,7 @@ impl Batch {
     /// in any order, and closes with [`Self::commit_row`]; nothing reads the
     /// row before that.
     #[inline(always)]
-    pub(crate) fn begin_row(&mut self, pk_bytes: &[u8], weight: i64) {
+    pub fn begin_row(&mut self, pk_bytes: &[u8], weight: i64) {
         self.open_row(pk_bytes, weight, 0);
     }
 
@@ -514,7 +513,7 @@ impl Batch {
 
     /// Close the row [`Self::begin_row`] opened.
     #[inline(always)]
-    pub(crate) fn commit_row(&mut self) {
+    pub fn commit_row(&mut self) {
         self.count += 1;
         self.consolidated = false;
     }
@@ -532,11 +531,48 @@ impl Batch {
         self.commit_row();
     }
 
+    /// Rewrite this batch's rows in place through `fill`, a writer over all of
+    /// them that writes whole whatever it overwrites. The batch keeps no claim of
+    /// consolidation; once `fill` takes a string cell or the heap to write, its
+    /// dead-heap bound becomes the whole heap, as a rewritten string cell may leave
+    /// its old long value unreferenced.
+    pub fn rewrite<R>(&mut self, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
+        self.consolidated = false;
+        let mut w = DirectWriter::over(
+            &mut self.data,
+            self.capacity,
+            0,
+            self.count,
+            &self.schema,
+            &mut self.blob,
+            None,
+        );
+        let out = fill(&mut w);
+        if w.strings_touched() {
+            self.dead_heap = self.blob.len();
+        }
+        out
+    }
+
+    /// Keep the first `rows` rows and the first `blob` heap bytes: what the batch
+    /// held before the rows past them were appended, whose long values lie past
+    /// `blob`. No kept row's cell may point there.
+    pub fn truncate(&mut self, rows: usize, blob: usize) {
+        assert!(
+            rows <= self.count && blob <= self.blob.len(),
+            "truncate: past the batch"
+        );
+        self.count = rows;
+        self.blob.truncate(blob);
+        self.dead_heap = self.dead_heap.min(blob);
+        self.debug_poison_rows(rows..self.capacity);
+    }
+
     /// Write `rows` rows past the last through `fill`, relocating strings under
     /// one span-dedup cache. They are counted once `fill` returns, so no reader
     /// reaches a row before its regions are written.
     #[inline(always)]
-    pub(crate) fn write_rows<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
+    pub fn write_rows<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
         let mut cache = BlobCache::for_rows(&self.schema, rows);
         self.write_at_most(rows, &mut cache, |w| (rows, fill(w)))
     }
@@ -546,7 +582,7 @@ impl Batch {
     /// rows: it returns how many it wrote beside its result, and only those are
     /// counted.
     #[inline(always)]
-    pub(super) fn write_at_most<R>(
+    pub fn write_at_most<R>(
         &mut self,
         rows: usize,
         cache: &mut BlobCache,
@@ -645,7 +681,7 @@ impl Batch {
         if !cfg!(debug_assertions) {
             return;
         }
-        if let Some((breach, (row, slot))) = super::batch_wire::null_breach(&self.as_mem_batch()) {
+        if let Some((breach, (row, slot))) = self.as_mem_batch().null_breach() {
             panic!(
                 "batch holds {breach} at row {row}, payload slot {slot}, of {} rows",
                 self.count
@@ -657,7 +693,7 @@ impl Batch {
     /// (PK, payload) (no unfolded duplicate) AND no zero-weight row (ghost
     /// eliminated, §2). The weights are this batch's; the rows are compared as
     /// `rows` reads them, which is the batch itself or its rows over another heap.
-    pub(super) fn debug_verify_consolidated(&self, rows: &impl RowSource) {
+    pub fn debug_verify_consolidated(&self, rows: &impl RowSource) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -697,18 +733,14 @@ impl Batch {
 
     /// The rows `indices` names, in that order, at their own weights; none may be
     /// weight 0.
-    pub(crate) fn indexed_rows(&self, indices: &[u32]) -> Self {
+    pub fn indexed_rows(&self, indices: &[u32]) -> Self {
         self.indexed_rows_then(indices, |_| {})
     }
 
     /// [`Self::indexed_rows`], then the writer of those rows handed to `then`,
     /// to overwrite cells. A row named twice shares its strings' heap bytes.
-    pub(crate) fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Self {
-        let blob_cap = string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len());
-        Self::write_new(&self.schema, indices.len(), blob_cap, |writer| {
-            super::scatter::scatter_copy(&self.as_mem_batch(), indices, writer);
-            then(writer);
-        })
+    pub fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Self {
+        self.as_mem_batch().indexed_rows_then(indices, then)
     }
 
     /// The rows named by a strictly ascending `indices`, inheriting this batch's
@@ -829,7 +861,7 @@ impl Batch {
 
     /// The first row whose OPK bytes are `>= key`, galloping from `hint` where
     /// there is one; `key` is exactly `pk_stride` bytes.
-    pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
+    pub fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
         let (count, stride, pk) = (self.count, self.schema.pk_stride(), self.pk_col_ptr());
         // SAFETY: the PK region holds a key for every row.
         unsafe { super::seek::seek_lower_bound(count, stride, pk, key, hint) }
@@ -882,54 +914,55 @@ impl Batch {
         self.push_ranges(src, ranges, &mut cache);
     }
 
-    /// Copy each of `rows` onto this batch's tail at `weight`, each payload
-    /// column `skip` names, as payload bits, as a zero that is not NULL.
-    pub fn append_stored(&mut self, rows: &[StoredRow], weight: i64, skip: u64) {
-        if rows.is_empty() {
+    /// Copy each of `rows`, a source and a row of it, onto this batch's tail at
+    /// `weight`, each payload column `skip` names, as payload bits, as a zero that
+    /// is not NULL.
+    pub fn append_source_rows<'s, S: RowSource + 's>(
+        &mut self,
+        rows: impl ExactSizeIterator<Item = (&'s S, usize)> + Clone,
+        weight: i64,
+        skip: u64,
+    ) {
+        if rows.len() == 0 {
             return;
         }
         self.reserve_rows(rows.len());
         let mask = self.schema.string_payload_slots() & !skip;
         if mask != 0 {
             self.reserve_blob(
-                rows.iter()
-                    .map(|r| string_heap::row_long_bytes(&r.run, mask, r.row))
+                rows.clone()
+                    .map(|(src, row)| string_heap::row_long_bytes(src, mask, row))
                     .sum(),
             );
         }
         let mut cache = BlobCache::for_rows(&self.schema, rows.len());
-        for r in rows {
-            self.append_row_from_source(weight, &r.run, r.row, skip, Some(&mut cache));
+        for (src, row) in rows {
+            self.append_row_from_source(weight, src, row, skip, Some(&mut cache));
         }
     }
 
-    /// Append each of `rows` at `weight`: its key, then its columns at `locs`
+    /// Append row `row` of `src` at `weight`: its key, then its columns at `locs`
     /// as this batch's payload columns, in order, a NULL one as a NULL.
-    pub fn append_projected(&mut self, locs: &[ColumnLocator], rows: impl IntoIterator<Item = StoredRow>, weight: i64) {
-        for row in rows {
-            let (src, i) = row.source();
-            self.begin_row(src.get_pk_bytes(i), weight);
-            self.append_cells_from(locs, src, i);
-            self.commit_row();
-        }
+    pub fn append_projected_row<S: RowSource>(&mut self, locs: &[ColumnLocator], src: &S, row: usize, weight: i64) {
+        self.begin_row(src.get_pk_bytes(row), weight);
+        self.append_cells_from(locs, src, row);
+        self.commit_row();
     }
 
-    /// One `-1` row per key of `pks`, whole `schema` PKs back to back, every
-    /// payload cell a zeroed non-NULL filler: the retraction a base table's
-    /// unique-PK rule resolves by key alone.
-    pub fn key_retractions(schema: &SchemaDescriptor, pks: &[u8]) -> Batch {
+    /// One row per key of `pks`, whole `schema` PKs back to back, each at
+    /// `weight`, every payload cell a zeroed non-NULL filler: at `-1`, the
+    /// retraction a base table's unique-PK rule resolves by key alone.
+    pub fn key_rows(schema: &SchemaDescriptor, pks: &[u8], weight: i64) -> Batch {
         let n = pks.len() / schema.pk_stride();
-        debug_assert_eq!(n * schema.pk_stride(), pks.len(), "key_retractions: pks are whole keys");
+        debug_assert_eq!(n * schema.pk_stride(), pks.len(), "key_rows: pks are whole keys");
         Self::write_new(schema, n, 0, |w| {
             for pi in 0..schema.num_payload_cols() {
                 w.col_mut(pi).fill(0);
             }
-            let (pk, weight, nulls) = w.fixed_mut();
+            let (pk, weights, nulls) = w.fixed_mut();
             pk.copy_from_slice(pks);
             nulls.fill(0);
-            for word in weight.as_chunks_mut::<8>().0 {
-                *word = (-1i64).to_le_bytes();
-            }
+            weights.as_chunks_mut::<8>().0.fill(weight.to_le_bytes());
         })
     }
 
@@ -1033,7 +1066,7 @@ impl Batch {
     /// appends into one output, and the whole heap per run ratchets capacity.
     /// Either outcome also reserves `room` more heap bytes, for long cells the
     /// caller relocates from another source.
-    pub(crate) fn carry_heap(
+    pub fn carry_heap(
         &mut self,
         src: &MemBatch<'_>,
         kept_slots: u64,
@@ -1053,7 +1086,7 @@ impl Batch {
     /// Append `heap` whole onto this batch's heap, charging `dead` of its bytes
     /// dead, with `room` more heap bytes reserved past it. Returns the base the
     /// caller shifts the cells it copies out of `heap` by.
-    pub(super) fn adopt_heap(&mut self, heap: &[u8], dead: usize, room: usize) -> usize {
+    pub fn adopt_heap(&mut self, heap: &[u8], dead: usize, room: usize) -> usize {
         let base = self.blob.len();
         self.reserve_blob(heap.len() + room);
         self.blob.extend_from_slice(heap);
@@ -1063,7 +1096,7 @@ impl Batch {
 
     /// Append `source[row]` at `weight`, each payload column `skip` names as a
     /// zero that is not NULL; a `blob_cache` dedups repeated long-string spans.
-    pub(super) fn append_row_from_source<S: RowSource>(
+    pub fn append_row_from_source<S: RowSource>(
         &mut self,
         weight: i64,
         source: &S,
@@ -1111,7 +1144,7 @@ impl Batch {
     /// Append the columns at `locs` of `src`'s row as the open row's payload
     /// slots, in order, a NULL one as a NULL.
     #[inline(always)]
-    pub(crate) fn append_cells_from<S: RowSource>(&mut self, locs: &[ColumnLocator], src: &S, row: usize) {
+    pub fn append_cells_from<S: RowSource>(&mut self, locs: &[ColumnLocator], src: &S, row: usize) {
         for (out_pi, loc) in locs.iter().enumerate() {
             match *loc {
                 ColumnLocator::Pk { .. } => {
@@ -1172,7 +1205,7 @@ impl Batch {
     /// Consolidate this batch: rows that stand in consolidated order are
     /// certified where they are, and any others are sorted and weight-folded
     /// into a fresh batch. Returns which row each output row was.
-    pub(crate) fn consolidate_recording(&mut self) -> RowOrigins {
+    pub fn consolidate_recording(&mut self) -> RowOrigins {
         if self.stands_consolidated() {
             self.certify_consolidated();
             return RowOrigins::Unmoved;
@@ -1278,7 +1311,7 @@ impl Batch {
     }
 
     /// [`MemBatch::debug_verify_dead_heap`].
-    pub(super) fn debug_verify_dead_heap(&self) {
+    pub fn debug_verify_dead_heap(&self) {
         self.as_mem_batch().debug_verify_dead_heap();
     }
 }
@@ -1337,6 +1370,16 @@ pub struct MemBatch<'a> {
 }
 
 impl<'a> MemBatch<'a> {
+    /// The `[start, end)` runs of rows with no null bit of `mask` set.
+    pub fn runs_without_nulls(&self, mask: u64) -> Vec<(usize, usize)> {
+        let words = self.null_bmp().as_chunks::<FIXED_REGION_BYTES>().0;
+        // A batch with none of them set takes only this branch-free pass.
+        if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
+            return vec![(0, self.count)];
+        }
+        runs_where(words, |w| u64::from_le_bytes(*w) & mask == 0)
+    }
+
     /// Row count of the view.
     #[inline(always)]
     pub fn len(&self) -> usize {
@@ -1351,6 +1394,12 @@ impl<'a> MemBatch<'a> {
     #[inline]
     pub fn schema(&self) -> &'a SchemaDescriptor {
         self.schema
+    }
+
+    /// An upper bound on the bytes of the heap no cell references.
+    #[inline]
+    pub fn dead_heap(&self) -> usize {
+        self.dead_heap
     }
 
     /// The string heap the long German-string cells index into.
@@ -1373,6 +1422,20 @@ impl<'a> MemBatch<'a> {
         b.count = self.count;
         b.debug_poison_rows(self.count..cap);
         b
+    }
+
+    /// [`Batch::indexed_rows`] of these rows.
+    pub fn indexed_rows(&self, indices: &[u32]) -> Batch {
+        self.indexed_rows_then(indices, |_| {})
+    }
+
+    /// [`Batch::indexed_rows_then`] of these rows.
+    pub fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Batch {
+        let blob_cap = string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len());
+        Batch::write_new(self.schema, indices.len(), blob_cap, |writer| {
+            super::scatter::scatter_copy(self, indices, writer);
+            then(writer);
+        })
     }
 
     /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
@@ -1440,14 +1503,14 @@ impl<'a> MemBatch<'a> {
 
     /// Weight region as a contiguous slice (`count * 8` bytes).
     #[inline]
-    pub(crate) fn weight(&self) -> &'a [u8] {
+    pub fn weight(&self) -> &'a [u8] {
         self.region(REG_WEIGHT)
     }
 
     /// Wrapping sum of the weights of rows `[start, end)`, over one
     /// bounds-checked slice of the weight region.
     #[inline]
-    pub(crate) fn sum_weights(&self, start: usize, end: usize) -> i64 {
+    pub fn sum_weights(&self, start: usize, end: usize) -> i64 {
         self.weight()[start * FIXED_REGION_BYTES..end * FIXED_REGION_BYTES]
             .as_chunks::<FIXED_REGION_BYTES>()
             .0
@@ -1457,13 +1520,13 @@ impl<'a> MemBatch<'a> {
 
     /// Null bitmap region as a contiguous slice (`count * 8` bytes).
     #[inline(always)]
-    pub(crate) fn null_bmp(&self) -> &'a [u8] {
+    pub fn null_bmp(&self) -> &'a [u8] {
         self.region(REG_NULL_BMP)
     }
 
     /// Payload column `pi` as a contiguous slice (`count * width` bytes).
     #[inline(always)]
-    pub(crate) fn col_data(&self, pi: usize) -> &'a [u8] {
+    pub fn col_data(&self, pi: usize) -> &'a [u8] {
         self.region(REG_PAYLOAD_START + pi)
     }
 
@@ -1485,8 +1548,28 @@ impl<'a> MemBatch<'a> {
         read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * FIXED_REGION_BYTES)
     }
     #[inline(always)]
-    pub(crate) fn get_null_word(&self, row: usize) -> u64 {
+    pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * FIXED_REGION_BYTES)
+    }
+    /// Every row's weight, in row order.
+    pub fn weights(&self) -> impl ExactSizeIterator<Item = i64> + 'a {
+        self.weight()
+            .as_chunks::<FIXED_REGION_BYTES>()
+            .0
+            .iter()
+            .map(|w| i64::from_le_bytes(*w))
+    }
+    /// Every row's null word, in row order.
+    pub fn null_words(&self) -> impl ExactSizeIterator<Item = u64> + 'a {
+        self.null_bmp()
+            .as_chunks::<FIXED_REGION_BYTES>()
+            .0
+            .iter()
+            .map(|w| u64::from_le_bytes(*w))
+    }
+    /// Indices of the live rows — those with positive weight.
+    pub fn live_rows(&self) -> impl Iterator<Item = usize> + 'a {
+        self.weights().enumerate().filter(|&(_, w)| w > 0).map(|(i, _)| i)
     }
     #[inline(always)]
     pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {

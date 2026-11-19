@@ -314,7 +314,7 @@ impl Batch {
     /// measured rather than its header's dead-byte bound trusted — and copied
     /// into an owned unconsolidated batch.
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
-        Ok(MemBatch::validate_foreign(data, schema)?.to_batch())
+        Ok(MemBatch::of_foreign_wal_block(data, schema)?.to_batch())
     }
 
     /// The sum of `blocks`, WAL blocks a peer wrote, as one batch, every block
@@ -328,7 +328,7 @@ impl Batch {
             [one] => Batch::decode_foreign_wal_block(one, schema),
             _ => {
                 let views = (blocks.iter())
-                    .map(|b| MemBatch::validate_foreign(b, schema))
+                    .map(|b| MemBatch::of_foreign_wal_block(b, schema))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(match views.iter().all(merge::view_in_consolidated_order) {
                     true => merge::merge_consolidated(&views, schema),
@@ -337,25 +337,6 @@ impl Batch {
             }
         }
     }
-}
-
-/// The first breach of `mb`'s null rule, and its `(row, payload slot)`: a null
-/// bit on a NOT NULL column, or a NULL cell that is not zeroed — a key reader
-/// packs or routes a cell whatever its null bit says, so a second encoding
-/// would key a row and its retraction apart.
-pub(super) fn null_breach(mb: &MemBatch<'_>) -> Option<(&'static str, (usize, usize))> {
-    let schema = mb.schema;
-    if let Some(at) = gnitz_wire::first_not_null_violation(schema.nullable_payload_slots(), mb.null_bmp()) {
-        return Some(("a null bit on a NOT NULL column", at));
-    }
-    let col = |pi| {
-        (
-            mb.col_data(pi),
-            schema.region_stride(gnitz_wire::REG_PAYLOAD_START + pi),
-        )
-    };
-    gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col)
-        .map(|at| ("a non-zero cell under a NULL", at))
 }
 
 /// Every BOOLEAN cell of `mb`, key or payload, is 0 or 1: a third byte would
@@ -400,6 +381,25 @@ fn validate_string_cells(mb: &MemBatch<'_>) -> Result<usize, &'static str> {
 }
 
 impl<'a> MemBatch<'a> {
+    /// The first breach of this batch's null rule, and its `(row, payload slot)`: a null
+    /// bit on a NOT NULL column, or a NULL cell that is not zeroed — a key reader
+    /// packs or routes a cell whatever its null bit says, so a second encoding
+    /// would key a row and its retraction apart.
+    pub fn null_breach(&self) -> Option<(&'static str, (usize, usize))> {
+        let schema = self.schema;
+        if let Some(at) = gnitz_wire::first_not_null_violation(schema.nullable_payload_slots(), self.null_bmp()) {
+            return Some(("a null bit on a NOT NULL column", at));
+        }
+        let col = |pi| {
+            (
+                self.col_data(pi),
+                schema.region_stride(gnitz_wire::REG_PAYLOAD_START + pi),
+            )
+        };
+        gnitz_wire::first_valued_null(schema.nullable_payload_slots(), self.null_bmp(), col)
+            .map(|at| ("a non-zero cell under a NULL", at))
+    }
+
     /// The rows of the WAL block `data` under `schema`: its fixed bytes are an
     /// arena of exactly its row count.
     ///
@@ -408,23 +408,31 @@ impl<'a> MemBatch<'a> {
     /// [`Batch::decode_foreign_wal_blocks`] or [`Self::certify_foreign`] first.
     pub fn of_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
         let block = wal::parse_block(data, schema.row_width())?;
-        Ok(MemBatch {
+        Ok(MemBatch::of_block(&block, schema))
+    }
+
+    /// The rows of a WAL block whose header [`wal::parse_block`] read, under `schema`,
+    /// taken as [`Self::of_wal_block`] takes them.
+    #[inline]
+    pub fn of_block(block: &wal::ParsedBlock<'a>, schema: &'a SchemaDescriptor) -> Self {
+        debug_assert_eq!(block.fixed.len(), block.rows * schema.row_width());
+        MemBatch {
             data: block.fixed,
             schema,
             cap: block.rows,
             blob: block.heap,
             count: block.rows,
             dead_heap: block.heap_dead,
-        })
+        }
     }
 
     /// [`Self::of_wal_block`] for a block a peer wrote, validated first: its
     /// string cells, null bits and BOOLEAN cells. The header's dead-heap bound
     /// is not trusted: the heap is measured.
-    fn validate_foreign(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
+    pub fn of_foreign_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
         let mut mb = MemBatch::of_wal_block(data, schema)?;
         mb.dead_heap = validate_string_cells(&mb)?;
-        if let Some((breach, _)) = null_breach(&mb) {
+        if let Some((breach, _)) = mb.null_breach() {
             return Err(breach);
         }
         if !boolean_cells_ok(&mb) {
@@ -438,7 +446,7 @@ impl<'a> MemBatch<'a> {
     /// header: from then on [`Self::of_wal_block`] reads `data` as a block the
     /// engine wrote.
     pub fn certify_foreign(data: &mut [u8], schema: &SchemaDescriptor) -> Result<(), &'static str> {
-        let dead = MemBatch::validate_foreign(data, schema)?.dead_heap;
+        let dead = MemBatch::of_foreign_wal_block(data, schema)?.dead_heap;
         gnitz_wire::wal::set_heap_dead(data, dead);
         Ok(())
     }

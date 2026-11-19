@@ -13,8 +13,8 @@ use std::time::Duration;
 use std::future::Future;
 
 use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema, Sent,
-    TableDef, ViewBundle, ZSetBatch, block_on,
+    ClientError, GnitzClient, PlannedView, PollResult, RelName, ScanReply, Schema, Sent, TableDef, ViewBundle,
+    ZSetBatch, block_on,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{ServerHandle, strace_test, unique_schema};
@@ -57,9 +57,9 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
 /// `pks` at weight 1.
 fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for pk in pks {
-        app.add_row(pk as u128, 1).int_val(pk * 3);
+        app.begin_row(pk as u128, 1).put_int((pk * 3) as u128);
     }
     batch
 }
@@ -94,7 +94,7 @@ fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
 /// How many rows a read returned, every one of them at weight 1. Every relation
 /// here is keyed uniquely, so a row counted twice is one row at weight 2.
 fn unit_rows(batch: &ZSetBatch) -> usize {
-    assert!(batch.weights().all(|w| w == 1), "{batch:?}");
+    assert!(batch.view().weights().all(|w| w == 1), "{batch:?}");
     batch.len()
 }
 
@@ -153,8 +153,8 @@ fn pipelined_verbs() {
             // Every kind of verb in flight together, behind a push that replaces
             // a row rather than adding to it.
             let mut replaced = ZSetBatch::new(&schema);
-            BatchAppender::new(&mut replaced).add_row(7, 1).int_val(-1);
-            let key = PkColumn::from_natives(&schema, [7]);
+            replaced.builder().begin_row(7, 1).put_int((-1i128) as u128);
+            let key = schema.pk_keys([[7]]);
             let (all, reply) = (ReadSpec::all_rows(ReadBound::None), Arc::clone(&schema));
             let resolve = |name: &'static str| {
                 let sn = sn.clone();
@@ -162,7 +162,7 @@ fn pipelined_verbs() {
             };
             let (_, one, many, found, missing) = tokio::join!(
                 push(&client, tid, &schema, replaced),
-                scan(&client, tid, ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
+                scan(&client, tid, ReadSpec::all_rows(ReadBound::PkSet(key.clone())), &schema),
                 client.send(move |c| c.scan_many(&[(tid.into(), &all, &reply), (empty.into(), &all, &reply)])),
                 resolve("t"),
                 resolve("nope"),
@@ -170,7 +170,7 @@ fn pipelined_verbs() {
             let (found, missing) = (found.unwrap(), missing.unwrap());
             let one = one.unwrap().batch;
             assert_eq!(unit_rows(&one), 1);
-            assert_eq!((one.pk(0), read_i64_le(one.col(0), 0)), (7, -1));
+            assert_eq!((one.pk(0), read_i64_le(one.view().col_data(0), 0)), (7, -1));
             let many: Vec<usize> = many.unwrap().iter().map(|r| unit_rows(&r.batch)).collect();
             assert_eq!(
                 many,

@@ -220,8 +220,12 @@ fn scan_spec_bench() {
     let strings = [TypeCode::String, I64];
     let r = fixture(&strings, &[], |bb, id| {
         match id % 4 < 2 {
-            true => bb.put_string(&format!("a-fairly-long-out-of-line-value-{id}")),
-            false => bb.put_string("short"),
+            true => {
+                bb.put_string(&format!("a-fairly-long-out-of-line-value-{id}"));
+            }
+            false => {
+                bb.put_string("short");
+            }
         }
         bb.put_u64(id % 2);
     });

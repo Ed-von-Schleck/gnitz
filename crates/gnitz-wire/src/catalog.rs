@@ -11,17 +11,14 @@ use crate::{
     ViewProps,
 };
 
-/// Where a row writer emits a row. Both sides already build batches this way —
-/// begin a row with its key and weight, push one value per payload column in
-/// schema order, close it.
+/// Where a row writer emits a row: begin a row with its key and weight, push one
+/// value per payload column in schema order, close it. `gnitz-zset`'s batch
+/// builder is the sink client and engine both write system rows into.
 ///
-/// `end_row` is where a builder that defers per-row bookkeeping (the engine's
-/// row count) does it; a builder that writes eagerly implements it as a no-op.
+/// `end_row` checks that the row got a value per payload column.
 pub trait SysRowSink {
     /// Begin a row keyed by `pk`: the family's PK columns in PK-list order, each
-    /// as its native value widened to `u128`. Both sinks OPK-encode them into
-    /// the same PK region layout, so the client's block and the engine's are
-    /// byte-identical.
+    /// as its native value widened to `u128`, OPK-encoded into the PK region.
     fn begin_row(&mut self, pk: &[u128], weight: i64);
     fn put_u64(&mut self, v: u64);
     fn put_string(&mut self, s: &str);

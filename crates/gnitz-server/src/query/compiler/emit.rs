@@ -4,14 +4,14 @@
 //! An arm resolves its operands, asks the operator's own constructor for its
 //! artifact, and pushes an instruction into a fresh register. The artifacts —
 //! output schemas, packers, plans — and the guards a client-supplied
-//! circuit clears to get one belong to `gnitz-zset`, beside the kernels that
+//! circuit clears to get one belong to `gnitz-zset` and `gnitz-trace`, beside the kernels that
 //! read them.
 
 use super::routing::{Dist, node_dist, pk_prefix_routed};
 use super::*;
 use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
+use gnitz_trace::stream::{JoinPlan, OrderedPlan, ReducePlan};
 use gnitz_zset::algebra::null_extend_output_schema;
-use gnitz_zset::stream::{JoinPlan, OrderedPlan, ReducePlan};
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against

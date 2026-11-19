@@ -9,8 +9,9 @@ use super::source::{KeyGather, SourceCursor};
 use crate::relation::{Cut, Relation, RelationRegistry};
 use crate::storage::Table;
 use gnitz_expr::ColumnLocator;
+use gnitz_trace::runs::{PkSetGather, empty_cursor};
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
-use gnitz_zset::repr::{Batch, PkSetGather, empty_cursor};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{SchemaDescriptor, project_schema};
 use std::num::NonZeroU64;
 
@@ -185,7 +186,10 @@ fn project_unique(table: &Table, schema: &SchemaDescriptor, keys: &PkKeys, cols:
     let out_schema = project_schema(schema, cols)?;
     let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
     let mut out = Batch::with_capacity(&out_schema, keys.len());
-    out.append_projected(&locs, keys.iter().filter_map(|k| table.unique_live_row_at(k)), 1);
+    for stored in keys.iter().filter_map(|k| table.unique_live_row_at(k)) {
+        let (src, row) = stored.source();
+        out.append_projected_row(&locs, src, row, 1);
+    }
     // One row per key, in ascending key order.
     out.certify_consolidated();
     Ok(out)

@@ -5,8 +5,9 @@ use crate::test_support::{
     relation_fixture, zset_of,
 };
 use gnitz_foundation::rng::Rng;
+use gnitz_trace::runs::Run;
 use gnitz_wire::{PkColList, ReadSpec, TypeCode, ViewBudget, image_mask, opk_bias};
-use gnitz_zset::repr::{BatchBuilder, Run};
+use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 const NBASE: u64 = 200;

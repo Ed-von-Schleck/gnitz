@@ -11,6 +11,7 @@ use gnitz_expr::{LogicalProgram, RowFilter, leading_pk};
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::BLIND;
 use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
+use gnitz_zset::repr::{Batch, MemBatch, Pick, gather_rows};
 
 use crate::client::GnitzClient;
 use crate::connection::PushFamily;
@@ -233,11 +234,11 @@ impl TidWrites {
         let TidWrites { fams, at, rows, last_op } = self;
         let from = *at;
         for (p, &fam) in fams.iter().enumerate().skip(from) {
-            let batch = &families[fam].batch;
+            let batch = families[fam].batch.view();
             let start = if p == from { *rows } else { 0 };
             for row in start..batch.len() {
-                if batch.weight(row) != 0 {
-                    last_op.insert(PkBuf::from_bytes(batch.pk_bytes(row)), (fam, row));
+                if batch.get_weight(row) != 0 {
+                    last_op.insert(PkBuf::from_bytes(batch.get_pk_bytes(row)), (fam, row));
                 }
             }
             (*at, *rows) = (p, batch.len());
@@ -349,45 +350,49 @@ impl TxnBuffer {
         let Some(index) = self.tids.get_mut(&tid).map(|t| t.index(families)) else {
             return Ok(committed);
         };
-        let keep: Vec<u32> = (0..committed.len())
-            .filter(|&i| !index.contains_key(committed.pk_bytes(i)))
+        let held = committed.view();
+        let keep: Vec<u32> = (0..held.len())
+            .filter(|&i| !index.contains_key(held.get_pk_bytes(i)))
             .map(|i| i as u32)
             .collect();
         // `gather` compacts the string arena the dropped rows carried.
         let mut out = committed.gather(&keep);
 
-        // Each family's live rows, gathered family by family.
-        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); families.len()];
+        // The families' live rows, gathered column by column in one pass.
+        let views: Vec<MemBatch<'_>> = families.iter().map(|f| f.batch.view()).collect();
+        let mut picks: Vec<Pick> = Vec::new();
         let take = |&(fam, row): &(usize, usize)| {
-            if families[fam].batch.weight(row) > 0 {
-                rows[fam].push(row as u32);
+            if views[fam].get_weight(row) > 0 {
+                picks.push((fam as u32, row as u32, 1));
             }
         };
         match &spec.bound {
             ReadBound::PkSet(set) => set.iter().filter_map(|k| index.get(k)).for_each(take),
             _ => index.values().for_each(take),
         }
-        let mut live = ZSetBatch::new(schema);
-        for (fam, rows) in families.iter().zip(&rows).filter(|(_, rows)| !rows.is_empty()) {
-            live.append_rows(&fam.batch, rows, true);
-        }
-        live.fill_weights(1);
+        let mut live: ZSetBatch = gather_rows(&views, schema.layout(), &picks, 0).into();
         if live.is_empty() {
             return Ok(out);
         }
         let mut filter = RowFilter::for_read(&spec.predicate, spec.bound.range(), schema.layout())
             .map_err(|e| ClientError::from(e.to_string()))?;
-        let ranges = filter.ranges(&live);
-        if keys {
+        let ranges = filter.ranges(&live.view());
+        match keys {
             // The predicate has read the payload; the key reply carries none.
-            let (keys, st) = (live.pk_region(), live.pk_stride());
-            for &(s, e) in ranges.iter() {
-                out.append_keys(&keys[s * st..e * st], 1);
+            true => {
+                let (v, stride) = (live.view(), schema.layout().pk_stride());
+                let kept: Vec<u8> = ranges
+                    .iter()
+                    .flat_map(|&(s, e)| &v.pk()[s * stride..e * stride])
+                    .copied()
+                    .collect();
+                out.extend_from_owned(Batch::key_rows(out.view().schema(), &kept, 1).into());
             }
-            return Ok(out);
+            false => {
+                live.retain_ranges(ranges);
+                out.extend_from_owned(live);
+            }
         }
-        let kept: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
-        out.extend_from_owned(live.gather(&kept));
         Ok(out)
     }
 }

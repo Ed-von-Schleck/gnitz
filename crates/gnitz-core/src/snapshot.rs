@@ -81,7 +81,7 @@ impl GnitzClient {
             let (mut more, mut start) = (false, 0);
             for (at, &end) in after.iter_mut().zip(&worker_ends) {
                 if end > start {
-                    *at = Some(PkBuf::from_bytes(batch.pk_bytes(end - 1)));
+                    *at = Some(PkBuf::from_bytes(batch.view().get_pk_bytes(end - 1)));
                 }
                 more |= (end - start) as u64 == share;
                 start = end;
@@ -119,6 +119,7 @@ impl GnitzClient {
     /// snapshot `id` holds them.
     pub async fn snapshot_serials(&mut self, id: u64) -> Result<HashMap<u64, u64>, ClientError> {
         let rows = self.snapshot_rows(id, SysFamily::Sequence).await?;
+        let rows = rows.view();
         Ok(rows
             .live_rows()
             .map(|i| {

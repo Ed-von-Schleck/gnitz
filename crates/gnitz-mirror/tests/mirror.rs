@@ -1495,13 +1495,13 @@ fn churn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
     let rel = block_on(client.resolve_relation(&rel(SH, "blb"))).unwrap();
     let mut batch = gnitz_core::ZSetBatch::new(&rel.schema);
     {
-        let mut app = gnitz_core::BatchAppender::new(&mut batch);
+        let mut app = batch.builder();
         for i in lo..=hi {
-            app.add_row(i as u128, 1);
+            app.begin_row(i as u128, 1);
             if i % 4 == 0 {
-                app.null();
+                app.put_null();
             } else {
-                app.bytes_val(&vec![(i % 251) as u8; 1 + (i as usize % 17)]);
+                app.put_blob(&vec![(i % 251) as u8; 1 + (i as usize % 17)]);
             }
         }
     }

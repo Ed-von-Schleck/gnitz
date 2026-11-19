@@ -19,6 +19,7 @@ sqlparser  = { version = "=0.64.0", features = ["visitor"] }
 gnitz-core.workspace = true
 gnitz-expr.workspace = true
 gnitz-wire.workspace = true
+gnitz-zset.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]

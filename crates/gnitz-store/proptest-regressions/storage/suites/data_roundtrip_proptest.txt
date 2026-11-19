@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 8a295d47fd441859c794320feee2dd67f5ea2a128fd0e5c496bd3ad85f428333 # shrinks to schema = SchemaDescriptor { columns: [U64 pk, U16 pk, U64 pk, U64 pk, Decimal?, UUID?, Timestamp, Timestamp], pk_indices: [2, 1, 0, 3] }, rows = 10, seed = 14789186877143982800
 cc 079c12d8bde770cc9058342215ac56f0ed0b271dab2758dc2ceeccf498d4b0f1 # shrinks to schema = SchemaDescriptor { columns: [U8 pk], pk_indices: [0] }, rows = 5, seed = 0
+cc 5672be04ecc1bbf84713556d967d35c81eb86ec31758746535195bdcb3b8f958 # shrinks to schema = SchemaDescriptor { columns: [F64, U8 pk], pk_indices: [1] }, rows = 5, durable = false, seed = 0

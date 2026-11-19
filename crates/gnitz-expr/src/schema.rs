@@ -449,6 +449,12 @@ impl SchemaDescriptor {
         }
     }
 
+    /// `other` has the same key column types in PK-list order, so its PK region is
+    /// byte-compatible with this schema's.
+    pub fn same_key_types(&self, other: &SchemaDescriptor) -> bool {
+        (self.pk_columns().map(|c| c.type_code)).eq(other.pk_columns().map(|c| c.type_code))
+    }
+
     /// The types of a batch's regions: the PK columns in PK-list order, then the
     /// payload columns in slot order.
     fn region_types(&self) -> impl Iterator<Item = TypeCode> {

@@ -26,8 +26,12 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
         b.begin_row_natives(&natives, 1);
         for (pc, col) in schema.payload_columns() {
             match col.type_code.is_german_string() {
-                true => b.put_string(&format!("key-{}", row % 50_000)),
-                false => b.put_int(spread(pc as u64 + 8) & gnitz_wire::image_mask(col.size())),
+                true => {
+                    b.put_string(&format!("key-{}", row % 50_000));
+                }
+                false => {
+                    b.put_int(spread(pc as u64 + 8) & gnitz_wire::image_mask(col.size()));
+                }
             }
         }
         b.end_row();

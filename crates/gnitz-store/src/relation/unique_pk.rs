@@ -7,7 +7,8 @@ use rustc_hash::FxHashMap;
 
 use crate::storage::Table;
 
-use gnitz_zset::repr::{Batch, StoredRow, merge_consolidated};
+use gnitz_trace::runs::StoredRow;
+use gnitz_zset::repr::{Batch, merge_consolidated};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// How a base table's write meets its unique PK.
@@ -117,12 +118,12 @@ pub(super) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
         return sum_in_order(batch, dropped, &stored);
     }
     if dropped.is_empty() {
-        batch.append_stored(&stored, -1, 0);
+        batch.append_source_rows(stored.iter().map(StoredRow::source), -1, 0);
         return batch;
     }
     let kept = complement(dropped, n);
     let mut effective = Batch::from_ranges(&batch, &kept, stored.len());
-    effective.append_stored(&stored, -1, 0);
+    effective.append_source_rows(stored.iter().map(StoredRow::source), -1, 0);
     effective
 }
 
@@ -150,7 +151,7 @@ fn sum_in_order(mut batch: Batch, dropped: Vec<usize>, stored: &[StoredRow]) -> 
 /// `stored`, rows of distinct keys in PK order, each at weight `-1`.
 fn retraction(schema: &SchemaDescriptor, stored: &[StoredRow]) -> Batch {
     let mut retracted = Batch::with_capacity(schema, stored.len());
-    retracted.append_stored(stored, -1, 0);
+    retracted.append_source_rows(stored.iter().map(StoredRow::source), -1, 0);
     retracted.certify_consolidated();
     retracted
 }

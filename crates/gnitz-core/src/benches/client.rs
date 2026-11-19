@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{rel, wide_rows, wide_schema};
-use crate::{PkColumn, TableDef, block_on};
+use crate::{TableDef, block_on};
 use gnitz_test_harness::{ServerHandle, unique_schema};
 use gnitz_wire::{ReadBound, WireConflictMode};
 use std::hint::black_box;
@@ -21,9 +21,7 @@ fn point_read_bench() {
         block_on(client.create_schema(&sn, false)).unwrap();
         let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), (*schema).clone()))).unwrap();
         block_on(client.push(tid, &schema, wide_rows(&schema, 100, 0), WireConflictMode::Update)).unwrap();
-        let mut key = PkColumn::empty_for_schema(&schema);
-        key.push_natives(&[5]);
-        let spec = ReadSpec::all_rows(ReadBound::PkSet(key.keys()));
+        let spec = ReadSpec::all_rows(ReadBound::PkSet(schema.pk_keys([[5]])));
         let mut read = || block_on(client.scan_served(tid, &spec, &schema)).unwrap();
         assert_eq!(read().batch.len(), 1);
         let total: u64 = (0..ROUNDS).map(|_| counter.measure(|| drop(black_box(read()))).1).sum();

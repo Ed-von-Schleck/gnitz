@@ -4,12 +4,12 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use gnitz_core::{ScanReply, ZSetBatch};
+use gnitz_core::ScanReply;
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{ColType, TypeCode, ValueText};
+use gnitz_wire::{ColType, RowSource, TypeCode, ValueText};
 
 /// Append the text of the non-NULL cell at `loc` in `row`.
-fn write_cell(out: &mut String, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) {
+fn write_cell(out: &mut String, batch: &impl RowSource, loc: ColumnLocator, ty: ColType, row: usize) {
     let _ = match ty.tc {
         TypeCode::String => out.write_str(&String::from_utf8_lossy(&loc.content(batch, row))),
         TypeCode::Blob => {
@@ -84,7 +84,7 @@ impl Rows {
                 ((schema.layout().locate(ci), c.ty), column)
             })
             .unzip();
-        let batch = &reply.batch;
+        let batch = &reply.batch.view();
         let mut out = Rows { columns, ..Rows::default() };
         out.cells.reserve(batch.len() * shown.len());
         for row in 0..batch.len() {
@@ -97,7 +97,7 @@ impl Rows {
                 out.cells.push(cell);
             }
         }
-        out.weights = batch.weights().collect();
+        out.weights = reply.batch.view().weights().collect();
         out
     }
 

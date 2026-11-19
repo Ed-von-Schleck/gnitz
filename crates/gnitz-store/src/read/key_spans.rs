@@ -2,7 +2,8 @@
 //! those columns, or off the relation's own PK where those columns lead it.
 
 use crate::relation::RelationRegistry;
-use gnitz_zset::repr::{Batch, ReadCursor};
+use gnitz_trace::runs::ReadCursor;
+use gnitz_zset::repr::Batch;
 
 /// The sorted `cols` spans of this process's rows of one relation, a chunk at a time.
 pub struct KeySpans {

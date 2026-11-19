@@ -8,8 +8,8 @@
 //! through its mapping, so what a pin costs is that memory and disk are given
 //! back only when it is released.
 
+use gnitz_trace::runs::Run;
 use gnitz_zset::algebra::Slot;
-use gnitz_zset::repr::Run;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
 

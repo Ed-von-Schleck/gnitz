@@ -324,7 +324,7 @@ fn partials_finish_to_one_row_per_group() {
         let got = f.finish(batch(f.partial_schema(), partials));
         let want = batch(f.out_schema(), want);
         got.validate(f.out_schema()).unwrap();
-        assert_eq!(got.pk_region(), want.pk_region(), "{sql}");
+        assert_eq!(got.view().pk(), want.view().pk(), "{sql}");
         assert_eq!(rows_of(f.out_schema(), &got), rows_of(f.out_schema(), &want), "{sql}");
     }
 }

@@ -77,11 +77,8 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
     {
         // One reservation for the whole statement.
         let n = rows.len();
-        rows.set_keys(&serial_keys(
-            client.reserve_serial_ids(&target, n as u64).await?,
-            n,
-            schema,
-        )?);
+        let keys = serial_keys(client.reserve_serial_ids(&target, n as u64).await?, n, schema)?;
+        rows.rewrite(|w| w.pk_mut().copy_from_slice(&keys));
     }
     let (tag, count) = match write {
         Write::Insert { rows, returning } => {
@@ -127,7 +124,7 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
         Write::Delete { bound, predicate } => {
             let count = client
                 .read_modify_write(&target, bound, predicate, true, |held| {
-                    Ok::<_, GnitzSqlError>(held.key_retraction(schema))
+                    Ok::<_, GnitzSqlError>(ZSetBatch::retraction(schema, held.view().pk()))
                 })
                 .await?;
             ("DELETE", count)

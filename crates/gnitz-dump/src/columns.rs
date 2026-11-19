@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use gnitz_core::{PkColumn, Schema, ZSetBatch};
+use gnitz_core::{Batch, MemBatch, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, as_le_bytes, push_zero_cell};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as Physical, ZstdLevel};
@@ -191,7 +191,7 @@ impl TableWriter {
 
     /// `batch`'s rows as one row group; every row must stand at weight 1.
     pub(crate) fn write(&mut self, batch: &ZSetBatch) -> Result<(), DumpError> {
-        if let Some(w) = batch.weights().find(|&w| w != 1) {
+        if let Some(w) = batch.view().weights().find(|&w| w != 1) {
             return Err(DumpError::from(format!("a base-table row at weight {w}")));
         }
         if batch.is_empty() {
@@ -199,9 +199,10 @@ impl TableWriter {
         }
         let mut group = self.writer.next_row_group()?;
         let mut cols = self.cols.iter();
+        let rows = batch.view();
         while let Some(mut writer) = group.next_column()? {
             let &(loc, codec, nullable) = cols.next().expect("one writer per column");
-            write_column(&mut writer, batch, loc, codec, nullable)?;
+            write_column(&mut writer, &rows, loc, codec, nullable)?;
             writer.close()?;
         }
         group.close()?;
@@ -220,7 +221,7 @@ impl TableWriter {
 /// file's schema is built from the same `codec`, so `writer` is of its type.
 fn write_column(
     writer: &mut SerializedColumnWriter<'_>,
-    batch: &ZSetBatch,
+    batch: &MemBatch<'_>,
     loc: ColumnLocator,
     codec: Codec,
     nullable: bool,
@@ -230,12 +231,12 @@ fn write_column(
     let levels = levels.as_deref();
     // Native little-endian cells; a key column's are decoded out of the key region.
     let cells: Cow<'_, [u8]> = match loc {
-        ColumnLocator::Payload { slot, .. } => Cow::Borrowed(batch.col(slot as usize)),
+        ColumnLocator::Payload { slot, .. } => Cow::Borrowed(batch.col_data(slot as usize)),
         ColumnLocator::Pk { byte_off, size, type_code } => {
             let mut cells = vec![0; batch.len() * size as usize];
             gnitz_wire::decode_pk_cells(
-                batch.pk_region(),
-                batch.pk_stride(),
+                batch.pk(),
+                batch.schema().pk_stride(),
                 byte_off as usize,
                 type_code,
                 &mut cells,
@@ -283,7 +284,7 @@ fn write_column(
             byte_values(present, |c, all| {
                 all.extend_from_slice(gnitz_wire::german_string_content(
                     c.first_chunk().unwrap(),
-                    batch.heap(),
+                    batch.blob(),
                 ))
             }),
             levels,
@@ -396,13 +397,23 @@ impl TableReader {
                 Ok(cells)
             })
             .collect::<Result<Vec<_>, DumpError>>()?;
-        let (keys, weights) = (PkColumn::from_native_columns(schema, &keys), vec![1i64; n]);
-        let mut regions = vec![keys.region(), as_le_bytes(&weights), as_le_bytes(&nulls)];
-        regions.extend(payload.iter().map(Vec::as_slice));
-        regions.push(&heap);
-        ZSetBatch::from_own_regions(schema, &regions)
-            .map(Some)
-            .map_err(|e| DumpError(e.to_string()))
+        // The file's schema is the table's (`open`), and a null bit lands only on a
+        // nullable column, so the rows need no check a foreign block would.
+        let layout = schema.layout();
+        let batch = Batch::write_new_carrying(layout, n, 0, &[(&heap, 0, 0)], |w| {
+            let (pk, weight, null_bmp) = w.fixed_mut();
+            let mut off = 0;
+            for (col, cells) in layout.pk_columns().zip(&keys) {
+                gnitz_wire::encode_pk_cells(cells, col.type_code, pk, layout.pk_stride(), off);
+                off += col.size();
+            }
+            weight.as_chunks_mut::<8>().0.fill(1i64.to_le_bytes());
+            null_bmp.copy_from_slice(as_le_bytes(&nulls));
+            for (pi, cells) in payload.iter().enumerate() {
+                w.col_mut(pi).copy_from_slice(cells);
+            }
+        });
+        Ok(Some(batch.into()))
     }
 }
 

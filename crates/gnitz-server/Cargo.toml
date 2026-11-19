@@ -25,6 +25,7 @@ include = ["../../container/seccomp.json", "../../packaging/gnitz-server.service
 gnitz-foundation.workspace = true
 gnitz-store.workspace = true
 gnitz-zset.workspace = true
+gnitz-trace.workspace = true
 gnitz-wire.workspace = true
 gnitz-expr.workspace = true
 libc.workspace = true

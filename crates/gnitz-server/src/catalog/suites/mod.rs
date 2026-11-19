@@ -25,10 +25,11 @@ mod wide_pk_validation;
 use std::fs;
 
 use gnitz_store::relation::{ChildKind, IndexClaim, Relation, RelationKind, SecondaryIndex, StoreConfig, relation_dir};
+use gnitz_trace::runs::ReadCursor;
 use gnitz_wire::{
     CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, SysRow, TableTabRow, TypeCode, ViewTabRow, payload_u64,
 };
-use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::sys_tables::*;
 use super::*;
@@ -303,7 +304,9 @@ fn rows<const N: usize>(
     let mut bb = BatchBuilder::new(&schema);
     for id in ids {
         bb.begin_row(id as u128, weight);
-        cells(id).into_iter().for_each(|c| bb.put_u64(c));
+        cells(id).into_iter().for_each(|c| {
+            bb.put_u64(c);
+        });
         bb.end_row();
     }
     bb.finish()

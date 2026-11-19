@@ -13,12 +13,12 @@ use crate::bind::bind_constant;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::exec::client_map::ClientMap;
-use crate::exec::keys::{Firsts, firsts};
+use crate::exec::keys::firsts;
 use crate::ir::BExpr;
 use crate::names::extract_object_name;
 use crate::rules::{ClassWant, require_class, require_column};
 use crate::validate::{QueryEnvelope, reject_unhonored_query_clauses};
-use gnitz_core::{ClientError, PkColumn, ProtocolError, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{ClientError, ProtocolError, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::FixedInt;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
@@ -227,6 +227,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
     };
 
     let serial_ci = serial_col(&target);
+    let serial_placeholder = vec![0u8; schema.layout().pk_stride()];
     let slot_of = value_slots(columns, schema, serial_ci)?;
     let expected = slot_of.iter().flatten().count();
     // Per PK column in PK-list order, the VALUES slot it reads; a SERIAL key
@@ -278,24 +279,24 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             cells.push(bind_constant(e)?);
         }
         // A SERIAL key is left zero, for the keys reserved at execute to replace.
-        let mut out = rows.open_row();
-        if serial_ci.is_none() {
-            let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-            for (k, (&pi, &slot)) in schema.pk_cols().iter().zip(&pk_slots).enumerate() {
-                let def = &schema.columns()[pi as usize];
-                check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
-                natives[k] = native_value(&cells[slot], def)?;
+        let mut out = rows.builder();
+        match serial_ci {
+            Some(_) => out.begin_row_bytes(&serial_placeholder, 1),
+            None => {
+                let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
+                for (k, (&pi, &slot)) in schema.pk_cols().iter().zip(&pk_slots).enumerate() {
+                    let def = &schema.columns()[pi as usize];
+                    check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
+                    natives[k] = native_value(&cells[slot], def)?;
+                }
+                out.begin_row_natives(&natives[..pk_slots.len()], 1)
             }
-            out.key_natives(&natives[..pk_slots.len()]);
-        }
-        out.weight(1);
-
-        let mut null_bits: u64 = 0;
-        for &(payload_idx, ci, col_def) in &payload {
+        };
+        for &(_, ci, col_def) in &payload {
             if col_def.is_hidden {
-                // Logical-dropped column: the open row's zero-filled NOT-NULL filler cell
-                // (null bit left unset), keeping a payload of non-null fixed-width
-                // integers non-null. The value is unobservable.
+                // Logical-dropped column: a zero NOT-NULL filler cell, keeping a payload of
+                // non-null fixed-width integers non-null. The value is unobservable.
+                out.put_zero();
                 continue;
             }
             // Read off the *bound* constant, so `+NULL` is the NULL it spells;
@@ -304,13 +305,11 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             let is_null = matches!(cell, BExpr::LitNull);
             check_not_null(col_def, is_null)?;
             if is_null {
-                gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
+                out.put_null();
+            } else {
+                out.put_cell(|cell_bytes, heap| write_value_cell(cell_bytes, heap, col_def, cell))?;
             }
-            let (cell_bytes, heap) = out.cell_and_heap(payload_idx);
-            write_value_cell(cell_bytes, heap, col_def, cell)?;
         }
-        out.null_word(null_bits);
-        out.commit();
     }
 
     let write = match on_conflict {
@@ -338,14 +337,15 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
 /// `rows` down to each key's first row, the one an ON CONFLICT resolves; under
 /// DO UPDATE (`refuse_repeat`) a second row for a key is refused instead.
 fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
-    let Firsts { absorbed, keep } = firsts(rows.pk_region(), rows.pk_stride());
-    if refuse_repeat && !absorbed.is_empty() {
+    let v = rows.view();
+    let firsts = firsts(v.pk(), v.schema().pk_stride());
+    if refuse_repeat && firsts.repeats() {
         return Err(GnitzSqlError::rejected(
             "ON CONFLICT DO UPDATE cannot affect row a second time \
              (duplicate PK in the same batch)",
         ));
     }
-    rows.retain_ranges(&keep);
+    rows.retain_ranges(&firsts.keep);
     Ok(rows)
 }
 
@@ -359,10 +359,11 @@ pub(super) fn resolve_conflicts(
     set: Option<&mut [SetCol]>,
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let at: FxHashMap<&[u8], usize> = (0..rows.len()).map(|i| (rows.pk_bytes(i), i)).collect();
-    let mut is_held = vec![false; rows.len()];
-    let collided = (0..held.len())
-        .map(|r| match at.get(held.pk_bytes(r)) {
+    let (v, held_rows) = (rows.view(), held.view());
+    let at: FxHashMap<&[u8], usize> = (0..v.len()).map(|i| (v.get_pk_bytes(i), i)).collect();
+    let mut is_held = vec![false; v.len()];
+    let collided = (0..held_rows.len())
+        .map(|r| match at.get(held_rows.get_pk_bytes(r)) {
             Some(&i) if !std::mem::replace(&mut is_held[i], true) => Ok(i as u32),
             Some(_) => Err(malformed_reply("a key held twice")),
             None => Err(malformed_reply("a key that was not read")),
@@ -399,9 +400,9 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
     }
 }
 
-/// The keys of `n` SERIAL rows drawn from `base`, refused when the last exceeds
-/// the key column's type.
-pub(super) fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<PkColumn, GnitzSqlError> {
+/// The PK region of `n` SERIAL rows drawn from `base`, in row order, refused when the last
+/// exceeds the key column's type.
+pub(super) fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
     let tc = schema.columns()[schema.pk_cols()[0] as usize].ty.tc;
     let max = FixedInt::from_type_code(tc)
         .expect("the engine admits only a fixed-width integer SERIAL key")
@@ -413,10 +414,11 @@ pub(super) fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<PkColu
             "SERIAL primary key exhausted: next value {next} exceeds the column type maximum {max}"
         )));
     }
-    Ok(PkColumn::from_natives(
-        schema,
-        (0..n as u64).map(|i| u128::from(base + i)),
-    ))
+    let mut region = Vec::with_capacity(n * tc.wire_stride());
+    for id in base..base + n as u64 {
+        gnitz_wire::push_opk(&mut region, tc.wire_stride(), gnitz_wire::key_image(tc, u128::from(id)));
+    }
+    Ok(region)
 }
 
 #[cfg(test)]

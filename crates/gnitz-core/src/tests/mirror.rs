@@ -1175,7 +1175,7 @@ fn a_sync_nobody_received_is_reported_by_the_next() {
     assert_eq!((pushed.sub, at.tick.get()), (sub, 12), "under the later cursor");
     let pks: Vec<u128> = (0..rows.batch.len()).map(|i| rows.batch.pk(i)).collect();
     assert_eq!(pks, [1, 2, 1], "the unreceived rows first");
-    assert_eq!(rows.batch.weights().collect::<Vec<_>>(), [1, 2, -1]);
+    assert_eq!(rows.batch.view().weights().collect::<Vec<_>>(), [1, 2, -1]);
 
     let h = std::thread::spawn(move || {
         peer.expect_sync("the sync after");

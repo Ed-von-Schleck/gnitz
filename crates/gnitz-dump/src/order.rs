@@ -18,6 +18,7 @@ pub(crate) fn order(batch: &ZSetBatch, schema: &Schema, refs: &[usize]) -> Vec<(
         return (0..n as u32).map(|r| (r, true)).collect();
     }
     let layout = schema.layout();
+    let batch = &batch.view();
     let ref_locs: Vec<_> = refs.iter().map(|&c| layout.locate(c)).collect();
     let k = ref_locs.len();
     // Row r's parents are parents[r * k..(r + 1) * k]. A NULL cell, or one naming

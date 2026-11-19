@@ -10,12 +10,12 @@ use crate::repr::pool::with_scratch;
 /// A player: an index into the caller's sources, its current row, and the key
 /// the caller gave that row.
 #[derive(Clone, Copy)]
-pub(crate) struct Player {
+pub struct Player {
     /// A lower key wins its match outright; the caller's `less` settles a tie.
     /// Two words, most significant first, so the player carries no padding.
     key: [u64; 2],
-    pub(crate) source_idx: u32,
-    pub(crate) row: u32,
+    pub source_idx: u32,
+    pub row: u32,
 }
 
 // `step_top` swaps whole players on every merge step.
@@ -66,7 +66,7 @@ fn beats(a: &Player, b: &Player, less: &impl Fn(&Player, &Player) -> bool) -> bo
     a.source_idx != SENTINEL && (b.source_idx == SENTINEL || less(a, b))
 }
 
-pub(crate) struct LoserTree {
+pub struct LoserTree {
     /// The champion: the overall min, or a sentinel once every source is out.
     top: Player,
     /// For each internal node `1..n_pad`, the loser of its last match; `[0]` is
@@ -87,7 +87,7 @@ impl LoserTree {
     /// before; every leaf is a sentinel, so it is empty until
     /// [`rebuild`](Self::rebuild) plays it. Allocates the losers only for
     /// `n >= 2`.
-    pub(crate) fn with_buffer(n: usize, mut losers: Vec<Player>) -> Self {
+    pub fn with_buffer(n: usize, mut losers: Vec<Player>) -> Self {
         debug_assert!(n < u32::MAX as usize, "source count must be < u32::MAX, the sentinel");
         let n_pad = n.next_power_of_two().max(1);
         losers.clear();
@@ -105,17 +105,13 @@ impl LoserTree {
 
     /// The losers' allocation, for a later [`Self::with_buffer`]; leaves the
     /// tree without one.
-    pub(crate) fn take_buffer(&mut self) -> Vec<Player> {
+    pub fn take_buffer(&mut self) -> Vec<Player> {
         std::mem::take(&mut self.losers)
     }
 
     /// Re-play the tournament over the same `n` sources at their current rows.
     /// O(n) compares, no allocation once the thread's scratch has grown.
-    pub(crate) fn rebuild(
-        &mut self,
-        init_fn: impl Fn(usize) -> Option<(u32, u128)>,
-        less: impl Fn(&Player, &Player) -> bool,
-    ) {
+    pub fn rebuild(&mut self, init_fn: impl Fn(usize) -> Option<(u32, u128)>, less: impl Fn(&Player, &Player) -> bool) {
         let slots = 2 * self.n_pad;
         if self.n_pad <= STACK_LEAVES {
             let mut stack = [MaybeUninit::<Player>::uninit(); 2 * STACK_LEAVES];
@@ -163,7 +159,7 @@ impl LoserTree {
 
     /// The current champion, or `None` once every source is exhausted.
     #[inline]
-    pub(crate) fn peek(&self) -> Option<Player> {
+    pub fn peek(&self) -> Option<Player> {
         let top = self.top;
         (top.source_idx != SENTINEL).then_some(top)
     }
@@ -190,7 +186,7 @@ impl LoserTree {
     /// Returns whether the step took that skip: the new champion is then below
     /// [`bound`](Self::bound), and so below every other source's head.
     #[inline(always)]
-    pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&Player, &Player) -> bool) -> bool {
+    pub fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&Player, &Player) -> bool) -> bool {
         let source_idx = self.top.source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {

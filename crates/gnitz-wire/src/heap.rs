@@ -16,6 +16,21 @@ pub const MAX_SYMBOLS: usize = SYMBOL_ESCAPE as usize;
 /// The most bytes a symbol stands for.
 pub const MAX_SYMBOL_LEN: usize = 8;
 
+// A Symbols image: a heap as its values coded under a symbol table. The bytes
+// the values decode to (u64 LE); how the table coded its training values, in
+// sixteenths of their bytes (u64 LE); the symbol count (u64 LE); each symbol,
+// eight bytes; each symbol's length, a byte; the values, each where a cell names
+// it, as its code count (LEB128) and its codes.
+pub const SYMBOLS_PLAIN_LEN_AT: usize = 0;
+pub const SYMBOLS_TRAINED_AT: usize = 8;
+pub const SYMBOLS_COUNT_AT: usize = 16;
+pub const SYMBOLS_AT: usize = 24;
+
+/// The bytes a Symbols image of `n` symbols takes before its codes.
+pub const fn symbols_head_len(n: usize) -> usize {
+    SYMBOLS_AT + n * (MAX_SYMBOL_LEN + 1)
+}
+
 /// Code `c` stands for the first `lens[c]` bytes of `symbols[c]`. A code past
 /// the table's own symbols stands for one zero byte, so a corrupt code stream
 /// decodes to some bytes of the length its cell holds and never stalls.

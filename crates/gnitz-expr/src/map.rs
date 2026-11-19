@@ -180,12 +180,6 @@ impl MapEval {
         !self.emits.is_empty()
     }
 
-    /// True iff some computed output slot is a German string, whose cell may spill into the
-    /// output heap.
-    pub fn emits_a_string(&self) -> bool {
-        self.emits.iter().any(|e| e.store == EmitStore::Str)
-    }
-
     /// True iff the map reproduces its input, given the input's PK carried through.
     pub fn is_identity(&self) -> bool {
         self.is_identity

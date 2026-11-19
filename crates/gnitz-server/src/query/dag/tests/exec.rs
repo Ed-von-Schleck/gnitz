@@ -8,8 +8,8 @@ use crate::test_support::{
     scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of,
 };
 use gnitz_store::relation::PkRule;
+use gnitz_trace::stream::ReducePlan;
 use gnitz_wire::{Circuit, ReadBound, TypeCode};
-use gnitz_zset::stream::ReducePlan;
 use std::collections::HashMap;
 
 /// The views of [`engine_with_views`], each holding a multiple of the base's

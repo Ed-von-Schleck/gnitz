@@ -11,7 +11,7 @@ use gnitz_wire::{RowSource, cmp_col_window, compare_german_strings, native_key_i
 /// A payload row order. Generic over both sources, so one selected order also
 /// compares rows of two source types, as the read cursor does a run's row
 /// against a batch's.
-pub(crate) trait PayloadOrder: Copy {
+pub trait PayloadOrder: Copy {
     fn compare<A: RowSource, B: RowSource>(
         self,
         schema: &SchemaDescriptor,
@@ -36,11 +36,11 @@ pub(crate) trait PayloadOrder: Copy {
 
 /// The order of a schema whose [`SchemaDescriptor::payload_is_fixed_int_nonnull`].
 #[derive(Clone, Copy)]
-pub(crate) struct FixedIntNonnull;
+pub struct FixedIntNonnull;
 /// The order of every other schema: each column by its type's order, NULL below
 /// every value.
 #[derive(Clone, Copy)]
-pub(crate) struct Generic;
+pub struct Generic;
 
 impl PayloadOrder for FixedIntNonnull {
     /// Each column by its cells' key images: the same order as [`Generic`],
@@ -114,6 +114,8 @@ impl PayloadOrder for Generic {
 
 /// `$body` with `$p` bound to the schema's [`PayloadOrder`]: one copy of `$body`
 /// per order.
+#[macro_export]
+#[doc(hidden)]
 macro_rules! with_payload_cmp {
     ($schema:expr, |$p:ident| $body:expr $(,)?) => {
         if $schema.payload_is_fixed_int_nonnull() {
@@ -125,7 +127,7 @@ macro_rules! with_payload_cmp {
         }
     };
 }
-pub(crate) use with_payload_cmp;
+pub use crate::with_payload_cmp;
 
 #[cfg(test)]
 #[path = "tests/payload_order.rs"]

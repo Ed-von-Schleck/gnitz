@@ -356,12 +356,12 @@ impl MirrorStore for Mirror {
 
     fn scan_spec(&mut self, tid: u64, spec: gnitz_wire::ReadSpec, reply_schema: &Schema) -> Result<ZSetBatch, String> {
         // No copy holds a skeleton row, so no hydrator is needed.
+        // The reply is the copy's own batch, in the regions `reply_schema` lays out: its
+        // cells were checked when the copy ingested them.
         let batch = self
             .registry
             .scan_spec(tid, spec, reply_schema.layout().layout_digest(), None)?;
-        // The client's own region append, so a local and a remote reply land in
-        // one row layout; the cells are this copy's, checked when it ingested them.
-        ZSetBatch::from_own_regions(reply_schema, &batch.wire_regions()).map_err(|e| e.to_string())
+        Ok(batch.into_batch().into())
     }
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {

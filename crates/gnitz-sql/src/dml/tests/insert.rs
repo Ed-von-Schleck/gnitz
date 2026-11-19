@@ -127,7 +127,7 @@ fn values_land_in_the_columns_the_list_names() {
         let schema = &plan.target.schema;
         match want_keys.is_empty() {
             // A SERIAL key is reserved at execute: planned, it is zero bytes.
-            true => assert!(rows(&plan).pk_region().iter().all(|&b| b == 0), "`{sql}`"),
+            true => assert!(rows(&plan).view().pk().iter().all(|&b| b == 0), "`{sql}`"),
             false => assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`"),
         }
         assert_eq!(rows_of(schema, rows(&plan)), want_rows, "`{sql}`");
@@ -145,7 +145,7 @@ fn a_written_key_packs_in_pk_list_order() {
         "INSERT INTO c VALUES (1, 2, 99) ON CONFLICT (a, b) DO NOTHING",
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        assert_eq!(rows(&plan).pk_region(), [0, 2, 0, 0, 0, 0, 0, 0, 0, 1], "`{sql}`");
+        assert_eq!(rows(&plan).view().pk(), [0, 2, 0, 0, 0, 0, 0, 0, 0, 1], "`{sql}`");
     }
 }
 
@@ -450,7 +450,7 @@ fn a_serial_id_past_the_type_maximum_is_exhausted() {
     let schema = pk_schema(TypeCode::I16);
     assert_eq!(
         serial_keys(max - 1, 2, &schema).unwrap(),
-        PkColumn::from_natives(&schema, [max as u128 - 1, max as u128])
+        schema.pk_keys([[max as u128 - 1], [max as u128]]).as_bytes()
     );
     for (base, n, next) in [(max, 2, max + 1), (max + 5, 1, max + 5)] {
         assert_rejects(

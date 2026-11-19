@@ -27,12 +27,12 @@ fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec
     let reply = block_on(client.scan_served(tid, &spec, &reply_schema))
         .expect("a PK-only reply must not be rejected")
         .batch;
-    assert!(reply.payload_count() == 0 && reply.heap().is_empty());
+    assert!(reply.view().schema().num_payload_cols() == 0 && reply.view().blob().is_empty());
     reply
         .validate(&reply_schema)
         .expect("the reply validates under its schema");
     // Weights reach the client unsummed: no top-k gate, one row per key.
-    assert!(reply.weights().all(|w| w == 1), "per-row weights preserved");
+    assert!(reply.view().weights().all(|w| w == 1), "per-row weights preserved");
     (reply_schema, reply)
 }
 
@@ -48,9 +48,11 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     );
 
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for i in 1u64..=200 {
-        app.add_row(i as u128, 1).int_val(i as i64).str_val(&"x".repeat(300));
+        app.begin_row(i as u128, 1)
+            .put_int((i as i64) as u128)
+            .put_string(&"x".repeat(300));
     }
     block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
@@ -86,11 +88,11 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
 
     let rows: Vec<(i64, u32, i64)> = vec![(-9_000_000_000, 7, 10), (-1, 4_294_967_295, 20), (0, 0, 30), (5, 1, 40)];
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch);
+    let mut app = batch.builder();
     for &(c3, c0, c2) in &rows {
-        app.add_row_natives(&[c3 as u128, c0 as u128], 1)
-            .str_val("payload")
-            .int_val(c2);
+        app.begin_row_natives(&[c3 as u128, c0 as u128], 1)
+            .put_string("payload")
+            .put_int(c2 as u128);
     }
     block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
@@ -101,7 +103,9 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         &schema,
         cmp_all(&[(CmpOp::Gt, 2, 15)]).to_blob_bytes(),
     );
-    let mut got: Vec<Vec<u8>> = (0..reply.len()).map(|i| reply.pk_bytes(i).to_vec()).collect();
+    let mut got: Vec<Vec<u8>> = (0..reply.len())
+        .map(|i| reply.view().get_pk_bytes(i).to_vec())
+        .collect();
     // The OPK image, spelled by hand: a signed I64 is big-endian with the sign
     // bit flipped, an unsigned U32 is plain big-endian.
     let mut want: Vec<Vec<u8>> = rows[1..]
