@@ -1082,15 +1082,15 @@ fn a_grouped_guard_refuses_a_read_as_it_does_a_view() {
         // A number is no condition, and nor is an aggregate that is not a BOOLEAN.
         (
             "SELECT g FROM t GROUP BY g HAVING 1",
-            "this operand is I64; a condition must be BOOLEAN",
+            "this operand is BIGINT; a condition must be BOOLEAN",
         ),
         (
             "SELECT g FROM t GROUP BY g HAVING SUM(g)",
-            "column \"_agg\" is I64; a condition must be BOOLEAN",
+            "column \"_agg\" is BIGINT; a condition must be BOOLEAN",
         ),
         (
             "SELECT g FROM t GROUP BY g HAVING -(SUM(g) * 0.0)",
-            "this operand is F64; a condition must be BOOLEAN",
+            "this operand is DOUBLE; a condition must be BOOLEAN",
         ),
         // A grouping modifier asks for more than one grouping per row.
         ("SELECT g, SUM(v) AS s FROM t GROUP BY g WITH ROLLUP", "WITH ROLLUP"),

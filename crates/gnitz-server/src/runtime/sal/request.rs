@@ -105,7 +105,7 @@ impl Apply<'_> {
 
 impl Ingest {
     /// The scalars the group's header carries: the inverse of [`Self::decode`].
-    /// The group's blob is its rows' schema record, which the payload codec
+    /// The group's blob is its rows' shape record, which the payload codec
     /// reads.
     pub(super) fn encode(self) -> RequestHead {
         use SalMessageKind as K;

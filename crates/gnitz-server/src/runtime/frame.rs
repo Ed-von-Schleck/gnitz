@@ -1,32 +1,28 @@
 //! The frame encoder: a [`WireMsg`] sized and written into a w2m slot or a
 //! client reply.
 
-use gnitz_wire::{ControlHeader, WireFault, WireFlags, WireStatus};
+use gnitz_wire::{ControlHeader, WireFault};
 use gnitz_zset::repr::{Batch, WireRows};
 
 // ---------------------------------------------------------------------------
 // WireMsg
 // ---------------------------------------------------------------------------
 
-/// One frame: its control header fields, blob and data block.
+/// One frame: its control header, blob and data block.
 /// Build it once, then [`size`](WireMsg::size) it and encode it: both read the
 /// same value, so the byte count a caller reserves and the bytes the encoder
 /// writes cannot disagree.
 ///
-/// Every field defaults to zero/absent (`status` defaults to `WireStatus::Ok`), so a
-/// caller names only what it sends:
+/// Every field defaults to zero/absent (the header's `status` to
+/// `WireStatus::Ok`), so a caller names only what it sends:
 ///
 /// ```ignore
-/// let msg = WireMsg { target_id, arg0: lsn, ..Default::default() };
+/// let msg = WireMsg { hdr: ControlHeader::ack(target_id, lsn), ..Default::default() };
 /// writer.try_send_msg(request_id, false, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
 pub struct WireMsg<'a> {
-    pub target_id: u64,
-    pub flags: WireFlags,
-    pub arg0: u64,
-    pub arg1: u64,
-    pub status: WireStatus,
+    pub hdr: ControlHeader,
     /// The frame's data block; an empty delta ships none.
     pub data: Option<WireRows<'a>>,
     pub blob: &'a [u8],
@@ -37,12 +33,13 @@ pub struct WireMsg<'a> {
 const MAX_FAULT_TEXT: usize = 16 << 10;
 
 impl<'a> WireMsg<'a> {
-    /// The control-only frame of `fault`: its status, and as the blob its text
-    /// up to the last character boundary within [`MAX_FAULT_TEXT`] bytes.
-    pub(crate) fn fault(fault: &'a WireFault) -> Self {
+    /// The control-only frame of `fault` refusing the request naming
+    /// `target_id`: its status, and as the blob its text up to the last
+    /// character boundary within [`MAX_FAULT_TEXT`] bytes.
+    pub(crate) fn fault(target_id: u64, fault: &'a WireFault) -> Self {
         let text = &fault.text;
         WireMsg {
-            status: fault.status,
+            hdr: ControlHeader::fault(target_id, fault.status),
             blob: &text.as_bytes()[..text.floor_char_boundary(MAX_FAULT_TEXT)],
             ..Default::default()
         }
@@ -51,8 +48,7 @@ impl<'a> WireMsg<'a> {
     /// One frame of a reply train for `target_id`, carrying `data`.
     pub(crate) fn train_frame(target_id: u64, last: bool, data: Option<WireRows<'a>>) -> Self {
         WireMsg {
-            target_id,
-            flags: WireFlags::train_frame(last),
+            hdr: ControlHeader::train(target_id, last),
             data,
             ..Default::default()
         }
@@ -97,20 +93,9 @@ impl<'a> WireMsg<'a> {
         Ok(())
     }
 
-    /// The control header this frame carries.
-    pub(crate) fn header(&self) -> ControlHeader {
-        ControlHeader {
-            status: self.status,
-            target_id: self.target_id,
-            flags: self.flags,
-            arg0: self.arg0,
-            arg1: self.arg1,
-        }
-    }
-
     /// Encode into `out`, which must be exactly [`size`](WireMsg::size) bytes.
     pub fn encode(&self, out: &mut [u8]) {
-        let mut pos = gnitz_wire::encode_frame_head(out, &self.header(), self.blob, self.data.is_some());
+        let mut pos = gnitz_wire::encode_frame_head(out, &self.hdr, self.blob, self.data.is_some());
 
         if let Some(d) = self.data {
             pos += d.encode(&mut out[pos..]);

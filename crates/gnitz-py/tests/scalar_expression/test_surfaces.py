@@ -137,10 +137,10 @@ def test_a_wide_literal_is_checked_against_its_target_before_any_row(client):
 
     for stmt, needle in (
             (f"DELETE FROM t WHERE v + {U64_MAX + 1} = 0", "does not fit a 64-bit register"),
-            (f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999", "U64 value out of range"),
-            ("UPDATE t SET v = -1 WHERE pk = 999", "U64 value out of range"),
+            (f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999", "BIGINT UNSIGNED value out of range"),
+            ("UPDATE t SET v = -1 WHERE pk = 999", "BIGINT UNSIGNED value out of range"),
             (f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}",
-             "U64 value out of range")):
+             "BIGINT UNSIGNED value out of range")):
         with pytest.raises(gnitz.GnitzRefusedError, match=needle):
             client.execute_sql(stmt)
     assert bag(scanned(client, "t")) == {(1, 100): 1}

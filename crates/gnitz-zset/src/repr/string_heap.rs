@@ -247,8 +247,8 @@ fn relocate_coded_cells(
     }
 }
 
-/// `cell` rebased onto `dst_blob`: [`gnitz_wire::relocate_german_string`],
-/// copying each source value once when `cache` is `Some`.
+/// `cell` rebased onto `dst_blob`: [`gnitz_wire::relocate_german_string_with`]
+/// appending to it, copying each source value once when `cache` is `Some`.
 #[inline]
 pub fn relocated_cell(
     cell: &[u8; 16],

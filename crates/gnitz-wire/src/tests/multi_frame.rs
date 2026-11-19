@@ -1,4 +1,5 @@
 use super::*;
+use crate::WireFlags;
 use crate::{CTRL_HEADER_SIZE, WireConflictMode, WireLane, WireStatus};
 
 /// [`decode_items`] of a whole item list.
@@ -76,6 +77,11 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
 
 fn sub(id: u64) -> SubId {
     SubId::new(id).unwrap()
+}
+
+/// The items of a `DELTA_POLL` body under a prologue keeping none.
+fn delta_items(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
+    decode_delta_poll(body, &ControlHeader::naming(ClientVerb::DeltaPoll, 0.into(), 0)).map(|p| p.items)
 }
 
 /// Peek `frame`'s prologue — it carries only its verb, and its body starts right
@@ -159,7 +165,7 @@ fn delta_poll_roundtrips_every_view_in_order() {
         item(1, 0, 1),
     ];
     let frame = encoded(|out| encode_delta_poll(out, &views, None));
-    assert_eq!(peeked(&frame, decode_delta_items).unwrap(), views);
+    assert_eq!(peeked(&frame, delta_items).unwrap(), views);
 }
 
 /// A multi-item frame is its prologue followed by each item framed on its own:
@@ -262,28 +268,35 @@ fn a_kept_delta_poll_carries_its_first_id_in_the_prologue() {
     let ctrl = peek_control_block(&frame).unwrap();
     assert_eq!(ctrl.client_verb(), Ok(ClientVerb::DeltaPoll));
     assert_eq!(ctrl.hdr, ControlHeader::naming(ClientVerb::DeltaPoll, 0.into(), 1_500));
-    assert_eq!(decode_delta_items(&frame[ctrl.body.clone()]).unwrap(), views.to_vec());
-    let kept = delta_poll_kept(&ctrl.hdr, views.len()).unwrap().expect("a kept poll");
+    let poll = decode_delta_poll(&frame[ctrl.body.clone()], &ctrl.hdr).unwrap();
+    assert_eq!(poll.items, views.to_vec());
+    let kept = poll.kept().expect("a kept poll");
     assert_eq!(kept.collect::<Vec<_>>(), [sub(1_500), sub(1_501)]);
 
     let unkept = encoded(|out| encode_delta_poll(out, &views, None));
-    let unkept = delta_poll_kept(&peek_control_block(&unkept).unwrap().hdr, views.len());
-    assert!(unkept.unwrap().is_none());
+    let ctrl = peek_control_block(&unkept).unwrap();
+    let poll = decode_delta_poll(&unkept[ctrl.body.clone()], &ctrl.hdr).unwrap();
+    assert!(poll.kept().is_none());
 }
 
 /// A kept poll whose last id would run past `u64::MAX` is refused; one ending
 /// on it is kept.
 #[test]
 fn a_kept_delta_poll_refuses_ids_past_the_last() {
-    let last = ControlHeader::naming(ClientVerb::DeltaPoll, 0.into(), u64::MAX);
-    let kept = delta_poll_kept(&last, 1).unwrap().expect("a kept poll");
-    assert_eq!(kept.collect::<Vec<_>>(), [sub(u64::MAX)]);
-    let err = delta_poll_kept(&last, 2).map(|_| ()).unwrap_err();
+    let decode = |n: u64, first: u64| {
+        let views: Vec<_> = (1..=n).map(|v| item(v, 0, 1)).collect();
+        let frame = encoded(|out| encode_delta_poll(out, &views, Some(sub(first))));
+        let ctrl = peek_control_block(&frame).unwrap();
+        let poll = decode_delta_poll(&frame[ctrl.body.clone()], &ctrl.hdr)?;
+        Ok::<_, String>(poll.kept().expect("a kept poll").collect::<Vec<_>>())
+    };
+    assert_eq!(decode(1, u64::MAX), Ok(vec![sub(u64::MAX)]));
+    let err = decode(2, u64::MAX).unwrap_err();
     assert!(err.contains("past u64::MAX"), "{err}");
 
-    let near = ControlHeader { arg0: u64::MAX - 2, ..last };
-    assert_eq!(delta_poll_kept(&near, 3).unwrap().unwrap().count(), 3);
-    assert!(delta_poll_kept(&near, 4).is_err());
+    assert_eq!(decode(3, u64::MAX - 2).map(|ids| ids.len()), Ok(3));
+    let err = decode(4, u64::MAX - 2).unwrap_err();
+    assert!(err.contains("past u64::MAX"), "{err}");
 }
 
 /// A delta poll names no view `0`: it is the id of a fault ending the request.
@@ -291,7 +304,7 @@ fn a_kept_delta_poll_refuses_ids_past_the_last() {
 fn a_delta_poll_refuses_view_id_zero() {
     let err = peeked(
         &encoded(|out| encode_delta_poll(out, &[item(1, 0, 9), item(0, 0, 9)], None)),
-        decode_delta_items,
+        delta_items,
     )
     .expect_err("view id 0");
     assert!(err.contains("view id 0"), "{err:?}");
@@ -302,15 +315,15 @@ fn a_delta_poll_refuses_view_id_zero() {
 #[test]
 fn a_delta_poll_refuses_a_blob_shorter_than_a_cursor() {
     let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, Target { tid: 7, token: 3 }, 9);
-    let err = decode_delta_items(&one_item(hdr, b"", false)).expect_err("no blob");
+    let err = delta_items(&one_item(hdr, b"", false)).expect_err("no blob");
     assert!(err.contains("lacks the blob"), "{err:?}");
     for len in [1, 15] {
-        let err = decode_delta_items(&one_item(hdr, &[0u8; 15][..len], false)).expect_err("a short blob");
+        let err = delta_items(&one_item(hdr, &[0u8; 15][..len], false)).expect_err("a short blob");
         assert!(err.contains("carries no cursor"), "{len}: {err:?}");
     }
     let body = one_item(hdr, &[0u8; 16], false);
     assert_eq!(
-        decode_delta_items(&body).unwrap(),
+        delta_items(&body).unwrap(),
         [DeltaPollItem {
             view: Target { tid: 7, token: 3 },
             from: None,

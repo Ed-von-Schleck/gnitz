@@ -315,9 +315,9 @@ fn a_refused_mutation_names_its_rule() {
         ("UPDATE ty SET u8c = 300", "out of range"),
         ("UPDATE ty SET n = f", "floating-point"),
         ("UPDATE ty SET f = f + 1.0", "floating-point"),
-        ("UPDATE ty SET f = n", "cannot assign a value of type I64"),
-        ("UPDATE ty SET n = UPPER(s)", "cannot assign a value of type STRING"),
-        ("UPDATE ty SET s = n + 1", "cannot assign a value of type I64"),
+        ("UPDATE ty SET f = n", "cannot assign a value of type BIGINT"),
+        ("UPDATE ty SET n = UPPER(s)", "cannot assign a value of type TEXT"),
+        ("UPDATE ty SET s = n + 1", "cannot assign a value of type BIGINT"),
         ("UPDATE ty SET n = f > 1.5", "cannot assign a value of type BOOLEAN"),
         // A view is read-only, and a stream holds no row.
         ("UPDATE vw SET v = 1 WHERE id = 1", "is a view"),

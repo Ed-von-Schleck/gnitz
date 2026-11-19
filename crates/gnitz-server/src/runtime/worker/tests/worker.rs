@@ -13,7 +13,7 @@ use crate::test_support::{
 };
 use gnitz_store::read::Probe;
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, WireStatus};
+use gnitz_wire::{PkColList, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::SchemaDescriptor;
 use std::borrow::Cow;
@@ -74,10 +74,10 @@ fn delta<'a>(view: u64, schema: &SchemaDescriptor, spec: &'a [u8]) -> Read<'a> {
 }
 
 /// `ids` as the keys a PK probe of a `U64`-keyed relation carries, encoded by
-/// [`PkKeys::encode_probe`].
+/// [`gnitz_wire::PkKeys::encode_probe`].
 pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
     let keys: Vec<[u8; 8]> = ids.iter().map(|id| id.to_be_bytes()).collect();
-    PkKeys::from_keys(8, keys.iter().map(|k| &k[..])).encode_probe()
+    gnitz_zset::schema::pk_keys(8, keys.iter().map(|k| &k[..])).encode_probe()
 }
 
 /// A PK probe of `tid` at `keys`.
@@ -106,7 +106,7 @@ fn in_wait_dispositions() {
     engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let record = engine.sal_target(tid).unwrap().1.to_vec();
+    let record = engine.shape_target(tid).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -193,7 +193,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let record = engine.sal_target(tid).unwrap().1.to_vec();
+    let record = engine.shape_target(tid).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -380,7 +380,7 @@ fn a_train_advances_in_a_wait_with_nothing_on_the_sal() {
 fn a_wait_behind_a_seal_sends_but_serves_nothing() {
     let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
-    let record = engine.sal_target(tid).unwrap().1.to_vec();
+    let record = engine.shape_target(tid).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
     queue_train(&mut wp);
@@ -453,7 +453,7 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     let (v1, counts) = register_count_of(&mut engine, t1, &schema, &[1], "v1");
     register_count_of(&mut engine, v1, counts.output_schema(), &[], "total");
     let v2 = register_identity_view(&mut engine, t2, "v2", &cols);
-    let record = engine.sal_target(t2).unwrap().1.to_vec();
+    let record = engine.shape_target(t2).unwrap().1.to_vec();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     engine
         .registry

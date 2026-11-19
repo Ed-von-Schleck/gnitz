@@ -38,13 +38,24 @@ impl ColumnDef {
         self
     }
 
-    /// This column's entry in a schema record.
+    /// This column's entry in the named schema record a RESOLVE carries.
     pub fn record_col(&self) -> RecordCol<'_> {
         RecordCol {
             ty: self.ty,
             nullable: self.is_nullable,
             hidden: self.is_hidden,
-            name: self.name.as_bytes(),
+            name: &self.name,
+        }
+    }
+
+    /// This column's entry in the nameless shape record a push and a SAL group
+    /// carry: its type, scale included, and nullability.
+    pub fn shape_col(&self) -> RecordCol<'_> {
+        RecordCol {
+            ty: self.ty,
+            nullable: self.is_nullable,
+            hidden: false,
+            name: "",
         }
     }
 }

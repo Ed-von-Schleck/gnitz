@@ -4,6 +4,7 @@ mod bundle_precheck_tests;
 mod catalog_view_tests;
 mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;
+use gnitz_zset::schema::pk_keys;
 mod ddl_tests;
 mod dir_deletion_tests;
 mod engine_tests;
@@ -36,7 +37,7 @@ use super::*;
 
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
 fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> gnitz_store::read::ReadRows {
-    let keys = gnitz_wire::PkKeys::from_keys(opk.len(), [opk]);
+    let keys = pk_keys(opk.len(), [opk]);
     read_rows(engine, tid, gnitz_wire::ReadBound::PkSet(keys))
 }
 

@@ -1,3 +1,4 @@
+use super::super::encoding::{SYMBOLS_AT, SYMBOLS_COUNT_AT};
 use super::super::file::ShardWriteOpts;
 use super::*;
 use crate::runs::StorageError;
@@ -7,9 +8,8 @@ use crate::test_support::{
     payload0_i64, pk_only_schema, prose, string_batch, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_foundation::rng::{Rng, mix};
-use gnitz_wire::write_u64_le;
+use gnitz_wire::{MAX_SYMBOL_LEN, write_u64_le};
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, TypeCode, num_regions};
-use gnitz_wire::{SYMBOLS_AT, SYMBOLS_COUNT_AT};
 use gnitz_zset::repr::Codebook;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::repr::{ColumnarSource, Pick, UnifiedSet};
@@ -959,7 +959,7 @@ fn a_symbol_table_its_image_cannot_hold_is_refused() {
         heap.off + SYMBOLS_COUNT_AT,
         gnitz_wire::read_u64_le(&base, heap.off + SYMBOLS_COUNT_AT),
     );
-    let first_len = heap.off + SYMBOLS_AT + n as usize * 8;
+    let first_len = heap.off + SYMBOLS_AT + n as usize * MAX_SYMBOL_LEN;
     // (label, offset, bytes written there)
     let cases: [(&str, usize, &[u8]); 4] = [
         ("more symbols than codes", count, &256u64.to_le_bytes()),
@@ -980,7 +980,6 @@ fn a_symbol_table_its_image_cannot_hold_is_refused() {
 /// writes, and one the rebuild asserts against.
 #[test]
 fn a_table_under_a_corrupt_body_is_refused() {
-    use gnitz_wire::MAX_SYMBOL_LEN;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.db");
     let batch = string_batch(&(0..400).map(|i| (i as u64, prose(i))).collect::<Vec<_>>());

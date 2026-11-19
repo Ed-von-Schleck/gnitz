@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 use gnitz_core::{ClientError, GnitzClient, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, ScanReply, Schema, Sent, ZSetBatch};
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::Target;
-use gnitz_wire::multi_frame::DeltaCursor;
+use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 use gnitz_wire::{
     ClientVerb, ColumnDef, ControlHeader, FRAME_LEN_PREFIX_BYTES, ReadBound, ReadSpec, TypeCode, WireConflictMode,
-    WireFlags, WireLane, append_frame, frame_len_prefix, peek_control_block,
+    WireStatus, append_frame, frame_len_prefix, peek_control_block,
 };
 use support::{PATIENCE, settled};
 use tokio::runtime::Runtime;
@@ -144,13 +144,8 @@ fn request(s: &mut UnixStream) -> u64 {
 
 /// Answer the oldest unanswered request, `tid`'s, with `lsn` and no rows.
 fn reply(s: &mut UnixStream, tid: u64, lsn: u64) {
-    let hdr = ControlHeader {
-        target_id: tid,
-        arg0: lsn,
-        ..Default::default()
-    };
     let mut frame = Vec::new();
-    append_frame(&mut frame, &hdr, &[], None);
+    append_frame(&mut frame, &ControlHeader::ack(tid, lsn), &[], None);
     write_frame(s, &frame);
 }
 
@@ -415,36 +410,19 @@ fn frame(hdr: ControlHeader, rows: &[(u64, i64)]) -> Vec<u8> {
     out
 }
 
+/// The cursor at round `tick` under [`TAG`].
+fn cursor(tick: u64) -> DeltaCursor {
+    DeltaCursor::from_pair(TAG, tick).expect("a round past 0")
+}
+
 /// One pushed train of subscription `sub` to view 40: `rows`, ending at round
 /// `tick`, then the sync's answer.
 fn push_train_and_answer(s: &mut UnixStream, sub: u64, rows: &[(u64, i64)], tick: u64) {
-    let lane = |lane| WireFlags { lane, ..Default::default() };
-    let opener = ControlHeader {
-        target_id: 40,
-        arg0: sub,
-        flags: lane(WireLane::PushedTrain),
-        ..Default::default()
-    };
-    write_frame(s, &frame(opener, &[]));
-    let data = ControlHeader {
-        target_id: 40,
-        arg1: TAG,
-        flags: WireFlags { continuation: true, ..Default::default() },
-        ..Default::default()
-    };
-    write_frame(s, &frame(data, rows));
-    let terminal = ControlHeader {
-        target_id: 40,
-        arg0: TAG,
-        arg1: tick,
-        ..Default::default()
-    };
-    write_frame(s, &frame(terminal, &[]));
-    let answer = ControlHeader {
-        flags: lane(WireLane::SyncAnswer),
-        ..Default::default()
-    };
-    write_frame(s, &frame(answer, &[]));
+    let sub = SubId::new(sub).expect("a kept poll");
+    write_frame(s, &frame(ControlHeader::pushed_train(40, sub), &[]));
+    write_frame(s, &frame(ControlHeader::train(40, false), rows));
+    write_frame(s, &frame(ControlHeader::delta_terminal(40, cursor(tick)), &[]));
+    write_frame(s, &frame(ControlHeader::sync_answer(WireStatus::Ok), &[]));
 }
 
 /// The header of the next request, which must be a SYNC_PUSHED.
@@ -493,13 +471,7 @@ fn cancel_a_sync(delivered: bool) {
             .hdr;
         assert_eq!(poll.flags.verb, Some(ClientVerb::DeltaPoll));
         let sub = poll.arg0;
-        let terminal = ControlHeader {
-            target_id: 40,
-            arg0: TAG,
-            arg1: 9,
-            ..Default::default()
-        };
-        write_frame(&mut peer, &frame(terminal, &[]));
+        write_frame(&mut peer, &frame(ControlHeader::delta_terminal(40, cursor(9)), &[]));
 
         expect_sync(&mut peer);
         assert_eq!(request(&mut peer), 5, "the first probe");

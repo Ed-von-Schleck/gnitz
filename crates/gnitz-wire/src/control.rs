@@ -11,26 +11,20 @@
 use std::ops::Range;
 
 use crate::codec::Reader;
-use crate::{write_u32_le, write_u64_le};
+use crate::multi_frame::{DeltaCursor, SubId};
 
-// Layout (all little-endian):
-//   [0,4)   STATUS     u32   `WireStatus`
-//   [4,8)   BLOB_LEN   u32
-//   [8,16)  FLAGS      u64   `WireFlags::pack`
-//   [16,24) TARGET_ID  u64
-//   [24,32) ARG0       u64
-//   [32,40) ARG1       u64
+// Layout (all little-endian), each word naturally aligned:
+//   [0,8)   FLAGS      u64   `WireFlags::pack`
+//   [8,16)  TARGET_ID  u64
+//   [16,24) ARG0       u64
+//   [24,32) ARG1       u64
+//   [32,36) STATUS     u32   `WireStatus`
+//   [36,40) BLOB_LEN   u32
 //   [40, 40+BLOB_LEN)  blob; under a non-`Ok` STATUS, the UTF-8 error text
-//   then a self-sizing data block, present iff FLAGS bit 33 is set
-const OFF_STATUS: usize = 0;
-const OFF_BLOB_LEN: usize = 4;
-const OFF_FLAGS: usize = 8;
-const OFF_TARGET_ID: usize = 16;
-const OFF_ARG0: usize = 24;
-const OFF_ARG1: usize = 32;
+//   then a self-sizing data block, present iff FLAGS bit 16 is set
 
 /// The FLAGS bit the codec owns: a data block follows the blob.
-const FLAG_HAS_DATA: u64 = 1 << 33;
+const FLAG_HAS_DATA: u64 = 1 << 16;
 
 pub const CTRL_HEADER_SIZE: usize = 40;
 
@@ -81,6 +75,81 @@ impl ControlHeader {
     /// The relation a [`Self::naming`] header names.
     pub fn target(&self) -> Target {
         Target { tid: self.target_id, token: self.arg1 }
+    }
+
+    /// The answer to a request that carries `value` in `arg0`: an ACK, a read's
+    /// watermark, a RESOLVE's descriptor token.
+    pub fn ack(target_id: u64, value: u64) -> Self {
+        ControlHeader {
+            target_id,
+            arg0: value,
+            ..Default::default()
+        }
+    }
+
+    /// A refusal of the request naming `target_id`, whose text the blob carries.
+    pub fn fault(target_id: u64, status: WireStatus) -> Self {
+        ControlHeader { target_id, status, ..Default::default() }
+    }
+
+    /// A frame of a worker's reply train: `continuation` always, since the
+    /// master's terminal frame ends the client's reply; `scan_last` on the
+    /// train's last frame.
+    pub fn train(target_id: u64, last: bool) -> Self {
+        ControlHeader {
+            target_id,
+            flags: WireFlags {
+                continuation: true,
+                scan_last: last,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The terminal of a `DELTA_POLL` view's train: the cursor `at` to read
+    /// `view` from next, read back by [`Self::delta_cursor`].
+    pub fn delta_terminal(view: u64, at: DeltaCursor) -> Self {
+        let (arg0, arg1) = at.pair();
+        ControlHeader {
+            target_id: view,
+            arg0,
+            arg1,
+            ..Default::default()
+        }
+    }
+
+    /// The cursor a [`Self::delta_terminal`] carries; `None` for round 0, which
+    /// no terminal names.
+    pub fn delta_cursor(&self) -> Option<DeltaCursor> {
+        DeltaCursor::from_pair(self.arg0, self.arg1)
+    }
+
+    /// The bare head opening a pushed train of the subscription `sub`, kept
+    /// over `view`.
+    pub fn pushed_train(view: u64, sub: SubId) -> Self {
+        ControlHeader {
+            target_id: view,
+            flags: WireFlags {
+                lane: WireLane::PushedTrain,
+                ..Default::default()
+            },
+            arg0: sub.get(),
+            ..Default::default()
+        }
+    }
+
+    /// The answer to a `SYNC_PUSHED`; a non-`Ok` `status` carries its text in
+    /// the blob.
+    pub fn sync_answer(status: WireStatus) -> Self {
+        ControlHeader {
+            status,
+            flags: WireFlags {
+                lane: WireLane::SyncAnswer,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Refuses a header no client writes: a status other than `Ok`, or a flag
@@ -153,6 +222,34 @@ impl DecodedControl {
         Ok(verb)
     }
 
+    /// The lane a server frame answers on, refusing a pushed-train opener that
+    /// is not a bare head naming a subscription, and a sync answer that is not
+    /// one frame without a data block naming `0`.
+    pub fn server_lane(&self) -> Result<ServerLane, &'static str> {
+        let h = &self.hdr;
+        match h.flags.lane {
+            WireLane::Reply => Ok(ServerLane::Reply),
+            WireLane::PushedTrain => {
+                if h.flags.continuation
+                    || h.status != WireStatus::Ok
+                    || self.data.is_some()
+                    || !self.blob.is_empty()
+                    || !self.body.is_empty()
+                {
+                    return Err("a pushed train opens with a bare head");
+                }
+                let sub = SubId::new(h.arg0).ok_or("a pushed train names no subscription")?;
+                Ok(ServerLane::PushedTrain { view: h.target_id, sub })
+            }
+            WireLane::SyncAnswer => {
+                if h.target_id != 0 || h.flags.continuation || self.data.is_some() {
+                    return Err("a sync answer is one empty frame naming 0");
+                }
+                Ok(ServerLane::SyncAnswer)
+            }
+        }
+    }
+
     /// The error a non-`Ok` frame carries: its status and its blob, read out of
     /// the peeked `frame`, as text.
     pub fn fault(&self, frame: &[u8]) -> Option<WireFault> {
@@ -161,6 +258,17 @@ impl DecodedControl {
             text: String::from_utf8_lossy(&frame[self.blob.clone()]).into_owned(),
         })
     }
+}
+
+/// What a server frame answers, as [`DecodedControl::server_lane`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerLane {
+    /// The oldest unanswered request other than a sync, or the open pushed train.
+    Reply,
+    /// The opener of a pushed train of subscription `sub`, kept over `view`.
+    PushedTrain { view: u64, sub: SubId },
+    /// The oldest unanswered `SYNC_PUSHED`.
+    SyncAnswer,
 }
 
 /// Bytes of one frame with these sections.
@@ -194,12 +302,19 @@ pub fn encode_frame_head(out: &mut [u8], hdr: &ControlHeader, blob: &[u8], has_d
         "a fault frame names its cause"
     );
     let flags = hdr.flags.pack() | if has_data { FLAG_HAS_DATA } else { 0 };
-    write_u32_le(head, OFF_STATUS, hdr.status.as_wire());
-    write_u32_le(head, OFF_BLOB_LEN, blob.len() as u32);
-    write_u64_le(head, OFF_FLAGS, flags);
-    write_u64_le(head, OFF_TARGET_ID, hdr.target_id);
-    write_u64_le(head, OFF_ARG0, hdr.arg0);
-    write_u64_le(head, OFF_ARG1, hdr.arg1);
+    // The header's words in layout order.
+    let mut at = 0;
+    let mut put = |b: &[u8]| {
+        head[at..at + b.len()].copy_from_slice(b);
+        at += b.len();
+    };
+    put(&flags.to_le_bytes());
+    put(&hdr.target_id.to_le_bytes());
+    put(&hdr.arg0.to_le_bytes());
+    put(&hdr.arg1.to_le_bytes());
+    put(&hdr.status.as_wire().to_le_bytes());
+    put(&(blob.len() as u32).to_le_bytes());
+    debug_assert_eq!(at, CTRL_HEADER_SIZE);
     tail[..blob.len()].copy_from_slice(blob);
     CTRL_HEADER_SIZE + blob.len()
 }
@@ -215,15 +330,12 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
     let mut r = Reader::new(data);
     // The header's words in layout order, each read whole: none can run short.
     let whole = "a whole header";
-    let (status, blob_len) = (r.u32().expect(whole), r.u32().expect(whole));
     let (word, target_id) = (r.u64().expect(whole), r.u64().expect(whole));
     let (arg0, arg1) = (r.u64().expect(whole), r.u64().expect(whole));
-    debug_assert_eq!(r.pos(), CTRL_HEADER_SIZE);
-    r.take(blob_len as usize)
-        .map_err(|_| "control blob runs past the frame")?;
-    let blob = CTRL_HEADER_SIZE..r.pos();
-    #[cfg(feature = "field-map")]
-    crate::fields::note_section(&data[OFF_BLOB_LEN..OFF_FLAGS], &data[blob.clone()]);
+    let status = r.u32().expect(whole);
+    debug_assert_eq!(r.pos(), CTRL_HEADER_SIZE - 4);
+    let blob_len = r.bytes32().map_err(|_| "control blob runs past the frame")?.len();
+    let blob = CTRL_HEADER_SIZE..CTRL_HEADER_SIZE + blob_len;
     let status = WireStatus::from_wire(status).ok_or("control header names no status")?;
     let flags = WireFlags::unpack(word)?;
     let data_block = if word & FLAG_HAS_DATA != 0 {
@@ -249,7 +361,7 @@ wire_enum! {
     /// The verb a client request frame names.
     pub enum ClientVerb: u8 {
         /// A data push under the descriptor token `arg1`, ACKed with its LSN in
-        /// `arg0`. Its blob is the schema record of its rows. An empty batch is
+        /// `arg0`. Its blob is the shape record of its rows. An empty batch is
         /// still a push, ACKed at LSN 0.
         Push = 1,
         /// A delta read of N views: one frame naming N fed views, each with its
@@ -377,7 +489,7 @@ impl VerbShape {
         }
         // (blob, data block, conflict mode read, items)
         let (blob, data, conflict_mode, items) = match verb {
-            // The blob is the schema record of the rows.
+            // The blob is the shape record of the rows.
             ClientVerb::Push => (Must, May, true, None),
             ClientVerb::Resolve | ClientVerb::SyncPushed | ClientVerb::SnapshotPage | ClientVerb::Backup => {
                 (May, Never, false, None)
@@ -387,7 +499,7 @@ impl VerbShape {
             | ClientVerb::SnapshotOpen
             | ClientVerb::SnapshotClose => (Never, Never, false, None),
             ClientVerb::DdlTxn => (Never, Must, false, items(usize::MAX, false)),
-            // The blob is the schema record of the family's rows.
+            // The blob is the shape record of the family's rows.
             ClientVerb::PushTxn => (Must, Must, true, items(usize::MAX, false)),
             ClientVerb::ScanMulti => (May, Never, false, items(SCAN_MULTI_MAX_RELATIONS, false)),
             // The blob is the item's cursor, then its `ReadSpec`.
@@ -407,7 +519,7 @@ impl VerbShape {
 /// The control header's `flags` word. `pack`/`unpack` are the only code that knows
 /// the bit layout, so no two fields can overlap and no consumer re-derives one.
 ///
-/// Bit 33 says a data block follows the blob; the frame codec sets and reads it,
+/// Bit 16 says a data block follows the blob; the frame codec sets and reads it,
 /// so `pack` leaves it clear and `unpack` ignores it.
 ///
 /// A request sets `verb` and, on a push, `conflict_mode`; the other fields are
@@ -418,40 +530,28 @@ pub struct WireFlags {
     pub verb: Option<ClientVerb>,
     /// Bits 8-15: a push's conflict mode.
     pub conflict_mode: WireConflictMode,
-    /// Bit 34: more frames of this reply follow. Set on every per-worker reply
+    /// Bit 17: more frames of this reply follow. Set on every per-worker reply
     /// frame, absent on the master's terminal frame.
     pub continuation: bool,
-    /// Bit 35: a worker's last frame of a train.
+    /// Bit 18: a worker's last frame of a train.
     pub scan_last: bool,
-    /// Bits 38-39.
+    /// Bits 19-20.
     pub lane: WireLane,
 }
 
 const CONFLICT_MODE_SHIFT: u32 = 8;
-const CONTINUATION_SHIFT: u32 = 34;
-const SCAN_LAST_SHIFT: u32 = 35;
-const LANE_SHIFT: u32 = 38;
+const CONTINUATION_SHIFT: u32 = 17;
+const SCAN_LAST_SHIFT: u32 = 18;
+const LANE_SHIFT: u32 = 19;
 
-/// The bits a field occupies: `verb` and `conflict_mode` (0-15), the data
-/// block bit (33), `continuation`, `scan_last` and the two `lane` bits.
-const DEFINED_BITS: u64 =
-    crate::low_bits_mask(16) | FLAG_HAS_DATA | 1 << CONTINUATION_SHIFT | 1 << SCAN_LAST_SHIFT | 3 << LANE_SHIFT;
+/// The bits a field occupies, contiguous from bit 0: `verb` and
+/// `conflict_mode` (0-15), the data block bit (16), `continuation` (17),
+/// `scan_last` (18) and the two `lane` bits (19-20).
+const DEFINED_BITS: u64 = crate::low_bits_mask(21);
 /// Every bit no field occupies.
 const RESERVED_BITS: u64 = !DEFINED_BITS;
 
 impl WireFlags {
-    /// A frame of a worker's reply train: `continuation` always, since the master's terminal
-    /// frame ends the client's reply; `scan_last` on the train's last frame.
-    pub const fn train_frame(last: bool) -> Self {
-        WireFlags {
-            verb: None,
-            conflict_mode: WireConflictMode::Update,
-            continuation: true,
-            scan_last: last,
-            lane: WireLane::Reply,
-        }
-    }
-
     pub(crate) const fn pack(self) -> u64 {
         let verb = match self.verb {
             Some(v) => v.as_wire(),

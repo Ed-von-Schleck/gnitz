@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::{HeapValue, MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable, push_coded, push_codes, symbols_head_len};
+use gnitz_wire::{HeapValue, MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable, push_coded, push_codes};
 
 use super::batch::Batch;
 
@@ -18,8 +18,8 @@ const _: () = assert!(
 );
 
 /// Long-value bytes a heap must hold before a table is trained over it: below
-/// four full tables, the table alone takes a quarter of them.
-const MIN_CODED_HEAP: usize = 4 * symbols_head_len(MAX_SYMBOLS);
+/// four tables' symbol bytes, the table alone takes a quarter of them.
+const MIN_CODED_HEAP: usize = 4 * MAX_SYMBOLS * (MAX_SYMBOL_LEN + 1);
 
 /// Plain bytes of the values sampled to price a table against a batch.
 const PROBE_BYTES: usize = 16 << 10;

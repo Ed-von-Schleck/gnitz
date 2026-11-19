@@ -36,33 +36,6 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
     Ok(ColType::of(tc))
 }
 
-/// The SQL spelling of a column type: the inverse of the SQL type parser on every type
-/// a `CREATE TABLE` accepts.
-pub fn sql_type_name(ty: ColType) -> String {
-    let name = match ty.tc {
-        TypeCode::U8 => "TINYINT UNSIGNED",
-        TypeCode::I8 => "TINYINT",
-        TypeCode::U16 => "SMALLINT UNSIGNED",
-        TypeCode::I16 => "SMALLINT",
-        TypeCode::U32 => "INT UNSIGNED",
-        TypeCode::I32 => "INT",
-        TypeCode::U64 => "BIGINT UNSIGNED",
-        TypeCode::I64 => "BIGINT",
-        TypeCode::U128 => "UHUGEINT",
-        TypeCode::I128 => "HUGEINT",
-        TypeCode::F32 => "FLOAT",
-        TypeCode::F64 => "DOUBLE",
-        TypeCode::String => "TEXT",
-        TypeCode::Blob => "BLOB",
-        TypeCode::UUID => "UUID",
-        TypeCode::Date => "DATE",
-        TypeCode::Timestamp => "TIMESTAMP",
-        TypeCode::Bool => "BOOLEAN",
-        TypeCode::Decimal => return ty.to_string(),
-    };
-    name.to_string()
-}
-
 /// `FLOAT` / `FLOAT(p)`: `p` counts binary digits of mantissa, so `1..=24` is single
 /// precision and `25..=53` double; any other modifier is refused.
 fn float_type(info: &ExactNumberInfo) -> Result<TypeCode, GnitzSqlError> {

@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use gnitz_wire::{OrderKey, RowSource, ScalarKind};
+use gnitz_wire::{OrderKey, RowSource, ScalarKind, ValueForm, WideForm};
 
 use crate::{ColumnLocator, SchemaDescriptor};
 
@@ -149,16 +149,18 @@ fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>) {
     }
     let loc = key.loc;
     let tc = loc.type_code();
-    match ScalarKind::from_type_code(tc) {
-        Some(ScalarKind::Int(fi)) => gnitz_wire::for_each_fixed_int!(fi, |FI| {
+    match tc.form() {
+        ValueForm::Scalar(ScalarKind::Int(fi)) => gnitz_wire::for_each_fixed_int!(fi, |FI| {
             fill(key, src, rows, |r| order_bits(&loc, src, r, ScalarKind::Int(FI)))
         }),
-        Some(kind) => fill(key, src, rows, |r| order_bits(&loc, src, r, kind)),
-        None if tc.is_german_string() => fill(key, src, rows, |r| {
+        ValueForm::Scalar(kind) => fill(key, src, rows, |r| order_bits(&loc, src, r, kind)),
+        ValueForm::Wide(WideForm::German) => fill(key, src, rows, |r| {
             gnitz_wire::german_string_lead(loc.german_cell(src, r), src.heap())
         }),
         // One half of a 16-byte integer.
-        None => fill(key, src, rows, |r| (loc.opk_image(src, r) >> key.shift) as u64),
+        ValueForm::Wide(WideForm::Int128 { .. }) => {
+            fill(key, src, rows, |r| (loc.opk_image(src, r) >> key.shift) as u64)
+        }
     }
 }
 

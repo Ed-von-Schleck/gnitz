@@ -130,14 +130,15 @@ impl ReduceScratch {
 const SCRATCH_KEEP_BYTES: usize = 1 << 16;
 
 impl ReducePlan {
-    /// `Err` for a shape `ReduceShape` refuses and a reduce without a COUNT(*).
+    /// `Err` for a shape `ReduceShape` refuses. `aggs` are a circuit reduce's,
+    /// which `OpNode::check` holds to carry a COUNT(*).
     pub fn from_wire(
         input: &SchemaDescriptor,
         group_cols: &[u32],
         aggs: &[AggDescriptor],
         seeds_ground: bool,
     ) -> Result<Self, String> {
-        Self::new(input, group_cols, aggs, count_star(aggs)?, seeds_ground)
+        Self::new(input, group_cols, aggs, count_star(aggs), seeds_ground)
     }
 
     /// One worker's share of a global reduce over `aggs`, or `None` for a float
@@ -158,7 +159,7 @@ impl ReducePlan {
             .map(|(d, col_idx)| AggDescriptor { col_idx, agg_op: d.agg_op.merge_op() })
             .collect();
         // A COUNT merges as a SUM, so its position is read off `aggs`.
-        let plan = Self::new(partials, &[], &merged, count_star(aggs)?, seeds_ground)?;
+        let plan = Self::new(partials, &[], &merged, count_star(aggs), seeds_ground)?;
         debug_assert_eq!(plan.shape.output_schema, *partials);
         Ok(plan)
     }
@@ -227,10 +228,10 @@ impl ReducePlan {
 
 /// The position of the COUNT(*) holding a group's net row count: only it tells
 /// an emptied group from a live one.
-fn count_star(aggs: &[AggDescriptor]) -> Result<usize, String> {
+fn count_star(aggs: &[AggDescriptor]) -> usize {
     aggs.iter()
         .position(|d| d.agg_op == AggFunc::Count)
-        .ok_or_else(|| "reduce: a circuit reduce needs a COUNT(*)".to_string())
+        .expect("a circuit reduce carries a COUNT(*), which the circuit's operator check enforces")
 }
 
 /// In a delta standing in group order, a run of more rows than this reads its

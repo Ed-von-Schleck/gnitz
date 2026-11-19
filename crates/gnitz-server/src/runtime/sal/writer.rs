@@ -624,7 +624,7 @@ impl SalScope<'_, '_> {
         self.write(&Group::ddl_sync(family, batch), true)
     }
 
-    /// Lay out a push of `rows` into `tid`, held to `rule`, whose schema record
+    /// Lay out a push of `rows` into `tid`, held to `rule`, whose shape record
     /// is `record`, addressed to the workers `rows` holds rows for and answered
     /// by none. `recovered` makes it a member of the scope's zone: the rows a
     /// restart must recover.

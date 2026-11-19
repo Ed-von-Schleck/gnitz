@@ -11,7 +11,7 @@ use gnitz_wire::{AggDescriptor, GroupAggs, KeyRange, PkColList, ReadBound, ReadS
 use gnitz_wire::{PkKeys, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`, scanned `scan_chunk_rows` rows at a time. A view's
@@ -53,7 +53,7 @@ pub(super) fn layout_of(schema: &SchemaDescriptor, sink: &ReadSink) -> u64 {
 
 /// A `pk IN (…)` bound over a U64 PK.
 fn pk_set(ids: &[u64]) -> ReadBound {
-    ReadBound::PkSet(PkKeys::from_images(8, ids.iter().map(|&id| id as u128)))
+    ReadBound::PkSet(pk_keys_of_images(8, ids.iter().map(|&id| id as u128)))
 }
 
 // ── Sinks ────────────────────────────────────────────────────────────
@@ -236,7 +236,7 @@ fn a_malformed_request_is_refused() {
     let cases = [
         (rows_spec(None, cut(1, order_by(99, false))), own, "order"),
         (walk(64), own, "column"),
-        (walk(2), own, "F64"),
+        (walk(2), own, "DOUBLE"),
         (
             ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_sorted(16, vec![0; 16]))),
             own,

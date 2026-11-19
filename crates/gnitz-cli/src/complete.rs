@@ -323,7 +323,7 @@ fn column_candidates<'a>(rel: &'a CatalogRelation, prefix: &'a str) -> impl Iter
     rel.visible_columns().map(move |c| Candidate {
         kind: Kind::Column,
         value: format!("{prefix}{}", gnitz_sql::column_text(&c.name)),
-        description: Some(format!("{} · {}", gnitz_sql::sql_type_name(c.ty), rel.name)),
+        description: Some(format!("{} · {}", c.ty, rel.name)),
     })
 }
 

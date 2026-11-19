@@ -174,7 +174,7 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
         ClientVerb::SnapshotPage => {
             attempt(root, anatomy, || gnitz_wire::snapshot::PageRequest::decode(blob)).and(None)
         }
-        // A push's blob is its rows' schema record. A multi-item prologue's blob
+        // A push's blob is its rows' shape record. A multi-item prologue's blob
         // is empty; its items carry the records.
         ClientVerb::Push | ClientVerb::PushTxn if !blob.is_empty() => {
             attempt(root, anatomy, || Schema::from_record(blob)).map(Arc::new)
@@ -211,7 +211,10 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
             }
         }
         ClientVerb::DeltaPoll => {
-            for p in attempt(root, anatomy, || multi_frame::decode_delta_items(body)).unwrap_or_default() {
+            let poll = attempt(root, anatomy, || {
+                multi_frame::decode_delta_poll(body, &ctrl.hdr).map(|p| p.items)
+            });
+            for p in poll.unwrap_or_default() {
                 attempt(root, anatomy, || ReadSpec::decode(p.spec));
             }
         }

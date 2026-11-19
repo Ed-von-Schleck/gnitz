@@ -8,7 +8,7 @@ use gnitz_foundation::rng::Rng;
 use gnitz_trace::runs::Run;
 use gnitz_wire::{PkColList, ReadSpec, TypeCode, ViewBudget, image_mask, opk_bias};
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 
 const NBASE: u64 = 200;
 
@@ -108,7 +108,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
 fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
     let schema = make_schema_u64_i64();
     let base = make_batch_raw(&schema, &rows(0..NBASE));
-    let keys = || ReadBound::PkSet(PkKeys::from_images(8, [2, 5, 7, 300]));
+    let keys = || ReadBound::PkSet(pk_keys_of_images(8, [2, 5, 7, 300]));
     for (kind, probed) in [
         (RelationKind::BaseTable, true),
         (RelationKind::SystemCatalog, true),
@@ -425,7 +425,7 @@ fn a_pk_probe_answers_each_key_a_live_row_carries() {
     let mut r = fixture(RelationKind::BaseTable, x10);
     r.ingest(TID, make_batch_raw(&make_schema_u64_i64(), &[(5, -1, 50)]))
         .unwrap();
-    let keys = PkKeys::from_images(8, [2, 5, 7, 300]);
+    let keys = pk_keys_of_images(8, [2, 5, 7, 300]);
     assert_eq!(keyed(&r.probe(TID, Probe::Pk, keys.clone()).unwrap()), [(2, 1), (7, 1)]);
     let column = r.probe(TID, Probe::PkColumn(1), keys).unwrap();
     assert_eq!(batch_rows(&column), rows([2, 7]));
@@ -437,7 +437,7 @@ fn a_pk_probe_answers_each_key_a_live_row_carries() {
 fn a_pk_or_column_probe_of_a_view_is_refused() {
     let r = fixture(RelationKind::View(ViewBudget::Plain), x10);
     for probe in [Probe::Pk, Probe::PkColumn(1)] {
-        let err = r.probe(TID, probe, PkKeys::from_images(8, [2])).map(drop).unwrap_err();
+        let err = r.probe(TID, probe, pk_keys_of_images(8, [2])).map(drop).unwrap_err();
         assert!(err.contains("may net above 1"), "{probe:?}: {err}");
     }
 }
@@ -453,7 +453,7 @@ fn an_index_probe_answers_each_held_span_up_to_its_cap() {
     let r = fixture(RelationKind::BaseTable, val_of);
     let probe = |cap: u64, vals: &[i64]| {
         let index = Probe::Index(PkColList::from_slice(&[1]), std::num::NonZeroU64::new(cap).unwrap());
-        let spans = PkKeys::from_images(8, vals.iter().map(|&v| img(v)));
+        let spans = pk_keys_of_images(8, vals.iter().map(|&v| img(v)));
         keyed(&r.probe(TID, index, spans).unwrap())
     };
     // An entry is its span, then its holder's id.
@@ -481,7 +481,7 @@ fn an_index_probe_answers_each_held_span_up_to_its_cap() {
 fn a_read_of_what_the_relation_has_not_got_is_refused() {
     let r = fixture(RelationKind::BaseTable, x10);
     let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), std::num::NonZeroU64::MIN);
-    let span = || PkKeys::from_images(8, [img(2)]);
+    let span = || pk_keys_of_images(8, [img(2)]);
     // A whole entry is a span and a source PK: wider than either store's key.
     let entry = || PkKeys::from_sorted(16, Vec::new());
     let refusals = [
@@ -510,7 +510,7 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
 fn a_read_of_a_stream_is_refused() {
     let r = relation_fixture(RelationKind::Stream, make_schema_u64_i64(), &[], []);
     for probe in [Probe::Pk, Probe::PkColumn(1)] {
-        let err = r.probe(TID, probe, PkKeys::from_images(8, [2])).map(drop).unwrap_err();
+        let err = r.probe(TID, probe, pk_keys_of_images(8, [2])).map(drop).unwrap_err();
         assert!(err.contains("is a stream"), "{probe:?}: {err}");
     }
     let relation = r.relation(TID).unwrap();
@@ -578,7 +578,7 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     );
     let range = || col_range(3, img(1000), img(1399));
     // Every other key, the deleted ones among them.
-    let keys = || ReadBound::PkSet(PkKeys::from_images(8, (0..N).step_by(2).map(u128::from)));
+    let keys = || ReadBound::PkSet(pk_keys_of_images(8, (0..N).step_by(2).map(u128::from)));
     let open = |label, read| match label {
         "index range" => relation.open_sealed(range(), read).unwrap(),
         "unique pk set" => relation.open_read(keys(), read).unwrap().0,

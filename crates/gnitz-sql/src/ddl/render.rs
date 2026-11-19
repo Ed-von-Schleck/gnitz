@@ -9,7 +9,7 @@ use gnitz_wire::{FkAction, TableDistribution};
 use super::options::with_options;
 use super::view_def::ViewDefinition;
 use crate::names::{column_text, relation_text};
-use crate::types::{serial_type_name, sql_type_name};
+use crate::types::serial_type_name;
 
 /// `CREATE SCHEMA <name>`.
 pub fn create_schema_statement(name: &str) -> String {
@@ -51,7 +51,7 @@ pub fn create_table_statement(catalog: &Catalog, rel: &CatalogRelation) -> Resul
                 .ok_or_else(|| format!("{}: a SERIAL column of type {}", rel.qualified(), c.ty.tc))?;
             line.push_str(serial);
         } else {
-            line.push_str(&sql_type_name(c.ty));
+            line.push_str(&c.ty.to_string());
             if !c.is_nullable {
                 line.push_str(" NOT NULL");
             }

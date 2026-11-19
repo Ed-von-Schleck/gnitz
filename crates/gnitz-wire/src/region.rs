@@ -52,22 +52,6 @@ pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
     }
 }
 
-/// The first `(row, payload slot)` whose little-endian `u64` null word in
-/// `null_bmp` sets a bit outside the `nullable` slots, past the last payload
-/// slot included.
-pub fn first_not_null_violation(nullable: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
-    let not_null = !nullable;
-    let words = null_bmp.as_chunks::<8>().0;
-    // A conforming batch takes only this branch-free pass.
-    if not_null == 0 || words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & not_null == 0 {
-        return None;
-    }
-    words.iter().enumerate().find_map(|(row, w)| {
-        let bad = u64::from_le_bytes(*w) & not_null;
-        (bad != 0).then(|| (row, bad.trailing_zeros() as usize))
-    })
-}
-
 /// Append one zero-filled cell of wire type `tc` to a payload region — the NULL
 /// encoding and the non-null filler alike. The null bitmap is the NULL truth,
 /// and a zeroed German cell *is* the empty value, which is what
@@ -75,40 +59,6 @@ pub fn first_not_null_violation(nullable: u64, null_bmp: &[u8]) -> Option<(usize
 #[inline]
 pub fn push_zero_cell(col: &mut Vec<u8>, tc: TypeCode) {
     col.extend(std::iter::repeat_n(0u8, tc.wire_stride()));
-}
-
-/// The first `(row, payload slot)` whose null bit in `null_bmp`, among the
-/// `nullable` slots, sits over a non-zero cell: NULL encodes as a zeroed cell.
-/// `col(slot)` is that slot's region and its cell width.
-pub fn first_valued_null<'a>(
-    nullable: u64,
-    null_bmp: &[u8],
-    col: impl Fn(usize) -> (&'a [u8], usize),
-) -> Option<(usize, usize)> {
-    let words = null_bmp.as_chunks::<8>().0;
-    // A batch holding no NULL takes only this branch-free pass.
-    let present = words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & nullable;
-    let mut first: Option<(usize, usize)> = None;
-    // One pass per slot that holds a NULL anywhere.
-    for slot in crate::BitIter(present) {
-        let (cells, width) = col(slot);
-        let row = crate::by_cell_width!(width, |T| valued_null_row::<{ size_of::<T>() }>(words, cells, slot));
-        if let Some(row) = row.filter(|&r| first.is_none_or(|(f, _)| r < f)) {
-            first = Some((row, slot));
-        }
-    }
-    first
-}
-
-/// The first row whose null word sets bit `slot` over a non-zero `W`-byte cell.
-fn valued_null_row<const W: usize>(words: &[[u8; 8]], cells: &[u8], slot: usize) -> Option<usize> {
-    let cells = cells.as_chunks::<W>().0;
-    let valued = |(w, c): (&[u8; 8], &[u8; W])| (u64::from_le_bytes(*w) >> slot) & 1 != 0 && *c != [0u8; W];
-    // A conforming column takes only this pass, which has no early exit to branch on.
-    if !words.iter().zip(cells).fold(false, |any, wc| any | valued(wc)) {
-        return None;
-    }
-    words.iter().zip(cells).position(valued)
 }
 
 /// A row's null word rebased onto output payload slot `at`; slot 64 and beyond
@@ -185,6 +135,38 @@ pub fn payload_str<S: RowSource>(
         Cow::Borrowed(bytes) => std::str::from_utf8(bytes).map(Cow::Borrowed),
         Cow::Owned(bytes) => String::from_utf8(bytes).map(Cow::Owned).map_err(|e| e.utf8_error()),
     }
+}
+
+/// `$body` once per fixed cell width — 1/2/4/8/16 bytes, the widths of a PK
+/// column and of every non-string payload cell — with `$t` the unsigned integer
+/// of `$width` bytes.
+#[macro_export]
+macro_rules! by_cell_width {
+    ($width:expr, |$t:ident| $body:expr) => {
+        match $width {
+            16 => {
+                type $t = u128;
+                $body
+            }
+            8 => {
+                type $t = u64;
+                $body
+            }
+            4 => {
+                type $t = u32;
+                $body
+            }
+            2 => {
+                type $t = u16;
+                $body
+            }
+            1 => {
+                type $t = u8;
+                $body
+            }
+            other => unreachable!("a fixed cell is 1/2/4/8/16 bytes, got {other}"),
+        }
+    };
 }
 
 /// `f` over the `W`-byte cell at byte `off` of each `stride`-byte row of `src`, paired

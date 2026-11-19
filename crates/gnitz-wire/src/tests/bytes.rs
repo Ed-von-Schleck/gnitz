@@ -9,18 +9,15 @@ fn as_le_bytes_mut_writes_through_to_the_typed_slice() {
 }
 
 #[test]
-fn extend_from_le_bytes_round_trips_as_le_bytes() {
+fn le_scalars_round_trips_as_le_bytes() {
     let src = [1i64, -2, i64::MAX, i64::MIN];
-    let mut dst = vec![7i64];
-    extend_from_le_bytes(&mut dst, as_le_bytes(&src));
-    assert_eq!(dst, [7, 1, -2, i64::MAX, i64::MIN]);
+    assert_eq!(le_scalars::<i64>(as_le_bytes(&src)).unwrap(), src);
+    assert!(le_scalars::<u64>(&[]).unwrap().is_empty());
 }
 
 #[test]
-#[should_panic(expected = "not a whole number")]
-fn extend_from_le_bytes_rejects_a_partial_scalar() {
-    let mut dst: Vec<u32> = Vec::new();
-    extend_from_le_bytes(&mut dst, &[0u8; 6]);
+fn le_scalars_refuses_a_partial_scalar() {
+    assert!(le_scalars::<u32>(&[0u8; 6]).unwrap_err().contains("no whole number"));
 }
 
 /// `BitIter` yields lowest-first and stops at the empty mask — including for

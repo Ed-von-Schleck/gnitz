@@ -6,15 +6,13 @@
 //! relation or of its columns leaves the definition true. `render` writes the
 //! body back out with the names the catalog holds then where the original ones
 //! stood. The engine and the client core store the encoding verbatim and read
-//! none of it.
+//! none of it. The layout's version is `gnitz_wire::VIEW_DEF_VERSION`, folded
+//! into the stored-shape digest, so a data directory holding another layout is
+//! refused at boot.
 
 use std::ops::Range;
 
 use gnitz_wire::{MAX_LIST_LEN, Reader, Wire, Writer, decode_all};
-
-/// The version of the layout [`ViewDefinition::encode`] writes, whose bytes a
-/// test pins.
-const ENCODING_VERSION: u8 = 1;
 
 /// A user view's body as written, and the relations it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,22 +49,13 @@ pub(crate) struct RelationRef {
 impl ViewDefinition {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        w.u8(ENCODING_VERSION)
-            .put(&self.query)
-            .list(&self.body_columns)
-            .list(&self.refs);
+        w.put(&self.query).list(&self.body_columns).list(&self.refs);
         w.into_vec()
     }
 
     /// The definition `bytes` encodes, held to [`Self::check`].
     pub(crate) fn decode(bytes: &[u8]) -> Result<ViewDefinition, String> {
         decode_all(bytes, "view definition", |r| {
-            let version = r.u8()?;
-            if version != ENCODING_VERSION {
-                return Err(format!(
-                    "encoding version {version}, this build reads {ENCODING_VERSION}"
-                ));
-            }
             let def = ViewDefinition {
                 query: r.get()?,
                 body_columns: r.list("names", MAX_LIST_LEN)?,

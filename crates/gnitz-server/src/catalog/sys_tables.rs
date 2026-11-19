@@ -17,7 +17,7 @@ use gnitz_wire::{
     ViewParts, ViewTabRow,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_record};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -248,16 +248,15 @@ impl DdlBundle {
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-/// Each family's schema and SAL record, indexed by [`SysFamily::index`], both
-/// derived from `gnitz-wire`'s system-table columns as a user relation's are
-/// from its COL_TAB records. The record is what every DdlSync group of the
-/// family carries.
+/// Each family's schema and shape record, indexed by [`SysFamily::index`],
+/// both derived from `gnitz-wire`'s system-table columns as a user relation's
+/// are from its COL_TAB records. The shape record is what every DdlSync group
+/// of the family carries.
 static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = LazyLock::new(|| {
     SysFamily::ALL.map(|family| {
         let (defs, pk) = (family.column_defs(), family.def().pk_cols);
         let schema = build_schema_from_col_defs(&defs, pk).expect("a system family is an admissible schema");
-        let record = encode_schema_record(&schema).into();
-        (schema, record)
+        (schema, encode_shape_record(pk, &defs))
     })
 });
 
@@ -265,6 +264,12 @@ static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = La
 /// reply carries.
 pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> Box<[u8]> {
     gnitz_wire::schema_record::encode(defs.iter().map(|c| c.def.record_col()), pk).into()
+}
+
+/// The shape record of a relation keyed `pk` over `defs`: what a push's blob is
+/// checked against and every SAL group of the relation carries.
+pub(in crate::catalog) fn encode_shape_record(pk: &[u32], defs: &[CatalogColumn]) -> Box<[u8]> {
+    gnitz_wire::schema_record::encode(defs.iter().map(|c| c.def.shape_col()), pk).into()
 }
 
 /// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
@@ -298,8 +303,8 @@ pub(crate) trait SysFamilyExt: Copy {
     /// This family's fixed schema.
     fn schema(self) -> &'static SchemaDescriptor;
 
-    /// This family's [`encode_schema_record`]: the record its DdlSync groups carry.
-    fn sal_record(self) -> &'static [u8];
+    /// This family's [`encode_shape_record`]: the record its DdlSync groups carry.
+    fn shape_record(self) -> &'static [u8];
 
     /// This family's column definitions, from the same wire slice its schema is
     /// built from — compile-time data, never read back from COL_TAB.
@@ -333,7 +338,7 @@ impl SysFamilyExt for SysFamily {
         &SCHEMAS[self.index()].0
     }
 
-    fn sal_record(self) -> &'static [u8] {
+    fn shape_record(self) -> &'static [u8] {
         &SCHEMAS[self.index()].1
     }
 

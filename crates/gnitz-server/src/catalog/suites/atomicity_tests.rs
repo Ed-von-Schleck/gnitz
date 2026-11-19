@@ -50,7 +50,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
         (
             SysFamily::Table,
             table_tab_batch(&[(string_pk, "t", 1)]),
-            "has type_code STRING",
+            "has type TEXT",
         ),
         (SysFamily::Table, table_tab_batch(&[(gapped, "t", 1)]), "non-contiguous"),
         (

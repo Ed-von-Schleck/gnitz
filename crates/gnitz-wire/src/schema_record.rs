@@ -1,6 +1,8 @@
 //! The **meta-schema record**: the one encoding that carries a relation's column
-//! shape across the wire — engine → client in a RESOLVE's descriptor, client →
-//! engine as the blob of a `PUSH` and of each `PUSH_TXN` family.
+//! shape across the wire. Engine → client, a RESOLVE's descriptor carries the
+//! named record. Client → engine, the blob of a `PUSH` and of each `PUSH_TXN`
+//! family carries the nameless **shape record**: every name empty, every hidden
+//! flag clear ([`crate::ColumnDef::shape_col`]).
 //!
 //! ```text
 //! u16              pk_count
@@ -22,8 +24,9 @@ use crate::codec::{Reader, Writer, decode_all};
 use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 
 /// One column as the record carries it. `name` borrows the record's own bytes on
-/// decode; on encode it is whatever the caller has (an empty slice for the
-/// anonymous records that describe physical shape only).
+/// decode, which refuses a name that is not UTF-8; on encode it is whatever the
+/// caller has (an empty string for the shape records that describe physical
+/// shape only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordCol<'a> {
     pub ty: ColType,
@@ -33,7 +36,7 @@ pub struct RecordCol<'a> {
     /// skip it; to the PK region, routing, sort and consolidation it is an
     /// ordinary column.
     pub hidden: bool,
-    pub name: &'a [u8],
+    pub name: &'a str,
 }
 
 const NULLABLE: u8 = 1 << 0;
@@ -57,7 +60,7 @@ fn take_col<'a>(r: &mut Reader<'a>) -> Result<RecordCol<'a>, String> {
     let flags = r.flags(DEFINED_FLAGS)?;
     let scale = r.u8()?;
     let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("invalid column type {code}/{scale}"))?;
-    let name = r.bytes32()?;
+    let name = r.str32()?;
     Ok(RecordCol {
         ty,
         nullable: flags & NULLABLE != 0,
@@ -83,7 +86,7 @@ pub fn encode<'a>(cols: impl Iterator<Item = RecordCol<'a>> + Clone, pk_cols: &[
         w.u8(c.ty.tc.as_wire())
             .u8((if c.nullable { NULLABLE } else { 0 }) | (if c.hidden { HIDDEN } else { 0 }))
             .u8(c.ty.scale)
-            .bytes32(c.name);
+            .bytes32(c.name.as_bytes());
     }
     w.into_vec()
 }
@@ -112,10 +115,11 @@ pub fn decode<'a>(
     })
 }
 
-/// `Err` naming the first difference unless `got` lays out the same columns as
-/// the well-formed record `want`: column count, PK list, and per column its type
-/// (scale included) and nullability. Names and the hidden flag are not compared.
-pub fn check_same_types(got: &[u8], want: &[u8]) -> Result<(), String> {
+/// `Err` naming the first difference unless `got` is the well-formed shape
+/// record `want` byte for byte. A shape record is canonical, so the decode only
+/// words a mismatch: column count, PK list, a column's type (scale included) or
+/// nullability, or else a name or hidden flag no shape record carries.
+pub fn check_shape(got: &[u8], want: &[u8]) -> Result<(), String> {
     debug_assert!(decode(want, |_| Ok(())).is_ok(), "`want` is a well-formed record");
     if got == want {
         return Ok(());
@@ -138,7 +142,7 @@ pub fn check_same_types(got: &[u8], want: &[u8]) -> Result<(), String> {
     } else if let Some((ci, ((wt, wn), (t, n)))) = want_cols.iter().zip(&cols).enumerate().find(|(_, (w, g))| w != g) {
         format!("column {ci}: expected {wt} {}, got {t} {}", null(*wn), null(*n))
     } else {
-        return Ok(());
+        "a shape record carries no column name and no hidden flag".to_string()
     };
     Err(format!("Schema mismatch: {difference}"))
 }

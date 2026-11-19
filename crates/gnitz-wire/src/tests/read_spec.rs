@@ -19,10 +19,10 @@ fn cut(k: u64, order: Vec<OrderKey>) -> Option<RowsCut> {
     Some(RowsCut { k: NonZeroU64::new(k).unwrap(), order })
 }
 
-/// Three OPK keys of `stride`, deliberately handed over out of order.
+/// Three OPK keys of `stride`.
 fn keys(stride: usize) -> PkKeys {
-    let ks: Vec<Vec<u8>> = [9u8, 3, 200].iter().map(|&b| vec![b; stride]).collect();
-    PkKeys::from_keys(stride, ks.iter().map(Vec::as_slice))
+    let ks: Vec<Vec<u8>> = [3u8, 9, 200].iter().map(|&b| vec![b; stride]).collect();
+    PkKeys::from_sorted(stride, ks.concat())
 }
 
 /// Bound, map and sink kind are independent axes of the encoding, so every
@@ -338,7 +338,7 @@ fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
                     continue;
                 }
                 let want = ReadSpec {
-                    bound: ReadBound::PkSet(PkKeys::from_keys(stride, mine.iter().copied())),
+                    bound: ReadBound::PkSet(PkKeys::from_sorted(stride, mine.concat())),
                     ..spec.clone()
                 };
                 // Decoding a PkSet refuses keys out of order.

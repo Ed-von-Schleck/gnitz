@@ -12,8 +12,8 @@ use crate::rules::require_column;
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::ScalarEval;
-use gnitz_wire::{ColType, FixedInt, Heap, TypeCode, null_word_get, null_word_set, relocate_german_string};
-use gnitz_zset::repr::StringDest;
+use gnitz_wire::{ColType, FixedInt, Heap, TypeCode, null_word_get, null_word_set};
+use gnitz_zset::repr::{StringDest, relocated_cell};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr};
 
 /// Which row a SET right-hand side reads: the row being rewritten, or (ON
@@ -219,8 +219,12 @@ pub(super) fn apply_set(
                 if def.ty.tc.is_german_string() {
                     // One long value for every row's cell.
                     let (cells, heap, _) = w.string_col_mut(pi);
-                    let cell =
-                        relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, heap);
+                    let cell = relocated_cell(
+                        cell.first_chunk().expect("a German cell is 16 bytes"),
+                        Heap::Plain(spill),
+                        heap,
+                        None,
+                    );
                     cells.as_chunks_mut::<16>().0.fill(cell);
                 } else {
                     gnitz_wire::by_cell_width!(cell.len(), |T| {

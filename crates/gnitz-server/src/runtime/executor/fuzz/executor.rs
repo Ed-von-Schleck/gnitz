@@ -30,7 +30,6 @@ use gnitz_store::relation::{RelationKind, Snapshot};
 use gnitz_wire::multi_frame::{FrameItem, ScanItem, decode_scan_multi, encode_items};
 use gnitz_wire::{ControlHeader, PkKeys, ReadSpec, append_frame};
 use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
-use gnitz_zset::schema::encode_schema_record;
 
 #[test]
 fn traffic_fuzz() {
@@ -98,7 +97,7 @@ impl Session {
         let body = &frame[ctrl.body.clone()];
         let buf = RecvBuf::detached(frame);
         match verb {
-            ClientVerb::DdlTxn => self.ddl(body),
+            ClientVerb::DdlTxn => self.ddl(frame, ctrl.body.clone()),
             ClientVerb::Push => {
                 let Ok(Some(push)) = admit_push(&self.cat, buf.as_slice(), ctrl, Access::Write) else {
                     return;
@@ -157,8 +156,10 @@ impl Session {
     /// bundle lands at the cut here, where a worker's DdlSync holds it above, so
     /// the tick carries no rows: a view over a system family is maintained from
     /// a DDL only against a server.
-    fn ddl(&mut self, body: &[u8]) {
-        let Ok(families) = ddl::decode_bundle(body) else { return };
+    fn ddl(&mut self, frame: &[u8], body: std::ops::Range<usize>) {
+        let Ok(families) = ddl::decode_bundle(frame, body) else {
+            return;
+        };
         // The master refuses a unique index over rows a duplicate may be
         // among, by asking its workers; this one has none to ask.
         let unique_over_rows = families
@@ -272,8 +273,8 @@ fn builtin() -> Seed {
         let rows = eight_rows(&session, tid);
         let mut frame = Vec::new();
         let hdr = ControlHeader::naming(ClientVerb::Push, Target::from(tid), 0);
-        let record = encode_schema_record(rows.schema());
-        append_frame(&mut frame, &hdr, &record, Some(&rows.wire_regions()));
+        let (_, record) = session.cat.shape_target(tid).expect("the DDL created it");
+        append_frame(&mut frame, &hdr, record, Some(&rows.wire_regions()));
         frame
     };
     let pushes = [rows(a), rows(b)];
@@ -343,13 +344,12 @@ fn a_push_txn_reads_each_family_where_it_lies() {
     let base = gnitz_wire::FIRST_USER_TABLE_ID;
     let tables = [base, base + 1];
     let batches = tables.map(|tid| eight_rows(&session, tid));
-    let records = batches.each_ref().map(|b| encode_schema_record(b.schema()));
     let items: Vec<FrameItem> = (0..2)
         .map(|i| FrameItem {
             target: Target::from(tables[i]),
             conflict_mode: Default::default(),
             basis: 0,
-            blob: &records[i],
+            blob: session.cat.shape_target(tables[i]).unwrap().1,
             data: batches[i].wire_regions(),
         })
         .collect();

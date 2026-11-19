@@ -133,9 +133,9 @@ fn every_op_node_variant_roundtrips() {
         scan(7),
         OpNode::ScanDelta {
             source: 7,
-            bound: crate::ReadBound::PkSet(crate::PkKeys::from_keys(
+            bound: crate::ReadBound::PkSet(crate::PkKeys::from_sorted(
                 8,
-                [&7u64.to_be_bytes()[..], &2u64.to_be_bytes()[..]],
+                [2u64.to_be_bytes(), 7u64.to_be_bytes()].concat(),
             )),
             scatter: Some(vec![]),
         },

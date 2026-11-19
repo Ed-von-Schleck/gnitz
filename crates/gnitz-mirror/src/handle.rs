@@ -267,7 +267,7 @@ impl MirrorStore for Mirror {
     /// entered empty otherwise.
     fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         let tid = desc.tid;
-        let record = desc.schema.to_record();
+        let record = desc.schema.shape_record();
         let indexes = index_lists(desc);
         // This name at another id was renamed or recreated upstream.
         let renamed = self

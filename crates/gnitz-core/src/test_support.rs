@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gnitz_foundation::posix_io::set_sockopt_int;
-use gnitz_wire::{ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus, framed, peek_control_block};
+use gnitz_wire::{ColumnDef, ControlHeader, TypeCode, WireFlags, WireStatus, framed, peek_control_block};
 
 use crate::connection::Session;
 use crate::transport::poll_fd;
@@ -284,14 +284,14 @@ pub(crate) fn encode_frame(hdr: ControlHeader, blob: &[u8], data: Option<&ZSetBa
     out
 }
 
+/// `schema`'s named record: what a RESOLVE's descriptor carries.
+pub(crate) fn named_record(schema: &crate::Schema) -> Vec<u8> {
+    gnitz_wire::schema_record::encode(schema.columns().iter().map(ColumnDef::record_col), schema.pk_cols())
+}
+
 /// A control-only reply frame naming `tid` and carrying `lsn` in `arg0`.
 pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: tid,
-        arg0: lsn,
-        ..Default::default()
-    };
-    encode_frame(hdr, &[], None)
+    encode_frame(ControlHeader::ack(tid, lsn), &[], None)
 }
 
 /// A reply frame carrying `batch` and `lsn` in `arg0`;
@@ -309,16 +309,17 @@ pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> V
 /// A frame of `view`'s delta train carrying `rows`, if any: a continuation, or
 /// with `end` the terminal at the cursor `(tag, tick)`.
 pub(crate) fn delta_frame(view: u64, rows: Option<&ZSetBatch>, end: Option<(u64, u64)>) -> Vec<u8> {
-    let (tag, tick) = end.unwrap_or_default();
-    let hdr = ControlHeader {
-        target_id: view,
-        flags: WireFlags {
-            continuation: end.is_none(),
-            ..Default::default()
+    let hdr = match end {
+        None => ControlHeader::train(view, false),
+        Some((tag, tick)) => match DeltaCursor::from_pair(tag, tick) {
+            Some(at) => ControlHeader::delta_terminal(view, at),
+            // Round 0, which no server names: a forged terminal.
+            None => ControlHeader {
+                target_id: view,
+                arg0: tag,
+                ..Default::default()
+            },
         },
-        arg0: tag,
-        arg1: tick,
-        ..Default::default()
     };
     encode_frame(hdr, &[], rows)
 }
@@ -331,16 +332,7 @@ pub(crate) fn delta_terminal(view: u64, tag: u64, tick: u64) -> Vec<u8> {
 
 /// The frame that opens a pushed train of subscription `sub` to `view`.
 pub(crate) fn pushed_marker(view: u64, sub: SubId) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: view,
-        arg0: sub.get(),
-        flags: WireFlags {
-            lane: WireLane::PushedTrain,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    encode_frame(hdr, &[], None)
+    encode_frame(ControlHeader::pushed_train(view, sub), &[], None)
 }
 
 /// One pushed train of subscription `sub` to `view`, framed: its opening frame,
@@ -385,25 +377,13 @@ pub(crate) fn sync_held(request: &[u8]) -> Vec<SubId> {
 
 /// The frame that answers the oldest sync: with `refusal`, a fault refusing it.
 pub(crate) fn sync_answer(refusal: Option<&str>) -> Vec<u8> {
-    let hdr = ControlHeader {
-        status: refusal.map_or(WireStatus::Ok, |_| WireStatus::Error),
-        flags: WireFlags {
-            lane: WireLane::SyncAnswer,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let hdr = ControlHeader::sync_answer(refusal.map_or(WireStatus::Ok, |_| WireStatus::Error));
     encode_frame(hdr, refusal.unwrap_or_default().as_bytes(), None)
 }
 
 /// A fault frame naming `tid`, with `text` as its body.
 pub(crate) fn reply_status(tid: u64, status: WireStatus, text: &str) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: tid,
-        status,
-        ..Default::default()
-    };
-    encode_frame(hdr, text.as_bytes(), None)
+    encode_frame(ControlHeader::fault(tid, status), text.as_bytes(), None)
 }
 
 /// Deliver `SIGUSR1` to the calling thread until `stop` is set, with a no-op

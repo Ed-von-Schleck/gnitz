@@ -3,9 +3,9 @@
 use crate::codec::{Reader, Wire, Writer};
 use crate::{MAX_COLUMNS, TypeCode};
 
-/// Which rule a candidate primary key broke, worded by [`PkRule::named`].
+/// Which rule a candidate key or index column list broke, worded by [`KeyListRefusal::named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkRule {
+pub enum KeyListRefusal {
     /// The word sets a bit outside its count and its columns.
     NonCanonical,
     /// No PK columns at all. Every base table has an enforced primary key.
@@ -13,7 +13,7 @@ pub enum PkRule {
     /// Arity past the cap the caller passed, which rides along so the message
     /// names the bound that was actually applied.
     TooManyColumns { count: usize, max: usize },
-    /// A PK index that names no column.
+    /// An index that names no column.
     IndexOutOfRange { col: u32 },
     /// The same column listed twice — it would double-count in the stride and
     /// yield duplicates from the PK-column walk.
@@ -25,7 +25,7 @@ pub enum PkRule {
     Nullable { col: u32 },
 }
 
-/// Which list a [`PkRule`] is about: the four structural rules of a primary key
+/// Which list a [`KeyListRefusal`] is about: the four structural rules of a primary key
 /// are equally a secondary index's column-list rules, so only the noun differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkListRole {
@@ -33,7 +33,7 @@ pub enum PkListRole {
     ColumnList,
 }
 
-impl PkRule {
+impl KeyListRefusal {
     /// This rule's message, worded for the list it is about, with every column
     /// rendered positionally.
     pub fn for_role(&self, role: PkListRole) -> String {
@@ -52,20 +52,19 @@ impl PkRule {
             None => c.to_string(),
         };
         match *self {
-            PkRule::NonCanonical => format!("{what} word carries bits outside its columns"),
-            PkRule::Empty => format!("{what} must name at least one column"),
-            PkRule::TooManyColumns { count, max } => {
+            KeyListRefusal::NonCanonical => format!("{what} word carries bits outside its columns"),
+            KeyListRefusal::Empty => format!("{what} must name at least one column"),
+            KeyListRefusal::TooManyColumns { count, max } => {
                 format!("{what} column count {count} out of range 1..={max}")
             }
-            PkRule::IndexOutOfRange { col } => format!("{what} index {col} out of bounds"),
-            PkRule::Duplicate { col: c } => format!("{what} names column {} twice", col(c)),
-            PkRule::NotEligible { col: c, type_code } => format!(
-                "{what} column {} has type_code {type_code}; only fixed-width integer, \
-                 U128, UUID, and I128 columns can be key columns \
-                 (String, Blob, and float columns cannot)",
+            KeyListRefusal::IndexOutOfRange { col } => format!("{what} index {col} out of bounds"),
+            KeyListRefusal::Duplicate { col: c } => format!("{what} names column {} twice", col(c)),
+            KeyListRefusal::NotEligible { col: c, type_code } => format!(
+                "{what} column {} has type {type_code}; only a type stored as an integer \
+                 can be a key column",
                 col(c)
             ),
-            PkRule::Nullable { col: c } => format!("{what} column {} must not be nullable", col(c)),
+            KeyListRefusal::Nullable { col: c } => format!("{what} column {} must not be nullable", col(c)),
         }
     }
 }
@@ -79,21 +78,21 @@ impl PkRule {
 /// `max_pk` is the caller's own arity cap: [`PK_LIST_MAX_COLS`] for a
 /// user-declared key, which must round-trip through the persisted PK-list word,
 /// and [`MAX_PK_COLUMNS`] for an engine schema derived from one.
-fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), PkRule> {
+fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), KeyListRefusal> {
     // Also bounds the duplicate scan below, which then unrolls.
     assert!(max_pk <= MAX_PK_COLUMNS, "a PK arity cap past MAX_PK_COLUMNS");
     if pk_cols.is_empty() {
-        return Err(PkRule::Empty);
+        return Err(KeyListRefusal::Empty);
     }
     if pk_cols.len() > max_pk {
-        return Err(PkRule::TooManyColumns { count: pk_cols.len(), max: max_pk });
+        return Err(KeyListRefusal::TooManyColumns { count: pk_cols.len(), max: max_pk });
     }
     for (j, &c) in pk_cols.iter().enumerate() {
         if c as usize >= ncols {
-            return Err(PkRule::IndexOutOfRange { col: c });
+            return Err(KeyListRefusal::IndexOutOfRange { col: c });
         }
         if pk_cols[..j].contains(&c) {
-            return Err(PkRule::Duplicate { col: c });
+            return Err(KeyListRefusal::Duplicate { col: c });
         }
     }
     Ok(())
@@ -107,15 +106,15 @@ pub fn validate_pk_tuple(
     ncols: usize,
     max_pk: usize,
     col: impl Fn(u32) -> (TypeCode, bool),
-) -> Result<(), PkRule> {
+) -> Result<(), KeyListRefusal> {
     validate_pk_indices(pk_cols, ncols, max_pk)?;
     for &c in pk_cols {
         let (type_code, nullable) = col(c);
         if !type_code.is_pk_eligible() {
-            return Err(PkRule::NotEligible { col: c, type_code });
+            return Err(KeyListRefusal::NotEligible { col: c, type_code });
         }
         if nullable {
-            return Err(PkRule::Nullable { col: c });
+            return Err(KeyListRefusal::Nullable { col: c });
         }
     }
     Ok(())
@@ -131,7 +130,7 @@ pub fn validate_index_key(
     ncols: usize,
     src_pk_len: usize,
     type_code: impl Fn(u32) -> TypeCode,
-) -> Result<PkColList, PkRule> {
+) -> Result<PkColList, KeyListRefusal> {
     validate_pk_tuple(key, ncols, MAX_PK_COLUMNS - src_pk_len, |c| (type_code(c), false))?;
     PkColList::checked(key, ncols)
 }
@@ -198,7 +197,7 @@ impl PkColList {
     /// is empty, longer than `PK_LIST_MAX_COLS`, names a column twice, or names
     /// one at or past `ncols`. A caller holding no column count passes
     /// `MAX_COLUMNS`.
-    pub fn checked(cols: &[u32], ncols: usize) -> Result<Self, PkRule> {
+    pub fn checked(cols: &[u32], ncols: usize) -> Result<Self, KeyListRefusal> {
         validate_pk_indices(cols, ncols.min(MAX_COLUMNS), PK_LIST_MAX_COLS)?;
         let mut arr = [0u32; PK_LIST_MAX_COLS];
         arr[..cols.len()].copy_from_slice(cols);
@@ -232,10 +231,10 @@ impl PkColList {
 
     /// Decode the persisted `u64` form: the one word [`Self::pack`] writes for
     /// the list it names.
-    fn unpack(word: u64) -> Result<Self, PkRule> {
+    fn unpack(word: u64) -> Result<Self, KeyListRefusal> {
         let n = (word & ((1 << PK_LIST_COUNT_BITS) - 1)) as usize;
         if n > PK_LIST_MAX_COLS {
-            return Err(PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS });
+            return Err(KeyListRefusal::TooManyColumns { count: n, max: PK_LIST_MAX_COLS });
         }
         let mut cols = [0u32; PK_LIST_MAX_COLS];
         for (i, slot) in cols[..n].iter_mut().enumerate() {
@@ -243,7 +242,7 @@ impl PkColList {
         }
         let list = Self::checked(&cols[..n], MAX_COLUMNS)?;
         if list.pack() != word {
-            return Err(PkRule::NonCanonical);
+            return Err(KeyListRefusal::NonCanonical);
         }
         Ok(list)
     }

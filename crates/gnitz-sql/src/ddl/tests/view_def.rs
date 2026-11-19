@@ -35,14 +35,6 @@ fn a_definition_reads_back_as_it_was_written() {
 }
 
 #[test]
-fn another_encoding_version_is_refused() {
-    let mut bytes = sample().encode();
-    bytes[0] = ENCODING_VERSION + 1;
-    let err = ViewDefinition::decode(&bytes).unwrap_err();
-    assert!(err.contains("encoding version"), "{err}");
-}
-
-#[test]
 fn trailing_bytes_are_refused() {
     let mut bytes = sample().encode();
     bytes.push(0);
@@ -73,12 +65,12 @@ fn a_reference_past_the_query_is_refused() {
     assert!(ViewDefinition::decode(&def.encode()).is_err());
 }
 
-/// The bytes version 1 writes. A change to them is a new layout, and moves
-/// `ENCODING_VERSION` with them.
+/// The bytes version 1 writes. A change to them is a new layout, and bumps
+/// `gnitz_wire::VIEW_DEF_VERSION` with them.
 #[test]
 fn version_1_encodes_these_bytes() {
     let query = b"SELECT x.a, b FROM s.t AS x JOIN \"\xc3\xbc\" ON x.a = \"\xc3\xbc\".a";
-    let mut golden: Vec<u8> = vec![1];
+    let mut golden = Vec::new();
     golden.extend_from_slice(&(query.len() as u32).to_le_bytes());
     golden.extend_from_slice(query);
     golden.extend_from_slice(&[
@@ -95,6 +87,9 @@ fn version_1_encodes_these_bytes() {
         2, 0, 0, 0, 0xc3, 0xbc, // alias
         0,    // columns
     ]);
-    assert_eq!(ENCODING_VERSION, 1);
-    assert_eq!(sample().encode(), golden);
+    assert_eq!(
+        (sample().encode(), gnitz_wire::VIEW_DEF_VERSION),
+        (golden, 1),
+        "the view-definition layout changed: bump VIEW_DEF_VERSION, then re-pin"
+    );
 }

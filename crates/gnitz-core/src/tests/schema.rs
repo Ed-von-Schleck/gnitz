@@ -21,10 +21,7 @@ fn from_parts_enforces_full_rule_set() {
     for (pk, want) in [
         (&[0, 1, 0, 1, 0][..], "out of range 1..=4"),
         (&[3][..], "primary key column 'n' must not be nullable"),
-        (
-            &[2][..],
-            "primary key column 's' has type_code STRING; only fixed-width integer",
-        ),
+        (&[2][..], "primary key column 's' has type TEXT; only a type stored"),
     ] {
         let got = schema(pk, &cols).unwrap_err();
         assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");
@@ -55,25 +52,31 @@ fn schema_survives_the_block_roundtrip() {
         &[4, 0],
     )
     .unwrap();
-    assert_eq!(Schema::from_record(original.to_record()).unwrap(), original);
+    let record = crate::test_support::named_record(&original);
+    assert_eq!(Schema::from_record(&record).unwrap(), original);
 }
 
-/// Whether a schema's record is cached does not enter its equality, and the
-/// cached record round-trips to the schema.
+/// Whether a schema's shape record is cached does not enter its equality, and
+/// the shape record carries the schema's layout, types and nullability, with no
+/// name and no hidden flag.
 #[test]
-fn a_cached_record_does_not_enter_equality() {
+fn a_cached_shape_record_does_not_enter_equality() {
     let schema = Schema::from_parts(
         vec![
-            ColumnDef::new("id", TypeCode::U64, false),
-            ColumnDef::new("v", TypeCode::I64, true),
+            ColumnDef::new("id", TypeCode::U64, false).hidden(),
+            ColumnDef::new("v", gnitz_wire::ColType::decimal(3), true),
         ],
         &[0],
     )
     .unwrap();
     let fresh = schema.clone();
-    let record = schema.to_record();
+    let shape = Schema::from_record(schema.shape_record()).unwrap();
     assert_eq!(schema, fresh);
-    assert_eq!(Schema::from_record(record).unwrap(), schema);
+    assert_eq!(shape.layout(), schema.layout());
+    for (got, want) in shape.columns().iter().zip(schema.columns()) {
+        assert_eq!((got.ty, got.is_nullable), (want.ty, want.is_nullable));
+        assert!(got.name.is_empty() && !got.is_hidden, "{got:?}");
+    }
 }
 
 /// The client's PK arity cap is `gnitz_wire::PK_LIST_MAX_COLS` — a key it accepts must

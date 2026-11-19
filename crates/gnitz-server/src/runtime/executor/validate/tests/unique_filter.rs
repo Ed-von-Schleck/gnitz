@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_zset::schema::pk_keys;
 
 /// A filter proves absence until it caps: a repeat span costs no capacity, and
 /// the first distinct span past the cap drops the whole set.
@@ -32,7 +33,7 @@ fn a_seed_drops_absent_spans_under_its_own_index() {
     // Of spans 1 and 5, the ones the filter keeps.
     let kept = |tid, cols| {
         let spans = [1u64.to_be_bytes(), 5u64.to_be_bytes()];
-        let mut keys = PkKeys::from_keys(8, spans.iter().map(|s| &s[..]));
+        let mut keys = pk_keys(8, spans.iter().map(|s| &s[..]));
         checks.unique_filter_retain_possible(tid, cols, &mut keys);
         keys.iter()
             .map(|k| u64::from_be_bytes(k.try_into().unwrap()))
@@ -67,7 +68,7 @@ fn a_claim_is_taken_where_a_span_is_absent_and_enters_its_filter() {
     assert!(!capped.insert(&9u64.to_be_bytes(), 0));
     checks.unique_filter_seed(8, a, capped);
     let keys_of = |vals: &[u64]| {
-        PkKeys::from_keys(
+        pk_keys(
             8,
             vals.iter()
                 .map(|v| v.to_be_bytes())

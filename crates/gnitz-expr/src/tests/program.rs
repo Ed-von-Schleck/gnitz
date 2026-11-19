@@ -224,7 +224,7 @@ fn a_validate_error_names_its_operands() {
     for want in [ColKind::ScalarCol, ColKind::StringCol] {
         let msg = ExprValidateErr::ColKindMismatch { col: 2, type_code: TypeCode::U128, want }.to_string();
         assert!(
-            msg.contains("column 2") && msg.contains("U128") && msg.contains(&want.to_string()),
+            msg.contains("column 2") && msg.contains("UHUGEINT") && msg.contains(&want.to_string()),
             "{msg}"
         );
     }

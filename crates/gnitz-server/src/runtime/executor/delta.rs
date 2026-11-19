@@ -22,7 +22,7 @@ use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Peer, PeerGone, SendBody, Train, TrainLease};
 use crate::runtime::sal::Read;
 use crate::runtime::sync::{ReadGuard, chan, oneshot, select2};
-use gnitz_wire::multi_frame::{DeltaPollItem, SubId, decode_delta_items, delta_poll_kept};
+use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId, decode_delta_poll};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
 /// Delta reads at one SAL cut: the ceiling on the trains a DELTA_POLL or a
@@ -153,9 +153,10 @@ pub(super) async fn handle_delta_poll(
     prologue: &ControlHeader,
     body: &[u8],
 ) -> Result<(), WireFault> {
-    let views = decode_delta_items(body).map_err(decode_fault)?;
+    let poll = decode_delta_poll(body, prologue).map_err(decode_fault)?;
+    let views = &poll.items;
     let disp = &shared.dispatcher;
-    let mut kept = delta_poll_kept(prologue, views.len()).map_err(decode_fault)?;
+    let mut kept = poll.kept();
     // The poll drained once, for this lock; a later slice takes the lock alone.
     let mut first_lock = Some(
         fresh_read_lock(
@@ -230,10 +231,9 @@ pub(super) async fn handle_delta_poll(
 
 /// The frame that ends a delta train: the cursor to read `view` from next.
 fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
+    let at = DeltaCursor::from_pair(tag, round).expect("round 0 is the boot round, never emitted");
     let msg = WireMsg {
-        target_id: view,
-        arg0: tag,
-        arg1: round,
+        hdr: ControlHeader::delta_terminal(view, at),
         ..Default::default()
     };
     debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + msg.size(), HEAD_FRAME_BYTES);
@@ -524,13 +524,10 @@ impl Subscriptions {
                 self.out.synced();
                 WireMsg::default()
             }
-            Err(fault) => WireMsg::fault(fault),
+            Err(fault) => WireMsg::fault(0, fault),
         };
-        let flags = gnitz_wire::WireFlags {
-            lane: gnitz_wire::WireLane::SyncAnswer,
-            ..Default::default()
-        };
-        cork_msg(peer, WireMsg { flags, ..end });
+        let hdr = ControlHeader::sync_answer(end.hdr.status);
+        cork_msg(peer, WireMsg { hdr, ..end });
     }
 
     /// Ship every queued train behind what is corked.
@@ -554,12 +551,7 @@ impl Subscriptions {
 /// The frame that opens a pushed train of subscription `id`.
 fn pushed_marker(view: u64, id: SubId) -> WireMsg<'static> {
     let marker = WireMsg {
-        target_id: view,
-        arg0: id.get(),
-        flags: gnitz_wire::WireFlags {
-            lane: gnitz_wire::WireLane::PushedTrain,
-            ..Default::default()
-        },
+        hdr: ControlHeader::pushed_train(view, id),
         ..Default::default()
     };
     debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + marker.size(), HEAD_FRAME_BYTES);
@@ -576,7 +568,7 @@ fn framed(msg: WireMsg<'_>) -> Vec<u8> {
 /// End `members`' subscriptions with `fault`. A fault frame is queued whatever
 /// the queue holds: it is what tells the subscriber to stop waiting.
 fn fail_subscribers<'a>(view: u64, members: impl IntoIterator<Item = &'a Rc<Subscriber>>, fault: &WireFault) {
-    let frame = Rc::new(framed(WireMsg { target_id: view, ..WireMsg::fault(fault) }));
+    let frame = Rc::new(framed(WireMsg::fault(view, fault)));
     for m in members {
         m.after_tick.set(None);
         m.out.send(view, m.id, Rc::clone(&frame));

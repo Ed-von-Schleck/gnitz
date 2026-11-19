@@ -6,7 +6,7 @@ fn col(tc: TypeCode, name: &str, nullable: bool) -> RecordCol<'_> {
         ty: ColType::of(tc),
         nullable,
         hidden: false,
-        name: name.as_bytes(),
+        name,
     }
 }
 
@@ -50,7 +50,7 @@ fn column_meta_and_the_widest_pk_survive_the_record() {
                     ty: ColType::decimal(scale),
                     nullable,
                     hidden,
-                    name: b"c",
+                    name: "c",
                 });
             }
         }
@@ -106,6 +106,8 @@ fn each_guard_rejects_its_own_forgery() {
             forge(&|r| crate::write_u32_le(r, COL0 + 3, u32::MAX)),
             "truncated".into(),
         ),
+        // The first byte of the first column's name, "id".
+        (forge(&|r| r[COL0 + 7] = 0xFF), "text is not UTF-8".into()),
     ];
     for (record, want) in cases {
         let err = decode_cols(&record).expect_err("expected a rejection");
@@ -133,7 +135,7 @@ fn the_record_layout_is_fixed() {
             ty: ColType::decimal(9),
             nullable: true,
             hidden: true,
-            name: long.as_bytes(),
+            name: long,
         },
     ];
     #[rustfmt::skip]
@@ -152,26 +154,21 @@ fn the_record_layout_is_fixed() {
     assert_eq!((got, pk.as_slice()), (cols.to_vec(), &[1u32, 0][..]));
 }
 
-/// Each difference `check_same_types` compares is refused as a mismatch, and
-/// each names itself distinctly — pairwise distinctness tests the message
-/// without pinning prose. What it does not compare (names, the hidden flag) is
-/// admitted, and a `got` that is not byte-equal to `want` is validated: a
-/// truncated one is a decode error, not a match.
+/// Each difference from `want` is refused as a mismatch, and each names itself
+/// distinctly — pairwise distinctness tests the message without pinning prose.
+/// A `got` that is not byte-equal to `want` is validated: a truncated one is a
+/// decode error.
 #[test]
-fn check_same_types_names_each_mismatch_distinctly() {
+fn check_shape_names_each_mismatch_distinctly() {
     let two_cols = |second: RecordCol<'static>| encode([col(TypeCode::U64, "id", false), second].into_iter(), &[0]);
     let want = two_cols(col(TypeCode::I64, "v", false));
-    assert_eq!(check_same_types(&want, &want), Ok(()), "a record matches itself");
+    assert_eq!(check_shape(&want, &want), Ok(()), "a record matches itself");
 
     let renamed_and_hidden = two_cols(RecordCol {
         hidden: true,
         ..col(TypeCode::I64, "renamed", false)
     });
-    assert_eq!(
-        check_same_types(&renamed_and_hidden, &want),
-        Ok(()),
-        "names and the hidden flag are not compared"
-    );
+    let named = check_shape(&renamed_and_hidden, &want).expect_err("a name or hidden flag");
 
     let cases = [
         ("count", encode([col(TypeCode::U64, "id", false)].into_iter(), &[0])),
@@ -187,8 +184,9 @@ fn check_same_types_names_each_mismatch_distinctly() {
     ];
     let mut msgs: Vec<String> = cases
         .iter()
-        .map(|(what, got)| check_same_types(got, &want).expect_err(what))
+        .map(|(what, got)| check_shape(got, &want).expect_err(what))
         .collect();
+    msgs.push(named);
 
     // Scale alone: the one difference a decoded descriptor cannot see.
     let decimal = |scale| {
@@ -204,7 +202,7 @@ fn check_same_types_names_each_mismatch_distinctly() {
             &[0],
         )
     };
-    msgs.push(check_same_types(&decimal(2), &decimal(4)).expect_err("scale"));
+    msgs.push(check_shape(&decimal(2), &decimal(4)).expect_err("scale"));
 
     for i in 0..msgs.len() {
         assert!(msgs[i].starts_with("Schema mismatch: "), "case {i}: {}", msgs[i]);
@@ -213,6 +211,30 @@ fn check_same_types_names_each_mismatch_distinctly() {
         }
     }
 
-    let err = check_same_types(&want[..want.len() - 1], &want).expect_err("a truncated record");
+    let err = check_shape(&want[..want.len() - 1], &want).expect_err("a truncated record");
     assert!(err.starts_with("schema record: "), "{err}");
+}
+
+/// Two clients' columns that differ only in their names and hidden flags encode
+/// one shape record, so a push from either matches the engine's byte for byte.
+#[test]
+fn differently_named_columns_encode_one_shape_record() {
+    let shape = |cols: &[crate::ColumnDef]| encode(cols.iter().map(crate::ColumnDef::shape_col), &[0]);
+    let engine = shape(&[
+        crate::ColumnDef::new("id", TypeCode::U64, false).hidden(),
+        crate::ColumnDef::new("price", ColType::decimal(4), true),
+    ]);
+    let client = shape(&[
+        crate::ColumnDef::new("key", TypeCode::U64, false),
+        crate::ColumnDef::new("p", ColType::decimal(4), true),
+    ]);
+    assert_eq!(client, engine);
+    assert_eq!(check_shape(&client, &engine), Ok(()));
+    let (cols, _) = decode_cols(&engine).unwrap();
+    assert!(cols.iter().all(|c| c.name.is_empty() && !c.hidden), "{cols:?}");
+    assert_eq!(
+        cols[1].ty,
+        ColType::decimal(4),
+        "the shape record keeps a DECIMAL's scale"
+    );
 }

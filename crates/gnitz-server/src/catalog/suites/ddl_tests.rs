@@ -429,9 +429,9 @@ fn test_hook_relation_register_rejects_malformed_pk() {
     let packed = 2 | (0u64 << 4) | (0u64 << 11);
     assert_rejects(packed, "names column 0 twice");
     // Non-integer PK column (c1 is STRING).
-    assert_rejects(1 | (1 << 4), "only fixed-width integer");
+    assert_rejects(1 | (1 << 4), "only a type stored");
     // Float PK column (c3 is F32) — floats break the byte-equal PK contract.
-    assert_rejects(1 | (3 << 4), "only fixed-width integer");
+    assert_rejects(1 | (3 << 4), "only a type stored");
     // Nullable PK column (c2 is nullable).
     assert_rejects(1 | (2 << 4), "must not be nullable");
 

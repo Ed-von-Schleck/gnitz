@@ -1,11 +1,11 @@
 //! Order-image tests: the byte string whose plain lexicographic order is the
 //! column's typed order, and its inverse.
 
-use super::{ImageCol, ImageKind, scalar_native_of_image, wide_native, wide_native_of_image};
+use super::{ImageCol, scalar_native_of_image, wide_native, wide_native_of_image};
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{STRS, le_cell};
-use gnitz_wire::TypeCode;
+use gnitz_wire::{TypeCode, ValueForm};
 
 /// Over a PK and a payload column of every image kind: a row's image decodes
 /// back to its value, a wide one orders as the value does, and `invert`
@@ -63,12 +63,12 @@ fn an_image_orders_round_trips_and_slots_as_its_value() {
             let mut scratch = [[0u8; 16]; 2];
             for (r, image) in images.iter().enumerate() {
                 match col.kind {
-                    ImageKind::Scalar(kind) => {
+                    ValueForm::Scalar(kind) => {
                         let native = le_cell(loc.native_le_bytes(&mb, r, &mut scratch[0])) as u64;
                         let bits = u64::from_be_bytes(image[..].try_into().unwrap());
                         assert_eq!(scalar_native_of_image(kind, invert, bits), native, "{what} row {r}");
                     }
-                    ImageKind::Wide(kind) => {
+                    ValueForm::Wide(kind) => {
                         let [sa, sb] = &mut scratch;
                         let native = wide_native(&loc, kind, &mb, r, sa);
                         let mut v = image.clone();

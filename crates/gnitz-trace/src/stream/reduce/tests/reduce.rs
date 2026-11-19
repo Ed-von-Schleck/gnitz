@@ -504,12 +504,11 @@ fn the_adhoc_fold_refuses_a_group_past_its_cap() {
 
 /// A circuit node and a read spec are trust boundaries: neither builds over a
 /// column that is not there, a float group column, a sum with no register
-/// image, or more columns than a schema holds — and a circuit reduce needs the
-/// COUNT(*) that tells an emptied group from a live one.
+/// image, or more columns than a schema holds.
 #[test]
 fn a_shape_the_reduce_cannot_run_is_refused() {
     let count = AggDescriptor::COUNT_STAR;
-    let refused: [(&[u32], Vec<AggDescriptor>, &str); 7] = [
+    let refused: [(&[u32], Vec<AggDescriptor>, &str); 6] = [
         (&[9], vec![count], "group key: column 9 out of range"),
         (&[4], vec![count], "is a float"),
         (
@@ -520,16 +519,12 @@ fn a_shape_the_reduce_cannot_run_is_refused() {
         (&[], vec![count, agg(AggFunc::Sum, 2)], "Sum is not defined over"),
         (&[], vec![count, agg(AggFunc::Sum, 6)], "Sum is not defined over"),
         (&[], vec![count; 65], "MAX_COLUMNS"),
-        (&[], vec![agg(AggFunc::Min, 0)], "needs a COUNT(*)"),
     ];
     for (group_cols, aggs, why) in refused {
         let err = ReducePlan::from_wire(&schema(), group_cols, &aggs, false)
             .err()
             .expect("refused");
         assert!(err.contains(why), "{err}");
-        if why == "needs a COUNT(*)" {
-            continue;
-        }
         let err = fold_sink(group_cols, aggs, usize::MAX).err().expect("refused");
         assert!(err.starts_with("fold: ") && err.contains(why), "{err}");
     }

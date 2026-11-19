@@ -46,7 +46,7 @@ pub use names::{
 };
 pub use source::Offsets;
 pub use sqlparser;
-pub use types::{sql_type_name, type_names};
+pub use types::type_names;
 
 use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subscription};
 use sqlparser::ast::Statement;

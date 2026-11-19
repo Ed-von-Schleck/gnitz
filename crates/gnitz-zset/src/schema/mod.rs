@@ -1,6 +1,6 @@
 //! The key and payload-order kernels over a schema, the shaping of a derived
-//! schema (an operator's output or an index's layout), and the nameless
-//! schema-record codec a descriptor is stored and shipped as. The descriptor
+//! schema (an operator's output or an index's layout), and a descriptor read
+//! from and written as a meta-schema record. The descriptor
 //! itself is `gnitz-expr`'s.
 
 use gnitz_expr::{SchemaRefusal, leading_pk};
@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 
 mod key;
 mod payload_order;
+mod sort_key;
 
 /// The schema descriptor, homed in `gnitz-expr` because its evaluator reads
 /// through it. Re-exported so a crate linking `gnitz-zset` alone can name it.
@@ -18,9 +19,11 @@ pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range
 
 pub use key::{band, compare_pk_ordering, group_floor};
 pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
+pub(crate) use sort_key::{PkSortKey, RadixKey, pack_pk_be, pk_width_dispatch, radix_sort_by_key};
+pub use sort_key::{pk_keys, pk_keys_of_images};
 
-/// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
-/// carried on the wire but nothing engine-side reads one.
+/// Rebuild a [`SchemaDescriptor`] from a meta-schema record, named or shape:
+/// nothing engine-side reads a name, a hidden flag or a scale.
 pub fn decode_schema_record(data: &[u8]) -> Result<SchemaDescriptor, String> {
     let mut cols: SmallVec<[SchemaColumn; MAX_COLUMNS]> = SmallVec::new();
     let pk = gnitz_wire::schema_record::decode(data, |c| {
@@ -30,14 +33,16 @@ pub fn decode_schema_record(data: &[u8]) -> Result<SchemaDescriptor, String> {
     Ok(SchemaDescriptor::try_new(&cols, pk.as_slice())?)
 }
 
-/// Encode `schema`'s physical column shape — the inverse of
-/// [`decode_schema_record`]: no names, no hidden flag, every scale zero.
+/// `schema` as a shape record. A descriptor holds no DECIMAL scale, so every
+/// scale is zero: this is a relation's own shape record only where none of its
+/// columns is a DECIMAL. A relation's is built from its column definitions
+/// (`ColumnDef::shape_col`).
 pub fn encode_schema_record(schema: &SchemaDescriptor) -> Vec<u8> {
     let cols = schema.columns().iter().map(|c| RecordCol {
         ty: ColType::of(c.type_code),
         nullable: c.nullable,
         hidden: false,
-        name: b"",
+        name: "",
     });
     gnitz_wire::schema_record::encode(cols, schema.pk_cols())
 }

@@ -222,7 +222,7 @@ pub(super) fn pk_set(stride: usize, keys: &[u64]) -> ReadBound {
 
 fn pk_keys(stride: usize, keys: &[u64]) -> PkKeys {
     let keys: Vec<Vec<u8>> = keys.iter().map(|k| k.to_be_bytes()[8 - stride..].to_vec()).collect();
-    PkKeys::from_keys(stride, keys.iter().map(Vec::as_slice))
+    gnitz_zset::schema::pk_keys(stride, keys.iter().map(Vec::as_slice))
 }
 
 /// A read reaches exactly the workers its bound names: a replicated relation's

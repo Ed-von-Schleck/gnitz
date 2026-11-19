@@ -41,7 +41,7 @@ fn agg_ops_picks_the_value_op_and_the_count_its_nullness_needs() {
     for (func, arg, want) in [
         (Sum, &blob, "SUM: not supported on BLOB column 'b'"),
         (Avg, &uuid, "AVG: not supported on UUID column 'u'"),
-        (Sum, &string, "SUM: not supported on STRING column 's'"),
+        (Sum, &string, "SUM: not supported on TEXT column 's'"),
     ] {
         assert_eq!(rejected(agg_ops(func, Some(arg), false)), want);
     }

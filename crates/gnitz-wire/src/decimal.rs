@@ -44,7 +44,7 @@ pub fn write_decimal(v: i64, scale: u8, buf: &mut [u8; VALUE_TEXT_MAX]) -> &str 
 /// The longest text [`scaled_bytes`] produces: a sign, 20 digits (all of a
 /// `u64`, or the `scale + 1` padded digits of a scale up to
 /// [`MAX_DECIMAL_SCALE`]) and a point.
-pub const SCALED_TEXT_MAX: usize = 22;
+pub(crate) const SCALED_TEXT_MAX: usize = 22;
 
 /// The ASCII text of `magnitude`, negated where `neg`, at scale `scale` — an
 /// integer's at scale 0 — written into the tail of `buf` and borrowed from it:

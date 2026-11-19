@@ -14,9 +14,9 @@
 use super::key_pack::{FOLD_CHUNK_MIN_ROWS, KeyPacker, locate_key_col, pk_run};
 use super::zeroed;
 use crate::repr::{Batch, MemBatch, vec_bytes};
-use crate::schema::{DerivedSchema, SchemaDescriptor};
+use crate::schema::{DerivedSchema, PkSortKey, SchemaDescriptor, pk_width_dispatch};
 use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
-use gnitz_wire::{NARROW_PK_MAX_BYTES, PkSortKey, TypeCode, pk_width_dispatch};
+use gnitz_wire::{NARROW_PK_MAX_BYTES, TypeCode};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;

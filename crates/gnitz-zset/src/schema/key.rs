@@ -2,13 +2,13 @@
 //!
 //! These pure layout/key operations compare two OPK regions in byte order,
 //! fingerprint an OPK span, and derive the half-open key band a `KeyRange`
-//! walks over a store's PK. The per-column codec and the fixed-width sort keys
-//! are `gnitz_wire::pk`'s, shared with the client.
+//! walks over a store's PK. The per-column codec is `gnitz_wire::pk`'s, shared
+//! with the client; the fixed-width sort keys are `sort_key`'s.
 use std::cmp::Ordering;
 
-use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES, PkBuf, pack_pk_be};
+use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES, PkBuf};
 
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, pack_pk_be};
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
 /// comparator of seeks, group walks and probes. Slice order

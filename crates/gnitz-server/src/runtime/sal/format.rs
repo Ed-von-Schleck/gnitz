@@ -43,7 +43,7 @@ pub(super) const fn anchor_word(epoch: u32) -> u64 {
 const SAL_LAYOUT: u32 = 2;
 
 /// The format word beside the anchor: the log's layout, and the
-/// [`WIRE_VERSION`] of the schema records and data blocks its payloads hold.
+/// [`WIRE_VERSION`] of the shape records and data blocks its payloads hold.
 /// Never 0, which is a fresh file's.
 pub(super) const SAL_FORMAT: u64 = (SAL_LAYOUT as u64) << 32 | WIRE_VERSION as u64;
 
@@ -364,7 +364,7 @@ impl Header {
 // A payload is `[blob_len u64][blob][data block?]`: the blob of the group's
 // request, or the worker's own in its place, then the rows the worker is sent
 // as a WAL block. A payload carries rows iff bytes follow its blob, and its
-// blob is then the schema record that lays those rows out.
+// blob is then the shape record that lays those rows out.
 
 /// The blob length in front of every payload; a `u64`, so a blob starts and
 /// ends 8-aligned within its payload.
@@ -381,7 +381,7 @@ pub(super) fn payload_size(blob: &[u8], rows: PayloadRows<'_>) -> usize {
 
 /// Write the payload of `blob` and `rows` into `out`, which is exactly
 /// [`payload_size`] bytes, every one of which is written. A payload with rows
-/// has their schema record as its blob.
+/// has their shape record as its blob.
 ///
 /// Always inlined: the writer encodes through it once per payload, and left to
 /// the inliner's judgement it becomes a call there as its other callers grow.
@@ -389,7 +389,7 @@ pub(super) fn payload_size(blob: &[u8], rows: PayloadRows<'_>) -> usize {
 pub(super) fn payload_encode(out: &mut [u8], blob: &[u8], rows: PayloadRows<'_>) {
     debug_assert!(
         rows.is_none() || !blob.is_empty(),
-        "rows need their schema record as the blob"
+        "rows need their shape record as the blob"
     );
     write_u64_le(out, 0, blob.len() as u64);
     let mut pos = PAYLOAD_HEAD;
@@ -422,7 +422,7 @@ fn payload_parse(bytes: &[u8]) -> Result<ParsedPayload<'_>, String> {
     Ok((blob, (!rest.is_empty()).then_some(rest)))
 }
 
-/// A payload's blob, and the rows of its data block under the schema record
+/// A payload's blob, and the rows of its data block under the shape record
 /// that is the blob; `known` answers what that record decodes to when the
 /// caller already knows.
 ///

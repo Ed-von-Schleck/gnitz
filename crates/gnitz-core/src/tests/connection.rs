@@ -635,16 +635,19 @@ fn a_train_pushed_after_a_kept_terminal_stays_parked() {
 #[test]
 fn a_resolve_reply_that_does_not_decode_ends_the_session() {
     let schema = schema_a();
-    let record = schema.to_record();
+    let record = crate::test_support::named_record(&schema);
     let desc = |schema: &[u8]| {
         RelDescriptorBlob {
-            schema: schema.into(),
-            ..Default::default()
+            class: RelClass::Table,
+            pk_repeats: false,
+            serial: false,
+            indexes: vec![],
+            schema,
         }
         .encode()
     };
-    let whole = desc(record);
-    let named = ControlHeader { target_id: 7, ..Default::default() };
+    let whole = desc(&record);
+    let named = ControlHeader::ack(7, 0);
     for (what, frame) in [
         ("no descriptor", encode_frame(named, &[], None)),
         (
@@ -1068,54 +1071,24 @@ fn a_pushed_train_naming_another_view_ends_the_session() {
     assert!(s.is_closed());
 }
 
-/// A pushed train opens with a bare head naming its subscription: an opener
-/// carrying anything else, or naming none, ends the session.
+/// A server frame whose lane it does not fit — here a pushed-train opener
+/// carrying a blob — ends the session. Each lane rule is `server_lane`'s, tested
+/// where it is defined.
 #[test]
-fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
-    let marker = |flags: gnitz_wire::WireFlags, status| ControlHeader {
-        target_id: 40,
-        arg0: 5,
-        status,
-        flags: gnitz_wire::WireFlags { lane: WireLane::PushedTrain, ..flags },
-        ..Default::default()
-    };
-    let bare = gnitz_wire::WireFlags::default();
-    let continued = gnitz_wire::WireFlags { continuation: true, ..bare };
-    let ok = WireStatus::Ok;
-    for (what, frame) in [
-        (
-            "a data block",
-            encode_frame(marker(bare, ok), &[], Some(&batch_a(&[1]))),
-        ),
-        ("a blob", encode_frame(marker(bare, ok), b"why", None)),
-        ("a continuation", encode_frame(marker(continued, ok), &[], None)),
-        (
-            "a fault",
-            encode_frame(marker(bare, WireStatus::Error), b"lagged", None),
-        ),
-        (
-            "no subscription",
-            encode_frame(ControlHeader { arg0: 0, ..marker(bare, ok) }, &[], None),
-        ),
-    ] {
-        let (mut s, peer) = pair();
-        let sent = s.submit(COMMIT);
-        peer.send(&frame);
-        let e = await_reply(&mut s, sent).expect_err(what);
-        assert!(
-            matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
-            "{what}: {e:?}"
-        );
-        assert!(s.is_closed(), "{what}");
-    }
+fn a_frame_that_misfits_its_lane_ends_the_session() {
+    let (mut s, peer) = pair();
+    let sent = s.submit(COMMIT);
+    let opener = ControlHeader::pushed_train(40, gnitz_wire::multi_frame::SubId::new(5).unwrap());
+    peer.send(&encode_frame(opener, b"why", None));
+    let e = await_reply(&mut s, sent).expect_err("a misfit frame");
+    assert!(
+        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
+        "{e:?}"
+    );
+    assert!(s.is_closed());
 }
 
 // ── Request frames ───────────────────────────────────────────────────────────
-
-/// A frame's blob, decoded as a schema record.
-fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Schema {
-    Schema::from_record(&buf[ctrl.blob.clone()]).expect("a schema record decodes")
-}
 
 /// A frame's data block, decoded under `schema`.
 fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Arc<Schema>) -> Option<ZSetBatch> {
@@ -1156,26 +1129,25 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     for (fam, want) in decoded.iter().zip(&families) {
         let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
         assert_eq!(got, (want.target.tid, want.mode, want.basis));
-        let block_schema = Arc::new(frame_schema(&payload, fam));
-        assert_eq!(*block_schema, *schema);
-        assert_eq!(frame_data(&payload, fam, &block_schema).as_ref(), Some(&*want.batch));
+        assert_eq!(&payload[fam.blob.clone()], schema.shape_record());
+        assert_eq!(frame_data(&payload, fam, &schema).as_ref(), Some(&*want.batch));
     }
 }
 
-/// A push frame carries its schema record as its blob, and its rows; an empty
-/// batch still ships the record, but no data block.
+/// A push frame carries its schema's shape record as its blob, and its rows; an
+/// empty batch still ships the record, but no data block.
 #[test]
 fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
     let schema = kv_schema(TypeCode::I64);
-    let hdr = ControlHeader { target_id: 42, ..Default::default() };
+    let hdr = ControlHeader::ack(42, 0);
     for batch in [
         kv_rows(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)]),
         ZSetBatch::new(&schema),
     ] {
-        let buf = encode_frame(hdr, schema.to_record(), Some(&batch));
+        let buf = encode_frame(hdr, schema.shape_record(), Some(&batch));
         let ctrl = peek_control_block(&buf).unwrap();
         assert_eq!(ctrl.hdr, hdr);
-        assert_eq!(frame_schema(&buf, &ctrl), *schema);
+        assert_eq!(&buf[ctrl.blob.clone()], schema.shape_record());
         let want = (!batch.is_empty()).then_some(&batch);
         assert_eq!(frame_data(&buf, &ctrl, &schema).as_ref(), want);
     }

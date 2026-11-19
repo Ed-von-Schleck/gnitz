@@ -248,7 +248,7 @@ fn create_index_naming_and_rejections() {
         ("CREATE INDEX ON t(s)", "'s'"),
         (
             "CREATE INDEX ON t(f)",
-            "CREATE INDEX: column list column 'f' has type_code F64",
+            "CREATE INDEX: column list column 'f' has type DOUBLE",
         ),
         ("CREATE UNIQUE INDEX ON t(s)", "'s'"),
         ("CREATE INDEX ON t(ghost)", "ghost"),

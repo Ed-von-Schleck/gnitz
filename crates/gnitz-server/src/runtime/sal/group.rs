@@ -37,9 +37,9 @@ impl Routed<'_> {
 #[derive(Clone, Copy)]
 pub(super) enum Payloads<'a> {
     /// One payload, which every addressed worker reads: the request's blob, and
-    /// any rows, whose schema record that blob then is.
+    /// any rows, whose shape record that blob then is.
     Shared(PayloadRows<'a>),
-    /// Worker `w` is sent the request's blob, which is the rows' schema record,
+    /// Worker `w` is sent the request's blob, which is the rows' shape record,
     /// and the rows `each[w]`; one entry per worker.
     EachRows(&'a [Option<WireRows<'a>>]),
     /// Worker `w` is sent no rows and `blobs[w]` in place of the request's blob;
@@ -87,7 +87,7 @@ impl<'a> Group<'a> {
         }
     }
 
-    /// A push of `rows` into `tid`, held to `rule`, whose schema record is
+    /// A push of `rows` into `tid`, held to `rule`, whose shape record is
     /// `record` and the group's blob: sent to the workers `rows` holds rows for,
     /// answered by none.
     pub(super) fn push(tid: u64, rule: PkRule, record: &'a [u8], rows: Routed<'a>) -> Self {
@@ -104,12 +104,12 @@ impl<'a> Group<'a> {
     }
 
     /// A catalog mutation of `family`: `batch`, sent whole to every worker under
-    /// the family's schema record as the blob. A family that reaches no worker is
+    /// the family's shape record as the blob. A family that reaches no worker is
     /// logged and addresses none.
     pub(super) fn ddl_sync(family: SysFamily, batch: &'a Batch) -> Self {
         Group {
             request: Ingest::DdlSync { family }.encode(),
-            blob: family.sal_record(),
+            blob: family.shape_record(),
             data: Payloads::Shared(batch.wire_whole()),
             to: if family.master_only() {
                 WorkerSet::EMPTY

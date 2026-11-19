@@ -6,7 +6,7 @@ use gnitz_expr::RowFilter;
 use gnitz_trace::runs::{PkSetGather, ReadCursor, StoredRow};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{SchemaDescriptor, pk_keys};
 
 use crate::storage::Table;
 
@@ -125,7 +125,7 @@ impl IndexWalk {
         if taken == 0 {
             return false;
         }
-        gather.reload(PkKeys::from_keys(stride, self.pks.chunks_exact(stride)));
+        gather.reload(pk_keys(stride, self.pks.chunks_exact(stride)));
         true
     }
 }

@@ -2,7 +2,7 @@
 //! its I/O without waiting; [`Session::turn`] waits on the client's [`Host`]
 //! only when the socket must report readiness first.
 //!
-//! A frame is of what its [`WireLane`] names. Replies arrive in request order,
+//! A frame is of the [`ServerLane`] its header names. Replies arrive in request order,
 //! each the head slot's until its last train terminates; a pushed train and
 //! the answer to a sync arrive whole between two replies.
 
@@ -23,7 +23,7 @@ use gnitz_wire::Target;
 use gnitz_wire::multi_frame::{self, DeltaCursor, FrameItem, SubId, encode_items, kept_as};
 use gnitz_wire::{
     CONNECT_TIMEOUT, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob, RelIndex,
-    SysFamily, WireConflictMode, WireLane, WireStatus, append_frame, peek_control_block,
+    ServerLane, SysFamily, WireConflictMode, append_frame, peek_control_block,
 };
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
@@ -154,7 +154,7 @@ impl Request<'_> {
             Request::Push { target, batch, mode } => {
                 let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
                 hdr.flags.conflict_mode = mode;
-                return append_payload(out, hdr, batch.schema().to_record(), Some(batch));
+                return append_payload(out, hdr, batch.schema().shape_record(), Some(batch));
             }
         };
         append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None)
@@ -190,7 +190,7 @@ pub(crate) struct PushFamily {
 
 /// Append an atomic user-table push transaction frame (`ClientVerb::PushTxn`) to
 /// `out` (without the 4-byte frame header). Every family carries its batch's
-/// schema record, which the master validates it against.
+/// shape record, which the master validates it against.
 pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
     let items: Vec<FrameItem> = families
         .iter()
@@ -198,7 +198,7 @@ pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
             target: f.target,
             conflict_mode: f.mode,
             basis: f.basis,
-            blob: f.batch.schema().to_record(),
+            blob: f.batch.schema().shape_record(),
             data: f.batch.wire_regions(),
         })
         .collect();
@@ -404,44 +404,19 @@ impl Inbox {
     fn feed(&mut self, buf: Cow<'_, [u8]>) -> Result<(), ProtocolError> {
         let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
         let in_train = self.pushed.is_some();
-        match ctrl.hdr.flags.lane {
-            WireLane::Reply => {}
+        match ctrl.server_lane() {
+            Ok(ServerLane::Reply) => {}
             _ if in_train => {
                 return Err(ProtocolError::DecodeError(
                     "a pushed train split by a frame that is not of it".into(),
                 ));
             }
-            WireLane::PushedTrain => {
-                let h = &ctrl.hdr;
-                if h.flags.continuation
-                    || h.status != WireStatus::Ok
-                    || ctrl.data.is_some()
-                    || !ctrl.blob.is_empty()
-                    || !ctrl.body.is_empty()
-                {
-                    return Err(ProtocolError::DecodeError(
-                        "a pushed train opens with a bare head".into(),
-                    ));
-                }
-                let Some(sub) = SubId::new(h.arg0) else {
-                    return Err(ProtocolError::DecodeError(
-                        "a pushed train names no subscription".into(),
-                    ));
-                };
-                self.pushed = Some(Slot::Pushed {
-                    tid: h.target_id,
-                    sub,
-                    blocks: Vec::new(),
-                });
+            Err(e) => return Err(ProtocolError::DecodeError(e.into())),
+            Ok(ServerLane::PushedTrain { view, sub }) => {
+                self.pushed = Some(Slot::Pushed { tid: view, sub, blocks: Vec::new() });
                 return Ok(());
             }
-            WireLane::SyncAnswer => {
-                let h = &ctrl.hdr;
-                if h.target_id != 0 || h.flags.continuation || ctrl.data.is_some() {
-                    return Err(ProtocolError::DecodeError(
-                        "a sync answer is one empty frame naming 0".into(),
-                    ));
-                }
+            Ok(ServerLane::SyncAnswer) => {
                 let Some(mut to) = self.syncing.pop_front() else {
                     return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
                 };
@@ -534,7 +509,7 @@ impl Session {
 
     /// Encode and queue `req`. A request this session refuses — at either cap,
     /// or past the frame ceiling — is answered with the refusal, as every
-    /// submit's is; the server certifies a pushed batch's schema record, and
+    /// submit's is; the server certifies a pushed batch's shape record, and
     /// every row's NULL bits and cells, against the relation's own schema.
     pub(crate) fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
         let tid = req.acked_tid();
@@ -989,7 +964,8 @@ impl Slot {
 
         // The train terminated; a train slot's last block is still in `buf`.
         let cursor = || {
-            DeltaCursor::from_pair(ctrl.hdr.arg0, ctrl.hdr.arg1)
+            ctrl.hdr
+                .delta_cursor()
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))
         };
         match self {
@@ -1083,7 +1059,7 @@ fn resolve_descriptor(ctrl: &DecodedControl, frame: &[u8]) -> Result<Option<Arc<
         return Ok(None);
     }
     let desc = RelDescriptorBlob::decode(&frame[ctrl.blob.clone()]).map_err(ProtocolError::DecodeError)?;
-    let schema = Arc::new(Schema::from_record(&desc.schema).map_err(ProtocolError::DecodeError)?);
+    let schema = Arc::new(Schema::from_record(desc.schema).map_err(ProtocolError::DecodeError)?);
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
         class: desc.class,

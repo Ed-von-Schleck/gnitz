@@ -7,9 +7,9 @@ use std::hint::black_box;
 use crate::test_support::{RelationFixture, TID};
 use crate::test_support::{cmp_all, fed_view, make_schema_u64_i64, map_of, relation_fixture, rows_spec};
 use gnitz_expr::{CmpOp, LogicalProgram};
-use gnitz_wire::{PkKeys, ReadBound, ReadSink, ReadSpec, TypeCode};
+use gnitz_wire::{ReadBound, ReadSink, ReadSpec, TypeCode};
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 
 /// A fed view over `keys` U64 key columns, then `c0 = id % 512`, `c1 = round`,
 /// and `s` where `string`, every other one out of line; its feed holds `rounds`
@@ -100,7 +100,7 @@ fn delta_read_bench() {
                 band,
             );
             let keyed = |n: u128, predicate| ReadSpec {
-                bound: ReadBound::PkSet(PkKeys::from_images(8, 0..n)),
+                bound: ReadBound::PkSet(pk_keys_of_images(8, 0..n)),
                 predicate,
                 sink: ReadSink::all_rows(),
             };

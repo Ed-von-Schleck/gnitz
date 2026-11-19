@@ -218,7 +218,7 @@ impl MapPlan {
         let (out_schema, prog, pk_source) = match mk {
             gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
 
-            gnitz_wire::MapKind::Reindex { keep, key, nulls, .. } => {
+            gnitz_wire::MapKind::Reindex { keep, key, nulls } => {
                 let packer = KeyPacker::new(in_schema, key)?;
                 let out_schema = packer.output_schema(in_schema, keep)?;
                 let drop_nulls = match nulls {

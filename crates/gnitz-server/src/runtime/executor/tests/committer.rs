@@ -216,7 +216,7 @@ fn string_tables<const N: usize>(engine: &mut CatalogEngine, names: [&str; N]) -
 fn sized_row(shared: &Shared, tid: u64, footprint: Option<usize>) -> Batch {
     let sal = shared.dispatcher.sal();
     let cat = shared.cat();
-    let (rel, record) = cat.sal_target(tid).unwrap();
+    let (rel, record) = cat.shape_target(tid).unwrap();
     let sized = |len: usize| {
         let batch = make_batch_bytes(&rel.schema(), &[(1, 1, &vec![b'x'; len])]);
         let bytes = sal.push_footprint(record, Routed::Same(batch.wire_whole()));

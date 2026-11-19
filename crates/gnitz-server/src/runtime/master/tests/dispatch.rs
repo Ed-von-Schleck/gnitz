@@ -371,7 +371,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     // The columns a push group's record lays out, each name checked empty.
     let sal_width = |engine: &CatalogEngine| {
         let mut n = 0;
-        gnitz_wire::schema_record::decode(engine.sal_target(tid).unwrap().1, |c| {
+        gnitz_wire::schema_record::decode(engine.shape_target(tid).unwrap().1, |c| {
             assert!(c.name.is_empty(), "a push group's record carries no name");
             n += 1;
             Ok(())
@@ -379,8 +379,8 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         .unwrap();
         n
     };
-    let record = engine.wire_target(tid).unwrap().1.to_vec();
-    let sal_record = engine.sal_target(tid).unwrap().1.to_vec();
+    let resolved = engine.resolve_answer(tid).unwrap().0;
+    let shape_record = engine.shape_target(tid).unwrap().1.to_vec();
     let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
 
     refused_then_applied(
@@ -388,8 +388,8 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         add,
         |disp| {
             assert_eq!(width(&disp.cat()), 2, "the refused ADD COLUMN leaves the schema");
-            assert_eq!(disp.cat().wire_target(tid).unwrap().1, &record[..]);
-            assert_eq!(disp.cat().sal_target(tid).unwrap().1, &sal_record[..]);
+            assert_eq!(disp.cat().resolve_answer(tid).unwrap().0, resolved);
+            assert_eq!(disp.cat().shape_target(tid).unwrap().1, &shape_record[..]);
             assert_eq!(scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(), col_rows);
         },
         |disp| {

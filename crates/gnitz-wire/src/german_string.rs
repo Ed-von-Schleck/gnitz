@@ -154,16 +154,6 @@ pub fn relocate_german_value_with(
     out
 }
 
-/// [`relocate_german_string_with`] appending the content to `dst_blob`.
-#[inline]
-pub fn relocate_german_string(cell: &[u8; 16], src_blob: &[u8], dst_blob: &mut Vec<u8>) -> [u8; 16] {
-    relocate_german_string_with(cell, src_blob, |content| {
-        let at = dst_blob.len();
-        dst_blob.extend_from_slice(content);
-        at
-    })
-}
-
 /// True if `cell` is short and all sixteen of its bytes are ASCII, so its
 /// content is.
 #[inline]

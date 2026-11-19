@@ -134,7 +134,7 @@ pub(crate) fn note_field(bytes: &[u8]) {
 }
 
 /// A reader took the section `content`, whose length the `u32` `prefix`
-/// states; the content need not follow the prefix.
+/// states.
 pub(crate) fn note_section(prefix: &[u8], content: &[u8]) {
     note(prefix, |m, at| {
         let start = content.as_ptr().addr() - m.root.start;

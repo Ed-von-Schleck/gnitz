@@ -197,15 +197,9 @@ fn peek_rejects_an_unreadable_header_word() {
     };
     let bad_status = crate::outside(WireStatus::from_wire);
     for (buf, want) in [
-        (
-            forged(OFF_BLOB_LEN, &u32::MAX.to_le_bytes()),
-            "control blob runs past the frame",
-        ),
-        (
-            forged(OFF_STATUS, &bad_status.to_le_bytes()),
-            "control header names no status",
-        ),
-        (forged(OFF_FLAGS, &(1u64 << 63).to_le_bytes()), "reserved bits"),
+        (forged(36, &u32::MAX.to_le_bytes()), "control blob runs past the frame"),
+        (forged(32, &bad_status.to_le_bytes()), "control header names no status"),
+        (forged(0, &(1u64 << 63).to_le_bytes()), "reserved bits"),
     ] {
         let err = peek_control_block(&buf).unwrap_err();
         assert!(err.contains(want), "{err:?} does not name {want:?}");
@@ -244,16 +238,16 @@ fn wire_flags_reject_unknown() {
         ..Default::default()
     }
     .pack();
-    for bit in (16..33).chain(36..38).chain(40..64) {
+    for bit in 21..64 {
         assert_eq!(
             WireFlags::unpack(verb | 1 << bit),
             Err("flags: reserved bits set"),
             "bit {bit}"
         );
     }
-    // Bit 33 is the frame codec's, so the flags word neither refuses nor
-    // carries it.
-    assert_eq!(WireFlags::unpack(1 << 33), Ok(WireFlags::default()));
+    // The data block bit is the frame codec's, so the flags word neither
+    // refuses nor carries it.
+    assert_eq!(WireFlags::unpack(FLAG_HAS_DATA), Ok(WireFlags::default()));
     // A verb of 0 is none: a reply's.
     assert_eq!(WireFlags::unpack(0).map(|f| f.verb), Ok(None));
     // The two-bit lane leaves one value unused.
@@ -268,8 +262,96 @@ fn wire_flags_reject_unknown() {
             verb | u64::from(crate::outside(WireConflictMode::from_wire)) << 8,
             "unknown conflict mode",
         ),
-        (verb | lane << 38, "unknown lane"),
+        (verb | lane << LANE_SHIFT, "unknown lane"),
     ] {
         assert_eq!(WireFlags::unpack(w), Err(format!("flags: {want}").as_str()), "{w:#x}");
     }
+}
+
+/// Each reply header the server builds reads back, through the client's
+/// decoders, as what it was built from.
+#[test]
+fn every_reply_header_reads_back_as_built() {
+    let peeked = |hdr: ControlHeader, blob: &[u8]| {
+        let mut buf = Vec::new();
+        append_frame(&mut buf, &hdr, blob, None);
+        let ctrl = peek_control_block(&buf).unwrap();
+        assert_eq!(ctrl.hdr, hdr);
+        ctrl
+    };
+    let sub = SubId::new(5).unwrap();
+    let at = DeltaCursor::from_pair(0xABCD, 9).unwrap();
+
+    let ack = peeked(ControlHeader::ack(7, 42), &[]);
+    assert_eq!(ack.server_lane(), Ok(ServerLane::Reply));
+    assert_eq!((ack.hdr.target_id, ack.hdr.arg0), (7, 42));
+    for last in [false, true] {
+        let train = peeked(ControlHeader::train(7, last), &[]);
+        assert_eq!(train.server_lane(), Ok(ServerLane::Reply));
+        let f = train.hdr.flags;
+        assert!(f.continuation);
+        assert_eq!(f.scan_last, last);
+    }
+    let terminal = peeked(ControlHeader::delta_terminal(7, at), &[]);
+    assert_eq!(terminal.server_lane(), Ok(ServerLane::Reply));
+    assert!(!terminal.hdr.flags.continuation);
+    assert_eq!((terminal.hdr.target_id, terminal.hdr.delta_cursor()), (7, Some(at)));
+    let opener = peeked(ControlHeader::pushed_train(7, sub), &[]);
+    assert_eq!(opener.server_lane(), Ok(ServerLane::PushedTrain { view: 7, sub }));
+    for status in [WireStatus::Ok, WireStatus::Error] {
+        let answer = peeked(ControlHeader::sync_answer(status), b"why");
+        assert_eq!(answer.server_lane(), Ok(ServerLane::SyncAnswer));
+        assert_eq!(answer.hdr.status, status);
+    }
+}
+
+/// A pushed-train opener that is not a bare head naming a subscription, and a
+/// sync answer naming a relation or carrying a data block, are refused.
+#[test]
+fn a_malformed_server_lane_is_refused() {
+    let lane = |hdr: ControlHeader, blob: &[u8], data: bool| {
+        peek_control_block(&frame(&hdr, blob, data)).unwrap().server_lane()
+    };
+    let opener = ControlHeader::pushed_train(7, SubId::new(5).unwrap());
+    let bare = Err("a pushed train opens with a bare head");
+    assert_eq!(lane(opener, b"blob", false), bare);
+    assert_eq!(lane(opener, &[], true), bare);
+    assert_eq!(
+        lane(
+            ControlHeader {
+                flags: WireFlags { continuation: true, ..opener.flags },
+                ..opener
+            },
+            &[],
+            false
+        ),
+        bare
+    );
+    assert_eq!(
+        lane(ControlHeader { status: WireStatus::Error, ..opener }, b"why", false),
+        bare
+    );
+    assert_eq!(
+        lane(ControlHeader { arg0: 0, ..opener }, &[], false),
+        Err("a pushed train names no subscription")
+    );
+    let mut trailing = frame(&opener, &[], false);
+    trailing.push(0);
+    assert_eq!(peek_control_block(&trailing).unwrap().server_lane(), bare);
+
+    let answer = ControlHeader::sync_answer(WireStatus::Ok);
+    let not_one = Err("a sync answer is one empty frame naming 0");
+    assert_eq!(lane(ControlHeader { target_id: 1, ..answer }, &[], false), not_one);
+    assert_eq!(lane(answer, &[], true), not_one);
+    assert_eq!(
+        lane(
+            ControlHeader {
+                flags: WireFlags { continuation: true, ..answer.flags },
+                ..answer
+            },
+            &[],
+            false
+        ),
+        not_one
+    );
 }

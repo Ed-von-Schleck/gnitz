@@ -81,6 +81,15 @@ fn shift_touches_only_long_offsets() {
 /// heap becomes the empty string, its prefix zeroed with its length, and a
 /// skewed short-cell pad does not survive — either left as it was would order
 /// the cell apart from an equal-content one.
+/// A `place` for [`relocate_german_string_with`] appending the content to `dst`.
+fn append(dst: &mut Vec<u8>) -> impl FnOnce(&[u8]) -> usize + '_ {
+    move |content| {
+        let at = dst.len();
+        dst.extend_from_slice(content);
+        at
+    }
+}
+
 #[test]
 fn relocation_rebuilds_each_cell_canonically() {
     let mut overrun = encode_german_string(&[0xAB; 20], &mut Vec::new());
@@ -95,7 +104,7 @@ fn relocation_rebuilds_each_cell_canonically() {
     let mut dst_blob = Vec::new();
     for (src, want) in cases {
         assert_eq!(
-            relocate_german_string(&src, &[0u8; 4], &mut dst_blob),
+            relocate_german_string_with(&src, &[0u8; 4], append(&mut dst_blob)),
             want,
             "{src:02x?}"
         );
@@ -104,14 +113,14 @@ fn relocation_rebuilds_each_cell_canonically() {
 }
 
 /// A long cell's content lands wherever `place` puts it, its length and prefix
-/// carried over; the appending form puts it at the destination's end.
+/// carried over.
 #[test]
 fn relocate_moves_only_a_long_cells_offset() {
     let content = b"abcdefghijklmnopqrst";
     let mut src_blob = vec![0x11u8; 9];
     let src = encode_german_string(content, &mut src_blob);
     let mut dst_blob = vec![0x22u8; 5];
-    let out = relocate_german_string(&src, &src_blob, &mut dst_blob);
+    let out = relocate_german_string_with(&src, &src_blob, append(&mut dst_blob));
     assert_eq!(out[..8], src[..8], "length and prefix carry over");
     assert_eq!(read_u64_le(&out, 8), 5);
     assert_eq!(german_string_content(&out, &dst_blob), content);

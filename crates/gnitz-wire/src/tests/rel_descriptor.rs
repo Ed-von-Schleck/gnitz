@@ -15,7 +15,6 @@ fn every_descriptor_shape_roundtrips() {
     for &class in RelClass::ALL {
         for (pk_repeats, serial) in [(false, false), (true, false), (false, true), (true, true)] {
             for (indexes, schema) in [(vec![], &b""[..]), (two_indexes.clone(), b"record")] {
-                let schema = schema.into();
                 let d = RelDescriptorBlob {
                     class,
                     pk_repeats,
@@ -33,17 +32,23 @@ fn every_descriptor_shape_roundtrips() {
 /// anywhere fails as a rel descriptor.
 #[test]
 fn each_decode_guard_rejects_its_own_forgery() {
-    let base = RelDescriptorBlob {
+    let base_desc = RelDescriptorBlob {
+        class: RelClass::Table,
+        pk_repeats: false,
+        serial: false,
         indexes: vec![RelIndex {
             cols: PkColList::from_slice(&[0]),
             is_unique: false,
         }],
-        ..Default::default()
-    }
-    .encode();
+        schema: &[],
+    };
+    let base = base_desc.encode();
     // The first index entry: its packed column list, then its uniqueness byte.
     // It starts where an empty descriptor's 4-byte record length does.
-    let ix = RelDescriptorBlob::default().encode().len() - 4;
+    let ix = RelDescriptorBlob { indexes: vec![], ..base_desc.clone() }
+        .encode()
+        .len()
+        - 4;
     let forge = |f: &dyn Fn(&mut Vec<u8>)| {
         let mut b = base.clone();
         f(&mut b);

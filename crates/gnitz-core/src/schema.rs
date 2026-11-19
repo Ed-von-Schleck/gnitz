@@ -2,21 +2,21 @@
 //! its PK list.
 
 use gnitz_expr::{SchemaColumn, SchemaDescriptor, SchemaRefusal};
+use gnitz_zset::schema::pk_keys;
 use std::sync::{Arc, OnceLock};
 
-use gnitz_wire::{ColumnDef, PkColList, PkListRole, PkRule, SysFamily};
+use gnitz_wire::{ColumnDef, KeyListRefusal, PkColList, PkListRole, SysFamily};
 
 #[derive(Clone)]
 pub struct Schema {
     columns: Vec<ColumnDef>,
     layout: SchemaDescriptor,
-    /// The meta-schema record of `columns` and the PK list, encoded on first
-    /// use.
-    record: OnceLock<Arc<[u8]>>,
+    /// The shape record of `columns` and the PK list, encoded on first use.
+    shape_record: OnceLock<Arc<[u8]>>,
 }
 
-/// Equality is over the columns and the layout; whether the record is cached
-/// does not enter it.
+/// Equality is over the columns and the layout; whether the shape record is
+/// cached does not enter it.
 impl PartialEq for Schema {
     fn eq(&self, o: &Schema) -> bool {
         self.columns == o.columns && self.layout == o.layout
@@ -46,14 +46,18 @@ impl Schema {
             ));
         }
         let pk_refusal =
-            |rule: PkRule| rule.named(PkListRole::PrimaryKey, |c| columns.get(c as usize).map(|cd| &*cd.name));
+            |rule: KeyListRefusal| rule.named(PkListRole::PrimaryKey, |c| columns.get(c as usize).map(|cd| &*cd.name));
         PkColList::checked(pk_cols, columns.len()).map_err(pk_refusal)?;
         let layout = SchemaDescriptor::try_new(&columns.iter().map(SchemaColumn::of_def).collect::<Vec<_>>(), pk_cols)
             .map_err(|refusal| match refusal {
                 SchemaRefusal::Pk(rule) => pk_refusal(rule),
                 other => other.to_string(),
             })?;
-        Ok(Schema { columns, layout, record: OnceLock::new() })
+        Ok(Schema {
+            columns,
+            layout,
+            shape_record: OnceLock::new(),
+        })
     }
 
     pub fn columns(&self) -> &[ColumnDef] {
@@ -84,7 +88,7 @@ impl Schema {
                 self.layout.opk_key_cols(n.as_ref())
             })
             .collect();
-        gnitz_wire::PkKeys::from_keys(self.layout.pk_stride(), keys.iter().map(|k| k.pk_bytes()))
+        pk_keys(self.layout.pk_stride(), keys.iter().map(|k| k.pk_bytes()))
     }
 
     /// The PK columns in PK-list order, hidden: the leading key of a reply that
@@ -113,11 +117,13 @@ impl Schema {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
-    /// This schema's meta-schema record — the bytes a schema-bearing push
-    /// embeds. Encoded once per schema; a clone shares it.
-    pub fn to_record(&self) -> &[u8] {
-        self.record.get_or_init(|| {
-            gnitz_wire::schema_record::encode(self.columns.iter().map(ColumnDef::record_col), self.pk_cols()).into()
+    /// This schema's shape record: the nameless meta-schema record a push
+    /// carries as its blob, with every hidden flag clear. [`Self::from_record`]
+    /// of it is not this schema, whose names it drops. Encoded once per schema;
+    /// a clone shares it.
+    pub fn shape_record(&self) -> &[u8] {
+        self.shape_record.get_or_init(|| {
+            gnitz_wire::schema_record::encode(self.columns.iter().map(ColumnDef::shape_col), self.pk_cols()).into()
         })
     }
 
@@ -125,20 +131,15 @@ impl Schema {
     pub fn from_record(record: &[u8]) -> Result<Schema, String> {
         let mut columns = Vec::new();
         let pk = gnitz_wire::schema_record::decode(record, |c| {
-            let name = std::str::from_utf8(c.name).map_err(|e| format!("utf8 in column name: {e}"))?;
             columns.push(ColumnDef {
-                name: Arc::from(name),
+                name: Arc::from(c.name),
                 ty: c.ty,
                 is_nullable: c.nullable,
                 is_hidden: c.hidden,
             });
             Ok(())
         })?;
-        // The encoding is a bijection, so `record` is the bytes `to_record` would
-        // encode.
-        let schema = Schema::from_parts(columns, pk.as_slice())?;
-        let _ = schema.record.set(record.into());
-        Ok(schema)
+        Schema::from_parts(columns, pk.as_slice())
     }
 }
 

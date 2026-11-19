@@ -1037,10 +1037,10 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         let reply = recv(raw);
         let ctrl = gnitz_wire::peek_control_block(&reply).expect("a control header");
         assert!(ctrl.fault(&reply).is_none(), "{which} is answered, not refused");
-        match ctrl.hdr.flags.lane {
-            gnitz_wire::WireLane::Reply => false,
-            gnitz_wire::WireLane::SyncAnswer => true,
-            gnitz_wire::WireLane::PushedTrain => panic!("{which}: a quiet view is sent no train"),
+        match ctrl.server_lane().expect("a well-formed lane") {
+            gnitz_wire::ServerLane::Reply => false,
+            gnitz_wire::ServerLane::SyncAnswer => true,
+            gnitz_wire::ServerLane::PushedTrain { .. } => panic!("{which}: a quiet view is sent no train"),
         }
     };
     send(&mut raw, &gnitz_wire::HELLO);

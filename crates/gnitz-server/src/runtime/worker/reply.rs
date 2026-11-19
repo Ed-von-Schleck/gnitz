@@ -94,7 +94,7 @@ impl Train {
         let id = self.route.request_id;
         loop {
             let (batch, ends) = match &mut self.answer {
-                Err(fault) => return w2m.try_send_msg(id, false, &WireMsg::fault(fault)).map(|()| true),
+                Err(fault) => return w2m.try_send_msg(id, false, &WireMsg::fault(0, fault)).map(|()| true),
                 Ok(Rows::Nothing) => {
                     let msg = WireMsg::train_frame(self.route.target_id, true, None);
                     return w2m.try_send_msg(id, false, &msg).map(|()| true);
@@ -117,7 +117,7 @@ impl Train {
                     Ok((msg, next_row)) => {
                         w2m.try_send_msg(id, false, &msg)?;
                         self.next_row = next_row;
-                        return Ok(msg.flags.scan_last);
+                        return Ok(msg.hdr.flags.scan_last);
                     }
                     Err(fault) => fault,
                 };
@@ -130,7 +130,7 @@ impl Train {
 /// `budget`.
 fn whole<'a>(route: &ReplyRoute, answer: &'a Result<Rows, WireFault>, budget: usize) -> Option<WireMsg<'a>> {
     match answer {
-        Err(fault) => Some(WireMsg::fault(fault)),
+        Err(fault) => Some(WireMsg::fault(0, fault)),
         Ok(Rows::Spans(_)) => None,
         Ok(Rows::Nothing) => Some(WireMsg::train_frame(route.target_id, true, None)),
         Ok(Rows::Batch(batch)) => {

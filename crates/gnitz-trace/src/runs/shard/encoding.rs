@@ -13,7 +13,6 @@ use gnitz_wire::{
     CodedHeap, FixedInt, GERMAN_INLINE_OFF, Heap, HeapValue, MAX_PK_COLUMNS, MAX_SYMBOL_LEN, MAX_SYMBOLS,
     SHORT_STRING_THRESHOLD, ScalarKind, SymbolTable, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
 };
-use gnitz_wire::{SYMBOLS_AT, SYMBOLS_COUNT_AT, SYMBOLS_PLAIN_LEN_AT, SYMBOLS_TRAINED_AT};
 use gnitz_zset::repr::Codebook;
 use gnitz_zset::repr::PooledBuf;
 use gnitz_zset::repr::append_value;
@@ -1011,6 +1010,16 @@ impl<'a> SeqImage<'a> {
         }
     }
 }
+
+// A Symbols image: a heap as its values coded under a symbol table. The bytes
+// the values decode to (u64 LE); how the table coded its training values, in
+// sixteenths of their bytes (u64 LE); the symbol count (u64 LE); each symbol,
+// eight bytes; each symbol's length, a byte; the values, each where a cell names
+// it, as its code count (LEB128) and its codes.
+const SYMBOLS_PLAIN_LEN_AT: usize = 0;
+const SYMBOLS_TRAINED_AT: usize = 8;
+pub(crate) const SYMBOLS_COUNT_AT: usize = 16;
+pub(crate) const SYMBOLS_AT: usize = 24;
 
 /// The heap a shard's string columns are packed into, as the writer fills it:
 /// each long value verbatim, or coded under a codebook.

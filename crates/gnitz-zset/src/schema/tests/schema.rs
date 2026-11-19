@@ -74,7 +74,7 @@ fn decode_schema_record_refuses_what_the_descriptor_refuses() {
                 ty: ColType::of(c.type_code),
                 nullable: c.nullable,
                 hidden: false,
-                name: b"k",
+                name: "k",
             }),
             &[0],
         );

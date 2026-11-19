@@ -35,7 +35,7 @@ fn a_cell_is_the_low_bytes_of_its_value_or_a_refusal_naming_the_column() {
             "'550e8400-e29b-41d4-a716-446655440000'",
             Ok(0x550e8400_e29b_41d4_a716_446655440000_u128.to_le_bytes().to_vec()),
         ),
-        (U8, "256", Err("column 'c': U8 value out of range: 256")),
+        (U8, "256", Err("column 'c': TINYINT UNSIGNED value out of range: 256")),
     ] {
         assert_eq!(
             write(tc, src),

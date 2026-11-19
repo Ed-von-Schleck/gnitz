@@ -47,7 +47,7 @@ use parquet::schema::types::{ColumnPath, Type};
 use crate::DumpError;
 
 /// The file metadata key naming each column's gnitz type, in column order. Its
-/// values are `gnitz_sql::sql_type_name`'s spelling, so a change to that
+/// values are `gnitz_wire::ColType`'s `Display` spelling, so a change to that
 /// spelling is a change to the format.
 const COLUMNS_KEY: &str = "gnitz.columns";
 
@@ -71,7 +71,7 @@ fn file_layout(schema: &Schema) -> Result<(Type, String, Vec<FileColumn>), DumpE
     for (ci, def) in schema.visible_columns() {
         let (codec, logical) = codec(def.ty);
         fields.push(Arc::new(parquet_column(def, codec, logical)?));
-        types.push(gnitz_sql::sql_type_name(def.ty));
+        types.push(def.ty.to_string());
         cols.push((schema.layout().locate(ci), codec, def.is_nullable));
     }
     Ok((

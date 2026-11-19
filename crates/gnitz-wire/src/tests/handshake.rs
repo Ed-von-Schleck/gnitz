@@ -92,6 +92,18 @@ fn wire_layout_samples() -> Vec<u8> {
         arg1: 0x9999_AAAA_BBBB_CCCC,
     };
     append_frame(&mut out, &hdr, b"blob", None);
+    // One frame per reply header the server builds.
+    let sub = SubId::new(4).unwrap();
+    for reply in [
+        ControlHeader::ack(7, 0x5555_6666_7777_8888),
+        ControlHeader::train(7, false),
+        ControlHeader::train(7, true),
+        ControlHeader::delta_terminal(7, DeltaCursor::from_pair(5, 6).unwrap()),
+        ControlHeader::pushed_train(7, sub),
+        ControlHeader::sync_answer(WireStatus::Ok),
+    ] {
+        append_frame(&mut out, &reply, &[], None);
+    }
 
     let target = Target { tid: 7, token: 9 };
     multi_frame::encode_scan_multi(&mut out, &[ScanItem { target, reply_layout: 3, spec: b"spec" }]);
@@ -142,21 +154,22 @@ fn wire_layout_samples() -> Vec<u8> {
             ty: TypeCode::U64.into(),
             nullable: false,
             hidden: false,
-            name: b"k",
+            name: "k",
         },
         schema_record::RecordCol {
             ty: ColType::decimal(9),
             nullable: true,
             hidden: true,
-            name: b"v",
+            name: "v",
         },
     ];
+    let record = schema_record::encode(schema.iter().copied(), &[0]);
     let desc = RelDescriptorBlob {
         class: RelClass::FedView,
         pk_repeats: true,
         serial: true,
         indexes: vec![RelIndex { cols, is_unique: true }],
-        schema: schema_record::encode(schema.iter().copied(), &[0]).into(),
+        schema: &record,
     };
     out.extend(desc.encode());
     let page = snapshot::PageRequest {
@@ -178,7 +191,7 @@ fn wire_layout_samples() -> Vec<u8> {
 fn the_wire_layouts_are_pinned_to_the_epoch() {
     assert_eq!(
         (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
-        (39, 0x37d4_131c_a0fe_c3fe),
+        (40, 0x53ce_cb29_3616_58b9),
         "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
     );
 }

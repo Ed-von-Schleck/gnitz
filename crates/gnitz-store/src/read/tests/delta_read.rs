@@ -10,10 +10,10 @@ use crate::test_support::{
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_foundation::rng::Rng;
-use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
+use gnitz_wire::{ReadSink, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 use gnitz_zset_testkit::{RowKey, zset_of};
 use std::collections::HashMap;
 
@@ -161,7 +161,7 @@ fn cases() -> Vec<Case> {
     // A key's image is `k2`'s, then `k1`'s.
     let keys = |set: &[(i64, u64)]| {
         let images = set.iter().map(|&(k2, k1)| img(k2) << 64 | k1 as u128);
-        ReadBound::PkSet(PkKeys::from_images(16, images))
+        ReadBound::PkSet(pk_keys_of_images(16, images))
     };
     const SET: [(i64, u64); 6] = [(-3, 0), (-1, 2), (0, 0), (0, 5), (2, 1), (3, 3)];
     // Most keys the model draws, so a round's keyed rows are most of it.
@@ -422,7 +422,7 @@ fn a_delta_read_refuses_what_it_cannot_answer() {
     let own = view_schema().layout_digest();
     let whole = || ReadSpec::all_rows(ReadBound::None);
     let first = || rows_spec(None, cut(1, vec![]));
-    let short = ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_images(8, [0])));
+    let short = ReadSpec::all_rows(ReadBound::PkSet(pk_keys_of_images(8, [0])));
     let cases = [
         (&fed, 0, whole(), own ^ 1, "reply schema does not match"),
         (&fed, 3, whole(), own ^ 1, "reply schema does not match"),

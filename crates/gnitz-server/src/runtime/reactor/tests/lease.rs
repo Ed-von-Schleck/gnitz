@@ -160,7 +160,7 @@ fn a_passing_frame_is_copied_out_unless_its_reader_waits_on_its_worker() {
 fn a_fault_frame_ends_its_workers_train() {
     let (r, mut lease, mut writers) = train_lease(2, "ScanSpec");
     let fault = gnitz_wire::WireFault::from("no such store");
-    writers[0].send_msg(lease.id(), &WireMsg::fault(&fault));
+    writers[0].send_msg(lease.id(), &WireMsg::fault(0, &fault));
     writers[1].send_msg(lease.id(), &WireMsg::train_frame(0, true, None));
     r.drain_all_w2m();
 
@@ -373,7 +373,7 @@ fn a_given_up_trains_remainder_is_read_off_before_the_next() {
     let id = lease.id();
 
     let fault = gnitz_wire::WireFault::from("no such store");
-    writers[0].send_msg(id, &WireMsg::fault(&fault));
+    writers[0].send_msg(id, &WireMsg::fault(0, &fault));
     writers[0].send_train_frame(id, true, Some(&rows(10)));
     writers[1].send_train_frame(id, false, Some(&rows(1)));
     writers[1].send_train_frame(id, false, Some(&rows(2)));

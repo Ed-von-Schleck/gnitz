@@ -12,7 +12,7 @@ fn declared(decl: &str) -> Result<(ColType, bool), GnitzSqlError> {
 }
 
 /// Every alias and modifier, as the type it declares — each type's own spelling
-/// is [`sql_type_name_round_trips`]'s. A SERIAL spelling is its signed integer.
+/// is [`col_type_display_round_trips`]'s. A SERIAL spelling is its signed integer.
 #[test]
 fn each_accepted_spelling_declares_its_type() {
     use TypeCode::*;
@@ -93,9 +93,9 @@ fn each_refused_spelling_names_its_reason() {
     }
 }
 
-/// Every type's SQL spelling declares that type again.
+/// Every type's SQL spelling, as `ColType` prints it, declares that type again.
 #[test]
-fn sql_type_name_round_trips() {
+fn col_type_display_round_trips() {
     let types = TypeCode::ALL
         .iter()
         .filter(|&&tc| tc != TypeCode::Decimal)
@@ -106,7 +106,7 @@ fn sql_type_name_round_trips() {
             ColType::decimal(MAX_DECIMAL_SCALE),
         ]);
     for ty in types {
-        let spelled = sql_type_name(ty);
+        let spelled = ty.to_string();
         let (got, _) = declared(&spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
         assert_eq!(got, ty, "{spelled}");
     }

@@ -178,10 +178,16 @@ impl Peer {
         let frame = self.expect_frame(what);
         let ctrl = peek_control_block(&frame).expect("a control header");
         assert_eq!(ctrl.hdr.flags.verb, Some(gnitz_wire::ClientVerb::DeltaPoll), "{what}");
-        let items = gnitz_wire::multi_frame::decode_delta_items(&frame[ctrl.body.clone()]).expect("a delta poll");
-        let kept = gnitz_wire::multi_frame::delta_poll_kept(&ctrl.hdr, items.len()).expect("ids in range");
-        let kept = kept.unwrap_or_else(|| panic!("{what}: a poll keeping its views"));
-        items.iter().zip(kept).map(|(item, id)| (item.view.tid, id)).collect()
+        let poll =
+            gnitz_wire::multi_frame::decode_delta_poll(&frame[ctrl.body.clone()], &ctrl.hdr).expect("a delta poll");
+        let kept = poll
+            .kept()
+            .unwrap_or_else(|| panic!("{what}: a poll keeping its views"));
+        poll.items
+            .iter()
+            .zip(kept)
+            .map(|(item, id)| (item.view.tid, id))
+            .collect()
     }
 
     /// The subscription ids the next request, a SYNC_PUSHED, names as held,
@@ -209,12 +215,16 @@ impl Peer {
 
     /// A RESOLVE answering with `tid`: a view descriptor carrying a feed.
     fn reply_resolved(&self, tid: u64) {
+        let schema = kv_schema(TypeCode::I64);
+        let record = crate::test_support::named_record(&schema);
         let blob = RelDescriptorBlob {
             class: RelClass::FedView,
-            schema: kv_schema(TypeCode::I64).to_record().into(),
-            ..Default::default()
+            pk_repeats: false,
+            serial: false,
+            indexes: vec![],
+            schema: &record,
         };
-        let hdr = ControlHeader { target_id: tid, ..Default::default() };
+        let hdr = ControlHeader::ack(tid, 0);
         self.send(&encode_frame(hdr, &blob.encode(), None));
     }
 }

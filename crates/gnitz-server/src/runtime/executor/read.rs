@@ -8,7 +8,7 @@ use crate::runtime::sal::Read;
 use gnitz_store::read::ReadRows;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::multi_frame::ScanItem;
-use gnitz_wire::{ReadSpec, WireFault, WireStatus};
+use gnitz_wire::{ControlHeader, ReadSpec, WireFault, WireStatus};
 
 /// RESOLVE: answer with the relation's descriptor, its schema record included,
 /// and its token.
@@ -34,8 +34,7 @@ pub(super) async fn handle_resolve(shared: &Shared, peer: &mut Peer, name_blob: 
         // No such relation: a successful reply naming none.
         None => WireMsg::default(),
         Some((tid, (desc, token))) => WireMsg {
-            target_id: *tid,
-            arg0: *token,
+            hdr: ControlHeader::ack(*tid, *token),
             blob: desc,
             ..Default::default()
         },

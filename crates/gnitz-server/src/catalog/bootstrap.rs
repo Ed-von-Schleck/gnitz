@@ -52,7 +52,7 @@ impl CatalogEngine {
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.caches.enter(
                 family.id(),
-                RelationEntry::new(family.schema(), &family.column_defs(), Vec::new()),
+                RelationEntry::new(family.def().pk_cols, &family.column_defs(), Vec::new()),
             );
             engine.mark_zone_applied(engine.replay_floor(family));
         }

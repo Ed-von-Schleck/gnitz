@@ -52,6 +52,58 @@ fn type_predicates_partition_the_type_table() {
     }
 }
 
+/// Every type's form against its width, sign and scalar image, and a type
+/// stored as an integer against that integer.
+#[test]
+fn a_types_form_fixes_its_width_sign_and_image() {
+    use TypeCode::*;
+    let strides: [(TypeCode, usize); 19] = [
+        (U8, 1),
+        (I8, 1),
+        (U16, 2),
+        (I16, 2),
+        (U32, 4),
+        (I32, 4),
+        (F32, 4),
+        (U64, 8),
+        (I64, 8),
+        (F64, 8),
+        (String, 16),
+        (U128, 16),
+        (UUID, 16),
+        (Blob, 16),
+        (I128, 16),
+        (Date, 4),
+        (Timestamp, 8),
+        (Decimal, 8),
+        (Bool, 1),
+    ];
+    assert_eq!(strides.len(), TypeCode::ALL.len());
+    for (tc, stride) in strides {
+        assert_eq!(tc.wire_stride(), stride, "wire_stride({tc:?})");
+        match tc.form() {
+            ValueForm::Scalar(kind) => {
+                assert_eq!(ScalarKind::from_type_code(tc), Some(kind), "{tc:?}");
+                if let ScalarKind::Int(fi) = kind {
+                    assert_eq!(FixedInt::from_type_code(tc), Some(fi), "{tc:?}");
+                    assert_eq!(fi.width(), stride, "{tc:?}");
+                    assert_eq!(fi.is_signed(), tc.is_signed_int(), "{tc:?}");
+                    assert_eq!(fi.type_code().form(), tc.form(), "{tc:?} is its storage integer");
+                } else {
+                    assert_eq!(FixedInt::from_type_code(tc), None, "{tc:?}");
+                }
+            }
+            ValueForm::Wide(wide) => {
+                assert_eq!(stride, 16, "{tc:?}");
+                assert_eq!(ScalarKind::from_type_code(tc), None, "{tc:?}");
+                if let WideForm::Int128 { signed } = wide {
+                    assert_eq!(signed, tc.is_signed_int(), "{tc:?}");
+                }
+            }
+        }
+    }
+}
+
 /// Membership and the discriminant round-trip are `wire_enum!`'s; only the
 /// names need a runtime compare.
 #[test]
@@ -60,6 +112,14 @@ fn type_code_wire_names_are_distinct() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate wire_name in ALL");
+}
+
+#[test]
+fn type_code_sql_names_are_distinct() {
+    let mut names: Vec<&str> = TypeCode::ALL.iter().map(|&tc| tc.sql_name()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate sql_name in ALL");
 }
 
 /// `[min, max]` of an integer type's values; `None` for every type stored as an

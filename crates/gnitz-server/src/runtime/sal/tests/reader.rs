@@ -76,11 +76,12 @@ fn sal_cross_process_checkpoint() {
                     break (msg.head.request.kind, msg.head.request.arg0);
                 }
             };
-            let msg = WireMsg {
+            let hdr = gnitz_wire::ControlHeader {
                 arg0: kind.as_wire() as u64,
                 arg1: generation,
                 ..Default::default()
             };
+            let msg = WireMsg { hdr, ..Default::default() };
             writer.send_msg(id(1), &msg);
         }
     };

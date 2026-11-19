@@ -301,7 +301,7 @@ fn every_unsupported_window_names_its_clause() {
             "window functions: DISTINCT is not supported",
         ),
         ("SELECT id, SUM(a) FILTER (WHERE a > 1) OVER () FROM t", "FILTER"),
-        ("SELECT id, SUM(s) OVER () FROM t", "SUM: not supported on STRING"),
+        ("SELECT id, SUM(s) OVER () FROM t", "SUM: not supported on TEXT"),
         // A window call belongs to the SELECT list and QUALIFY only.
         (
             "SELECT id FROM t WHERE SUM(a) OVER () > 1",

@@ -6,9 +6,7 @@ use crate::{PkColList, SysFamily, ViewBudget};
 
 wire_enum! {
     /// What a relation is, as the client sees it.
-    #[derive(Default)]
     pub enum RelClass: u8 {
-        #[default]
         Table = 0,
         /// A storeless, append-only ingestion point: it holds no rows to read.
         Stream = 1,
@@ -82,8 +80,8 @@ impl Wire for RelIndex {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct RelDescriptorBlob {
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RelDescriptorBlob<'a> {
     pub class: RelClass,
     /// Whether two rows may share a PK, or one may stand at weight above 1.
     pub pk_repeats: bool,
@@ -91,27 +89,27 @@ pub struct RelDescriptorBlob {
     pub serial: bool,
     pub indexes: Vec<RelIndex>,
     /// The relation's [`crate::schema_record`], names included.
-    pub schema: Box<[u8]>,
+    pub schema: &'a [u8],
 }
 
-impl RelDescriptorBlob {
+impl<'a> RelDescriptorBlob<'a> {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.put(&self.class)
             .bool(self.pk_repeats)
             .bool(self.serial)
             .list(&self.indexes)
-            .bytes32(&self.schema);
+            .bytes32(self.schema);
         w.into_vec()
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Self, String> {
+    pub fn decode(buf: &'a [u8]) -> Result<Self, String> {
         decode_all(buf, "rel descriptor", |r| {
             let class = r.get()?;
             let pk_repeats = r.bool()?;
             let serial = r.bool()?;
             let indexes = r.list("index list", MAX_LIST_LEN)?;
-            let schema = r.bytes32()?.into();
+            let schema = r.bytes32()?;
             Ok(RelDescriptorBlob {
                 class,
                 pk_repeats,

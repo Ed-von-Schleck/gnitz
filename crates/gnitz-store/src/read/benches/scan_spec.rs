@@ -22,7 +22,7 @@ use gnitz_wire::{
     ViewBudget,
 };
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 
 /// Rows a fixture holds: a multiple of every period a column repeats at.
 const ROWS: u64 = 3 << 17;
@@ -167,7 +167,7 @@ fn scan_spec_bench() {
     }
 
     // `id IN (…)` over every other id: more keys than one drain chunk.
-    let keys = gnitz_wire::PkKeys::from_images(8, (0..ROWS).step_by(2).map(u128::from));
+    let keys = pk_keys_of_images(8, (0..ROWS).step_by(2).map(u128::from));
     cell(
         "key set, every other id",
         &r,
@@ -249,7 +249,7 @@ fn scan_spec_bench() {
             let keyed = |spec: ReadSpec| ReadSpec {
                 bound: ReadBound::PkSet(PkKeys::from_sorted(
                     8,
-                    (0..ROWS).step_by(16).flat_map(u64::to_be_bytes).collect(),
+                    (0..ROWS).step_by(16).flat_map(u64::to_be_bytes).collect::<Vec<u8>>(),
                 )),
                 ..spec
             };

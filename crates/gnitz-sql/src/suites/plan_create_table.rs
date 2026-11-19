@@ -94,15 +94,15 @@ fn primary_key_admission() {
         ),
         (
             "CREATE TABLE t (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))",
-            "primary key column 'a' has type_code STRING",
+            "primary key column 'a' has type TEXT",
         ),
         (
             "CREATE TABLE t (id REAL PRIMARY KEY)",
-            "primary key column 'id' has type_code F64",
+            "primary key column 'id' has type DOUBLE",
         ),
         (
             "CREATE TABLE t (id DOUBLE PRIMARY KEY)",
-            "primary key column 'id' has type_code F64",
+            "primary key column 'id' has type DOUBLE",
         ),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);

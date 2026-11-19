@@ -430,7 +430,7 @@ impl MasterDispatcher {
     }
 
     /// Lay one push batch out as a SAL group inside `scope`, held to `rule`: the
-    /// target's schema record and the rows routed to the workers that own them.
+    /// target's shape record and the rows routed to the workers that own them.
     /// Answers whether the group rides inside the zone: a base table's rows do;
     /// a stream's, which no restart recovers, ride outside. No worker ACKs it: a
     /// read or tick behind it in the SAL reaches its workers after their apply,
@@ -444,7 +444,7 @@ impl MasterDispatcher {
     ) -> Result<bool, SalFull> {
         let cat = self.cat();
         let (rel, record) = cat
-            .sal_target(target_id)
+            .shape_target(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
         with_routed(batch, rel.placement(), self.sal.num_workers(), |rows| {

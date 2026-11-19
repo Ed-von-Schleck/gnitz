@@ -3,6 +3,7 @@ use crate::test_support::{
     TID, assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture,
     solo, spec, zset_of,
 };
+use gnitz_zset::schema::pk_keys;
 
 fn index(id: u64, unique: bool) -> IndexClaim {
     IndexClaim::Index { id, unique }
@@ -189,7 +190,7 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
 #[test]
 fn an_index_leading_the_pk_reads_the_owners_rows() {
     use crate::read::Probe;
-    use gnitz_wire::{PkKeys, TypeCode};
+    use gnitz_wire::TypeCode;
     use gnitz_zset::repr::BatchBuilder;
     use gnitz_zset::schema::SchemaColumn;
     use std::num::NonZeroU64;
@@ -242,8 +243,7 @@ fn an_index_leading_the_pk_reads_the_owners_rows() {
         let picked: Vec<&[u8]> = spans.iter().copied().step_by(2).collect();
         let probe = |cap: u64| {
             let probe = Probe::Index(PkColList::from_slice(cols), NonZeroU64::new(cap).unwrap());
-            r.probe(TID, probe, PkKeys::from_keys(k, picked.iter().copied()))
-                .unwrap()
+            r.probe(TID, probe, pk_keys(k, picked.iter().copied())).unwrap()
         };
         let mut hit = Batch::empty_with_schema(&ix_schema);
         entries

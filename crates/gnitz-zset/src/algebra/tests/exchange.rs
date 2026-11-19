@@ -207,7 +207,7 @@ fn a_key_the_schema_cannot_route_is_refused() {
         ),
         (
             ScatterPlan::join(&schema, &[(0, TypeCode::U32)]),
-            "reindex key: column 0 of type U64 does not pack at U32",
+            "reindex key: column 0 of type BIGINT UNSIGNED does not pack at INT UNSIGNED",
         ),
     ] {
         assert_eq!(plan.err().as_deref(), Some(why));

@@ -1,5 +1,6 @@
 //! Column types: the typed `TypeCode` enum, the scale-carrying `ColType`, and the
-//! register forms a narrow column's value decodes to (`FixedInt`, `ScalarKind`).
+//! register forms a narrow column's value decodes to (`FixedInt`, `ScalarKind`),
+//! and the form every type's value is held in (`ValueForm`).
 
 use core::cmp::Ordering;
 
@@ -39,8 +40,34 @@ crate::wire_enum! {
 }
 
 impl TypeCode {
-    /// The type's name in the wire vocabulary, which is what the client bindings
-    /// expose.
+    /// The type's SQL spelling, which every message naming a type prints. On every
+    /// type but DECIMAL it is what `gnitz-sql`'s type parser reads back as the
+    /// type; a DECIMAL's full spelling, its scale included, is [`ColType`]'s.
+    pub const fn sql_name(self) -> &'static str {
+        match self {
+            TypeCode::U8 => "TINYINT UNSIGNED",
+            TypeCode::I8 => "TINYINT",
+            TypeCode::U16 => "SMALLINT UNSIGNED",
+            TypeCode::I16 => "SMALLINT",
+            TypeCode::U32 => "INT UNSIGNED",
+            TypeCode::I32 => "INT",
+            TypeCode::U64 => "BIGINT UNSIGNED",
+            TypeCode::I64 => "BIGINT",
+            TypeCode::U128 => "UHUGEINT",
+            TypeCode::I128 => "HUGEINT",
+            TypeCode::F32 => "FLOAT",
+            TypeCode::F64 => "DOUBLE",
+            TypeCode::String => "TEXT",
+            TypeCode::Blob => "BLOB",
+            TypeCode::UUID => "UUID",
+            TypeCode::Date => "DATE",
+            TypeCode::Timestamp => "TIMESTAMP",
+            TypeCode::Bool => "BOOLEAN",
+            TypeCode::Decimal => "DECIMAL",
+        }
+    }
+
+    /// The type's name in the Python binding's `TypeCode` enum.
     pub const fn wire_name(self) -> &'static str {
         match self {
             TypeCode::U8 => "U8",
@@ -73,14 +100,38 @@ impl TypeCode {
         matches!(self, TypeCode::Date | TypeCode::Timestamp)
     }
 
+    /// How a value of this type is held. Every type has exactly one form; the
+    /// other physical facts of a type (its width, sign, scalar image, PK
+    /// eligibility) are read off it.
+    #[inline(always)]
+    pub const fn form(self) -> ValueForm {
+        use FixedInt as F;
+        use ValueForm::{Scalar, Wide};
+        match self {
+            TypeCode::U8 | TypeCode::Bool => Scalar(ScalarKind::Int(F::U8)),
+            TypeCode::I8 => Scalar(ScalarKind::Int(F::I8)),
+            TypeCode::U16 => Scalar(ScalarKind::Int(F::U16)),
+            TypeCode::I16 => Scalar(ScalarKind::Int(F::I16)),
+            TypeCode::U32 => Scalar(ScalarKind::Int(F::U32)),
+            TypeCode::I32 | TypeCode::Date => Scalar(ScalarKind::Int(F::I32)),
+            TypeCode::U64 => Scalar(ScalarKind::Int(F::U64)),
+            TypeCode::I64 | TypeCode::Timestamp | TypeCode::Decimal => Scalar(ScalarKind::Int(F::I64)),
+            TypeCode::F32 => Scalar(ScalarKind::F32),
+            TypeCode::F64 => Scalar(ScalarKind::F64),
+            TypeCode::U128 | TypeCode::UUID => Wide(WideForm::Int128 { signed: false }),
+            TypeCode::I128 => Wide(WideForm::Int128 { signed: true }),
+            TypeCode::String | TypeCode::Blob => Wide(WideForm::German),
+        }
+    }
+
     /// The integer type a value of this type is stored, ordered and computed as:
     /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, `U8` for `Bool`,
     /// and the type itself otherwise.
     #[inline(always)]
-    pub(crate) const fn storage_type(self) -> TypeCode {
-        match FixedInt::from_type_code(self) {
-            Some(fi) => fi.type_code(),
-            None => self,
+    const fn storage_type(self) -> TypeCode {
+        match self.form() {
+            ValueForm::Scalar(ScalarKind::Int(fi)) => fi.type_code(),
+            _ => self,
         }
     }
 
@@ -123,7 +174,7 @@ impl TypeCode {
     /// the expression VM.
     #[inline(always)]
     pub const fn is_wide_int(self) -> bool {
-        matches!(self, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
+        matches!(self.form(), ValueForm::Wide(WideForm::Int128 { .. }))
     }
 
     /// Whether this type uses the 16-byte "German string" layout (a 4-byte
@@ -142,17 +193,18 @@ impl TypeCode {
     /// float, and string types are not signed.
     #[inline(always)]
     pub const fn is_signed_int(self) -> bool {
-        matches!(
-            self.storage_type(),
-            TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 | TypeCode::I128
-        )
+        match self.form() {
+            ValueForm::Scalar(ScalarKind::Int(fi)) => fi.is_signed(),
+            ValueForm::Wide(WideForm::Int128 { signed }) => signed,
+            _ => false,
+        }
     }
 
     /// Whether this type is a fixed-width integer of ≤ 8 bytes, any sign — the
     /// domain of [`FixedInt`], which answers through the storage type.
     #[inline(always)]
     pub const fn is_fixed_int(self) -> bool {
-        FixedInt::from_type_code(self).is_some()
+        matches!(self.form(), ValueForm::Scalar(ScalarKind::Int(_)))
     }
 
     /// Whether this type is a plain **integer** of any width or sign. BOOLEAN, a
@@ -171,7 +223,10 @@ impl TypeCode {
     /// compare equal) do not survive.
     #[inline(always)]
     pub const fn is_pk_eligible(self) -> bool {
-        self.is_fixed_int() || self.is_wide_int()
+        matches!(
+            self.form(),
+            ValueForm::Scalar(ScalarKind::Int(_)) | ValueForm::Wide(WideForm::Int128 { .. })
+        )
     }
 
     /// Byte stride (width) of this type in a column payload.
@@ -292,7 +347,7 @@ pub enum JoinKeyRule {
 
 impl core::fmt::Display for TypeCode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.wire_name())
+        f.write_str(self.sql_name())
     }
 }
 
@@ -362,7 +417,7 @@ impl core::fmt::Display for ColType {
             // was declared with: a DECIMAL's value is bounded by the integer
             // behind its scale, and `ColType` carries no declared precision.
             TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::MAX_DECIMAL_SCALE, self.scale),
-            tc => write!(f, "{tc}"),
+            tc => f.write_str(tc.sql_name()),
         }
     }
 }
@@ -429,28 +484,12 @@ impl FixedInt {
         Self::I64,
     ];
 
-    /// Exhaustive over `TypeCode` (no `_` arm): a new `TypeCode` variant is a
-    /// compile error here until someone decides whether it is a narrow integer.
+    /// The fixed int a value of `tc` is stored as, read off [`TypeCode::form`].
     #[inline(always)]
     pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
-        match tc {
-            TypeCode::U8 | TypeCode::Bool => Some(Self::U8),
-            TypeCode::I8 => Some(Self::I8),
-            TypeCode::U16 => Some(Self::U16),
-            TypeCode::I16 => Some(Self::I16),
-            TypeCode::U32 => Some(Self::U32),
-            TypeCode::I32 => Some(Self::I32),
-            TypeCode::U64 => Some(Self::U64),
-            TypeCode::I64 => Some(Self::I64),
-            TypeCode::Date => Some(Self::I32),
-            TypeCode::Timestamp | TypeCode::Decimal => Some(Self::I64),
-            TypeCode::F32
-            | TypeCode::F64
-            | TypeCode::U128
-            | TypeCode::UUID
-            | TypeCode::String
-            | TypeCode::Blob
-            | TypeCode::I128 => None,
+        match tc.form() {
+            ValueForm::Scalar(ScalarKind::Int(fi)) => Some(fi),
+            _ => None,
         }
     }
 
@@ -481,7 +520,12 @@ impl FixedInt {
     /// Byte width (1/2/4/8).
     #[inline(always)]
     pub const fn width(self) -> usize {
-        self.type_code().wire_stride()
+        match self {
+            Self::U8 | Self::I8 => 1,
+            Self::U16 | Self::I16 => 2,
+            Self::U32 | Self::I32 => 4,
+            Self::U64 | Self::I64 => 8,
+        }
     }
 
     /// The representable `(min, max)` of this integer type, widened to `i128`
@@ -527,7 +571,7 @@ impl FixedInt {
     /// Whether this integer type is signed.
     #[inline(always)]
     pub const fn is_signed(self) -> bool {
-        self.type_code().is_signed_int()
+        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
     }
 
     /// Decode the leading `width()` little-endian bytes of `b` as this integer,
@@ -603,11 +647,9 @@ pub enum ScalarKind {
 impl ScalarKind {
     /// A narrow integer's [`FixedInt`], else a float's own kind.
     pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
-        match (tc, FixedInt::from_type_code(tc)) {
-            (_, Some(fi)) => Some(Self::Int(fi)),
-            (TypeCode::F32, None) => Some(Self::F32),
-            (TypeCode::F64, None) => Some(Self::F64),
-            _ => None,
+        match tc.form() {
+            ValueForm::Scalar(k) => Some(k),
+            ValueForm::Wide(_) => None,
         }
     }
 
@@ -644,25 +686,50 @@ impl ScalarKind {
     }
 }
 
-// A new `TypeCode` is classified by `FixedInt::from_type_code`'s exhaustive
-// match; these hold the scalar/wide split and every type to its storage type's
-// width.
+/// How a value of a column type is held ([`TypeCode::form`]): a ≤8-byte scalar
+/// register image, or a 16-byte cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueForm {
+    Scalar(ScalarKind),
+    Wide(WideForm),
+}
+
+/// A 16-byte value: an integer (U128, UUID, I128), or a German-string cell
+/// (STRING, BLOB) whose content may sit in a heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WideForm {
+    Int128 { signed: bool },
+    German,
+}
+
+impl WideForm {
+    /// Order two values by their **native** bytes — an integer's 16 little-endian
+    /// bytes, a string's content already resolved out of its blob heap, not its
+    /// 16-byte cell.
+    #[inline(always)]
+    pub fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
+        match self {
+            Self::Int128 { signed } => cmp_col_window(a, b, if signed { TypeCode::I128 } else { TypeCode::U128 }),
+            Self::German => a.cmp(b),
+        }
+    }
+}
+
+// `is_german_string`, `is_float` and `wire_stride` stay literal matches, since per-row callers
+// run unoptimized in the debug build; these hold them to `form`.
 const _: () = {
     let mut i = 0;
     while i < TypeCode::ALL.len() {
         let tc = TypeCode::ALL[i];
-        let kind = ScalarKind::from_type_code(tc);
-        assert!(
-            kind.is_some() != (tc.is_wide_int() || tc.is_german_string()),
-            "a type is wide iff it has no scalar image"
-        );
-        // A temporal, decimal or boolean type is its storage integer under another name,
-        // so the two must lay out identically — `wire_stride` spells the width
-        // table separately from `storage_type`'s map.
-        assert!(
-            tc.wire_stride() == tc.storage_type().wire_stride(),
-            "a type must have its storage type's width"
-        );
+        assert!(tc.is_german_string() == matches!(tc.form(), ValueForm::Wide(WideForm::German)));
+        assert!(tc.is_float() == matches!(tc.form(), ValueForm::Scalar(ScalarKind::F32 | ScalarKind::F64)));
+        let stride = match tc.form() {
+            ValueForm::Scalar(ScalarKind::Int(fi)) => fi.width(),
+            ValueForm::Scalar(ScalarKind::F32) => 4,
+            ValueForm::Scalar(ScalarKind::F64) => 8,
+            ValueForm::Wide(_) => 16,
+        };
+        assert!(tc.wire_stride() == stride);
         i += 1;
     }
 };

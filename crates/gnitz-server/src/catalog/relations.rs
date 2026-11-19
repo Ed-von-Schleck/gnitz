@@ -1,5 +1,5 @@
 //! The state every relation registration enters and every unregistration
-//! removes — the relation's two records, its FK edges in both directions and its
+//! removes — the relation's named and shape records, its FK edges in both directions and its
 //! RESOLVE token — together with the readers of that state;
 //! and the name index, which follows every TABLE_TAB and VIEW_TAB delta instead,
 //! rename pairs and the system families' own rows included.
@@ -19,12 +19,12 @@ use gnitz_wire::{
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaDescriptor, encode_schema_record};
+use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::CatalogEngine;
-use super::sys_tables::encode_record;
+use super::sys_tables::{encode_record, encode_shape_record};
 
 /// A set of table ids to lock; a write to one table without FK edges, the
 /// common case, fits inline.
@@ -33,12 +33,12 @@ pub(crate) type LockSet = SmallVec<[u64; 4]>;
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
-    /// The relation's [`encode_record`]: what a RESOLVE answers, and what a
-    /// client's push is checked against.
+    /// The relation's [`encode_record`]: what a RESOLVE answers.
     record: Box<[u8]>,
-    /// The relation's [`encode_schema_record`]: what every SAL group of it
+    /// The relation's [`encode_shape_record`], DECIMAL scales included: what a
+    /// client's push blob is checked against, what every SAL group of it
     /// carries, and what a worker checks one against.
-    sal_record: Box<[u8]>,
+    shape_record: Box<[u8]>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
     /// The token of [`CatalogEngine::resolve_answer`], once computed. Reset by
@@ -47,20 +47,20 @@ pub(in crate::catalog) struct RelationEntry {
 }
 
 impl RelationEntry {
-    /// The entry of a relation of `schema`, whose columns `defs` describe.
-    pub(in crate::catalog) fn new(schema: &SchemaDescriptor, defs: &[CatalogColumn], fks: Vec<FkEdge>) -> Self {
+    /// The entry of a relation keyed `pk` over the columns `defs`.
+    pub(in crate::catalog) fn new(pk: &[u32], defs: &[CatalogColumn], fks: Vec<FkEdge>) -> Self {
         RelationEntry {
-            record: encode_record(schema.pk_cols(), defs),
-            sal_record: encode_schema_record(schema).into(),
+            record: encode_record(pk, defs),
+            shape_record: encode_shape_record(pk, defs),
             fks,
             token: Cell::new(None),
         }
     }
 
-    /// Re-encode both records for `schema`, whose columns `defs` describe.
-    pub(in crate::catalog) fn set_records(&mut self, schema: &SchemaDescriptor, defs: &[CatalogColumn]) {
-        self.record = encode_record(schema.pk_cols(), defs);
-        self.sal_record = encode_schema_record(schema).into();
+    /// Re-encode both records for a relation keyed `pk` over the columns `defs`.
+    pub(in crate::catalog) fn set_records(&mut self, pk: &[u32], defs: &[CatalogColumn]) {
+        self.record = encode_record(pk, defs);
+        self.shape_record = encode_shape_record(pk, defs);
     }
 }
 
@@ -77,24 +77,19 @@ impl CatalogEngine {
             .expect("every registered relation has an entry")
     }
 
-    /// `tid`'s relation and its named record; `None` for an unregistered id.
-    pub(crate) fn wire_target(&self, tid: u64) -> Option<(&Relation, &[u8])> {
-        Some((self.registry.relation(tid)?, &*self.caches.relations.get(&tid)?.record))
-    }
-
-    /// `tid`'s relation and the nameless record its SAL push groups carry;
-    /// `None` for an unregistered id.
-    pub(crate) fn sal_target(&self, tid: u64) -> Option<(&Relation, &[u8])> {
+    /// `tid`'s relation and its shape record, which a push's blob is checked
+    /// against and its SAL push groups carry; `None` for an unregistered id.
+    pub(crate) fn shape_target(&self, tid: u64) -> Option<(&Relation, &[u8])> {
         Some((
             self.registry.relation(tid)?,
-            &*self.caches.relations.get(&tid)?.sal_record,
+            &*self.caches.relations.get(&tid)?.shape_record,
         ))
     }
 
-    /// What `frame_record` decodes to, when it is the record [`Self::sal_target`]
+    /// What `frame_record` decodes to, when it is the record [`Self::shape_target`]
     /// lays `tid`'s groups out with.
     pub(crate) fn known_decode(&self, tid: u64, frame_record: &[u8]) -> Option<SchemaDescriptor> {
-        let (rel, record) = self.sal_target(tid)?;
+        let (rel, record) = self.shape_target(tid)?;
         (record == frame_record).then(|| rel.schema())
     }
 
@@ -118,7 +113,7 @@ impl CatalogEngine {
                     is_unique: ic.is_unique(),
                 })
                 .collect(),
-            schema: entry.record.as_ref().into(),
+            schema: &entry.record,
         };
         let desc = desc.encode();
         let token = entry.token.get().unwrap_or_else(|| {

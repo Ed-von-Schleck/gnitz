@@ -37,7 +37,7 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
 /// Write `rows` to `log` as the master's push of them to `tid`, in a zone of its
 /// own: that zone's LSN.
 fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) -> u64 {
-    let (rel, record) = engine.sal_target(tid).unwrap();
+    let (rel, record) = engine.shape_target(tid).unwrap();
     let mut excl = log.excl();
     let mut scope = excl.begin();
     with_routed(rows.as_mem_batch(), rel.placement(), log.num_workers(), |data| {

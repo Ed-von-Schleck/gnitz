@@ -12,7 +12,7 @@
 use crate::calendar::CalendarOp;
 use crate::like::{LikeMatcher, LikePattern};
 use crate::{ColumnLocator, SchemaDescriptor};
-use gnitz_wire::{FixedInt, MAX_DECIMAL_SCALE, ScalarKind, TypeCode, encode_german_string};
+use gnitz_wire::{FixedInt, MAX_DECIMAL_SCALE, ScalarKind, TypeCode, ValueForm, encode_german_string};
 use std::fmt;
 
 /// The register file is capped at 64: the `BoolBinary` 3VL paths, the
@@ -109,7 +109,7 @@ impl fmt::Display for ExprValidateErr {
             ExprValidateErr::ColKindMismatch { col, type_code, want } => {
                 write!(
                     f,
-                    "column {col} (type code {type_code}) cannot be used here; this operator needs {want}"
+                    "column {col} (type {type_code}) cannot be used here; this operator needs {want}"
                 )
             }
             // Already a sentence naming the format and the fault; `Debug` would
@@ -149,7 +149,7 @@ impl ColKind {
     fn admits(self, tc: TypeCode) -> bool {
         match self {
             Self::AnyCol => true,
-            Self::ScalarCol => ScalarKind::from_type_code(tc).is_some(),
+            Self::ScalarCol => matches!(tc.form(), ValueForm::Scalar(_)),
             Self::StringCol => tc.is_german_string(),
         }
     }

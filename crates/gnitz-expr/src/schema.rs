@@ -3,7 +3,7 @@
 //! contract, linked by the engine and the client alike. A reduce's output key is
 //! one of those facts.
 
-use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PkListRole, PkRule, TypeCode};
+use gnitz_wire::{KeyListRefusal, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PkListRole, TypeCode};
 
 use crate::ColumnLocator;
 
@@ -119,7 +119,7 @@ pub fn leading_pk(n: usize) -> &'static [u32] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaRefusal {
     TooManyColumns(usize),
-    Pk(PkRule),
+    Pk(KeyListRefusal),
 }
 
 impl std::fmt::Display for SchemaRefusal {

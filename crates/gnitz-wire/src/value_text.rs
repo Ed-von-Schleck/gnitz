@@ -11,7 +11,7 @@ use crate::{ColType, FixedInt, FloatText, TypeCode, write_date, write_decimal, w
 
 /// The longest text any value-text writer produces: a UUID's 36. The others
 /// are shorter — a TIMESTAMP at most 29 (`-290308-12-21 19:59:05.224192`, at
-/// `i64::MIN`), a DECIMAL [`crate::SCALED_TEXT_MAX`], a DATE 14 at its `i32`
+/// `i64::MIN`), a DECIMAL 22, a DATE 14 at its `i32`
 /// day width.
 pub const VALUE_TEXT_MAX: usize = 36;
 

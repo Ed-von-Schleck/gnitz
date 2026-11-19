@@ -3,60 +3,20 @@
 //! and the form a scalar MIN/MAX holds its running extreme in.
 
 use std::borrow::Cow;
-use std::cmp::Ordering;
 
 use super::int_cell;
 use crate::repr::MemBatch;
 use crate::schema::SchemaColumn;
 use gnitz_expr::{ColumnLocator, order_bits};
 use gnitz_wire::{RowSource, TypeCode};
-use gnitz_wire::{ScalarKind, cmp_col_window, for_each_fixed_int};
-
-/// The column types outside [`ScalarKind`]: the 16-byte integers and the
-/// German-string pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WideKind {
-    Fixed(TypeCode),
-    Bytes,
-}
-
-/// How a column's value is held and ordered: as its [`ScalarKind`] register
-/// image, or as the native bytes of a [`WideKind`] value too wide for one.
-/// Every type has exactly one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ImageKind {
-    Scalar(ScalarKind),
-    Wide(WideKind),
-}
-
-impl ImageKind {
-    pub(super) const fn of(tc: TypeCode) -> Self {
-        match ScalarKind::from_type_code(tc) {
-            Some(kind) => Self::Scalar(kind),
-            None if tc.is_german_string() => Self::Wide(WideKind::Bytes),
-            None => Self::Wide(WideKind::Fixed(tc)),
-        }
-    }
-}
-
-impl WideKind {
-    /// Order two values by their **native** bytes — a string's content, already
-    /// resolved out of its blob heap, not its 16-byte cell.
-    #[inline(always)]
-    pub(super) fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
-        match self {
-            Self::Fixed(tc) => cmp_col_window(a, b, tc),
-            Self::Bytes => a.cmp(b),
-        }
-    }
-}
+use gnitz_wire::{ScalarKind, ValueForm, WideForm, for_each_fixed_int};
 
 /// One column as an ordered index keys it: where it lies, how its image is
 /// encoded, and whether the image is complemented, which reverses its order.
 #[derive(Clone, Copy)]
 pub struct ImageCol {
     pub loc: ColumnLocator,
-    kind: ImageKind,
+    kind: ValueForm,
     invert: bool,
 }
 
@@ -64,19 +24,19 @@ impl ImageCol {
     pub fn new(loc: ColumnLocator, invert: bool) -> Self {
         ImageCol {
             loc,
-            kind: ImageKind::of(loc.type_code()),
+            kind: loc.type_code().form(),
             invert,
         }
     }
 
     /// Whether the image outgrows a scalar's 8-byte slot.
     pub fn is_wide(&self) -> bool {
-        matches!(self.kind, ImageKind::Wide(_))
+        matches!(self.kind, ValueForm::Wide(_))
     }
 
     /// Whether a key slot holds the image whole: every kind's but a byte string's.
     pub fn fits_slot(&self) -> bool {
-        self.kind != ImageKind::Wide(WideKind::Bytes)
+        self.kind != ValueForm::Wide(WideForm::German)
     }
 
     /// Append `row`'s image, **known non-NULL**.
@@ -84,9 +44,9 @@ impl ImageCol {
     pub fn append(&self, src: &impl RowSource, row: usize, out: &mut Vec<u8>) {
         let ImageCol { loc, kind, invert } = self;
         match *kind {
-            ImageKind::Scalar(kind) => out.extend_from_slice(&scalar_image(loc, kind, *invert, src, row).to_be_bytes()),
-            ImageKind::Wide(WideKind::Fixed(_)) => out.extend_from_slice(&int16_image(loc, *invert, src, row)),
-            ImageKind::Wide(WideKind::Bytes) => append_bytes_image(*invert, &loc.content(src, row), out),
+            ValueForm::Scalar(kind) => out.extend_from_slice(&scalar_image(loc, kind, *invert, src, row).to_be_bytes()),
+            ValueForm::Wide(WideForm::Int128 { .. }) => out.extend_from_slice(&int16_image(loc, *invert, src, row)),
+            ValueForm::Wide(WideForm::German) => append_bytes_image(*invert, &loc.content(src, row), out),
         }
     }
 
@@ -97,7 +57,7 @@ impl ImageCol {
     pub fn write_slot(&self, src: &impl RowSource, row: usize, slot: &mut [u8], whole: &mut Vec<u8>) {
         let ImageCol { loc, kind, invert } = self;
         match *kind {
-            ImageKind::Scalar(kind) => {
+            ValueForm::Scalar(kind) => {
                 // Zero-padded where the slot is 16 bytes wide: a value index's, when
                 // another of its aggregates is wide.
                 let (image, pad) = slot.split_at_mut(8);
@@ -106,8 +66,8 @@ impl ImageCol {
                     *pad = [0; 8];
                 }
             }
-            ImageKind::Wide(WideKind::Fixed(_)) => slot.copy_from_slice(&int16_image(loc, *invert, src, row)),
-            ImageKind::Wide(WideKind::Bytes) => {
+            ValueForm::Wide(WideForm::Int128 { .. }) => slot.copy_from_slice(&int16_image(loc, *invert, src, row)),
+            ValueForm::Wide(WideForm::German) => {
                 let at = whole.len();
                 append_bytes_image(*invert, &loc.content(src, row), whole);
                 let image = &whole[at..];
@@ -131,7 +91,7 @@ impl ImageCol {
         at: usize,
         slot: usize,
     ) -> bool {
-        let ImageKind::Scalar(kind) = self.kind else {
+        let ValueForm::Scalar(kind) = self.kind else {
             return false;
         };
         let flip = if self.invert { u64::MAX } else { 0 };
@@ -191,14 +151,14 @@ pub const IMAGE_COL: SchemaColumn = SchemaColumn::new(TypeCode::Blob, false);
 #[inline(always)]
 pub(super) fn wide_native<'a>(
     loc: &ColumnLocator,
-    kind: WideKind,
+    kind: WideForm,
     mb: &'a impl RowSource,
     row: usize,
     scratch: &'a mut [u8; 16],
 ) -> Cow<'a, [u8]> {
     match kind {
-        WideKind::Bytes => loc.content(mb, row),
-        WideKind::Fixed(_) => Cow::Borrowed(loc.native_le_bytes(mb, row, scratch)),
+        WideForm::German => loc.content(mb, row),
+        WideForm::Int128 { .. } => Cow::Borrowed(loc.native_le_bytes(mb, row, scratch)),
     }
 }
 
@@ -236,18 +196,18 @@ fn int16_image(loc: &ColumnLocator, invert: bool, src: &impl RowSource, row: usi
 /// [`append_bytes_image`]'s and [`int16_image`]'s inverse, in place: decodes
 /// the index image in `v` into the native bytes at its front and returns their
 /// length.
-pub(super) fn wide_native_of_image(kind: WideKind, invert: bool, v: &mut [u8]) -> usize {
+pub(super) fn wide_native_of_image(kind: WideForm, invert: bool, v: &mut [u8]) -> usize {
     if invert {
         v.iter_mut().for_each(|b| *b = !*b);
     }
     match kind {
-        WideKind::Fixed(tc) => {
+        WideForm::Int128 { signed } => {
             let (n, mut native) = (v.len(), [0u8; 16]);
-            gnitz_wire::decode_pk_cell(v, tc.is_signed_int(), &mut native[..n]);
+            gnitz_wire::decode_pk_cell(v, signed, &mut native[..n]);
             v.copy_from_slice(&native[..n]);
             n
         }
-        WideKind::Bytes => {
+        WideForm::German => {
             debug_assert!(v.ends_with(&[0, 0]), "a byte-string image ends in its terminator");
             let n = v.len() - 2;
             let (mut r, mut w) = (0, 0);

@@ -284,7 +284,7 @@ fn a_refused_insert_names_its_rule() {
         ),
         (
             "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET s = EXCLUDED.v",
-            "cannot assign a value of type I64",
+            "cannot assign a value of type BIGINT",
         ),
         // A view is read-only, a reserved name is refused before the catalog is
         // probed, and a stream holds no row to resolve a conflict against.

@@ -882,17 +882,17 @@ fn each_refused_form_names_its_rule() {
             vec![t(T::Bool)],
             "operator Add is not supported on a BOOLEAN operand",
         ),
-        ("c1 = 1", vec![t(T::Bool)], "comparison Eq between BOOLEAN and I64"),
+        ("c1 = 1", vec![t(T::Bool)], "comparison Eq between BOOLEAN and BIGINT"),
         (
             "c1 IN (1, 0)",
             vec![t(T::Bool)],
-            "comparison Eq between BOOLEAN and I64",
+            "comparison Eq between BOOLEAN and BIGINT",
         ),
-        ("c1 = TRUE", vec![t(T::I64)], "comparison Eq between I64 and BOOLEAN"),
+        ("c1 = TRUE", vec![t(T::I64)], "comparison Eq between BIGINT and BOOLEAN"),
         (
             "c1 AND TRUE",
             vec![t(T::I64)],
-            "column \"c1\" is I64; a condition must be BOOLEAN",
+            "column \"c1\" is BIGINT; a condition must be BOOLEAN",
         ),
         (
             "CASE WHEN c1 THEN 1 END",
@@ -907,15 +907,15 @@ fn each_refused_form_names_its_rule() {
         (
             "GREATEST(c1, 1)",
             vec![t(T::Bool)],
-            "is I64; CAST it to use it as BOOLEAN",
+            "is BIGINT; CAST it to use it as BOOLEAN",
         ),
         ("ABS(c1)", vec![t(T::Bool)], "a numeric function takes a number"),
         ("LEFT('abc', c1)", vec![t(T::Bool)], "must be an integer expression"),
-        ("c1 || 'x'", vec![t(T::Bool)], "is BOOLEAN; CAST it to use it as STRING"),
+        ("c1 || 'x'", vec![t(T::Bool)], "is BOOLEAN; CAST it to use it as TEXT"),
         (
             "CAST(c1 AS DOUBLE)",
             vec![t(T::Bool)],
-            "CAST of BOOLEAN to F64 is not supported",
+            "CAST of BOOLEAN to DOUBLE is not supported",
         ),
         (
             "CAST(c1 AS DATE)",
@@ -925,7 +925,7 @@ fn each_refused_form_names_its_rule() {
         (
             "CAST(c1 AS BOOLEAN)",
             vec![t(T::F64)],
-            "CAST of F64 to BOOLEAN is not supported",
+            "CAST of DOUBLE to BOOLEAN is not supported",
         ),
         (
             "CAST(c1 AS BOOLEAN)",
@@ -935,17 +935,17 @@ fn each_refused_form_names_its_rule() {
         (
             "c1 AND 'x'",
             vec![t(T::String)],
-            "column \"c1\" is STRING; a condition must be BOOLEAN",
+            "column \"c1\" is TEXT; a condition must be BOOLEAN",
         ),
         (
             "c1 OR 'x'",
             vec![t(T::String)],
-            "column \"c1\" is STRING; a condition must be BOOLEAN",
+            "column \"c1\" is TEXT; a condition must be BOOLEAN",
         ),
         (
             "NOT c1",
             vec![t(T::String)],
-            "column \"c1\" is STRING; a condition must be BOOLEAN",
+            "column \"c1\" is TEXT; a condition must be BOOLEAN",
         ),
         ("-c1", vec![t(T::String)], "column \"c1\" is a string"),
         ("ABS(c1)", vec![t(T::String)], "column \"c1\" is a string"),
@@ -996,12 +996,12 @@ fn each_refused_form_names_its_rule() {
         (
             "c1 + 1",
             vec![t(T::U128)],
-            "column \"c1\" is U128; 128-bit columns cannot be used",
+            "column \"c1\" is UHUGEINT; 128-bit columns cannot be used",
         ),
         (
             "c1 IN (1, 2)",
             vec![t(T::I128)],
-            "column \"c1\" is I128; 128-bit columns cannot be used",
+            "column \"c1\" is HUGEINT; 128-bit columns cannot be used",
         ),
         (
             "GREATEST(c1, c1)",
@@ -1009,7 +1009,11 @@ fn each_refused_form_names_its_rule() {
             "column \"c1\" is UUID; 128-bit columns cannot be used",
         ),
         ("CAST(c1 AS UUID)", vec![t(T::I64)], "CAST to UUID is not supported"),
-        ("CAST(c1 AS UINT128)", vec![t(T::I64)], "CAST to U128 is not supported"),
+        (
+            "CAST(c1 AS UINT128)",
+            vec![t(T::I64)],
+            "CAST to UHUGEINT is not supported",
+        ),
         (
             "UUID '00000000-0000-0000-0000-000000000001'",
             vec![t(T::I64)],
@@ -1044,7 +1048,7 @@ fn each_refused_form_names_its_rule() {
         (
             "CASE WHEN TRUE THEN c1 ELSE 1.5 END",
             vec![t(T::Date)],
-            "cannot mix DATE with F64",
+            "cannot mix DATE with DOUBLE",
         ),
         (
             "CAST(c1 AS DATE)",
@@ -1054,11 +1058,11 @@ fn each_refused_form_names_its_rule() {
         (
             "EXTRACT(YEAR FROM c1)",
             vec![t(T::I64)],
-            "a calendar function takes a DATE or TIMESTAMP; column \"c1\" is I64",
+            "a calendar function takes a DATE or TIMESTAMP; column \"c1\" is BIGINT",
         ),
         // A string compared with an integer-stored column must spell a value of it.
         ("c1 = 'abc'", vec![dec(2)], "invalid DECIMAL(18, 2) literal: 'abc'"),
-        ("c1 = 'abc'", vec![t(T::I64)], "invalid I64 literal: 'abc'"),
+        ("c1 = 'abc'", vec![t(T::I64)], "invalid BIGINT literal: 'abc'"),
         (
             "c1 + c2",
             vec![dec(2), t(T::String)],
@@ -1138,12 +1142,12 @@ fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
         (
             "c1",
             BoundExpr::ColRef(1),
-            "column \"c1\" is I64; a condition must be BOOLEAN",
+            "column \"c1\" is BIGINT; a condition must be BOOLEAN",
         ),
         (
             "TRUE OR c1",
             settled,
-            "column \"c1\" is I64; a condition must be BOOLEAN",
+            "column \"c1\" is BIGINT; a condition must be BOOLEAN",
         ),
         (
             "c1 + 'x'",

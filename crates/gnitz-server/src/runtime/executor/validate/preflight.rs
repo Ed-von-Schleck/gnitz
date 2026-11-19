@@ -31,7 +31,7 @@ use gnitz_store::relation::{PkRule, Relation};
 use gnitz_wire::{FkAction, PkBuf, PkKeys, WireConflictMode};
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::{Batch, MemBatch};
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{SchemaDescriptor, pk_keys, pk_keys_of_images};
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
 /// `plan` its replies fold into.
@@ -309,7 +309,7 @@ fn plan_pk_checks<'a>(
         payload_refs.sort_unstable();
         payload_refs.dedup();
         if !payload_refs.is_empty() {
-            let keys = PkKeys::from_keys(stride, t.fold.keys().copied());
+            let keys = pk_keys(stride, t.fold.keys().copied());
             if keys.is_empty() {
                 continue;
             }
@@ -328,7 +328,7 @@ fn plan_pk_checks<'a>(
             .iter()
             .filter(|(_, e)| part_pk_ref && matches!(e.last, FoldOp::Deleted))
             .map(|(pk, _)| *pk);
-        let keys = PkKeys::from_keys(stride, t.probe_keys.iter().copied().chain(deleted));
+        let keys = pk_keys(stride, t.probe_keys.iter().copied().chain(deleted));
         if keys.is_empty() {
             continue;
         }
@@ -377,7 +377,7 @@ fn plan_unique_checks<'a>(
                 }
                 spans
             };
-            let mut keys = PkKeys::from_keys(key_size, spans.chunks_exact(key_size));
+            let mut keys = pk_keys(key_size, spans.chunks_exact(key_size));
             // Each surviving PK gave one span, so a span the dedup collapsed is
             // two rows of the bundle claiming it.
             if keys.len() * key_size != spans.len() {
@@ -467,7 +467,7 @@ fn plan_fk_existence<'a>(
                 continue;
             }
         }
-        let keys = PkKeys::from_images(span, values.keys().copied());
+        let keys = pk_keys_of_images(span, values.keys().copied());
         checks.push(Check::new(parent, probe, keys, Rule::FkExists { edge, span, values })?);
     }
     Ok(())
@@ -694,7 +694,7 @@ async fn removed_references(
             let cap = NonZeroU64::MIN.saturating_add(admitted as u64);
             let spec = index.key_spec();
             // The parent column has the FK column's type, so its image is the span's.
-            let keys = PkKeys::from_images(spec.key_size(), values);
+            let keys = pk_keys_of_images(spec.key_size(), values);
             let plan = ReferencePlan { edge, spec: spec.clone(), cascades };
             checks.push(Check::new(child, Probe::Index(cols, cap), keys, plan)?);
         }

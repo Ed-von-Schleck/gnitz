@@ -223,7 +223,7 @@ fn test_create_unique_index_on_string_blob_rejected() {
         for col in ["name", "data"] {
             let e = engine.create_index("public.t", &[col], unique).unwrap_err();
             assert!(
-                e.contains("Index: column list column") && e.contains("can be key columns"),
+                e.contains("Index: column list column") && e.contains("can be a key column"),
                 "unique={unique} col={col} got: {e}"
             );
         }

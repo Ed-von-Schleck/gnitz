@@ -65,28 +65,16 @@ pub fn le_scalars<T: LeScalar>(src: &[u8]) -> Result<Vec<T>, String> {
             src.len()
         ));
     }
-    let mut v = Vec::new();
-    extend_from_le_bytes(&mut v, src);
-    Ok(v)
-}
-
-/// Append `src`, a whole number of little-endian `T`s, to `dst` in one copy.
-pub fn extend_from_le_bytes<T: LeScalar>(dst: &mut Vec<T>, src: &[u8]) {
-    let size = std::mem::size_of::<T>();
-    assert!(
-        src.len().is_multiple_of(size),
-        "extend_from_le_bytes: {} bytes is not a whole number of {size}-byte scalars",
-        src.len()
-    );
-    let (base, n) = (dst.len(), src.len() / size);
-    dst.reserve(n);
-    // SAFETY: `reserve` leaves room for `n` more `T`s, i.e. `src.len()` bytes past
-    // `base`; the regions do not overlap; the copy initializes every element
-    // `set_len` publishes, and `LeScalar` makes every byte pattern a valid `T`.
+    let n = src.len() / size;
+    let mut v = Vec::<T>::with_capacity(n);
+    // SAFETY: `v` has room for `n` `T`s = `src.len()` bytes (checked whole above); the
+    // regions do not overlap; the copy initializes every element `set_len` publishes,
+    // and `LeScalar` makes every byte pattern a valid `T`.
     unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(base).cast::<u8>(), src.len());
-        dst.set_len(base + n);
+        std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr().cast::<u8>(), src.len());
+        v.set_len(n);
     }
+    Ok(v)
 }
 
 /// A `u64` with its low `n` bits set; all ones for `n >= 64`.

@@ -2,8 +2,8 @@ use super::{Cut, DEFAULT_RAM_TIER_BYTES, RecoverySource, flush_barrier};
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table, table_shards};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
-use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::pk_keys;
 
 /// Instructions per row of `Table::ingest` at the cadence a worker
 /// runs it: a tick is one ingest and the memtable drains on its own budget. One
@@ -226,7 +226,7 @@ fn sealed_read_bench() {
         for n in [1u64, 64, 4096] {
             let step = held / (n + 1);
             let key_bytes: Vec<[u8; 8]> = (1..=n).map(|i| (i * step).to_be_bytes()).collect();
-            let passes = vec![PkKeys::from_keys(8, key_bytes.iter().map(|k| &k[..])); gathers];
+            let passes = vec![pk_keys(8, key_bytes.iter().map(|k| &k[..])); gathers];
             let (rows, instructions) = counter.measure(|| {
                 let gather = |keys| {
                     t.gather(keys, Cut::Sealed)

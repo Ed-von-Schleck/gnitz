@@ -31,7 +31,7 @@ wire_enum! {
 impl AggFunc {
     /// True iff `Agg(A + B) == Agg(A) + Agg(B)`: a delta folds with no history
     /// replay, and the value over no rows is `0`.
-    pub const fn is_linear(self) -> bool {
+    const fn is_linear(self) -> bool {
         match self {
             AggFunc::Count
             | AggFunc::CountNonNull

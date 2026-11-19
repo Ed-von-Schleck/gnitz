@@ -5,7 +5,6 @@ use crate::catalog::sys_tables::encode_record;
 use crate::catalog::{SysFamily, SysFamilyExt};
 use crate::test_support::{arb_schema, cols_of};
 
-use gnitz_wire::schema_record::check_same_types;
 use gnitz_wire::{ColumnDef, MAX_PK_COLUMNS};
 use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, decode_schema_record};
@@ -19,20 +18,16 @@ proptest! {
         prop_assert_eq!(decode_schema_record(&record).unwrap(), schema);
     }
 
-    /// A record the catalog admits for a relation — names and hidden flags free
-    /// to differ — decodes to the relation's own schema.
+    /// A named record decodes to the relation's own schema whatever its names
+    /// and hidden flags.
     #[test]
-    fn an_admitted_record_decodes_as_itself(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
+    fn a_named_record_decodes_as_its_schema(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
         let mut defs: Vec<ColumnDef> = cols_of(&schema).into_iter().map(|c| c.def).collect();
         for c in &mut defs {
             c.name = format!("renamed_{}", c.name).into();
             c.is_hidden = hidden;
         }
         let frame = gnitz_wire::schema_record::encode(defs.iter().map(ColumnDef::record_col), schema.pk_cols());
-        prop_assert_eq!(
-            check_same_types(&frame, &encode_record(schema.pk_cols(), &cols_of(&schema))),
-            Ok(())
-        );
         prop_assert_eq!(decode_schema_record(&frame).unwrap(), schema);
     }
 }

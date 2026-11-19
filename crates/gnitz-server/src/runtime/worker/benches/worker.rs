@@ -7,7 +7,7 @@ use crate::test_support::{
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
-use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
+use gnitz_wire::{PkColList, ReadBound, ReadSpec, WireStatus};
 
 /// Requests an arm writes, unless it says otherwise.
 const REQUESTS: u32 = 4096;
@@ -38,7 +38,7 @@ fn arm(
     let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
     let batch = make_batch_raw(&make_schema_u64_i64(), &rows);
     engine.registry.ingest(tid, batch).unwrap();
-    let record = engine.sal_target(tid).unwrap().1.to_vec();
+    let record = engine.shape_target(tid).unwrap().1.to_vec();
     let (mut wp, sal, rx) = worker_over(&mut engine, 1 << 26, 32 << 20);
     // Independent client requests: each under a hold of its own.
     let mut acked = 0;
@@ -104,7 +104,7 @@ fn worker_request_bench() {
 
     let scan = |excl: &mut SalExcl, tid, _: &[u8], id: u32| {
         let key = (id as u64 % HELD).to_be_bytes();
-        let spec = ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, [&key[..]]))).encode();
+        let spec = ReadSpec::all_rows(ReadBound::PkSet(gnitz_zset::schema::pk_keys(8, [&key[..]]))).encode();
         let read = Read::ScanSpec {
             tid,
             reply_layout: schema.layout_digest(),

@@ -13,7 +13,6 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
-use gnitz_wire::{RadixKey, radix_sort_by_key};
 use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
@@ -22,11 +21,11 @@ use super::scatter::{ColumnarSource, Pick};
 use super::seek::gallop_from;
 use super::string_heap::{BlobCache, rebase_string_cells, row_long_bytes};
 use super::writer::DirectWriter;
-use crate::schema::{PayloadOrder, SchemaColumn, SchemaDescriptor, with_payload_cmp};
-use gnitz_wire::{
-    Heap, NARROW_PK_MAX_BYTES, PkSortKey, REG_PAYLOAD_START, REG_WEIGHT, RowSource, ScalarKind, native_key_image,
-    pack_pk_be, pk_width_dispatch,
+use crate::schema::{
+    PayloadOrder, PkSortKey, RadixKey, SchemaColumn, SchemaDescriptor, pack_pk_be, pk_width_dispatch,
+    radix_sort_by_key, with_payload_cmp,
 };
+use gnitz_wire::{Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT, RowSource, ScalarKind, native_key_image};
 
 mod loser_tree;
 pub use loser_tree::{LoserTree, Player};

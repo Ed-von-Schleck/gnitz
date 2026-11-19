@@ -3,12 +3,12 @@ use gnitz_foundation::perf::{Counters, Event};
 use gnitz_foundation::rng::Rng;
 use std::hint::black_box;
 
-/// Instructions and cycles per key of [`PkKeys::from_keys`] at a stride in each of
+/// Instructions and cycles per key of [`pk_keys`] at a stride in each of
 /// its sort arms, over random words, over a dense id range shuffled, and over that
 /// range ascending; at a small, a chunk-sized and a far-past-cache `n`.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn pk_keys_from_keys_bench() {
+fn pk_keys_bench() {
     let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     for shape in ["random", "dense-shuffled", "dense-ascending"] {
         for n in [1024usize, 65_536, 4 << 20] {
@@ -33,13 +33,12 @@ fn pk_keys_from_keys_bench() {
                         }
                     }
                 }
-                black_box(PkKeys::from_keys(stride, flat.chunks_exact(stride)));
-                let (keys, counts) =
-                    counters.measure(|| PkKeys::from_keys(stride, black_box(&flat).chunks_exact(stride)));
+                black_box(pk_keys(stride, flat.chunks_exact(stride)));
+                let (keys, counts) = counters.measure(|| pk_keys(stride, black_box(&flat).chunks_exact(stride)));
                 black_box(keys);
                 let [instr, cycles] = counts.map(|count| count as f64 / n as f64);
                 println!(
-                    "pk_keys_from_keys_bench {shape:<15} n={n:<8} stride={stride:<3} {instr:7.1} instr/key, {cycles:7.1} cycles/key"
+                    "pk_keys_bench {shape:<15} n={n:<8} stride={stride:<3} {instr:7.1} instr/key, {cycles:7.1} cycles/key"
                 );
             }
         }

@@ -1,6 +1,7 @@
 //! The client batch: the engine's [`Batch`] under a client [`Schema`], its
 //! builders, and its WAL-block decode.
 
+use gnitz_zset::schema::pk_keys;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
@@ -150,7 +151,7 @@ impl ZSetBatch {
     /// The keys as a read's key set.
     pub fn pk_keys(&self) -> PkKeys {
         let stride = self.layout().pk_stride();
-        PkKeys::from_keys(stride, self.view().pk().chunks_exact(stride))
+        pk_keys(stride, self.view().pk().chunks_exact(stride))
     }
 
     // ── Writes ──────────────────────────────────────────────────────────────

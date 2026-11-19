@@ -10,7 +10,7 @@ use gnitz_zset::schema::{SchemaDescriptor, decode_schema_record};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MirrorRecord {
     pub(crate) name: RelName,
-    /// The view's schema record; the copy's layout.
+    /// The view's shape record; the copy's layout.
     pub(crate) schema: Vec<u8>,
     /// Whether two of the view's rows may share a PK.
     pub(crate) pk_repeats: bool,

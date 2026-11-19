@@ -554,7 +554,7 @@ impl Shell {
                 }
                 vec![
                     c.name.to_string(),
-                    gnitz_sql::sql_type_name(c.ty),
+                    c.ty.to_string(),
                     if c.is_nullable { "" } else { "not null" }.to_string(),
                     key.join(", "),
                 ]

@@ -377,8 +377,58 @@ fn validate_string_cells(mb: &MemBatch<'_>) -> Result<usize, &'static str> {
         true
     })
     .ok_or("data WAL German string is not in canonical form")?;
-    simdutf8::basic::from_utf8(&text).map_err(|_| "a STRING cell is not UTF-8")?;
+    simdutf8::basic::from_utf8(&text).map_err(|_| "a TEXT cell is not UTF-8")?;
     Ok(dead)
+}
+
+/// The first `(row, payload slot)` whose little-endian `u64` null word in
+/// `null_bmp` sets a bit outside the `nullable` slots, past the last payload
+/// slot included.
+fn first_not_null_violation(nullable: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
+    let not_null = !nullable;
+    let words = null_bmp.as_chunks::<8>().0;
+    // A conforming batch takes only this branch-free pass.
+    if not_null == 0 || words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & not_null == 0 {
+        return None;
+    }
+    words.iter().enumerate().find_map(|(row, w)| {
+        let bad = u64::from_le_bytes(*w) & not_null;
+        (bad != 0).then(|| (row, bad.trailing_zeros() as usize))
+    })
+}
+
+/// The first `(row, payload slot)` whose null bit in `null_bmp`, among the
+/// `nullable` slots, sits over a non-zero cell: NULL encodes as a zeroed cell.
+/// `col(slot)` is that slot's region and its cell width.
+fn first_valued_null<'a>(
+    nullable: u64,
+    null_bmp: &[u8],
+    col: impl Fn(usize) -> (&'a [u8], usize),
+) -> Option<(usize, usize)> {
+    let words = null_bmp.as_chunks::<8>().0;
+    // A batch holding no NULL takes only this branch-free pass.
+    let present = words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & nullable;
+    let mut first: Option<(usize, usize)> = None;
+    // One pass per slot that holds a NULL anywhere.
+    for slot in gnitz_wire::BitIter(present) {
+        let (cells, width) = col(slot);
+        let row = gnitz_wire::by_cell_width!(width, |T| valued_null_row::<{ size_of::<T>() }>(words, cells, slot));
+        if let Some(row) = row.filter(|&r| first.is_none_or(|(f, _)| r < f)) {
+            first = Some((row, slot));
+        }
+    }
+    first
+}
+
+/// The first row whose null word sets bit `slot` over a non-zero `W`-byte cell.
+fn valued_null_row<const W: usize>(words: &[[u8; 8]], cells: &[u8], slot: usize) -> Option<usize> {
+    let cells = cells.as_chunks::<W>().0;
+    let valued = |(w, c): (&[u8; 8], &[u8; W])| (u64::from_le_bytes(*w) >> slot) & 1 != 0 && *c != [0u8; W];
+    // A conforming column takes only this pass, which has no early exit to branch on.
+    if !words.iter().zip(cells).fold(false, |any, wc| any | valued(wc)) {
+        return None;
+    }
+    words.iter().zip(cells).position(valued)
 }
 
 impl<'a> MemBatch<'a> {
@@ -388,7 +438,7 @@ impl<'a> MemBatch<'a> {
     /// would key a row and its retraction apart.
     pub fn null_breach(&self) -> Option<(&'static str, (usize, usize))> {
         let schema = self.schema;
-        if let Some(at) = gnitz_wire::first_not_null_violation(schema.nullable_payload_slots(), self.null_bmp()) {
+        if let Some(at) = first_not_null_violation(schema.nullable_payload_slots(), self.null_bmp()) {
             return Some(("a null bit on a NOT NULL column", at));
         }
         let col = |pi| {
@@ -397,7 +447,7 @@ impl<'a> MemBatch<'a> {
                 schema.region_stride(gnitz_wire::REG_PAYLOAD_START + pi),
             )
         };
-        gnitz_wire::first_valued_null(schema.nullable_payload_slots(), self.null_bmp(), col)
+        first_valued_null(schema.nullable_payload_slots(), self.null_bmp(), col)
             .map(|at| ("a non-zero cell under a NULL", at))
     }
 

@@ -162,7 +162,7 @@ impl AdmittedPush {
 }
 
 /// Judge the push frame `data` against the catalog, as `access`: its token must
-/// name a target that serves it, and the schema record in its blob must lay out
+/// name a target that serves it, and the shape record in its blob must lay out
 /// the target's columns. Its data block is certified where it lies, and the
 /// answer holds the block's range in `data`; `None` for an empty delta. A push
 /// to a stream must also pass the stream rule ([`check_stream_push`]), an empty
@@ -179,8 +179,8 @@ pub(super) fn admit_push(
     let target = ctrl.hdr.target();
     let (tid, mode) = (target.tid, ctrl.hdr.flags.conflict_mode);
     let kind = target_kind(cat, target, access)?;
-    let (rel, record) = cat.wire_target(tid).expect("target_kind found the target");
-    gnitz_wire::schema_record::check_same_types(&data[ctrl.blob.clone()], record).map_err(decode_fault)?;
+    let (rel, record) = cat.shape_target(tid).expect("target_kind found the target");
+    gnitz_wire::schema_record::check_shape(&data[ctrl.blob.clone()], record).map_err(decode_fault)?;
     let block = ctrl
         .data
         .map(|r| PushedBlock::certify(data, r, rel.schema()))

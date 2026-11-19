@@ -1,8 +1,8 @@
 //! The system catalog: the system families — their registry, and per family the
 //! row, payload slots, writer and reader one `sys_row!` declaration yields, so
 //! the client's rows and the engine's are laid out and read back by the same
-//! list — the stored-shape digest and [`EXPR_BLOB_VERSION`], the system and user
-//! id ranges, and [`bool_word`].
+//! list — the stored-shape digest, [`EXPR_BLOB_VERSION`] and
+//! [`VIEW_DEF_VERSION`], the system and user id ranges, and [`bool_word`].
 
 use std::sync::Arc;
 
@@ -307,7 +307,8 @@ sys_families! {
         compress: Bool,
         /// The user view's body as its planner recorded it, for a client to
         /// write the view again; the engine stores it verbatim and reads none of
-        /// it. Empty for a chain segment, and for a view no planner wrote.
+        /// it. Laid out as [`VIEW_DEF_VERSION`] names. Empty for a chain segment,
+        /// and for a view no planner wrote.
         definition: Blob,
     }
 
@@ -650,7 +651,8 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
 /// The family half is folded straight over [`SysFamily::ALL`], so a family added
 /// there is covered without a second edit. The version consts cover what that
 /// fold cannot see: a `Blob` column's bytes are as durable as its neighbours',
-/// but its internal layout is invisible to a fold over names and types.
+/// but its internal layout is invisible to a fold over names and types. They
+/// cover a circuit, the expression programs inside one, and a view's definition.
 pub const SYS_SCHEMA_DIGEST: u64 = {
     let mut h = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
@@ -660,12 +662,17 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
     }
     h = (h ^ crate::circuit::CIRCUIT_VERSION as u64).wrapping_mul(FNV_PRIME);
     h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(FNV_PRIME);
+    h = (h ^ VIEW_DEF_VERSION as u64).wrapping_mul(FNV_PRIME);
     h
 };
 
 /// Version of the compiled expression-program blob `gnitz-expr` lays out, folded
 /// into [`SYS_SCHEMA_DIGEST`].
 pub const EXPR_BLOB_VERSION: u8 = 9;
+
+/// Version of the user-view definition blob `gnitz-sql` lays out in a `VIEW_TAB`
+/// row's `definition`, folded into [`SYS_SCHEMA_DIGEST`].
+pub const VIEW_DEF_VERSION: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // Object-id ranges

@@ -118,7 +118,7 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
     let f32_bits = |v: f32| u128::from(v.to_bits());
     for (tc, src, want) in [
         (I64, "2.5", Ok(3)),
-        (I8, "127.5", Err("I8 value out of range: 127.5")),
+        (I8, "127.5", Err("TINYINT value out of range: 127.5")),
         (F64, "5", Ok(f64_bits(5.0))),
         (F64, "-0.0", Ok(f64_bits(-0.0))),
         (F64, "DATE '2020-01-02'", Ok(f64_bits(18263.0))),
@@ -132,9 +132,9 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
         // column refuses one, where it was stored as an infinity.
         // A literal past `i128` has no exact decimal, so it is quoted as its
         // float.
-        (F32, "1e39", Err("F32 value out of range: 1e39")),
+        (F32, "1e39", Err("FLOAT value out of range: 1e39")),
         (I64, "1.10", Ok(1)),
-        (I8, "-128.5", Err("I8 value out of range: -128.5")),
+        (I8, "-128.5", Err("TINYINT value out of range: -128.5")),
         (
             Date,
             "123456789012345678901.5",
@@ -145,7 +145,7 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
         (
             String,
             "DATE '2020-01-02'",
-            Err("DATE '2020-01-02' is not a STRING value"),
+            Err("DATE '2020-01-02' is not a TEXT value"),
         ),
         (
             Bool,
@@ -155,13 +155,13 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
         (
             F32,
             U128_MAX,
-            Err("F32 value out of range: 340282366920938463463374607431768211455"),
+            Err("FLOAT value out of range: 340282366920938463463374607431768211455"),
         ),
-        (F64, "1e400", Err("F64 value out of range: Infinity")),
+        (F64, "1e400", Err("DOUBLE value out of range: Infinity")),
         (Date, "1.5", Err("1.5 is not a DATE value")),
-        (U32, "'5'", Err("invalid U32 literal: '5'")),
-        (F64, "'5'", Err("invalid F64 literal: '5'")),
-        (String, "5", Err("5 is not a STRING value")),
+        (U32, "'5'", Err("invalid INT UNSIGNED literal: '5'")),
+        (F64, "'5'", Err("invalid DOUBLE literal: '5'")),
+        (String, "5", Err("5 is not a TEXT value")),
         (Blob, "'5'", Err("invalid BLOB literal: '5'")),
     ] {
         let got = assign(&lit(src), ColType::of(tc));

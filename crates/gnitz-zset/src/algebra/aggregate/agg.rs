@@ -7,12 +7,10 @@ use std::rc::Rc;
 use crate::algebra::{int_cell, zeroed};
 use crate::repr::{Batch, DirectWriter, MemBatch, vec_bytes};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{AggFunc, FixedInt, ScalarKind, for_each_fixed_int};
+use gnitz_wire::{AggFunc, FixedInt, ScalarKind, ValueForm, WideForm, for_each_fixed_int};
 use gnitz_wire::{RowSource, TypeCode};
 
-use crate::algebra::order_image::{
-    ImageCol, ImageKind, WideKind, scalar_image, scalar_native_of_image, wide_native, wide_native_of_image,
-};
+use crate::algebra::order_image::{ImageCol, scalar_image, scalar_native_of_image, wide_native, wide_native_of_image};
 
 /// One aggregate: the column it reads, the output column it fills, and what a
 /// row does to a group's value. The values live in an [`AggValues`].
@@ -47,7 +45,7 @@ enum StepKind {
     /// MAX, so the smaller image always wins.
     Extreme {
         max: bool,
-        kind: ImageKind,
+        kind: ValueForm,
     },
 }
 
@@ -65,10 +63,7 @@ impl StepKind {
             },
             AggFunc::Sum => StepKind::Sum(scalar()),
             AggFunc::FiniteSum => StepKind::FiniteSum(scalar()),
-            AggFunc::Min | AggFunc::Max => StepKind::Extreme {
-                max: op == AggFunc::Max,
-                kind: ImageKind::of(tc),
-            },
+            AggFunc::Min | AggFunc::Max => StepKind::Extreme { max: op == AggFunc::Max, kind: tc.form() },
         }
     }
 }
@@ -468,7 +463,7 @@ impl Agg {
     }
 
     pub fn is_wide(&self) -> bool {
-        matches!(self.kind, StepKind::Extreme { kind: ImageKind::Wide(_), .. })
+        matches!(self.kind, StepKind::Extreme { kind: ValueForm::Wide(_), .. })
     }
 
     /// A count or an integer sum: exact whatever the row order.
@@ -517,11 +512,11 @@ impl AggValues {
         };
         let at = self.at(k, g);
         match kind {
-            ImageKind::Scalar(_) => {
+            ValueForm::Scalar(_) => {
                 self.acc[at] = u64::from_be_bytes(image[..8].try_into().unwrap()) as i64;
                 self.has[at] = true;
             }
-            ImageKind::Wide(kind) => {
+            ValueForm::Wide(kind) => {
                 let start = self.reserve_wide(at, image.len());
                 let room = &mut self.heap[start..start + image.len()];
                 room.copy_from_slice(image);
@@ -570,10 +565,10 @@ impl AggValues {
             StepKind::Extreme { max, kind } => {
                 debug_assert!(weight > 0, "an extreme cannot retract: step it with positive rows only");
                 match kind {
-                    ImageKind::Scalar(kind) => {
+                    ValueForm::Scalar(kind) => {
                         Least::step(&mut self.slot(k, g), 0, scalar_image(&loc, kind, max, rows, row))
                     }
-                    ImageKind::Wide(kind) => {
+                    ValueForm::Wide(kind) => {
                         let mut scratch = [0u8; 16];
                         let v = wide_native(&loc, kind, rows, row, &mut scratch);
                         let wins = if max { Ordering::Greater } else { Ordering::Less };
@@ -660,7 +655,7 @@ impl AggValues {
         self.reset(inserted.groups);
         for k in 0..self.aggs.len() {
             let Agg {
-                kind: StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) },
+                kind: StepKind::Extreme { max, kind: ValueForm::Scalar(scalar) },
                 src,
                 ..
             } = self.aggs[k]
@@ -757,11 +752,11 @@ impl AggValues {
                 (!null && v.is_finite()).then_some(v * w as f64)
             }),
             StepKind::Sum(kind) => fold_float!(kind, FloatSum, |v, w, null| (!null).then_some(v * w as f64)),
-            StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) } => {
+            StepKind::Extreme { max, kind: ValueForm::Scalar(scalar) } => {
                 fold_least((&mut self.column(k), mb, src, ranges, groups), scalar, max, |w| w > 0)
             }
             // A wide extreme compares native bytes, a row at a time.
-            StepKind::Extreme { kind: ImageKind::Wide(_), .. } => {
+            StepKind::Extreme { kind: ValueForm::Wide(_), .. } => {
                 let mut i = 0;
                 for (range, &(s, e)) in ranges.iter().enumerate() {
                     for row in s..e {
@@ -799,7 +794,7 @@ impl AggValues {
             self.acc[to] = self.acc[from];
             if let StepKind::Extreme { kind, .. } = self.aggs[k].kind {
                 self.has[to] = self.has[from];
-                if matches!(kind, ImageKind::Wide(_)) && self.has[from] {
+                if matches!(kind, ValueForm::Wide(_)) && self.has[from] {
                     let (src, len, _) = self.wide[from];
                     let dst = self.reserve_wide(to, len as usize);
                     self.heap.copy_within(src..src + len as usize, dst);
@@ -818,8 +813,8 @@ impl AggValues {
                     self.has[a] == self.has[b]
                         && (!self.has[a]
                             || match kind {
-                                ImageKind::Scalar(_) => self.acc[a] == self.acc[b],
-                                ImageKind::Wide(_) => self.wide(a) == self.wide(b),
+                                ValueForm::Scalar(_) => self.acc[a] == self.acc[b],
+                                ValueForm::Wide(_) => self.wide(a) == self.wide(b),
                             })
                 }
                 _ => self.acc[a] == self.acc[b],
@@ -884,13 +879,13 @@ impl AggValues {
             match agg.kind {
                 StepKind::Extreme { .. } if !self.has[at] => out.put_null(pi),
                 StepKind::Extreme {
-                    kind: ImageKind::Wide(WideKind::Bytes), ..
+                    kind: ValueForm::Wide(WideForm::German), ..
                 } => out.extend_col_blob(pi, self.wide(at)),
                 StepKind::Extreme {
-                    kind: ImageKind::Wide(WideKind::Fixed(_)),
+                    kind: ValueForm::Wide(WideForm::Int128 { .. }),
                     ..
                 } => out.extend_col(pi, self.wide(at)),
-                StepKind::Extreme { kind: ImageKind::Scalar(kind), max } => {
+                StepKind::Extreme { kind: ValueForm::Scalar(kind), max } => {
                     let bits = scalar_native_of_image(kind, max, self.acc[at] as u64);
                     out.extend_col(pi, &bits.to_le_bytes()[..size])
                 }
@@ -919,14 +914,14 @@ impl AggValues {
                 continue;
             };
             match kind {
-                ImageKind::Scalar(kind) => {
+                ValueForm::Scalar(kind) => {
                     let native = |(row, g): (usize, usize)| match self.has[at(g)] {
                         true => (row, scalar_native_of_image(kind, max, self.acc[at(g)] as u64)),
                         false => (row, 0),
                     };
                     put_cells_at(w.col_mut(pi), size, rows.clone().map(native));
                 }
-                ImageKind::Wide(WideKind::Fixed(_)) => {
+                ValueForm::Wide(WideForm::Int128 { .. }) => {
                     let col = w.col_mut(pi);
                     for (row, g) in rows.clone() {
                         let cell = &mut col[row * size..(row + 1) * size];
@@ -936,7 +931,7 @@ impl AggValues {
                         }
                     }
                 }
-                ImageKind::Wide(WideKind::Bytes) => {
+                ValueForm::Wide(WideForm::German) => {
                     let (cells, heap, _) = w.string_col_mut(pi);
                     for (row, g) in rows.clone() {
                         let cell = &mut cells[row * 16..(row + 1) * 16];
@@ -982,7 +977,7 @@ impl AggValues {
                 // An 8-byte integer extreme with a value, against a cell holding one.
                 (
                     StepKind::Extreme {
-                        kind: ImageKind::Scalar(kind @ ScalarKind::Int(_)),
+                        kind: ValueForm::Scalar(kind @ ScalarKind::Int(_)),
                         max,
                     },
                     ColumnLocator::Payload { slot, size: 8, type_code },
@@ -1015,13 +1010,13 @@ impl AggValues {
             },
             _ if null => Ordering::Greater,
             StepKind::Extreme {
-                kind: ImageKind::Wide(WideKind::Bytes), ..
+                kind: ValueForm::Wide(WideForm::German), ..
             } => self.wide(at).cmp(&agg.out.content(stored, row)),
             StepKind::Extreme {
-                kind: ImageKind::Wide(WideKind::Fixed(_)),
+                kind: ValueForm::Wide(WideForm::Int128 { .. }),
                 ..
             } => gnitz_wire::cmp_col_window(self.wide(at), stored.get_col_ptr(row, pi, size), type_code),
-            StepKind::Extreme { kind: ImageKind::Scalar(kind), max } => {
+            StepKind::Extreme { kind: ValueForm::Scalar(kind), max } => {
                 let bits = scalar_native_of_image(kind, max, self.acc[at] as u64);
                 gnitz_wire::cmp_col_window(
                     &bits.to_le_bytes()[..size],

@@ -22,7 +22,7 @@ fn a_pk_col_list_roundtrips_through_its_packed_word() {
 /// schema has and a bit outside the list's fields are refused.
 #[test]
 fn unpack_refuses_a_crafted_list() {
-    use PkRule::*;
+    use KeyListRefusal::*;
     let over = PK_LIST_MAX_COLS + 1;
     for (w, want) in [
         (0, Empty),
@@ -56,13 +56,13 @@ fn validate_pk_tuple_names_each_rule() {
     let check = |pk: &[u32], max| validate_pk_tuple(pk, cols.len(), max, |c| cols[c as usize]);
     assert_eq!(check(&[0, 1], 4), Ok(()));
     for (pk, max, want) in [
-        (&[][..], 4, PkRule::Empty),
-        (&[0, 1], 1, PkRule::TooManyColumns { count: 2, max: 1 }),
-        (&[5], 4, PkRule::IndexOutOfRange { col: 5 }),
-        (&[1, 1], 4, PkRule::Duplicate { col: 1 }),
-        (&[2], 4, PkRule::NotEligible { col: 2, type_code: String }),
-        (&[3], 4, PkRule::NotEligible { col: 3, type_code: F64 }),
-        (&[4], 4, PkRule::Nullable { col: 4 }),
+        (&[][..], 4, KeyListRefusal::Empty),
+        (&[0, 1], 1, KeyListRefusal::TooManyColumns { count: 2, max: 1 }),
+        (&[5], 4, KeyListRefusal::IndexOutOfRange { col: 5 }),
+        (&[1, 1], 4, KeyListRefusal::Duplicate { col: 1 }),
+        (&[2], 4, KeyListRefusal::NotEligible { col: 2, type_code: String }),
+        (&[3], 4, KeyListRefusal::NotEligible { col: 3, type_code: F64 }),
+        (&[4], 4, KeyListRefusal::Nullable { col: 4 }),
     ] {
         assert_eq!(check(pk, max), Err(want), "{pk:?}");
     }
@@ -71,7 +71,7 @@ fn validate_pk_tuple_names_each_rule() {
     assert_eq!(index(&[4], MAX_PK_COLUMNS - 1), Ok(PkColList::from_slice(&[4])));
     assert_eq!(
         index(&[0, 4], MAX_PK_COLUMNS - 1),
-        Err(PkRule::TooManyColumns { count: 2, max: 1 })
+        Err(KeyListRefusal::TooManyColumns { count: 2, max: 1 })
     );
 }
 
@@ -84,22 +84,22 @@ fn a_pk_rule_names_the_columns_its_caller_can() {
     let role = PkListRole::PrimaryKey;
     for (rule, named, positional) in [
         (
-            PkRule::Duplicate { col: 1 },
+            KeyListRefusal::Duplicate { col: 1 },
             "primary key names column 'price' twice",
             "primary key names column 1 twice",
         ),
         (
-            PkRule::Nullable { col: 0 },
+            KeyListRefusal::Nullable { col: 0 },
             "primary key column 'id' must not be nullable",
             "primary key column 0 must not be nullable",
         ),
         (
-            PkRule::Nullable { col: 7 },
+            KeyListRefusal::Nullable { col: 7 },
             "primary key column 7 must not be nullable",
             "primary key column 7 must not be nullable",
         ),
         (
-            PkRule::IndexOutOfRange { col: 1 },
+            KeyListRefusal::IndexOutOfRange { col: 1 },
             "primary key index 1 out of bounds",
             "primary key index 1 out of bounds",
         ),
@@ -107,15 +107,15 @@ fn a_pk_rule_names_the_columns_its_caller_can() {
         assert_eq!(rule.named(role, name), named, "{rule:?}");
         assert_eq!(rule.for_role(role), positional, "{rule:?}");
     }
-    let float = PkRule::NotEligible { col: 1, type_code: TypeCode::F64 };
+    let float = KeyListRefusal::NotEligible { col: 1, type_code: TypeCode::F64 };
     assert!(
         float
             .named(role, name)
-            .starts_with("primary key column 'price' has type_code F64;")
+            .starts_with("primary key column 'price' has type DOUBLE;")
     );
     assert!(
         float
             .for_role(role)
-            .starts_with("primary key column 1 has type_code F64;")
+            .starts_with("primary key column 1 has type DOUBLE;")
     );
 }

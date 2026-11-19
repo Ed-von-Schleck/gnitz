@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 /// `view`'s rows recomputed for the U64 keys `ids`, as a Z-set.
 fn hydrate(engine: &mut CatalogEngine, view: u64, ids: &[u64]) -> HashMap<RowKey, i64> {
-    let keys = PkKeys::from_sorted(8, ids.iter().flat_map(|k| k.to_be_bytes()).collect());
+    let keys = PkKeys::from_sorted(8, ids.iter().flat_map(|k| k.to_be_bytes()).collect::<Vec<u8>>());
     let out = engine.dag.hydrate_keys(&engine.registry, view, keys).unwrap();
     zset_of(&out, out.schema())
 }

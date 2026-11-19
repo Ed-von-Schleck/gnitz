@@ -45,7 +45,7 @@ use crate::runtime::signals;
 use crate::runtime::sync::{AsyncRwLock, Either, WriteGuard, chan, oneshot, select2};
 use crate::runtime::tls::{Served, TlsListener};
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_wire::{ClientVerb, Target, WireFault, WireStatus};
+use gnitz_wire::{ClientVerb, ControlHeader, Target, WireFault, WireStatus};
 
 /// Park in 1 ms reactor ticks until `ready`, or until `polls` elapse. The shape
 /// every hold-seam needs: it holds no lock while it waits, so the event it waits
@@ -333,7 +333,7 @@ async fn dispatch_request(
     let ack = match ctrl.client_verb()? {
         // The multi-item frames name no single relation in `target_id`; each
         // decodes its items from the frame's body.
-        ClientVerb::DdlTxn => handle_ddl_txn(shared, &data[ctrl.body]).await?,
+        ClientVerb::DdlTxn => handle_ddl_txn(shared, data, ctrl.body).await?,
         ClientVerb::PushTxn => handle_push_txn(shared, buf, ctrl).await?,
         ClientVerb::ScanMulti => {
             let scans = gnitz_wire::multi_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
@@ -473,7 +473,7 @@ fn cork_train(peer: &mut Peer, target_id: u64, rows: &gnitz_zset::repr::Batch) -
     loop {
         let (msg, n) = WireMsg::next_train_frame(target_id, rows, next, gnitz_wire::MAX_FRAME_PAYLOAD, true)?;
         cork_msg(peer, msg);
-        if msg.flags.scan_last {
+        if msg.hdr.flags.scan_last {
             return Ok(());
         }
         next = n;
@@ -484,19 +484,13 @@ fn cork_train(peer: &mut Peer, target_id: u64, rows: &gnitz_zset::repr::Batch) -
 /// write's LSN, an allocation's base id, or the watermark of the read whose
 /// train it ends (see [`tick::read_watermark`]) — in `arg0`.
 fn cork_ack(peer: &mut Peer, target_id: u64, value: u64) {
-    cork_msg(
-        peer,
-        WireMsg {
-            target_id,
-            arg0: value,
-            ..Default::default()
-        },
-    )
+    let hdr = ControlHeader::ack(target_id, value);
+    cork_msg(peer, WireMsg { hdr, ..Default::default() })
 }
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.
 fn cork_fault(peer: &mut Peer, target_id: u64, fault: &WireFault) {
-    cork_msg(peer, WireMsg { target_id, ..WireMsg::fault(fault) })
+    cork_msg(peer, WireMsg::fault(target_id, fault))
 }
 
 #[cfg(all(test, fuzzing))]

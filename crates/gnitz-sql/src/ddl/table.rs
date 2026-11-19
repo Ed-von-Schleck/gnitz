@@ -21,7 +21,7 @@ use std::collections::btree_map::Entry;
 
 /// The column list of an index over `key`, or why no index can be built on it.
 fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
-    let rejected = |rule: gnitz_wire::PkRule| {
+    let rejected = |rule: gnitz_wire::KeyListRefusal| {
         let named = rule.named(PkListRole::ColumnList, |c| cols.get(c as usize).map(|d| &*d.name));
         GnitzSqlError::rejected(format!("{role}: {named}"))
     };

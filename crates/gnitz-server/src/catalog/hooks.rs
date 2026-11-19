@@ -126,7 +126,7 @@ impl CatalogEngine {
             pk_repeats,
             compress,
         };
-        let entry = RelationEntry::new(&schema, &col_defs, fks);
+        let entry = RelationEntry::new(rel.pk.as_slice(), &col_defs, fks);
         self.registry.register_at(spec, schema, &fk_indexes, traces, None)?;
         self.caches.enter(rel.id, entry);
         Ok(())
@@ -194,7 +194,7 @@ impl CatalogEngine {
                 .relations
                 .get_mut(&owner)
                 .expect("every registered relation has an entry")
-                .set_records(&rebuilt, &defs);
+                .set_records(rebuilt.pk_cols(), &defs);
         }
         Ok(())
     }

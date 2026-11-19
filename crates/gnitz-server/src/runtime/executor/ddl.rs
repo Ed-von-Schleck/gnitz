@@ -17,6 +17,7 @@ use crate::runtime::sync::WriteGuard;
 use gnitz_foundation::fault::Switch;
 use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
+use std::ops::Range;
 
 /// What a DDL body runs under: the catalog write, and the apply lock, so no
 /// tick is in flight, every broadcast DdlSync lands between epochs, and no
@@ -61,15 +62,15 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
     Ok((family, batch))
 }
 
-/// A `DDL_TXN` body as one block per family, each family's wal-block slice
-/// materialised into an owned batch under its own schema — see
+/// The `DDL_TXN` item list at `body` of `frame` as one block per family, each
+/// family's wal-block slice materialised into an owned batch under its own schema — see
 /// [`decode_sys_family`]. One slot per family: every list derived from a bundle
 /// reads one block of each.
-pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
-    let items = gnitz_wire::multi_frame::decode_items(body, 0..body.len(), ClientVerb::DdlTxn).map_err(decode_fault)?;
+pub(super) fn decode_bundle(frame: &[u8], body: Range<usize>) -> Result<DdlBundle, WireFault> {
+    let items = gnitz_wire::multi_frame::decode_items(frame, body, ClientVerb::DdlTxn).map_err(decode_fault)?;
     let mut families = DdlBundle::default();
     for ctrl in items {
-        decode_sys_family(body, ctrl)
+        decode_sys_family(frame, ctrl)
             .and_then(|(family, batch)| families.insert(family, batch))
             .map_err(|e| format!("DDL_TXN: {e}"))?;
     }
@@ -83,9 +84,9 @@ pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
 /// The bundle is applied and its zone laid out under one hold of the SAL lock,
 /// with no await between: a bundle the catalog or the log refuses is negated in
 /// master memory there, so no system flush sees a row no zone carries.
-pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, WireFault> {
+pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<usize>) -> Result<u64, WireFault> {
     // Decoded up front, before any lock.
-    let families = decode_bundle(body)?;
+    let families = decode_bundle(frame, body)?;
     let unique_creates = families.unique_index_creates();
 
     let locks = enter_ddl(shared).await;

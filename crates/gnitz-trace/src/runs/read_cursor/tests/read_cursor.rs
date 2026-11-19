@@ -652,7 +652,12 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
 
     let merged = || create_read_cursor(&[Rc::clone(&gone)], &[Rc::clone(&old), Rc::clone(&new)], schema);
     // Every other key, the deleted ones among them.
-    let keys = || PkKeys::from_sorted(8, (0..200u64).step_by(2).flat_map(u64::to_be_bytes).collect());
+    let keys = || {
+        PkKeys::from_sorted(
+            8,
+            (0..200u64).step_by(2).flat_map(u64::to_be_bytes).collect::<Vec<u8>>(),
+        )
+    };
     let drain = |label, skip| -> Vec<Batch> {
         let mut c = match label {
             "single" => create_read_cursor(&[], &[Rc::clone(&old)], schema),

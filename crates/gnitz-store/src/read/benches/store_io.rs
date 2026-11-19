@@ -11,7 +11,7 @@ use crate::test_support::{
     RelationFixture, TID, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, table_shards,
 };
 use gnitz_wire::{PkColList, PkKeys, TypeCode};
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{SchemaDescriptor, pk_keys_of_images};
 
 /// Sorted runs a probe's cursor merges (one ingest round each).
 const RUNS: usize = 8;
@@ -36,7 +36,7 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
 fn keys(schema: &SchemaDescriptor, vals: impl Iterator<Item = u64>) -> PkKeys {
     let tc = schema.pk_columns().next().expect("one key column").type_code;
     let images = vals.map(|v| gnitz_wire::key_image(tc, v as u128));
-    PkKeys::from_images(schema.pk_stride(), images)
+    pk_keys_of_images(schema.pk_stride(), images)
 }
 
 #[test]
