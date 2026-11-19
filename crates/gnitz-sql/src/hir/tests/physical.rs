@@ -34,16 +34,19 @@ fn a_root_renumbers_a_frame_without_moving_a_payload_column() {
         let ids = ColIdGen::new();
         let f = Frame::new(names.map(|n| (Some(ids.next()), col(n, TypeCode::I64))), npk).unwrap();
         let id = |n: &str| f.layout[names.iter().position(|&m| m == n).unwrap()].unwrap();
-        let got = f.schema_in_order(root.split(' ').map(id)).ok().map(|(s, moved_to)| {
-            assert!(s.layout().same_region_types(f.schema.layout()), "{root}");
-            for (slot, def) in f.schema.columns().iter().enumerate() {
-                assert_eq!(&s.columns()[moved_to[slot] as usize], def, "{root}");
-            }
-            let name = |c: usize| &*s.columns()[c].name;
-            let shown: Vec<&str> = (0..s.columns().len()).map(name).collect();
-            let key: Vec<&str> = s.pk_cols().iter().map(|&c| name(c as usize)).collect();
-            (shown.join(" "), key.join(" "))
-        });
+        let got = f
+            .schema_in_order(root.split(' ').map(id), |_| None)
+            .ok()
+            .map(|(s, moved_to)| {
+                assert!(s.layout().same_region_types(f.schema.layout()), "{root}");
+                for (slot, def) in f.schema.columns().iter().enumerate() {
+                    assert_eq!(&s.columns()[moved_to[slot] as usize], def, "{root}");
+                }
+                let name = |c: usize| &*s.columns()[c].name;
+                let shown: Vec<&str> = (0..s.columns().len()).map(name).collect();
+                let key: Vec<&str> = s.pk_cols().iter().map(|&c| name(c as usize)).collect();
+                (shown.join(" "), key.join(" "))
+            });
         assert_eq!(
             got,
             want.map(|(s, k)| (s.to_string(), k.to_string())),

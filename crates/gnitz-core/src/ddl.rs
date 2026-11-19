@@ -14,8 +14,9 @@ use crate::catalog::{CATALOG_FAMILIES, Catalog, idx_rows};
 use crate::client::GnitzClient;
 use crate::connection::{RelDescriptor, Request};
 use crate::error::{ClientError, absent, not_found};
-use crate::{MemBatch, ProtocolError, RelName, Schema, ZSetBatch, sys_schema};
+use crate::{ProtocolError, RelName, Schema, ZSetBatch, sys_schema};
 use gnitz_wire::Target;
+use gnitz_zset::repr::MemBatch;
 
 /// The live row named `schema_name` (already canonical) in `schemas`,
 /// SCHEMA_TAB's rows: its index there and the schema's id.
@@ -35,8 +36,8 @@ fn live_schema_id(schemas: &ZSetBatch, schema_name: &str) -> Option<u64> {
 }
 
 /// The catalog name of an unnamed index on `cols` of `table`, whose columns are
-/// `columns`: `{schema}__{table}__idx_{col1}_{col2}…`, suffixed `_{n}` (n ≥ 2)
-/// where `taken` holds it.
+/// `columns`: `{schema}__{table}__idx_{col1}_{col2}…`, lowercased with every
+/// non-identifier byte made `_`, suffixed `_{n}` (n ≥ 2) where `taken` holds it.
 fn auto_index_name(table: &RelName, columns: &[ColumnDef], cols: &[u32], taken: &HashSet<String>) -> String {
     let col_names: Vec<&str> = cols.iter().map(|&c| &*columns[c as usize].name).collect();
     let name = format!("{}__{}__idx_{}", table.schema(), table.name(), col_names.join("_"));
@@ -61,8 +62,9 @@ fn auto_index_name(table: &RelName, columns: &[ColumnDef], cols: &[u32], taken: 
 }
 
 /// One inline `UNIQUE` constraint of a `CREATE TABLE`. `name` is the catalog
-/// index name `DROP INDEX` matches; `None` takes an [`auto_index_name`] free of
-/// every live index name and every other name in the bundle.
+/// index name `DROP INDEX` matches; `None` takes an automatic name, built from
+/// the schema, table and column names, free of every live index name and every
+/// other name in the bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineUniqueIndex {
     pub cols: PkColList,
@@ -134,7 +136,7 @@ pub enum ColumnChange<'a> {
     /// the table keeps its layout and comparator.
     Drop,
     /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: once the catalog reports
-    /// the column nullable, `ZSetBatch::validate` permits a null bit there.
+    /// the column nullable, the server's push certification admits a null bit there.
     DropNotNull,
 }
 
@@ -220,19 +222,16 @@ impl DdlBundle {
             .collect()
     }
 
-    /// Whether `other` holds the same live rows, family for family.
-    fn same_rows(&self, other: &DdlBundle) -> bool {
-        // A German cell's offset is relative to the arena of the batch it sits
-        // in, so each side is copied onto an arena laid out in key order.
-        fn in_key_order(rows: &ZSetBatch) -> ZSetBatch {
-            let v = rows.view();
-            let mut live: Vec<u32> = v.live_rows().map(|i| i as u32).collect();
-            live.sort_unstable_by_key(|&i| v.get_pk_bytes(i as usize));
-            rows.gathered(&live)
-        }
-        self.0.iter().zip(&other.0).all(|pair| match pair {
+    /// Whether `self` and `other` hold the same Z-set, family for family: their
+    /// difference consolidates to nothing.
+    fn same_rows(self, other: &DdlBundle) -> bool {
+        self.0.into_iter().zip(&other.0).all(|pair| match pair {
             (None, None) => true,
-            (Some(rows), Some(theirs)) => in_key_order(rows) == in_key_order(theirs),
+            (Some(rows), Some(theirs)) => {
+                let mut diff = rows.into_batch().negated();
+                diff.append_ranges(&theirs.view(), &[(0, theirs.len())]);
+                diff.into_consolidated().is_empty()
+            }
             _ => false,
         })
     }
@@ -336,7 +335,7 @@ impl GnitzClient {
 
     /// Index `cols` of `owner`, named `owner_name`, in that order, under the
     /// catalog name `name`: the new index's id. With no name it takes the first
-    /// free [`auto_index_name`], and
+    /// free automatic name built from the schema, table and column names, and
     /// is refused where an index of `owner` on `cols` already serves it, whatever
     /// that index is named: unique where `is_unique`.
     pub async fn create_index(

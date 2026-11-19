@@ -4,11 +4,11 @@
 use crate::catalog::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{Batch, BatchBuilder};
 use gnitz_core::{PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_expr::{CmpOp, ColumnLocator};
 use gnitz_wire::payload_u64;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use sqlparser::ast::Expr;
 use std::cell::RefCell;
 use std::collections::HashMap;

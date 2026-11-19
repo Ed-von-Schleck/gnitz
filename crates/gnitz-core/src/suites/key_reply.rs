@@ -28,7 +28,11 @@ fn read_keys(client: &mut GnitzClient, tid: u64, schema: &Schema, predicate: Vec
         .expect("a PK-only reply must not be rejected")
         .batch;
     assert!(reply.view().schema().num_payload_cols() == 0 && reply.view().blob().is_empty());
-    reply.validate().expect("the reply validates under its schema");
+    assert_eq!(
+        reply.view().null_breach(),
+        None,
+        "the reply breaks no null rule of its schema"
+    );
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.view().weights().all(|w| w == 1), "per-row weights preserved");
     reply

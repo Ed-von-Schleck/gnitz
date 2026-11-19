@@ -3,10 +3,10 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_core::{Batch, Schema, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::{Agg, AggValues};
-use gnitz_zset::repr::range_rows;
+use gnitz_zset::repr::{Batch, range_rows};
 
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;

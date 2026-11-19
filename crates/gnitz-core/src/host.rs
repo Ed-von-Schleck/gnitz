@@ -4,15 +4,16 @@
 //! [`Promise`] — every wait ends on.
 
 use std::future::{Future, poll_fn};
-use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use crate::client::GnitzClient;
 use crate::error::ClientError;
+use crate::pushed::Delivery;
 use crate::transport::{Interest, poll_fd_or_cancel};
 
 /// What [`BlockingHost::with_hook`] runs.
@@ -79,12 +80,6 @@ impl BlockingHost {
     }
 }
 
-/// Read what `cancel` holds, so it cancels no later wait.
-pub fn drain_cancel(mut cancel: &UnixStream) {
-    let mut buf = [0u8; 64];
-    while matches!(cancel.read(&mut buf), Ok(n) if n > 0) {}
-}
-
 impl Host for BlockingHost {
     fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
         self.fd = Some(fd);
@@ -102,7 +97,7 @@ impl Host for BlockingHost {
             match poll_fd_or_cancel(fd, want, cancel.map(AsFd::as_fd), None) {
                 Ok(Some(ready)) => return Poll::Ready(Ok(ready)),
                 Ok(None) => {
-                    drain_cancel(cancel.expect("only a cancel socket cancels"));
+                    gnitz_foundation::posix_io::drain(cancel.expect("only a cancel socket cancels"));
                     let why: Box<dyn std::error::Error + Send + Sync> = "cancelled".into();
                     return Poll::Ready(Err(ClientError::Interrupted(why.into())));
                 }
@@ -174,9 +169,37 @@ impl<T> Future for Pending<'_, T> {
     }
 }
 
-/// One queued call of a [`serve`] loop: it has the client to itself until its
-/// future completes.
-pub type Op = Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, ()> + Send>;
+/// One queued call of a [`serve`] loop.
+pub struct Op(Call);
+
+enum Call {
+    Run(Run),
+    Sync(Duration, Land),
+    /// A parked sync whose answer has arrived, and where its delivery goes:
+    /// only [`serve`] makes one.
+    Finish(Result<(), ClientError>, Land),
+}
+
+/// What an [`Op::call`] runs.
+type Run = Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, ()> + Send>;
+
+/// Where an [`Op::sync`]'s delivery goes.
+type Land = Box<dyn FnOnce(Result<Delivery, ClientError>) + Send>;
+
+impl Op {
+    /// A call that has the client to itself until its future completes.
+    pub fn call(f: impl for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, ()> + Send + 'static) -> Op {
+        Op(Call::Run(Box::new(f)))
+    }
+
+    /// A sync whose [`Delivery`] goes to `land`, which [`serve`] calls before
+    /// it ends, whether or not the sync's caller is still there: a delivery
+    /// nobody takes hands back its reseeds, and what it brought a reader stays
+    /// with the client until one is taken.
+    pub fn sync(wait: Duration, land: impl FnOnce(Result<Delivery, ClientError>) + Send + 'static) -> Op {
+        Op(Call::Sync(wait, Box::new(land)))
+    }
+}
 
 /// A boxed future a host can move between threads.
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -192,18 +215,23 @@ pub fn finished<'a>() -> BoxFut<'a, ()> {
 /// and once `next` yields `None` until nothing is outstanding; then drops the
 /// client.
 pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_>) -> Poll<Option<Op>>) {
+    // The syncs an [`Op::sync`] sent, each with where its delivery lands, in
+    // send order.
+    let mut parked: Vec<(Sent<()>, Land)> = Vec::new();
     loop {
-        let op = poll_fn(|cx| {
+        let step = poll_fn(|cx| {
             loop {
                 // A sync's answer arrives only inside a step or an op, both run
                 // below, so nothing has to wake this. Not only the oldest: a
                 // sync with nothing to hold is answered at once, ahead of one
                 // the server is holding.
-                if let Some(op) = client.answered_sync() {
-                    return Poll::Ready(Some(op));
+                let mut answered = parked.iter_mut().enumerate();
+                if let Some((i, reply)) = answered.find_map(|(i, (sent, _))| Some((i, sent.try_take()?))) {
+                    let (_, land) = parked.remove(i);
+                    return Poll::Ready(Some(Call::Finish(reply, land)));
                 }
                 let drained = match next(cx) {
-                    Poll::Ready(Some(op)) => return Poll::Ready(Some(op)),
+                    Poll::Ready(Some(op)) => return Poll::Ready(Some(op.0)),
                     Poll::Ready(None) => true,
                     Poll::Pending => false,
                 };
@@ -223,13 +251,17 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
             }
         })
         .await;
-        let Some(op) = op else { return };
+        let Some(step) = step else { return };
         // A connection that is gone refuses the op's own requests, as what
         // ended it.
         if let Err(e) = client.make_room().await {
             client.session.end(e);
         }
-        op(&mut client).await;
+        match step {
+            Call::Run(f) => f(&mut client).await,
+            Call::Sync(wait, land) => parked.push((client.begin_sync(wait), land)),
+            Call::Finish(reply, land) => land(client.finish_sync(reply).await),
+        }
     }
 }
 

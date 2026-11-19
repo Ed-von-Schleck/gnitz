@@ -1,7 +1,6 @@
 use super::*;
 use crate::ProtocolError;
 use crate::connection::Request;
-use crate::sync_op;
 use crate::test_support::{
     client_pair, hold_subscription, interrupt_self_until, kv_schema, reply_ctrl, session_pair, sub_id, sync_answer,
 };
@@ -222,7 +221,7 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
     let detached: Arc<Mutex<Vec<Sent<u64>>>> = Arc::default();
     let mut calls: VecDeque<Op> = VecDeque::new();
     let out = Arc::clone(&whole);
-    calls.push_back(Box::new(move |c| {
+    calls.push_back(Op::call(move |c| {
         Box::pin(async move {
             let mut ids = Vec::new();
             for _ in 0..3 {
@@ -233,7 +232,7 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
     }));
     for _ in 0..2 {
         let detached = Arc::clone(&detached);
-        calls.push_back(Box::new(move |c| {
+        calls.push_back(Op::call(move |c| {
             let sent = c.ack(Request::AllocIds(1)).detach();
             detached.lock().unwrap().push(sent);
             finished()
@@ -312,7 +311,7 @@ fn serve_ends_the_session_as_the_hosts_failure() {
     let c = GnitzClient::over(s, Box::new(FailingHost)).unwrap();
     let owed: Arc<Mutex<Option<Sent<u64>>>> = Arc::default();
     let out = Arc::clone(&owed);
-    let mut call: Option<Op> = Some(Box::new(move |c| {
+    let mut call: Option<Op> = Some(Op::call(move |c| {
         *out.lock().unwrap() = Some(c.ack(Request::AllocIds(1)).detach());
         finished()
     }));
@@ -343,7 +342,7 @@ fn serve_lands_a_sync_answered_after_the_calls_ended() {
     let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
     let landed = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&landed);
-    let mut call = Some(sync_op(std::time::Duration::ZERO, move |d| {
+    let mut call = Some(Op::sync(std::time::Duration::ZERO, move |d| {
         done.store(d.is_ok(), Ordering::Relaxed)
     }));
     drive(fd.as_fd(), serve(c, |_| Poll::Ready(call.take())));
@@ -374,8 +373,8 @@ fn serve_lands_a_sync_answered_in_place_ahead_of_a_held_one() {
     let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
     let (first, second) = (Arc::clone(&landed), Arc::clone(&landed));
     let mut calls: VecDeque<Op> = VecDeque::from([
-        sync_op(std::time::Duration::ZERO, move |_| first.lock().unwrap().push("held")),
-        sync_op(std::time::Duration::ZERO, move |_| {
+        Op::sync(std::time::Duration::ZERO, move |_| first.lock().unwrap().push("held")),
+        Op::sync(std::time::Duration::ZERO, move |_| {
             second.lock().unwrap().push("in place");
             second_landed.send(()).unwrap();
         }),

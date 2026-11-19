@@ -22,7 +22,7 @@ use crate::transport::poll_fd;
 use crate::{
     BlockingHost, ClientError, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema, Sent, ZSetBatch,
 };
-use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId};
+use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 
 /// `schema.name`.
 pub(crate) fn rel(schema: &str, name: &str) -> RelName {
@@ -267,24 +267,13 @@ pub(crate) fn step_until_idle(s: &mut Session) {
 }
 
 /// Hold subscription `id` of view 40 on `s`, replied in `schema`'s layout: a
-/// one-item DELTA_POLL kept as `id`, whose terminal `peer` answers with no row
-/// at round `(1, tick)`.
-pub(crate) fn hold_subscription(s: &mut Session, peer: &Peer, id: SubId, schema: &Schema, tick: u64) {
-    let item = DeltaPollItem {
-        view: 40.into(),
-        from: None,
-        reply_layout: schema.layout().layout_digest(),
-        spec: &[],
-    };
-    s.submit_delta_poll(id, &[item]);
+/// delta read kept as `id`, whose terminal `peer` answers with no row at round
+/// `(1, tick)`.
+pub(crate) fn hold_subscription(s: &mut Session, peer: &Peer, id: SubId, schema: &Arc<Schema>, tick: u64) {
+    let sent = s.submit_delta_read(40.into(), None, schema, &[], Some(id));
     peer.send(&delta_terminal(40, 1, tick));
-    let (blocks, at) = loop {
-        match s.take_ended(id) {
-            Some(held) => break held.unwrap(),
-            None => s.step(poll_fd(s.as_fd(), s.interest(), None).unwrap()),
-        }
-    };
-    assert_eq!((blocks.len(), at), (0, DeltaCursor::from_pair(1, tick).unwrap()));
+    let (rows, at) = await_reply(s, sent).unwrap();
+    assert_eq!((rows.batch.len(), at), (0, DeltaCursor::from_pair(1, tick).unwrap()));
 }
 
 /// One frame payload, without the 4-byte length prefix, as

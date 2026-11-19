@@ -11,7 +11,7 @@ pub struct Schema {
     columns: Vec<ColumnDef>,
     layout: SchemaDescriptor,
     /// The meta-schema record of `columns` and the PK list, encoded on first
-    /// use. Every `&mut self` method that changes either resets it.
+    /// use.
     record: OnceLock<Arc<[u8]>>,
 }
 
@@ -85,12 +85,6 @@ impl Schema {
             })
             .collect();
         gnitz_wire::PkKeys::from_keys(self.layout.pk_stride(), keys.iter().map(|k| k.pk_bytes()))
-    }
-
-    /// A name carries no layout, but the record carries it.
-    pub fn rename_column(&mut self, ci: usize, name: Arc<str>) {
-        self.columns[ci].name = name;
-        self.record = OnceLock::new();
     }
 
     /// The PK columns in PK-list order, hidden: the leading key of a reply that

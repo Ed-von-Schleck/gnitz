@@ -27,8 +27,7 @@ pub struct ZSetBatch {
 
 #[derive(Clone)]
 enum Rows {
-    /// Boxed, so a batch moves as a pointer: a reply moves several times on its way to the
-    /// caller.
+    /// Boxed, so a move copies a pointer, not the batch's inline schema descriptor.
     Owned(Box<Batch>),
     /// A WAL block of `frame`, certified under the batch's schema.
     Block { frame: Vec<u8>, block: CertifiedBlock },
@@ -249,25 +248,6 @@ impl ZSetBatch {
     /// their strings; `self` is left as it was.
     pub fn gathered(&self, rows: &[u32]) -> ZSetBatch {
         self.again(self.view().indexed_rows(rows))
-    }
-
-    // ── Shape checks ────────────────────────────────────────────────────────
-
-    /// The null rule the server certifies of each row it is sent, here with the row and
-    /// column named.
-    pub fn validate(&self) -> Result<(), String> {
-        let Some((breach, (row, slot))) = self.view().null_breach() else {
-            return Ok(());
-        };
-        let schema = &self.schema;
-        let layout = schema.layout();
-        Err(match slot < layout.num_payload_cols() {
-            true => format!(
-                "row {row}: {breach} ('{}')",
-                schema.columns()[layout.payload_col_idx(slot)].name
-            ),
-            false => format!("row {row} sets null bit {slot}, past the last payload column"),
-        })
     }
 
     /// This batch as its canonical region list.

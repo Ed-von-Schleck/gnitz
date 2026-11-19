@@ -32,12 +32,9 @@ pub use client::{GnitzClient, env_target};
 pub use connection::{MAX_IN_FLIGHT, MAX_QUEUED_BYTES, RelDescriptor, ScanReply};
 pub use ddl::{ColumnChange, InlineUniqueIndex, PlannedView, TableDef, ViewBundle, pending_id};
 pub use error::{ClientError, ProtocolError, not_found};
-pub use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
-pub use host::{
-    BlockingHost, BoxFut, Host, Job, Op, Pending, Promise, Sent, block_on, drain_cancel, finished, promise, serve,
-};
+pub use host::{BlockingHost, BoxFut, Host, Job, Op, Pending, Promise, Sent, block_on, finished, promise, serve};
 pub use mirror::{MirrorStore, Planner, PollOutcome, PollResult, Subscription};
-pub use pushed::{Delivery, Pushed, Synced, sync_op};
+pub use pushed::{Delivery, Pushed, Synced};
 pub use rel_name::RelName;
 pub use schema::{Schema, sys_schema};
 pub use snapshot::DEFAULT_PAGE_ROWS;

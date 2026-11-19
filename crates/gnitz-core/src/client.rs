@@ -49,10 +49,6 @@ pub struct GnitzClient {
     /// of a connection since replaced is told that one ended, never handed
     /// another's trains.
     pub(crate) next_sub: SubId,
-    /// The syncs a [`crate::sync_op`] sent, each with where its delivery lands,
-    /// in send order. A [`serve`] loop finishes one whose answer has arrived
-    /// ahead of the calls it is handed.
-    pub(crate) syncs: Vec<(Sent<()>, crate::pushed::Land)>,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -115,7 +111,6 @@ impl GnitzClient {
             received: Default::default(),
             kept: HashMap::new(),
             next_sub: SubId::FIRST,
-            syncs: Vec::new(),
         })
     }
 
@@ -146,7 +141,6 @@ impl GnitzClient {
             received: _,
             kept,
             next_sub: _,
-            syncs: _,
         } = self;
         host.attach(fresh.as_fd().try_clone_to_owned()?)?;
         *session = fresh;
@@ -301,7 +295,9 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        let sent = self.session.submit_delta_read(view.into(), from, reply_schema, spec);
+        let sent = self
+            .session
+            .submit_delta_read(view.into(), from, reply_schema, spec, None);
         self.wait(sent)
     }
 

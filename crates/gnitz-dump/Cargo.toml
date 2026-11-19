@@ -21,6 +21,7 @@ gnitz-foundation.workspace = true
 gnitz-expr.workspace = true
 gnitz-wire.workspace = true
 gnitz-sql.workspace = true
+gnitz-zset.workspace = true
 # The low-level column API alone: no Arrow, and zstd the one codec a dump writes.
 parquet = { version = "60", default-features = false, features = ["zstd"] }
 serde = { version = "1", features = ["derive"] }

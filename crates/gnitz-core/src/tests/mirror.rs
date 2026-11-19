@@ -604,9 +604,11 @@ fn a_leftover_poll_does_not_shift_the_replies() {
         reply_layout: kv_schema(TypeCode::I64).layout().layout_digest(),
         spec: &[],
     };
-    let first = client.next_sub;
-    client.next_sub = kept_as(first, 1);
-    drop(DeltaPoll::start(&mut client.session, first, &[abandoned]));
+    drop(DeltaPoll::start(
+        &mut client.session,
+        &mut client.next_sub,
+        &[abandoned],
+    ));
 
     let h = std::thread::spawn(move || {
         let abandoned = peer.expect_kept("the abandoned poll");
@@ -1101,6 +1103,46 @@ fn a_subscription_that_ended_is_continued_by_a_delta_read() {
         "an ended subscription is nobody's failure: {report:?}"
     );
     assert_eq!(log.take(), [Ev::Advance(7, 13)]);
+}
+
+/// A recovery that lands on a view its pushed train already advanced in the
+/// same poll reports that view once, for its last sync.
+#[test]
+fn a_recovery_onto_a_view_advanced_by_its_push_is_reported_once() {
+    let (mut client, peer, log, subs) = subscribed();
+    let h = std::thread::spawn(move || {
+        peer.expect_sync("the poll");
+        peer.push_train(7, subs[&7], &[], None);
+        peer.push_train(8, subs[&8], &[], Some(12));
+        peer.send(&sync_answer(None));
+        let read = peer.expect_kept("the delta read");
+        assert!(matches!(read[..], [(7, _)]), "{read:?}");
+        peer.send(&reply_status(7, WireStatus::StaleCatalog, "stale"));
+        // The registration of 7 re-resolves to 8.
+        assert_eq!(peer.expect_request("the re-resolve"), 0);
+        peer.reply_resolved(8);
+        let next = peer.expect_kept("the next round");
+        assert!(matches!(next[..], [(8, _)]), "{next:?}");
+        peer.reply_watermark(8, TAG, 13);
+    });
+    let before = client.requests_sent();
+    let report = poll(&mut client);
+    h.join().unwrap();
+    assert_eq!(
+        client.requests_sent() - before,
+        4,
+        "the sync, the delta read, the resolve, the next round"
+    );
+    assert!(
+        matches!(report.as_slice(), [o] if o.view_id == 8 && o.cursor.is_some_and(|c| c.tick.get() == 13)),
+        "one entry for 8, for its last sync: {report:?}",
+    );
+    assert_eq!(client.mirrored_ids(), [8]);
+    let events = log.take();
+    assert!(
+        !events.iter().any(|e| matches!(e, Ev::Refill(8) | Ev::Seal(8, _))),
+        "the live copy must be neither erased nor re-read whole: {events:?}",
+    );
 }
 
 /// Subscribe a reader to view 40 after round 9, its read answered with no row

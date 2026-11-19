@@ -1,5 +1,5 @@
-//! Syscall idioms `std` does not offer. Each returns `io::Result`, the errno
-//! captured at the syscall.
+//! Syscall idioms `std` does not offer. Each fallible one returns `io::Result`,
+//! the errno captured at the syscall.
 //!
 //! The idioms only the server calls — the EINTR retry, the fork-shared
 //! mapping and the memfd — are gated to Linux, where the server runs; the
@@ -178,6 +178,12 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Read what the non-blocking socket `s` holds until it is empty, at its end, or failing.
+pub fn drain(mut s: &std::os::unix::net::UnixStream) {
+    let mut buf = [0u8; 64];
+    while matches!(std::io::Read::read(&mut s, &mut buf), Ok(n) if n > 0) {}
 }
 
 #[cfg(test)]

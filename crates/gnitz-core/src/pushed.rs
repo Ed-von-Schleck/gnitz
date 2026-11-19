@@ -3,19 +3,18 @@
 //! advances every mirrored view.
 
 use std::collections::BTreeMap;
-use std::future::poll_fn;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::Schema;
 use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
-use crate::connection::{DeltaPoll, Held, ScanReply, park, untaken};
+use crate::connection::{Held, ScanReply, draw_subs, park, untaken};
 use crate::error::ClientError;
-use crate::host::{Op, Sent, finished};
+use crate::host::Sent;
 use crate::mirror::PollOutcome;
 use gnitz_wire::Target;
-use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId, kept_as};
+use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 
 /// What a sync hands a reader for one of its subscriptions.
 pub struct Pushed {
@@ -123,7 +122,9 @@ pub struct Synced {
 impl GnitzClient {
     /// A delta read of `view` after `from` — whole with none — that stays
     /// subscribed from the cursor it answers with: the subscription's id, the
-    /// rows and that cursor.
+    /// rows and that cursor. A reply that does not decode ends the connection,
+    /// as [`Self::delta_read`]'s does. What is pushed after the answer is
+    /// delivered by the next sync.
     pub async fn subscribe(
         &mut self,
         view: impl Into<Target>,
@@ -131,24 +132,11 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Result<(SubId, ScanReply, DeltaCursor), ClientError> {
-        let id = self.next_sub;
-        self.next_sub = kept_as(id, 1);
-        let item = DeltaPollItem {
-            view: view.into(),
-            from,
-            reply_layout: reply_schema.layout().layout_digest(),
-            spec,
-        };
-        // Released unless taken whole: a failed or abandoned read keeps no subscription.
-        let mut poll = DeltaPoll::start(&mut self.session, id, &[item]);
-        let host = &mut *self.host;
-        let (blocks, cursor) = poll_fn(|cx| poll.session.poll_until(host, cx, |s| s.take_ended(id))).await??;
-        let rows = ScanReply {
-            batch: decode_wal_blocks(blocks, None, reply_schema)?,
-            lsn: None,
-        };
-        poll.at = 1;
-        drop(poll);
+        let id = draw_subs(&mut self.next_sub, 1);
+        let sent = self
+            .session
+            .submit_delta_read(view.into(), from, reply_schema, spec, Some(id));
+        let (rows, cursor) = self.wait(sent).await?;
         let schema = Arc::clone(reply_schema);
         let held = Ok((Vec::new(), cursor));
         lock(&self.received).readers.insert(id, Reader { schema, held });
@@ -223,32 +211,4 @@ impl GnitzClient {
             received: Arc::clone(received),
         })
     }
-
-    /// The first parked sync whose answer has arrived, as the op that finishes
-    /// it and lands its delivery.
-    pub(crate) fn answered_sync(&mut self) -> Option<Op> {
-        let (i, reply) = (self.syncs.iter_mut().enumerate()).find_map(|(i, (sent, _))| Some((i, sent.try_take()?)))?;
-        let (_, land) = self.syncs.remove(i);
-        Some(Box::new(move |client| {
-            Box::pin(async move { land(client.finish_sync(reply).await) })
-        }))
-    }
-}
-
-/// Where a [`sync_op`]'s delivery goes.
-pub(crate) type Land = Box<dyn FnOnce(Result<Delivery, ClientError>) + Send>;
-
-/// A sync as one queued call of a [`serve`](crate::serve) loop: its request
-/// goes out and is parked on the client; once its answer has arrived, `serve`
-/// finishes it and hands the [`Delivery`] to `land` before it waits again, and
-/// serves on until it has. The sync is finished
-/// whether or not its caller is still there; a delivery nobody takes hands back
-/// its reseeds, and what the sync brought a reader stays with the client until
-/// one is taken.
-pub fn sync_op(wait: Duration, land: impl FnOnce(Result<Delivery, ClientError>) + Send + 'static) -> Op {
-    Box::new(move |client| {
-        let sent = client.begin_sync(wait);
-        client.syncs.push((sent, Box::new(land)));
-        finished()
-    })
 }

@@ -247,8 +247,11 @@ enum RowsTo {
         to: Promise<Vec<ScanReply>>,
     },
     /// One view's delta read, whose terminal carries the cursor to read from
-    /// next.
-    Delta(Promise<(ScanReply, DeltaCursor)>),
+    /// next; with `keep`, the subscription it is kept as.
+    Delta {
+        to: Promise<(ScanReply, DeltaCursor)>,
+        keep: Option<SubId>,
+    },
     /// SNAPSHOT_PAGE: every worker's rows as one train, with the row count at
     /// the end of each worker's so far.
     Page {
@@ -356,11 +359,18 @@ impl Polls {
     /// The delta poll's item kept as `id` ended with `end`: its train is held
     /// at the cursor, or the item ended. An id no longer read is left as it is.
     fn poll_end(&mut self, id: SubId, end: PollEnd) {
-        // A cursor is what the server keeps a subscription from, held here or not.
-        self.server_holds |= end.is_ok();
-        if let Some(blocks) = self.reading.remove(&id) {
-            self.subs.insert(id, end.map(|cursor| (blocks, cursor)));
+        match self.reading.remove(&id) {
+            Some(blocks) => self.hold(id, blocks, end),
+            // A cursor is what the server keeps a subscription from, held here or not.
+            None => self.server_holds |= end.is_ok(),
         }
+    }
+
+    /// Hold `id` with `blocks` read for it, at the cursor `end` names, or
+    /// ended.
+    fn hold(&mut self, id: SubId, blocks: Vec<RawBlock>, end: PollEnd) {
+        self.server_holds |= end.is_ok();
+        self.subs.insert(id, end.map(|cursor| (blocks, cursor)));
     }
 
     /// A train pushed for `sub` ended with `end`, after `train`.
@@ -622,18 +632,21 @@ impl Session {
     }
 
     /// DELTA_POLL of one view after `from` — the view whole with none — under
-    /// `spec`, replied in `reply_schema`'s layout. It keeps no subscription.
+    /// `spec`, replied in `reply_schema`'s layout. With `keep`, it stays
+    /// subscribed as that id from the cursor it answers with, held for
+    /// [`Self::take_pushed`] until a sync no longer names it.
     pub(crate) fn submit_delta_read(
         &mut self,
         view: Target,
         from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
+        keep: Option<SubId>,
     ) -> Sent<(ScanReply, DeltaCursor)> {
         let (to, sent) = promise();
         let slot = Slot::Rows {
             train: Train::new(view.tid, reply_schema),
-            to: RowsTo::Delta(to),
+            to: RowsTo::Delta { to, keep },
         };
         let item = multi_frame::DeltaPollItem {
             view,
@@ -641,7 +654,7 @@ impl Session {
             reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
-        self.enqueue(|out| multi_frame::encode_delta_poll(out, &[item], None), slot);
+        self.enqueue(|out| multi_frame::encode_delta_poll(out, &[item], keep), slot);
         sent
     }
 
@@ -696,13 +709,6 @@ impl Session {
     /// and end then taken by [`Self::take_pushed`].
     pub(crate) fn take_reading(&mut self, id: SubId) -> Option<Vec<RawBlock>> {
         self.inbox.polls.reading.get_mut(&id).map(std::mem::take)
-    }
-
-    /// The delta poll's item kept as `id`, once it ended: its whole train under
-    /// the cursor past it, or the fault that ended it; `None` while its train
-    /// is read.
-    pub(crate) fn take_ended(&mut self, id: SubId) -> Option<Held> {
-        (!self.inbox.polls.reading.contains_key(&id)).then(|| self.take_pushed(id))
     }
 
     /// Stop holding subscription `id`: what is pushed for it from now on is
@@ -1013,9 +1019,13 @@ impl Slot {
                         let worker_ends = std::mem::take(worker_ends);
                         to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
                     }
-                    RowsTo::Delta(to) => {
+                    RowsTo::Delta { to, keep } => {
                         let cursor = cursor()?;
-                        to.fulfil(Ok((train.reply(last, None)?, cursor)))
+                        let reply = train.reply(last, None)?;
+                        if let Some(id) = *keep {
+                            polls.hold(id, Vec::new(), Ok(cursor));
+                        }
+                        to.fulfil(Ok((reply, cursor)))
                     }
                 }
             }
@@ -1040,7 +1050,7 @@ impl Slot {
             Slot::Rows { to, .. } => match to {
                 RowsTo::Scan(to) => to.fulfil(Err(why)),
                 RowsTo::Scans { to, .. } => to.fulfil(Err(why)),
-                RowsTo::Delta(to) => to.fulfil(Err(why)),
+                RowsTo::Delta { to, .. } => to.fulfil(Err(why)),
                 RowsTo::Page { to, .. } => to.fulfil(Err(why)),
             },
             Slot::DeltaPoll { views, at, first } => {
@@ -1085,8 +1095,16 @@ fn resolve_descriptor(ctrl: &DecodedControl, frame: &[u8]) -> Result<Option<Arc<
     })))
 }
 
+/// `n` fresh subscription ids, of which the first is returned: `next_sub`
+/// moves past them.
+pub(crate) fn draw_subs(next_sub: &mut SubId, n: usize) -> SubId {
+    let first = *next_sub;
+    *next_sub = kept_as(first, n);
+    first
+}
+
 /// A delta poll in flight: `items` in one request, item `i` parked in the
-/// session as `kept_as(first, i)` and taken in order. Dropping it releases
+/// session as [`Self::id`]`(i)` and taken in order. Dropping it releases
 /// every item not yet taken whole, which drops what is left of its train. A
 /// subscription it kept is its caller's only once recorded where the next
 /// sync names it from.
@@ -1101,14 +1119,16 @@ pub(crate) struct DeltaPoll<'s> {
 impl Drop for DeltaPoll<'_> {
     fn drop(&mut self) {
         for i in self.at..self.items {
-            self.session.release(kept_as(self.first, i));
+            self.session.release(self.id(i));
         }
     }
 }
 
 impl<'s> DeltaPoll<'s> {
-    /// Poll `items`, item `i` kept as the subscription `kept_as(first, i)`.
-    pub(crate) fn start(session: &'s mut Session, first: SubId, items: &[multi_frame::DeltaPollItem]) -> Self {
+    /// Poll `items`, each kept as a subscription whose id is drawn from
+    /// `next_sub`, which moves past them.
+    pub(crate) fn start(session: &'s mut Session, next_sub: &mut SubId, items: &[multi_frame::DeltaPollItem]) -> Self {
+        let first = draw_subs(next_sub, items.len());
         session.submit_delta_poll(first, items);
         DeltaPoll {
             session,
@@ -1116,6 +1136,11 @@ impl<'s> DeltaPoll<'s> {
             at: 0,
             items: items.len(),
         }
+    }
+
+    /// The subscription item `i` is kept as.
+    pub(crate) fn id(&self, i: usize) -> SubId {
+        kept_as(self.first, i)
     }
 }
 

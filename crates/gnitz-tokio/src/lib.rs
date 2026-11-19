@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use gnitz_core::{
     BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Pending, Sent, Synced, finished, promise,
-    serve, sync_op,
+    serve,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::mpsc;
@@ -129,7 +129,7 @@ impl AsyncClient {
     {
         let (mut to, sent) = promise();
         // A driver that is gone drops the op, and with it `to`.
-        let _ = self.tx.send(Box::new(move |client| {
+        let _ = self.tx.send(Op::call(move |client| {
             Box::pin(async move { to.fulfil(Ok(f(client).await)) })
         }));
         sent
@@ -148,7 +148,7 @@ impl AsyncClient {
         F: for<'a> FnOnce(&'a mut GnitzClient) -> Pending<'a, T> + Send + 'static,
     {
         let (mut to, sent) = promise();
-        let _ = self.tx.send(Box::new(move |client| {
+        let _ = self.tx.send(Op::call(move |client| {
             f(client).detach().then(move |reply| to.fulfil(reply));
             finished()
         }));
@@ -165,7 +165,7 @@ impl AsyncClient {
     /// arrives.
     pub fn sync(&self, wait: Duration) -> impl Future<Output = Result<Synced, ClientError>> + Send + use<> {
         let (mut to, sent) = promise();
-        let _ = self.tx.send(sync_op(wait, move |delivery| to.fulfil(delivery)));
+        let _ = self.tx.send(Op::sync(wait, move |delivery| to.fulfil(delivery)));
         // Taken here, on the caller's task: its trains decode off the driver,
         // and a delivery dropped untaken hands its reseeds back.
         async move { sent.await.map(Delivery::take) }

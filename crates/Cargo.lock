@@ -780,6 +780,7 @@ dependencies = [
  "gnitz-sql",
  "gnitz-test-harness",
  "gnitz-wire",
+ "gnitz-zset",
  "parquet",
  "serde",
  "serde_json",

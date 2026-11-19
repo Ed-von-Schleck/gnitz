@@ -38,10 +38,10 @@ fn batch_of(
     ZSetBatch::of(schema, rows)
 }
 
-/// Each null-rule breach is refused and named; a NULL over a zeroed cell of a nullable
-/// column is not one.
+/// `null_breach` names each null-rule breach with its row and payload slot; a NULL over
+/// a zeroed cell of a nullable column is not one.
 #[test]
-fn validate_refuses_each_malformed_batch() {
+fn null_breach_names_each_malformed_row() {
     // `(pk U64 | v I64 | s STRING nullable)`, two valid rows, the second NULL in `s`.
     let schema = Arc::new(
         Schema::from_parts(
@@ -60,20 +60,23 @@ fn validate_refuses_each_malformed_batch() {
         a.begin_row(1, 1).put_int(10).put_string("x");
         a.begin_row(2, -1).put_int(20).put_null();
     }
-    base.validate().expect("a NULL over a zeroed nullable cell validates");
+    assert_eq!(
+        base.view().null_breach(),
+        None,
+        "a NULL over a zeroed nullable cell is no breach"
+    );
 
-    // (null bits set on row 0, the refusal)
-    let cases: [(u64, &str); 3] = [
-        (1, "a null bit on a NOT NULL column ('v')"),
-        (2, "a non-zero cell under a NULL ('s')"),
-        (1 << 2, "past the last payload column"),
+    // (null bits set on row 0, the breach and its (row, payload slot))
+    let cases = [
+        (1u64, ("a null bit on a NOT NULL column", (0, 0))),
+        (2, ("a non-zero cell under a NULL", (0, 1))),
+        (1 << 2, ("a null bit on a NOT NULL column", (0, 2))),
     ];
     for (bits, want) in cases {
         let mut b = base.clone();
         let word = b.view().get_null_word(0) | bits;
         set_null_word(&mut b, 0, word);
-        let err = b.validate().unwrap_err();
-        assert!(err.contains(want), "{err:?} does not mention {want:?}");
+        assert_eq!(b.view().null_breach(), Some(want));
     }
 }
 
@@ -152,7 +155,7 @@ fn extend_from_owned_concatenates() {
         .map(|r| payload_str(&acc.view(), r, 0).unwrap().into_owned())
         .collect();
     assert_eq!(strs, [long(1).as_str(), "short", long(10).as_str(), "short"]);
-    acc.validate().unwrap();
+    assert_eq!(acc.view().null_breach(), None);
 }
 
 /// Every writer lands its value in its own payload slot — the PK column is
@@ -216,7 +219,7 @@ fn the_appender_writes_each_value_into_its_slot() {
         &blob,
     );
     assert_eq!(batch, want);
-    batch.validate().unwrap();
+    assert_eq!(batch.view().null_breach(), None);
 }
 
 // ── Row selection: retain_ranges and gather ──────────────────────────────
@@ -285,7 +288,7 @@ fn retain_ranges_keeps_the_named_runs_in_order() {
     ] {
         let mut z = b.clone();
         z.retain_ranges(ranges);
-        z.validate().unwrap();
+        assert_eq!(z.view().null_breach(), None);
         let want: Vec<Row> = keep.iter().map(|&r| all[r].clone()).collect();
         assert_eq!(rows(&z), want, "{ranges:?}");
     }
@@ -315,7 +318,7 @@ fn a_cut_gather_matches_a_row_by_row_rebuild() {
     }
     let got = b.gather(&picks);
     assert_eq!(rows(&got), rows(&want));
-    got.validate().unwrap();
+    assert_eq!(got.view().null_breach(), None);
 }
 
 /// A gather naming every row in place is the batch itself.
@@ -326,7 +329,7 @@ fn an_in_place_gather_is_the_batch() {
     let arena = b.view().pk().as_ptr();
     let got = b.gather(&in_place);
     assert_eq!(got.view().pk().as_ptr(), arena);
-    got.validate().unwrap();
+    assert_eq!(got.view().null_breach(), None);
 }
 
 /// A gather keeping every row reorders it, every string read back as it was.
@@ -338,7 +341,7 @@ fn a_whole_gather_reorders_every_row() {
     let want: Vec<Row> = perm.iter().map(|&r| all[r as usize].clone()).collect();
     let got = b.gather(&perm);
     assert_eq!(rows(&got), want);
-    got.validate().unwrap();
+    assert_eq!(got.view().null_breach(), None);
 }
 
 /// A batch over a compound key with payload cells of every stride, NULLs among the
@@ -378,7 +381,7 @@ fn mixed_batch(strings: usize) -> (Arc<Schema>, ZSetBatch) {
             };
         }
     }
-    b.validate().unwrap();
+    assert_eq!(b.view().null_breach(), None);
     (schema, b)
 }
 
@@ -433,7 +436,7 @@ fn a_borrowing_gather_matches_a_row_by_row_copy() {
                 want.copy_row_at(&b, r as usize, b.view().get_weight(r as usize));
             }
             let got = b.gathered(&picks);
-            got.validate().unwrap();
+            assert_eq!(got.view().null_breach(), None);
             if strings < 2 {
                 assert_eq!(got, want, "{strings} strings, {picks:?}");
             } else {
@@ -735,7 +738,7 @@ fn a_decoded_batch_takes_every_write() {
         b.retain_ranges(&[(1, 5)]);
     }
     assert_eq!(rows(&got), rows(&want));
-    got.validate().unwrap();
+    assert_eq!(got.view().null_breach(), None);
 }
 
 /// Bytes a frame carries in front of its data block and behind it.
@@ -771,7 +774,7 @@ fn a_lone_owned_block_is_read_in_its_frame() {
             .unwrap();
             assert_eq!(got, batch);
             assert_eq!(got.view().pk().as_ptr() as usize, at, "the regions are the frame's");
-            got.validate().unwrap();
+            assert_eq!(got.view().null_breach(), None);
         }
     }
 }
@@ -793,7 +796,7 @@ fn several_blocks_concatenate_into_one_arena() {
     want.extend_from(&b);
     want.extend_from(&c);
     assert_eq!(got, want);
-    got.validate().unwrap();
+    assert_eq!(got.view().null_breach(), None);
 
     // One bad block refuses the whole train.
     let mut forged = c.clone();

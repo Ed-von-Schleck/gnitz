@@ -164,14 +164,9 @@ pub(crate) fn lower(rel: Rc<RelExpr>, names: &[HirCol]) -> Result<(Vec<PlannedVi
     let mut chain = ViewChain::new(&rel);
     let top = lower_body(&mut chain, &rel)?;
     let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
-    let (schema, moved_to) = top.out.schema_in_order(visible)?;
-    let mut schema = Arc::unwrap_or_clone(schema);
-    for (slot, id) in top.out.layout.iter().enumerate() {
-        if let Some(c) = id.and_then(|id| col_by_id(names, id)) {
-            schema.rename_column(moved_to[slot] as usize, c.def.name.clone());
-        }
-    }
-    Ok(chain.finish(top, Arc::new(schema)))
+    let name = |id| col_by_id(names, id).map(|c| c.def.name.clone());
+    let (schema, _) = top.out.schema_in_order(visible, name)?;
+    Ok(chain.finish(top, schema))
 }
 
 /// Lower a complete view body to circuit pieces: its linear levels over one

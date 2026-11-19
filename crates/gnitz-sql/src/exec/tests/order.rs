@@ -44,7 +44,7 @@ fn cut_of(order: &[OrderKey], slice: WeightSlots) -> ResultCut {
 /// The sort and cut of `b`, checked to be a well-formed batch.
 fn run(b: &ZSetBatch, order: &[OrderKey], slice: WeightSlots) -> ZSetBatch {
     let out = cut_of(order, slice).apply(b.clone());
-    out.validate().unwrap();
+    assert_eq!(out.view().null_breach(), None);
     out
 }
 

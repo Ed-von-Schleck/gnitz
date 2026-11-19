@@ -19,7 +19,8 @@ fn reply_fuzz() {
         let mut resolve = s.submit_resolve("s.t");
         let mut scan = s.submit_scan(Target::from(5), &spec, &schema);
         let mut multi = s.submit_scan_multi(&[(Target::from(5), &spec, &schema), (Target::from(6), &spec, &schema)]);
-        let mut delta = s.submit_delta_read(Target::from(7), None, &schema, &spec_bytes);
+        let mut delta = s.submit_delta_read(Target::from(7), None, &schema, &spec_bytes, None);
+        let mut kept = s.submit_delta_read(Target::from(7), None, &schema, &spec_bytes, Some(sub_id(101)));
         let mut page = s.submit_snapshot_page(1, 8, &[], 16, &schema);
         s.submit_delta_poll(
             sub_id(100),
@@ -45,6 +46,7 @@ fn reply_fuzz() {
             scan.try_take().is_some(),
             multi.try_take().is_some(),
             delta.try_take().is_some(),
+            kept.try_take().is_some(),
             page.try_take().is_some(),
             sync.try_take().is_some(),
         ]

@@ -328,7 +328,7 @@ pub(crate) fn reply_rows(
         .then(|| payload_program(&proj, &out.schema, &src))
         .transpose()?;
     let visible = items.iter().filter(|c| !c.out.def.is_hidden).map(|c| c.out.id);
-    let (schema, column_of) = out.schema_in_order(visible)?;
+    let (schema, column_of) = out.schema_in_order(visible, |_| None)?;
     // Each key with its slot of the projection's output.
     let slots = order
         .into_iter()

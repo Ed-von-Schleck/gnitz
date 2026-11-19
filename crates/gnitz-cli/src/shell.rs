@@ -102,7 +102,7 @@ impl Shell {
     /// Clear an interrupt that arrived before the wait it would cancel.
     pub(crate) fn clear_interrupt(&self) {
         if let Some(cancel) = &self.options.interrupt {
-            gnitz_core::drain_cancel(cancel);
+            gnitz_foundation::posix_io::drain(cancel);
         }
     }
 

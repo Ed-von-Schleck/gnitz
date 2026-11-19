@@ -30,7 +30,7 @@
 //! view's registration is derived by resolving its name, an alias's is by
 //! calling the [`Planner`] it was mirrored with.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::poll_fn;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -42,7 +42,7 @@ use crate::error::ClientError;
 use crate::host::{BoxFut, Host, Pending, Sent, offload};
 use crate::{RelName, Schema, ZSetBatch};
 use gnitz_wire::Target;
-use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId, kept_as};
+use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId};
 use gnitz_wire::{RelClass, WireStatus};
 
 // ---------------------------------------------------------------------------
@@ -349,7 +349,7 @@ impl MirrorState {
 
     /// One entry for each view of `done` still registered, for a caller that is
     /// about to be handed it.
-    fn report(&mut self, done: Vec<(u64, Result<(), ClientError>)>) -> Vec<PollOutcome> {
+    fn report(&mut self, done: BTreeMap<u64, Result<(), ClientError>>) -> Vec<PollOutcome> {
         let MirrorState { store, views } = self;
         let store = store.get();
         done.into_iter()
@@ -488,13 +488,13 @@ impl GnitzClient {
 
     /// Bring every view of `tids` up to date and subscribed, each by a delta
     /// read and then the recovery its refusal names. Returns how each view's
-    /// sync went, under the id it ended up mirrored at.
+    /// last sync went, under the id it ended up mirrored at.
     async fn settle(
         &mut self,
         tids: impl IntoIterator<Item = u64>,
-    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
+    ) -> Result<BTreeMap<u64, Result<(), ClientError>>, ClientError> {
         let mut pending: Vec<u64> = tids.into_iter().collect();
-        let mut done = Vec::with_capacity(pending.len());
+        let mut done = BTreeMap::new();
         // The views whose cursor the feed no longer continues.
         let mut expired = Vec::new();
         for attempt in 1..=SETTLE_ATTEMPTS {
@@ -509,13 +509,9 @@ impl GnitzClient {
             let synced = self.read_copies(&pending, &expired).await?;
             pending.clear();
             for (tid, result) in synced {
-                // A view synced again answers for its last sync alone.
-                if attempt > 1 {
-                    done.retain(|(synced, _)| *synced != tid);
-                }
                 let recovered = match result {
                     Ok(()) => {
-                        done.push((tid, Ok(())));
+                        done.insert(tid, Ok(()));
                         continue;
                     }
                     Err(e) if attempt == SETTLE_ATTEMPTS => Err(e),
@@ -529,7 +525,7 @@ impl GnitzClient {
                         if let Some(v) = self.mirror_state()?.views.get_mut(&tid) {
                             v.link = Link::Failed;
                         }
-                        done.push((tid, Err(e)))
+                        done.insert(tid, Err(e));
                     }
                 }
             }
@@ -570,7 +566,6 @@ impl GnitzClient {
             let from = |tid: &u64| store.cursor_of(*tid).filter(|_| !whole.contains(tid));
             tids.iter().map(from).collect()
         };
-        let first = *next_sub;
         let mut poll = {
             let item = |(tid, &from): (&u64, &Option<DeltaCursor>)| {
                 let view = &views[tid];
@@ -586,8 +581,7 @@ impl GnitzClient {
                 }
             };
             let items: Vec<DeltaPollItem> = tids.iter().zip(&froms).map(item).collect();
-            *next_sub = kept_as(first, items.len());
-            DeltaPoll::start(session, first, &items)
+            DeltaPoll::start(session, next_sub, &items)
         };
         let mut done = Vec::with_capacity(tids.len());
         // The view being answered: its blocks not yet in the store and, for
@@ -595,19 +589,19 @@ impl GnitzClient {
         let mut blocks = Vec::new();
         let (mut opened, mut failed) = (false, None);
         // The views holding a cursor that one step ended — each its id, its
-        // blocks and the cursor they ended at, and in `ended` its item —
-        // applied together before the session reads on. Such a copy takes its
-        // train whole, with the cursor past it, in one advance: rows and cursor
-        // move together, so a read abandoned mid-train reads again from a
-        // cursor none of its rows were applied past. A copy read whole is
-        // unreadable until sealed and erased by its next refill, so it takes
-        // each step's blocks as they come.
-        let mut ended: Vec<usize> = Vec::new();
+        // blocks and the cursor they ended at, and in `ended` its id and the
+        // subscription it is kept as — applied together before the session
+        // reads on. Such a copy takes its train whole, with the cursor past it,
+        // in one advance: rows and cursor move together, so a read abandoned
+        // mid-train reads again from a cursor none of its rows were applied
+        // past. A copy read whole is unreadable until sealed and erased by its
+        // next refill, so it takes each step's blocks as they come.
+        let mut ended: Vec<(u64, SubId)> = Vec::new();
         let mut due: Vec<(u64, Vec<RawBlock>, DeltaCursor)> = Vec::new();
         loop {
             while poll.at < tids.len() {
                 let (i, tid) = (poll.at, tids[poll.at]);
-                let id = kept_as(first, i);
+                let id = poll.id(i);
                 let end = match poll.session.take_reading(id) {
                     Some(read) => {
                         blocks.extend(read);
@@ -659,12 +653,12 @@ impl GnitzClient {
                         if read.is_ok()
                             && let Some(view) = views.get_mut(&tid)
                         {
-                            view.subscribed(kept_as(first, i));
+                            view.subscribed(id);
                         }
                         done.push((tid, read));
                     }
                     (Some(_), Ok(next)) => {
-                        ended.push(i);
+                        ended.push((tid, id));
                         due.push((tid, std::mem::take(&mut blocks), next));
                     }
                     (Some(_), Err(e)) => done.push((tid, Err(e))),
@@ -674,12 +668,11 @@ impl GnitzClient {
             }
             if !due.is_empty() {
                 let advanced = store.clone().advance(host, std::mem::take(&mut due)).await?;
-                for (i, advanced) in ended.drain(..).zip(advanced) {
-                    let tid = tids[i];
+                for ((tid, id), advanced) in ended.drain(..).zip(advanced) {
                     if advanced.is_ok()
                         && let Some(view) = views.get_mut(&tid)
                     {
-                        view.subscribed(kept_as(first, i));
+                        view.subscribed(id);
                     }
                     done.push((tid, advanced));
                 }
@@ -699,10 +692,10 @@ impl GnitzClient {
     async fn advance_pushed(
         &mut self,
         synced: &Result<(), ClientError>,
-    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
+    ) -> Result<BTreeMap<u64, Result<(), ClientError>>, ClientError> {
         let GnitzClient { session, host, mirror, .. } = self;
         let MirrorState { views, store, .. } = mirror.as_deref_mut().ok_or_else(no_mirror_store)?;
-        let (mut done, mut due) = (Vec::new(), Vec::new());
+        let (mut done, mut due) = (BTreeMap::new(), Vec::new());
         {
             let store = store.get();
             for (&tid, view) in views.iter_mut() {
@@ -718,7 +711,7 @@ impl GnitzClient {
                 if next != at || !blocks.is_empty() {
                     due.push((tid, blocks, next));
                 } else {
-                    done.push((tid, Ok(())));
+                    done.insert(tid, Ok(()));
                 }
             }
         }
@@ -743,7 +736,7 @@ impl GnitzClient {
             {
                 view.link = Link::Due;
             }
-            done.push((tid, advanced));
+            done.insert(tid, advanced);
         }
         Ok(done)
     }
@@ -892,9 +885,7 @@ impl GnitzClient {
         let views = &self.mirror_state()?.views;
         let unsubscribed = views.iter().filter(|(_, v)| !matches!(v.link, Link::Subscribed(_)));
         let unsubscribed = unsubscribed.map(|(tid, _)| *tid);
-        let polled: Vec<u64> = unsubscribed
-            .filter(|tid| done.iter().all(|(done, _)| done != tid))
-            .collect();
+        let polled: Vec<u64> = unsubscribed.filter(|tid| !done.contains_key(tid)).collect();
         done.extend(self.settle(polled).await?);
         Ok(self.mirror_state()?.report(done))
     }

@@ -21,7 +21,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
-use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, drain_cancel, serve, sync_op};
+use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, serve};
 
 use crate::client::{Convert, Mode, PyClient, VerbOp, resolve_target, whole};
 use crate::reply::{none, synced};
@@ -153,7 +153,7 @@ impl Wakeup {
 
     /// Take every wake so far, so the loop calls back again only on the next.
     fn drain(&self) {
-        drain_cancel(&self.rx);
+        gnitz_foundation::posix_io::drain(&self.rx);
     }
 }
 
@@ -190,7 +190,7 @@ impl Owed {
         O: VerbOp<T>,
         C: Convert<T>,
     {
-        Box::new(move |client| {
+        Op::call(move |client| {
             Box::pin(async move {
                 match op(client).await {
                     Ok(sent) => sent.then(move |reply| self.land(reply.map_err(client_err), convert)),
@@ -408,7 +408,7 @@ impl LoopCore {
     /// its reseeds back, and the next sync reports them.
     pub(crate) fn sync(&self, py: Python<'_>, wait: Duration) -> PyResult<Py<PyAny>> {
         let delivery = self.queue(py, |owed| {
-            sync_op(wait, move |synced| owed.land(synced.map_err(client_err), delivered))
+            Op::sync(wait, move |synced| owed.land(synced.map_err(client_err), delivered))
         })?;
         static CLAIMED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
         let claimed = CLAIMED.import(py, "gnitz.aio", "_claimed")?;

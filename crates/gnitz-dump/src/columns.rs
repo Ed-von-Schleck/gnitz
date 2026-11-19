@@ -29,9 +29,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use gnitz_core::{Batch, MemBatch, Schema, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, as_le_bytes, push_zero_cell};
+use gnitz_zset::repr::{Batch, MemBatch};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as Physical, ZstdLevel};
 use parquet::column::reader::{ColumnReader, get_typed_column_reader};
 use parquet::data_type::{

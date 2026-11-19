@@ -104,11 +104,13 @@ impl Frame {
     /// `root`'s columns in `root` order, each unnamed payload slot staying where
     /// the payload order puts it. The regions are this frame's own, so the engine
     /// relabels a batch rather than moving a column. Refused for a `root` that
-    /// would move a payload column. A `root` that keeps every slot in place returns
+    /// would move a payload column. Each slot whose identity `name` names is
+    /// renamed so. A `root` that keeps every slot in place and its name returns
     /// this frame's own schema.
     pub(crate) fn schema_in_order(
         &self,
         root: impl IntoIterator<Item = ColId>,
+        name: impl Fn(ColId) -> Option<Arc<str>>,
     ) -> Result<(Arc<Schema>, Vec<u32>), GnitzSqlError> {
         let internal = |m: &str| GnitzSqlError::Internal(format!("output order: {m}"));
         let is_pk = |s: usize| self.schema.layout().is_pk_col(s);
@@ -135,7 +137,16 @@ impl Frame {
         if !order.iter().filter(|&&s| !is_pk(s)).is_sorted() {
             return Err(internal("the root would move a payload column"));
         }
-        if order.iter().copied().eq(0..order.len()) {
+        let columns: Vec<ColumnDef> = (order.iter())
+            .map(|&s| {
+                let mut c = self.schema.columns()[s].clone();
+                if let Some(n) = self.layout[s].and_then(&name) {
+                    c.name = n;
+                }
+                c
+            })
+            .collect();
+        if order.iter().copied().eq(0..order.len()) && columns == self.schema.columns() {
             return Ok((Arc::clone(&self.schema), (0..order.len() as u32).collect()));
         }
         let mut moved_to = vec![0u32; order.len()];
@@ -143,8 +154,8 @@ impl Frame {
             moved_to[from] = to as u32;
         }
         let pk: Vec<u32> = self.schema.pk_cols().iter().map(|&s| moved_to[s as usize]).collect();
-        let schema = Schema::from_parts(order.iter().map(|&s| self.schema.columns()[s].clone()).collect(), &pk)
-            .map_err(|e| GnitzSqlError::rejected(format!("output schema: {e}")))?;
+        let schema =
+            Schema::from_parts(columns, &pk).map_err(|e| GnitzSqlError::rejected(format!("output schema: {e}")))?;
         Ok((Arc::new(schema), moved_to))
     }
 

@@ -14,8 +14,7 @@ use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode,
 use gnitz_zset::repr::{MemBatch, Pick, gather_rows};
 
 use crate::client::GnitzClient;
-use crate::connection::PushFamily;
-use crate::connection::{RelDescriptor, Request, ScanReply};
+use crate::connection::{PushFamily, RelDescriptor, Request, ScanReply};
 use crate::error::ClientError;
 use crate::{Schema, ZSetBatch};
 
@@ -55,7 +54,9 @@ impl GnitzClient {
 
     /// Commit the open transaction atomically and return its durable zone LSN, `0`
     /// when it wrote nothing. Errors if no transaction is open; the transaction is
-    /// closed even when the commit fails.
+    /// closed even when the commit fails. The buffer ships as one `PUSH_TXN`
+    /// frame, whose families land together under one zone LSN or not at all; an
+    /// empty buffer sends nothing.
     ///
     /// A `StaleCatalog` refusal is reported as `TxnConflict`: a relation the
     /// transaction wrote has been altered since this client resolved it — which
@@ -65,7 +66,10 @@ impl GnitzClient {
     /// afresh.
     pub async fn txn_commit(&mut self) -> Result<u64, ClientError> {
         let buf = self.txn.take().ok_or_else(no_transaction)?;
-        self.push_txn(&buf).await.map_err(|e| match e {
+        if buf.families.is_empty() {
+            return Ok(0);
+        }
+        self.ack(Request::PushTxn(&buf.families)).await.map_err(|e| match e {
             ClientError::Refused(WireFault { status: WireStatus::StaleCatalog, text }) => {
                 self.kept.retain(|_, rel| !buf.tids.contains_key(&rel.tid));
                 ClientError::Refused(WireFault {
@@ -75,15 +79,6 @@ impl GnitzClient {
             }
             e => e,
         })
-    }
-
-    /// Ship `buf` as one `PUSH_TXN` frame, whose families land together under one
-    /// zone LSN or not at all; an empty buffer sends nothing.
-    async fn push_txn(&mut self, buf: &TxnBuffer) -> Result<u64, ClientError> {
-        if buf.families.is_empty() {
-            return Ok(0);
-        }
-        self.ack(Request::PushTxn(&buf.families)).await
     }
 
     /// Read `target`'s rows under `bound` and `predicate` — only their keys when
@@ -133,9 +128,9 @@ impl GnitzClient {
         let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
         let count = batch.len();
         txn.push(target, batch, WireConflictMode::Update, basis)?;
-        if self.txn.is_none() {
-            // Autocommit: the statement is a transaction of its own.
-            self.push_txn(&own).await?;
+        // Autocommit: the statement is a transaction of its own.
+        if self.txn.is_none() && !own.families.is_empty() {
+            self.ack(Request::PushTxn(&own.families)).await?;
         }
         Ok(count)
     }
@@ -145,7 +140,7 @@ fn no_transaction() -> ClientError {
     ClientError::from("no transaction open")
 }
 
-/// A transaction's buffered writes, which [`GnitzClient::push_txn`] ships as one
+/// A transaction's buffered writes, which [`GnitzClient::txn_commit`] ships as one
 /// `PUSH_TXN` frame; dropping it sends nothing. Per tid, the families are the
 /// maximal same-mode runs of the writes in call order, the order the engine
 /// validates and applies them in.

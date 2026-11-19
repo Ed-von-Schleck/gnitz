@@ -1,6 +1,6 @@
 use super::*;
-use gnitz_core::{Batch, BatchBuilder};
 use gnitz_foundation::rng::mix;
+use gnitz_zset::repr::{Batch, BatchBuilder};
 
 /// Rows a bench table holds.
 const ROWS: usize = 1 << 20;

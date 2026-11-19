@@ -1,8 +1,8 @@
 use super::*;
 use crate::test_support::{col, ncol, schema};
-use gnitz_core::{Batch, BatchBuilder};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use std::sync::Arc;
 
 /// `rows` rows of `(id U64 pk, v)`, ids ascending, each `v` written by `write` from a

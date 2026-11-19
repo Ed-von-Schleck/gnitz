@@ -499,16 +499,17 @@ fn a_poll_released_mid_train_drops_the_rest() {
     assert!(!s.inbox.polls.untaken(), "nothing parked");
 }
 
-/// A read of view 7's delta feed after `(tag 1, tick 4)`.
-fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>) -> Sent<(ScanReply, DeltaCursor)> {
-    s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[])
+/// A read of view 7's delta feed after `(tag 1, tick 4)`, kept as
+/// subscription `keep`.
+fn submit_delta_read(s: &mut Session, schema: &Arc<Schema>, keep: Option<SubId>) -> Sent<(ScanReply, DeltaCursor)> {
+    s.submit_delta_read(7.into(), DeltaCursor::from_pair(1, 4), schema, &[], keep)
 }
 
 #[test]
 fn a_delta_read_yields_its_trains_rows_and_the_terminals_cursor() {
     let (mut s, peer) = pair();
     let schema = schema_a();
-    let sent = submit_delta_read(&mut s, &schema);
+    let sent = submit_delta_read(&mut s, &schema, None);
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&delta_frame(7, Some(&batch_a(&[1, 2])), None));
@@ -525,7 +526,7 @@ fn a_delta_read_yields_its_trains_rows_and_the_terminals_cursor() {
 #[test]
 fn a_fault_naming_a_delta_reads_view_refuses_it_alone() {
     let (mut s, peer) = pair();
-    let sent = submit_delta_read(&mut s, &schema_a());
+    let sent = submit_delta_read(&mut s, &schema_a(), None);
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&reply_status(7, WireStatus::Error, "refused"));
@@ -541,7 +542,7 @@ fn a_fault_naming_a_delta_reads_view_refuses_it_alone() {
 #[test]
 fn a_delta_read_terminal_at_round_0_ends_the_session() {
     let (mut s, peer) = pair();
-    let sent = submit_delta_read(&mut s, &schema_a());
+    let sent = submit_delta_read(&mut s, &schema_a(), None);
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&delta_terminal(7, 1, 0));
@@ -551,6 +552,82 @@ fn a_delta_read_terminal_at_round_0_ends_the_session() {
         "{e:?}"
     );
     assert!(s.is_closed());
+}
+
+#[test]
+fn a_kept_read_holds_its_id_at_the_terminals_cursor() {
+    let (mut s, peer) = pair();
+    let sent = submit_delta_read(&mut s, &schema_a(), Some(sub_id(3)));
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&delta_frame(7, Some(&batch_a(&[1, 2])), None));
+    peer.send(&delta_terminal(7, 1, 9));
+    let (reply, at) = await_reply(&mut s, sent).unwrap();
+    assert_eq!((reply.batch, at.pair()), (batch_a(&[1, 2]), (1, 9)));
+    assert!(s.inbox.polls.server_holds);
+    let (blocks, held_at) = s.take_pushed(sub_id(3)).unwrap();
+    assert_eq!(
+        (blocks.len(), held_at),
+        (0, at),
+        "held with its rows already handed out"
+    );
+}
+
+#[test]
+fn a_kept_read_no_sync_names_is_dropped() {
+    let (mut s, peer) = pair();
+    let sent = submit_delta_read(&mut s, &schema_a(), Some(sub_id(3)));
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&delta_terminal(7, 1, 9));
+    await_reply(&mut s, sent).unwrap();
+    drop(s.submit_sync(&[], Duration::ZERO));
+    assert!(s.take_pushed(sub_id(3)).is_err());
+}
+
+#[test]
+fn a_kept_read_refused_holds_nothing() {
+    let (mut s, peer) = pair();
+    let sent = submit_delta_read(&mut s, &schema_a(), Some(sub_id(3)));
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&reply_status(7, WireStatus::Error, "refused"));
+    let r = await_reply(&mut s, sent);
+    assert!(
+        matches!(&r, Err(ClientError::Refused(f)) if f.text == "refused"),
+        "{r:?}"
+    );
+    assert!(s.take_pushed(sub_id(3)).is_err());
+
+    s.end(ClientError::Closed);
+    let mut sent = submit_delta_read(&mut s, &schema_a(), Some(sub_id(4)));
+    assert!(
+        matches!(sent.try_take(), Some(Err(ClientError::Closed))),
+        "refused at enqueue"
+    );
+    assert!(s.take_pushed(sub_id(4)).is_err());
+}
+
+/// A train pushed after a kept read's terminal is not folded into its reply:
+/// it stays parked for the id under its own cursor.
+#[test]
+fn a_train_pushed_after_a_kept_terminal_stays_parked() {
+    let (mut s, peer) = pair();
+    let sent = submit_delta_read(&mut s, &schema_a(), Some(sub_id(3)));
+    let after = s.submit(COMMIT);
+    s.step(Interest::WRITE);
+    peer.recv();
+    let mut wire = framed(&delta_frame(7, Some(&batch_a(&[1])), None));
+    wire.extend(framed(&delta_terminal(7, 1, 9)));
+    wire.extend(pushed_train(7, sub_id(3), &batch_a(&[2]), Ok((1, 11))));
+    wire.extend(framed(&reply_ctrl(0, 1)));
+    peer.send_bytes(&wire);
+    let (reply, at) = await_reply(&mut s, sent).unwrap();
+    assert_eq!((reply.batch, at.pair()), (batch_a(&[1]), (1, 9)));
+    assert_eq!(await_reply(&mut s, after).unwrap(), 1);
+    let (blocks, held_at) = s.take_pushed(sub_id(3)).unwrap();
+    assert_eq!((blocks.len(), held_at), (1, cursor(11)));
+    assert_eq!(decode_wal_blocks(blocks, None, &schema_a()).unwrap(), batch_a(&[2]));
 }
 
 /// A RESOLVE reply that does not decode ends the session, whichever part of
