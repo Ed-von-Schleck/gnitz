@@ -15,7 +15,7 @@ use super::key_pack::{FOLD_CHUNK_MIN_ROWS, KeyPacker, locate_key_col, pk_run};
 use super::zeroed;
 use crate::repr::{Batch, MemBatch, vec_bytes};
 use crate::schema::{DerivedSchema, PkSortKey, SchemaDescriptor, pk_width_dispatch};
-use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
+use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot, radix_sort_by_key};
 use gnitz_wire::{NARROW_PK_MAX_BYTES, TypeCode};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -524,7 +524,7 @@ impl GroupOrdinals {
         let GroupOrdinals { mut ord, mut first, mut by_pk, mut ids } = self.take_cleared();
         // A batch too small to hash sorts on the stack.
         let mut pairs: SmallVec<[(K, u32); HASH_MIN_ROWS]> = (0..n).map(|i| (key(i), i as u32)).collect();
-        K::sort_by_key(&mut pairs, |p| p.0);
+        radix_sort_by_key(&mut pairs, |p| p.0);
         zeroed(&mut ord, n);
         for (p, &(k, row)) in pairs.iter().enumerate() {
             if p == 0 || k != pairs[p - 1].0 {
@@ -616,7 +616,7 @@ impl IdentityLoop for Hashed<'_> {
             // The identities are distinct and sort as the output PK. Taken in
             // discovery order, which is often PK order already.
             by_pk.extend(0..first.len() as u32);
-            by_pk.sort_unstable_by_key(|&g| ids[g as usize]);
+            radix_sort_by_key(&mut by_pk, |&g| ids[g as usize]);
         }
         (*out, *kept) = (GroupOrdinals { ord, first, by_pk, ids }, numbers);
         fits

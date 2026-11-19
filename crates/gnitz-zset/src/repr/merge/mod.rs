@@ -13,6 +13,7 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
+use gnitz_expr::{RadixKey, radix_sort_by_key};
 use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
@@ -22,8 +23,7 @@ use super::seek::gallop_from;
 use super::string_heap::{BlobCache, rebase_string_cells, row_long_bytes};
 use super::writer::DirectWriter;
 use crate::schema::{
-    PayloadOrder, PkSortKey, RadixKey, SchemaColumn, SchemaDescriptor, pack_pk_be, pk_width_dispatch,
-    radix_sort_by_key, with_payload_cmp,
+    PayloadOrder, PkSortKey, SchemaColumn, SchemaDescriptor, pack_pk_be, pk_width_dispatch, with_payload_cmp,
 };
 use gnitz_wire::{Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT, RowSource, ScalarKind, native_key_image};
 
@@ -809,14 +809,13 @@ struct PackedEntry([u128; 2]);
 
 /// The key is the bytes above the row index.
 impl RadixKey for PackedEntry {
-    const BYTES: usize = PACKED_MAX_STRIDE;
     #[inline(always)]
     fn byte(self, i: usize) -> u8 {
         self.0.byte(i + size_of::<u32>())
     }
-    #[inline(always)]
-    fn or_diff(self, a: Self, b: Self) -> Self {
-        PackedEntry(self.0.or_diff(a.0, b.0))
+    #[inline]
+    fn varying(first: Self, keys: impl Iterator<Item = Self>) -> u128 {
+        <[u128; 2]>::varying(first.0, keys.map(|e| e.0)) >> size_of::<u32>()
     }
 }
 
@@ -876,7 +875,7 @@ fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pic
                 idx: i,
             })
             .collect();
-        K::sort_by_key(&mut entries, |e| e.key);
+        radix_sort_by_key(&mut entries, |e| e.key);
         fold_runs(&mut entries, batch, schema, payload, out);
     })
 }
@@ -1034,7 +1033,7 @@ fn fold_keyed(
             w => unreachable!("a packable column of {w} bytes"),
         }
     }
-    keyed.sort_unstable_by_key(|e| e.0);
+    radix_sort_by_key(keyed, |e| e.0);
     if next == schema.num_payload_cols() {
         return fold_sorted(keyed, |e| e.1 as usize, |a, b| a.0 == b.0, weights, out);
     }

@@ -3,8 +3,8 @@ use super::tests::{build, wide_string};
 use super::*;
 use crate::runs::write_shard;
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
-    weighted_rows,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_payload_schema, pk_u64_two_i64_schema,
+    u64_pk_schema, weighted_rows,
 };
 use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::{Rng, mix};
@@ -352,46 +352,58 @@ fn shard_read_bench() {
 }
 
 /// What the PK filter adds to a shard write and costs a probe, at key counts
-/// inside and outside the cache. Cycles beside instructions because the
-/// filter's construction trades one for the other.
+/// inside and outside the cache, under an 8-byte PK, whose probe keys are the
+/// keys, and a 16-byte one, whose probe keys are hashes the build sorts and
+/// dedups. Cycles beside instructions because the filter's construction trades
+/// one for the other.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_filter_bench() {
     let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    for rows in [1usize << 12, 1 << 16, 1 << 20] {
-        let batch = build(schema, rows, |b, i| {
-            b.begin_row(i as u128, 1);
-            b.put_int(i as u128);
-        });
-        let [with, without] = [false, true].map(|skip_pk_filter| {
-            let opts = ShardWriteOpts { skip_pk_filter, ..Default::default() };
-            let write = |pass: &str| {
-                let path = dir.path().join(format!("{rows}_{skip_pk_filter}_{pass}.db"));
-                write_shard(&batch, path.to_str().unwrap(), opts).unwrap();
-                path
-            };
-            // The first write warms the allocator and the page cache.
-            write("warm");
-            let (path, counts) = counters.measure(|| write("counted"));
-            let shard = MappedShard::open(path.to_str().unwrap(), &schema).unwrap();
-            assert_eq!(shard.has_pk_filter(), !skip_pk_filter);
-            let per_row = counts.map(|n| n as f64 / rows as f64);
-            (shard, per_row)
-        });
-        let probes: Vec<u64> = (0..rows).map(|row| probe_key(with.0.get_pk_bytes(row))).collect();
-        let (admitted, [probe, _]) =
-            counters.measure(|| probes.iter().filter(|&&p| with.0.pk_filter_may_contain(p)).count());
-        assert_eq!(admitted, rows);
-        println!(
-            "pk_filter_bench {rows:>7} rows: {:.1} instr/row and {:.1} cycles/row with the filter, \
+    let wide = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
+    for (pk, schema) in [("8-byte PK", make_schema_u64_i64()), ("16-byte PK", wide)] {
+        for rows in [1usize << 12, 1 << 16, 1 << 20] {
+            let batch = build(schema, rows, |b, i| {
+                let id = i as u128;
+                // The 16-byte PK: a constant leading column over the ids.
+                let key: &[u128] = match schema.pk_cols().len() {
+                    1 => &[id],
+                    _ => &[7, id],
+                };
+                b.begin_row_natives(key, 1);
+                b.put_int(i as u128);
+            });
+            let [with, without] = [false, true].map(|skip_pk_filter| {
+                let opts = ShardWriteOpts { skip_pk_filter, ..Default::default() };
+                let write = |pass: &str| {
+                    let path = dir
+                        .path()
+                        .join(format!("{}_{rows}_{skip_pk_filter}_{pass}.db", schema.pk_stride()));
+                    write_shard(&batch, path.to_str().unwrap(), opts).unwrap();
+                    path
+                };
+                // The first write warms the allocator and the page cache.
+                write("warm");
+                let (path, counts) = counters.measure(|| write("counted"));
+                let shard = MappedShard::open(path.to_str().unwrap(), &schema).unwrap();
+                assert_eq!(shard.has_pk_filter(), !skip_pk_filter);
+                let per_row = counts.map(|n| n as f64 / rows as f64);
+                (shard, per_row)
+            });
+            let probes: Vec<u64> = (0..rows).map(|row| probe_key(with.0.get_pk_bytes(row))).collect();
+            let (admitted, [probe, _]) =
+                counters.measure(|| probes.iter().filter(|&&p| with.0.pk_filter_may_contain(p)).count());
+            assert_eq!(admitted, rows);
+            println!(
+                "pk_filter_bench {pk} {rows:>7} rows: {:.1} instr/row and {:.1} cycles/row with the filter, \
              {:.1} and {:.1} without, {:.1} instr/probe",
-            with.1[0],
-            with.1[1],
-            without.1[0],
-            without.1[1],
-            probe as f64 / rows as f64
-        );
+                with.1[0],
+                with.1[1],
+                without.1[0],
+                without.1[1],
+                probe as f64 / rows as f64
+            );
+        }
     }
 }

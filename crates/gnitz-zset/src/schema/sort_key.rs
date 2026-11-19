@@ -1,7 +1,7 @@
-//! The fixed-width sort keys of an OPK region and the radix sort over them: the
-//! key a merge, a group walk and a seek order rows by, and the sort that builds
-//! a [`PkKeys`] list.
+//! The fixed-width sort keys of an OPK region: the key a merge, a group walk and
+//! a seek order rows by, and the sort that builds a [`PkKeys`] list.
 
+use gnitz_expr::{RadixKey, radix_sort_by_key};
 use gnitz_wire::{MAX_PK_BYTES, NARROW_PK_MAX_BYTES, PkKeys};
 use smallvec::SmallVec;
 
@@ -67,15 +67,13 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
 /// A whole-PK sort key in the slice order of the bytes it was built from, so a
 /// key sort needs no PK-byte tiebreak. Keys compare only
 /// against keys built from the same number of bytes.
-pub(crate) trait PkSortKey<'a>: Ord + Copy + Default {
+pub(crate) trait PkSortKey<'a>: RadixKey + Default {
     fn from_opk(opk: &'a [u8]) -> Self;
     /// The bytes [`Self::put`] writes for a key built from `stride` bytes.
     fn put_width(stride: usize) -> usize;
     /// The key's bytes big-endian into `out`, [`Self::put_width`] long: the
     /// `stride` bytes it was built from, then zeros.
     fn put(self, out: &mut [u8]);
-    /// Sort `v` by `key`, unstably: a radix sort where the key is an integer.
-    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self);
 }
 
 /// Run `$body` with `$k` bound to the [`PkSortKey`] matching `$stride` — the one
@@ -122,10 +120,6 @@ impl PkSortKey<'_> for u64 {
     fn put(self, out: &mut [u8]) {
         out.copy_from_slice(&self.to_be_bytes());
     }
-    #[inline]
-    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
-        radix_sort_by_key(v, key)
-    }
 }
 
 impl PkSortKey<'_> for u128 {
@@ -148,10 +142,6 @@ impl PkSortKey<'_> for u128 {
     fn put(self, out: &mut [u8]) {
         out.copy_from_slice(&self.to_be_bytes());
     }
-    #[inline]
-    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
-        radix_sort_by_key(v, key)
-    }
 }
 
 impl<'a> PkSortKey<'a> for &'a [u8] {
@@ -166,10 +156,6 @@ impl<'a> PkSortKey<'a> for &'a [u8] {
     #[inline(always)]
     fn put(self, out: &mut [u8]) {
         out.copy_from_slice(self);
-    }
-    #[inline]
-    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
-        v.sort_unstable_by_key(key)
     }
 }
 
@@ -194,116 +180,6 @@ impl PkSortKey<'_> for [u128; 2] {
         let (high, low) = out.split_at_mut(16);
         self[0].put(high);
         self[1].put(low);
-    }
-    #[inline]
-    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
-        radix_sort_by_key(v, key)
-    }
-}
-
-/// A key [`radix_sort_by_key`] orders a byte at a time: `BYTES` bytes read as
-/// one unsigned integer, which orders as `Ord` does. A key may hold bytes below
-/// them that `Ord` also reads; the radix passes leave their ties in any order.
-pub(crate) trait RadixKey: Copy + Ord + Default {
-    /// How many bytes the key has.
-    const BYTES: usize;
-    /// Byte `i` of `0..BYTES`, counted from the least significant.
-    fn byte(self, i: usize) -> u8;
-    /// `self` with every bit set where `a` and `b` differ.
-    fn or_diff(self, a: Self, b: Self) -> Self;
-}
-
-impl RadixKey for u64 {
-    const BYTES: usize = 8;
-    #[inline(always)]
-    fn byte(self, i: usize) -> u8 {
-        (self >> (8 * i)) as u8
-    }
-    #[inline(always)]
-    fn or_diff(self, a: Self, b: Self) -> Self {
-        self | (a ^ b)
-    }
-}
-
-impl RadixKey for u128 {
-    const BYTES: usize = 16;
-    /// The half first: a variable shift of the whole `u128` costs a funnel shift.
-    #[inline(always)]
-    fn byte(self, i: usize) -> u8 {
-        let half = if i < 8 { self as u64 } else { (self >> 64) as u64 };
-        half.byte(i & 7)
-    }
-    #[inline(always)]
-    fn or_diff(self, a: Self, b: Self) -> Self {
-        self | (a ^ b)
-    }
-}
-
-/// The high word, then the low.
-impl RadixKey for [u128; 2] {
-    const BYTES: usize = 32;
-    #[inline(always)]
-    fn byte(self, i: usize) -> u8 {
-        if i < 16 { self[1].byte(i) } else { self[0].byte(i - 16) }
-    }
-    #[inline(always)]
-    fn or_diff(self, a: Self, b: Self) -> Self {
-        [self[0].or_diff(a[0], b[0]), self[1].or_diff(a[1], b[1])]
-    }
-}
-
-/// Sort `v` by `key`, unstably: least-significant-digit radix over the key bytes
-/// that vary among its elements, or a comparison sort on a list too short to
-/// repay one or whose keys vary in too many bytes.
-pub(crate) fn radix_sort_by_key<T: Copy + Default, K: RadixKey>(v: &mut [T], key: impl Fn(&T) -> K) {
-    const RADIX_MIN: usize = 256;
-    if v.len() < RADIX_MIN {
-        v.sort_unstable_by_key(&key);
-        return;
-    }
-    if v.is_sorted_by_key(&key) {
-        return;
-    }
-    if v.is_sorted_by(|a, b| key(a) >= key(b)) {
-        v.reverse();
-        return;
-    }
-    // A pass costs about what four levels of a comparison sort do.
-    let max_digits = v.len().ilog2() as usize / 4;
-    let varying = |diff: K| (0..K::BYTES).filter(move |&b| diff.byte(b) != 0);
-    let first = key(&v[0]);
-    let mut diff = K::default();
-    for chunk in v.chunks(RADIX_MIN) {
-        diff = chunk.iter().fold(diff, |d, x| d.or_diff(key(x), first));
-        if varying(diff).count() > max_digits {
-            v.sort_unstable_by_key(&key);
-            return;
-        }
-    }
-    // Neither ascending nor descending, so some byte varies.
-    let digits: SmallVec<[usize; 32]> = varying(diff).collect();
-    let mut buf = vec![T::default(); v.len()];
-    let (mut src, mut dst) = (&mut *v, &mut buf[..]);
-    // A pass reading one key byte, rather than also counting the next digit
-    // while it scatters, lets the compiler hoist the byte's word out of the loop.
-    for &b in &digits {
-        let mut count = [0usize; 256];
-        for x in src.iter() {
-            count[key(x).byte(b) as usize] += 1;
-        }
-        let mut at = 0;
-        for c in count.iter_mut() {
-            (*c, at) = (at, at + *c);
-        }
-        for &x in src.iter() {
-            let slot = &mut count[key(&x).byte(b) as usize];
-            dst[*slot] = x;
-            *slot += 1;
-        }
-        std::mem::swap(&mut src, &mut dst);
-    }
-    if digits.len() % 2 == 1 {
-        v.copy_from_slice(&buf);
     }
 }
 
@@ -337,7 +213,7 @@ pub fn pk_keys_of_images(stride: usize, images: impl IntoIterator<Item = u128>) 
 /// of at most two keys, and its bytes up to `MAX_PK_BYTES`, end up inline.
 fn sorted<'a, K: PkSortKey<'a>>(stride: usize, keys: impl Iterator<Item = K>) -> PkKeys {
     let mut keys: SmallVec<[K; 2]> = keys.collect();
-    K::sort_by_key(&mut keys, |&k| k);
+    radix_sort_by_key(&mut keys, |&k| k);
     let width = K::put_width(stride);
     let mut bytes = SmallVec::<[u8; MAX_PK_BYTES]>::from_elem(0, keys.len() * stride + width - stride);
     let mut at = 0;

@@ -19,7 +19,7 @@ pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range
 
 pub use key::{band, compare_pk_ordering, group_floor};
 pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
-pub(crate) use sort_key::{PkSortKey, RadixKey, pack_pk_be, pk_width_dispatch, radix_sort_by_key};
+pub(crate) use sort_key::{PkSortKey, pack_pk_be, pk_width_dispatch};
 pub use sort_key::{pk_keys, pk_keys_of_images};
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record, named or shape:

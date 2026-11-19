@@ -4,7 +4,8 @@ use std::cmp::Ordering;
 
 use gnitz_wire::{OrderKey, RowSource, ScalarKind, ValueForm, WideForm};
 
-use crate::{ColumnLocator, SchemaDescriptor};
+use crate::radix::stable_radix_sort_by_key;
+use crate::{ColumnLocator, RadixKey, SchemaDescriptor};
 
 /// One resolved ORDER BY key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +99,7 @@ pub fn order_bits(loc: &ColumnLocator, src: &impl RowSource, row: usize, kind: S
 }
 
 /// A row with one of its order keys as integers.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Ranked {
     image: u64,
     row: u32,
@@ -106,14 +107,26 @@ struct Ranked {
     rank: u8,
 }
 
-/// A row's place under its leading order key alone.
+/// A row's place under its leading order key alone: the rank above the image,
+/// one integer, which compares in fewer instructions than the pair.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Lead(u8, u64);
+pub struct Lead(u128);
+
+impl RadixKey for Lead {
+    #[inline(always)]
+    fn byte(self, i: usize) -> u8 {
+        self.0.byte(i)
+    }
+    #[inline]
+    fn varying(first: Self, keys: impl Iterator<Item = Self>) -> u128 {
+        u128::varying(first.0, keys.map(|l| l.0))
+    }
+}
 
 impl Ranked {
     #[inline(always)]
     fn lead(&self) -> Lead {
-        Lead(self.rank, self.image)
+        Lead((self.rank as u128) << 64 | self.image as u128)
     }
 }
 
@@ -164,10 +177,24 @@ fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>) {
     }
 }
 
+/// Sort `run` by lead, stably. Several workers' replies concatenated stand in a few
+/// ascending runs, which a merge sort joins in a pass per halving of their number: fewer
+/// passes than the radix sort makes while the runs are few.
+fn sort_by_lead(run: &mut [Ranked]) {
+    const FEW_RUNS: usize = 8;
+    match run.windows(2).filter(|w| w[0].lead() > w[1].lead()).count() {
+        0 => {}
+        // Every pair strictly descending: reversed, no tie changes its order.
+        descents if descents == run.len() - 1 => run.reverse(),
+        descents if descents < FEW_RUNS => run.sort_by_key(Ranked::lead),
+        _ => stable_radix_sort_by_key(run, Ranked::lead),
+    }
+}
+
 /// Sort `run`, whose images are `keys[0]`'s, by `keys`; rows the keys do not tell apart keep
 /// their order. The images sort first, and each run they leave tied is sorted by the rest.
 fn sort_run<S: RowSource>(keys: &[OrderLocator], src: &S, run: &mut [Ranked]) {
-    run.sort_by_key(Ranked::lead);
+    sort_by_lead(run);
     let whole = keys[0].image_is_whole();
     if whole && keys.len() == 1 {
         return;

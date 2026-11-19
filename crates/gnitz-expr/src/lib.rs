@@ -49,6 +49,9 @@
 //!   [`SchemaDescriptor::reduce_out_layout`]);
 //! - LIKE patterns ([`LikePattern`], [`LikeMatcher`]).
 //!
+//! Beside them, [`radix_sort_by_key`] is the sort under the ranking and under
+//! the engine's key sorts.
+//!
 //! # Layout
 //!
 //! A module's unit tests live in `tests/<module>.rs` and its `#[ignore]`d
@@ -90,6 +93,7 @@ mod map;
 mod morsel;
 mod order;
 mod program;
+mod radix;
 mod range;
 mod schema;
 mod search;
@@ -105,6 +109,7 @@ pub use locator::*;
 pub use map::MapEval;
 pub use order::*;
 pub use program::*;
+pub use radix::{RadixKey, radix_sort_by_key};
 pub use schema::*;
 pub use simd::{Level, null_bits};
 pub use view::*;
