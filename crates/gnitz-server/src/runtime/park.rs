@@ -67,8 +67,9 @@ const ARMED: u64 = 1 << 63;
 /// The two kinds of wake order against the arm differently.
 ///
 /// - **An RMW wake** ([`Self::publish_waking`], [`Self::bump`]): the arm and every
-///   advance are RMWs on the one atomic, so they are totally ordered: an advance
-///   behind the arm sees it and wakes, and an arm behind the advance reads
+///   advance are RMWs on the one atomic, so they are totally ordered: the first
+///   advance behind the arm takes it in the same RMW and wakes, a later one
+///   before a re-arm only moves the value, and an arm behind the advance reads
 ///   everything the advance released, so the parker's re-test sees it.
 /// - **A load wake** ([`Self::take_arm`]): the peer stores the word the parker
 ///   waits on and then loads the park; the parker arms and then loads that word.
@@ -143,12 +144,18 @@ impl Park {
     }
 
     /// One of any number of writers advances the value by one, waking an armed
-    /// parker. The arm stays the parker's to clear: cleared here in a second RMW,
-    /// it could erase an arm taken after the wake.
+    /// parker. The advance and the taking of the arm are one CAS, so an arm has
+    /// one taker: a later bump before the parker re-arms only advances, and costs
+    /// no `FUTEX_WAKE` that would find the parker already runnable. The parker's
+    /// futex wait compares the value the arm returned, which the taker moved, so
+    /// a take that lands before the wait still ends it.
     #[inline]
     #[track_caller]
     pub(super) fn bump(&self) {
-        if self.0.fetch_add(1, Ordering::AcqRel) & ARMED != 0 {
+        let prev = self
+            .0
+            .update(Ordering::AcqRel, Ordering::Relaxed, |cur| (cur + 1) & !ARMED);
+        if prev & ARMED != 0 {
             futex_wake(self.futex_word());
         }
     }

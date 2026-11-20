@@ -22,6 +22,19 @@ fn a_park_returns_at_once_when_its_retest_finds_a_group() {
     assert!(!parks.park(0).armed(), "and the park disarms");
 }
 
+/// A bump takes the arm it advances past, so a second bump before the parker
+/// re-arms finds none; each still moves the value a futex wait compares.
+#[test]
+fn a_bump_takes_the_arm_it_wakes() {
+    let parks = WorkerParks::create(1).unwrap();
+    let park = parks.park(0);
+    let (_, at) = park.arm_for(|| true).expect("still waiting: the arm stays");
+    park.bump();
+    assert!(!park.armed(), "the bump took the arm");
+    park.bump();
+    assert_eq!(park.value(), u64::from(at) + 2, "both bumps advanced the value");
+}
+
 /// A worker parked on an empty SAL wakes on another process's wake.
 #[test]
 fn a_parked_worker_wakes_on_a_forked_masters_wake() {

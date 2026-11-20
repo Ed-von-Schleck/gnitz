@@ -8,10 +8,8 @@ use gnitz_foundation::perf::voluntary_ctx_switches;
 /// A forked child waits until a word reaches `N`; the parent advances it `N`
 /// times back to back. A bumped word is the child's own park; a published one
 /// is a word apart, which the child arms before parking on its own park, as a
-/// worker short of ring room does. [`Park::publish_waking`] takes the arm, so it
-/// spends one syscall per arm; [`Park::bump`] leaves it, so every advance landing
-/// before the parker disarms spends one. The arm is sampled just before each
-/// advance.
+/// worker short of ring room does. Both advances take the arm, so each spends
+/// one syscall per arm. The arm is sampled just before each advance.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn park_wake_bench() {
