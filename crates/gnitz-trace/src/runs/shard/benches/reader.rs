@@ -208,6 +208,55 @@ fn shard_read_bench() {
             }),
         ),
         (
+            "one column, 60-byte values drawn from 1,000,000",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(pick(1_000_000), 60));
+            }),
+        ),
+        (
+            "one column, 60-byte values drawn from 20,000",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(pick(20_000), 60));
+            }),
+        ),
+        (
+            "one column, 60-byte values drawn from 1,000",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(pick(1_000), 60));
+            }),
+        ),
+        (
+            "one column, 60-byte values drawn from 20",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(pick(20), 60));
+            }),
+        ),
+        (
+            "one column, inline values drawn from 5,000",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&format!("owner-{:05}", pick(5_000)));
+            }),
+        ),
+        (
+            "9,000 rows, one column, distinct 60-byte values",
+            build(one_string, 9_000, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(i, 60));
+            }),
+        ),
+        (
+            "5,000 rows, one column, each inline value in two adjacent rows, as a retraction and its insert are",
+            build(one_string, 5_000, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&format!("t{:x}", i / 2));
+            }),
+        ),
+        (
             "an i64, ascending",
             build(i64_col, N, |b, i| {
                 b.begin_row(i as u128, 1);
@@ -285,7 +334,7 @@ fn shard_read_bench() {
         .chain(coded)
         .collect();
     for (si, (label, batch, codebook)) in measured.iter().enumerate() {
-        let schema = *batch.schema();
+        let (schema, n) = (*batch.schema(), batch.len());
         let path = dir.path().join(format!("{si}.db")).to_str().unwrap().to_owned();
         let opts = ShardWriteOpts {
             codebook: codebook.as_deref(),
@@ -299,17 +348,17 @@ fn shard_read_bench() {
             .map(|(role, encoding, size)| format!("{role}:{size}/{encoding}"))
             .collect();
         let shard = MappedShard::open(&path, &schema).unwrap();
-        let (whole, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N, 0)));
+        let (whole, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, n, 0)));
         let want = weighted_rows(batch);
         assert_eq!(weighted_rows(&whole), want, "{label}: slice");
         let (_, window_i) = instructions.measure(|| {
-            for start in (0..N).step_by(WINDOW) {
-                black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start), 0));
+            for start in (0..n).step_by(WINDOW) {
+                black_box(shard.slice_to_owned_batch(start, WINDOW.min(n - start), 0));
             }
         });
         let cells = || {
             let mut sink = 0usize;
-            for row in 0..N {
+            for row in 0..n {
                 for (pi, col) in schema.payload_columns() {
                     sink += match col.type_code.is_german_string() {
                         true => gnitz_wire::payload_bytes(&shard, black_box(row), pi).len(),
@@ -322,19 +371,19 @@ fn shard_read_bench() {
         let [fresh_i, decoded_i] = [(); 2].map(|()| instructions.measure(cells).1);
         let (_, word_i) = instructions.measure(|| {
             let mut sink = 0u64;
-            for row in 0..N {
+            for row in 0..n {
                 sink = sink.wrapping_add(shard.get_weight(black_box(row)) as u64 ^ shard.get_null_word(row));
             }
             black_box(sink)
         });
-        let rows: Vec<Pick> = (0..N).map(|r| (0, r as u32, batch.get_weight(r))).collect();
+        let rows: Vec<Pick> = (0..n).map(|r| (0, r as u32, batch.get_weight(r))).collect();
         let (merged, merge_i) = instructions.measure(|| {
             black_box(UnifiedSet::with_whole(std::slice::from_ref(&shard), &schema, |set| {
                 set.materialize(&rows, None)
             }))
         });
         assert_eq!(weighted_rows(&merged), want, "{label}: materialize");
-        let per_row = |i: u64| i as f64 / N as f64;
+        let per_row = |i: u64| i as f64 / n as f64;
         println!(
             "{label}\n  {:.1} bytes per row; instructions per row: write {:.1}, slice {:.1}, windows {:.1}, \
              cells {:.1} then {:.1}, weight and null word {:.1}, materialize {:.1}\n  regions {}",
