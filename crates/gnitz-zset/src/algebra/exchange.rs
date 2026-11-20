@@ -2,7 +2,7 @@
 //! routing-key kernels.
 
 use super::group_key::{GroupKey, KeyCells, KeyForm, cell_image, for_key_cells};
-use super::key_pack::{FOLD_CHUNK, KeyPacker, filled};
+use super::key_pack::{IDENTITY_CHUNK, KeyPacker, filled};
 use super::route::{Placement, Slot, ground_owner, worker_for_key, worker_for_wide_pk};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
@@ -197,10 +197,10 @@ fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8]
 #[inline(never)]
 fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, key: &GroupKey, nw: usize) {
     let (rows, weights) = (mb.len(), mb.weight().as_chunks::<8>().0);
-    let mut buf = [MaybeUninit::<u128>::uninit(); FOLD_CHUNK];
-    let ids = filled(&mut buf[..rows.min(FOLD_CHUNK)], 0);
-    for start in (0..rows).step_by(FOLD_CHUNK) {
-        let ids = &mut ids[..(rows - start).min(FOLD_CHUNK)];
+    let mut buf = [MaybeUninit::<u128>::uninit(); IDENTITY_CHUNK];
+    let ids = filled(&mut buf[..rows.min(IDENTITY_CHUNK)], 0);
+    for start in (0..rows).step_by(IDENTITY_CHUNK) {
+        let ids = &mut ids[..(rows - start).min(IDENTITY_CHUNK)];
         key.identities(mb, start, ids);
         for ((id, weight), row) in ids.iter().zip(&weights[start..]).zip(start as u32..) {
             if *weight != [0; 8] {
@@ -217,10 +217,10 @@ fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, key: &GroupKey, nw: 
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
     let (rows, width, weights) = (mb.len(), packer.out_stride(), mb.weight().as_chunks::<8>().0);
-    let mut buf = [MaybeUninit::<u8>::uninit(); FOLD_CHUNK * MAX_PK_BYTES];
-    let keys = filled(&mut buf[..rows.min(FOLD_CHUNK) * width], 0);
-    for start in (0..rows).step_by(FOLD_CHUNK) {
-        let n = (rows - start).min(FOLD_CHUNK);
+    let mut buf = [MaybeUninit::<u8>::uninit(); IDENTITY_CHUNK * MAX_PK_BYTES];
+    let keys = filled(&mut buf[..rows.min(IDENTITY_CHUNK) * width], 0);
+    for start in (0..rows).step_by(IDENTITY_CHUNK) {
+        let n = (rows - start).min(IDENTITY_CHUNK);
         packer.pack_rows(keys, width, mb, &[(start, start + n)]);
         let rows = keys
             .chunks_exact(width)

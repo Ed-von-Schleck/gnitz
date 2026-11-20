@@ -8,7 +8,7 @@
 use gnitz_expr::{ColCopy, ColumnLocator, ExprValidateErr, LogicalProgram, MapEval};
 
 use super::copy::{ColMoves, RowWindow, copy_window, rebase_copied_strings};
-use super::key_pack::{FOLD_CHUNK, FoldCols, KeyPacker, locate_key_col, pk_run};
+use super::key_pack::{FoldCols, IDENTITY_CHUNK, KeyPacker, locate_key_col, pk_run};
 use crate::repr::{Batch, DirectWriter, MemBatch, copy_runs};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
@@ -72,9 +72,9 @@ fn stamp_hash_row_pks(output: &mut DirectWriter<'_>, fold: &FoldCols) {
     assert_eq!(output.schema.pk_stride(), KEY_BYTES, "a hash-row PK is one U128 column");
     // Hashing borrows `output` and the write-back mutates it, so keys are staged
     // per chunk.
-    let mut keys = [0u128; FOLD_CHUNK];
-    for start in (0..n).step_by(FOLD_CHUNK) {
-        let end = (start + FOLD_CHUNK).min(n);
+    let mut keys = [0u128; IDENTITY_CHUNK];
+    for start in (0..n).step_by(IDENTITY_CHUNK) {
+        let end = (start + IDENTITY_CHUNK).min(n);
         let keys = &mut keys[..end - start];
         fold.identities(&output.written(), first + start, keys);
         let pk = &mut output.pk_mut()[start * KEY_BYTES..end * KEY_BYTES];
@@ -297,7 +297,7 @@ impl MapPlan {
                 PkSource::Inherit => {
                     let stride = src.schema().pk_stride();
                     debug_assert_eq!(stride, out.schema.pk_stride(), "PkSource::Inherit: PK stride mismatch");
-                    copy_runs::<0>(src.pk(), out.pk_mut(), ranges.iter().copied(), stride);
+                    copy_runs::<0>(src.pk(), out.pk_mut(), ranges, stride);
                 }
                 PkSource::Pack { packer, .. } => {
                     debug_assert_eq!(out.schema.pk_stride(), packer.out_stride());
@@ -306,7 +306,7 @@ impl MapPlan {
                 // Hashes the finished output row, below.
                 PkSource::HashRow(_) => {}
             }
-            copy_runs::<8>(src.weight(), out.weight_mut(), ranges.iter().copied(), 8);
+            copy_runs::<8>(src.weight(), out.weight_mut(), ranges, 8);
             let mut dst = 0;
             for &(start, end) in ranges {
                 let w = RowWindow { src: start, dst, n: end - start };

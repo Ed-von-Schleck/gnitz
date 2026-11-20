@@ -1,13 +1,14 @@
 //! Columns copied verbatim from one batch into another: [`ColMoves`], the copies
 //! with the null bits and German-string slots that follow from them, and the
-//! kernels that write a copy's null words, cells and string heap offsets.
+//! kernels that write a copy's null words, cells and string heap offsets — over
+//! a row window, or gathered from listed rows.
 
 use gnitz_expr::{ColCopy, ColumnLocator};
 
 use super::int_cell;
-use crate::repr::{DirectWriter, MemBatch};
+use crate::repr::{Batch, DirectWriter, MemBatch, relocated_cell};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{FixedInt, TypeCode, zip_cells};
+use gnitz_wire::{FixedInt, Heap, RowSource, TypeCode, zip_cells};
 
 /// One copy step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`.
@@ -141,6 +142,24 @@ impl ColMoves {
             }
         }
     }
+
+    /// The moves of `src`'s rows `rows` onto this writer's rows `0..`, in order:
+    /// each row's whole null word, holding the copied columns' bits and no other,
+    /// then each copied cell, a German-string cell relocated into the writer's
+    /// heap. A copy is at its source column's own width: none widens.
+    pub fn gather(&self, src: &MemBatch, rows: impl Iterator<Item = usize> + Clone, out: &mut DirectWriter<'_>) {
+        let words = out.null_bmp_mut().as_chunks_mut::<8>().0;
+        if self.first.mask == 0 {
+            words.fill([0; 8]);
+        } else {
+            for (word, row) in words.iter_mut().zip(rows.clone()) {
+                *word = self.null_word(src.get_null_word(row)).to_le_bytes();
+            }
+        }
+        for c in self.copies() {
+            gather_column(src, c, rows.clone(), out);
+        }
+    }
 }
 
 /// Copy `moves` of `src` rows `0..n` onto `out` rows `0..n`: each row's whole
@@ -150,6 +169,85 @@ impl ColMoves {
 pub fn copy_columns(src: &MemBatch, out: &mut DirectWriter<'_>, moves: &ColMoves, n: usize, heap_at: Option<usize>) {
     copy_window(src, out, moves, RowWindow { src: 0, dst: 0, n });
     rebase_copied_strings(moves, out, src.blob(), heap_at);
+}
+
+/// Every row of `b` in a fresh `out_schema` batch of `b`'s PK stride: its PK and
+/// weight, and each payload column with its null bit at output slot
+/// `first_slot + pi`, over `b`'s heap. Every row's null word also holds
+/// `null_bits`. `rest` then writes each output column no input column lands in.
+pub(super) fn copy_rows_into(
+    b: &Batch,
+    out_schema: &SchemaDescriptor,
+    first_slot: usize,
+    null_bits: u64,
+    rest: impl FnOnce(&mut DirectWriter<'_>),
+) -> Batch {
+    let in_schema = b.schema();
+    debug_assert_eq!(out_schema.pk_stride(), in_schema.pk_stride());
+    debug_assert!(out_schema.num_payload_cols() >= first_slot + in_schema.num_payload_cols());
+    let n = b.len();
+    let mut out = Batch::with_capacity(out_schema, n);
+    let heap_at = out.carry_heap(&b.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)], 0);
+    out.write_rows(n, |w| {
+        let (pk, weights, nulls) = w.fixed_mut();
+        pk.copy_from_slice(b.pk());
+        weights.copy_from_slice(b.weight());
+        // Every input column moves `first_slot` slots up, its null bit with it.
+        if first_slot == 0 && null_bits == 0 {
+            nulls.copy_from_slice(b.null_bmp());
+        } else {
+            let words = nulls
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(b.null_bmp().as_chunks::<8>().0);
+            let word = |s: &[u8; 8]| u64::from_le_bytes(*s);
+            match first_slot {
+                // Unshifted, the loop compiles to fewer instructions per row.
+                0 => words.for_each(|(d, s)| *d = (word(s) | null_bits).to_le_bytes()),
+                _ => words
+                    .for_each(|(d, s)| *d = (gnitz_wire::null_word_at(word(s), first_slot) | null_bits).to_le_bytes()),
+            }
+        }
+        for (pi, col) in in_schema.payload_columns() {
+            w.col_mut(first_slot + pi).copy_from_slice(b.col_data(pi));
+            if col.type_code.is_german_string() {
+                w.rebase_string_col(first_slot + pi, Heap::Plain(b.blob()), heap_at.into());
+            }
+        }
+        rest(w);
+    });
+    out
+}
+
+/// [`ColMoves::gather`]'s cells of one column. Out of line for the reason
+/// [`copy_column`] is.
+#[inline(never)]
+fn gather_column(src: &MemBatch, c: &ColCopy, rows: impl Iterator<Item = usize>, out: &mut DirectWriter<'_>) {
+    debug_assert_eq!(c.width, c.src.size(), "a gathered column keeps its width");
+    let ColumnLocator::Payload { slot, size, type_code } = c.src else {
+        let mut scratch = [0u8; 16];
+        for (cell, row) in out.col_mut(c.slot).chunks_exact_mut(c.width).zip(rows) {
+            cell.copy_from_slice(c.src.native_le_bytes(src, row, &mut scratch));
+        }
+        return;
+    };
+    let col = src.col_data(slot as usize);
+    if type_code.is_german_string() {
+        let cells = col.as_chunks::<16>().0;
+        let (dst, heap, mut cache) = out.string_col_mut(c.slot);
+        for (cell, row) in dst.as_chunks_mut::<16>().0.iter_mut().zip(rows) {
+            *cell = relocated_cell(&cells[row], src.heap(), heap, cache.as_deref_mut());
+        }
+    } else {
+        gnitz_wire::by_cell_width!(size as usize, |T| {
+            const N: usize = size_of::<T>();
+            let cells = col.as_chunks::<N>().0;
+            for (cell, row) in out.col_mut(c.slot).as_chunks_mut::<N>().0.iter_mut().zip(rows) {
+                *cell = cells[row];
+            }
+        })
+    }
 }
 
 /// Copy `moves` of `in_batch` onto `output` over `w`: each row's whole null word,

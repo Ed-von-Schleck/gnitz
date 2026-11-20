@@ -1,7 +1,7 @@
 //! Z-set algebra: the functions of one Z-set, and the key encoders they share.
 //!
-//!   - `linear`      — filter and union (Theorem 3.3: no state added), and the output schemas of a union and a null-extend
-//!   - `copy`        — columns copied verbatim between batches: their cells, null bits and string heap offsets
+//!   - `linear`      — filter, union and null-extend (Theorem 3.3: no state added), and the output schemas of a union and a null-extend
+//!   - `copy`        — columns copied verbatim between batches, over a row window or from listed rows: their cells, null bits and string heap offsets
 //!   - `map`         — `MapPlan`, the columnar driver behind every map and projection
 //!   - `exchange`    — the scatter plan of a worker exchange
 //!   - `aggregate`   — the aggregates, a reduce's row shape, and the ad-hoc fold
@@ -38,14 +38,14 @@ mod sink;
 
 pub use exchange::ScatterPlan;
 pub use index_entry::{KeySpec, extend_spans, index_entries};
-pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
+pub use linear::{null_extend, null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
 pub use route::{Placement, Slot, ground_owner};
 pub use sink::SinkPlan;
 
-pub use aggregate::{Agg, AggValues, FoldGroups, ReduceShape, resolve_aggs};
+pub use aggregate::{Agg, AggValues, FoldGroups, Groups, ReduceShape, resolve_aggs};
 pub use copy::{ColMoves, copy_columns};
-pub use group_key::{GroupOrdinals, GroupOutKey, GroupPrefix, GroupScratch, OutPk, ground_pk};
+pub use group_key::{GroupOrdinals, GroupOutKey, GroupPrefix, GroupScratch, OutPk, PkFirsts, ground_pk, pk_firsts};
 pub use order::{OrderCol, RowRanking, cmp_order_keys, order_cols};
 pub use order_image::{IMAGE_COL, ImageCol, image_slot_col};
 

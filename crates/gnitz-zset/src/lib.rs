@@ -23,7 +23,8 @@
 //! else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
-//! path says, and the root itself holds no name.
+//! path says. The only crate-root names are the `#[macro_export]` macros, which
+//! each rung re-exports under its own path.
 //!
 //! A public function panics only on a violation of its own contract by the
 //! caller: an out-of-range column index, a malformed slot. Every *runtime*

@@ -109,6 +109,11 @@ impl<'a> TwoValueImage<'a> {
         })
     }
 
+    /// Both words mapped through `f`, so every row's word is.
+    pub(crate) fn map_words(&mut self, f: impl Fn(u64) -> u64) {
+        self.words = self.words.map(f);
+    }
+
     /// Row `row`'s word.
     #[inline(always)]
     pub(crate) fn at(&self, row: usize) -> u64 {
@@ -212,6 +217,13 @@ impl<'a> ForImage<'a> {
             mask: gnitz_wire::low_bits_mask(8 * bw),
             bw,
         })
+    }
+
+    /// Every value with the bits `high` set, each of them above every bit any
+    /// value holds: the reference takes them, since a value is its offset added
+    /// to the reference and the sum carries into none of them.
+    pub(crate) fn set_high_bits(&mut self, high: u64) {
+        self.reference |= high;
     }
 
     /// Row `row`'s value, widened to 64 bits.

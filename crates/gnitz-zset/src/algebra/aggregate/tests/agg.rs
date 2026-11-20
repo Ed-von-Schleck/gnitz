@@ -67,7 +67,7 @@ fn assert_kernels_match(b: &Batch, ci: u32) {
             one.fold(0, &mb, &[(s, e)], FoldGroups::One(0));
             let ord: Vec<u32> = (s..e).map(|row| (row % GROUPS) as u32).collect();
             mixed.resize(if i < 2 { 1 } else { GROUPS });
-            mixed.fold(0, &mb, &[(s, e)], FoldGroups::Rows(&ord));
+            mixed.fold(0, &mb, &[(s, e)], &ord[..]);
             for row in s..e {
                 step(&mut one_each, 0, row);
                 step(&mut ranged_each, i, row);

@@ -121,7 +121,7 @@ fn recover_from_sal(tail: &CommittedTail, slot: Slot, catalog: &mut CatalogEngin
             }
             // The ingest rejects a payload-count mismatch outright.
             if owned.schema().num_payload_cols() < schema.num_payload_cols() {
-                owned = owned.widened_with_nulls(&schema, false);
+                owned = gnitz_zset::algebra::null_extend(&owned, &schema, false);
             }
             catalog.ingest_unticked(tid, owned, PkRule::Enforce).map_err(|e| {
                 format!(

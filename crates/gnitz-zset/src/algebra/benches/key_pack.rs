@@ -51,9 +51,9 @@ fn fold_key_bench() {
         };
         let chunked = || {
             let mut acc = 0u128;
-            let mut keys = [0u128; FOLD_CHUNK];
-            for start in (0..N).step_by(FOLD_CHUNK) {
-                let keys = &mut keys[..(N - start).min(FOLD_CHUNK)];
+            let mut keys = [0u128; IDENTITY_CHUNK];
+            for start in (0..N).step_by(IDENTITY_CHUNK) {
+                let keys = &mut keys[..(N - start).min(IDENTITY_CHUNK)];
                 fold.identities(mb, start, keys);
                 acc = keys.iter().fold(acc, |acc, &k| acc ^ k);
             }

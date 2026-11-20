@@ -149,7 +149,11 @@ fn every_producer_states_its_claim() {
         ("negated", src.clone().negated(), CONSOLIDATED),
         ("compacted", src.compacted(), CONSOLIDATED),
         ("append_above", above, CONSOLIDATED),
-        ("widened", src.widened_with_nulls(&wider, false), CONSOLIDATED),
+        (
+            "null_extend",
+            crate::algebra::null_extend(&src, &wider, false),
+            CONSOLIDATED,
+        ),
         ("append", appended, RAW),
         ("clear", cleared, RAW),
         ("indexed_rows", src.indexed_rows(&[2, 0]), RAW),
@@ -321,47 +325,6 @@ fn from_ranges_resolves_long_values_under_both_heap_arms() {
         (28, 0),
         "only the survivor's span"
     );
-}
-
-/// The widen at both NULL placements: the input's payload lands where the
-/// placement leaves it, the fill column reads NULL, and the input's blob heap
-/// comes along — without it a long (> 12 byte) string reads back as garbage.
-#[test]
-fn widened_with_nulls_places_the_fill_on_either_side() {
-    let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-    let b = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, long)]));
-
-    let cols = |first: bool| -> SchemaDescriptor {
-        let pk = SchemaColumn::new(TypeCode::U64, false);
-        let s = SchemaColumn::new(TypeCode::String, false);
-        let fill = SchemaColumn::new(TypeCode::I64, true);
-        let cols = match first {
-            true => [pk, fill, s],
-            false => [pk, s, fill],
-        };
-        SchemaDescriptor::new(&cols, &[0])
-    };
-
-    for nulls_first in [false, true] {
-        let out_schema = cols(nulls_first);
-        let out = b.widened_with_nulls(&out_schema, nulls_first);
-        let (str_slot, fill_slot) = match nulls_first {
-            true => (1, 0),
-            false => (0, 1),
-        };
-
-        assert_eq!(out.count, 1);
-        assert_eq!(gnitz_wire::widen_pk_be(out.get_pk_bytes(0)), 1);
-        assert!(!out.blob.is_empty(), "output blob must be propagated ({nulls_first})");
-        assert_eq!(
-            gnitz_wire::payload_bytes(&out, 0, str_slot),
-            long,
-            "long string must resolve to the original ({nulls_first})"
-        );
-        let nw = out.get_null_word(0);
-        assert!(gnitz_wire::null_word_get(nw, fill_slot), "the fill column reads NULL");
-        assert!(!gnitz_wire::null_word_get(nw, str_slot), "the input column stays live");
-    }
 }
 
 /// A batch whose rows stand consolidated without the claim is certified where it

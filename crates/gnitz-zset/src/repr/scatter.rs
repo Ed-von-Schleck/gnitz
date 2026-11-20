@@ -21,18 +21,19 @@
 //! Z-set weight and answers each region as a `ColPtr`, which every N-way merge
 //! and these kernels read sources through.
 
+use std::borrow::Borrow;
 use std::cell::Cell;
 use std::ops::Range;
 
 use super::batch::{Batch, MemBatch, range_rows};
-use super::pool::{PooledBuf, with_scratch};
-use super::seek::ColPtr;
+use super::columnar::{ColPtr, ColumnarSource, DecodedColumns};
+use super::pool::with_scratch;
 use super::string_heap::{
     BlobCache, HeapCoder, StringDest, carry_dead_rows, prorated_blob_cap, rebase_string_cell, relocated_cell,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource};
+use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use smallvec::{SmallVec, smallvec};
 
 /// One output row of a pick-driven copy: `(source, row, weight)` — the index of
@@ -40,14 +41,14 @@ use smallvec::{SmallVec, smallvec};
 /// out at, which overrides that row's own weight. A merge emits one per surviving
 /// (PK, payload) group, at the group's net weight.
 ///
-/// A pick whose source index carries [`SPAN`] is a span instead: `(src | SPAN,
-/// start, len)` stands for rows `start..start + len` of source `src`, each
-/// copied at the weight it holds there — a merge's stretch of groups of one.
+/// A pick [`span_pick`] builds is a span instead: it stands for rows
+/// `start..start + len` of source `src`, each copied at the weight it holds
+/// there — a merge's stretch of groups of one. [`span_of`] reads one back.
 /// Only a set built to copy spans (see [`UnifiedSet::with`]) takes them.
 pub type Pick = (u32, u32, i64);
 
 /// The source-index bit that makes a [`Pick`] a span.
-pub const SPAN: u32 = 1 << 31;
+pub(crate) const SPAN: u32 = 1 << 31;
 
 /// The span of rows `rows` of source `src`.
 #[inline(always)]
@@ -124,34 +125,30 @@ pub const fn stride<const N: usize>(width: usize) -> usize {
 }
 
 /// Each `[start, end)` run of `width`-byte cells of `src`, copied onto `dst`
-/// back to back.
+/// back to back. A constant width indexes whole cells, so a one-row run is a
+/// load and a store with no byte-offset arithmetic. `runs` takes a run list as
+/// it stands: an iterator built over the list at the call compiles to more
+/// instructions per run in [`copy_ranges`].
 #[inline(always)]
-pub fn copy_runs<const N: usize>(src: &[u8], dst: &mut [u8], runs: impl Iterator<Item = (usize, usize)>, width: usize) {
-    let w = stride::<N>(width);
-    let mut at = 0usize;
-    for (start, end) in runs {
-        let n = end - start;
-        if n == 1 && N != 0 {
-            // A constant width keeps the one-row run a load and a store.
-            let cell: [u8; N] = src[start * N..start * N + N].try_into().unwrap();
-            dst[at * N..at * N + N].copy_from_slice(&cell);
-        } else {
-            dst[at * w..(at + n) * w].copy_from_slice(&src[start * w..end * w]);
-        }
-        at += n;
-    }
-}
-
-/// [`copy_runs`] of a run list. A constant width indexes whole cells, so a
-/// one-row run is a load and a store with no byte-offset arithmetic.
-#[inline(always)]
-fn copy_cell_runs<const N: usize>(src: &[u8], dst: &mut [u8], runs: &[(usize, usize)], width: usize) {
+pub fn copy_runs<const N: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    runs: impl IntoIterator<Item: Borrow<(usize, usize)>>,
+    width: usize,
+) {
     if N == 0 {
-        return copy_runs::<0>(src, dst, runs.iter().copied(), width);
+        let mut at = 0usize;
+        for run in runs {
+            let &(start, end) = run.borrow();
+            dst[at * width..(at + end - start) * width].copy_from_slice(&src[start * width..end * width]);
+            at += end - start;
+        }
+        return;
     }
     let (src, dst) = (src.as_chunks::<N>().0, dst.as_chunks_mut::<N>().0);
     let mut at = 0usize;
-    for &(start, end) in runs {
+    for run in runs {
+        let &(start, end) = run.borrow();
         let n = end - start;
         if n == 1 {
             dst[at] = src[start];
@@ -197,7 +194,7 @@ pub(crate) fn copy_ranges(
             for r in 0..schema.num_fixed_regions() {
                 stride_dispatch!(
                     schema.region_stride(r),
-                    copy_cell_runs,
+                    copy_runs,
                     src.region(r),
                     writer.region_mut(r),
                     ranges
@@ -297,68 +294,15 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
     }
 }
 
-/// A `RowSource` that also carries the Z-set weight: a storage row the N-way
-/// merge folds. Its regions are read as [`ColPtr`]s, in place or decoded for a
-/// window of rows.
-pub trait ColumnarSource: RowSource {
-    /// The row's signed Z-set weight / multiplicity (region 1).
-    fn get_weight(&self, row: usize) -> i64;
-
-    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
-    /// a capacity-bounded view's skeleton shard.
-    fn is_skeleton(&self) -> bool;
-
-    /// Region `r` as a [`ColPtr`] readable in place at every row a caller reads,
-    /// each null word without [`null_pad_mask`](Self::null_pad_mask); `None`
-    /// where it is read through a decode.
-    fn in_place(&self, r: usize) -> Option<ColPtr>;
-
-    /// Region `r` as a [`ColPtr`] readable at the rows of `window`, decoded into
-    /// `decoded` where it is not held in place; null words as
-    /// [`in_place`](Self::in_place) reads them.
-    fn region(&self, r: usize, window: &Range<usize>, decoded: &mut DecodedColumns) -> ColPtr;
-
-    /// The null bits OR'd into every null word the row accessor reads.
-    fn null_pad_mask(&self) -> u64;
-}
-
-impl<'a> ColumnarSource for MemBatch<'a> {
-    #[inline(always)]
-    fn get_weight(&self, row: usize) -> i64 {
-        MemBatch::get_weight(self, row)
-    }
-
-    #[inline(always)]
-    fn is_skeleton(&self) -> bool {
-        false
-    }
-
-    fn in_place(&self, r: usize) -> Option<ColPtr> {
-        Some(ColPtr {
-            base: self.data.as_ptr().wrapping_add(self.region_start(r)),
-            stride: self.schema.region_stride(r),
-        })
-    }
-
-    fn region(&self, r: usize, _window: &Range<usize>, _decoded: &mut DecodedColumns) -> ColPtr {
-        self.in_place(r).expect("a batch holds every region in place")
-    }
-
-    #[inline(always)]
-    fn null_pad_mask(&self) -> u64 {
-        0
-    }
-}
-
 /// Copy the rows `rows` names, in the order given, each at the weight its pick
 /// carries, or a [span](SPAN)'s rows at their own: exactly the writer's rows.
 /// The sources may be any mix of `MemBatch` and shard backings.
 ///
 /// `table` holds `n` [`ColPtr`]s per slot of the writer's layout, one per
 /// source in source order: slot 0 the PK, slot 1 the null words, slot `2 + pi`
-/// payload column `pi`. `strings`, `pad` and `weights` are per source: its heap
-/// and where that heap is carried, its null pad, and under `SPANS` its weights.
-/// `rows` holds spans only under `SPANS`.
+/// payload column `pi`. `strings` and `weights` are per source: its heap and
+/// where that heap is carried, and under `SPANS` its weights. `rows` holds
+/// spans only under `SPANS`.
 ///
 /// Out of line: inlined into [`UnifiedSet::write`], its per-row loops lose
 /// registers to the write's own state.
@@ -368,13 +312,12 @@ fn scatter_unified_sources<const SPANS: bool>(
     table: &[ColPtr],
     weights: &[ColPtr],
     strings: &[(Heap<'_>, Carry)],
-    pad: &[u64],
     rows: &[Pick],
     codebook: Option<&dyn HeapCoder>,
     skip: u64,
     writer: &mut DirectWriter<'_>,
 ) {
-    let n = pad.len();
+    let n = strings.len();
     // Every kernel below writes the rows `rows` stands for unchecked.
     assert_eq!(
         picked_rows::<SPANS>(rows),
@@ -382,7 +325,7 @@ fn scatter_unified_sources<const SPANS: bool>(
         "scatter_unified_sources: a writer of another row count"
     );
     let schema = writer.schema;
-    assert!(table.len() == (2 + schema.num_payload_cols()) * n && strings.len() == n);
+    assert_eq!(table.len(), (2 + schema.num_payload_cols()) * n);
     // SAFETY: `k` is a slot of the writer's schema, inside `table` by the assert.
     let slot = |k: usize| unsafe { table.get_unchecked(k * n..(k + 1) * n) };
     let keep = schema.payload_slots() & !skip;
@@ -392,7 +335,6 @@ fn scatter_unified_sources<const SPANS: bool>(
         slot(0),
         weights,
         slot(1),
-        pad,
         rows,
         keep,
         SPANS,
@@ -462,9 +404,9 @@ fn copy_string_cells(
 /// The PK, weight and null word of every row `picks` stands for, read through
 /// source `si`'s `pk[si]` and `nulls[si]`: a pick's weight is its own, and a
 /// [span](SPAN)'s, under `spans`, its rows' as `weights[si]` reads them. A null
-/// word gains `pad[si]` and keeps only the bits of `keep`. The destination
-/// stride is the writer's; a source read keeps its `ColPtr`'s stride, so a
-/// Constant region repeats its one row for every output row.
+/// word keeps only the bits of `keep`. The destination stride is the writer's;
+/// a source read keeps its `ColPtr`'s stride, so a Constant region repeats its
+/// one row for every output row.
 ///
 /// `picks` must stand for exactly the writer's rows, as each caller asserts.
 /// Out of line, as [`copy_col_picks`] is.
@@ -474,7 +416,6 @@ fn copy_fixed_picks<const PKS: usize>(
     pk: &[ColPtr],
     weights: &[ColPtr],
     nulls: &[ColPtr],
-    pad: &[u64],
     picks: &[Pick],
     keep: u64,
     spans: bool,
@@ -483,7 +424,7 @@ fn copy_fixed_picks<const PKS: usize>(
 ) {
     const FB: usize = FIXED_REGION_BYTES;
     let pks = stride::<PKS>(width);
-    assert!(pk.len() == pad.len() && nulls.len() == pad.len() && (!spans || weights.len() == pad.len()));
+    assert!(pk.len() == nulls.len() && (!spans || weights.len() == nulls.len()));
     let (pk_dst, wt_dst, nbm_dst) = writer.fixed_mut();
     let (pk_dst, wt_dst, nbm_dst) = (pk_dst.as_mut_ptr(), wt_dst.as_mut_ptr(), nbm_dst.as_mut_ptr());
     // SAFETY (every block below): the tables hold one entry per source, the
@@ -505,7 +446,7 @@ fn copy_fixed_picks<const PKS: usize>(
             std::ptr::copy_nonoverlapping(pk_ptr, d, pks);
         }
         std::ptr::copy_nonoverlapping(w.to_le_bytes().as_ptr(), wt_dst.add(at * FB), FB);
-        let nbm = ((nbm_ptr as *const u64).read_unaligned() | *pad.get_unchecked(si)) & keep;
+        let nbm = (nbm_ptr as *const u64).read_unaligned() & keep;
         (nbm_dst.add(at * FB) as *mut u64).write_unaligned(nbm);
     };
     if !spans {
@@ -528,9 +469,9 @@ fn copy_fixed_picks<const PKS: usize>(
             );
             let wt = std::slice::from_raw_parts_mut(wt_dst.add(at * FB), n * FB);
             weights.get_unchecked(si).copy_rows(rows.start, FB, wt);
-            let (nb, pad) = (nulls.get_unchecked(si), *pad.get_unchecked(si));
+            let nb = nulls.get_unchecked(si);
             for (i, r) in rows.enumerate() {
-                let nbm = ((nb.row_ptr(r) as *const u64).read_unaligned() | pad) & keep;
+                let nbm = (nb.row_ptr(r) as *const u64).read_unaligned() & keep;
                 (nbm_dst.add((at + i) * FB) as *mut u64).write_unaligned(nbm);
             }
         }
@@ -599,7 +540,6 @@ pub fn gather_into(
     // The PK and null words are copied in one pass, so both are read in place
     // or neither is.
     if hoist && all_in_place(&mut direct, sources, &[REG_PK, REG_NULL_BMP]) {
-        let pad: SmallVec<[u64; 4]> = sources.iter().map(|s| s.null_pad_mask()).collect();
         let (pk, nulls) = direct.split_at(sources.len());
         stride_dispatch!(
             schema.pk_stride(),
@@ -607,7 +547,6 @@ pub fn gather_into(
             pk,
             &[],
             nulls,
-            &pad,
             picks,
             keep,
             false,
@@ -691,25 +630,6 @@ fn gather_cells<const N: usize>(sources: &[impl ColumnarSource], picks: &[Pick],
     }
 }
 
-/// The columns a source decoded to be viewed at a window of its rows, freed
-/// with the [`UnifiedSet`] or the window that views them.
-#[derive(Default)]
-pub struct DecodedColumns(Vec<PooledBuf>);
-
-impl DecodedColumns {
-    /// A column of `width`-byte cells readable at `window`, which `decode`
-    /// writes whole given the window's bytes.
-    pub fn column(&mut self, window: &Range<usize>, width: usize, decode: impl FnOnce(&mut [u8])) -> ColPtr {
-        // SAFETY: `decode` writes every cell of `column`.
-        let mut column = unsafe { PooledBuf::uninit(window.len() * width) };
-        decode(&mut column);
-        // Rebased so that row `window.start` reads the column's first cell.
-        let base = column.as_ptr().wrapping_sub(window.start * width);
-        self.0.push(column);
-        ColPtr { base, stride: width }
-    }
-}
-
 /// A [`UnifiedSet`]'s slot-major region table, inline up to 40 entries across
 /// all slots and sources: four sources' PK and null words, and 32 payload
 /// columns among them. Nothing keeps a pointer into it: the scatter slices it
@@ -743,8 +663,6 @@ pub struct UnifiedSet<'a> {
     table: ColTable,
     /// Each source's heap, and its [`Carry`].
     strings: PerSource<(Heap<'a>, Carry)>,
-    /// Each source's [`ColumnarSource::null_pad_mask`].
-    pad: PerSource<u64>,
     /// Each source's weights, where the set copies [spans](SPAN); empty
     /// otherwise.
     weights: PerSource<ColPtr>,
@@ -763,7 +681,7 @@ impl<'a> UnifiedSet<'a> {
     /// `f` applied to views over `sources` under `schema`, source `si` readable
     /// at rows in the `si`-th window, the payload columns `skip` names left
     /// undecoded and written as zeroes. Where `spans` is set, the rows the set
-    /// copies may hold [spans](SPAN), and it reads each source's weights for
+    /// copies may hold [spans](span_pick), and it reads each source's weights for
     /// them. The set is built in this frame and lent to `f`, so its inline
     /// tables are never copied out by a return.
     pub fn with<S: ColumnarSource, R>(
@@ -777,7 +695,6 @@ impl<'a> UnifiedSet<'a> {
         let mut set = UnifiedSet {
             table: ColTable::new(),
             strings: PerSource::new(),
-            pad: PerSource::new(),
             weights: PerSource::new(),
             schema,
             src_blob: 0,
@@ -791,20 +708,16 @@ impl<'a> UnifiedSet<'a> {
         let keep = schema.payload_slots() & !skip;
         reserve(&mut set.table, slots * n);
         reserve(&mut set.strings, n);
-        reserve(&mut set.pad, n);
         // Written through raw pointers and lengthened once each: a push per
         // entry costs a capacity check, which a set of a few rows pays per call.
-        let (table, strings, pad) = (set.table.as_mut_ptr(), set.strings.as_mut_ptr(), set.pad.as_mut_ptr());
+        let (table, strings) = (set.table.as_mut_ptr(), set.strings.as_mut_ptr());
         let mut each = windows.into_iter();
         for (si, s) in sources.iter().enumerate() {
             let w = each.next().expect("UnifiedSet::with: one window per source");
             set.src_blob += s.heap().plain_len();
             set.src_rows += s.row_count();
-            // SAFETY: every array was reserved past `si`.
-            unsafe {
-                strings.add(si).write((s.heap(), None));
-                pad.add(si).write(s.null_pad_mask());
-            }
+            // SAFETY: `strings` was reserved past `si`.
+            unsafe { strings.add(si).write((s.heap(), None)) };
             for k in 0..slots {
                 let r = match k {
                     0 => Some(REG_PK),
@@ -836,7 +749,6 @@ impl<'a> UnifiedSet<'a> {
         unsafe {
             set.table.set_len(slots * n);
             set.strings.set_len(n);
-            set.pad.set_len(n);
         }
         f(&mut set)
     }
@@ -851,7 +763,7 @@ impl<'a> UnifiedSet<'a> {
     }
 
     /// Copy the rows `rows` names, in the order given, each at the weight its
-    /// pick carries or a [span](SPAN)'s rows at their own, into a fresh
+    /// pick carries or a [span](span_pick)'s rows at their own, into a fresh
     /// unconsolidated batch under the set's schema, its heap coded under
     /// `codebook` where one is given (see [`append_value`](super::append_value)).
     /// The heap reserved is prorated from the whole sources, and none where the
@@ -894,7 +806,6 @@ impl<'a> UnifiedSet<'a> {
                     &self.table,
                     &self.weights,
                     &self.strings,
-                    &self.pad,
                     rows,
                     codebook,
                     self.skip,

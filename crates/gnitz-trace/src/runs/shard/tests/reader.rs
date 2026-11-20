@@ -711,12 +711,17 @@ fn every_shape_reads_back_through_every_surface() {
         for &(region, enc) in &s.encodings {
             assert_eq!(spans_of(&image)[region].encoding, enc, "{}: region {region}", s.label);
         }
-        let want = s.written.widened_with_nulls(&s.reader, false);
+        let want = gnitz_zset::algebra::null_extend(&s.written, &s.reader, false);
         let shard = MappedShard::open(&path, &s.reader).unwrap();
         assert!(!shard.is_skeleton(), "{}", s.label);
         assert_reads_as(s.label, &shard, &want);
         let written = MappedShard::open(&path, s.written.schema()).unwrap();
         assert_reads_as(s.label, &written.rebind(&s.reader).unwrap(), &want);
+        // A column the file predates reads NULL, whatever its null words'
+        // encoding.
+        let wider = gnitz_zset::algebra::null_extend_output_schema(&s.reader, &[TypeCode::I64], false).unwrap();
+        let want = gnitz_zset::algebra::null_extend(&want, &wider, false);
+        assert_reads_as(s.label, &written.rebind(&wider).unwrap(), &want);
     }
 }
 

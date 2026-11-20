@@ -202,7 +202,7 @@ fn wire_batches() -> Vec<Batch> {
 }
 
 /// A row run, and a scattered prefix, is the longest run whose block — sized as
-/// `encode_listed` writes it under span dedup, which a block of rows sharing no
+/// `encode_relocated` writes it under span dedup, which a block of rows sharing no
 /// span matches cell by cell — fits; each reads back its rows. No rows is no
 /// block.
 #[test]
@@ -212,7 +212,7 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
         let mut buf = vec![0u8; 2 * whole];
         let size = |rows: &[u32]| {
             b.as_mem_batch()
-                .encode_listed(rows, 0, &mut vec![0; 2 * whole], true)
+                .encode_relocated(Rows::Listed(rows), 0, &mut vec![0; 2 * whole], true)
                 .unwrap()
         };
         assert!(b.wire_rows_within(b.len(), usize::MAX).is_none());
@@ -241,7 +241,11 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
                 if let Some((k, n)) = got {
                     assert_eq!(read_back(&out[..n]), weighted_rows(&b)[start..start + k]);
                     let mut short = vec![0u8; n - 1];
-                    assert!(b.as_mem_batch().encode_listed(&run(k), 0, &mut short, true).is_none());
+                    assert!(
+                        b.as_mem_batch()
+                            .encode_relocated(Rows::Listed(&run(k)), 0, &mut short, true)
+                            .is_none()
+                    );
                 }
             }
         }

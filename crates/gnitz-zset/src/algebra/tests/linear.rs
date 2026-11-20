@@ -1,8 +1,8 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    assert_folds, certified, make_batch, make_int_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema,
-    weighted_rows, zset_of, zset_sum,
+    assert_folds, certified, make_batch, make_batch_bytes, make_int_batch, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows, zset_of, zset_sum,
 };
 use gnitz_wire::TypeCode;
 
@@ -147,13 +147,54 @@ fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
     for nulls_first in [false, true] {
         let out_schema = null_extend_output_schema(&in_schema, &[TypeCode::I64, TypeCode::String], nulls_first)
             .expect("two fill columns extend cleanly");
-        let out = input.widened_with_nulls(&out_schema, nulls_first);
+        let out = null_extend(&input, &out_schema, nulls_first);
 
         let declared: Vec<bool> = out_schema.payload_columns().map(|(_, c)| c.nullable).collect();
         let written: Vec<bool> = (0..out_schema.num_payload_cols())
             .map(|pi| gnitz_wire::null_word_get(out.get_null_word(0), pi))
             .collect();
         assert_eq!(written, declared, "nulls_first={nulls_first}");
+    }
+}
+
+/// The null-extend at both NULL placements: the input's payload lands where the
+/// placement leaves it, the fill column reads NULL, and the input's blob heap
+/// comes along — without it a long (> 12 byte) string reads back as garbage.
+#[test]
+fn null_extend_places_the_fill_on_either_side() {
+    let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
+    let b = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, long)]));
+
+    let cols = |first: bool| -> SchemaDescriptor {
+        let pk = SchemaColumn::new(TypeCode::U64, false);
+        let s = SchemaColumn::new(TypeCode::String, false);
+        let fill = SchemaColumn::new(TypeCode::I64, true);
+        let cols = match first {
+            true => [pk, fill, s],
+            false => [pk, s, fill],
+        };
+        SchemaDescriptor::new(&cols, &[0])
+    };
+
+    for nulls_first in [false, true] {
+        let out_schema = cols(nulls_first);
+        let out = null_extend(&b, &out_schema, nulls_first);
+        let (str_slot, fill_slot) = match nulls_first {
+            true => (1, 0),
+            false => (0, 1),
+        };
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(gnitz_wire::widen_pk_be(out.get_pk_bytes(0)), 1);
+        assert!(!out.blob().is_empty(), "output blob must be propagated ({nulls_first})");
+        assert_eq!(
+            gnitz_wire::payload_bytes(&out, 0, str_slot),
+            long,
+            "long string must resolve to the original ({nulls_first})"
+        );
+        let nw = out.get_null_word(0);
+        assert!(gnitz_wire::null_word_get(nw, fill_slot), "the fill column reads NULL");
+        assert!(!gnitz_wire::null_word_get(nw, str_slot), "the input column stays live");
     }
 }
 
@@ -180,4 +221,32 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     ]);
     assert!(extend(&wide, 1).is_ok());
     assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), guard);
+}
+
+/// A null-extend whose shift spans the whole null word: a PK-only input under
+/// 64 fill columns ahead of it, and a 64-column input under none. Every fill
+/// bit reads NULL and every input bit keeps its value.
+#[test]
+fn null_extend_at_the_full_null_word() {
+    let pk = SchemaColumn::new(TypeCode::U64, false);
+    let fill = SchemaColumn::new(TypeCode::I64, true);
+    let pk_only = SchemaDescriptor::new(&[pk], &[0]);
+    let mut input = Batch::with_capacity(&pk_only, 3);
+    for k in 1..=3u64 {
+        input.push_key_row(&k.to_be_bytes(), 1);
+    }
+    let input = certified(input);
+    let cols: Vec<SchemaColumn> = std::iter::once(pk).chain(std::iter::repeat_n(fill, 64)).collect();
+    let wide = SchemaDescriptor::new(&cols, &[0]);
+    for nulls_first in [false, true] {
+        let out = null_extend(&input, &wide, nulls_first);
+        assert_eq!(out.len(), 3);
+        for row in 0..3 {
+            assert_eq!(out.get_null_word(row), u64::MAX, "nulls_first={nulls_first}");
+        }
+        let same = null_extend(&out, &wide, nulls_first);
+        for row in 0..3 {
+            assert_eq!(same.get_null_word(row), u64::MAX, "nulls_first={nulls_first}");
+        }
+    }
 }

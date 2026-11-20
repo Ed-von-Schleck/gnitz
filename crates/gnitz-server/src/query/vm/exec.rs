@@ -409,7 +409,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, pass: &Pass, from: usi
             Op::Share(plan) => plan.share(&batches[in_reg.at()], stores.registry.slot()),
 
             Op::NullExtend { nulls_first } => {
-                batches[in_reg.at()].widened_with_nulls(&regs[out_reg.at()].schema, *nulls_first)
+                algebra::null_extend(&batches[in_reg.at()], &regs[out_reg.at()].schema, *nulls_first)
             }
 
             Op::Reduce { out_trace, index, plan } => {

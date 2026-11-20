@@ -21,7 +21,7 @@ use gnitz_wire::{
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::DirectWriter;
 use gnitz_zset::repr::PooledBuf;
-use gnitz_zset::repr::{ColPtr, ZERO_CELL, seek_lower_bound, seek_pk_rows};
+use gnitz_zset::repr::{ColPtr, seek_lower_bound, seek_pk_rows};
 use gnitz_zset::repr::{ColumnarSource, DecodedColumns};
 use gnitz_zset::repr::{StringDest, carried_dead, long_bytes_outside, prorated_blob_cap, row_long_bytes};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -32,8 +32,8 @@ use StorageError::Corrupt;
 /// A payload-column region.
 enum PayloadRegion {
     /// Readable in place: a Raw (stride = width) or Constant (stride 0) region
-    /// of the mapping, or `ZERO_CELL` at stride 0 for a column the file predates
-    /// (its null bit comes from `null_pad_mask`).
+    /// of the mapping, or zero cells at stride 0 for a column the file predates
+    /// (its null bit is set by [`WordRegion::fit_nulls`]).
     Mapped(ColPtr),
     Packed(PackedRegion),
     /// An [`Encoding::Dict`] region of the mapping: a per-row read answers out
@@ -177,6 +177,42 @@ impl WordRegion {
         }
     }
 
+    /// These null words of a file of `file_npc` payload columns, `count` rows,
+    /// fitted to `schema`: without the bits of columns `schema` lacks, and a
+    /// column the file predates NULL. Fitted in the image where it holds the
+    /// words by value, else into the words returned, which this then reads.
+    fn fit_nulls(&mut self, file_npc: usize, schema: &SchemaDescriptor, count: usize) -> Option<Box<[u8]>> {
+        let npc = schema.num_payload_cols();
+        let (keep, pad) = (
+            schema.payload_slots(),
+            schema.payload_slots() & !gnitz_wire::low_bits_mask(file_npc),
+        );
+        match self {
+            _ if file_npc == npc => None,
+            WordRegion::TwoValue(two) => {
+                two.map_words(|w| (w & keep) | pad);
+                None
+            }
+            // Every file word is below bit `file_npc`, where the pad starts.
+            WordRegion::For(frame) if file_npc < npc => {
+                frame.set_high_bits(pad);
+                None
+            }
+            _ => {
+                // A Constant region stays one word read at stride 0.
+                let stride = self.in_place().map_or(FIXED_REGION_BYTES, |cp| cp.stride);
+                let rows = if stride == 0 { count.min(1) } else { count };
+                let mut words = vec![0u8; rows * FIXED_REGION_BYTES].into_boxed_slice();
+                self.decode(0, &mut words);
+                for word in words.as_chunks_mut::<8>().0 {
+                    *word = ((u64::from_le_bytes(*word) & keep) | pad).to_le_bytes();
+                }
+                *self = WordRegion::Mapped(ColPtr { base: words.as_ptr(), stride });
+                Some(words)
+            }
+        }
+    }
+
     /// Rows `start..` as they stand in a batch, `dst.len() / 8` rows of the
     /// shard.
     fn decode(&self, start: usize, dst: &mut [u8]) {
@@ -194,8 +230,8 @@ impl WordRegion {
 pub struct MappedShard {
     /// The mapping the regions below read, shared by every handle
     /// [`rebind`](Self::rebind) derives from this one. Two regions read
-    /// elsewhere: a column the file predates reads `ZERO_CELL` at stride 0,
-    /// and a narrowed `null_bmp` reads `_narrowed_nulls`.
+    /// elsewhere: a column the file predates reads zero cells at stride 0,
+    /// and a `null_bmp` fitted to `schema` may read `_fitted_nulls`.
     mmap: Rc<Mmap>,
     header: ShardHeader,
     schema: SchemaDescriptor,
@@ -205,15 +241,12 @@ pub struct MappedShard {
     /// Non-PK column regions indexed by payload position, always one per payload
     /// column of `schema`, a column the file predates included.
     col_regions: Vec<PayloadRegion>,
-    /// The null bits of `schema`'s payload columns past the file's own, OR'd
-    /// into every null word read: a column the file predates reads NULL.
-    null_pad_mask: u64,
     heap: ShardHeap<'static>,
     /// The validated PK filter, or `None` when the file carries none.
     pk_filter: Option<BinaryFuse8Ref<'static>>,
-    /// The words `null_bmp` points into when the file is wider than `schema`:
-    /// the file's null words without the bits of the columns `schema` lacks.
-    _narrowed_nulls: Option<Box<[u8]>>,
+    /// The words `null_bmp` points into where fitting them to `schema` took a
+    /// copy (see [`WordRegion::fit_nulls`]).
+    _fitted_nulls: Option<Box<[u8]>>,
 }
 
 /// The heap region: the verbatim heap, or the parsed image of one coded under
@@ -354,26 +387,13 @@ impl MappedShard {
         let pk = KeyRegion::bind(data, &spans[REG_PK], count, schema)?;
         let weight = WordRegion::bind(data, &spans[REG_WEIGHT], count)?;
         let mut null_bmp = WordRegion::bind(data, &spans[REG_NULL_BMP], count)?;
-        let narrowed_nulls = (file_npc > schema.num_payload_cols()).then(|| {
-            let keep = schema.payload_slots();
-            let mut words = vec![0u8; count * FIXED_REGION_BYTES].into_boxed_slice();
-            null_bmp.decode(0, &mut words);
-            for word in words.as_chunks_mut::<8>().0 {
-                *word = (u64::from_le_bytes(*word) & keep).to_le_bytes();
-            }
-            null_bmp = WordRegion::Mapped(ColPtr {
-                base: words.as_ptr(),
-                stride: FIXED_REGION_BYTES,
-            });
-            words
-        });
+        let fitted_nulls = null_bmp.fit_nulls(file_npc, schema, count);
 
         let col_regions = schema
             .payload_columns()
             .map(|(pi, col)| {
                 let width = col.size();
                 if pi >= file_npc {
-                    debug_assert!(width <= ZERO_CELL.len());
                     return Ok(PayloadRegion::Mapped(ColPtr::zeroes()));
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
@@ -405,8 +425,6 @@ impl MappedShard {
                 }))
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
-        let null_pad_mask = schema.payload_slots() & !gnitz_wire::low_bits_mask(file_npc);
-
         let (heap, pk_filter) = frame(data, &spans)?;
 
         Ok(MappedShard {
@@ -415,9 +433,8 @@ impl MappedShard {
             pk,
             weight,
             null_bmp,
-            _narrowed_nulls: narrowed_nulls,
+            _fitted_nulls: fitted_nulls,
             col_regions,
-            null_pad_mask,
             heap,
             pk_filter,
             mmap,
@@ -691,9 +708,9 @@ impl MappedShard {
             return;
         }
         self.decode_region(REG_NULL_BMP, start, null_bmp);
-        if self.null_pad_mask != 0 || skip != 0 {
+        if skip != 0 {
             for word in null_bmp.as_chunks_mut::<8>().0 {
-                *word = ((u64::from_le_bytes(*word) | self.null_pad_mask) & !skip).to_le_bytes();
+                *word = (u64::from_le_bytes(*word) & !skip).to_le_bytes();
             }
         }
         for (pi, col) in schema.payload_columns() {
@@ -710,7 +727,7 @@ impl MappedShard {
     }
 
     /// Rows `first..` of region `r` as they stand in a batch, as many as `out`
-    /// holds cells of the region's stride; null words without `null_pad_mask`.
+    /// holds cells of the region's stride.
     fn decode_region(&self, r: usize, first: usize, out: &mut [u8]) {
         match r {
             REG_PK => self.pk.decode(first, self.schema.pk_stride(), out),
@@ -736,7 +753,7 @@ impl RowSource for MappedShard {
     #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         debug_assert!(row < self.header.row_count);
-        self.null_bmp.word(row) | self.null_pad_mask
+        self.null_bmp.word(row)
     }
 
     #[inline(always)]
@@ -809,11 +826,6 @@ impl ColumnarSource for MappedShard {
             })
         })
     }
-
-    #[inline(always)]
-    fn null_pad_mask(&self) -> u64 {
-        self.null_pad_mask
-    }
 }
 
 /// A shard at the rows of one window, their keys decoded once for the merge
@@ -880,11 +892,6 @@ impl ColumnarSource for ShardWindow<'_> {
             REG_PK => self.pk,
             _ => self.shard.region(r, window, decoded),
         }
-    }
-
-    #[inline(always)]
-    fn null_pad_mask(&self) -> u64 {
-        self.shard.null_pad_mask
     }
 }
 

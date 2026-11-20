@@ -75,8 +75,10 @@ const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 /// The most key bytes one row of a stack-assembled fold holds.
 const FOLD_INLINE_BYTES: usize = 8 + FOLD_BYTES * FOLD_INLINE_COLS;
 
-/// The most rows [`FoldCols::identities`] digests a column at a time at once.
-pub(crate) const FOLD_CHUNK: usize = 256;
+/// The most rows whose identities one pass computes at once, into a buffer on
+/// the stack: a chunk of [`FoldCols::identities`] digested a column at a time,
+/// or of a group key's identities computed ahead.
+pub(crate) const IDENTITY_CHUNK: usize = 256;
 
 /// Fewest rows at which [`FoldCols::identities`] assembling them a column at a
 /// time costs less than digesting each with [`FoldCols::key_row`].
@@ -138,10 +140,10 @@ impl FoldCols {
     }
 
     /// [`Self::key_row`] of rows `start..start + out.len()` of `src` into `out`,
-    /// [`FOLD_CHUNK`] rows at a time.
+    /// [`IDENTITY_CHUNK`] rows at a time.
     #[inline]
     pub(crate) fn identities<B: BatchView>(&self, src: &B, start: usize, out: &mut [u128]) {
-        for (start, out) in (start..).step_by(FOLD_CHUNK).zip(out.chunks_mut(FOLD_CHUNK)) {
+        for (start, out) in (start..).step_by(IDENTITY_CHUNK).zip(out.chunks_mut(IDENTITY_CHUNK)) {
             if out.len() < FOLD_CHUNK_MIN_ROWS {
                 for (key, row) in out.iter_mut().zip(start..) {
                     *key = self.key_row(src, row);
@@ -159,7 +161,7 @@ impl FoldCols {
     fn keys_by_column<B: BatchView>(&self, src: &B, start: usize, out: &mut [u128]) {
         let n = out.len() * self.stride();
         if self.locs.len() <= FOLD_INLINE_COLS {
-            let mut buf = [MaybeUninit::<u8>::uninit(); FOLD_CHUNK * FOLD_INLINE_BYTES];
+            let mut buf = [MaybeUninit::<u8>::uninit(); IDENTITY_CHUNK * FOLD_INLINE_BYTES];
             self.assemble(src, start, filled(&mut buf[..n], 0), out);
         } else {
             with_scratch(&FOLD_SCRATCH, |buf| {

@@ -141,7 +141,7 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
             _ => suffix::<0>,
         };
         suffix(entries, idx_stride, key_size, source.pk(), src_stride, &runs);
-        copy_runs::<8>(source.weight(), weights, runs.iter().copied(), 8);
+        copy_runs::<8>(source.weight(), weights, &runs, 8);
         // An index entry is all key: it has no payload column to be NULL.
         nulls.fill(0);
     })

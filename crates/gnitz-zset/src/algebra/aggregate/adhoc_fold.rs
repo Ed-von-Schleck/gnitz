@@ -18,6 +18,7 @@ use gnitz_wire::GroupAggs;
 
 use super::agg::{AggValues, FoldGroups};
 use super::shape::ReduceShape;
+use crate::algebra::copy::copy_rows_into;
 use crate::algebra::group_key::{GroupNumbers, GroupOutKey, IdentityLoop, ground_pk};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
@@ -88,10 +89,10 @@ impl AdhocFold {
             mb: &mb,
             ranges,
         };
-        self.shape.key.with_identity(&mb, ranges, assign)?;
+        self.shape.key.key().with_identity(&mb, ranges, assign)?;
         self.vals.resize(self.groups.len());
         for k in 0..self.shape.aggs.len() {
-            self.vals.fold(k, &mb, ranges, FoldGroups::Rows(&self.ord));
+            self.vals.fold(k, &mb, ranges, &self.ord[..]);
         }
         Ok(())
     }
@@ -100,10 +101,7 @@ impl AdhocFold {
     /// `groups` is the output's leading columns, copied whole, then each
     /// aggregate's column.
     pub(crate) fn finish(self) -> Batch {
-        self.groups.copied_into(&self.shape.output_schema, 0, |w| {
-            let (pk, _, nulls) = w.fixed_mut();
-            pk.copy_from_slice(self.groups.pk());
-            nulls.copy_from_slice(self.groups.null_bmp());
+        copy_rows_into(&self.groups, &self.shape.output_schema, 0, 0, |w| {
             self.vals.emit_at(w, (0..w.rows()).map(|g| (g, g)));
         })
     }

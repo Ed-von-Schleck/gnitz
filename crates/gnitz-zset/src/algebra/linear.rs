@@ -1,13 +1,14 @@
-//! Linear operators: filter and union, with the union's merged output schema and
-//! an outer join's null-extend output schema.
+//! Linear operators: filter, union and null-extend, with the union's merged
+//! output schema and an outer join's null-extend output schema.
 //!
-//! Negate and null-extend's rows are batch mechanics, `Batch::negated` and
-//! `Batch::widened_with_nulls`; MAP is `MapPlan`, in the sibling `map` module.
+//! Negate's rows are a batch mechanic, `Batch::negated`; MAP is `MapPlan`, in
+//! the sibling `map` module.
 
 use std::borrow::Cow;
 
 use gnitz_expr::RowFilter;
 
+use super::copy::copy_rows_into;
 use crate::repr::{Batch, merge_consolidated};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
@@ -39,7 +40,7 @@ pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Re
     Ok(SchemaDescriptor::new(&cols, a.pk_cols()))
 }
 
-/// Output schema of an outer-join NULL_EXTEND ([`Batch::widened_with_nulls`]):
+/// Output schema of an outer-join NULL_EXTEND ([`null_extend`]):
 /// the input's PK region unchanged, then its payload and one nullable column per
 /// `type_codes` entry, in the order `nulls_first` selects.
 pub fn null_extend_output_schema(
@@ -58,6 +59,31 @@ pub fn null_extend_output_schema(
         fill(&mut b);
     }
     b.finish().map_err(|e| format!("null-extend: merged schema {e}"))
+}
+
+/// Every row of `b` copied into `out_schema`, which extends `b`'s schema with
+/// NULL-filled payload columns — ahead of `b`'s own under `nulls_first`, behind
+/// them otherwise. It must share `b`'s PK stride.
+///
+/// The consolidated claim carries over: an all-NULL column compares equal on every
+/// row, so (PK, payload) order and distinctness stay the original columns'.
+pub fn null_extend(b: &Batch, out_schema: &SchemaDescriptor, nulls_first: bool) -> Batch {
+    let (in_npc, out_npc) = (b.schema().num_payload_cols(), out_schema.num_payload_cols());
+    debug_assert!(out_npc >= in_npc);
+    let n_new = out_npc - in_npc;
+    let (first_slot, new_slots) = match nulls_first {
+        true => (n_new, 0..n_new),
+        false => (0, in_npc..out_npc),
+    };
+    let new_null_bits = gnitz_wire::null_word_at(gnitz_wire::low_bits_mask(n_new), new_slots.start);
+    let mut out = copy_rows_into(b, out_schema, first_slot, new_null_bits, |w| {
+        // The new columns are NULL, and a NULL cell is zeroed.
+        for pi in new_slots {
+            w.col_mut(pi).fill(0);
+        }
+    });
+    out.inherit_consolidated(b);
+    out
 }
 
 /// Union: algebraic addition of two Z-Set streams. Two consolidated inputs take an
@@ -103,3 +129,7 @@ pub fn op_union(batch_a: Cow<'_, Batch>, batch_b: Cow<'_, Batch>, out_schema: &S
 #[cfg(test)]
 #[path = "tests/linear.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/linear.rs"]
+mod bench;

@@ -122,10 +122,10 @@ impl ValueIndex {
 
 impl ValueIndex {
     /// The index entries `delta` contributes, each at its row's weight, unsorted:
-    /// one ordinal at a time, each of its regions in one pass. `key` groups the
-    /// reduce. Out of line, so its row loops compile apart from the caller's.
+    /// one ordinal at a time, each of its regions in one pass. Out of line, so
+    /// its row loops compile apart from the caller's.
     #[inline(never)]
-    pub(super) fn entries(&self, key: &GroupOutKey, delta: &Batch) -> Batch {
+    pub(super) fn entries(&self, delta: &Batch) -> Batch {
         // Consolidated, so no row is a ghost.
         debug_assert!(delta.is_consolidated());
         let mb = delta.as_mem_batch();
@@ -139,9 +139,9 @@ impl ValueIndex {
         let mut image = Vec::new();
         // Every row's group prefix, computed once for all ordinals when
         // computing one hashes; each ordinal otherwise computes its own rows'.
-        let shared = (self.aggs.len() > 1 && self.prefix.hashes(key)).then(|| {
+        let shared = (self.aggs.len() > 1 && self.prefix.hashes()).then(|| {
             let mut keys = vec![0u8; n * stride];
-            key.write_prefixes(&self.prefix, &mb, &[(0, n)], &mut keys, stride);
+            self.prefix.write(&mb, &[(0, n)], &mut keys, stride);
             keys
         });
 
@@ -157,9 +157,9 @@ impl ValueIndex {
                             key[..stride].copy_from_slice(&keys[row * stride..][..stride]);
                         }
                     }
-                    None => key.write_prefixes(&self.prefix, &mb, &runs, w.pk_mut(), width),
+                    None => self.prefix.write(&mb, &runs, w.pk_mut(), width),
                 }
-                copy_runs::<8>(delta.weight(), w.weight_mut(), runs.iter().copied(), 8);
+                copy_runs::<8>(delta.weight(), w.weight_mut(), &runs, 8);
                 w.null_bmp_mut().fill(0);
                 let (keys, mut cells, blob) = w.pk_and_payload_mut(IMAGE_SLOT..IMAGE_SLOT + has_payload as usize);
                 // The image cells, where the index has them, hold the whole

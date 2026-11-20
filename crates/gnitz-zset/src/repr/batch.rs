@@ -5,10 +5,10 @@
 
 use std::ops::Range;
 
+use super::columnar::ColPtr;
 use super::merge;
 use super::pool::{PooledBuf, is_tight};
 use super::scatter::{Pick, copy_ranges, with_picks};
-use super::seek::ColPtr;
 use super::string_heap::{self, BlobCache, relocated_cell};
 use super::writer::DirectWriter;
 use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
@@ -676,7 +676,7 @@ impl Batch {
     /// (PK, payload) order, distinctness and weights, which a debug build
     /// verifies.
     #[inline]
-    fn inherit_consolidated(&mut self, src: &Batch) {
+    pub(crate) fn inherit_consolidated(&mut self, src: &Batch) {
         self.consolidated = src.consolidated;
         if self.consolidated {
             self.debug_verify_consolidated(self);
@@ -768,37 +768,6 @@ impl Batch {
         out
     }
 
-    /// Every row copied into a fresh `out_schema` batch: its weight, and every
-    /// payload column landed at output slot `first_slot + pi` over this batch's
-    /// heap. `rest` writes what remains — the PK region, the null words, and
-    /// any output column no input column lands in.
-    pub(crate) fn copied_into(
-        &self,
-        out_schema: &SchemaDescriptor,
-        first_slot: usize,
-        rest: impl FnOnce(&mut DirectWriter<'_>),
-    ) -> Batch {
-        let in_schema = &self.schema;
-        debug_assert!(
-            out_schema.num_payload_cols() >= first_slot + in_schema.num_payload_cols(),
-            "copied_into lands every payload column at first_slot + its own index",
-        );
-        let n = self.count;
-        let mut out = Self::with_capacity(out_schema, n);
-        let heap_at = out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)], 0);
-        out.write_rows(n, |w| {
-            w.weight_mut().copy_from_slice(self.weight());
-            for (pi, col) in in_schema.payload_columns() {
-                w.col_mut(first_slot + pi).copy_from_slice(self.col_data(pi));
-                if col.type_code.is_german_string() {
-                    w.rebase_string_col(first_slot + pi, Heap::Plain(&self.blob), heap_at.into());
-                }
-            }
-            rest(w);
-        });
-        out
-    }
-
     /// Every row's leading key bytes — as many as `out_schema`'s stride — at its
     /// weight, in `out_schema`, which has no payload column: a row's payload is
     /// dropped. Left unconsolidated: rows may now share a key.
@@ -813,46 +782,6 @@ impl Batch {
                 dst.copy_from_slice(&src[..dst.len()]);
             }
         })
-    }
-
-    /// Copy every row into `out_schema`, which extends this batch's schema with
-    /// NULL-filled payload columns — ahead of this batch's own under
-    /// `nulls_first`, behind them otherwise. It must share this batch's PK stride.
-    ///
-    /// The consolidated claim carries over: an all-NULL column compares equal on every
-    /// row, so (PK, payload) order and distinctness stay the original columns'.
-    pub fn widened_with_nulls(&self, out_schema: &SchemaDescriptor, nulls_first: bool) -> Self {
-        let in_schema = &self.schema;
-        debug_assert_eq!(out_schema.pk_stride(), in_schema.pk_stride());
-        let in_npc = in_schema.num_payload_cols();
-        let out_npc = out_schema.num_payload_cols();
-        debug_assert!(out_npc >= in_npc);
-        let n_new = out_npc - in_npc;
-        let (first_slot, new_slots) = match nulls_first {
-            true => (n_new, 0..n_new),
-            false => (0, in_npc..out_npc),
-        };
-        let new_null_bits = gnitz_wire::low_bits_mask(n_new);
-
-        let mut output = self.copied_into(out_schema, first_slot, |w| {
-            // The new columns are NULL, and a NULL cell is zeroed.
-            for pi in new_slots {
-                w.col_mut(pi).fill(0);
-            }
-            let (pk, _, nulls) = w.fixed_mut();
-            pk.copy_from_slice(self.pk());
-            let out_words = nulls.as_chunks_mut::<8>().0.iter_mut();
-            for (out, word) in out_words.zip(self.null_bmp().as_chunks::<8>().0) {
-                let in_null = u64::from_le_bytes(*word);
-                let out_null = match nulls_first {
-                    true => new_null_bits | gnitz_wire::null_word_at(in_null, n_new),
-                    false => in_null | gnitz_wire::null_word_at(new_null_bits, in_npc),
-                };
-                *out = out_null.to_le_bytes();
-            }
-        });
-        output.inherit_consolidated(self);
-        output
     }
 
     // ── Seeks ───────────────────────────────────────────────────────────

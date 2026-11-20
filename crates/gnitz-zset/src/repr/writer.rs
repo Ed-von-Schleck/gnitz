@@ -2,10 +2,9 @@
 //! fixed bytes, written a region at a time.
 
 use super::batch::MemBatch;
-use super::string_heap::{BlobCache, StringDest, rebase_string_cells, relocated_cell};
+use super::string_heap::{BlobCache, StringDest, rebase_string_cells};
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::ColumnLocator;
-use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource};
+use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use std::ops::Range;
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
@@ -189,50 +188,6 @@ impl<'a> DirectWriter<'a> {
     pub fn rebase_string_col(&mut self, pi: usize, src: Heap<'_>, dest: StringDest<'_>) {
         let (cells, blob, cache) = self.string_col_mut(pi);
         rebase_string_cells(cells, src, blob, dest, cache);
-    }
-
-    /// The columns at `locs` of `src`'s rows `rows` into payload slots `0..`, in
-    /// order, a row of this writer per row of `rows`, each NULL bit set on the
-    /// null words the caller zeroed. A NULL cell is copied as it is: zero.
-    pub fn gather_cells_from(
-        &mut self,
-        locs: &[ColumnLocator],
-        src: &MemBatch,
-        rows: impl Iterator<Item = usize> + Clone,
-    ) {
-        for (pi, loc) in locs.iter().enumerate() {
-            let ColumnLocator::Payload { slot, size, type_code } = *loc else {
-                // A PK column is never NULL.
-                let mut scratch = [0u8; 16];
-                for (cell, row) in self.col_mut(pi).chunks_exact_mut(loc.size()).zip(rows.clone()) {
-                    cell.copy_from_slice(loc.native_le_bytes(src, row, &mut scratch));
-                }
-                continue;
-            };
-            let col = src.col_data(slot as usize);
-            if type_code.is_german_string() {
-                let cells = col.as_chunks::<16>().0;
-                let (dst, heap, mut cache) = self.string_col_mut(pi);
-                for (cell, row) in dst.as_chunks_mut::<16>().0.iter_mut().zip(rows.clone()) {
-                    *cell = relocated_cell(&cells[row], src.heap(), heap, cache.as_deref_mut());
-                }
-            } else {
-                gnitz_wire::by_cell_width!(size as usize, |T| {
-                    const N: usize = size_of::<T>();
-                    let cells = col.as_chunks::<N>().0;
-                    for (cell, row) in self.col_mut(pi).as_chunks_mut::<N>().0.iter_mut().zip(rows.clone()) {
-                        *cell = cells[row];
-                    }
-                })
-            }
-            if gnitz_wire::null_word_get(src.schema.nullable_payload_slots(), slot as usize) {
-                let nulls = self.null_bmp_mut().as_chunks_mut::<FIXED_REGION_BYTES>().0;
-                for (word, row) in nulls.iter_mut().zip(rows.clone()) {
-                    let bit = (src.get_null_word(row) >> slot & 1) << pi;
-                    *word = (u64::from_le_bytes(*word) | bit).to_le_bytes();
-                }
-            }
-        }
     }
 }
 

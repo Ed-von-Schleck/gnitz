@@ -17,7 +17,7 @@ use gnitz_zset::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 
 /// Leading PK columns, one per type code in `pk` and in that order, then the
 /// `payload` columns.
-pub fn keyed_schema(pk: &[TypeCode], payload: &[SchemaColumn]) -> SchemaDescriptor {
+fn keyed_schema(pk: &[TypeCode], payload: &[SchemaColumn]) -> SchemaDescriptor {
     let cols: Vec<SchemaColumn> = pk
         .iter()
         .map(|&t| SchemaColumn::new(t, false))

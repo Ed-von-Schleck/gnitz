@@ -21,8 +21,9 @@ use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
+use super::columnar::ColumnarSource;
 use super::pool::vec_bytes;
-use super::scatter::{ColumnarSource, Pick, span_pick};
+use super::scatter::{Pick, span_pick};
 use super::seek::gallop_from;
 use super::string_heap::{BlobCache, rebase_string_cells, row_long_bytes};
 use super::writer::DirectWriter;
@@ -137,7 +138,7 @@ pub use crate::with_spans;
 /// The consolidated merge of sorted `sources`, source `i` walked over the `i`-th
 /// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
 /// zero, at that sum, in (PK, payload) order; and whether any of them may be a
-/// [span](super::scatter::SPAN).
+/// [span](super::scatter::span_pick).
 ///
 /// `distinct` says each source holds each element of the merge's order at most
 /// once and at a nonzero weight, which lets the merge emit a

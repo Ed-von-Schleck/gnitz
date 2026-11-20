@@ -172,7 +172,7 @@ impl RunSet {
         let mut bytes = 0;
         for HeldRun { batch: run, .. } in &mut self.runs {
             if run.schema().num_payload_cols() < npc {
-                let widened = run.widened_with_nulls(schema, false);
+                let widened = gnitz_zset::algebra::null_extend(run, schema, false);
                 debug_assert!(
                     widened.is_consolidated(),
                     "widen_runs: the widened run must still be consolidated",

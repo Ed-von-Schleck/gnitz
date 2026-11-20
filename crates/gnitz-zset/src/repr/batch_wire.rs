@@ -32,10 +32,8 @@ pub struct WireRows<'a> {
 enum Selection<'a> {
     /// Every row, over the batch's heap as it stands.
     Whole,
-    /// Rows `[start, start + rows)`.
-    Range { start: usize, rows: usize, dedup: bool },
-    /// The listed rows.
-    Listed { rows: &'a [u32], dedup: bool },
+    /// The rows `rows` names, their strings relocated.
+    Relocated { rows: Rows<'a>, dedup: bool },
 }
 
 impl WireRows<'_> {
@@ -43,8 +41,7 @@ impl WireRows<'_> {
     pub fn rows(&self) -> usize {
         match self.selection {
             Selection::Whole => self.batch.len(),
-            Selection::Range { rows, .. } => rows,
-            Selection::Listed { rows, .. } => rows.len(),
+            Selection::Relocated { rows, .. } => rows.len(),
         }
     }
 
@@ -61,40 +58,34 @@ impl WireRows<'_> {
                 b.debug_verify_dead_heap();
                 wal::write_block(&b.regions(), b.dead_heap, out)
             }
-            Selection::Range { start, rows, dedup } => b
-                .encode_relocating(rows, self.heap, out, dedup, |writer| {
-                    // An empty heap is carried: its cells name no byte of it.
-                    let heap_at = b.blob().is_empty().then_some(0);
-                    copy_ranges(&b, heap_at, &[(start, start + rows)], writer);
-                })
-                .expect("a sized range fits the bytes its size reserved"),
-            Selection::Listed { rows, dedup } => b
-                .encode_listed(rows, self.heap, out, dedup)
-                .expect("a sized list fits the bytes its size reserved"),
+            Selection::Relocated { rows, dedup } => b
+                .encode_relocated(rows, self.heap, out, dedup)
+                .expect("a sized selection fits the bytes its size reserved"),
         }
     }
 }
 
-/// The rows a block is sized over, in order: a run of the batch's rows, or a
-/// list of them.
+/// Rows of a batch, in order: the run of `len` rows from `start`, or a list of
+/// them.
+#[derive(Clone, Copy)]
 enum Rows<'r> {
-    Run(Range<usize>),
+    Run { start: usize, len: usize },
     Listed(&'r [u32]),
 }
 
 impl Rows<'_> {
-    fn len(&self) -> usize {
+    fn len(self) -> usize {
         match self {
-            Rows::Run(r) => r.len(),
+            Rows::Run { len, .. } => len,
             Rows::Listed(ids) => ids.len(),
         }
     }
 
     /// The `i`-th row.
     #[inline(always)]
-    fn at(&self, i: usize) -> usize {
+    fn at(self, i: usize) -> usize {
         match self {
-            Rows::Run(r) => r.start + i,
+            Rows::Run { start, .. } => start + i,
             Rows::Listed(ids) => ids[i] as usize,
         }
     }
@@ -126,10 +117,14 @@ impl<'a> MemBatch<'a> {
         }
         // Relocation is decided over the rows that fit by width alone.
         let by_width = (budget.saturating_sub(wal::WAL_HEADER_SIZE) / self.schema().row_width()).max(1);
-        let (rows, heap, dedup) = self.relocation(Rows::Run(start..self.len().min(start + by_width)), budget);
+        let len = by_width.min(self.len() - start);
+        let (rows, heap, dedup) = self.relocation(Rows::Run { start, len }, budget);
         let out = WireRows {
             batch: *self,
-            selection: Selection::Range { start, rows, dedup },
+            selection: Selection::Relocated {
+                rows: Rows::Run { start, len: rows },
+                dedup,
+            },
             heap,
         };
         debug_assert!(
@@ -155,7 +150,7 @@ impl<'a> MemBatch<'a> {
         let (_, heap, dedup) = self.relocation(Rows::Listed(indices), usize::MAX);
         Some(WireRows {
             batch: *self,
-            selection: Selection::Listed { rows: indices, dedup },
+            selection: Selection::Relocated { rows: Rows::Listed(indices), dedup },
             heap,
         })
     }
@@ -174,18 +169,18 @@ impl<'a> MemBatch<'a> {
     /// span dedup, as [`Self::fit_plain`] decides.
     fn relocation(&self, rows: Rows<'_>, budget: usize) -> (usize, usize, bool) {
         let slots = self.heap_referencing_slots();
-        let (n, heap, dedup) = self.fit_plain(&rows, slots, budget);
+        let (n, heap, dedup) = self.fit_plain(rows, slots, budget);
         if !dedup {
             return (n, heap, false);
         }
-        let (n, heap) = self.deduped_fit(&rows, slots, budget);
+        let (n, heap) = self.deduped_fit(rows, slots, budget);
         (n, heap, true)
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they
     /// relocate under span dedup are charged — each span once — and those heap
     /// bytes. `slots` names the German-string payload slots.
-    fn deduped_fit(&self, rows: &Rows<'_>, slots: u64, budget: usize) -> (usize, usize) {
+    fn deduped_fit(&self, rows: Rows<'_>, slots: u64, budget: usize) -> (usize, usize) {
         let mut seen = BlobCache::for_rows(self.schema, rows.len());
         let costs = (0..rows.len()).map(|i| self.row_heap_cost(rows.at(i), slots, &mut seen));
         self.fit_rows(costs, budget)
@@ -214,7 +209,7 @@ impl<'a> MemBatch<'a> {
     /// whether the block relocates under span dedup instead: where the cells of
     /// the rows read take more heap than the extent of the heap they name, some
     /// name a byte twice, and the block keeps each span once.
-    fn fit_plain(&self, rows: &Rows<'_>, slots: u64, budget: usize) -> (usize, usize, bool) {
+    fn fit_plain(&self, rows: Rows<'_>, slots: u64, budget: usize) -> (usize, usize, bool) {
         const CHUNK: usize = 256;
         let (blob_len, slope) = (self.blob().len(), self.schema().row_width());
         let (mut fit, mut heap) = (0usize, 0usize);
@@ -234,9 +229,9 @@ impl<'a> MemBatch<'a> {
                     }
                 };
                 match rows {
-                    Rows::Run(r) => costs
+                    Rows::Run { start, .. } => costs
                         .iter_mut()
-                        .zip(&cells[r.start + s..r.start + e])
+                        .zip(&cells[start + s..start + e])
                         .for_each(|(c, cell)| charge(c, cell)),
                     Rows::Listed(ids) => costs
                         .iter_mut()
@@ -269,30 +264,14 @@ impl<'a> MemBatch<'a> {
             .sum()
     }
 
-    /// The rows `indices` selects, in order, as one WAL block at the front of
-    /// `out`, their strings relocated into the block's own heap, for which
+    /// The rows `rows` names, in order, as one WAL block at the front of `out`,
+    /// their strings relocated into the block's own heap, for which
     /// `heap_bytes` are reserved: under span dedup when `dedup`, else each cell
-    /// on its own. Returns bytes written; `None` when the block does not fit
+    /// on its own. An empty heap is carried instead, since its cells name no
+    /// byte of it. Returns bytes written; `None` when the block does not fit
     /// `out`.
-    fn encode_listed(&self, indices: &[u32], heap_bytes: usize, out: &mut [u8], dedup: bool) -> Option<usize> {
-        let count = indices.len();
-        self.encode_relocating(count, heap_bytes, out, dedup, |writer| {
-            scatter_copy(self, indices, None, writer);
-        })
-    }
-
-    /// A WAL block of `count` rows at the front of `out`, which `fill` writes
-    /// through a writer over its fixed bytes and a heap reserved at
-    /// `heap_bytes`, relocating under span dedup when `dedup`. `None` when the
-    /// block does not fit `out`.
-    fn encode_relocating(
-        &self,
-        count: usize,
-        heap_bytes: usize,
-        out: &mut [u8],
-        dedup: bool,
-        fill: impl FnOnce(&mut DirectWriter<'_>),
-    ) -> Option<usize> {
+    fn encode_relocated(&self, rows: Rows<'_>, heap_bytes: usize, out: &mut [u8], dedup: bool) -> Option<usize> {
+        let count = rows.len();
         let fixed = count * self.schema().row_width();
         let heap_at = wal::WAL_HEADER_SIZE + fixed;
         if heap_at > out.len() {
@@ -302,15 +281,12 @@ impl<'a> MemBatch<'a> {
         let mut cache = BlobCache::for_rows(self.schema, count);
         let block = &mut out[wal::WAL_HEADER_SIZE..heap_at];
         let cache = dedup.then_some(&mut cache);
-        fill(&mut DirectWriter::over(
-            block,
-            count,
-            0,
-            count,
-            self.schema(),
-            &mut heap,
-            cache,
-        ));
+        let writer = &mut DirectWriter::over(block, count, 0, count, self.schema(), &mut heap, cache);
+        let carry = self.blob().is_empty().then_some(0);
+        match rows {
+            Rows::Run { start, len } => copy_ranges(self, carry, &[(start, start + len)], writer),
+            Rows::Listed(ids) => scatter_copy(self, ids, carry, writer),
+        }
         let total = heap_at + heap.len();
         out.get_mut(heap_at..total)?.copy_from_slice(&heap);
         // Relocated cell by cell, so every heap byte is referenced.
@@ -340,25 +316,26 @@ impl<'a> MemBatch<'a> {
         }
         let slots = self.heap_referencing_slots();
         let listed = Rows::Listed(rows);
-        let (_, copied, dedup) = self.fit_plain(&listed, slots, usize::MAX);
+        let (_, copied, dedup) = self.fit_plain(listed, slots, usize::MAX);
         // Dedup copies each distinct span once, so the whole source heap bounds
         // the block's unless cells name overlapping spans, which a certified
         // foreign block may; a block that then overruns `out` is refused here
         // and sized exactly below.
         let heap = if dedup { self.blob().len() } else { copied };
         if wal::WAL_HEADER_SIZE + rows.len() * width + heap <= out.len()
-            && let Some(len) = self.encode_listed(rows, heap, out, dedup)
+            && let Some(len) = self.encode_relocated(listed, heap, out, dedup)
         {
             return Some((rows.len(), len));
         }
         let (n, heap) = match dedup {
             false => {
-                let (n, heap, _) = self.fit_plain(&listed, slots, out.len());
+                let (n, heap, _) = self.fit_plain(listed, slots, out.len());
                 (n, heap)
             }
-            true => self.deduped_fit(&listed, slots, out.len()),
+            true => self.deduped_fit(listed, slots, out.len()),
         };
-        self.encode_listed(&rows[..n], heap, out, dedup).map(|len| (n, len))
+        self.encode_relocated(Rows::Listed(&rows[..n]), heap, out, dedup)
+            .map(|len| (n, len))
     }
 }
 

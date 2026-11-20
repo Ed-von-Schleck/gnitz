@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::RowFilter;
-use gnitz_zset::algebra::{Agg, AggValues};
+use gnitz_zset::algebra::{Agg, AggValues, pk_firsts};
 use gnitz_zset::repr::{Batch, range_rows};
 
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
-use crate::exec::keys::firsts;
 use crate::expr_lower::compile_filter_program;
 use crate::ir::BoundExpr;
 
@@ -77,7 +76,7 @@ impl FoldFinish {
     fn combine(&self, partial: ZSetBatch) -> ZSetBatch {
         let v = partial.view();
         debug_assert!(v.weights().all(|w| w == 1), "a fold partial is one reduce row");
-        let firsts = firsts(v.pk(), v.schema().pk_stride());
+        let firsts = pk_firsts(&v);
         if !firsts.repeats() {
             // Every group is one partial already; a write would copy a received reply out
             // of its frame for nothing.

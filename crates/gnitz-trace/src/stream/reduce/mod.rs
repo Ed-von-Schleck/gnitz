@@ -17,11 +17,12 @@ use std::cmp::Ordering;
 
 use crate::runs::{CursorRow, GroupProbe, ReadCursor};
 use crate::stream::OpenAt;
+use gnitz_expr::ColCopy;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 use gnitz_wire::{MAX_PK_BYTES, PkBuf, RowSource};
 use gnitz_zset::algebra::{
-    Agg, AggValues, FoldGroups, GroupOrdinals, GroupPrefix, GroupScratch, OutPk, ReduceShape, ground_pk,
+    Agg, AggValues, ColMoves, FoldGroups, GroupOrdinals, GroupPrefix, GroupScratch, OutPk, ReduceShape, ground_pk,
 };
 use gnitz_zset::repr::{Batch, DirectWriter, MemBatch, vec_bytes};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -30,6 +31,9 @@ use value_index::ValueIndex;
 /// The baked per-instruction circuit reduce plan.
 pub struct ReducePlan {
     shape: ReduceShape,
+    /// The carried input columns, as moves onto a fresh group row's payload
+    /// slots `0..`.
+    carried: ColMoves,
     /// Whether this global aggregate publishes a row over an empty input.
     seeds_ground: bool,
     /// Position of the COUNT(*) holding a group's net row count.
@@ -179,7 +183,10 @@ impl ReducePlan {
         );
         let (shape, _) = ReduceShape::new(input, group_cols, aggs)?;
         let value_index = ValueIndex::new(&shape.key, &shape.aggs)?;
+        let copies = shape.key.carried().iter().enumerate();
+        let copies = copies.map(|(slot, &src)| ColCopy { src, slot, width: src.size() });
         Ok(ReducePlan {
+            carried: ColMoves::new(copies.collect(), input),
             shape,
             seeds_ground,
             count_star,
@@ -218,9 +225,7 @@ impl ReducePlan {
     /// The index entries `delta` contributes, each at its row's weight,
     /// unsorted; `None` for a reduce without a value index.
     pub fn index_entries(&self, delta: &Batch) -> Option<Batch> {
-        self.value_index
-            .as_ref()
-            .map(|index| index.entries(&self.shape.key, delta))
+        self.value_index.as_ref().map(|index| index.entries(delta))
     }
 
     /// True iff every aggregate is a count or an integer sum, whose value is the
@@ -357,11 +362,11 @@ fn reduce_epoch(
         for (k, agg) in aggs.iter().enumerate() {
             match retracting > 0 && agg.is_wide() {
                 true => vals.fold_wide(k, &mb, all, &groups.ord, |g| probes[g] != Probe::No),
-                false => vals.fold(k, &mb, all, FoldGroups::Rows(&groups.ord)),
+                false => vals.fold(k, &mb, all, &groups.ord[..]),
             }
         }
         if retracting * RETRACTED_FOLD_ROWS >= delta.len() {
-            retracted.fold_retracted(&mb, all, FoldGroups::Rows(&groups.ord), vals);
+            retracted.fold_retracted(&mb, all, &groups.ord[..], vals);
         } else if retracting > 0 {
             probes
                 .iter_mut()
@@ -489,10 +494,7 @@ impl<'a> GroupHeads<'a, '_> {
     #[inline(always)]
     fn index_prefix<'b>(&self, prefix: &GroupPrefix, g: u32, buf: &'b mut [u8]) -> &'b [u8] {
         let id = self.groups.ids.get(g as usize).copied();
-        self.plan
-            .shape
-            .key
-            .prefix_of(prefix, self.delta, self.first(g), id, buf)
+        prefix.of(self.delta, self.first(g), id, buf)
     }
 
     /// The new rows of groups `fresh`, none with a stored row, onto `w` a
@@ -500,7 +502,7 @@ impl<'a> GroupHeads<'a, '_> {
     /// delta row, its aggregates off `vals`.
     #[inline(always)]
     fn write_fresh(&self, vals: &AggValues, w: &mut DirectWriter<'_>, fresh: &[u32]) {
-        let (keys, weights, nulls) = w.fixed_mut();
+        let (keys, weights, _) = w.fixed_mut();
         for (key, &g) in keys
             .chunks_exact_mut(self.plan.shape.output_schema.pk_stride())
             .zip(fresh)
@@ -508,9 +510,8 @@ impl<'a> GroupHeads<'a, '_> {
             key.copy_from_slice(self.out_pk(g).bytes());
         }
         weights.as_chunks_mut::<8>().0.fill(1i64.to_le_bytes());
-        nulls.fill(0);
         let firsts = fresh.iter().map(|&g| self.first(g));
-        w.gather_cells_from(self.plan.shape.key.carried(), self.delta, firsts);
+        self.plan.carried.gather(self.delta, firsts, w);
         vals.emit_at(w, fresh.iter().enumerate().map(|(row, &g)| (row, g as usize)));
     }
 }

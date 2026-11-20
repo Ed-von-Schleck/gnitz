@@ -154,3 +154,64 @@ fn reply_chunk_strings_bench() {
         );
     }
 }
+
+/// Instructions per row of `wire_listed(..).encode` and of
+/// `encode_scattered_prefix` over every other row of a 1000-row batch, ascending:
+/// a fixed-width schema, a string schema whose values are all inline (an empty
+/// heap), and one whose values all live in the heap.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn wire_listed_encode_bench() {
+    const ROWS: usize = 1000;
+    const PASSES: usize = 1000;
+    let mut b = BatchBuilder::new(&pk_u64_two_i64_schema());
+    for i in 0..ROWS as u64 {
+        b.begin_row(i as u128, 1);
+        b.put_int(i as u128);
+        b.put_int((i * 3) as u128);
+        b.end_row();
+    }
+    let fixed = b.finish();
+    let strings = |value: &dyn Fn(u64) -> String| {
+        make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
+            &(0..ROWS as u64).map(|i| (i, 1, value(i))).collect::<Vec<_>>(),
+        )
+    };
+    let inline = strings(&|i| format!("s{i}"));
+    let heap = strings(&|i| format!("{i:040}"));
+    let list: Vec<u32> = (0..ROWS as u32).step_by(2).collect();
+    let counter = Counter::instructions();
+    for (name, batch) in [("fixed", &fixed), ("inline strings", &inline), ("heap strings", &heap)] {
+        let mb = batch.as_mem_batch();
+        let mut buf = vec![0u8; 2 * batch.wire_whole().unwrap().byte_size()];
+        let (listed, listed_instr) = counter.measure(|| {
+            (0..PASSES)
+                .map(|_| {
+                    black_box(mb)
+                        .wire_listed(black_box(&list))
+                        .unwrap()
+                        .encode(black_box(&mut buf))
+                })
+                .sum::<usize>()
+        });
+        let (prefix, prefix_instr) = counter.measure(|| {
+            (0..PASSES)
+                .map(|_| {
+                    black_box(mb)
+                        .encode_scattered_prefix(black_box(&list), black_box(&mut buf))
+                        .unwrap()
+                        .0
+                })
+                .sum::<usize>()
+        });
+        assert!(listed > 0);
+        assert_eq!(prefix, list.len() * PASSES);
+        let per_row = |instr: u64| instr as f64 / (list.len() * PASSES) as f64;
+        println!(
+            "wire_listed_encode_bench {name:<15} listed {:6.1} instr/row, scattered prefix {:6.1}",
+            per_row(listed_instr),
+            per_row(prefix_instr)
+        );
+    }
+}

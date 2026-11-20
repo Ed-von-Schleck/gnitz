@@ -210,31 +210,11 @@ impl TopK {
     /// the client, which sees every worker's rows, may clip it.
     fn trim(&mut self, keeper: &mut Batch) {
         let mb = keeper.as_mem_batch();
-        let mut ranking = RowRanking::new(&self.order, &mb);
-        if let Some(bound) = self.bound {
-            ranking.drop_above(bound);
-        }
-        ranking.keep_smallest(self.window as usize);
-        let weight = |r: u32| keeper.get_weight(r as usize);
-        let mut acc = ranking.rows().fold(0i64, |a, r| a.saturating_add(weight(r)));
-        // Every row weighs ≥ 1, so the kept rows cover the window; a surplus is the only way a
-        // comparator-larger row among them is droppable.
-        if acc > self.window {
-            ranking.sort();
-            acc = 0;
-            let window = self.window;
-            let cut = ranking.rows().position(|r| {
-                acc = acc.saturating_add(weight(r));
-                acc >= window
-            });
-            if let Some(i) = cut {
-                ranking.truncate(i + 1);
-            }
-        }
-        self.bound = ranking.max_lead();
-        self.summed = acc;
-        let perm: Vec<u32> = ranking.rows().collect();
-        *keeper = keeper.indexed_rows(&perm);
+        let kept =
+            RowRanking::new(&self.order, &mb).keep_covering(self.window, self.bound, |r| keeper.get_weight(r as usize));
+        self.summed = kept.summed;
+        self.bound = kept.bound;
+        *keeper = keeper.indexed_rows(&kept.rows);
     }
 }
 

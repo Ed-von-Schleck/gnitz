@@ -47,7 +47,7 @@ impl OrderCol {
     /// Where a row stands under the key on being NULL alone, 0 before 1. The direction
     /// does not flip it.
     #[inline(always)]
-    pub fn rank(&self, is_null: bool) -> u8 {
+    pub(crate) fn rank(&self, is_null: bool) -> u8 {
         (is_null != self.nulls_first) as u8
     }
 
@@ -338,31 +338,51 @@ impl<'a> RowRanking<'a> {
         }
     }
 
-    /// Drop every row whose lead is above `bound`.
-    pub(crate) fn drop_above(&mut self, bound: u128) {
-        self.rows.retain(|r| r.lead() <= bound);
+    /// The smallest rows whose summed `weight` covers `window`, in no particular order,
+    /// among those whose lead is at most `bound`; every such row when they fall short of
+    /// it. The boundary row stays whole. Every row weighs at least 1.
+    pub(crate) fn keep_covering(mut self, window: i64, bound: Option<u128>, weight: impl Fn(u32) -> i64) -> Covering {
+        if let Some(bound) = bound {
+            self.rows.retain(|r| r.lead() <= bound);
+        }
+        self.keep_smallest(window as usize);
+        let mut summed = self.rows().fold(0i64, |a, r| a.saturating_add(weight(r)));
+        // Every row weighs ≥ 1, so the kept rows cover the window; a surplus is the only way a
+        // comparator-larger row among them is droppable.
+        if summed > window {
+            self.sort();
+            summed = 0;
+            let cut = self.rows().position(|r| {
+                summed = summed.saturating_add(weight(r));
+                summed >= window
+            });
+            if let Some(i) = cut {
+                self.rows.truncate(i + 1);
+            }
+        }
+        let bound = self.max_lead();
+        Covering {
+            rows: self.rows().collect(),
+            summed,
+            bound,
+        }
     }
 
     /// The largest lead among the rows. A sort leaves a tie its later keys' images, so the
     /// leading key ranks the rows again first.
-    pub(crate) fn max_lead(&mut self) -> Option<u128> {
+    fn max_lead(&mut self) -> Option<u128> {
         rank_rows(&self.keys[0], self.src, Rows::Run(&mut self.rows));
         self.rows.iter().map(Ranked::lead).max()
     }
 
     /// The rows, in no particular order.
-    pub(crate) fn rows(&self) -> impl ExactSizeIterator<Item = u32> {
+    fn rows(&self) -> impl ExactSizeIterator<Item = u32> {
         self.rows.iter().map(|r| r.row)
     }
 
     /// Order the rows ascending; rows the keys do not tell apart keep their order.
-    pub(crate) fn sort(&mut self) {
+    fn sort(&mut self) {
         sort_run(self.keys, self.src, &mut self.rows);
-    }
-
-    /// Keep the first `n` rows.
-    pub(crate) fn truncate(&mut self, n: usize) {
-        self.rows.truncate(n);
     }
 
     /// The rows ascending; rows the keys do not tell apart keep their order.
@@ -370,6 +390,16 @@ impl<'a> RowRanking<'a> {
         self.sort();
         self.rows().collect()
     }
+}
+
+/// What [`RowRanking::keep_covering`] keeps.
+pub(crate) struct Covering {
+    /// The kept rows, in no particular order.
+    pub(crate) rows: Vec<u32>,
+    /// Their summed weight.
+    pub(crate) summed: i64,
+    /// The largest lead among them.
+    pub(crate) bound: Option<u128>,
 }
 
 /// Out of line: the images decide most comparisons, and this body inlined would crowd them.

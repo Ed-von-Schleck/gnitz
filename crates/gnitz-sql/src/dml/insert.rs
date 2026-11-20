@@ -13,13 +13,13 @@ use crate::bind::bind_constant;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::exec::client_map::ClientMap;
-use crate::exec::keys::firsts;
 use crate::ir::BExpr;
 use crate::names::extract_object_name;
 use crate::rules::{ClassWant, require_class, require_column};
 use crate::validate::{QueryEnvelope, reject_unhonored_query_clauses};
 use gnitz_core::{ClientError, ProtocolError, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::FixedInt;
+use gnitz_zset::algebra::pk_firsts;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     ConflictTarget, DoUpdate, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
@@ -338,7 +338,7 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
 /// DO UPDATE (`refuse_repeat`) a second row for a key is refused instead.
 fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
     let v = rows.view();
-    let firsts = firsts(v.pk(), v.schema().pk_stride());
+    let firsts = pk_firsts(&v);
     if refuse_repeat && firsts.repeats() {
         return Err(GnitzSqlError::rejected(
             "ON CONFLICT DO UPDATE cannot affect row a second time \

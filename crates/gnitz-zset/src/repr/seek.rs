@@ -2,71 +2,9 @@
 
 use std::ops::Range;
 
+use super::columnar::ColPtr;
 use crate::schema::{PkSortKey, pk_width_dispatch};
 use gnitz_wire::RowSource;
-
-/// A column as `base + row * stride`. Stride 0 reads one shared element for
-/// every row. `base` itself need not lie inside the column: a decoded window is
-/// rebased so that its first row lands on its first cell.
-#[derive(Clone, Copy)]
-pub struct ColPtr {
-    pub base: *const u8,
-    pub stride: usize,
-}
-
-/// The bytes a column of zero cells reads, any cell width up to its length.
-pub static ZERO_CELL: [u8; 16] = [0; 16];
-
-impl ColPtr {
-    /// A column whose every row reads zero cells of up to `ZERO_CELL.len()`
-    /// bytes.
-    #[inline(always)]
-    pub fn zeroes() -> Self {
-        ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }
-    }
-
-    /// Row `i`'s address.
-    #[inline(always)]
-    pub(crate) fn row_ptr(self, i: usize) -> *const u8 {
-        self.base.wrapping_add(i * self.stride)
-    }
-
-    /// Row `i`'s first `len` bytes.
-    ///
-    /// # Safety
-    /// Row `i` is a row of a live column this addresses, and `len` does not
-    /// exceed its element width.
-    #[inline(always)]
-    pub unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
-        // SAFETY: the caller's contract above.
-        unsafe { std::slice::from_raw_parts(self.row_ptr(i), len) }
-    }
-
-    /// Copy rows `start..` of this column of `width`-byte elements onto `dst`,
-    /// `dst.len() / width` rows.
-    ///
-    /// # Safety
-    /// Those rows are rows of a live column this addresses.
-    pub unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
-        if self.stride != 0 {
-            // SAFETY: the caller's contract above.
-            return dst.copy_from_slice(unsafe { std::slice::from_raw_parts(self.row_ptr(start), dst.len()) });
-        }
-        if dst.is_empty() {
-            return;
-        }
-        // One element repeated: write it once, then double the written prefix,
-        // so any element width costs O(log rows) copies.
-        // SAFETY: the caller's contract above; a zero stride is one element.
-        dst[..width].copy_from_slice(unsafe { self.row(0, width) });
-        let mut filled = width;
-        while filled < dst.len() {
-            let n = filled.min(dst.len() - filled);
-            dst.copy_within(..n, filled);
-            filled += n;
-        }
-    }
-}
 
 /// Lower bound over `[lo, hi)`: the first index whose row sorts at-or-after the
 /// probe, where `lt(i)` reports row `i < probe`.

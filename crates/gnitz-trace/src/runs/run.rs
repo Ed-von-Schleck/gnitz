@@ -136,12 +136,4 @@ impl ColumnarSource for Run {
             Run::Shard(s) => s.region(r, window, decoded),
         }
     }
-
-    #[inline(always)]
-    fn null_pad_mask(&self) -> u64 {
-        match self {
-            Run::Mem(_) => 0,
-            Run::Shard(s) => s.null_pad_mask(),
-        }
-    }
 }

@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, make_schema_pk_u64_payload_string, opk_pk, pk_only_schema,
-    radix_fold_rows, u64_pk_schema,
+    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk,
+    pk_only_schema, pk_payload_schema, radix_fold_rows, u64_pk_schema,
 };
 use gnitz_foundation::rng::mix;
 use gnitz_wire::{MAX_PK_BYTES, TypeCode};
@@ -23,7 +23,7 @@ impl IdentityLoop for Over<'_> {
 /// Every row's identity.
 fn identities(key: &GroupOutKey, mb: &MemBatch) -> Vec<u128> {
     let all = [(0, mb.len())];
-    key.with_identity(mb, &all, Over(&all))
+    key.key.with_identity(mb, &all, Over(&all))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
 
 /// The group prefix of an index grouped by `key` — by `cols` — ahead
 /// of a suffix of one column and of two: every row's, written a batch at a time,
-/// is its own [`GroupOutKey::prefix_of`], built from its identity `ids[row]` or
+/// is its own [`GroupPrefix::of`], built from its identity `ids[row]` or
 /// not, and two rows share one iff they share an output PK.
 fn assert_prefixes_follow_out_pk(
     key: &GroupOutKey,
@@ -207,8 +207,8 @@ fn assert_prefixes_follow_out_pk(
         // A key past each prefix, so a write past one shows.
         let stride = width + 1;
         let mut keys = vec![0xA5u8; mb.len() * stride];
-        key.write_prefixes(&prefix, mb, &[(0, mb.len())], &mut keys, stride);
-        let prefix_of = |row: usize| key.prefix_of(&prefix, mb, row, None, &mut [0; MAX_PK_BYTES]).to_vec();
+        prefix.write(mb, &[(0, mb.len())], &mut keys, stride);
+        let prefix_of = |row: usize| prefix.of(mb, row, None, &mut [0; MAX_PK_BYTES]).to_vec();
         for (row, &id) in ids.iter().enumerate() {
             let own = prefix_of(row);
             prop_assert_eq!(
@@ -219,7 +219,7 @@ fn assert_prefixes_follow_out_pk(
                 row
             );
             let mut buf = [0; MAX_PK_BYTES];
-            let from_id = key.prefix_of(&prefix, mb, row, Some(id), &mut buf);
+            let from_id = prefix.of(mb, row, Some(id), &mut buf);
             prop_assert_eq!(from_id, &own[..], "{:?}: row {}", cols, row);
         }
         for a in 0..mb.len() {
@@ -394,11 +394,50 @@ fn packed_identities_over_runs_are_their_whole_batch_identities() {
             let runs: Vec<(usize, usize)> = (0..N).step_by(gap + run).map(|s| (s, (s + run).min(N))).collect();
             let want: Vec<u128> = runs.iter().flat_map(|&(s, e)| s..e).map(|r| whole[r]).collect();
             assert_eq!(
-                key.with_identity(&mb, &runs, Over(&runs)),
+                key.key.with_identity(&mb, &runs, Over(&runs)),
                 want,
                 "{cols:?}: runs of {run}, gaps of {gap}"
             );
         }
-        assert!(key.with_identity(&mb, &[], Over(&[])).is_empty(), "{cols:?}: no rows");
+        assert!(
+            key.key.with_identity(&mb, &[], Over(&[])).is_empty(),
+            "{cols:?}: no rows"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pk_firsts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pk_firsts_numbers_keys_by_first_row() {
+    // A narrow key, and a wide one whose keys differ only past the narrow width.
+    let narrow = pk_payload_schema(&[TypeCode::U64]);
+    let wide = pk_payload_schema(&[TypeCode::U64, TypeCode::U64, TypeCode::U64]);
+    assert!(wide.pk_stride() > NARROW_PK_MAX_BYTES);
+    for schema in [&narrow, &wide] {
+        let pk = |k: u128| match schema.pk_cols().len() {
+            1 => opk_pk(schema, &[k]),
+            _ => opk_pk(schema, &[1, 2, k]),
+        };
+        let firsts = |keys: &[u128]| {
+            let rows: Vec<_> = keys.iter().map(|&k| (pk(k), 1, 0)).collect();
+            pk_firsts(&make_batch_opk(schema, &rows).as_mem_batch())
+        };
+
+        let f = firsts(&[5, 5, 7, 5, 9, 7, 9, 9, 1]);
+        assert_eq!(f.groups, [0, 0, 1, 0, 2, 1, 2, 2, 3]);
+        assert_eq!(f.keep, [(0, 1), (2, 3), (4, 5), (8, 9)]);
+        assert!(f.repeats());
+
+        let f = firsts(&[3, 4, 5]);
+        assert_eq!(f.groups, [0, 1, 2]);
+        assert_eq!(f.keep, [(0, 3)]);
+        assert!(!f.repeats());
+
+        let f = firsts(&[]);
+        assert!(f.groups.is_empty() && f.keep.is_empty());
+        assert!(!f.repeats());
     }
 }

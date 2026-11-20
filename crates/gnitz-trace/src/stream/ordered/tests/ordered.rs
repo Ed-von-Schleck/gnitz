@@ -191,9 +191,7 @@ fn entries_by_row(index: &OrderIndex, delta: &Batch) -> Batch {
     let (stride, group) = (index.schema.pk_stride(), index.prefix.width());
     let mut image = Vec::new();
     out.write_rows(n, |w| {
-        index
-            .key
-            .write_prefixes(&index.prefix, &mb, &[(0, n)], w.pk_mut(), stride);
+        index.prefix.write(&mb, &[(0, n)], w.pk_mut(), stride);
         let (keys, cells, blob) = w.pk_and_payload_mut(0..index.images.len());
         let mut cells: Vec<_> = cells.collect();
         for (row, key) in keys.chunks_exact_mut(stride).enumerate() {

@@ -420,8 +420,7 @@ impl OrderIndex {
         let (stride, group) = (self.schema.pk_stride(), self.prefix.width());
         let mut image = Vec::new();
         out.write_rows(n, |w| {
-            self.key
-                .write_prefixes(&self.prefix, &mb, &[(0, n)], w.pk_mut(), stride);
+            self.prefix.write(&mb, &[(0, n)], w.pk_mut(), stride);
             let (keys, cells, blob) = w.pk_and_payload_mut(0..self.images.len());
             let mut cells: Vec<_> = cells.collect();
             // The image columns: a string lead's whole image, then the rest's.

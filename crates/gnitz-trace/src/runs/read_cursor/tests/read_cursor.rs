@@ -941,12 +941,15 @@ fn gather_rows_reads_every_backing_alike() {
                 .all(|w| w.in_place(pk).is_some() && w.in_place(nulls).is_some() && w.in_place(p2).is_some())
         );
         assert!(windows.iter().all(|w| w.in_place(p0).is_some() == spread));
-        // A column the file predates is padded NULL, its fixed regions still
-        // read in place.
-        assert!(narrowed_windows.iter().all(|n| n.null_pad_mask() == 1 << 2
-            && n.in_place(pk).is_some()
-            && n.in_place(nulls).is_some()
-            && n.in_place(p2).is_some()));
+        // A column the file predates reads NULL; the PK and the columns the
+        // file holds still read in place.
+        assert!(
+            narrowed_windows
+                .iter()
+                .all(|n| (0..n.row_count()).all(|r| n.get_null_word(r) & 1 << 2 != 0)
+                    && n.in_place(pk).is_some()
+                    && n.in_place(p2).is_some())
+        );
         let got = [
             gather_rows(&mem, &wide, &picks, 0),
             gather_rows(&windows, &wide, &picks, 0),
