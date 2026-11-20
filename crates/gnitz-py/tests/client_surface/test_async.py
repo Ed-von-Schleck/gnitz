@@ -196,12 +196,12 @@ async def test_a_dropped_connection_frees_its_socket(server):
     assert _open_sockets() == before
 
 
-async def test_connecting_leaves_the_loop_free(tmp_path):
+async def test_connecting_leaves_the_loop_free(_sock_path):
     """The connect runs off the loop: a peer that never answers the handshake
     holds up the client and not the loop. Calls made meanwhile wait behind the
     connect, and its failure is what the client and every one of them raise,
     a call made after it included."""
-    path = str(tmp_path / "mute.sock")
+    path = _sock_path()
     with socket.socket(socket.AF_UNIX) as mute:
         mute.bind(path)
         mute.listen()           # queues the connection, and answers nothing

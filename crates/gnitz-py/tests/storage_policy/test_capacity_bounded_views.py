@@ -134,7 +134,9 @@ def test_a_pk_group_with_several_payloads_folds_to_one_skeleton_weight(swept, sw
     """
     c = swept_client
     base_tables(c)
-    fan, keys = 4, 400
+    # Enough keys that each worker's share of the folded view, one row per key,
+    # outgrows the capacity at eight workers too.
+    fan, keys = 4, 1600
     b_spread, p_spread = _twin(c, "spread", "SELECT t.id, u.w FROM t JOIN u ON t.id = u.tid")
     b_folded, p_folded = _twin(c, "folded", "SELECT t.id, t.v FROM t JOIN u ON t.id = u.tid")
 
@@ -190,7 +192,8 @@ def test_a_bounded_join_over_a_stream_reads_like_its_twin(swept, swept_client):
     sources' stores, so it may read a stream, whose store holds nothing.
 
     No checkpoint writes a view a stream reaches, so its rows reach a shard only
-    by outgrowing the store's memtable: hence the kilobyte bodies."""
+    by outgrowing the store's memtable: hence 4 KB bodies, which give each
+    worker's share of the 1,200 rows more than a memtable holds at eight workers."""
     c = swept_client
     c.execute_sql(
         "CREATE TABLE s (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL) "
@@ -202,10 +205,10 @@ def test_a_bounded_join_over_a_stream_reads_like_its_twin(swept, swept_client):
     bid, pid = _twin(c, "sj", "SELECT s.id, s.body, u.w FROM s JOIN u ON s.id = u.tid")
 
     for lo in range(1, n + 1, 100):
-        insert(c, "s", [(i, i * 3, f"body-{i:0>1000}") for i in range(lo, lo + 100)])
+        insert(c, "s", [(i, i * 3, f"body-{i:0>4000}") for i in range(lo, lo + 100)])
 
     live = bag(c.scan(*pid))
-    assert live == {(i, f"body-{i:0>1000}", i * 7): 1 for i in range(1, n + 1)}
+    assert live == {(i, f"body-{i:0>4000}", i * 7): 1 for i in range(1, n + 1)}
     assert _skeletal(swept.data_dir, bid[0], pid[0]) == {bid[0]}, "the bounded store alone dehydrated"
     assert bag(c.scan(*bid)) == live, "full scan"
     for pk in (1, 2, n // 2, n - 1, n):
