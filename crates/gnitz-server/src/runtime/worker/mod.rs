@@ -221,18 +221,24 @@ fn answer(
     snapshots: &mut FxHashMap<u64, Snapshot>,
     read: &Read<'_>,
 ) -> Result<Rows, WireFault> {
-    Ok(match *read {
+    // Each arm builds its own `Ok`: wrapped around the whole match, every answer
+    // would be copied at the width of the widest one.
+    match *read {
         Read::HasPk { tid, probe, keys } => {
             let keys = PkKeys::decode_probe(keys)?;
-            Rows::from(cat.registry.probe(tid, probe, keys)?)
+            Ok(Rows::from(cat.registry.probe(tid, probe, keys)?))
         }
-        Read::ScanSpec { tid, reply_layout, spec } => {
-            Rows::from(cat.scan_spec(tid, gnitz_wire::ReadSpec::decode(spec)?, reply_layout)?)
-        }
-        Read::Delta { view, after_tick, reply_layout, spec } => {
-            let spec = gnitz_wire::ReadSpec::decode(spec)?;
-            Rows::from(cat.registry.delta_read(view, after_tick, spec, reply_layout)?)
-        }
+        Read::ScanSpec { tid, reply_layout, spec } => Ok(Rows::from(cat.scan_spec(
+            tid,
+            gnitz_wire::ReadSpec::decode(spec)?,
+            reply_layout,
+        )?)),
+        Read::Delta { view, after_tick, reply_layout, spec } => Ok(Rows::from(cat.registry.delta_read(
+            view,
+            after_tick,
+            gnitz_wire::ReadSpec::decode(spec)?,
+            reply_layout,
+        )?)),
         Read::KeySpans { tid, cols, claim } => {
             if claim {
                 cat.registry.add_indexes(tid, &[(IndexClaim::Preflight, cols)])?;
@@ -240,11 +246,11 @@ fn answer(
             if KEY_SPANS_ERROR.armed() {
                 return Err("injected key-spans fault".into());
             }
-            Rows::Spans(Box::new(cat.registry.key_spans(tid, cols.as_slice())?))
+            Ok(Rows::Spans(Box::new(cat.registry.key_spans(tid, cols.as_slice())?)))
         }
         Read::ReleasePreflight => {
             cat.registry.release_claim(IndexClaim::Preflight);
-            Rows::Nothing
+            Ok(Rows::Nothing)
         }
         // A worker holds no system family a snapshot reads: the master answers
         // those from its own pin.
@@ -252,24 +258,24 @@ fn answer(
         Read::Pin { snapshot } => {
             let prior = snapshots.insert(snapshot, cat.registry.pin());
             debug_assert!(prior.is_none(), "snapshot {snapshot} pinned twice");
-            Rows::Nothing
+            Ok(Rows::Nothing)
         }
         Read::Unpin { snapshot } => {
             snapshots.remove(&snapshot);
-            Rows::Nothing
+            Ok(Rows::Nothing)
         }
         Read::SnapshotPage { snapshot, tid, page } => {
             let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
             let pin = snapshots
                 .get(&snapshot)
                 .ok_or_else(|| format!("snapshot {snapshot} is not pinned"))?;
-            Rows::from(pin.page(tid, &page)?)
+            Ok(Rows::from(pin.page(tid, &page)?))
         }
         Read::Backup { dir } => {
             cat.registry.link_published_into(dir)?;
-            Rows::Nothing
+            Ok(Rows::Nothing)
         }
-    })
+    }
 }
 
 #[cfg(test)]
