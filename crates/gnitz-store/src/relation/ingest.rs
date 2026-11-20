@@ -26,12 +26,17 @@ fn inject_ingest_apply_error(which: &str, kind: RelationKind, r: Result<(), Stor
 
 /// Where a write lands in its relation's store.
 #[derive(Clone, Copy)]
-enum Landing {
+pub enum Landing {
     /// Above the cut, until a seal answers it: neither captured nor echoed.
     Pending,
     /// At the cut: captured as `round` by the delta feed this process serves, and
     /// the batch as applied echoed back iff `echo`.
     Cut { round: Option<u64>, echo: bool },
+}
+
+impl Landing {
+    /// At the cut, captured by no feed, echoing nothing.
+    pub const CUT: Landing = Landing::Cut { round: None, echo: false };
 }
 
 impl Relation {
@@ -55,10 +60,20 @@ impl Relation {
         }
     }
 
-    /// Apply `batch` to this relation's store and its index projections where
-    /// `landing` puts it, a base table's under `rule`; the batch as applied
-    /// comes back iff it asks for an echo and the batch holds a row.
+    /// See [`RelationRegistry::land`].
     fn apply(&mut self, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
+        match landing {
+            Landing::Pending if self.kind().is_view() => {
+                return Err(format!(
+                    "relation {} is a view: its rows land only at the cut",
+                    self.id()
+                ));
+            }
+            // Rows left above the cut would stay there: nothing seals a
+            // relation no view reads.
+            Landing::Cut { .. } if self.has_pending() => drop(self.seal()?),
+            _ => {}
+        }
         let Relation { spec, rows, indexes, .. } = self;
         let id = spec.id;
         // Checked, not asserted: the append path sizes by the destination's region
@@ -138,53 +153,23 @@ impl RelationRegistry {
     // Each verb is one lookup and one call, inlined into its caller: out of
     // line, a batch moving through it by value is copied once more.
 
-    /// [`Self::ingest_with`] at the cut, under [`PkRule::Enforce`].
+    /// [`Self::land`] at the cut, under [`PkRule::Enforce`].
     #[inline(always)]
     pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        self.ingest_with(id, batch, PkRule::Enforce, false)
+        self.land(id, batch, Landing::CUT, PkRule::Enforce).map(drop)
     }
 
-    /// Apply `batch` to `id`'s store and its index projections, moving it in,
-    /// consolidated, a base table's after `rule`. At `pending` the rows land
-    /// above the cut: every reader sees them but one at
-    /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them,
-    /// and a view is refused. A stream holds no rows: it keeps a pending batch
-    /// as pushed, for the seal, and writes nothing at the cut.
+    /// Apply `batch` to `id`'s store and its index projections where `landing`
+    /// puts it, moving it in, consolidated, a base table's after `rule`; the
+    /// batch as applied comes back iff it asks for an echo and the batch holds
+    /// a row. Pending rows land above the cut: every reader sees them but one
+    /// at [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers
+    /// them, and a view is refused. A landing at the cut seals what the
+    /// relation left pending first. A stream holds no rows: it keeps a pending
+    /// batch as pushed, for the seal, and writes nothing at the cut.
     #[inline(always)]
-    pub fn ingest_with(&mut self, id: u64, batch: Batch, rule: PkRule, pending: bool) -> Result<(), String> {
-        let relation = self.relation_mut_or_err(id)?;
-        let landing = match pending {
-            true if relation.kind().is_view() => {
-                return Err(format!("relation {id} is a view: its rows land only at the cut"));
-            }
-            true => Landing::Pending,
-            false => {
-                // Rows left above the cut would stay there: nothing seals a
-                // relation no view reads.
-                if relation.has_pending() {
-                    relation.seal()?;
-                }
-                Landing::Cut { round: None, echo: false }
-            }
-        };
-        relation.apply(batch, landing, rule).map(drop)
-    }
-
-    /// [`Self::ingest`], without its seal of pending rows (a view holds none:
-    /// [`Self::ingest_with`] refuses one), of one round of view `id`'s
-    /// output, captured as round `round` by the delta feed this process serves
-    /// for it, and by none where `round` is `None`; the batch as applied comes
-    /// back iff `echo` and it holds a row.
-    #[inline]
-    pub fn ingest_round(
-        &mut self,
-        id: u64,
-        batch: Batch,
-        round: Option<u64>,
-        echo: bool,
-    ) -> Result<Option<Batch>, String> {
-        let landing = Landing::Cut { round, echo };
-        self.relation_mut_or_err(id)?.apply(batch, landing, PkRule::Enforce)
+    pub fn land(&mut self, id: u64, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
+        self.relation_mut_or_err(id)?.apply(batch, landing, rule)
     }
 
     /// Move `id`'s cut past every row ingested as pending since the last seal,

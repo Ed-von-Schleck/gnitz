@@ -12,7 +12,7 @@ use crate::test_support::{
     scan_all, table_engine, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::read::Probe;
-use gnitz_store::relation::PkRule;
+use gnitz_store::relation::{Landing, PkRule};
 use gnitz_wire::{PkColList, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -167,7 +167,12 @@ fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
         );
         engine
             .registry
-            .ingest_with(tid, make_batch(&schema, &[(tid, 1, 10)]), PkRule::Enforce, true)
+            .land(
+                tid,
+                make_batch(&schema, &[(tid, 1, 10)]),
+                Landing::Pending,
+                PkRule::Enforce,
+            )
             .unwrap();
     }
     let (mut wp, sal, rx) = test_worker(&mut engine);
@@ -457,7 +462,12 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     let row = make_batch(&schema, &[(1, 1, 10)]);
     engine
         .registry
-        .ingest_with(t1, make_batch(&schema, &[(7, 1, 70)]), PkRule::Enforce, true)
+        .land(
+            t1,
+            make_batch(&schema, &[(7, 1, 70)]),
+            Landing::Pending,
+            PkRule::Enforce,
+        )
         .unwrap();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 

@@ -8,7 +8,7 @@ use crate::test_support::{
     register_identity_view, scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols,
     zset_of,
 };
-use gnitz_store::relation::PkRule;
+use gnitz_store::relation::{Landing, PkRule};
 use gnitz_trace::stream::ReducePlan;
 use gnitz_wire::{Circuit, ReadBound, TypeCode};
 use std::collections::HashMap;
@@ -425,7 +425,12 @@ fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
                 .unwrap();
             engine
                 .registry
-                .ingest_with(tid, certified(make_batch(&schema, &above[i])), PkRule::Enforce, true)
+                .land(
+                    tid,
+                    certified(make_batch(&schema, &above[i])),
+                    Landing::Pending,
+                    PkRule::Enforce,
+                )
                 .unwrap();
         }
 

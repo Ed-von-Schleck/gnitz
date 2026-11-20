@@ -4,8 +4,9 @@
 use gnitz_wire::{PkKeys, ReadSink, ReadSpec, SinkKind};
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
-use super::{ReadRows, check_layout};
+use super::check_layout;
 use crate::relation::RelationRegistry;
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_zset::algebra::SinkPlan;
@@ -28,7 +29,7 @@ impl RelationRegistry {
         spec: ReadSpec,
         reply_layout: u64,
         mut hydrate: Option<&mut dyn FnMut(PkKeys) -> Result<Batch, String>>,
-    ) -> Result<ReadRows, String> {
+    ) -> Result<Rc<Batch>, String> {
         let entry = self.relation_or_err(target_id)?;
         let table = entry.table_or_err()?;
         let src_schema = entry.schema();
@@ -43,7 +44,7 @@ impl RelationRegistry {
         // Nothing to hydrate either: the relation whole, off the store's cached
         // snapshot.
         if whole && !skeleton {
-            return Ok(ReadRows::Shared(entry.full_scan()));
+            return Ok(entry.full_scan());
         }
         let (mut source, walk) = entry.open_read(bound, payload_read(&src_schema, &predicate, &wire_sink))?;
         let mut filter =
@@ -77,7 +78,7 @@ impl RelationRegistry {
                 break;
             }
         }
-        Ok(ReadRows::Own(sink.finish()))
+        Ok(Rc::new(sink.finish()))
     }
 }
 

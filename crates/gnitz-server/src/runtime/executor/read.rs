@@ -5,10 +5,11 @@ use super::{Access, Shared, cork_ack, cork_msg, cork_train, decode_fault, forwar
 use crate::runtime::frame::WireMsg;
 use crate::runtime::reactor::{Peer, TrainLease};
 use crate::runtime::sal::Read;
-use gnitz_store::read::ReadRows;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::multi_frame::ScanItem;
 use gnitz_wire::{ControlHeader, ReadSpec, WireFault, WireStatus};
+use gnitz_zset::repr::Batch;
+use std::rc::Rc;
 
 /// RESOLVE: answer with the relation's descriptor, its schema record included,
 /// and its token.
@@ -49,7 +50,7 @@ struct Scanned {
     kind: RelationKind,
     /// A system catalog family's rows, read off the master's own copy; `None`
     /// for a scan its workers answer.
-    local: Option<ReadRows>,
+    local: Option<Rc<Batch>>,
     /// The read's watermark; a fanned scan's is sampled inside the cut.
     lsn: u64,
 }

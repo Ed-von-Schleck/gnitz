@@ -1,5 +1,6 @@
 use super::*;
-use crate::relation::{IndexClaim, PkRule, RelationKind};
+use crate::read::source::Source;
+use crate::relation::{IndexClaim, Landing, PkRule, RelationKind};
 use crate::test_support::{
     RelationFixture, TID, batch_rows, col_range, img, make_batch, make_schema_u64_i64, pk_only_schema,
     relation_fixture, zset_of,
@@ -27,11 +28,6 @@ fn x10(id: u64) -> i64 {
 /// The bound `val ∈ [lo, hi)`.
 fn val_range(lo: i64, hi: i64) -> ReadBound {
     col_range(1, img(lo), img(hi - 1))
-}
-
-/// Whether `cur` walks a secondary index.
-fn walks_index(cur: &SourceCursor) -> bool {
-    matches!(cur, SourceCursor::Keyed { walk: Some(_), .. })
 }
 
 /// Drain a cursor to its `(id, weight, val)` rows, `chunk` rows at a time so a chunk
@@ -94,7 +90,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
             let (read, unapplied) = relation.open_read(bound.clone(), u64::MAX).unwrap();
             assert_eq!(unapplied.map(ReadBound::Range), (!walks).then(|| bound.clone()));
             for mut cur in [relation.open_sealed(bound.clone(), u64::MAX).unwrap(), read] {
-                assert_eq!(walks_index(&cur), walks && !want.is_empty(), "{bound:?}");
+                assert_eq!(cur.walks_index(), walks && !want.is_empty(), "{bound:?}");
                 assert_eq!(drain_all(&mut cur, chunk), want, "{bound:?} chunk {chunk}");
             }
         }
@@ -119,8 +115,8 @@ fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
         let relation = r.relation(TID).unwrap();
         let (mut read, unapplied) = relation.open_read(keys(), u64::MAX).unwrap();
         assert_eq!(unapplied, None);
-        let gather = match &read {
-            SourceCursor::Keyed { gather, walk: None } => gather,
+        let gather = match &read.0 {
+            Source::Keyed { gather, walk: None } => gather,
             _ => panic!("{kind:?}: a key list is a listed gather"),
         };
         assert_eq!(matches!(gather, KeyGather::Unique(_)), probed, "{kind:?}");
@@ -142,12 +138,12 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
         .unwrap()
         .open_sealed(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(walks_index(&cur), "nothing pending: the index");
+    assert!(cur.walks_index(), "nothing pending: the index");
     assert_eq!(drain_all(&mut cur, 7), rows(50..60));
 
     // One pending row inside the range, one outside it.
     let pending = make_batch(&make_schema_u64_i64(), &[(NBASE, 1, 555), (NBASE + 1, 1, 9_000)]);
-    r.ingest_with(TID, pending, PkRule::Enforce, true).unwrap();
+    r.land(TID, pending, Landing::Pending, PkRule::Enforce).unwrap();
     let with_pending = || {
         let mut rows = rows(50..60);
         rows.push((NBASE, 1, 555));
@@ -159,7 +155,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
         .unwrap()
         .open_sealed(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(!walks_index(&cur), "rows pending: the sealed store");
+    assert!(!cur.walks_index(), "rows pending: the sealed store");
     assert_eq!(drain_all(&mut cur, 7), rows(0..NBASE), "the pending rows are left out");
 
     let (mut cur, _) = r
@@ -167,7 +163,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
         .unwrap()
         .open_read(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(walks_index(&cur), "a read at now walks the index");
+    assert!(cur.walks_index(), "a read at now walks the index");
     assert_eq!(drain_all(&mut cur, 7), with_pending());
 
     r.seal(TID).unwrap().expect("rows were pending");
@@ -176,7 +172,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
         .unwrap()
         .open_sealed(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(walks_index(&cur), "sealed: the cuts agree again");
+    assert!(cur.walks_index(), "sealed: the cuts agree again");
     assert_eq!(drain_all(&mut cur, 7), with_pending());
 }
 
@@ -217,7 +213,7 @@ fn a_walk_follows_the_relations_writes() {
             .unwrap()
             .open_read(val_range(500, 560), u64::MAX)
             .unwrap();
-        assert!(walks_index(&cur), "{kind:?}");
+        assert!(cur.walks_index(), "{kind:?}");
         assert_eq!(unapplied, None);
         assert_eq!(drain_all(&mut cur, 4), want, "{kind:?}");
     }
@@ -347,7 +343,14 @@ fn a_composite_range_reads_exactly_the_rows_its_bounds_admit() {
                 .collect();
 
             let bound = ReadBound::Range(range);
-            match walks_index(&r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap().0) {
+            match r
+                .relation(TID)
+                .unwrap()
+                .open_read(bound.clone(), u64::MAX)
+                .unwrap()
+                .0
+                .walks_index()
+            {
                 true => walked += usize::from(!admitted.is_empty()),
                 false => scanned += 1,
             }
@@ -380,7 +383,7 @@ fn an_index_walk_over_a_repeating_key_trips_the_gather() {
     let view = RelationKind::View(ViewBudget::Plain);
     let r = relation_fixture(view, schema, &[&[1]], [make_batch(&schema, &rows)]);
     let mut cur = r.relation(TID).unwrap().open_sealed(val_range(5, 6), u64::MAX).unwrap();
-    assert!(walks_index(&cur));
+    assert!(cur.walks_index());
     cur.drain_chunk(1024);
 }
 
@@ -404,7 +407,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
         .unwrap()
         .open_read(ReadBound::Range(range), u64::MAX)
         .unwrap();
-    assert!(!walks_index(&cur), "a PK walk, not the index");
+    assert!(!cur.walks_index(), "a PK walk, not the index");
     assert_eq!(unapplied, None, "a PK walk applies the whole range");
     let b = cur.drain_chunk(64).unwrap();
     assert!(cur.drain_chunk(64).is_none());
@@ -585,13 +588,13 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
         _ => relation.open_read(range(), read).unwrap().0,
     };
     for label in ["index range", "unique pk set", "unique index range"] {
-        let shape = match open(label, u64::MAX) {
-            SourceCursor::Keyed {
+        let shape = match open(label, u64::MAX).0 {
+            Source::Keyed {
                 gather: KeyGather::Merge(_),
                 walk: Some(_),
             } => "index range",
-            SourceCursor::Keyed { gather: KeyGather::Unique(_), walk: None } => "unique pk set",
-            SourceCursor::Keyed {
+            Source::Keyed { gather: KeyGather::Unique(_), walk: None } => "unique pk set",
+            Source::Keyed {
                 gather: KeyGather::Unique(_),
                 walk: Some(_),
             } => "unique index range",

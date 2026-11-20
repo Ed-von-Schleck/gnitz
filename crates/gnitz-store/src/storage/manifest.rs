@@ -118,18 +118,9 @@ pub(super) fn staging_path(dir: &str) -> String {
     format!("{dir}/manifest.bin.tmp")
 }
 
-/// The basename of the shard drawn at its seq: `shard_{seq}.db`.
-struct ShardName(u64);
-
-impl std::fmt::Display for ShardName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "shard_{}.db", self.0)
-    }
-}
-
-/// The basename of the shard drawn at `seq`.
+/// The basename of the shard drawn at `seq`: `shard_{seq}.db`.
 pub(super) fn shard_name(seq: u64) -> String {
-    ShardName(seq).to_string()
+    format!("shard_{seq}.db")
 }
 
 /// The seq `name` denotes, or `None` unless [`shard_name`] gives that seq
@@ -150,7 +141,7 @@ pub(super) fn shard_seqs(dir: &str) -> io::Result<Vec<u64>> {
 
 /// The path of the shard drawn at `seq` in the store at `dir`.
 fn shard_path(dir: &str, seq: u64) -> String {
-    format!("{dir}/{}", ShardName(seq))
+    format!("{dir}/{}", shard_name(seq))
 }
 
 /// `r`, with `NotFound` read as success.

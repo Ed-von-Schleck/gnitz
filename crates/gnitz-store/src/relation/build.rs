@@ -99,7 +99,6 @@ impl RelationRegistry {
                 store,
                 key_spec,
                 claims: vec![claim],
-                covers_pk: schema.covers_pk(cols.as_slice()),
             });
         }
         let entered = owner.indexes.len();

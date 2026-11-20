@@ -31,18 +31,19 @@ use gnitz_wire::{
     CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, SysRow, TableTabRow, TypeCode, ViewTabRow, payload_u64,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
+use std::rc::Rc;
 
 use super::sys_tables::*;
 use super::*;
 
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
-fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> gnitz_store::read::ReadRows {
+fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> Rc<Batch> {
     let keys = pk_keys(opk.len(), [opk]);
     read_rows(engine, tid, gnitz_wire::ReadBound::PkSet(keys))
 }
 
 /// [`pk_group`] by a narrow native key.
-fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> gnitz_store::read::ReadRows {
+fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> Rc<Batch> {
     let schema = engine
         .registry
         .relation(tid)

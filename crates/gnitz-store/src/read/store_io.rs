@@ -48,14 +48,27 @@ impl RelationRegistry {
             (relation.unique_rows())
                 .ok_or_else(|| format!("probe: PK probe of relation {id}, whose keys may net above 1"))
         };
+        let out_schema = relation.probe_reply_schema(probe)?;
         match probe {
-            Probe::Pk => project_unique(unique_rows()?, &relation.schema(), &keys, &[]),
-            Probe::PkColumn(col) => project_unique(unique_rows()?, &relation.schema(), &keys, &[col]),
+            Probe::Pk => Ok(project_unique(
+                unique_rows()?,
+                &relation.schema(),
+                &keys,
+                &[],
+                &out_schema,
+            )),
+            Probe::PkColumn(col) => Ok(project_unique(
+                unique_rows()?,
+                &relation.schema(),
+                &keys,
+                &[col],
+                &out_schema,
+            )),
             Probe::Index(cols, cap) => {
                 let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.
                 keyed_as(index.key_spec().key_size())?;
-                let mut entries = Batch::empty_with_schema(&index.key_spec().index_schema(&relation.schema()));
+                let mut entries = Batch::empty_with_schema(&out_schema);
                 let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
                 index.for_each_entry(relation, keys, cap, |entry| entries.push_key_row(entry, 1));
                 Ok(entries)
@@ -69,8 +82,7 @@ impl Relation {
     pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
         let schema = self.schema();
         match probe {
-            // `project_unique`'s layout, which the probe writes.
-            Probe::Pk => Ok(schema.pk_only()),
+            Probe::Pk => project_schema(&schema, &[]),
             Probe::PkColumn(col) => project_schema(&schema, &[col]),
             Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.key_spec().index_schema(&schema)),
         }
@@ -114,85 +126,87 @@ impl Relation {
         read: u64,
     ) -> Result<(SourceCursor<'a>, Option<KeyRange>), String> {
         let schema = self.schema();
-        let table = self.table_or_err()?;
-        let (mut cursor, unapplied) = match bound {
-            ReadBound::None => (SourceCursor::Full(table.open_cursor(cut)), None),
+        self.table_or_err()?;
+        Ok(match bound {
+            ReadBound::None => (SourceCursor::full(self.open_cursor(cut, read)), None),
             ReadBound::PkSet(keys) => {
                 check_stride("open", self.id(), keys.stride(), schema.pk_stride())?;
                 // A key this worker holds no row for copies nothing.
                 let gather = match unique {
-                    Some(store) => KeyGather::unique(store, schema, keys),
-                    None => KeyGather::Merge(table.gather(keys, cut)),
+                    Some(store) => KeyGather::unique(store, schema, keys, self.unread(read)),
+                    None => KeyGather::Merge(self.gather(keys, cut, read)),
                 };
-                (SourceCursor::Keyed { gather, walk: None }, None)
+                (SourceCursor::listed(gather), None)
             }
-            ReadBound::Range(r) => open_range(self, table, r, cut, unique),
-        };
-        // The reader applies a range the source leaves unapplied.
-        let walked = unapplied
-            .as_ref()
-            .map_or(0, |r| schema.payload_bits(r.cols().as_slice().iter().copied()));
-        cursor.skip_payload(self.unread(read | walked));
-        Ok((cursor, unapplied))
+            ReadBound::Range(r) => self.open_range(r, cut, unique, read),
+        })
     }
-}
 
-/// The walk `r` names over `entry`, whose store is `table`, and the part of it
-/// the cursor leaves unapplied. `unique`, when given, is that store, probed for
-/// an index entry's row.
-fn open_range<'a>(
-    entry: &Relation,
-    table: &Table,
-    r: KeyRange,
-    cut: Cut,
-    unique: Option<&'a Table>,
-) -> (SourceCursor<'a>, Option<KeyRange>) {
-    let schema = entry.schema();
-    if r.walks_pk(schema.pk_cols()) {
-        let cursor = table.range_cursor(&r, cut);
-        return (SourceCursor::Full(cursor), None);
-    }
-    // An index holds a pending row's entry from its ingest on, so it is walked
-    // only where the store's two cuts read the same rows.
-    let index = entry
-        .index_on(r.cols().as_slice())
-        .filter(|_| cut == Cut::Now || !table.has_pending());
-    if let Some(ic) = index {
-        let idx = ic.cursor_over(&r);
-        // No entry in the range: no store cursor to open.
-        if !idx.is_valid() {
-            return (SourceCursor::Full(empty_cursor(schema)), None);
+    /// The walk `r` names over this relation's store, which holds one, for a
+    /// reader of the payload columns `read` names, as payload bits, and the
+    /// part of it the cursor leaves unapplied. `unique`, when given, is that
+    /// store, probed for an index entry's row.
+    fn open_range<'a>(
+        &self,
+        r: KeyRange,
+        cut: Cut,
+        unique: Option<&'a Table>,
+        read: u64,
+    ) -> (SourceCursor<'a>, Option<KeyRange>) {
+        let (schema, table) = (self.schema(), self.table());
+        if r.walks_pk(schema.pk_cols()) {
+            let mut cursor = table.range_cursor(&r, cut);
+            cursor.skip_payload(self.unread(read));
+            return (SourceCursor::full(cursor), None);
         }
-        if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO {
-            // The walk feeds the gather its keys.
-            let none = PkKeys::from_sorted(schema.pk_stride(), Vec::new());
-            let gather = match unique {
-                Some(store) => KeyGather::unique(store, schema, none),
-                None => KeyGather::Merge(PkSetGather::over(table.open_cursor(cut), none)),
-            };
-            return (SourceCursor::index_walk(idx, gather), None);
+        // An index holds a pending row's entry from its ingest on, so it is
+        // walked only where the store's two cuts read the same rows.
+        let index = self
+            .index_on(r.cols().as_slice())
+            .filter(|_| cut == Cut::Now || !table.has_pending());
+        if let Some(ic) = index {
+            let idx = ic.cursor_over(&r);
+            // No entry in the range: no store cursor to open.
+            if !idx.is_valid() {
+                return (SourceCursor::full(empty_cursor(schema)), None);
+            }
+            if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO {
+                // The walk feeds the gather its keys.
+                let none = PkKeys::from_sorted(schema.pk_stride(), Vec::new());
+                let gather = match unique {
+                    Some(store) => KeyGather::unique(store, schema, none, self.unread(read)),
+                    None => KeyGather::Merge(PkSetGather::over(self.open_cursor(cut, read), none)),
+                };
+                return (SourceCursor::index_walk(idx, gather), None);
+            }
         }
+        // The reader applies the range, so it reads the range's columns.
+        let walked = schema.payload_bits(r.cols().as_slice().iter().copied());
+        (SourceCursor::full(self.open_cursor(cut, read | walked)), Some(r))
     }
-    (SourceCursor::Full(table.open_cursor(cut)), Some(r))
 }
 
 /// Every live row of `keys`, a strictly ascending list of whole PKs of
 /// `schema`, probed from `table`, whose every key nets 0 or 1, at weight 1 and
-/// in the [`project_schema`] layout of `cols`: the PK, then the payload columns
-/// `cols` names. The probe reads the rows `Cut::Now` reads. `Err` where
-/// `project_schema` refuses `cols`.
-fn project_unique(table: &Table, schema: &SchemaDescriptor, keys: &PkKeys, cols: &[u32]) -> Result<Batch, String> {
+/// in `out_schema`, the [`project_schema`] layout of `cols`: the PK, then the
+/// payload columns `cols` names. The probe reads the rows `Cut::Now` reads.
+fn project_unique(
+    table: &Table,
+    schema: &SchemaDescriptor,
+    keys: &PkKeys,
+    cols: &[u32],
+    out_schema: &SchemaDescriptor,
+) -> Batch {
     debug_assert_eq!(keys.stride(), schema.pk_stride());
-    let out_schema = project_schema(schema, cols)?;
     let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
-    let mut out = Batch::with_capacity(&out_schema, keys.len());
+    let mut out = Batch::with_capacity(out_schema, keys.len());
     for stored in keys.iter().filter_map(|k| table.unique_live_row_at(k)) {
         let (src, row) = stored.source();
         out.append_projected_row(&locs, src, row, 1);
     }
     // One row per key, in ascending key order.
     out.certify_consolidated();
-    Ok(out)
+    out
 }
 
 #[cfg(test)]

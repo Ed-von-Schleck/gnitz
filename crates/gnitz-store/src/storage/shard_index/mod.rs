@@ -66,7 +66,10 @@ impl ShardIndex {
     /// The tree's shape as counts: L0 shards, then L1's and the terminal level's
     /// guards.
     pub(crate) fn level_shape(&self) -> (usize, [usize; 2]) {
-        (self.l0.len(), [L1, TERMINAL].map(|l| self.levels[l].guards.len()))
+        (
+            self.sealed_l0().len(),
+            [L1, TERMINAL].map(|l| self.levels[l].guards.len()),
+        )
     }
 }
 
@@ -170,7 +173,7 @@ impl LevelGuard {
     /// Whether this guard's entries can hold a key of `[lo, hi]`.
     fn overlaps(&self, lo: PkBuf, hi: PkBuf) -> bool {
         let (min, max) = self.key_extent();
-        min <= hi && max >= lo
+        pk_ranges_overlap(min.pk_bytes(), max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes())
     }
 
     /// The key span this guard's entries actually cover. The guard *key* is only
@@ -241,7 +244,7 @@ impl FLSMLevel {
     /// The guard owning `key`: the last one `≤ key`, or 0 below the first — and
     /// 0 on an empty level, which callers bound against `guards.len()`.
     fn slot(&self, key: &[u8]) -> usize {
-        // A lone guard owns the whole key line, whatever its key.
+        // A lone guard owns the whole key line, whatever its key: no compare.
         if self.guards.len() <= 1 {
             return 0;
         }
@@ -250,7 +253,7 @@ impl FLSMLevel {
 
     /// The guards overlapping `[range_min, range_max]`: a contiguous run,
     /// because guards partition the key line.
-    fn find_guards_for_range(&self, range_min: &[u8], range_max: &[u8]) -> std::ops::Range<usize> {
+    fn find_guards_for_range(&self, range_min: &[u8], range_max: &[u8]) -> Range<usize> {
         self.slot(range_min)..(self.slot(range_max) + 1).min(self.guards.len())
     }
 
@@ -283,14 +286,16 @@ pub(super) struct ShardIndex {
     pub(super) dir: StoreDir,
     pub(super) schema: SchemaDescriptor,
 
-    /// L0: spills as they arrive, oldest first, whose key spans overlap. Folded
-    /// down into L1 whole, never in place.
+    /// L0: shards as they arrive, oldest first, whose key spans overlap. All
+    /// but the last [`Self::pending`] are under the store's cut and fold down
+    /// into L1 whole, never in place.
     l0: Vec<ShardEntry>,
+    /// How many of `l0`'s last shards a flush wrote of rows above the cut:
+    /// read by every reader but one at the cut and folded with nothing, until
+    /// [`Self::seal_pending`] moves the cut past them. A reopen finds every
+    /// shard of L0 under it.
+    pending: usize,
     levels: [FLSMLevel; LEVELS],
-    /// Shards a flush wrote of rows above the store's cut: read by every reader
-    /// but one at the cut, compacted with nothing, and entered into L0 by
-    /// [`Self::seal_pending`]. A reopen finds them in L0.
-    pending: Vec<ShardEntry>,
 
     /// `R`, the unit every byte target is stated in: the running max of the
     /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of
@@ -373,8 +378,8 @@ impl ShardIndex {
             dir,
             schema,
             l0: Vec::new(),
+            pending: 0,
             levels: Default::default(),
-            pending: Vec::new(),
             l0_run_bytes: shards.run_bytes.max(MIN_GUARD_BYTES),
             capacity,
             // A rederived store's shards carry no PK filter: nothing probes it by PK.
@@ -412,8 +417,7 @@ impl ShardIndex {
     }
 
     /// The shard set this index publishes: L0 at level 0 under no guard, then
-    /// each guarded level below it. Pending shards go in at level 0, so a
-    /// reopen finds them in L0.
+    /// each guarded level below it, pending shards included.
     pub(super) fn shard_set(&self) -> ShardSet {
         let entry = |level, guard_key, e: &ShardEntry| ManifestEntry {
             seq: e.seq,
@@ -422,7 +426,7 @@ impl ShardIndex {
             guard_key,
         };
         let whole = PkBuf::zeroed(self.schema.pk_stride());
-        let l0 = (self.l0.iter()).chain(&self.pending).map(|e| entry(0, whole, e));
+        let l0 = self.l0.iter().map(|e| entry(0, whole, e));
         let guarded = (1u64..).zip(&self.levels).flat_map(|(level, l)| {
             (l.guards.iter()).flat_map(move |g| g.entries.iter().map(move |e| entry(level, g.guard_key, e)))
         });

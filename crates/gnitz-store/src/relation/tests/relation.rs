@@ -66,7 +66,7 @@ fn only_a_store_naming_one_row_per_key_admits_an_index() {
     for (id, (kind, pk_repeats, want)) in (70..).zip(owners) {
         let spec = RelationSpec { pk_repeats, ..spec(id, kind, schema) };
         registry.register(spec, schema).unwrap();
-        let verdict = |unique| registry.index_owner(id, unique).map(drop);
+        let verdict = |unique| registry.relation_or_err(id)?.admit_index(unique);
         match want {
             Ok(unique_too) => {
                 assert!(verdict(false).is_ok(), "{kind:?}");

@@ -15,6 +15,7 @@ use gnitz_wire::{
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
+use std::rc::Rc;
 
 /// Relation `id`, a `kind` over `schema` placed by its full PK.
 pub fn full_pk_spec(id: u64, kind: RelationKind, schema: &SchemaDescriptor) -> RelationSpec {
@@ -96,7 +97,7 @@ pub fn fk_def_on_delete(
 }
 
 /// Every row of `tid` under `bound`, in the relation's own layout.
-pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBound) -> gnitz_store::read::ReadRows {
+pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBound) -> Rc<Batch> {
     let schema = engine
         .registry
         .relation(tid)
@@ -108,7 +109,7 @@ pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBo
 }
 
 /// Every row of `tid`.
-pub fn scan_all(engine: &mut CatalogEngine, tid: u64) -> gnitz_store::read::ReadRows {
+pub fn scan_all(engine: &mut CatalogEngine, tid: u64) -> Rc<Batch> {
     read_rows(engine, tid, gnitz_wire::ReadBound::None)
 }
 

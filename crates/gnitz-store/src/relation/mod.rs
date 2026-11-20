@@ -15,6 +15,7 @@ use gnitz_trace::runs::{PkSetGather, ReadCursor, StorageError, StoredRow};
 use gnitz_wire::{PkColList, PkKeys, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
+use std::rc::Rc;
 
 mod build;
 mod circuit_state;
@@ -31,6 +32,7 @@ pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub use dirs::{ChildAddr, ChildKind, DirLock, lock_data_dir, relation_dir};
 pub use disk_usage::{DiskUsage, disk_usage};
 use feed::Feed;
+pub use ingest::Landing;
 pub use snapshot::Snapshot;
 use store::{Rows, not_held};
 pub use unique_pk::PkRule;
@@ -78,8 +80,6 @@ pub struct SecondaryIndex {
     key_spec: KeySpec,
     /// Every holder of this circuit.
     claims: Vec<IndexClaim>,
-    /// Whether `cols` covers the owner's PK, so the index can never collide.
-    covers_pk: bool,
 }
 
 impl SecondaryIndex {
@@ -374,7 +374,7 @@ impl Relation {
     }
 
     /// `Ok` iff this relation may carry a secondary index, `unique` or not.
-    fn admit_index(&self, unique: bool) -> Result<(), String> {
+    pub fn admit_index(&self, unique: bool) -> Result<(), String> {
         let (id, kind) = (self.id(), self.kind());
         if !kind.admits_index() {
             return Err(format!(
@@ -416,7 +416,10 @@ impl Relation {
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> {
-        self.indexes.iter().filter(|ic| ic.is_unique() && !ic.covers_pk)
+        let schema = self.rows.schema();
+        self.indexes
+            .iter()
+            .filter(move |ic| ic.is_unique() && !schema.covers_pk(ic.cols.as_slice()))
     }
 
     /// Non-compacting cursor over this relation's store.
@@ -450,7 +453,7 @@ impl Relation {
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.
-    pub fn full_scan(&self) -> std::rc::Rc<Batch> {
+    pub fn full_scan(&self) -> Rc<Batch> {
         self.table().full_scan()
     }
 
@@ -700,13 +703,6 @@ impl RelationRegistry {
     /// same by the mutating paths.
     pub fn relation_or_err(&self, id: u64) -> Result<&Relation, String> {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
-    }
-
-    /// `owner`, if it may carry a secondary index, `unique` or not.
-    pub fn index_owner(&self, owner: u64, unique: bool) -> Result<&Relation, String> {
-        let e = self.relation_or_err(owner)?;
-        e.admit_index(unique)?;
-        Ok(e)
     }
 
     /// [`Self::relation_or_err`] as `&mut`.

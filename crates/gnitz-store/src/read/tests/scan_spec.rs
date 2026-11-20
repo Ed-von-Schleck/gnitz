@@ -1,5 +1,4 @@
 use super::*;
-use crate::read::SourceCursor;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
     RelationFixture, TID, batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch, make_schema_u64_i64,
@@ -38,7 +37,7 @@ fn view_with(
 }
 
 /// `spec` over `TID`, replying in the layout its sink produces.
-fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<ReadRows, String> {
+fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
     let layout = layout_of(&r.relation(TID).unwrap().schema(), &spec.sink);
     r.scan_spec(TID, spec, layout, None)
 }
@@ -299,10 +298,11 @@ fn keyed_reads_return_each_named_keys_whole_group() {
             assert_eq!(batch_rows(&got), want, "{bound:?}");
         }
     }
-    let ReadRows::Shared(whole) = run(&r, rows_spec(None, None)).unwrap() else {
-        panic!("a whole read shares the cached snapshot");
-    };
-    assert!(std::rc::Rc::ptr_eq(&whole, &r.relation(TID).unwrap().full_scan()));
+    let whole = run(&r, rows_spec(None, None)).unwrap();
+    assert!(
+        Rc::ptr_eq(&whole, &r.relation(TID).unwrap().full_scan()),
+        "a whole read shares the cached snapshot"
+    );
 }
 
 // ── Index walks ──────────────────────────────────────────────────────
@@ -369,11 +369,7 @@ fn an_index_walk_returns_exactly_its_range() {
     for (col, start, end, walks, want) in walks {
         let bound = col_range(col, start, end);
         let (cursor, _) = r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap();
-        assert_eq!(
-            matches!(cursor, SourceCursor::Keyed { walk: Some(_), .. }),
-            walks,
-            "{bound:?}"
-        );
+        assert_eq!(cursor.walks_index(), walks, "{bound:?}");
         let spec = |cut| ReadSpec {
             bound: bound.clone(),
             ..rows_spec(None, cut)

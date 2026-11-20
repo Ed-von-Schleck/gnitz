@@ -5,6 +5,8 @@ use super::*;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 
+use gnitz_store::relation::{Landing, PkRule};
+
 // ── DAG traversal driver ────────────────────────────────────────────────
 
 /// Whether this process mints the row a global aggregate owes over an empty input: each
@@ -236,7 +238,12 @@ impl TickRun {
         let echo = match dag.passes_through(view) {
             // Its delta reaches its readers in this run.
             true => needed.then_some(out),
-            false => registry.ingest_round(view, out, self.pass.round(), needed)?,
+            false => registry.land(
+                view,
+                out,
+                Landing::Cut { round: self.pass.round(), echo: needed },
+                PkRule::Enforce,
+            )?,
         };
         if let Some(out) = echo {
             match self.outputs.entry(view) {

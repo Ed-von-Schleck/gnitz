@@ -7,7 +7,7 @@
 //! `cd crates && cargo test -p gnitz-store --release unique_pk_bench -- --ignored --nocapture --test-threads=1`
 
 use super::enforce_unique_pk;
-use crate::relation::{PkRule, RelationKind, StoreConfig};
+use crate::relation::{Landing, PkRule, RelationKind, StoreConfig};
 use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
     TID, make_schema_pk_u64_payload_string, make_schema_u64_i64, relation_fixture_with, spec, table_shards,
@@ -163,6 +163,7 @@ fn unique_pk_bench() {
                 };
                 assert_eq!(in_shards(&r), spilled, "{label}: held in shards");
 
+                let landing = tick.map_or(Landing::CUT, |_| Landing::Pending);
                 let (mut enforce, mut write, mut eff_rows) = (0, 0, 0);
                 for (push, b) in (1..).zip(pushes(&schema, per, row)) {
                     let probe = b.clone();
@@ -171,7 +172,7 @@ fn unique_pk_bench() {
                     eff_rows += eff.len() as u64;
                     drop(eff);
                     let ((), w) = counter.measure(|| {
-                        r.ingest_with(TID, b, rule, tick.is_some()).unwrap();
+                        r.land(TID, b, landing, rule).unwrap();
                         if tick.is_some_and(|rows| push * per % rows == 0) {
                             black_box(r.seal(TID).unwrap());
                         }

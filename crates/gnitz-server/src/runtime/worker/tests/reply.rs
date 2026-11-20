@@ -251,11 +251,11 @@ fn a_fitting_reply_is_the_source_batch_verbatim() {
     );
 
     let (mut q, rx) = queue_over(1 << 22);
-    q.reply(route(1, 5), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
+    q.reply(route(1, 5), Ok(Rows::from(Rc::clone(&batch))));
     assert!(q.is_empty(), "the first read of its lease leaves at once");
     // Behind a fault its own lease owes, the same reply waits in the queue.
     q.reply_owed(route(1, 6), Err("boom".into()));
-    q.reply(route(1, 6), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
+    q.reply(route(1, 6), Ok(Rows::from(Rc::clone(&batch))));
     drain(&mut q);
 
     let out = frames(&rx);

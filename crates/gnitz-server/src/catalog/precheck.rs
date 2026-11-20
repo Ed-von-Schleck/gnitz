@@ -735,7 +735,8 @@ impl CatalogEngine {
     /// The owner and column rules of a CREATE INDEX on `owner_id`, `unique` or
     /// not, and the key span they admit.
     pub(crate) fn validate_index_create(&self, owner_id: u64, cols: &[u32], unique: bool) -> Result<KeySpec, String> {
-        let entry = self.registry.index_owner(owner_id, unique)?;
+        let entry = self.registry.relation_or_err(owner_id)?;
+        entry.admit_index(unique)?;
         // A segment drops its rows once its chain is built, and its index would
         // keep their entries.
         if self.dag.chain_of(owner_id) != owner_id {

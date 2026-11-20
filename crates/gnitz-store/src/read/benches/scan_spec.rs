@@ -10,7 +10,6 @@
 use std::hint::black_box;
 
 use super::tests::layout_of;
-use crate::read::SourceCursor;
 use crate::relation::RelationKind;
 use crate::test_support::{RelationFixture, TID};
 use crate::test_support::{
@@ -186,11 +185,7 @@ fn scan_spec_bench() {
     ] {
         let bound = col_range(3, img(0), img(width as i64 - 1));
         let (source, _) = r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap();
-        assert_eq!(
-            matches!(source, SourceCursor::Keyed { walk: Some(_), .. }),
-            walks,
-            "{label}"
-        );
+        assert_eq!(source.walks_index(), walks, "{label}");
         cell(label, &r, ReadSpec::all_rows(bound), width, width);
     }
 

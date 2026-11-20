@@ -6,7 +6,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::relation::{
-    IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StateLayout, StoreConfig,
+    IndexClaim, Landing, PkRule, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StateLayout, StoreConfig,
 };
 use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table};
 use gnitz_expr::LogicalProgram;
@@ -88,6 +88,14 @@ impl std::ops::Deref for RelationFixture {
 impl std::ops::DerefMut for RelationFixture {
     fn deref_mut(&mut self) -> &mut RelationRegistry {
         &mut self.registry
+    }
+}
+
+impl RelationFixture {
+    /// Land `batch` at `TID`'s cut, captured as `round` by its delta feed.
+    pub(crate) fn land_round(&mut self, batch: Batch, round: u64) {
+        let landing = Landing::Cut { round: Some(round), echo: false };
+        self.registry.land(TID, batch, landing, PkRule::Enforce).unwrap();
     }
 }
 

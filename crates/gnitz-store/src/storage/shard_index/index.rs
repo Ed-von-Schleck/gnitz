@@ -68,10 +68,11 @@ impl ShardIndex {
     /// Every shard `cut` reads whose PK extent meets the inclusive `bound`, the
     /// pending ones only at [`Cut::Now`]; `None` takes them all.
     ///
-    /// Newest first: pending, L0, then each level's routed guards, each newest
-    /// first. Every fold keeps that order, as its outputs hold no row older
-    /// than one left above them, and a key lies in one guard per level, so of
-    /// the shards holding a key each is newer than every later one.
+    /// Newest first: L0's shards, pending ones above the rest, then each
+    /// level's routed guards, each newest first. Every fold keeps that order, as
+    /// its outputs hold no row older than one left above them, and a key lies in
+    /// one guard per level, so of the shards holding a key each is newer than
+    /// every later one.
     fn entries(&self, bound: Option<(&[u8], &[u8])>, cut: Cut) -> impl Iterator<Item = &ShardEntry> {
         let levels = self.levels.iter().flat_map(move |level| {
             let guards = match bound {
@@ -80,16 +81,13 @@ impl ShardIndex {
             };
             level.guards[guards].iter().flat_map(|g| g.entries.iter().rev())
         });
-        let pending: &[ShardEntry] = match cut {
-            Cut::Now => &self.pending,
-            Cut::Sealed => &[],
+        let l0 = match cut {
+            Cut::Now => &self.l0[..],
+            Cut::Sealed => self.sealed_l0(),
         };
-        (pending.iter().rev())
-            .chain(self.l0.iter().rev())
-            .chain(levels)
-            .filter(move |e| {
-                bound.is_none_or(|(lo, hi)| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo, hi))
-            })
+        (l0.iter().rev()).chain(levels).filter(move |e| {
+            bound.is_none_or(|(lo, hi)| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo, hi))
+        })
     }
 
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
@@ -102,7 +100,17 @@ impl ShardIndex {
             .levels
             .iter_mut()
             .flat_map(|l| l.guards.iter_mut().flat_map(|g| &mut g.entries));
-        (self.pending.iter_mut()).chain(&mut self.l0).chain(levels)
+        self.l0.iter_mut().chain(levels)
+    }
+
+    /// L0's shards under the cut, the ones its folds read.
+    pub(super) fn sealed_l0(&self) -> &[ShardEntry] {
+        &self.l0[..self.l0.len() - self.pending]
+    }
+
+    /// L0's shards above the cut.
+    fn pending_l0(&self) -> &[ShardEntry] {
+        &self.l0[self.l0.len() - self.pending..]
     }
 
     /// Write `run`, a run spilled into the store, as an unpublished shard named
@@ -144,42 +152,40 @@ impl ShardIndex {
         Some(codebook)
     }
 
-    /// Append `run` to L0 as one unpublished shard: the spill.
+    /// Append `run` to L0 as one unpublished shard under the cut: the spill.
     pub(crate) fn append_l0_run(&mut self, run: &Batch) -> Result<(), StorageError> {
         let entry = self.write_shard(run)?;
-        self.l0.push(entry);
+        self.l0.insert(self.l0.len() - self.pending, entry);
         self.owed = true;
         Ok(())
     }
 
-    /// Write `run`, rows above the store's cut, as one unpublished shard outside
-    /// every level.
+    /// Append `run`, rows above the store's cut, to L0 as one unpublished shard
+    /// above it.
     pub(crate) fn append_pending_run(&mut self, run: &Batch) -> Result<(), StorageError> {
         let entry = self.write_shard(run)?;
-        self.pending.push(entry);
+        self.l0.push(entry);
+        self.pending += 1;
         Ok(())
     }
 
     /// Whether any shard sits above the cut.
     pub(crate) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        self.pending > 0
     }
 
     /// The least key a shard above the cut holds.
     pub(crate) fn pending_least(&self) -> Option<&[u8]> {
-        self.pending.iter().map(|e| e.pk_min.pk_bytes()).min()
+        self.pending_l0().iter().map(|e| e.pk_min.pk_bytes()).min()
     }
 
-    /// Move the cut past every pending shard: each enters L0 as it stands.
-    /// Answers their shards.
+    /// Move the cut past every pending shard. Answers their shards.
     pub(crate) fn seal_pending(&mut self) -> Vec<Rc<MappedShard>> {
-        if self.pending.is_empty() {
-            return Vec::new();
+        let shards: Vec<_> = self.pending_l0().iter().map(|e| Rc::clone(&e.shard)).collect();
+        if !shards.is_empty() {
+            self.pending = 0;
+            self.owed = true;
         }
-        let pending = std::mem::take(&mut self.pending);
-        let shards = pending.iter().map(|e| Rc::clone(&e.shard)).collect();
-        self.l0.extend(pending);
-        self.owed = true;
         shards
     }
 
@@ -248,7 +254,7 @@ impl ShardIndex {
     /// store. They retract from the levels below, so only the fold down brings
     /// them to the guards whose own folds then cancel them.
     fn l0_cancels(&self) -> bool {
-        let retractions: usize = self.l0.iter().map(|e| e.shard.retraction_rows()).sum();
+        let retractions: usize = self.sealed_l0().iter().map(|e| e.shard.retraction_rows()).sum();
         retractions > 0
             && self.cancels(
                 retractions,
@@ -274,7 +280,7 @@ impl ShardIndex {
             "a terminal run enters a store with no fold under way"
         );
         debug_assert!(
-            self.pending.is_empty() && self.l0.is_empty() && self.levels[L1].guards.is_empty(),
+            self.l0.is_empty() && self.levels[L1].guards.is_empty(),
             "a terminal run lands under no newer shard"
         );
         let entry = self.write_shard(run)?;
@@ -323,8 +329,7 @@ impl ShardIndex {
     #[inline]
     pub(crate) fn holding<'s, 'k>(&'s self, key: &'k [u8], filter_key: u64) -> Holding<'s, 'k> {
         Holding {
-            entries: &self.pending,
-            l0: Some(&self.l0),
+            entries: &self.l0,
             levels: &self.levels,
             key,
             filter_key,
@@ -418,7 +423,9 @@ impl ShardIndex {
         // fold first.
         let is_input = |e: &ShardEntry| shards.iter().any(|s| Rc::ptr_eq(s, &e.shard));
         let mut superseded = Vec::with_capacity(shards.len());
-        superseded.extend(self.l0.extract_if(.., |e| is_input(e)));
+        // No fold reads a pending shard, so its inputs lie under the cut.
+        let sealed = self.l0.len() - self.pending;
+        superseded.extend(self.l0.extract_if(..sealed, |e| is_input(e)));
         for level in &mut self.levels {
             for guard in &mut level.guards {
                 superseded.extend(guard.entries.extract_if(.., |e| is_input(e)));
@@ -470,10 +477,10 @@ impl ShardIndex {
     pub(crate) fn clear(&mut self) {
         self.abandon_fold();
         let l0 = std::mem::take(&mut self.l0);
+        self.pending = 0;
         let levels = std::mem::take(&mut self.levels);
         let settled = levels.into_iter().flat_map(|l| l.guards).flat_map(|g| g.entries);
-        let pending = std::mem::take(&mut self.pending);
-        self.retire(l0.into_iter().chain(settled).chain(pending));
+        self.retire(l0.into_iter().chain(settled));
     }
 
     /// The next fold the tree owes, or `None` when it owes none. What costs no
@@ -491,7 +498,7 @@ impl ShardIndex {
             if split.is_some() {
                 return split;
             }
-            if self.l0.len() > L0_COMPACT_THRESHOLD || self.l0_cancels() {
+            if self.sealed_l0().len() > L0_COMPACT_THRESHOLD || self.l0_cancels() {
                 return self.plan_l0_fold();
             }
             let merge = [L1, TERMINAL].into_iter().find_map(|level| self.plan_merge(level));
@@ -528,26 +535,31 @@ impl ShardIndex {
                 }
                 // L1 empty, so only the capacity sweep gets here, over a floor
                 // under the capacity: L0 folds down to be drained next. With L0
-                // empty too, pending shards hold the store over its capacity,
-                // and no fold reaches them.
+                // under the cut empty too, pending shards hold the store over
+                // its capacity, and no fold reaches them.
                 None => return self.plan_l0_fold(),
             }
         }
     }
 
-    /// Total registered bytes of L0.
+    /// Total registered bytes of L0 under the cut.
     fn l0_bytes(&self) -> u64 {
-        self.l0.iter().map(|e| e.shard.file_len()).sum()
+        self.sealed_l0().iter().map(|e| e.shard.file_len()).sum()
     }
 
-    /// All of L0 into L1's guards; `None` while L0 is empty. Observing `R` first
-    /// is what makes the targets reflect the fold this plans.
+    /// All of L0 under the cut into L1's guards; `None` while that is empty.
+    /// Observing `R` first is what makes the targets reflect the fold this plans.
     fn plan_l0_fold(&mut self) -> Option<Fold> {
-        if self.l0.is_empty() {
+        if self.sealed_l0().is_empty() {
             return None;
         }
         self.l0_run_bytes = self.l0_run_bytes.max(self.l0_bytes());
-        Some(Fold::new(CompactionKind::L0Fold, L1, self.l1_guard_keys(), &self.l0))
+        Some(Fold::new(
+            CompactionKind::L0Fold,
+            L1,
+            self.l1_guard_keys(),
+            self.sealed_l0(),
+        ))
     }
 
     /// The largest a guard of `level_idx` is allowed to get: `R`, so no
@@ -624,7 +636,7 @@ impl ShardIndex {
         let guards = &self.levels[L1].guards;
         let top = guards.last().map(|g| g.key_extent().1.max(g.guard_key));
         let (mut above, mut rows, mut fence) = (0, 0, None::<PkBuf>);
-        for e in &self.l0 {
+        for e in self.sealed_l0() {
             let n = e.shard.row_count();
             let first = top.map_or(0, |t| e.shard.pk_rows(t.pk_bytes()).end);
             rows += n;
@@ -775,9 +787,8 @@ impl ShardIndex {
 /// chain, which the per-key probes do not inline.
 pub(crate) struct Holding<'s, 'k> {
     /// The tier being walked, oldest first; its newest unwalked entry is last.
+    /// L0, pending shards included, is the first.
     entries: &'s [ShardEntry],
-    /// L0, until the walk reaches it.
-    l0: Option<&'s [ShardEntry]>,
     /// The levels below, each routed once the walk reaches it.
     levels: &'s [FLSMLevel],
     key: &'k [u8],
@@ -796,14 +807,9 @@ impl<'s> Iterator for Holding<'s, '_> {
                     return Some((&e.shard, rows));
                 }
             }
-            self.entries = match self.l0.take() {
-                Some(l0) => l0,
-                None => {
-                    let (level, rest) = self.levels.split_first()?;
-                    self.levels = rest;
-                    level.guards.get(level.slot(self.key)).map_or(&[], |g| &g.entries)
-                }
-            };
+            let (level, rest) = self.levels.split_first()?;
+            self.levels = rest;
+            self.entries = level.guards.get(level.slot(self.key)).map_or(&[], |g| &g.entries);
         }
     }
 }

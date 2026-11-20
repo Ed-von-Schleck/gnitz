@@ -8,6 +8,7 @@
 //! `GNITZ_CAPTURE_ROUND_ROWS` the round sizes (default `1,100,8192`). A cell
 //! ingests twice the RAM tier plus the budget, so it crosses both.
 
+use crate::relation::{Landing, PkRule};
 use std::hint::black_box;
 
 use crate::relation::RelationKind;
@@ -79,7 +80,15 @@ fn run(counter: &Counter, kind: RelationKind, strings: bool, rounds: u64, per_ro
     for n in 0..rounds {
         let batch = round(&s, strings, n * per_round, per_round);
         instr += counter
-            .measure(|| r.ingest_round(TID, batch, Some(2 + n), false).unwrap())
+            .measure(|| {
+                r.land(
+                    TID,
+                    batch,
+                    Landing::Cut { round: Some(2 + n), echo: false },
+                    PkRule::Enforce,
+                )
+                .unwrap()
+            })
             .1;
     }
     let (w1, b1) = io_written();

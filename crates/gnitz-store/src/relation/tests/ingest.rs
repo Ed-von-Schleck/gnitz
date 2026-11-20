@@ -1,4 +1,4 @@
-use crate::relation::{ChildKind, PkRule, RelationKind};
+use crate::relation::{ChildKind, Landing, PkRule, RelationKind};
 use crate::storage::{read_at, read_intact};
 use crate::test_support::{
     TID, assert_index_holds, id_rows, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
@@ -59,9 +59,15 @@ fn only_the_ephemeral_round_publishes_an_index() {
 fn pending_rows_are_refused_for_a_view() {
     let schema = make_schema_u64_i64();
     let mut registry = relation_fixture(RelationKind::View(ViewBudget::Plain), schema, &[], []);
-    let err = registry
-        .ingest_with(TID, make_batch(&schema, &[(1, 1, 10)]), PkRule::Enforce, true)
-        .unwrap_err();
+    let landed = registry.land(
+        TID,
+        make_batch(&schema, &[(1, 1, 10)]),
+        Landing::Pending,
+        PkRule::Enforce,
+    );
+    let Err(err) = landed else {
+        panic!("a view takes no pending rows")
+    };
     assert!(err.contains("is a view"), "{err}");
     assert!(registry.seal(TID).unwrap().is_none());
 }
@@ -80,11 +86,16 @@ fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
         [rows(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)])],
     );
     registry
-        .ingest_with(TID, rows(&[(1, 1, 11)]), PkRule::Enforce, true)
+        .land(TID, rows(&[(1, 1, 11)]), Landing::Pending, PkRule::Enforce)
         .unwrap();
     // The second upsert of key 1 retracts the pending row, not the stored one.
     registry
-        .ingest_with(TID, rows(&[(1, 1, 12), (2, -1, 20), (4, 1, 40)]), PkRule::Enforce, true)
+        .land(
+            TID,
+            rows(&[(1, 1, 12), (2, -1, 20), (4, 1, 40)]),
+            Landing::Pending,
+            PkRule::Enforce,
+        )
         .unwrap();
     let delta = registry.seal(TID).unwrap().expect("rows sat above the cut");
     assert!(delta.is_consolidated());
@@ -95,7 +106,7 @@ fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
     assert!(registry.seal(TID).unwrap().is_none(), "a seal drains the pending rows");
 
     registry
-        .ingest_with(TID, rows(&[(3, -1, 30)]), PkRule::Enforce, true)
+        .land(TID, rows(&[(3, -1, 30)]), Landing::Pending, PkRule::Enforce)
         .unwrap();
     registry.ingest(TID, rows(&[(5, 1, 50)])).unwrap();
     assert!(

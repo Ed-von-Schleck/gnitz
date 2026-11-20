@@ -2,7 +2,7 @@
 //! layout through the caller's sink → ingest → `fire_hooks`), the undo of a
 //! refused write, what an applied bundle did, and the zone pin.
 
-use gnitz_store::relation::PkRule;
+use gnitz_store::relation::{Landing, PkRule};
 use gnitz_wire::{IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault, payload_u64};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
@@ -98,7 +98,7 @@ impl CatalogEngine {
             let scanned = self.dag.is_scanned(family.id());
             zone.push(ZoneGroup { family, batch, scanned });
             let applied = &zone[zone.len() - 1].batch;
-            self.apply_family(family, applied, false)?;
+            self.apply_family(family, applied, Landing::CUT)?;
         }
         Ok(())
     }
@@ -167,7 +167,7 @@ impl CatalogEngine {
         let undone = zone
             .into_iter()
             .rev()
-            .try_for_each(|g| self.apply_family(g.family, &g.batch.negated(), false));
+            .try_for_each(|g| self.apply_family(g.family, &g.batch.negated(), Landing::CUT));
         Err(match undone {
             Ok(()) => ZoneError::Refused(cause),
             Err(e) => ZoneError::Diverged(format!("DDL refused ({cause}); undoing what it applied failed: {e}")),
@@ -196,16 +196,16 @@ impl CatalogEngine {
         Ok(created)
     }
 
-    /// Ingest one delta, under its family's schema, into its family's store —
-    /// above its cut iff `above` — and fire its hooks.
-    fn apply_family(&mut self, family: SysFamily, batch: &Batch, above: bool) -> Result<(), String> {
+    /// Ingest one delta, under its family's schema, into its family's store
+    /// where `landing` puts it, and fire its hooks.
+    fn apply_family(&mut self, family: SysFamily, batch: &Batch, landing: Landing) -> Result<(), String> {
         debug_assert!(
             *batch.schema() == *family.schema(),
             "a {} delta under another descriptor",
             family.name()
         );
-        let id = family.id();
-        self.registry.ingest_with(id, batch.clone(), PkRule::Enforce, above)?;
+        self.registry
+            .land(family.id(), batch.clone(), landing, PkRule::Enforce)?;
         self.fire_hooks(family, batch)
     }
 
@@ -219,13 +219,22 @@ impl CatalogEngine {
         if !kind.is_ingestion_point() {
             return Err(format!("relation {tid} is a {}, not an ingestion point", kind.noun()));
         }
-        self.registry.ingest_with(tid, batch, rule, self.dag.is_scanned(tid))
+        self.registry.land(tid, batch, self.landing_of(tid), rule).map(drop)
     }
 
     /// Apply one DdlSync group: above the store's cut when a view scans the
     /// family, for the tick the master sends behind the zone.
     pub(crate) fn ddl_sync(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
-        self.apply_family(family, &batch, self.dag.is_scanned(family.id()))
+        self.apply_family(family, &batch, self.landing_of(family.id()))
+    }
+
+    /// Where a worker's write to `id` lands: above the cut while a view scans
+    /// it, for the tick that view is owed; at the cut otherwise.
+    fn landing_of(&self, id: u64) -> Landing {
+        match self.dag.is_scanned(id) {
+            true => Landing::Pending,
+            false => Landing::CUT,
+        }
     }
 
     // -- Applied zone -------------------------------------------------------------

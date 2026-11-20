@@ -4,11 +4,12 @@
 //! for the ring back.
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use crate::runtime::frame::WireMsg;
 use crate::runtime::sal::{KeptRead, Read, ReplyRoute};
 use crate::runtime::w2m::{RequestId, W2mWriter};
-use gnitz_store::read::{KeySpans, ReadRows};
+use gnitz_store::read::KeySpans;
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 
@@ -51,27 +52,30 @@ struct Train {
 }
 
 /// The rows a read answers with.
-// One per reply, so the variants' size is immaterial; boxing the batch would
-// cost every probe an allocation.
+// One per reply, so the variants' size is immaterial.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Rows {
-    /// One batch, cut into frames.
-    Batch(ReadRows),
+    /// One batch, cut into frames: the store's cached snapshot, a feed round as
+    /// it was captured, or one built for this read.
+    Batch(Rc<Batch>),
+    /// A batch built for this read alone, cut into frames. Unboxed, so a probe
+    /// costs no allocation for its reply.
+    Owned(Batch),
     /// Sorted key spans, a chunk at a time; the first empty chunk ends them.
     Spans(Box<KeySpans>),
     /// A read answered with no rows: its train is one empty last frame.
     Nothing,
 }
 
-impl From<ReadRows> for Rows {
-    fn from(rows: ReadRows) -> Self {
+impl From<Rc<Batch>> for Rows {
+    fn from(rows: Rc<Batch>) -> Self {
         Rows::Batch(rows)
     }
 }
 
 impl From<Batch> for Rows {
     fn from(rows: Batch) -> Self {
-        Rows::Batch(ReadRows::Own(rows))
+        Rows::Owned(rows)
     }
 }
 
@@ -100,6 +104,7 @@ impl Train {
                     return w2m.try_send_msg(id, false, &msg).map(|()| true);
                 }
                 Ok(Rows::Batch(batch)) => (&**batch, true),
+                Ok(Rows::Owned(batch)) => (&*batch, true),
                 Ok(Rows::Spans(spans)) => {
                     if self.next_row == spans.chunk().len() {
                         spans.advance();
@@ -129,15 +134,15 @@ impl Train {
 /// `answer` as the one frame of its reply to `route`, when it is one within
 /// `budget`.
 fn whole<'a>(route: &ReplyRoute, answer: &'a Result<Rows, WireFault>, budget: usize) -> Option<WireMsg<'a>> {
-    match answer {
-        Err(fault) => Some(WireMsg::fault(0, fault)),
-        Ok(Rows::Spans(_)) => None,
-        Ok(Rows::Nothing) => Some(WireMsg::train_frame(route.target_id, true, None)),
-        Ok(Rows::Batch(batch)) => {
-            let msg = WireMsg::train_frame(route.target_id, true, batch.wire_whole());
-            (msg.data.is_none() || msg.size() <= budget).then_some(msg)
-        }
-    }
+    let batch: &Batch = match answer {
+        Err(fault) => return Some(WireMsg::fault(0, fault)),
+        Ok(Rows::Spans(_)) => return None,
+        Ok(Rows::Nothing) => return Some(WireMsg::train_frame(route.target_id, true, None)),
+        Ok(Rows::Batch(batch)) => batch,
+        Ok(Rows::Owned(batch)) => batch,
+    };
+    let msg = WireMsg::train_frame(route.target_id, true, batch.wire_whole());
+    (msg.data.is_none() || msg.size() <= budget).then_some(msg)
 }
 
 impl Replies {

@@ -7,8 +7,8 @@
 //! A store's runs are its history in order, so a read may stop short of the
 //! newest: a pending ingest lands in the `pending` run set, above the store's
 //! [`Cut`], and [`Table::seal`] moves the cut past it. A barrier that comes
-//! first writes the pending rows to shards the disk tier holds apart, which a
-//! reader at the cut leaves out.
+//! first writes the pending rows to L0 shards above the cut, which a reader at
+//! the cut leaves out.
 //!
 //! Oldest to newest, the runs are: the shard levels, the RAM tier, the
 //! memtable, then above the cut the pending shards and the `pending` set. Each
@@ -195,9 +195,6 @@ impl Table {
         self.admit(&run);
         let ingested = run.total_bytes();
         self.memtable.push_run(run, &self.shard_index.schema);
-        if self.memtable.is_full() {
-            self.fold_to_ram()?;
-        }
         self.upkeep(ingested)
     }
 
@@ -246,16 +243,17 @@ impl Table {
         };
         // The cut now reads every ingest.
         self.rejudge_live_floor();
-        if self.memtable.is_full() {
-            self.fold_to_ram()?;
-        }
         self.upkeep(delta.as_ref().map_or(0, |delta| delta.total_bytes()))?;
         // Copied only while a heap tier still holds the run.
         Ok(delta.map(Rc::unwrap_or_clone).filter(|delta| !delta.is_empty()))
     }
 
-    /// Pay the disk tier's [upkeep](ShardIndex::upkeep) for `ingested` bytes.
+    /// Fold a full memtable into the RAM tier, then pay the disk tier's
+    /// [upkeep](ShardIndex::upkeep) for `ingested` bytes.
     fn upkeep(&mut self, ingested: usize) -> Result<(), StorageError> {
+        if self.memtable.is_full() {
+            self.fold_to_ram()?;
+        }
         // A read replica of another process's directory must not write into it.
         if self.held_in_ram {
             return Ok(());

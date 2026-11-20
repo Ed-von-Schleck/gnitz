@@ -11,8 +11,11 @@ use gnitz_zset::schema::{SchemaDescriptor, pk_keys};
 use crate::storage::Table;
 
 /// A chunked source of `Batch`es: a whole cursor, or the rows of a key list.
+pub struct SourceCursor<'a>(pub(super) Source<'a>);
+
+/// What backs a [`SourceCursor`].
 // An index walk holds a cursor beside the gather's, so it is boxed.
-pub enum SourceCursor<'a> {
+pub(super) enum Source<'a> {
     Full(ReadCursor),
     /// The rows of a key list, resolved by `gather`: listed whole (`pk IN (…)`)
     /// with no `walk`, or fed a refill at a time by an index range's `walk`.
@@ -23,23 +26,30 @@ pub enum SourceCursor<'a> {
 }
 
 impl<'a> SourceCursor<'a> {
+    /// The rows of `cursor`.
+    pub(super) fn full(cursor: ReadCursor) -> Self {
+        SourceCursor(Source::Full(cursor))
+    }
+
+    /// The rows of the key list `gather` holds.
+    pub(super) fn listed(gather: KeyGather<'a>) -> Self {
+        SourceCursor(Source::Keyed { gather, walk: None })
+    }
+
     /// The walk of `idx` — a secondary-index range, positioned on it and
     /// clamped at its end — gathering each entry's row through `gather`, which
     /// holds no keys yet.
     pub(super) fn index_walk(idx: ReadCursor, gather: KeyGather<'a>) -> Self {
         let walk = IndexWalk { idx, pks: Vec::new() };
-        SourceCursor::Keyed { gather, walk: Some(Box::new(walk)) }
+        SourceCursor(Source::Keyed { gather, walk: Some(Box::new(walk)) })
     }
 }
 
 impl SourceCursor<'_> {
-    /// [`ReadCursor::skip_payload`] on whichever cursor or probe the rows are
-    /// drained from.
-    pub(super) fn skip_payload(&mut self, skip: u64) {
-        match self {
-            SourceCursor::Full(c) => c.skip_payload(skip),
-            SourceCursor::Keyed { gather, .. } => gather.skip_payload(skip),
-        }
+    /// Whether the source walks a secondary index.
+    #[cfg(test)]
+    pub(super) fn walks_index(&self) -> bool {
+        matches!(self.0, Source::Keyed { walk: Some(_), .. })
     }
 
     /// The next non-empty source chunk, or `None` once the source is exhausted.
@@ -68,9 +78,9 @@ impl SourceCursor<'_> {
         filter: &mut RowFilter,
         hydrate: &mut impl FnMut(PkKeys) -> Result<Batch, String>,
     ) -> Result<Option<(Batch, bool)>, String> {
-        let (gather, mut walk) = match self {
-            SourceCursor::Full(c) => return c.drain_hydrated(max_rows, filter, hydrate),
-            SourceCursor::Keyed { gather, walk } => (gather, walk.as_deref_mut()),
+        let (gather, mut walk) = match &mut self.0 {
+            Source::Full(c) => return c.drain_hydrated(max_rows, filter, hydrate),
+            Source::Keyed { gather, walk } => (gather, walk.as_deref_mut()),
         };
         loop {
             let chunk = match gather {
@@ -100,7 +110,7 @@ impl SourceCursor<'_> {
 /// The gather returns every row under an entry's source PK, so the walk is
 /// exact only over rows unique on their PK: a source PK then has one live row
 /// and at most one live index entry.
-pub struct IndexWalk {
+pub(super) struct IndexWalk {
     /// Positioned on the index range and clamped at its end; an entry is a
     /// leading span followed by the source PK.
     idx: ReadCursor,
@@ -134,24 +144,18 @@ impl IndexWalk {
 /// probed key by key from a store whose every key nets 0 or 1.
 // One per keyed read; boxing the merge gather would cost each one an allocation.
 #[allow(clippy::large_enum_variant)]
-pub enum KeyGather<'a> {
+pub(super) enum KeyGather<'a> {
     Merge(PkSetGather),
     Unique(UniqueGather<'a>),
 }
 
 impl<'a> KeyGather<'a> {
     /// A gather of `keys`, whole PKs of `schema`, probed from `table`, whose
-    /// every key nets 0 or 1.
-    pub(super) fn unique(table: &'a Table, schema: SchemaDescriptor, keys: PkKeys) -> Self {
+    /// every key nets 0 or 1, writing the payload columns `skip` names as
+    /// zeroes (see [`ReadCursor::skip_payload`]).
+    pub(super) fn unique(table: &'a Table, schema: SchemaDescriptor, keys: PkKeys, skip: u64) -> Self {
         debug_assert_eq!(keys.stride(), schema.pk_stride());
-        KeyGather::Unique(UniqueGather { table, schema, keys, next: 0, skip: 0 })
-    }
-
-    fn skip_payload(&mut self, skip: u64) {
-        match self {
-            KeyGather::Merge(g) => g.skip_payload(skip),
-            KeyGather::Unique(g) => g.skip = skip,
-        }
+        KeyGather::Unique(UniqueGather { table, schema, keys, next: 0, skip })
     }
 
     fn reload(&mut self, keys: PkKeys) {
@@ -171,7 +175,7 @@ impl<'a> KeyGather<'a> {
 
 /// Every live row of a strictly ascending list of whole keys, one
 /// [`Table::unique_live_row_at`] probe per key.
-pub struct UniqueGather<'a> {
+pub(super) struct UniqueGather<'a> {
     table: &'a Table,
     schema: SchemaDescriptor,
     keys: PkKeys,

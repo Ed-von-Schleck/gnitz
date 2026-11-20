@@ -15,6 +15,7 @@ use gnitz_wire::{PkColList, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
+use std::rc::Rc;
 
 use crate::record::{Feed, MirrorRecord, index_lists};
 
@@ -367,7 +368,7 @@ impl MirrorStore for Mirror {
         let batch = self
             .registry
             .scan_spec(tid, spec, reply_schema.layout().layout_digest(), None)?;
-        Ok(ZSetBatch::of(reply_schema, batch.into_batch()))
+        Ok(ZSetBatch::of(reply_schema, Rc::unwrap_or_clone(batch)))
     }
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
