@@ -12,7 +12,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use crate::names::extract_table_ref;
 use crate::validate::{HonoredClauses, as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses};
-use gnitz_wire::{ColType, ColumnDef};
+use gnitz_wire::{ColType, ColumnDef, ReduceKind};
 use sqlparser::ast::{BinaryOperator, Expr, InTarget, Query, Select, SelectItem};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -365,7 +365,12 @@ fn scalar_leaf(
         id: value.id,
         kind: SubqueryKind::Scalar { ty, count: func == AggFunc::Count },
         rel: RelExpr::project(
-            RelExpr::reduce(ir.rel, group_cols, HirAgg::physical(std::slice::from_ref(&agg))),
+            RelExpr::reduce(
+                ir.rel,
+                group_cols,
+                HirAgg::physical(std::slice::from_ref(&agg)),
+                ReduceKind::Aggregate,
+            ),
             items,
         ),
         correlation: ir.correlation,

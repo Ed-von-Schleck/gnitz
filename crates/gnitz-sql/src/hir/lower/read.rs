@@ -168,7 +168,7 @@ pub(crate) fn lower_read(
     let (lin, shape) = match top.base.as_ref() {
         RelExpr::Unit => return constant(&top, items, order),
         // Everything over the reduce is its HAVING and its finalize projection.
-        RelExpr::Reduce { input, group_cols, aggs } => {
+        RelExpr::Reduce { input, group_cols, aggs, .. } => {
             let lin = linear(input)?;
             let pieces = flat_reduce(&lin, &input.cols(), group_cols, aggs, &top.preds, items, order)?;
             (lin, folded(pieces, false))

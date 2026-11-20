@@ -182,7 +182,9 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
         (true, RelExpr::Join { left, right, kind, on }) => {
             return join::lower_join_view(chain, peeled, [left, right], *kind, on);
         }
-        (true, RelExpr::Reduce { input, group_cols, aggs }) => reduce::lower_reduce(chain, input, group_cols, aggs)?,
+        (true, RelExpr::Reduce { input, group_cols, aggs, kind }) => {
+            reduce::lower_reduce(chain, input, group_cols, aggs, *kind)?
+        }
         (true, RelExpr::Ordered { input, partition, order, op }) => {
             ordered::lower_ordered(chain, input, partition, order, op)?
         }

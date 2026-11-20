@@ -11,7 +11,7 @@ use crate::error::{GnitzSqlError, unsupported_clause};
 use crate::ir::{BExpr, LeafTyping};
 use crate::rules::reject_float_keys;
 use crate::tail::{OrderKey, group_by_target};
-use gnitz_wire::{ColType, ColumnDef};
+use gnitz_wire::{ColType, ColumnDef, ReduceKind};
 use sqlparser::ast::{Expr, GroupByExpr, Select};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -205,7 +205,10 @@ pub(super) fn bind_grouped_suffix(
             None if pre.extra.is_empty() => input,
             None => RelExpr::project(input, pre.items_for(&reads)),
         };
-        RelExpr::filter(RelExpr::reduce(input, group_cols.clone(), phys), having)
+        RelExpr::filter(
+            RelExpr::reduce(input, group_cols.clone(), phys, ReduceKind::Aggregate),
+            having,
+        )
     };
     bind_select_list(cx, select, rel, &grouped, "GROUP BY", order)
 }

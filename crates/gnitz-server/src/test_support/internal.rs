@@ -9,8 +9,8 @@ use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_trace::runs::ReadCursor;
 use gnitz_wire::{
-    CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, PkColList, SchemaTabRow,
-    SysRow, TableProps, TableTabRow, TypeCode, ViewTabRow,
+    CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, PkColList, ReduceKind,
+    SchemaTabRow, SysRow, TableProps, TableTabRow, TypeCode, ViewTabRow,
 };
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -761,7 +761,11 @@ pub fn join_chain_under_a_reduce(engine: &mut CatalogEngine, t: u64, u: u64) -> 
     let reduce = |segment| {
         let mut circuit = Circuit::default();
         let scan = circuit.input_delta(segment, ReadBound::None);
-        circuit.reduce_local(scan, GroupAggs { group_cols: vec![0], aggs: aggs.to_vec() });
+        circuit.reduce(
+            scan,
+            GroupAggs { group_cols: vec![0], aggs: aggs.to_vec() },
+            ReduceKind::Local,
+        );
         circuit
     };
     let join = two_term_join_circuit(t, u, TypeCode::U64);
@@ -827,6 +831,7 @@ pub fn register_count_of(
             group_cols: group_cols.to_vec(),
             aggs: aggs.to_vec(),
         },
+        ReduceKind::Aggregate,
     );
     let view = try_register_view(engine, circuit, name, &cols_of(plan.output_schema()), 0, 0).unwrap();
     (view, plan)

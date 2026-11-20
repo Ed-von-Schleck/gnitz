@@ -12,7 +12,7 @@ use crate::rules::reject_arity;
 
 use gnitz_core::Schema;
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, GroupAggs, JoinKind};
+use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, GroupAggs, JoinKind, ReduceKind};
 use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexSlot, TypeCode};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,11 +41,6 @@ impl OutKey {
             OutKey::PairPk => [true, true],
             OutKey::OuterPk { .. } => [true, false],
         }
-    }
-
-    /// Whether the output needs an exchange onto its own PK.
-    fn exchanged(self) -> bool {
-        matches!(self, OutKey::PairPk | OutKey::OuterPk { owned: false })
     }
 }
 
@@ -128,7 +123,9 @@ pub(super) fn lower_join_view(
         });
     }
     let (node, out) = acc.expect("a join step emits at least one branch");
-    if out_key.exchanged() {
+    // An output keyed by A's PK leading is made on that PK's owner when A's delta
+    // is placed there.
+    if !matches!(out_key, OutKey::JoinKey) && !sides[0].pk_placed {
         cb.shard(node);
     }
     // A join key and a pair PK each identify a matched pair, not a row.
@@ -155,8 +152,19 @@ fn emit_join_inputs(
         spine::open(chain, rels[0], &live[0])?,
         spine::open(chain, rels[1], &live[1])?,
     ];
-    // Each outer row is decided on the worker owning its PK, the output key.
-    let pk_placed = [matches!(out_key, OutKey::OuterPk { owned: true }), false];
+    // Each outer row is decided on the worker owning its PK, the output key. An
+    // INNER step with no equality slot against a side of at most one row — unique
+    // on no columns — keeps the other side's delta on its PK owner: only the
+    // one-row side is broadcast.
+    let unique = [0, 1].map(|i| class.side_unique(rels[i], i));
+    let one_row = match kind == JoinType::Inner && class.eq.is_empty() {
+        true => [unique[1] && !unique[0], unique[0] && !unique[1]],
+        false => [false, false],
+    };
+    let pk_placed = [
+        matches!(out_key, OutKey::OuterPk { owned: true }) || one_row[0],
+        one_row[1],
+    ];
     // The key each side's delta is co-located by ahead of the circuit: its source
     // PK, or the equality slots the sides meet on — broadcast by none.
     let scatter = |spine: &Spine<'_>, i: usize| match pk_placed[i] {
@@ -211,7 +219,7 @@ fn emit_join_inputs(
                 .collect(),
             keep,
             pk_arity,
-            unique: class.side_unique(rels[i], i),
+            unique: unique[i],
             pk_repeats: pk_repeats[i],
             pk_placed: pk_placed[i],
             frame,
@@ -563,9 +571,8 @@ fn emit_band(cb: &mut Circuit, class: &JoinClass, op: RangeRel, kind: JoinType, 
 }
 
 /// A pure-range join, keyed on the range slot alone. Its pair terms integrate
-/// each worker's own slice of them: a whole integral against the broadcast delta would
-/// emit each pair once per worker. A's ν is `A_owned − matched` against the
-/// one-row [`threshold`].
+/// as [`integrals`] places them, or, LEFT, A's owned slice and each worker's own
+/// slice of B. A's ν is `A_owned − matched` against the one-row [`threshold`].
 fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[JoinSide; 2]) -> Vec<Branch> {
     let rel = JoinKind::Range { rel: op };
     let left = match (kind, kind.exists()) {
@@ -585,12 +592,11 @@ fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[Join
     // terms integrate A's owned slice, which its ν subtracts from.
     let reindex_a = range_keyed(cb, &sides[0]);
     let owned = left.then(|| own_a(cb, &sides[0]));
-    let int_a = match owned {
-        Some((_, int_a)) => int_a,
-        None => cb.shard(reindex_a),
-    };
     let reindex_b = range_keyed(cb, &sides[1]);
-    let int_b = cb.shard(reindex_b);
+    let [int_a, int_b] = match owned {
+        Some((_, int_a)) => [int_a, cb.shard(reindex_b)],
+        None => integrals(cb, sides, [reindex_a, reindex_b]),
+    };
     let merged = cb.join([reindex_a, reindex_b], [int_a, int_b], rel);
     let pairs = rekey_pinned(cb, merged, 1, sides);
     let Some((owned, int_a)) = owned else {
@@ -600,6 +606,19 @@ fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[Join
     let nu_a = cb.difference(owned, matched);
     let branch = emit_range_null_fill_tail(cb, sides, nu_a, 0);
     vec![(cb.union(branch, pairs), None)]
+}
+
+/// The integrals an INNER keyless or pure-range step pairs each side's delta
+/// against. Both deltas broadcast, each worker pairs against its own slice of
+/// the other side, so every pair is made once. With one side placed by its PK —
+/// the other then a broadcast side of at most one row — each side integrates its
+/// delta where it lands: the one row whole on every worker, the placed side on
+/// its PK owner, which pairs each match once with neither exchanged.
+fn integrals(cb: &mut Circuit, sides: &[JoinSide; 2], [a, b]: [NodeId; 2]) -> [NodeId; 2] {
+    match sides.iter().any(|s| s.pk_placed) {
+        true => [a, b],
+        false => [cb.shard(a), cb.shard(b)],
+    }
 }
 
 /// `side`'s input re-keyed onto a range join's key, NULL keys dropped.
@@ -628,7 +647,7 @@ fn threshold(cb: &mut Circuit, side_a: &JoinSide, reindex_b: NodeId, int_a: Node
         ],
     };
     // [_group_pk:U128, m:Tc, count]
-    let red = cb.reduce_local(keys, agg);
+    let red = cb.reduce(keys, agg, ReduceKind::Local);
     // `m` is a MIN/MAX of B's non-NULL range keys, so never NULL, and is typed as
     // the range pair's common type, which A's range key also carries.
     let reindex_m = cb.map_reindex(red, &[(1, side_a.key[0].1)], &[], NullKeys::Keep);
@@ -663,13 +682,11 @@ fn own_a(cb: &mut Circuit, side: &JoinSide) -> (NodeId, NodeId) {
 // ── Cross emission ──────────────────────────────────────────────────────────────
 
 /// The keyless join `A × B`, INNER only. Each side is keyed on its own source PK,
-/// which takes no part in the match — it only partitions the integral the
-/// broadcast delta is paired against.
+/// which takes no part in the match; its integrals are placed by [`integrals`].
 fn emit_cross(cb: &mut Circuit, sides: &[JoinSide; 2]) -> Vec<Branch> {
     let reindex_a = rekey_on_source_pk(cb, &sides[0]);
     let reindex_b = rekey_on_source_pk(cb, &sides[1]);
-    let int_a = cb.shard(reindex_a);
-    let int_b = cb.shard(reindex_b);
+    let [int_a, int_b] = integrals(cb, sides, [reindex_a, reindex_b]);
     // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
     // so both terms already share one schema.
     let inner = cb.join([reindex_a, reindex_b], [int_a, int_b], JoinKind::Cross);

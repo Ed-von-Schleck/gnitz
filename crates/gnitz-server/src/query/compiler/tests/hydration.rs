@@ -3,7 +3,7 @@ use crate::query::compiler::fixtures::{
     Build, Source, compile, count_by, predicate, rejection, scan, sources, tables_at,
 };
 use crate::test_support::{make_schema_u64_i64, map_copy, reindexed_on_col1};
-use gnitz_wire::{Circuit, JoinKind, TypeCode};
+use gnitz_wire::{Circuit, JoinKind, ReduceKind, TypeCode};
 use gnitz_zset::algebra::Slot;
 
 /// Every broken clause of the two-term form, and every other shape, is refused.
@@ -36,7 +36,7 @@ fn a_shape_outside_the_equation_is_refused() {
         }),
         ("a reduce as the output", |c| {
             let a = scan(c, 1);
-            c.reduce_local(a, count_by(&[0]));
+            c.reduce(a, count_by(&[0]), ReduceKind::Local);
         }),
     ];
     for (why, build) in cases {

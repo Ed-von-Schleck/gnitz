@@ -66,6 +66,22 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// Where an [`OpNode::Reduce`] reads its input from, and what it owes an
+    /// input with no row. Wire values are stable.
+    pub enum ReduceKind: u8 {
+        /// SQL's aggregate: over its input co-located by its group columns, and
+        /// over no group columns one row even over an empty input.
+        Aggregate = 0,
+        /// Each worker's slice of its input as that worker holds it, one row per
+        /// group the slice has.
+        Local = 1,
+        /// Over its input co-located by its group columns, one row per group the
+        /// input has: over no group columns, one row while the input has any.
+        Groups = 2,
+    }
+}
+
 impl RangeRel {
     /// The order-reversing converse: `x OP y` ⟺ `y OP.converse() x`.
     pub fn converse(self) -> RangeRel {
@@ -168,13 +184,11 @@ pub enum OpNode {
     Negate,
     Union,
     WeightClamp(ClampKind),
-    /// Aggregates its input co-located by its group columns, or, `local`, each
-    /// worker's slice of it as that worker holds it. Over no group columns it
-    /// aggregates the whole relation and owes one row over an empty input; a
-    /// `local` one owes none. Carries a `Count`; a reduce without one is refused.
+    /// Aggregates its input as `kind` places it; over no group columns, the
+    /// whole of it. Carries a `Count`; a reduce without one is refused.
     Reduce {
         group: GroupAggs,
-        local: bool,
+        kind: ReduceKind,
     },
     /// The bilinear join of SQL sides A and B over slots `[ΔA, ΔB, iA, iB]`:
     /// `ΔA ⋈ z⁻¹(I(iB)) + ΔB ⋈ z⁻¹(I(iA))`, written `[key, A payload…, B
@@ -218,16 +232,17 @@ pub enum OpNode {
 impl OpNode {
     /// The operator moves its input's rows between workers before it reads them.
     pub fn exchanges(&self) -> bool {
-        matches!(
-            self,
-            OpNode::ExchangeShard | OpNode::Reduce { local: false, .. } | OpNode::TopN { .. } | OpNode::Window { .. }
-        )
+        match self {
+            OpNode::ExchangeShard | OpNode::TopN { .. } | OpNode::Window { .. } => true,
+            OpNode::Reduce { kind, .. } => *kind != ReduceKind::Local,
+            _ => false,
+        }
     }
 
-    /// A reduce that owes a row over an empty input: one over no group columns
-    /// that is not `local`.
+    /// A reduce that owes a row over an empty input: an aggregate over no group
+    /// columns.
     pub fn owes_ground_row(&self) -> bool {
-        matches!(self, OpNode::Reduce { group, local: false } if group.group_cols.is_empty())
+        matches!(self, OpNode::Reduce { group, kind: ReduceKind::Aggregate } if group.group_cols.is_empty())
     }
 
     /// How many input slots this operator is wired on.
@@ -291,7 +306,7 @@ impl OpNode {
             OpNode::Union => w.put(&Opcode::Union),
             OpNode::WeightClamp(ClampKind::Distinct) => w.put(&Opcode::Distinct),
             OpNode::WeightClamp(ClampKind::PositivePart) => w.put(&Opcode::PositivePart),
-            OpNode::Reduce { group, local } => w.put(&Opcode::Reduce).bool(*local).put(group),
+            OpNode::Reduce { group, kind } => w.put(&Opcode::Reduce).put(kind).put(group),
             OpNode::Join(kind) => match kind {
                 JoinKind::Equi => w.put(&Opcode::JoinEqui),
                 JoinKind::Range { rel } => w.put(&Opcode::JoinRange).put(rel),
@@ -339,8 +354,8 @@ impl OpNode {
             Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
             Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
             Opcode::Reduce => {
-                let local = r.bool()?;
-                OpNode::Reduce { group: r.get()?, local }
+                let kind = r.get()?;
+                OpNode::Reduce { group: r.get()?, kind }
             }
             Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
             Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: r.get()? }),
@@ -613,16 +628,9 @@ impl Circuit {
         self.add(OpNode::Join(kind), &[da, db, ia, ib])
     }
 
-    /// [`OpNode::Reduce`] over `input` co-located by its group columns. Over no
-    /// group columns it owes a row over an empty input.
-    pub fn reduce(&mut self, input: NodeId, group: GroupAggs) -> NodeId {
-        self.add(OpNode::Reduce { group, local: false }, &[input])
-    }
-
-    /// A `local` [`OpNode::Reduce`]: it aggregates `input` as each worker holds
-    /// it, and emits nothing over an empty input.
-    pub fn reduce_local(&mut self, input: NodeId, group: GroupAggs) -> NodeId {
-        self.add(OpNode::Reduce { group, local: true }, &[input])
+    /// [`OpNode::Reduce`] of `kind` over `input`.
+    pub fn reduce(&mut self, input: NodeId, group: GroupAggs, kind: ReduceKind) -> NodeId {
+        self.add(OpNode::Reduce { group, kind }, &[input])
     }
 
     /// [`OpNode::TopN`].

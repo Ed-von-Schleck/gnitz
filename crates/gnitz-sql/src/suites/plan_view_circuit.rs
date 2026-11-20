@@ -239,7 +239,16 @@ const SHAPES: &[Row] = &[
     // Segments: a subquery and a grouped join side cut; a CTE or derived table
     // over one relation, a computed group key and a projection over a join do not.
     ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1), (NullExtend, 1)]),
-    ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[PK, PK, PK, Some(&[])], &[(RangeJoin, 1), (Reduce, 1), (GlobalGround, 1)]),
+    // Against a side of at most one row, the other side stays on its PK owner: only
+    // the one-row side is broadcast, and neither integral is exchanged. Every pair
+    // is made on the owner of its left PK, so a one-row right side needs no output
+    // exchange either.
+    ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[Some(&[])], &[(RangeJoin, 1), (Reduce, 1), (GlobalGround, 1)]),
+    // A window's partition exists only while it holds a row, so its reduce owes
+    // no ground row.
+    ("SELECT a.id, SUM(a.v) OVER () AS s FROM a", 2, &[Some(&[])], &[(CrossJoin, 1), (Reduce, 1)]),
+    ("SELECT a.id AS aid, s.m FROM a CROSS JOIN (SELECT MAX(w) AS m FROM b) s", 2, &[Some(&[])], &[(CrossJoin, 1), (Reduce, 1), (GlobalGround, 1)]),
+    ("SELECT s.m, a.id AS aid FROM (SELECT MAX(w) AS m FROM b) s CROSS JOIN a", 2, &[PK, Some(&[])], &[(CrossJoin, 1), (Reduce, 1), (GlobalGround, 1)]),
     ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 1, &[], &[(Filter, 1)]),
     ("WITH c AS (SELECT id, v FROM t WHERE v > 1) SELECT id FROM c", 1, &[], &[(Filter, 1)]),
@@ -508,9 +517,9 @@ const B: u64 = 19;
 
 /// A side states the slots its delta is routed by, in its source's own columns:
 /// an equi join's whole key, a band's equality prefix, none for a pure range or
-/// a cross join — and the whole
-/// source PK for the outer side of an EXISTS over a pure range, which is owned
-/// before it is joined.
+/// a cross join — and the whole source PK for the outer side of an EXISTS over a
+/// pure range, which is owned before it is joined, and for a side against one of
+/// at most one row, which alone is broadcast, on whichever side it sits.
 #[test]
 fn a_join_side_states_the_slots_its_delta_is_routed_by() {
     let cat = cat();
@@ -526,16 +535,18 @@ fn a_join_side_states_the_slots_its_delta_is_routed_by() {
         // A derived side whose `Map` moves the key off its source slot.
         ("SELECT x.k AS k, x.s AS s, b.w FROM (SELECT v + 1 AS s, k FROM a) x JOIN b ON x.k = b.k", &[1], &[1]),
         ("SELECT x.k AS k, x.k2 AS k2, b.w FROM (SELECT k, k AS k2 FROM a) x JOIN b ON x.k2 = b.k", &[1], &[1]),
+        // The one-row side reads a segment of `b`.
+        ("SELECT s.m, a.id AS aid FROM (SELECT MAX(w) AS m FROM b) s CROSS JOIN a", &[0], &[]),
+        ("SELECT s.m, a.id AS aid FROM (SELECT MAX(w) AS m FROM b) s JOIN a ON s.m > a.v", &[0], &[]),
+        ("SELECT a.id AS aid, s.m FROM a CROSS JOIN (SELECT MAX(w) AS m FROM b) s", &[0], &[]),
+        ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", &[0], &[]),
     ];
-    for &(body, a, b) in rows {
+    for &(body, a, other) in rows {
         let keys = scatter_keys(&view(&cat, body));
-        for (source, want) in [(A, a), (B, b)] {
-            let stated: Vec<&[u32]> = keys.iter().filter(|k| k.0 == source).map(|k| k.1.as_slice()).collect();
-            assert!(!stated.is_empty(), "`{body}`: source {source} states no key");
-            assert!(
-                stated.iter().all(|s| *s == want),
-                "`{body}`: source {source} states {stated:?}"
-            );
+        let (on_a, on_other): (Vec<_>, Vec<_>) = keys.iter().partition(|k| k.0 == A);
+        for (side, stated, want) in [("a", on_a, a), ("the other side", on_other, other)] {
+            assert!(!stated.is_empty(), "`{body}`: {side} states no key");
+            assert!(stated.iter().all(|k| k.1 == want), "`{body}`: {side} states {stated:?}");
         }
     }
 }

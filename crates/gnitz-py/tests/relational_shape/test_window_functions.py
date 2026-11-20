@@ -340,3 +340,31 @@ def test_a_window_over_a_bag_weighs_every_copy(client):
         t = _over(f, "SUM", "a")
         assert bag(scanned(client, "w"), "k", "a", "r", "d", "t", "c") == {
             (*ka, f[ka][0], f[ka][1], t[ka], len(f[ka][2])): w for ka, w in copies.items()}, sql
+
+
+def test_an_unpartitioned_aggregate_over_a_not_null_argument_is_never_null(client):
+    """`SUM`, `MIN`, `MAX` and `AVG` over the whole of a NOT NULL column are
+    declared NOT NULL: every row's frame holds the row itself. The views exist
+    before the table holds a row, so each value is computed incrementally as the
+    table fills, empties and fills again — never read off an empty input."""
+    funcs = {"s": "SUM", "mn": "MIN", "mx": "MAX", "av": "AVG"}
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        + "; ".join(f"CREATE VIEW w_{c} AS SELECT a.id AS aid, a.v, {f}(a.v) OVER () AS {c} FROM a"
+                    for c, f in funcs.items()))
+    for c in funcs:
+        assert not next(d for d in client.resolve_table(f"w_{c}")[1].columns if d.name == c).is_nullable, c
+
+    state = {"a": {}}
+    for sql in churn(client, state, [
+        inserting("a", {1: 5, 2: 7}),
+        inserting("a", {3: -2}),
+        ("UPDATE a SET v = 40 WHERE id = 1", "a", {1: 40}),
+        ("DELETE FROM a WHERE id = 2", "a", {2: None}),
+        ("DELETE FROM a", "a", {1: None, 3: None}),
+        inserting("a", {4: 9}),
+    ]):
+        vals = list(state["a"].values())
+        for c, f in funcs.items():
+            assert bag(scanned(client, f"w_{c}"), "aid", "v", c) == {
+                (i, v, agg(f, vals)): 1 for i, v in state["a"].items()}, (sql, c)

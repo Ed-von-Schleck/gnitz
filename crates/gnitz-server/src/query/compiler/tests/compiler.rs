@@ -5,7 +5,7 @@ use crate::test_support::{
     identity_circuit, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, pk_payload_schema,
     u64_pk_schema,
 };
-use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, OrderKey, ReadBound, TypeCode, WeightSlots};
+use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, OrderKey, ReadBound, ReduceKind, TypeCode, WeightSlots};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
 
@@ -59,8 +59,8 @@ fn global(op: AggFunc) -> GroupAggs {
     }
 }
 
-const SUM: Stage = |c, a| c.reduce(a, global(AggFunc::Sum));
-const MIN: Stage = |c, a| c.reduce(a, global(AggFunc::Min));
+const SUM: Stage = |c, a| c.reduce(a, global(AggFunc::Sum), ReduceKind::Aggregate);
+const MIN: Stage = |c, a| c.reduce(a, global(AggFunc::Min), ReduceKind::Aggregate);
 const TOP_N: Stage = |c, a| c.top_n(a, &[], &BY_COL1, WeightSlots { skip: 5, keep: 10 });
 const WINDOW: Stage = |c, a| {
     c.window(
@@ -71,7 +71,7 @@ const WINDOW: Stage = |c, a| {
     )
 };
 /// A reduce of each worker's slice.
-const LOCAL_SUM: Stage = |c, a| c.reduce_local(a, global(AggFunc::Sum));
+const LOCAL_SUM: Stage = |c, a| c.reduce(a, global(AggFunc::Sum), ReduceKind::Local);
 
 /// `build` over a scan of 10, compiled as worker `slot` into the view its
 /// unsplit, one-worker plan outputs: a split plan must write that layout too.

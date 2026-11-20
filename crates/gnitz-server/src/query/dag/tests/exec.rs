@@ -10,7 +10,7 @@ use crate::test_support::{
 };
 use gnitz_store::relation::{Landing, PkRule};
 use gnitz_trace::stream::ReducePlan;
-use gnitz_wire::{Circuit, ReadBound, TypeCode};
+use gnitz_wire::{Circuit, ReadBound, ReduceKind, TypeCode};
 use std::collections::HashMap;
 
 /// The views of [`engine_with_views`], each holding a multiple of the base's
@@ -546,6 +546,7 @@ fn a_segment_ground_row_reaches_its_head() {
             group_cols: vec![],
             aggs: vec![gnitz_wire::AggDescriptor::COUNT_STAR],
         },
+        ReduceKind::Aggregate,
     );
     let out = cols_of(plan.output_schema());
     let identity = |segment| crate::test_support::identity_circuit(segment, ReadBound::None);

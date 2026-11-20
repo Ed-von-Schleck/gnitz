@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use gnitz_wire::TypeCode;
+use gnitz_wire::{ReduceKind, TypeCode};
 
 /// Per-view circuit metadata, derived from one circuit load: every worker routes
 /// its own partitions by it, so no two workers can route one round differently.
@@ -399,16 +399,16 @@ pub(super) fn node_dist(
         }
         OpNode::Union => dists[inputs[0]].common(&dists[inputs[1]])?,
         OpNode::Join(kind) => join_dist(*kind, inputs, dists, &schema, &out)?,
-        // An exchange leaves each row on the owner of the key it scatters by,
-        // the PK its operator emits, wherever its input sat.
-        OpNode::ExchangeShard | OpNode::Reduce { local: false, .. } | OpNode::TopN { .. } | OpNode::Window { .. } => {
-            Dist::on(&pk_slots(&out, out.pk_cols().len()))
-        }
         // A local reduce aggregates each worker's slice as it holds it.
-        OpNode::Reduce { local: true, .. } => match unary() {
+        OpNode::Reduce { kind: ReduceKind::Local, .. } => match unary() {
             Dist::Whole => Dist::Whole,
             _ => Dist::Anywhere,
         },
+        // An exchange leaves each row on the owner of the key it scatters by,
+        // the PK its operator emits, wherever its input sat.
+        OpNode::ExchangeShard | OpNode::Reduce { .. } | OpNode::TopN { .. } | OpNode::Window { .. } => {
+            Dist::on(&pk_slots(&out, out.pk_cols().len()))
+        }
     })
 }
 

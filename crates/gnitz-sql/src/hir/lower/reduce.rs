@@ -8,7 +8,7 @@ use super::spine::{Top, open};
 use super::{EmitPieces, ReduceSpecs, ViewChain, keyed_frame, project_front, resolve_reduce_specs};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
-use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, Circuit, NodeId};
+use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, Circuit, NodeId, ReduceKind};
 use std::rc::Rc;
 
 /// Lower a `Reduce` of `input` to circuit pieces, whose frame addresses the raw
@@ -18,6 +18,7 @@ pub(super) fn lower_reduce(
     input: &Rc<RelExpr>,
     group_cols: &[ColId],
     aggs: &[AggCol],
+    kind: ReduceKind,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let live: ColSet = reduce_reads(group_cols, aggs).into_iter().collect();
     let spine = open(chain, input, &live)?;
@@ -41,7 +42,7 @@ pub(super) fn lower_reduce(
     }
     let ReduceSpecs { agg, cols } = r;
     let out = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;
-    cb.reduce(node, agg);
+    cb.reduce(node, agg, kind);
     // One row per group key, which the reduce output is keyed on.
     Ok(EmitPieces { circuit: cb, out, pk_repeats: false })
 }

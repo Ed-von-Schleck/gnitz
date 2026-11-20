@@ -13,7 +13,7 @@ use super::*;
 use gnitz_foundation::perf;
 use gnitz_foundation::rng::mix;
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, ReadBound, WeightSlots};
+use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, ReadBound, ReduceKind, WeightSlots};
 
 /// Base rows a table-sourced fixture loads before its view is created.
 const ROWS: u64 = 1_000_000;
@@ -318,6 +318,7 @@ fn minmax_view_tick_bench() {
                 group_cols: group.to_vec(),
                 aggs: aggs.to_vec(),
             },
+            ReduceKind::Aggregate,
         );
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
         let out = *gnitz_trace::stream::ReducePlan::from_wire(&schema, &group, &aggs, false)

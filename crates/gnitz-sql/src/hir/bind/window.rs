@@ -51,7 +51,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
 use crate::rules::{find_unique_column, reject_float_key};
 use crate::tail::{OrderKey, parse_order_key};
-use gnitz_wire::{ColType, ColumnDef, TypeCode, WeightSlots};
+use gnitz_wire::{ColType, ColumnDef, ReduceKind, TypeCode, WeightSlots};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, Select, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowSpec, WindowType,
@@ -718,7 +718,14 @@ fn partition_values(
         };
         values.insert(c.out.id, value);
     }
-    let reduce = RelExpr::reduce(Rc::clone(&wf), keys.clone(), HirAgg::physical(&aggs));
+    // A partition exists only while it holds a row: the join onto it pairs each
+    // row with its own partition's values, so none is owed over no rows.
+    let reduce = RelExpr::reduce(
+        Rc::clone(&wf),
+        keys.clone(),
+        HirAgg::physical(&aggs),
+        ReduceKind::Groups,
+    );
     Ok((reduce, keys))
 }
 

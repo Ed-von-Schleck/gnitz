@@ -4,7 +4,7 @@ use crate::test_support::{
     make_schema_u64_i64, map_copy, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
 };
 use gnitz_foundation::rng::mix;
-use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReadBound, TypeCode};
+use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReadBound, ReduceKind, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
@@ -491,7 +491,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             "a reduce moves each row to its group's owner, whatever placed its source",
             |c| {
                 let a = scan(c, 7);
-                c.reduce(a, count_by(&[3]));
+                c.reduce(a, count_by(&[3]), ReduceKind::Aggregate);
             },
             [clustered.placed(Placement::Local); 2],
             Placement::Keyed { dist_stride: 8 },

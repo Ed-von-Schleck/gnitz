@@ -23,7 +23,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_wire::AggFunc as WireAggFunc;
-use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode, WeightSlots};
+use gnitz_wire::{ColType, ColumnDef, RangeRel, ReduceKind, TypeCode, WeightSlots};
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -313,6 +313,9 @@ pub(crate) enum RelExpr {
         /// `ColId`s of `input`'s columns; an expression key is a `Project` column below.
         group_cols: Vec<ColId>,
         aggs: Vec<AggCol>,
+        /// [`ReduceKind::Aggregate`] for SQL's aggregate, [`ReduceKind::Groups`]
+        /// for one that owes no row over an empty input.
+        kind: ReduceKind,
     },
     /// Every weight of `input` clamped to `[0, 1]`, its element identified by all
     /// its columns, hidden ones included.
@@ -763,8 +766,13 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
-    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<AggCol>) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Reduce { input, group_cols, aggs })
+    pub(crate) fn reduce(
+        input: Rc<RelExpr>,
+        group_cols: Vec<ColId>,
+        aggs: Vec<AggCol>,
+        kind: ReduceKind,
+    ) -> Rc<RelExpr> {
+        Rc::new(RelExpr::Reduce { input, group_cols, aggs, kind })
     }
 
     /// A DISTINCT over every column of `input`, or `input` itself when it is
@@ -953,7 +961,7 @@ impl RelExpr {
                     Cow::Owned(cols)
                 }
             },
-            RelExpr::Reduce { input, group_cols, aggs } => {
+            RelExpr::Reduce { input, group_cols, aggs, .. } => {
                 let in_cols = input.cols();
                 let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
                 cols.extend(aggs.iter().map(|c| c.col.clone()));

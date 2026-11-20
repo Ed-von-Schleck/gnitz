@@ -3,7 +3,7 @@ use crate::query::compiler::fixtures::*;
 use crate::query::vm::Vm;
 use crate::test_support::{make_schema_u64_i64, map_copy, reindexed_on_col1, scan_keyed, self_typed_slots};
 use gnitz_store::relation::RelationKind::{self, BaseTable, Stream};
-use gnitz_wire::{Circuit, JoinKind, ReindexSlot, TypeCode, WeightSlots};
+use gnitz_wire::{Circuit, JoinKind, ReduceKind, ReindexSlot, TypeCode, WeightSlots};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
 
@@ -266,11 +266,15 @@ fn two_joins_probing_one_integrand_share_one_integral() {
 #[test]
 fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
     let cases: [(&str, Stage, bool); 2] = [
-        ("the output", |c, a| c.reduce_local(a, count_by(&[1])), true),
+        (
+            "the output",
+            |c, a| c.reduce(a, count_by(&[1]), ReduceKind::Local),
+            true,
+        ),
         (
             "behind a negate",
             |c, a| {
-                let r = c.reduce_local(a, count_by(&[1]));
+                let r = c.reduce(a, count_by(&[1]), ReduceKind::Local);
                 c.negate(r)
             },
             false,
@@ -368,7 +372,7 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
                 let a = c.negate(a);
                 let a = c.shard(a);
                 let a = c.negate(a);
-                c.reduce(a, count_by(&[1]));
+                c.reduce(a, count_by(&[1]), ReduceKind::Aggregate);
             },
             (1, 1),
         ),
@@ -407,7 +411,7 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
                 let deltas = [7, 9].map(|source| scan_keyed(c, source, &key));
                 c.join(deltas, deltas, JoinKind::Equi);
                 // `scan_keyed` pushed 7's scan first.
-                c.reduce(0, count_by(&[0]));
+                c.reduce(0, count_by(&[0]), ReduceKind::Aggregate);
             },
             (3, 0),
         ),
@@ -506,7 +510,7 @@ fn the_output_exchange_is_skipped_only_where_its_input_sits_by_its_key() {
         let (rounds, _) = relays(4, [source; 2], |c| {
             let a = scan(c, 7);
             let tip = mid(c, a);
-            c.reduce(tip, count_by(group));
+            c.reduce(tip, count_by(group), ReduceKind::Aggregate);
         });
         assert_eq!(rounds == 0, skipped, "{why}");
     }
@@ -664,7 +668,7 @@ fn a_scan_reads_the_columns_its_readers_name() {
             "a reduce's group columns",
             |c| {
                 let a = scan(c, 10);
-                c.reduce(a, count_by(&[4]));
+                c.reduce(a, count_by(&[4]), ReduceKind::Aggregate);
             },
             0b01000,
         ),

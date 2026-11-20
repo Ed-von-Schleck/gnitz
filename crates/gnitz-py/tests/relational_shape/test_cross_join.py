@@ -89,3 +89,65 @@ def test_each_delta_adds_or_retracts_exactly_its_pairs(client):
             (a, b, s, ui, uw): 1 for (a, b), s in c.items() for ui, uw in u.items()}, sql
         assert bag(scanned(client, "g"), "tid", "n", "s") == (
             {(ti, len(u), sum(u.values())): 1 for ti in t} if u else {}), sql
+
+
+# view -> (body, its columns, its rows from (m, a, c)): `m` is b's MAX, None once
+# b is empty, `a` `{id: v}`, `c` a set of ids. The one-row side is the step's left
+# operand.
+_ONE_ROW_LEFT = {
+    "lx": ("SELECT s.m, a.id AS aid FROM (SELECT MAX(w) AS m FROM b) s CROSS JOIN a", ("m", "aid"),
+           lambda m, a, c: [(m, i) for i in a]),
+    "lr": ("SELECT s.m, a.id AS aid FROM (SELECT MAX(w) AS m FROM b) s JOIN a ON s.m > a.v", ("m", "aid"),
+           lambda m, a, c: [(m, i) for i, v in a.items() if m is not None and m > v]),
+    "l3": ("SELECT s.m, a.id AS aid, c.id AS cid FROM (SELECT MAX(w) AS m FROM b) s, a, c", ("m", "aid", "cid"),
+           lambda m, a, c: [(m, i, k) for i in a for k in c]),
+}
+
+
+def test_a_one_row_left_side_pairs_each_row_once(client):
+    """A global aggregate on the left of a keyless or pure-range step is the side
+    of at most one row: it is broadcast whole while the other side's rows stay
+    on their PK's owner. Each view holds every pair exactly once, weight 1, as
+    the other side churns, the aggregate's value moves, and its source empties
+    — its ground row then pairs NULL — and fills again. A copy created after
+    the load, a pure backfill, holds the same rows at the same weights."""
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL); "
+        "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL); "
+        + "; ".join(f"CREATE VIEW {n} AS {body}" for n, (body, _, _) in _ONE_ROW_LEFT.items()))
+
+    def make_twins(client):
+        client.execute_sql("; ".join(f"CREATE VIEW {n}_twin AS {body}" for n, (body, _, _) in _ONE_ROW_LEFT.items()))
+
+    twins = False
+    state = {"a": {}, "b": {}, "c": {}}
+    for sql in churn(client, state, [
+        (None, {}),
+        inserting("a", {1: 3, 2: 8, 3: 5, 4: 12, 5: 0}),
+        inserting("c", {10: 0, 20: 0}),
+        inserting("b", {1: 6, 2: 4}),
+        (make_twins, {}),
+        # The other side churns under a fixed aggregate.
+        inserting("a", {6: 1, 7: 20}),
+        ("DELETE FROM a WHERE id = 2", "a", {2: None}),
+        ("UPDATE a SET v = 2 WHERE id = 4", "a", {4: 2}),
+        # The aggregate's value moves up, then back down.
+        inserting("b", {3: 9}),
+        ("UPDATE b SET w = 1 WHERE id = 3", "b", {3: 1}),
+        ("DELETE FROM b WHERE id = 1", "b", {1: None}),
+        inserting("c", {30: 0}),
+        # Its source empties, then fills again.
+        ("DELETE FROM b", "b", {2: None, 3: None}),
+        inserting("a", {8: 4}),
+        inserting("b", {4: 7}),
+        ("DELETE FROM a WHERE id = 1 OR id = 7", "a", {1: None, 7: None}),
+    ]):
+        twins = twins or sql is make_twins
+        b = state["b"]
+        m = max(b.values()) if b else None
+        for name, (_, cols, rows) in _ONE_ROW_LEFT.items():
+            want = {r: 1 for r in rows(m, state["a"], state["c"])}
+            assert bag(scanned(client, name), *cols) == want, (sql, name)
+            if twins:
+                assert bag(scanned(client, name + "_twin"), *cols) == want, (sql, name + "_twin")

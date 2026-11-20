@@ -24,7 +24,7 @@ fn sample(op: Opcode) -> OpNode {
                     .map(|(i, &agg_op)| AggDescriptor { agg_op, col_idx: i as u32 })
                     .collect(),
             },
-            local: false,
+            kind: ReduceKind::Aggregate,
         },
         Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
         // A non-ascending index column list: `PkColList`'s `PartialEq` spans the
@@ -142,13 +142,6 @@ fn every_op_node_variant_roundtrips() {
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
         // A hash-row target's domain is the copy kernel's, not this decode's.
         OpNode::Map(MapKind::HashRow { cols: vec![(3, TypeCode::U128)] }),
-        OpNode::Reduce {
-            group: GroupAggs {
-                group_cols: vec![],
-                aggs: vec![AggDescriptor::COUNT_STAR],
-            },
-            local: false,
-        },
         // The global shape: no group, one key, no offset.
         OpNode::TopN {
             group_cols: vec![],
@@ -163,9 +156,18 @@ fn every_op_node_variant_roundtrips() {
         }),
     ]);
     // Every join kind on either side, and every relation the range kind can carry
-    // — `Join`'s own sample can only be one of them. Same for the null-extend's
-    // two placements.
+    // — `Join`'s own sample can only be one of them. Same for the reduce's kinds and the
+    // null-extend's two placements.
     nodes.push(OpNode::Join(JoinKind::Cross));
+    for &kind in ReduceKind::ALL {
+        nodes.push(OpNode::Reduce {
+            group: GroupAggs {
+                group_cols: vec![],
+                aggs: vec![AggDescriptor::COUNT_STAR],
+            },
+            kind,
+        });
+    }
     for &rel in RangeRel::ALL {
         nodes.push(OpNode::Join(JoinKind::Range { rel }));
     }
@@ -237,19 +239,19 @@ fn each_decode_guard_rejects_its_own_forgery() {
         type_codes: vec![TypeCode::I64],
         nulls_first: false,
     };
-    // tag 0 | local 1 | group count 2..4 | agg count 4..6 | func 6
+    // tag 0 | kind 1 | group count 2..4 | agg count 4..6 | func 6
     let reduce = OpNode::Reduce {
         group: GroupAggs {
             group_cols: vec![],
             aggs: vec![AggDescriptor::COUNT_STAR],
         },
-        local: false,
+        kind: ReduceKind::Aggregate,
     };
     let cases = [
         (poke(&aux, 1, outside(NullKeys::from_wire)), "unknown NullKeys"),
         (poke(&aux, 8, 0), "unknown TypeCode 0"),
         (poke(&aux, 8, 200), "unknown TypeCode 200"),
-        (poke(&reduce, 1, 2), "boolean byte 2"),
+        (poke(&reduce, 1, outside(ReduceKind::from_wire)), "unknown ReduceKind"),
         (poke(&hash_row, 7, 0), "unknown TypeCode 0"),
         (poke(&null_ext, 4, 200), "unknown TypeCode 200"),
         // tag 0 | rel 1
@@ -320,14 +322,14 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
             group_cols: vec![0],
             aggs: vec![AggDescriptor::COUNT_STAR],
         },
-        local: false,
+        kind: ReduceKind::Aggregate,
     };
     let countless = OpNode::Reduce {
         group: GroupAggs {
             group_cols: vec![0],
             aggs: vec![AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum }],
         },
-        local: false,
+        kind: ReduceKind::Aggregate,
     };
     let keepless = OpNode::TopN {
         group_cols: vec![],
@@ -470,26 +472,27 @@ fn decode_refuses_a_source_scanned_twice() {
     );
 }
 
-/// A reduce is exchanged or each worker's local fold by its builder, and a
-/// group-less exchanged one alone owes its ground row.
+/// A reduce is exchanged unless it is each worker's local fold, and only an
+/// aggregate over no group columns owes its ground row.
 #[test]
-fn the_reduce_builders_differ_in_the_exchange() {
+fn the_reduce_kinds_differ_in_the_exchange_and_the_ground_row() {
     let mut c = Circuit::default();
     let input = c.input_delta(7, crate::ReadBound::None);
     let agg = |group_cols| GroupAggs {
         group_cols,
         aggs: vec![AggDescriptor::COUNT_STAR],
     };
-    let global = c.reduce(input, agg(vec![]));
-    let grouped = c.reduce(input, agg(vec![1]));
-    let local = c.reduce_local(input, agg(vec![]));
+    let global = c.reduce(input, agg(vec![]), ReduceKind::Aggregate);
+    let grouped = c.reduce(input, agg(vec![1]), ReduceKind::Aggregate);
+    let groups = c.reduce(input, agg(vec![]), ReduceKind::Groups);
+    let local = c.reduce(input, agg(vec![]), ReduceKind::Local);
     assert_eq!(
-        [global, grouped, local].map(|id| c.op(id).owes_ground_row()),
-        [true, false, false]
+        [global, grouped, groups, local].map(|id| c.op(id).owes_ground_row()),
+        [true, false, false, false]
     );
     assert_eq!(
-        [global, grouped, local].map(|id| c.op(id).exchanges()),
-        [true, true, false]
+        [global, grouped, groups, local].map(|id| c.op(id).exchanges()),
+        [true, true, true, false]
     );
     assert_eq!(c.inputs(grouped), [input]);
 }
