@@ -15,7 +15,7 @@ use gnitz_foundation::perf::Counter;
 use gnitz_foundation::rng::mix;
 use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
 use gnitz_zset::algebra::copy_columns;
-use gnitz_zset::algebra::{OrderLocator, cmp_order_keys, order_locators};
+use gnitz_zset::algebra::{OrderCol, cmp_order_keys, order_cols};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{ReduceOutSlot, SchemaColumn, SchemaDescriptor, reduce_out_layout};
 
@@ -35,9 +35,9 @@ pub(super) fn ordered_groups(
     rows: &[(Row, i64)],
     group_cols: &[u32],
     keys: &[OrderKey],
-) -> (Batch, Vec<OrderLocator>, Vec<Vec<usize>>) {
+) -> (Batch, Vec<OrderCol>, Vec<Vec<usize>>) {
     let b = batch(rows);
-    let locs = order_locators(keys, &schema(), false).unwrap();
+    let locs = order_cols(keys, &schema(), false).unwrap();
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by(|&x, &y| cmp_order_keys(&locs, &b.as_mem_batch(), x, y));
     let mut groups: BTreeMap<Cells, Vec<usize>> = BTreeMap::new();
@@ -175,7 +175,7 @@ fn a_shape_the_order_index_cannot_hold_is_refused() {
     let err = |r: Result<OrderedPlan, String>| r.err().expect("refused");
     assert!(err(OrderedPlan::top_n(&s, &[], &[], WeightSlots { skip: 0, keep: 1 })).contains("no order keys"));
     let oob = [OrderKey { col: 9, desc: false, nulls_first: false }];
-    assert!(err(OrderedPlan::top_n(&s, &[], &oob, WeightSlots { skip: 0, keep: 1 })).contains("order column"));
+    assert!(err(OrderedPlan::top_n(&s, &[], &oob, WeightSlots { skip: 0, keep: 1 })).contains("order key column"));
 }
 
 /// [`OrderIndex::entries`] a row at a time: each row's lead and every other
@@ -188,10 +188,12 @@ fn entries_by_row(index: &OrderIndex, delta: &Batch) -> Batch {
         0 => None,
         strings => out.carry_heap(&mb, strings, &[(0, n)], 0),
     };
-    let (stride, group) = (index.schema.pk_stride(), index.key_packer.out_stride);
+    let (stride, group) = (index.schema.pk_stride(), index.prefix.width());
     let mut image = Vec::new();
     out.write_rows(n, |w| {
-        index.key_packer.pack_rows(w.pk_mut(), stride, &mb, &[(0, n)]);
+        index
+            .key
+            .write_prefixes(&index.prefix, &mb, &[(0, n)], w.pk_mut(), stride);
         let (keys, cells, blob) = w.pk_and_payload_mut(0..index.images.len());
         let mut cells: Vec<_> = cells.collect();
         for (row, key) in keys.chunks_exact_mut(stride).enumerate() {

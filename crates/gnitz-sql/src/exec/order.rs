@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_wire::{OrderKey, WeightSlots};
-use gnitz_zset::algebra::{OrderLocator, RowRanking, order_locators};
+use gnitz_zset::algebra::{OrderCol, RowRanking, order_cols};
 use gnitz_zset::repr::{Pick, materialize_carrying};
 
 use crate::error::GnitzSqlError;
@@ -17,7 +17,7 @@ pub(crate) struct ResultCut {
     schema: Arc<Schema>,
     /// The written keys, hidden appended ones included; under a cut, extended to a total
     /// order. Empty when unordered.
-    keys: Vec<OrderLocator>,
+    keys: Vec<OrderCol>,
     /// The OFFSET / LIMIT window, cut exactly here after any worker's superset cut.
     slice: WeightSlots,
 }
@@ -29,9 +29,7 @@ impl ResultCut {
         // rows alone. Uncut ties stay in input order.
         let keys = match order.is_empty() {
             true => Vec::new(),
-            false => {
-                order_locators(order, schema.layout(), slice != WeightSlots::ALL).map_err(GnitzSqlError::Internal)?
-            }
+            false => order_cols(order, schema.layout(), slice != WeightSlots::ALL).map_err(GnitzSqlError::Internal)?,
         };
         Ok(ResultCut { schema, keys, slice })
     }

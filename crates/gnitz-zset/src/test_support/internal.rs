@@ -1,15 +1,15 @@
-//! The test helpers only this crate uses.
+//! The test helpers only this crate's tests use.
 //!
 //! Unlike [`super::shared`], this file is compiled once, inside `gnitz-zset`,
-//! so it names crate-internals through `crate::` and needs nothing published on
-//! its behalf.
+//! so nothing here is published on its behalf, and it may name crate-internals
+//! through `crate::`.
 
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
 
-use super::shared::u64_pk_schema;
-use gnitz_foundation::rng::Rng;
+use super::shared::{FoldRow, u64_pk_schema};
+use gnitz_foundation::rng::{Rng, mix};
 
 /// A native little-endian cell of up to 16 bytes as the zero-extended value
 /// `BatchBuilder::put_int` writes back at the cell's own width.
@@ -91,4 +91,20 @@ pub(crate) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Opt
         batch.end_row();
     }
     batch.finish()
+}
+
+/// `n` rows of keys of `stride` that differ in their first byte's low bit and
+/// their last byte alone — so a batch of at least 256 of them takes the radix
+/// sort — with repeats, cancels and payload ties.
+pub(crate) fn radix_fold_rows(stride: usize, n: u64) -> Vec<FoldRow> {
+    (0..n)
+        .map(|i| {
+            let r = mix(i);
+            let mut pk = vec![0u8; stride];
+            pk[0] = (r >> 40) as u8 & 1;
+            pk[stride - 1] = (r >> 48) as u8;
+            let w = (r >> 20) as i64 % 4 - 1;
+            (pk, w, Some((r >> 8) as u8 % 4), Some((r >> 12) as u8 % 4))
+        })
+        .collect()
 }

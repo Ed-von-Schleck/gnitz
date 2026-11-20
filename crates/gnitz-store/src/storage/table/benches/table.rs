@@ -1,5 +1,5 @@
 use super::{Cut, DEFAULT_RAM_TIER_BYTES, RecoverySource, flush_barrier};
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table, table_shards};
+use crate::test_support::{certified, make_batch, make_schema_u64_i64, new_table, scratch_table, table_shards};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_zset::repr::Batch;
@@ -48,7 +48,7 @@ fn table_ingest_bench() {
             .map(|t| {
                 let rows: Vec<_> = (t * per_tick..(t + 1) * per_tick).flat_map(update).flatten().collect();
                 // As a pushed batch arrives: decoded at its row count.
-                make_batch_raw(&schema, &rows).trimmed()
+                make_batch(&schema, &rows).trimmed()
             })
             .collect();
         let rows: usize = ticks.iter().map(Batch::len).sum();
@@ -92,7 +92,7 @@ fn ram_tier_ceiling_bench() {
         let mut table = new_table(dir.path().join(fill.to_string()), schema, rederive, TIER);
         let load: Vec<_> = (0..hot).map(|k| (k, 1, 0)).collect();
         for chunk in load.chunks(1000) {
-            table.ingest(make_batch_raw(&schema, chunk)).unwrap();
+            table.ingest(make_batch(&schema, chunk)).unwrap();
         }
         // Each update retracts the row its key holds and inserts the next.
         let mut version = vec![0i64; hot as usize];
@@ -105,7 +105,7 @@ fn ram_tier_ceiling_bench() {
                     rows.extend([(key, -1, *v), (key, 1, *v + 1)]);
                     *v += 1;
                 }
-                make_batch_raw(&schema, &rows)
+                make_batch(&schema, &rows)
             })
             .collect();
         let ((), [instr, cyc]) = counters.measure(|| {
@@ -151,7 +151,7 @@ fn ingest_call_bench() {
             let rows: Vec<_> = (t * PER_TICK..(t + 1) * PER_TICK)
                 .map(|u| (key(u), 1, u as i64))
                 .collect();
-            let tick = make_batch_raw(&schema, &rows);
+            let tick = make_batch(&schema, &rows);
             kept_up += u64::from(table.shard_index.owed());
             let ((), instructions) = counter.measure(|| table.ingest(tick).unwrap());
             total += instructions;
@@ -200,12 +200,12 @@ fn sealed_read_bench() {
         );
         for r in 0..8u64 {
             let rows: Vec<_> = (0..held / 8).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
-            t.ingest(make_batch(&schema, &rows)).unwrap();
+            t.ingest(certified(make_batch(&schema, &rows))).unwrap();
         }
         for from in (0..pending).step_by(per as usize) {
             let row = |s: u64| ((mix(s) >> 24) % held, 1, -1 - s as i64);
             let rows: Vec<_> = (from..from + per).map(row).collect();
-            t.ingest_pending(make_batch_raw(&schema, &rows));
+            t.ingest_pending(make_batch(&schema, &rows));
         }
         if written {
             flush_barrier([&mut t], 0).unwrap();
@@ -300,7 +300,7 @@ fn barrier_seal_bench() {
         );
         for from in (0..tier).step_by(PER as usize) {
             let rows: Vec<_> = (from..from + PER).map(|k| (2 * k, 1, k as i64)).collect();
-            t.ingest(make_batch(&schema, &rows)).unwrap();
+            t.ingest(certified(make_batch(&schema, &rows))).unwrap();
         }
         assert!(table_shards(&t).is_empty(), "the tier's rows are held in RAM");
         let span = tier.max(pending);
@@ -316,7 +316,7 @@ fn barrier_seal_bench() {
                     .flat_map(|(k, s)| [(2 * k, -1, k as i64), (2 * k, 1, -1 - s as i64)])
                     .collect(),
             };
-            t.ingest_pending(make_batch_raw(&schema, &rows));
+            t.ingest_pending(make_batch(&schema, &rows));
         }
 
         let mib = |resident: Option<perf::Resident>| match resident {
@@ -358,15 +358,15 @@ fn open_cursor_bench() {
     for cancelled in [0u64, 8, 32, 64, 4096] {
         let mut t = scratch_table(dir.path().join(cancelled.to_string()), schema);
         let held: Vec<_> = (0..HELD).map(|k| (k, 1, k as i64)).collect();
-        t.ingest(make_batch(&schema, &held)).unwrap();
+        t.ingest(certified(make_batch(&schema, &held))).unwrap();
         t.fold_to_ram().unwrap();
         if cancelled > 0 {
             let retracted: Vec<_> = (0..cancelled).map(|k| (k, -1, k as i64)).collect();
-            t.ingest(make_batch(&schema, &retracted)).unwrap();
+            t.ingest(certified(make_batch(&schema, &retracted))).unwrap();
         }
         for r in 0..RUNS {
             let rows: Vec<_> = (0..64).map(|i| (HELD + r * 64 + i, 1, 0)).collect();
-            t.ingest(make_batch(&schema, &rows)).unwrap();
+            t.ingest(certified(make_batch(&schema, &rows))).unwrap();
         }
         let first = t.open_cursor(Cut::Now);
         assert_eq!(first.current_pk_bytes(), cancelled.to_be_bytes(), "the first live row");
@@ -399,11 +399,11 @@ fn unique_live_row_bench() {
     let scattered = |k: u64| k * 0x9E37_79B1 % KEYS;
     for base in (0..KEYS).step_by(SPILL as usize) {
         let rows: Vec<_> = (base..(base + SPILL).min(KEYS)).map(|k| (scattered(k), 1, 0)).collect();
-        t.ingest(make_batch_raw(&schema, &rows)).unwrap();
+        t.ingest(make_batch(&schema, &rows)).unwrap();
     }
     let updated: Vec<u64> = (0..UPDATED).map(|i| scattered(i * (KEYS / UPDATED))).collect();
     let rows: Vec<_> = updated.iter().flat_map(|&k| [(k, -1, 0), (k, 1, 1)]).collect();
-    t.ingest(make_batch_raw(&schema, &rows)).unwrap();
+    t.ingest(make_batch(&schema, &rows)).unwrap();
     flush_barrier([&mut t], 0).unwrap();
     assert!(
         t.ram_tiers(Cut::Now).all(|set| set.len() == 0),

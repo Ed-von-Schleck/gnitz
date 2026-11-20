@@ -3,7 +3,7 @@ use super::tests::{ask, pk_keys, probe, worker_over};
 use super::*;
 use crate::runtime::sal::{Routed, SalExcl, SalFull};
 use crate::test_support::{
-    chunked, make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine_with, u64_i64_cols,
+    chunked, make_batch, make_schema_u64_i64, net_weight, register_identity_view, table_engine_with, u64_i64_cols,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
@@ -36,7 +36,7 @@ fn arm(
     let (_dir, mut engine, tid) = table_engine_with(1, &u64_i64_cols(), chunked(CHUNK_ROWS));
     prepare(&mut engine, tid);
     let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
-    let batch = make_batch_raw(&make_schema_u64_i64(), &rows);
+    let batch = make_batch(&make_schema_u64_i64(), &rows);
     engine.registry.ingest(tid, batch).unwrap();
     let record = engine.shape_target(tid).unwrap().1.to_vec();
     let (mut wp, sal, rx) = worker_over(&mut engine, 1 << 26, 32 << 20);
@@ -93,7 +93,7 @@ fn worker_request_bench() {
     arm("empty", 0, bare, REQUESTS, empty, 0, 0);
 
     let one_row = |excl: &mut SalExcl, tid, record: &[u8], n: u32| {
-        let row = make_batch_raw(&schema, &[(n as u64, 1, n as i64)]);
+        let row = make_batch(&schema, &[(n as u64, 1, n as i64)]);
         excl.push(tid, record, Routed::Same(row.wire_whole())).map(|()| 0)
     };
     arm("push", 0, bare, REQUESTS, one_row, 0, REQUESTS as u64);

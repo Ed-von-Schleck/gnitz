@@ -1,11 +1,11 @@
 use super::*;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_foundation::rng::Rng;
 
 fn round_of(rows: u64) -> Rc<Batch> {
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64, i64)> = (0..rows).map(|id| (id, 1, id as i64)).collect();
-    Rc::new(make_batch_raw(&schema, &rows).into_consolidated())
+    Rc::new(make_batch(&schema, &rows).into_consolidated())
 }
 
 fn lens(feed: &Feed, after: u64) -> Option<Vec<usize>> {

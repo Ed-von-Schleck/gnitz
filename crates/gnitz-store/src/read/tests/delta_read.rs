@@ -4,7 +4,7 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    TID, batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw,
+    TID, batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch,
     make_schema_u64_i64, map_of, pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec,
     spec,
 };
@@ -14,7 +14,7 @@ use gnitz_wire::{ReadSink, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
-use gnitz_zset_testkit::{RowKey, zset_of};
+use gnitz_zset_testkit::{RowKey, zset_add, zset_of};
 use std::collections::HashMap;
 
 /// `(k1, k2, a, b, s)`: the PK is `(k2, k1)`.
@@ -223,13 +223,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-fn add(acc: &mut HashMap<RowKey, i64>, b: &Batch, schema: &SchemaDescriptor) {
-    for (k, w) in zset_of(b, schema) {
-        *acc.entry(k).or_default() += w;
-    }
-    acc.retain(|_, w| *w != 0);
-}
-
 /// One subscriber: a case's copy of the view, and the cursor it polls from.
 struct Subscriber {
     case: usize,
@@ -320,7 +313,7 @@ fn reads_past_any_cursor_match_a_model() {
                     reply => reply,
                 };
                 let reply = reply.unwrap_or_else(|e| panic!("seed {seed} {}: {e:?}", case.name));
-                add(&mut sub.copy, &reply, &out);
+                zset_add(&mut sub.copy, zset_of(&reply, &out));
                 sub.cursor = round;
                 polls += 1;
                 assert_eq!(
@@ -387,9 +380,9 @@ fn reads_past_any_cursor_match_a_model() {
 fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
     let mut r = relation_fixture(fed_view(1 << 20), schema, &[], []);
-    r.ingest_round(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
+    r.ingest_round(TID, make_batch(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();
-    r.ingest_round(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
+    r.ingest_round(TID, make_batch(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
         .unwrap();
     let whole = || ReadSpec::all_rows(ReadBound::None);
     let read = |after_tick| batch_rows(&r.delta_read(TID, after_tick, whole(), schema.layout_digest()).unwrap());
@@ -467,7 +460,7 @@ fn a_delta_read_reads_each_round_once_however_rounds_are_chunked() {
             })
             .collect();
         want.extend(rows.iter().copied().filter(|&(_, _, val)| val < 5));
-        r.ingest_round(TID, make_batch_raw(&schema, &rows), Some(at as u64 + 2), false)
+        r.ingest_round(TID, make_batch(&schema, &rows), Some(at as u64 + 2), false)
             .unwrap();
     }
     want.sort_unstable();

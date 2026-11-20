@@ -437,7 +437,7 @@ pub(crate) fn read_frame(mut r: impl Read) -> Vec<u8> {
 /// The batch as a lone WAL block.
 pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
     let mut out = Vec::new();
-    gnitz_wire::wal::append_block(&batch.wire_regions(), 0, &mut out);
+    gnitz_wire::wal::append_block(&batch.regions(), 0, &mut out);
     out
 }
 

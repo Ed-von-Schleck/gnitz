@@ -6,18 +6,6 @@
 use super::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
 
-/// How a reduce keys its output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReduceOutKey {
-    /// The group columns are the output PK: the source's whole PK list, or one
-    /// non-nullable PK-eligible column.
-    Natural,
-    /// A leading hidden `_group_pk` U128, a NULL-distinct key of the group
-    /// columns, which ride as payload. Every other group set, the empty
-    /// (global) one included.
-    SyntheticFold,
-}
-
 /// One slot of a reduce's output layout, ahead of the aggregate columns. See
 /// [`reduce_out_layout`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,19 +25,18 @@ impl ReduceOutSlot {
     pub const SYNTHETIC_KEY_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 }
 
-/// The output-key kind a reduce grouped by `group` over `schema` warrants.
-pub(crate) fn reduce_out_key(schema: &SchemaDescriptor, group: &[u32]) -> ReduceOutKey {
-    let natural = group == schema.pk_cols()
+/// Whether a reduce grouped by `group` over `schema` is keyed by the group
+/// columns themselves — the source's whole PK list, or one non-nullable
+/// PK-eligible column. Every other group set, the empty (global) one included,
+/// is keyed by a leading hidden `_group_pk` U128, a NULL-distinct key of the
+/// group columns, which ride as payload.
+pub(crate) fn natural_key(schema: &SchemaDescriptor, group: &[u32]) -> bool {
+    group == schema.pk_cols()
         || matches!(*group, [c] if {
             let col = schema.columns()[c as usize];
             // The PK region carries no null bitmap.
             !col.nullable && col.type_code.is_pk_eligible()
-        });
-    if natural {
-        ReduceOutKey::Natural
-    } else {
-        ReduceOutKey::SyntheticFold
-    }
+        })
 }
 
 /// A reduce's output layout ahead of its aggregates, grouped by `group` over
@@ -60,9 +47,9 @@ pub fn reduce_out_layout(
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
 ) -> Vec<ReduceOutSlot> {
-    let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match reduce_out_key(schema, group) {
-        ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
-        ReduceOutKey::Natural => (group.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group),
+    let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match natural_key(schema, group) {
+        false => (vec![ReduceOutSlot::SyntheticKey], &[]),
+        true => (group.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group),
     };
     slots.extend(
         row.into_iter()

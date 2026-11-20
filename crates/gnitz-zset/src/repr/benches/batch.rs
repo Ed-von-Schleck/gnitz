@@ -2,7 +2,8 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, make_string_batch, pk_payload_schema, string_batch, u64_pk_schema,
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
+    u64_pk_schema,
 };
 use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
@@ -39,7 +40,7 @@ fn consolidate_bench() {
         let rows: Vec<(u64, i64, i64)> = (0..N).map(row).map(|(pk, v)| (pk, 1, v as i64)).collect();
         // The first pass takes the pool's first allocations.
         let [_, (out, instructions)] = [(); 2].map(|()| {
-            let batch = make_batch_raw(&schema, &rows);
+            let batch = make_batch(&schema, &rows);
             counter.measure(|| black_box(batch).into_consolidated())
         });
         assert_eq!(out.count as u64, survivors);
@@ -169,7 +170,7 @@ fn consolidate_small_bench() {
                         )
                     })
                     .collect();
-                make_batch_raw(&schema, &rows)
+                make_batch(&schema, &rows)
             })
             .collect();
         let (kept, instructions) = counter.measure(|| {
@@ -195,7 +196,10 @@ fn consolidate_small_bench() {
 fn append_batch_strings_bench() {
     const ROWS: usize = 64;
     const APPENDS: usize = 10_000;
-    let src = string_batch(&(0..ROWS as u64).map(|i| (i, format!("{i:040}"))).collect::<Vec<_>>());
+    let src = make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &(0..ROWS as u64).map(|i| (i, 1, format!("{i:040}"))).collect::<Vec<_>>(),
+    );
     let counter = Counter::instructions();
     let (dst, instructions) = counter.measure(|| {
         let mut dst = Batch::empty_with_schema(src.schema());
@@ -270,7 +274,14 @@ fn blob_cache_bench() {
         }
         b.finish()
     };
-    let (one, hundred, many) = (make_string_batch(&[(1, 1, &[b'x'; 40])]), build(100), build(25_000));
+    let (one, hundred, many) = (
+        certified(make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
+            &[(1, 1, &[b'x'; 40])],
+        )),
+        build(100),
+        build(25_000),
+    );
     // A relocating write of every row of `src`: `compacted` carries no heap.
     let write = |src: &Batch| black_box(black_box(src).compacted()).count;
     for src in [&one, &hundred, &many] {

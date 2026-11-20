@@ -4,20 +4,62 @@
 
 use std::borrow::Cow;
 
-use super::int_cell;
 use crate::repr::MemBatch;
 use crate::schema::SchemaColumn;
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{RowSource, TypeCode};
-use gnitz_wire::{ScalarKind, ValueForm, WideForm, for_each_fixed_int};
+use gnitz_wire::{ScalarKind, ValueForm, WideForm};
+
+/// `$body` with `$image` the [`ScalarKind::order_image`], uncomplemented, of the scalar
+/// column at `$loc` of kind `$kind` in `$mb`, read from a row's cell: the `$cs`-byte window
+/// of `$cells` at the row's index. The cell layout and the kind are resolved here, once,
+/// outside any loop over rows in `$body`.
+macro_rules! scalar_images {
+    ($loc:expr, $kind:expr, $mb:expr, |$cells:ident, $cs:ident, $image:ident| $body:expr) => {{
+        use gnitz_expr::ColumnLocator;
+        use gnitz_wire::ScalarKind;
+        let (loc, mb): (ColumnLocator, &$crate::repr::MemBatch) = ($loc, $mb);
+        // Each row's cell, `cs` bytes apart, holds the value at `off`.
+        let ($cells, $cs, off) = match loc {
+            ColumnLocator::Pk { byte_off, .. } => (mb.pk(), mb.pk_stride(), byte_off as usize),
+            ColumnLocator::Payload { slot, size, .. } => (mb.col_data(slot as usize), size as usize, 0),
+        };
+        match ($kind, loc) {
+            (ScalarKind::Int(fi), ColumnLocator::Pk { .. }) => gnitz_wire::for_each_fixed_int!(fi, |FI| {
+                let $image = |c: &[u8]| {
+                    ScalarKind::Int(FI)
+                        .order_image($crate::algebra::int_cell::<true>(FI, &c[off..off + FI.width()]) as u64)
+                };
+                $body
+            }),
+            (ScalarKind::Int(fi), ColumnLocator::Payload { .. }) => gnitz_wire::for_each_fixed_int!(fi, |FI| {
+                let $image = |c: &[u8]| {
+                    ScalarKind::Int(FI).order_image($crate::algebra::int_cell::<false>(FI, &c[..FI.width()]) as u64)
+                };
+                $body
+            }),
+            // A float is never a PK column.
+            (ScalarKind::F32, _) => {
+                let $image =
+                    |c: &[u8]| ScalarKind::F32.order_image(u32::from_le_bytes(c[..4].try_into().unwrap()) as u64);
+                $body
+            }
+            (ScalarKind::F64, _) => {
+                let $image = |c: &[u8]| ScalarKind::F64.order_image(u64::from_le_bytes(c[..8].try_into().unwrap()));
+                $body
+            }
+        }
+    }};
+}
+pub(super) use scalar_images;
 
 /// One column as an ordered index keys it: where it lies, how its image is
 /// encoded, and whether the image is complemented, which reverses its order.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageCol {
     pub loc: ColumnLocator,
-    kind: ValueForm,
-    invert: bool,
+    pub(super) kind: ValueForm,
+    pub(super) invert: bool,
 }
 
 impl ImageCol {
@@ -79,9 +121,10 @@ impl ImageCol {
     }
 
     /// [`Self::write_slot`] for every row of `runs`, all **known non-NULL**, a
-    /// column at a time: the `n`-th row's image into the `slot`-byte window at
-    /// `at` of the `n`-th `stride`-byte key of `keys`. `false`, writing nothing,
-    /// for a wide image, which takes [`Self::write_slot`] a row at a time.
+    /// column at a time: the `n`-th row's image into the `slot`-byte window, 8
+    /// or 16 bytes, at `at` of the `n`-th `stride`-byte key of `keys`. `false`,
+    /// writing nothing, for a wide image, which takes [`Self::write_slot`] a row
+    /// at a time.
     pub fn write_slots(
         &self,
         mb: &MemBatch,
@@ -91,48 +134,24 @@ impl ImageCol {
         at: usize,
         slot: usize,
     ) -> bool {
+        debug_assert!(matches!(slot, 8 | 16), "an image slot is 8 or 16 bytes");
         let ValueForm::Scalar(kind) = self.kind else {
             return false;
         };
         let flip = if self.invert { u64::MAX } else { 0 };
-        // Each row's cell, `cs` bytes apart, holds the value at `off`.
-        let (cells, cs, off) = match self.loc {
-            ColumnLocator::Pk { byte_off, .. } => (mb.pk(), mb.pk_stride(), byte_off as usize),
-            ColumnLocator::Payload { slot, size, .. } => (mb.col_data(slot as usize), size as usize, 0),
-        };
         // Zero-padded where the slot is 16 bytes wide, as `write_slot` pads it.
         let pad = slot == 16;
-        macro_rules! fill {
-            ($w:expr, |$c:ident| $image:expr) => {{
-                let mut keys = keys.chunks_exact_mut(stride);
-                for &(s, e) in runs {
-                    for (cell, key) in cells[s * cs..e * cs].chunks_exact(cs).zip(&mut keys) {
-                        let $c = &cell[off..off + $w];
-                        key[at..at + 8].copy_from_slice(&(($image) ^ flip).to_be_bytes());
-                        if pad {
-                            key[at + 8..at + 16].fill(0);
-                        }
+        scalar_images!(self.loc, kind, mb, |cells, cs, image| {
+            let mut keys = keys.chunks_exact_mut(stride);
+            for &(s, e) in runs {
+                for (cell, key) in cells[s * cs..e * cs].chunks_exact(cs).zip(&mut keys) {
+                    key[at..at + 8].copy_from_slice(&(image(cell) ^ flip).to_be_bytes());
+                    if pad {
+                        key[at + 8..at + 16].fill(0);
                     }
                 }
-            }};
-        }
-        match (kind, self.loc) {
-            (ScalarKind::Int(fi), ColumnLocator::Pk { .. }) => for_each_fixed_int!(fi, |FI| {
-                fill!(FI.width(), |c| ScalarKind::Int(FI)
-                    .order_image(int_cell::<true>(FI, c) as u64))
-            }),
-            (ScalarKind::Int(fi), ColumnLocator::Payload { .. }) => for_each_fixed_int!(fi, |FI| {
-                fill!(FI.width(), |c| ScalarKind::Int(FI)
-                    .order_image(int_cell::<false>(FI, c) as u64))
-            }),
-            // A float is never a PK column.
-            (ScalarKind::F32, _) => {
-                fill!(4, |c| ScalarKind::F32
-                    .order_image(u32::from_le_bytes(c.try_into().unwrap()) as u64))
             }
-            (ScalarKind::F64, _) => fill!(8, |c| ScalarKind::F64
-                .order_image(u64::from_le_bytes(c.try_into().unwrap()))),
-        }
+        });
         true
     }
 }

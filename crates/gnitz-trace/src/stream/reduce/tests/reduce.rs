@@ -759,7 +759,7 @@ fn extremes_under_a_hashed_group_key_each_key_their_entries_as_one_alone() {
             })
             .collect::<Vec<_>>()
     };
-    // A string and a column folded behind two packed ones.
+    // The folds of a column and a string, and of three columns.
     for group in [&[3, 2][..], &[0, 1, 3]] {
         let both = entries(group, &[AggDescriptor::COUNT_STAR, min, max]);
         let alone = [min, max].map(|a| entries(group, &[AggDescriptor::COUNT_STAR, a]));

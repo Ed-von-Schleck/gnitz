@@ -1,4 +1,7 @@
 use super::*;
+use crate::test_support::encode_schema_record;
+use gnitz_wire::ColType;
+use gnitz_wire::schema_record::RecordCol;
 
 /// The PK columns in PK-list order, then each named payload column in the order
 /// named, a repeat kept.

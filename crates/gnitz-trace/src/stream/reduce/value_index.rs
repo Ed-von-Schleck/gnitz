@@ -3,19 +3,18 @@
 //! whose column is not NULL in it.
 //!
 //! ```text
-//! PK      = group key ‖ ordinal ‖ value image (8 bytes; 16 when any ordinal is wide)
+//! PK      = group prefix ‖ ordinal ‖ value image (8 bytes; 16 when any ordinal is wide)
 //! payload = the whole image (BLOB), only when an ordinal is a string
 //! ```
+//!
+//! The group prefix is the reduce's [`GroupPrefix`].
 //!
 //! The ordinal names the aggregate, so `MIN(a)` and `MAX(a)` never collide, and
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
 use crate::runs::ReadCursor;
-use gnitz_wire::PkBuf;
-use gnitz_wire::RowSource;
 use gnitz_wire::{MAX_PK_BYTES, TypeCode, payload_bytes};
-use gnitz_zset::algebra::KeyPacker;
-use gnitz_zset::algebra::{Agg, AggValues};
+use gnitz_zset::algebra::{Agg, AggValues, GroupOutKey, GroupPrefix};
 use gnitz_zset::algebra::{IMAGE_COL, ImageCol, image_slot_col};
 use gnitz_zset::repr::{Batch, copy_runs, range_rows};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -45,15 +44,16 @@ struct IndexedAgg {
 
 /// The value index a reduce's plan carries, baked once at compile time.
 pub(super) struct ValueIndex {
-    /// Packs a row's group columns into the key's leading bytes.
-    key_packer: KeyPacker,
+    /// The group prefix leading an entry's key.
+    pub(super) prefix: GroupPrefix,
     pub(super) schema: SchemaDescriptor,
     aggs: Vec<IndexedAgg>,
 }
 
 impl ValueIndex {
-    /// The index over `aggs`' MIN/MAX aggregates, or `None` when there are none.
-    pub(super) fn new(src: &SchemaDescriptor, group_cols: &[u32], aggs: &[Agg]) -> Result<Option<Self>, String> {
+    /// The index over `aggs`' MIN/MAX aggregates of a reduce grouped by `key`;
+    /// `None` when there are none.
+    pub(super) fn new(key: &GroupOutKey, aggs: &[Agg]) -> Result<Option<Self>, String> {
         let aggs: Vec<IndexedAgg> = aggs
             .iter()
             .enumerate()
@@ -68,47 +68,32 @@ impl ValueIndex {
         let has_wide = aggs.iter().any(|a| a.image.is_wide());
         let has_payload = aggs.iter().any(|a| !a.image.fits_slot());
         let suffix = [ORDINAL_COL, image_slot_col(has_wide)];
-        let (key_packer, mut b) = KeyPacker::new_group_key(src, group_cols, &suffix)?;
+        let (prefix, mut b) = key.index_prefix(&suffix);
         if has_payload {
             b.push(IMAGE_COL);
         }
         let schema = b.finish().map_err(|e| format!("min/max index: {e}"))?;
         debug_assert!(!has_payload || schema.payload_slot(schema.num_columns() - 1) == Some(IMAGE_SLOT));
-        Ok(Some(ValueIndex { schema, key_packer, aggs }))
+        Ok(Some(ValueIndex { schema, prefix, aggs }))
     }
 
-    /// The least and the greatest group key among `rows`; `None` for no row.
-    pub(super) fn group_span<R: RowSource>(
-        &self,
-        src: &R,
-        rows: impl Iterator<Item = usize>,
-    ) -> Option<(PkBuf, PkBuf)> {
-        let mut key = [0u8; MAX_PK_BYTES];
-        rows.map(|row| PkBuf::from_bytes(self.key_packer.pack_prefix(&mut key, src, row)))
-            .fold(None, |span, group| match span {
-                None => Some((group, group)),
-                Some((lo, hi)) => Some((lo.min(group), hi.max(group))),
-            })
-    }
-
-    /// Seed group `g` of each value-indexed aggregate `k` — the group of `row` —
-    /// with its extreme out of the index, emptying one whose ordinal has no
-    /// positive entry; with `retracted`, the fold of the group's retractions,
-    /// only each one that [`AggValues::recedes`]. `cur` is opened by `open` at
-    /// its first seek.
-    pub(super) fn seed_extremes<R: RowSource>(
+    /// Seed group `g` of each value-indexed aggregate `k` — the group whose
+    /// prefix is `prefix` — with its extreme out of the index, emptying one whose
+    /// ordinal has no positive entry; with `retracted`, the fold of the group's
+    /// retractions, only each one that [`AggValues::recedes`]. `cur` is opened by
+    /// `open` at its first seek.
+    pub(super) fn seed_extremes(
         &self,
         (cur, mut open): (&mut Option<ReadCursor>, impl FnMut() -> ReadCursor),
-        src: &R,
-        row: usize,
+        prefix: &[u8],
         vals: &mut AggValues,
         g: usize,
         retracted: Option<&AggValues>,
     ) {
-        let mut key = [0u8; MAX_PK_BYTES];
-        let stride = self.key_packer.out_stride;
+        let stride = prefix.len();
+        let mut key = [0; MAX_PK_BYTES];
+        key[..stride].copy_from_slice(prefix);
         let prefix_len = stride + ORDINAL_BYTES;
-        self.key_packer.pack_prefix(&mut key, src, row);
         for (j, a) in self.aggs.iter().enumerate() {
             let k = a.agg_idx as usize;
             if retracted.is_some_and(|r| !r.recedes(k, g, vals)) {
@@ -137,24 +122,26 @@ impl ValueIndex {
 
 impl ValueIndex {
     /// The index entries `delta` contributes, each at its row's weight, unsorted:
-    /// one ordinal at a time, each of its regions in one pass.
-    pub(super) fn entries(&self, delta: &Batch) -> Batch {
+    /// one ordinal at a time, each of its regions in one pass. `key` groups the
+    /// reduce. Out of line, so its row loops compile apart from the caller's.
+    #[inline(never)]
+    pub(super) fn entries(&self, key: &GroupOutKey, delta: &Batch) -> Batch {
         // Consolidated, so no row is a ghost.
         debug_assert!(delta.is_consolidated());
         let mb = delta.as_mem_batch();
         let n = delta.len();
-        let stride = self.key_packer.out_stride;
+        let stride = self.prefix.width();
         let width = self.schema.pk_stride();
         let value = stride + ORDINAL_BYTES..width;
         let has_payload = self.schema.num_payload_cols() != 0;
         let mut out = Batch::with_capacity(&self.schema, n * self.aggs.len());
         // A string ordinal's whole image of one row; empty between rows.
         let mut image = Vec::new();
-        // Every row's group key, packed once for all ordinals when packing one
-        // hashes; each ordinal otherwise packs its own rows' keys.
-        let shared = (self.aggs.len() > 1 && !self.key_packer.packs_without_hashing()).then(|| {
+        // Every row's group prefix, computed once for all ordinals when
+        // computing one hashes; each ordinal otherwise computes its own rows'.
+        let shared = (self.aggs.len() > 1 && self.prefix.hashes(key)).then(|| {
             let mut keys = vec![0u8; n * stride];
-            self.key_packer.pack_rows(&mut keys, stride, &mb, &[(0, n)]);
+            key.write_prefixes(&self.prefix, &mb, &[(0, n)], &mut keys, stride);
             keys
         });
 
@@ -170,7 +157,7 @@ impl ValueIndex {
                             key[..stride].copy_from_slice(&keys[row * stride..][..stride]);
                         }
                     }
-                    None => self.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs),
+                    None => key.write_prefixes(&self.prefix, &mb, &runs, w.pk_mut(), width),
                 }
                 copy_runs::<8>(delta.weight(), w.weight_mut(), runs.iter().copied(), 8);
                 w.null_bmp_mut().fill(0);

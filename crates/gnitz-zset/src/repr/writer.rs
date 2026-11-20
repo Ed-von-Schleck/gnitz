@@ -1,5 +1,5 @@
-//! The direct row writer: a batch's tail or a wire block's fixed bytes, written
-//! a region at a time.
+//! The direct row writer: a batch's tail, a batch's own rows, or a wire block's
+//! fixed bytes, written a region at a time.
 
 use super::batch::MemBatch;
 use super::string_heap::{BlobCache, StringDest, rebase_string_cells, relocated_cell};
@@ -9,12 +9,13 @@ use gnitz_wire::{FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_
 use std::ops::Range;
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
-/// out as a slice of exactly those rows: a batch's tail, or a wire block's fixed
-/// bytes.
+/// out as a slice of exactly those rows: a batch's tail, a batch's own rows
+/// ([`Batch::rewrite`](super::Batch::rewrite)), or a wire block's fixed bytes.
 ///
-/// **Whoever fills a writer writes every byte of every row it hands out, a NULL
-/// cell's included**: the arena is uninitialised, and a batch counts the rows
-/// only once the writer is done.
+/// **Whoever fills a writer over a tail or a block writes every byte of every
+/// row it hands out, a NULL cell's included**: the arena is uninitialised, and
+/// a batch counts the rows only once the writer is done. A rewrite writes whole
+/// every cell it overwrites.
 pub struct DirectWriter<'a> {
     /// An arena of `cap` rows under `schema`.
     data: &'a mut [u8],

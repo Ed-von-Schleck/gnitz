@@ -4,9 +4,9 @@ use crate::runtime::sal::fixtures::{scan, test_log, unanswered, zone_rows};
 use crate::runtime::sal::format::{PREFIX_BYTES, RequestHead, SAL_FORMAT, anchor_word};
 use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Routed, SalWriter};
+use crate::test_support::encode_schema_record;
 use crate::test_support::sweep_bit_flips;
 use gnitz_store::relation::PkRule;
-use gnitz_zset::schema::encode_schema_record;
 
 const SIZE: usize = 1 << 20;
 const NW: usize = 4;

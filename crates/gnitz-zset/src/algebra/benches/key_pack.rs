@@ -9,7 +9,7 @@ use std::hint::black_box;
 const N: usize = 500_000;
 
 /// Instructions and cycles per row of [`FoldCols::key_row`] and of
-/// [`FoldCols::for_each_chunk`] by column count, over `[U64 PK, I64, U32 NULL, I64,
+/// [`FoldCols::identities`] by column count, over `[U64 PK, I64, U32 NULL, I64,
 /// I64, I64]` — each count the least of several passes.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -51,10 +51,15 @@ fn fold_key_bench() {
         };
         let chunked = || {
             let mut acc = 0u128;
-            fold.for_each_chunk(mb, &[(0, N)], |_, keys| acc = keys.iter().fold(acc, |acc, &k| acc ^ k));
+            let mut keys = [0u128; FOLD_CHUNK];
+            for start in (0..N).step_by(FOLD_CHUNK) {
+                let keys = &mut keys[..(N - start).min(FOLD_CHUNK)];
+                fold.identities(mb, start, keys);
+                acc = keys.iter().fold(acc, |acc, &k| acc ^ k);
+            }
             black_box(acc)
         };
-        assert_eq!(row(), chunked(), "for_each_chunk digests as key_row does");
+        assert_eq!(row(), chunked(), "identities digests as key_row does");
         let [instr, cyc] = least(&row);
         let [chunk_instr, chunk_cyc] = least(&chunked);
         println!(

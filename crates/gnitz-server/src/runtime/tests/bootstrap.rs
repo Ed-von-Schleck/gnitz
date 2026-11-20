@@ -4,8 +4,8 @@ use crate::runtime::master::route::with_routed;
 use crate::runtime::sal::Apply;
 use crate::runtime::sal::fixtures::test_log;
 use crate::test_support::{
-    batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, register_identity_view,
-    sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
+    batch_rows, certified, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight,
+    register_identity_view, sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{TableDistribution, TableProps};
@@ -136,7 +136,7 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
         .filter(|(pk, ..)| keyed.owner(&pk.to_be_bytes(), slot.of as usize) == Some(slot.rank as usize))
         .collect();
     assert!(!own.is_empty() && own.len() < all.len(), "the key space is split");
-    let rows = make_batch(&engine.registry.relation(k).unwrap().schema(), &all);
+    let rows = certified(make_batch(&engine.registry.relation(k).unwrap().schema(), &all));
     let tails: Vec<_> = [(r, 4, &all), (k, 1, &own), (k, 2, &own)]
         .into_iter()
         .map(|(tid, written_at, expected)| {
@@ -175,7 +175,7 @@ fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
         &log,
         &engine,
         t,
-        &make_batch(&engine.registry.relation(t).unwrap().schema(), &rows),
+        &certified(make_batch(&engine.registry.relation(t).unwrap().schema(), &rows)),
     );
     engine.close();
 
@@ -220,7 +220,7 @@ fn a_tail_lands_above_the_cut_of_a_scanned_table() {
             &log,
             &engine,
             tid,
-            &make_batch(&engine.registry.relation(tid).unwrap().schema(), &rows),
+            &certified(make_batch(&engine.registry.relation(tid).unwrap().schema(), &rows)),
         );
     }
     engine.close();

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_wire::WireConflictMode::{Error, Update};
 use gnitz_zset::repr::Batch;
 
@@ -10,7 +10,7 @@ use gnitz_zset::repr::Batch;
 fn a_stream_push_admits_only_positive_weights_outside_error_mode() {
     let weighted = |weights: &[i64]| {
         let rows: Vec<(u64, i64, i64)> = weights.iter().enumerate().map(|(i, &w)| (i as u64, w, 0)).collect();
-        make_batch_raw(&make_schema_u64_i64(), &rows)
+        make_batch(&make_schema_u64_i64(), &rows)
     };
     assert_eq!(check_stream_push(7, None, Update), Ok(()));
     assert_eq!(

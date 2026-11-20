@@ -38,7 +38,7 @@ pub(crate) fn ddl_frame(circuit: &[u8]) -> Vec<u8> {
     let mut batch = ZSetBatch::new(sys_schema(SysFamily::Circuit));
     CircuitRow { view_id: 100, circuit: circuit.into() }.write(&mut batch.builder(), 1);
     let mut out = Vec::new();
-    encode_ddl_txn(&mut out, [(SysFamily::Circuit, batch.view().wire_regions())]);
+    encode_ddl_txn(&mut out, [(SysFamily::Circuit, batch.view().regions())]);
     out
 }
 

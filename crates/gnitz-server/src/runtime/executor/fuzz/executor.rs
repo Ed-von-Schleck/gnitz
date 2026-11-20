@@ -274,7 +274,7 @@ fn builtin() -> Seed {
         let mut frame = Vec::new();
         let hdr = ControlHeader::naming(ClientVerb::Push, Target::from(tid), 0);
         let (_, record) = session.cat.shape_target(tid).expect("the DDL created it");
-        append_frame(&mut frame, &hdr, record, Some(&rows.wire_regions()));
+        append_frame(&mut frame, &hdr, record, Some(&rows.regions()));
         frame
     };
     let pushes = [rows(a), rows(b)];
@@ -309,7 +309,7 @@ fn ddl_frame(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> Vec<u8> {
             conflict_mode: Default::default(),
             basis: 0,
             blob: &[],
-            data: batch.wire_regions(),
+            data: batch.regions(),
         })
         .collect();
     let mut frame = Vec::new();
@@ -350,7 +350,7 @@ fn a_push_txn_reads_each_family_where_it_lies() {
             conflict_mode: Default::default(),
             basis: 0,
             blob: session.cat.shape_target(tables[i]).unwrap().1,
-            data: batches[i].wire_regions(),
+            data: batches[i].regions(),
         })
         .collect();
     let mut frame = Vec::new();

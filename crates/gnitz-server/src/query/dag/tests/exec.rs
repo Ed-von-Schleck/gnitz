@@ -3,9 +3,10 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    EchoDrive, RowKey, chunked, col_def, cols_of, empty_catalog, empty_catalog_with, join_chain_under_a_reduce,
-    make_batch, make_schema_u64_i64, push_and_tick, register_chain, register_count_of, register_identity_view,
-    scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of,
+    EchoDrive, RowKey, certified, chunked, col_def, cols_of, empty_catalog, empty_catalog_with,
+    join_chain_under_a_reduce, make_batch, make_schema_u64_i64, push_and_tick, register_chain, register_count_of,
+    register_identity_view, scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols,
+    zset_of,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_trace::stream::ReducePlan;
@@ -57,7 +58,7 @@ pub(super) fn engine_with_views() -> (tempfile::TempDir, CatalogEngine, u64, Vie
 
 /// `(pk, weight, payload)` rows of a base table `(id U64 PK, v I64)`.
 pub(super) fn base_rows(rows: &[(u64, i64, i64)]) -> Batch {
-    make_batch(&make_schema_u64_i64(), rows)
+    certified(make_batch(&make_schema_u64_i64(), rows))
 }
 
 /// `COUNT(*)` over `source`, a relation of the base's columns, grouped by
@@ -378,7 +379,10 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
         let b = engine.create_table("public.b", &cols, &[0]).unwrap();
         let view = register_join(&mut engine, [a, b], key, "join");
         for (tid, rows) in [(a, &a_rows[..]), (b, &b_rows)] {
-            let rows = make_batch(&engine.registry.relation_or_err(tid).unwrap().schema(), rows);
+            let rows = certified(make_batch(
+                &engine.registry.relation_or_err(tid).unwrap().schema(),
+                rows,
+            ));
             engine.registry.ingest(tid, rows).unwrap();
         }
 
@@ -415,10 +419,13 @@ fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
         let view = register_join(&mut engine, tables, key, "join");
         for (i, &tid) in tables.iter().enumerate() {
             let schema = engine.registry.relation_or_err(tid).unwrap().schema();
-            engine.registry.ingest(tid, make_batch(&schema, &sealed[i])).unwrap();
             engine
                 .registry
-                .ingest_with(tid, make_batch(&schema, &above[i]), PkRule::Enforce, true)
+                .ingest(tid, certified(make_batch(&schema, &sealed[i])))
+                .unwrap();
+            engine
+                .registry
+                .ingest_with(tid, certified(make_batch(&schema, &above[i])), PkRule::Enforce, true)
                 .unwrap();
         }
 
@@ -442,7 +449,7 @@ fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
 #[test]
 fn the_ground_row_is_minted_where_the_whole_input_arrives() {
     let schema = make_schema_u64_i64();
-    let probe = make_batch(&schema, &[(1, 1, 1)]);
+    let probe = certified(make_batch(&schema, &[(1, 1, 1)]));
     let group = ScatterPlan::group(&schema, &[]).unwrap();
     let (mints, receives): (Vec<bool>, Vec<bool>) = (0..4)
         .map(|rank| {
@@ -480,8 +487,8 @@ fn a_chain_backfills_through_its_segment_in_memory() {
     // Two rows of `u` a key; `t`'s rows span several chunks.
     let u_rows: Vec<(u64, i64, i64)> = (0..10).map(|id| (id, 1, (id % 5) as i64)).collect();
     let t_rows: Vec<(u64, i64, i64)> = (0..23).map(|id| (id, 1, (id * 7 % 6) as i64)).collect();
-    push_and_tick(&mut engine, u, make_batch(&schema, &u_rows));
-    push_and_tick(&mut engine, t, make_batch(&schema, &t_rows));
+    push_and_tick(&mut engine, u, certified(make_batch(&schema, &u_rows)));
+    push_and_tick(&mut engine, t, certified(make_batch(&schema, &t_rows)));
 
     let (seg, top) = join_chain_under_a_reduce(&mut engine, tables[0], tables[1]);
     backfill(&mut engine, &[seg, top]).unwrap();
@@ -507,7 +514,7 @@ fn a_set_feeds_a_shared_source_reader_once() {
     backfill(&mut engine, &oracle).unwrap();
     let schema = engine.registry.relation_or_err(t).unwrap().schema();
     let rows: Vec<(u64, i64, i64)> = (0..11).map(|id| (id, 1, id as i64 % 3)).collect();
-    push_and_tick(&mut engine, t, make_batch(&schema, &rows));
+    push_and_tick(&mut engine, t, certified(make_batch(&schema, &rows)));
 
     let views = pair(&mut engine, "set");
     backfill(&mut engine, &views).unwrap();
@@ -554,7 +561,10 @@ fn a_ground_row_lands_before_the_rows_of_its_set() {
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let schema = engine.registry.relation_or_err(t).unwrap().schema();
     let rows: Vec<(u64, i64, i64)> = (0..9).map(|id| (id, 1, id as i64)).collect();
-    engine.registry.ingest(t, make_batch(&schema, &rows)).unwrap();
+    engine
+        .registry
+        .ingest(t, certified(make_batch(&schema, &rows)))
+        .unwrap();
     let v = register_identity_view(&mut engine, t, "v", &cols);
     let (count, _) = register_count_of(&mut engine, v, &schema, &[], "count");
     backfill(&mut engine, &[v, count]).unwrap();

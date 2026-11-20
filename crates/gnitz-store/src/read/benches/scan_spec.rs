@@ -14,7 +14,8 @@ use crate::read::SourceCursor;
 use crate::relation::RelationKind;
 use crate::test_support::{RelationFixture, TID};
 use crate::test_support::{
-    cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec, table_shards, wide_on_disk,
+    cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec, table_shards, u64_pk_schema,
+    wide_on_disk,
 };
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{
@@ -29,11 +30,12 @@ const ROWS: u64 = 3 << 17;
 
 /// `id U64 PK` and the NOT NULL `payload` columns.
 fn schema(payload: &[TypeCode]) -> SchemaDescriptor {
-    let cols: Vec<_> = std::iter::once(&TypeCode::U64)
-        .chain(payload)
-        .map(|&tc| SchemaColumn::new(tc, false))
-        .collect();
-    SchemaDescriptor::new(&cols, &[0])
+    u64_pk_schema(
+        &payload
+            .iter()
+            .map(|&tc| SchemaColumn::new(tc, false))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// A base table over [`schema`]`(payload)`, indexed on `indexed`, holding ids

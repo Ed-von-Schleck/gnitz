@@ -15,8 +15,10 @@ fn train_route_bench() {
     const LAP: usize = 4;
     let schema = crate::test_support::make_schema_u64_i64();
     for (rows, laps) in [(16usize, 20_000u64), (512, 20_000), (32_768, 500)] {
-        let batch =
-            crate::test_support::make_batch(&schema, &(0..rows as u64).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+        let batch = crate::test_support::certified(crate::test_support::make_batch(
+            &schema,
+            &(0..rows as u64).map(|i| (i, 1, i as i64)).collect::<Vec<_>>(),
+        ));
         let (mut writers, receiver) = test_rings(1, 16 << 20);
         let r = Reactor::new(Limits::TEST, receiver).expect("reactor");
         let mut lease = r.lease_train();

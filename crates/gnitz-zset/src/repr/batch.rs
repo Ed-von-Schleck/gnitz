@@ -14,8 +14,8 @@ use super::writer::DirectWriter;
 use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::{
-    FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource, TypeCode, read_i64_le,
-    read_u64_le,
+    FIXED_REGION_BYTES, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, Regions, RowSource, TypeCode,
+    read_i64_le, read_u64_le,
 };
 
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
@@ -268,6 +268,11 @@ impl Batch {
         &self.blob
     }
 
+    /// [`MemBatch::regions`].
+    pub fn regions(&self) -> Regions<'_> {
+        self.as_mem_batch().regions()
+    }
+
     /// An upper bound on the bytes of the heap no string cell references.
     #[inline]
     pub fn dead_heap(&self) -> usize {
@@ -334,16 +339,19 @@ impl Batch {
     pub fn get_weight(&self, row: usize) -> i64 {
         read_i64_le(&self.data, self.region_start(REG_WEIGHT) + row * FIXED_REGION_BYTES)
     }
-    /// Indices of the live rows — those at positive weight, the elements the
-    /// batch asserts.
-    #[inline(always)]
+    /// [`MemBatch::live_rows`].
+    #[inline]
     pub fn live_rows(&self) -> impl Iterator<Item = usize> {
-        (0..self.count).filter(move |&i| self.get_weight(i) > 0)
+        self.as_mem_batch().live_rows()
     }
     /// Indices of the retracted rows — those at negative weight.
-    #[inline(always)]
+    #[inline]
     pub fn retracted_rows(&self) -> impl Iterator<Item = usize> {
-        (0..self.count).filter(move |&i| self.get_weight(i) < 0)
+        self.as_mem_batch()
+            .weights()
+            .enumerate()
+            .filter(|&(_, w)| w < 0)
+            .map(|(i, _)| i)
     }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
@@ -731,24 +739,25 @@ impl Batch {
 
     // ── Copies ──────────────────────────────────────────────────────────
 
-    /// The rows `indices` names, in that order, at their own weights; none may be
-    /// weight 0.
+    /// The rows `indices` names, in that order, any of them any number of times,
+    /// at their own weights; none may be weight 0. This batch's heap is carried
+    /// whole where that beats relocating the named rows' long strings.
     pub fn indexed_rows(&self, indices: &[u32]) -> Self {
         self.indexed_rows_then(indices, |_| {})
     }
 
     /// [`Self::indexed_rows`], then the writer of those rows handed to `then`,
-    /// to overwrite cells. A row named twice shares its strings' heap bytes.
+    /// to overwrite cells. A row named twice shares its strings' heap bytes, and
+    /// nothing charges a long value `then` overwrites dead: it may overwrite a
+    /// string cell only where another copy still references the old value.
     pub fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Self {
         self.as_mem_batch().indexed_rows_then(indices, then)
     }
 
-    /// The rows named by a strictly ascending `indices`, inheriting this batch's
-    /// claim: taking rows in source order preserves (PK, payload) ordering and
-    /// leaves weights untouched, so a consolidated source yields a consolidated
-    /// subset. A reordering caller wants
-    /// [`indexed_rows`](Self::indexed_rows), whose weight-0 precondition
-    /// this inherits.
+    /// [`Self::indexed_rows`] of a strictly ascending `indices`, inheriting this
+    /// batch's claim: taking rows in source order preserves (PK, payload)
+    /// ordering and leaves weights untouched, so a consolidated source yields a
+    /// consolidated subset.
     pub fn ascending_subset(&self, indices: &[u32]) -> Self {
         debug_assert!(
             indices.is_sorted_by(|a, b| a < b),
@@ -937,7 +946,7 @@ impl Batch {
         }
         let mut cache = BlobCache::for_rows(&self.schema, rows.len());
         for (src, row) in rows {
-            self.append_row_from_source(weight, src, row, skip, Some(&mut cache));
+            self.append_row_skipping(weight, src, row, skip, Some(&mut cache));
         }
     }
 
@@ -1094,9 +1103,14 @@ impl Batch {
         base
     }
 
-    /// Append `source[row]` at `weight`, each payload column `skip` names as a
+    /// Append `source[row]` at `weight`.
+    pub fn append_row_from_source<S: RowSource>(&mut self, weight: i64, source: &S, row: usize) {
+        self.append_row_skipping(weight, source, row, 0, None);
+    }
+
+    /// [`Self::append_row_from_source`], each payload column `skip` names as a
     /// zero that is not NULL; a `blob_cache` dedups repeated long-string spans.
-    pub fn append_row_from_source<S: RowSource>(
+    fn append_row_skipping<S: RowSource>(
         &mut self,
         weight: i64,
         source: &S,
@@ -1431,9 +1445,16 @@ impl<'a> MemBatch<'a> {
 
     /// [`Batch::indexed_rows_then`] of these rows.
     pub fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Batch {
-        let blob_cap = string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len());
-        Batch::write_new(self.schema, indices.len(), blob_cap, |writer| {
-            super::scatter::scatter_copy(self, indices, writer);
+        let dead = string_heap::carry_dead_rows(self, indices.len(), false, || {
+            string_heap::named_rows(self.count, indices.iter().map(|&row| row as usize))
+        });
+        let carried = dead.map(|dead| (self.blob, 0, dead));
+        let blob_cap = match carried {
+            Some(_) => 0,
+            None => string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len()),
+        };
+        Batch::write_new_carrying(self.schema, indices.len(), blob_cap, carried.as_slice(), |writer| {
+            super::scatter::scatter_copy(self, indices, dead.map(|_| 0), writer);
             then(writer);
         })
     }
@@ -1495,6 +1516,17 @@ impl<'a> MemBatch<'a> {
         &self.data[off..off + self.count * self.schema.region_stride(r)]
     }
 
+    /// Every fixed region followed by the blob heap, in canonical order: what a
+    /// WAL block and a shard each encode.
+    pub fn regions(&self) -> Regions<'a> {
+        let mut out = Regions::new();
+        for r in 0..self.schema().num_fixed_regions() {
+            out.push(self.region(r));
+        }
+        out.push(self.blob());
+        out
+    }
+
     /// PK region as a contiguous slice (`count * pk_stride` bytes).
     #[inline]
     pub fn pk(&self) -> &'a [u8] {
@@ -1552,7 +1584,7 @@ impl<'a> MemBatch<'a> {
         read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * FIXED_REGION_BYTES)
     }
     /// Every row's weight, in row order.
-    pub fn weights(&self) -> impl ExactSizeIterator<Item = i64> + 'a {
+    pub fn weights(&self) -> impl ExactSizeIterator<Item = i64> + use<'a> {
         self.weight()
             .as_chunks::<FIXED_REGION_BYTES>()
             .0
@@ -1567,8 +1599,9 @@ impl<'a> MemBatch<'a> {
             .iter()
             .map(|w| u64::from_le_bytes(*w))
     }
-    /// Indices of the live rows — those with positive weight.
-    pub fn live_rows(&self) -> impl Iterator<Item = usize> + 'a {
+    /// Indices of the live rows — those at positive weight, the elements the
+    /// batch asserts.
+    pub fn live_rows(&self) -> impl Iterator<Item = usize> + use<'a> {
         self.weights().enumerate().filter(|&(_, w)| w > 0).map(|(i, _)| i)
     }
     #[inline(always)]

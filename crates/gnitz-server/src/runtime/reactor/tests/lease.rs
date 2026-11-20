@@ -207,7 +207,7 @@ fn a_ring_given_back_copies_queued_frames_and_holds_their_train() {
     let id = lease.id();
     let train = train_of(&mut lease);
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
+    let rows = crate::test_support::certified(crate::test_support::make_batch(&schema, &[(7, 1, 0)]));
     writers[0].send_train_frame(id, false, Some(&rows));
     writers[0].send_train_frame(id, false, Some(&rows));
     r.drain_all_w2m();
@@ -251,7 +251,7 @@ fn a_give_back_past_the_hold_table_copies_without_a_hold() {
         .collect();
     assert!(!fillers.is_empty(), "the table takes holds until it is full");
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
+    let rows = crate::test_support::certified(crate::test_support::make_batch(&schema, &[(7, 1, 0)]));
 
     writers[0].send_train_frame(train, false, Some(&rows));
     writers[0].name_shortage();
@@ -278,7 +278,7 @@ fn a_give_back_past_the_hold_table_copies_without_a_hold() {
 fn a_reused_queue_box_holds_only_its_own_leases_frames() {
     let (r, mut writers) = reactor_with_rings(3);
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = |pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]);
+    let rows = |pk| crate::test_support::certified(crate::test_support::make_batch(&schema, &[(pk, 1, 0)]));
     let read_all = |lease: &mut TrainLease| {
         let train = train_of(lease);
         let mut pks = Vec::new();
@@ -327,7 +327,9 @@ fn a_reused_queue_box_holds_only_its_own_leases_frames() {
 fn a_leases_trains_split_at_their_terminals() {
     let (r, mut writers) = reactor_with_rings(3);
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = |pk: u64, weight: i64| crate::test_support::make_batch(&schema, &[(pk, weight, 0)]);
+    let rows = |pk: u64, weight: i64| {
+        crate::test_support::certified(crate::test_support::make_batch(&schema, &[(pk, weight, 0)]))
+    };
     let read_all = |train: Train<'_>| {
         let mut got = Vec::new();
         while let Some(f) = try_poll_once(train.next()).expect("routed").expect("no fault") {
@@ -368,7 +370,7 @@ fn a_leases_trains_split_at_their_terminals() {
 fn a_given_up_trains_remainder_is_read_off_before_the_next() {
     let (r, mut writers) = reactor_with_rings(2);
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = |pk: u64| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]);
+    let rows = |pk: u64| crate::test_support::certified(crate::test_support::make_batch(&schema, &[(pk, 1, 0)]));
     let mut lease = lease_of(&r, &[WorkerSet::ALL, WorkerSet::ALL]);
     let id = lease.id();
 
@@ -415,7 +417,7 @@ fn a_given_up_trains_remainder_is_read_off_before_the_next() {
 fn a_hold_ends_when_the_read_being_taken_waits_on_its_worker() {
     let (r, mut writers) = reactor_with_rings(1);
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
+    let rows = crate::test_support::certified(crate::test_support::make_batch(&schema, &[(7, 1, 0)]));
     let mut lease = lease_of(&r, &[WorkerSet::ALL, WorkerSet::ALL]);
     let id = lease.id();
     // All of the first read's train, and the start of the second's.

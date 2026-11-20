@@ -5,7 +5,7 @@ use super::tests::stride_schema;
 use super::tests::trailing_gk;
 use super::tests::trailing_key_batch;
 use crate::storage::Cut;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_foundation::rng::Rng;
 use gnitz_zset::schema::probe_key;
 
@@ -262,7 +262,7 @@ fn compaction_amplification_bench() {
         // spilled by then, the shards and the bytes its barriers synced.
         let mut barriers = BARRIERS.map(|every| (every, 0, 0, 0usize, 0u64));
         for n in 0..runs {
-            let run = make_batch_raw(&schema, &rows(n, &mut rng)).into_consolidated();
+            let run = make_batch(&schema, &rows(n, &mut rng)).into_consolidated();
             spill += counter.measure(|| idx.append_l0_run(&run).unwrap()).1;
             spilled += idx.l0.last().unwrap().shard.file_len();
             spilled_rows += run.len();

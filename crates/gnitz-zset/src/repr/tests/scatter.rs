@@ -4,7 +4,7 @@ use super::*;
 /// survivors interleaved across both — and every kept string reads back.
 #[test]
 fn materialize_carrying_charges_each_sources_dropped_rows() {
-    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string, read_strings};
+    use crate::test_support::{certified, make_batch_bytes, make_schema_pk_u64_payload_string, read_strings};
     let schema = make_schema_pk_u64_payload_string();
     // Eight rows a side, one dropped from each: too little to make either
     // carried heap wasteful.
@@ -12,7 +12,7 @@ fn materialize_carrying_charges_each_sources_dropped_rows() {
         let kept = [fill; 40];
         let mut rows: Vec<(u64, i64, &[u8])> = (0..8).map(|i| (first + 2 * i, 1, &kept[..])).collect();
         rows[3].2 = dropped;
-        make_batch_bytes(&schema, &rows)
+        certified(make_batch_bytes(&schema, &rows))
     };
     let (a, b) = (side(1, b'a', &[b'x'; 30]), side(2, b'b', &[b'y'; 50]));
     let sources = [a.as_mem_batch(), b.as_mem_batch()];

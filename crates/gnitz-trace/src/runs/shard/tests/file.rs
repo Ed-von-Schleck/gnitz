@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, map_shard, read_strings,
-    string_batch, u64_pk_schema,
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard,
+    read_strings, u64_pk_schema,
 };
 use gnitz_wire::{Heap, TypeCode, write_u64_le};
 use gnitz_zset::repr::{BatchBuilder, merge_consolidated};
@@ -75,10 +75,15 @@ fn write_refuses_an_existing_path_and_leaves_it_intact() {
     let path = dir.path().join("taken.db");
     let path = path.to_str().unwrap();
     let schema = make_schema_u64_i64();
-    write_shard(&make_batch(&schema, &[(1, 1, 10)]), path, ShardWriteOpts::default()).unwrap();
+    write_shard(
+        &certified(make_batch(&schema, &[(1, 1, 10)])),
+        path,
+        ShardWriteOpts::default(),
+    )
+    .unwrap();
     let before = std::fs::read(path).unwrap();
 
-    let other = make_batch(&schema, &[(2, 1, 20)]);
+    let other = certified(make_batch(&schema, &[(2, 1, 20)]));
     assert_eq!(
         write_shard(&other, path, ShardWriteOpts::default()),
         Err(StorageError::Io(libc::EEXIST))
@@ -113,8 +118,8 @@ fn a_shard_drops_its_runs_dead_heap() {
     for copies in [1, 3] {
         let mut rows = vec![(1, 1, &x[..])];
         rows.extend((2..2 + copies).map(|pk| (pk, 1, &y[..])));
-        let retract = make_string_batch(&[(1, -1, &x)]);
-        let run = make_string_batch(&rows);
+        let retract = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, -1, &x)]));
+        let run = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows));
         let run = merge_consolidated(
             &[run.as_mem_batch(), retract.as_mem_batch()],
             &make_schema_pk_u64_payload_string(),
@@ -132,18 +137,24 @@ fn a_repeated_long_string_reaches_the_heap_once() {
     // Three rows: a dictionary would not be the smaller image.
     let few: Vec<(u64, i64, &[u8])> = vec![(1, 1, &x), (2, 1, &y), (3, 1, &x)];
     assert_eq!(
-        written_strings(&make_string_batch(&few)),
+        written_strings(&certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &few))),
         (x.len() + y.len(), Encoding::Raw)
     );
     let many: Vec<(u64, i64, &[u8])> = (1..=40)
         .map(|pk| (pk, 1, if pk % 3 == 0 { &y[..] } else { &x[..] }))
         .collect();
     assert_eq!(
-        written_strings(&make_string_batch(&many)),
+        written_strings(&certified(make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
+            &many
+        ))),
         (x.len() + y.len(), Encoding::Dict)
     );
     let one: Vec<(u64, i64, &[u8])> = (1..=40).map(|pk| (pk, 1, &y[..])).collect();
-    assert_eq!(written_strings(&make_string_batch(&one)), (y.len(), Encoding::Constant));
+    assert_eq!(
+        written_strings(&certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &one))),
+        (y.len(), Encoding::Constant)
+    );
 }
 
 /// `2 * values` cells holding each of `values` strings of `width` bytes twice,
@@ -213,9 +224,10 @@ fn more_short_values_than_a_dictionary_holds_are_their_lengths() {
 #[test]
 fn distinct_strings_are_their_lengths() {
     let distinct = |n: u64| {
-        string_batch(
+        make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
             &(1..=n)
-                .map(|pk| (pk, format!("{pk:0w$}", w = 8 + pk as usize % 9)))
+                .map(|pk| (pk, 1, format!("{pk:0w$}", w = 8 + pk as usize % 9)))
                 .collect::<Vec<_>>(),
         )
     };
@@ -345,7 +357,10 @@ fn string_images_are_pinned() {
         (vec![Constant, Dict, Seq, Seq, Symbols, Raw], 15498601318452023197),
         "coded heap"
     );
-    let two = string_batch(&[(1, "the first long value"), (2, "the second long value")]);
+    let two = make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(1, 1, "the first long value"), (2, 1, "the second long value")],
+    );
     assert_eq!(
         shard(&two, false),
         (vec![Raw, Raw, Raw], 12857855154648196144),

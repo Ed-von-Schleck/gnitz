@@ -11,22 +11,22 @@ fn col(tc: TypeCode) -> SchemaColumn {
 /// has three columns, the PK ones `U64 NOT NULL` and the rest of the case's type.
 #[test]
 #[allow(clippy::type_complexity)]
-fn reduce_out_key_picks_the_output_key() {
-    use ReduceOutKey::*;
+fn natural_key_picks_the_output_key() {
     use TypeCode as T;
-    // (pk, group, (non-PK type code, nullable), key)
-    let rows: &[(&[u32], &[u32], (TypeCode, bool), ReduceOutKey)] = &[
-        (&[0], &[], (T::U64, false), SyntheticFold),
-        (&[0], &[1], (T::U64, true), SyntheticFold),
-        (&[0], &[1], (T::U64, false), Natural),
-        (&[0], &[1], (T::F64, false), SyntheticFold),
-        (&[0], &[1], (T::String, false), SyntheticFold),
-        (&[0], &[0], (T::String, true), Natural),
-        (&[0, 1], &[0, 1], (T::String, true), Natural),
-        (&[0, 1], &[1, 0], (T::String, true), SyntheticFold),
-        (&[0, 1], &[0], (T::String, true), Natural),
-        (&[0, 1], &[0, 1, 2], (T::U64, false), SyntheticFold),
-        (&[0, 1], &[1, 2], (T::U64, false), SyntheticFold),
+    let (natural, synthetic_fold) = (true, false);
+    // (pk, group, (non-PK type code, nullable), natural)
+    let rows: &[(&[u32], &[u32], (TypeCode, bool), bool)] = &[
+        (&[0], &[], (T::U64, false), synthetic_fold),
+        (&[0], &[1], (T::U64, true), synthetic_fold),
+        (&[0], &[1], (T::U64, false), natural),
+        (&[0], &[1], (T::F64, false), synthetic_fold),
+        (&[0], &[1], (T::String, false), synthetic_fold),
+        (&[0], &[0], (T::String, true), natural),
+        (&[0, 1], &[0, 1], (T::String, true), natural),
+        (&[0, 1], &[1, 0], (T::String, true), synthetic_fold),
+        (&[0, 1], &[0], (T::String, true), natural),
+        (&[0, 1], &[0, 1, 2], (T::U64, false), synthetic_fold),
+        (&[0, 1], &[1, 2], (T::U64, false), synthetic_fold),
     ];
     for &(pk, group, (tc, nullable), want) in rows {
         let cols: Vec<SchemaColumn> = (0..3)
@@ -36,11 +36,7 @@ fn reduce_out_key_picks_the_output_key() {
             })
             .collect();
         let schema = SchemaDescriptor::new(&cols, pk);
-        assert_eq!(
-            reduce_out_key(&schema, group),
-            want,
-            "{pk:?} {group:?} {tc:?} {nullable}"
-        );
+        assert_eq!(natural_key(&schema, group), want, "{pk:?} {group:?} {tc:?} {nullable}");
     }
 }
 

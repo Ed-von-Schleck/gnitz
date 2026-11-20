@@ -352,7 +352,7 @@ nothing can link.
 | `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
 | `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |
 | `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them |
-| `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
+| `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests, and re-runs a test of the calling binary in a child process |
 | `gnitz-fuzz` | Dev-only: fuzzing through what a network delivers — seeds from recorded traffic, edits placed by what the decoders read, and the driver that plays edited traffic into a real server |
 
 ### The engine (`gnitz-zset` + `gnitz-trace` + `gnitz-store` + `gnitz-server`)

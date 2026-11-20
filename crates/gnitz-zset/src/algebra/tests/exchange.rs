@@ -166,7 +166,11 @@ fn a_join_scatter_routes_each_row_to_its_reindexed_owner() {
         (vec![(5, I64), (6, U128)], true),
     ] {
         let plan = ScatterPlan::join(&schema, &slots).expect("the fixture key routes");
-        assert_eq!(matches!(plan.0, Some(GroupKey::Packed(_))), packed, "{slots:?}");
+        assert_eq!(
+            matches!(plan.0, Some(Route::Key(GroupKey::Packed(_)) | Route::WidePacked(_))),
+            packed,
+            "{slots:?}"
+        );
         let reindex = MapKind::Reindex {
             keep: vec![],
             key: slots.clone(),

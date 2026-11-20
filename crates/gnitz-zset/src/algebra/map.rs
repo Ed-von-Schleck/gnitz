@@ -76,7 +76,7 @@ fn stamp_hash_row_pks(output: &mut DirectWriter<'_>, fold: &FoldCols) {
     for start in (0..n).step_by(FOLD_CHUNK) {
         let end = (start + FOLD_CHUNK).min(n);
         let keys = &mut keys[..end - start];
-        fold.keys_chunk(&output.written(), first + start, keys);
+        fold.identities(&output.written(), first + start, keys);
         let pk = &mut output.pk_mut()[start * KEY_BYTES..end * KEY_BYTES];
         for (key, dst) in keys.iter().zip(pk.as_chunks_mut::<KEY_BYTES>().0) {
             *dst = key.to_be_bytes();
@@ -300,8 +300,8 @@ impl MapPlan {
                     copy_runs::<0>(src.pk(), out.pk_mut(), ranges.iter().copied(), stride);
                 }
                 PkSource::Pack { packer, .. } => {
-                    debug_assert_eq!(out.schema.pk_stride(), packer.out_stride);
-                    packer.pack_rows(out.pk_mut(), packer.out_stride, &mb, ranges);
+                    debug_assert_eq!(out.schema.pk_stride(), packer.out_stride());
+                    packer.pack_rows(out.pk_mut(), packer.out_stride(), &mb, ranges);
                 }
                 // Hashes the finished output row, below.
                 PkSource::HashRow(_) => {}

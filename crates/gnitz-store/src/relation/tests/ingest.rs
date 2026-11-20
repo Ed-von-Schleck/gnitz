@@ -1,8 +1,7 @@
 use crate::relation::{ChildKind, PkRule, RelationKind};
 use crate::storage::{read_at, read_intact};
 use crate::test_support::{
-    TID, assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture,
-    zset_of,
+    TID, assert_index_holds, id_rows, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
 };
 use gnitz_wire::{PkColList, ViewBudget};
 
@@ -32,7 +31,7 @@ fn an_upsert_moves_the_index_entry() {
     let schema = make_schema_u64_i64();
     let mut registry = relation_fixture(RelationKind::BaseTable, schema, &[&[1]], []);
     for val in [10, 10, 10, 20] {
-        let row = make_batch_raw(&schema, &[(1, 1, val)]);
+        let row = make_batch(&schema, &[(1, 1, val)]);
         registry.ingest(TID, row.clone()).unwrap();
         let ix = registry.relation(TID).unwrap().index_on(&[1]).unwrap();
         assert_index_holds(ix, &row, format_args!("after {val}"));
@@ -61,7 +60,7 @@ fn pending_rows_are_refused_for_a_view() {
     let schema = make_schema_u64_i64();
     let mut registry = relation_fixture(RelationKind::View(ViewBudget::Plain), schema, &[], []);
     let err = registry
-        .ingest_with(TID, make_batch_raw(&schema, &[(1, 1, 10)]), PkRule::Enforce, true)
+        .ingest_with(TID, make_batch(&schema, &[(1, 1, 10)]), PkRule::Enforce, true)
         .unwrap_err();
     assert!(err.contains("is a view"), "{err}");
     assert!(registry.seal(TID).unwrap().is_none());
@@ -73,7 +72,7 @@ fn pending_rows_are_refused_for_a_view() {
 #[test]
 fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
     let schema = make_schema_u64_i64();
-    let rows = |rows: &[(u64, i64, i64)]| make_batch_raw(&schema, rows);
+    let rows = |rows: &[(u64, i64, i64)]| make_batch(&schema, rows);
     let mut registry = relation_fixture(
         RelationKind::BaseTable,
         schema,

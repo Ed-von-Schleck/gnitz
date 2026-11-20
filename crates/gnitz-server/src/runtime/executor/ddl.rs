@@ -57,7 +57,7 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
     let tid = ctrl.hdr.target_id;
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     let block = &frame[ctrl.data.expect("a DDL_TXN item carries a data block")];
-    let batch = Batch::decode_foreign_wal_block(block, family.schema())
+    let batch = Batch::decode_foreign_wal_blocks(&[block], family.schema())
         .map_err(|e| format!("family {tid} decode error: {e}"))?;
     Ok((family, batch))
 }

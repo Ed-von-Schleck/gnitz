@@ -161,7 +161,7 @@ fn a_content_key_packs_its_content_hash() {
         let packer = KeyPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
         let want: Vec<u128> = contents.iter().map(|c| gnitz_wire::checksum_128(c)).collect();
         let mut got = vec![0; contents.len()];
-        packer.identities_over(&b.as_mem_batch(), &[(0, contents.len())], &mut got);
+        packer.identities(&b.as_mem_batch(), 0, &mut got);
         assert_eq!(got, want, "{}", schema.columns()[1].type_code);
     }
 }
@@ -216,7 +216,7 @@ fn pack_rows_hashes_content_slots_as_a_row_at_a_time() {
         &[2, 4, 5],
         &[1, 2, 3, 4, 5],
     ] {
-        let (packer, _) = KeyPacker::new_group_key(&schema, group, &[]).unwrap();
+        let packer = group_packer(&schema, group);
         for runs in windows {
             let want: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
             for pad in [0, 3] {
@@ -231,6 +231,15 @@ fn pack_rows_hashes_content_slots_as_a_row_at_a_time() {
             }
         }
     }
+}
+
+/// The packer of a group key over `group`.
+fn group_packer(schema: &SchemaDescriptor, group: &[u32]) -> KeyPacker {
+    let cols: Vec<_> = group
+        .iter()
+        .map(|&c| locate_key_col(schema, c, "group key").unwrap())
+        .collect();
+    KeyPacker::group(&cols).unwrap()
 }
 
 // -----------------------------------------------------------------------
@@ -386,7 +395,7 @@ mod pack_proptest {
             }
 
             let group: Vec<u32> = (1..=types.len() as u32).collect();
-            let (packer, _) = KeyPacker::new_group_key(&null_schema, &group, &[]).unwrap();
+            let packer = group_packer(&null_schema, &group);
             let mb = nb.as_mem_batch();
             let by_row = |r: usize| {
                 let mut key = vec![0u8; packer.out_stride];
@@ -407,7 +416,7 @@ mod pack_proptest {
 /// a string is assembled on the stack and through the scratch; over chunks that
 /// start anywhere and end short.
 #[test]
-fn keys_chunk_digests_each_row_as_key_row_does() {
+fn identities_digest_each_row_as_key_row_does() {
     use TypeCode::*;
     let mut rng = Rng::new(0xf01d);
     let payload = [U8, I8, U16, I16, U32, I32, U64, I64, U128, I128, String];
@@ -445,17 +454,14 @@ fn keys_chunk_digests_each_row_as_key_row_does() {
         let has_string = cols.iter().any(|&c| s.columns()[c].type_code.is_german_string());
         paths.insert((has_string, k > FOLD_INLINE_COLS));
         let want: Vec<u128> = (0..n).map(|r| f.key_row(&mb, r)).collect();
-        let mut all = Vec::new();
-        f.for_each_chunk(&mb, &[(0, n)], |start, keys| {
-            assert_eq!(start, all.len(), "chunks in row order");
-            all.extend_from_slice(keys);
-        });
+        let mut all = vec![0u128; n];
+        f.identities(&mb, 0, &mut all);
         let types: Vec<TypeCode> = s.columns().iter().map(|c| c.type_code).collect();
         assert_eq!(all, want, "{cols:?} over {types:?}");
         let start = rng.gen_range(n as u64) as usize;
-        let len = (rng.gen_range((n - start) as u64 + 1) as usize).min(FOLD_CHUNK);
+        let len = rng.gen_range((n - start) as u64 + 1) as usize;
         let mut chunk = vec![0u128; len];
-        f.keys_chunk(&mb, start, &mut chunk);
+        f.identities(&mb, start, &mut chunk);
         assert_eq!(chunk, want[start..start + len], "{cols:?} from row {start}");
     }
     assert_eq!(

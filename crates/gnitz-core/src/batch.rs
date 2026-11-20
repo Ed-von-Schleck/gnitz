@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use gnitz_expr::SchemaDescriptor;
 use gnitz_wire::{PkKeys, Regions};
-use gnitz_zset::repr::{Batch, BatchBuilder, CertifiedBlock, DirectWriter, MemBatch, Pick, materialize_carrying};
+use gnitz_zset::repr::{Batch, BatchBuilder, CertifiedBlock, DirectWriter, MemBatch};
 
 use crate::{ProtocolError, Schema};
 
@@ -179,7 +179,7 @@ impl ZSetBatch {
     /// agreeing. `src` and `self` must share a layout.
     pub fn copy_row_at(&mut self, src: &ZSetBatch, i: usize, weight: i64) {
         debug_assert!(self.same_layout(src), "copy_row_at: layout mismatch");
-        self.owned().append_row_from_source(weight, &src.view(), i, 0, None);
+        self.owned().append_row_from_source(weight, &src.view(), i);
     }
 
     /// Same key column types and the same payload type list.
@@ -231,36 +231,30 @@ impl ZSetBatch {
     }
 
     /// The rows `rows` names, in order, each at most once. A gather naming every row in
-    /// place is the batch itself; otherwise the heap is carried whole where that beats
-    /// moving each kept string.
+    /// place is the batch itself.
     pub fn gather(self, rows: &[u32]) -> ZSetBatch {
         if rows.len() == self.len() && rows.iter().enumerate().all(|(i, &r)| r as usize == i) {
             return self;
         }
-        let v = self.view();
-        if v.schema().string_payload_slots() == 0 {
-            return self.gathered(rows);
-        }
-        let picks: Vec<Pick> = rows.iter().map(|&r| (0, r, v.get_weight(r as usize))).collect();
-        self.again(materialize_carrying(&[v], v.schema(), &picks))
+        self.gathered(rows)
     }
 
-    /// The rows `rows` names, in order, each at most once, onto a fresh heap holding only
-    /// their strings; `self` is left as it was.
+    /// The rows `rows` names, in order, as [`MemBatch::indexed_rows`] copies them;
+    /// `self` is left as it was.
     pub fn gathered(&self, rows: &[u32]) -> ZSetBatch {
         self.again(self.view().indexed_rows(rows))
     }
 
     /// This batch as its canonical region list.
-    pub(crate) fn wire_regions(&self) -> Regions<'_> {
-        self.view().wire_regions()
+    pub(crate) fn regions(&self) -> Regions<'_> {
+        self.view().regions()
     }
 }
 
 /// Equal layouts' types, rows and heap bytes.
 impl PartialEq for ZSetBatch {
     fn eq(&self, o: &Self) -> bool {
-        self.same_layout(o) && self.wire_regions() == o.wire_regions()
+        self.same_layout(o) && self.regions() == o.regions()
     }
 }
 

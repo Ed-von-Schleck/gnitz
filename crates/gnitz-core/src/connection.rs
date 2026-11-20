@@ -147,7 +147,7 @@ impl Request<'_> {
             Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, Target::from(0), id, &[]),
             Request::Backup(name) => (ClientVerb::Backup, Target::from(0), 0, name.as_bytes()),
             Request::DdlTxn(families) => {
-                let blocks = families.iter().map(|(family, b)| (*family, b.wire_regions()));
+                let blocks = families.iter().map(|(family, b)| (*family, b.regions()));
                 return multi_frame::encode_ddl_txn(out, blocks);
             }
             Request::PushTxn(families) => return append_push_txn(out, families),
@@ -168,7 +168,7 @@ pub(crate) fn append_payload(out: &mut Vec<u8>, hdr: ControlHeader, blob: &[u8],
         out,
         &hdr,
         blob,
-        data.filter(|b| !b.is_empty()).map(|b| b.wire_regions()).as_deref(),
+        data.filter(|b| !b.is_empty()).map(|b| b.regions()).as_deref(),
     );
 }
 
@@ -199,7 +199,7 @@ pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
             conflict_mode: f.mode,
             basis: f.basis,
             blob: f.batch.schema().shape_record(),
-            data: f.batch.wire_regions(),
+            data: f.batch.regions(),
         })
         .collect();
     encode_items(out, ClientVerb::PushTxn, &items)

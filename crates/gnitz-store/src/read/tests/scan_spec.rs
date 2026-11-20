@@ -2,8 +2,8 @@ use super::*;
 use crate::read::SourceCursor;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    RelationFixture, TID, batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch_raw,
-    make_schema_u64_i64, map_of, order_by, relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of,
+    RelationFixture, TID, batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch, make_schema_u64_i64,
+    map_of, order_by, relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_foundation::rng::Rng;
@@ -19,7 +19,7 @@ use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 /// admitted verbatim.
 fn view(rows: &[(u64, i64, i64)], scan_chunk_rows: usize) -> RelationFixture {
     let schema = make_schema_u64_i64();
-    let batch = make_batch_raw(&schema, rows);
+    let batch = make_batch(&schema, rows);
     view_with(chunked(scan_chunk_rows), schema, [batch])
 }
 
@@ -159,9 +159,7 @@ fn a_filtered_read_over_many_runs_keeps_the_survivors_net_weights() {
             .collect();
         want.sort_unstable();
         for config in [StoreConfig::default(), spilling()] {
-            let batches = rounds
-                .iter()
-                .map(|rows| make_batch_raw(&schema, rows).into_consolidated());
+            let batches = rounds.iter().map(|rows| make_batch(&schema, rows).into_consolidated());
             let config = StoreConfig {
                 scan_chunk_rows: 1 + rng.gen_range(24) as usize,
                 ..config
@@ -272,7 +270,7 @@ fn keyed_reads_return_each_named_keys_whole_group() {
     rows.extend([(7, 1, 71), (7, 1, 72), (7, 1, 73)]);
     let mut r = view(&rows, 2);
     // Retracted in a later ingest, (7, 70) is a ghost every read must drop.
-    r.ingest(TID, make_batch_raw(&schema, &[(7, -1, 70)])).unwrap();
+    r.ingest(TID, make_batch(&schema, &[(7, -1, 70)])).unwrap();
     let pk_range = |start, end| col_range(0, start, end);
     let reads = [
         (ReadBound::None, (0..10).collect()),
@@ -551,7 +549,7 @@ fn skeleton_fixture() -> RelationFixture {
     let schema = make_schema_u64_i64();
     let rows = |ids: std::ops::Range<u64>| {
         let rows: Vec<_> = ids.map(|id| (id, 1, id as i64)).collect();
-        make_batch_raw(&schema, &rows)
+        make_batch(&schema, &rows)
     };
     let kind = RelationKind::View(ViewBudget::Bounded {
         capacity_bytes: std::num::NonZeroU64::MIN,
@@ -571,8 +569,7 @@ fn skeleton_fixture() -> RelationFixture {
         "premise: the capacity sweep must have dehydrated the flushed shard",
     );
     r.ingest(TID, rows(100..105)).unwrap();
-    r.ingest(TID, make_batch_raw(&schema, &[(2, 1, 7), (100, 1, 7)]))
-        .unwrap();
+    r.ingest(TID, make_batch(&schema, &[(2, 1, 7), (100, 1, 7)])).unwrap();
     r
 }
 
@@ -612,7 +609,7 @@ impl Recompute {
         (self.edit)(&mut rows);
         rows.sort_unstable();
         self.calls.push(ks);
-        Ok(make_batch_raw(&make_schema_u64_i64(), &rows).into_consolidated())
+        Ok(make_batch(&make_schema_u64_i64(), &rows).into_consolidated())
     }
 }
 

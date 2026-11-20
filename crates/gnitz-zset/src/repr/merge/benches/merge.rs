@@ -1,7 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, weighted_rows};
+use crate::test_support::{
+    certified, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, u64_pk_schema, weighted_rows,
+};
 use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
@@ -68,7 +70,8 @@ fn run_merge_dup_pk_bench() {
         let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let merge = || {
-            let rows = run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), true);
+            let (rows, spans) = run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), true);
+            assert!(!spans, "copies of one batch interleave");
             black_box(rows.iter().map(|r| r.2).sum::<i64>())
         };
         // K copies of one batch: every row folds with its twins.
@@ -193,7 +196,7 @@ fn two_way_bench() {
                 .map(|i| row(i, side))
                 .map(|(pk, v)| (pk as u64, 1, v as i64))
                 .collect();
-            make_batch(&schema, &rows)
+            certified(make_batch(&schema, &rows))
         });
         let rows = (N + side1) as f64;
         let mem = [a.as_mem_batch(), b.as_mem_batch()];
@@ -504,7 +507,13 @@ fn shared_lead_merge_bench() {
                 .collect();
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
             let rows = groups * k * run;
-            let merge = || black_box(run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), true).len());
+            let merge = || {
+                black_box(
+                    run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), true)
+                        .0
+                        .len(),
+                )
+            };
             assert_eq!(merge(), rows, "every row is distinct");
             // The least of several runs: nothing but the kernel can lower a count.
             let least = (0..5).map(|_| instructions.measure(merge).1).min().unwrap();

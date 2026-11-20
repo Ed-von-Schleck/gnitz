@@ -8,7 +8,7 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    FoldRow, RowKey, arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, scratch_table,
+    FoldRow, RowKey, arb_fold_case, fold_batch, make_batch, make_schema_u64_i64, new_table, row_key, scratch_table,
     table_shards, zset_of, zset_sum,
 };
 use gnitz_wire::PkKeys;
@@ -16,7 +16,7 @@ use proptest::prelude::*;
 
 /// unconsolidated rows over [`make_schema_u64_i64`]; the ingest path runs the sort+fold.
 fn rows(rows: &[(u64, i64, i64)]) -> Batch {
-    make_batch_raw(&make_schema_u64_i64(), rows)
+    make_batch(&make_schema_u64_i64(), rows)
 }
 
 /// Every shard file in `dir`.
@@ -718,11 +718,17 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
     let batch = |keys: std::ops::Range<u64>| {
         let values: Vec<String> = keys.clone().map(sentence).collect();
         let rows: Vec<(u64, i64, &[u8])> = keys.zip(&values).map(|(k, v)| (k, 1, v.as_bytes())).collect();
-        crate::test_support::make_string_batch(&rows)
+        crate::test_support::certified(crate::test_support::make_batch_bytes(
+            &crate::test_support::make_schema_pk_u64_payload_string(),
+            &rows,
+        ))
     };
     let digests = |t: &Table| -> Vec<Option<u64>> {
         let shards = table_shards(t);
-        shards.iter().map(|s| s.codebook().map(|b| b.digest())).collect()
+        shards
+            .iter()
+            .map(|s| s.codebook().map(|b| b.table().digest()))
+            .collect()
     };
     let mut t = open();
     let mut pushed = Vec::new();

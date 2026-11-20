@@ -15,13 +15,31 @@ use gnitz_expr::ColumnLocator;
 use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
 use gnitz_zset::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 
-/// A schema with one PK column per type code in `tcs`, plus a single trailing
-/// I64 payload column. [`pk_only_schema`] is the no-payload counterpart.
-pub fn pk_payload_schema(tcs: &[TypeCode]) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-    cols.push(SchemaColumn::new(TypeCode::I64, false));
-    let pk: Vec<u32> = (0..tcs.len() as u32).collect();
-    SchemaDescriptor::new(&cols, &pk)
+/// Leading PK columns, one per type code in `pk` and in that order, then the
+/// `payload` columns.
+pub fn keyed_schema(pk: &[TypeCode], payload: &[SchemaColumn]) -> SchemaDescriptor {
+    let cols: Vec<SchemaColumn> = pk
+        .iter()
+        .map(|&t| SchemaColumn::new(t, false))
+        .chain(payload.iter().copied())
+        .collect();
+    SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
+}
+
+/// The `pk` columns plus a single trailing I64 payload column.
+pub fn pk_payload_schema(pk: &[TypeCode]) -> SchemaDescriptor {
+    keyed_schema(pk, &[SchemaColumn::new(TypeCode::I64, false)])
+}
+
+/// The `pk` columns and no payload: the PK-shape builder for the OPK
+/// encode/compare/route tests.
+pub fn pk_only_schema(pk: &[TypeCode]) -> SchemaDescriptor {
+    keyed_schema(pk, &[])
+}
+
+/// A U64 PK ahead of the `payload` columns.
+pub fn u64_pk_schema(payload: &[SchemaColumn]) -> SchemaDescriptor {
+    keyed_schema(&[TypeCode::U64], payload)
 }
 
 /// `cols` of `schema` as join-key slots, each at the column's own slot type.
@@ -36,31 +54,22 @@ pub fn make_schema_u64_i64() -> SchemaDescriptor {
     pk_payload_schema(&[TypeCode::U64])
 }
 
-/// Build a batch over [`make_schema_u64_i64`]-shaped schemas from native
-/// `(pk, weight, payload)` tuples and certify it consolidated. **Rows must
-/// arrive pre-sorted by (PK, payload) with no net-zero duplicates** — the
-/// certification is a claim the caller makes, and `certify_consolidated` only
-/// debug-verifies it; a lying claim would let a consumer skip-point silently
-/// mis-fold weights.
+/// `batch` certified consolidated. **Its rows must already be in (PK, payload)
+/// order with no duplicate and no net-zero element** — the certification is a
+/// claim the caller makes, and `certify_consolidated` only debug-verifies it; a
+/// lying claim would let a consumer that skips the fold silently mis-fold
+/// weights. Every builder here leaves its batch unconsolidated, so a test makes
+/// this claim where it calls this.
+pub fn certified(mut batch: Batch) -> Batch {
+    batch.certify_consolidated();
+    batch
+}
+
+/// A batch over [`make_schema_u64_i64`]-shaped schemas of native
+/// `(pk, weight, payload)` rows, unconsolidated in the order given.
 pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = make_batch_raw(schema, rows);
-    b.certify_consolidated();
-    b
-}
-
-/// [`make_batch`] without the consolidated certification: the batch stays
-/// honestly unconsolidated, for tests whose rows are unsorted or that exercise the
-/// sort/fold paths themselves.
-pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let rows: Vec<(u128, i64, i64)> = rows.iter().map(|&(pk, w, v)| (pk as u128, w, v)).collect();
-    make_batch_u128_raw(schema, &rows)
-}
-
-/// A U64 PK ahead of the `payload` columns.
-pub fn u64_pk_schema(payload: &[SchemaColumn]) -> SchemaDescriptor {
-    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend_from_slice(payload);
-    SchemaDescriptor::new(&cols, &[0])
+    make_batch_u128(schema, &rows)
 }
 
 /// A schema of 1..=8 columns interleaving `1..=max_pk` PK columns — PK-eligible,
@@ -96,56 +105,6 @@ pub fn arb_schema(max_pk: usize) -> impl Strategy<Value = SchemaDescriptor> {
                 .collect();
             SchemaDescriptor::new(&cols, pk)
         })
-}
-
-/// Set by [`run_test_in_child`] on the child it spawns; the body test guards on
-/// [`in_child_test`] so a normal sweep skips it.
-const CHILD_TEST_VAR: &str = "GNITZ_RUN_CHILD_TEST";
-
-/// True only inside a re-exec'd child spawned by [`run_test_in_child`].
-pub fn in_child_test() -> bool {
-    std::env::var(CHILD_TEST_VAR).is_ok()
-}
-
-/// Re-run the current test binary filtered to `internal_test`, with `envs` set,
-/// and hand back the child's exit status and captured output.
-///
-/// The reason a test needs a child at all rather than setting the variable
-/// itself: a fault seam — and the `io_uring` verdict — reads its variable once per
-/// process, and the test runner runs a crate's tests as
-/// threads of one process, so an in-process `set_var` would race every other
-/// test and lose to whichever read first. A direct in-process fail-stop would
-/// also terminate the runner. `internal_test` must return early unless
-/// [`in_child_test`], so a normal test sweep skips it.
-///
-/// `--exact`, so the filter cannot also pick up a sibling whose name contains
-/// this one. Pass the caller's `module_path!()` as `module`: libtest's filter
-/// path is the module path minus the crate segment, so deriving it here keeps
-/// the filter right when a test module moves.
-pub fn run_test_in_child(module: &str, internal_test: &str, envs: &[(&str, &str)]) -> std::process::Output {
-    let filter = match module.split_once("::") {
-        Some((_krate, path)) => format!("{path}::{internal_test}"),
-        None => internal_test.to_string(),
-    };
-    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-    cmd.arg("--exact").arg(&filter).arg("--nocapture");
-    cmd.env(CHILD_TEST_VAR, "1");
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    cmd.output().unwrap()
-}
-
-/// Assert the child exited cleanly **and** ran its one test. The exit code alone
-/// proves nothing: `libtest` exits 0 when its filter matches nothing, so
-/// renaming a child would otherwise leave its caller green covering nothing.
-pub fn assert_child_ok(out: &std::process::Output, what: &str) {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.code() == Some(0) && stdout.contains("1 passed"),
-        "{what}\n-- child stdout --\n{stdout}-- child stderr --\n{stderr}",
-    );
 }
 
 /// Flip each bit of `buf[span]` in turn, run `check(byte, bit, buf)` with it
@@ -201,24 +160,13 @@ pub fn row_key<S: RowSource>(src: &S, schema: &SchemaDescriptor, row: usize) -> 
                 return None;
             }
             let tc = col.type_code;
-            let raw = src.get_col_ptr(row, pi, tc.wire_stride());
-            Some(if tc.is_german_string() {
-                gnitz_wire::german_string_bytes(raw.first_chunk().unwrap(), src.heap()).into_owned()
-            } else {
-                raw.to_vec()
+            Some(match tc.is_german_string() {
+                true => gnitz_wire::payload_bytes(src, row, pi).into_owned(),
+                false => src.get_col_ptr(row, pi, tc.wire_stride()).to_vec(),
             })
         })
         .collect();
     (src.get_pk_bytes(row).to_vec(), vals)
-}
-
-/// An all-PK schema: one column per type code in `types`, every column a PK
-/// column (`pk_indices = 0..n`) and no payload — the generic PK-shape builder
-/// for the OPK encode/compare/route tests.
-pub fn pk_only_schema(types: &[TypeCode]) -> SchemaDescriptor {
-    let cols: Vec<SchemaColumn> = types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
-    let pk: Vec<u32> = (0..types.len() as u32).collect();
-    SchemaDescriptor::new(&cols, &pk)
 }
 
 /// OPK-encode native PK column values (one per PK column, in PK-list order) into
@@ -229,9 +177,9 @@ pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
     schema.opk_key_cols(vals).pk_bytes().to_vec()
 }
 
-/// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native
-/// u128 PKs, rows left unconsolidated in the order given.
-pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
+/// [`make_batch`] over [`make_schema_u128_i64`]-shaped schemas — native u128
+/// PKs.
+pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
     let mut b = BatchBuilder::new(schema);
     for &(pk, w, val) in rows {
         b.begin_row(pk, w);
@@ -239,16 +187,6 @@ pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)])
         b.end_row();
     }
     b.finish()
-}
-
-/// [`make_batch_u128_raw`] plus the consolidated certification. **Rows must
-/// arrive pre-sorted by (PK, payload) with no net-zero duplicates** — the
-/// certification is a claim the caller makes, and `certify_consolidated` only
-/// debug-verifies it.
-pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
-    let mut b = make_batch_u128_raw(schema, rows);
-    b.certify_consolidated();
-    b
 }
 
 /// U128 pk + a single I64 payload column — the 16-byte-PK sibling of
@@ -262,37 +200,46 @@ pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
     u64_pk_schema(&[SchemaColumn::new(TypeCode::String, false)])
 }
 
-/// [`make_batch_bytes`] under [`make_schema_pk_u64_payload_string`].
-pub fn make_string_batch(rows: &[(u64, i64, &[u8])]) -> Batch {
-    make_batch_bytes(&make_schema_pk_u64_payload_string(), rows)
-}
-
-/// [`make_batch_bytes_raw`] certified consolidated: the rows must already be in
-/// (PK, payload) order.
-pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-    let mut b = make_batch_bytes_raw(schema, rows);
-    b.certify_consolidated();
-    b
-}
-
-/// A `(U64 pk, STRING|BLOB payload)` batch of `(pk, weight, bytes)` rows, in the
-/// order given.
-pub fn make_batch_bytes_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
+/// A `(U64 pk, STRING|BLOB payload)` batch of `(pk, weight, bytes)` rows,
+/// unconsolidated in the order given.
+pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, impl AsRef<[u8]>)]) -> Batch {
     let mut b = BatchBuilder::new(schema);
-    for &(pk, w, val) in rows {
-        b.begin_row(pk as u128, w);
-        b.put_blob(val);
+    for (pk, w, val) in rows {
+        b.begin_row(*pk as u128, *w);
+        b.put_blob(val.as_ref());
         b.end_row();
     }
     b.finish()
 }
 
-/// The batch as the Z-Set it denotes: `Σ weight` per logical row identity, with
-/// the net-zero entries dropped. Emission order and the physical encoding of a
-/// string both drop out, which is what lets two independently produced batches
-/// be compared.
+/// Add `rows` — each a logical row identity and its weight — into the Z-set
+/// `z`, dropping the elements that net to zero. The rows may come from any
+/// source a [`row_key`] can read.
+pub fn zset_add(z: &mut HashMap<RowKey, i64>, rows: impl IntoIterator<Item = (RowKey, i64)>) {
+    for (key, w) in rows {
+        *z.entry(key).or_insert(0) += w;
+    }
+    z.retain(|_, w| *w != 0);
+}
+
+/// The batch, read under `schema`, as the Z-Set it denotes: `Σ weight` per
+/// logical row identity, with the net-zero entries dropped. Emission order and
+/// the physical encoding of a string both drop out, which is what lets two
+/// independently produced batches be compared.
 pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
     zset_sum(std::slice::from_ref(batch), schema)
+}
+
+/// The Z-set sum of `inputs`, each read under `schema`, net-zero elements dropped.
+pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
+    let mut z = HashMap::new();
+    for b in inputs {
+        zset_add(
+            &mut z,
+            (0..b.len()).map(|row| (row_key(b, schema, row), b.get_weight(row))),
+        );
+    }
+    z
 }
 
 /// Every row of `batch` as its logical identity and weight, in batch order —
@@ -417,7 +364,7 @@ pub fn payload0_i64<S: RowSource>(src: &S, row: usize) -> i64 {
     gnitz_wire::payload_u64(src, row, 0) as i64
 }
 
-/// The `(pk, weight, payload)` rows [`make_batch_raw`] would build `batch` from,
+/// The `(pk, weight, payload)` rows [`make_batch`] would build `batch` from,
 /// sorted: a batch's row order is not what a test compares.
 pub fn batch_rows(batch: &Batch) -> Vec<(u64, i64, i64)> {
     let mut rows: Vec<_> = (0..batch.len())
@@ -433,18 +380,6 @@ pub fn batch_rows(batch: &Batch) -> Vec<(u64, i64, i64)> {
     rows
 }
 
-/// The Z-set sum of `inputs`, net-zero elements dropped.
-pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
-    let mut z: HashMap<RowKey, i64> = HashMap::new();
-    for b in inputs {
-        for row in 0..b.len() {
-            *z.entry(row_key(b, schema, row)).or_insert(0) += b.get_weight(row);
-        }
-    }
-    z.retain(|_, w| *w != 0);
-    z
-}
-
 /// Fixed-int schemas at both edges of every argsort key form — `≤8` (strides 1,
 /// 2, 4, 8), `9..=16` (12, 16), the packed `17..=28` (17, 24, 28), `29..=32` (29,
 /// 32) and the `>32` fallback (80) — one whose fixed-int payload spans every
@@ -454,11 +389,7 @@ pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, 
 /// than the schema's.
 pub(crate) fn fold_schemas() -> Vec<SchemaDescriptor> {
     use TypeCode::*;
-    let generic = |pk: &[TypeCode]| {
-        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-        cols.extend([SchemaColumn::new(String, true), SchemaColumn::new(I64, true)]);
-        SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
-    };
+    let generic = |pk: &[TypeCode]| keyed_schema(pk, &[SchemaColumn::new(String, true), SchemaColumn::new(I64, true)]);
     let wide_ints = [I8, U16, I32, U64, I64, I16, U8].map(|t| SchemaColumn::new(t, false));
     vec![
         pk_payload_schema(&[U8]),
@@ -533,22 +464,6 @@ pub fn arb_fold_case() -> impl Strategy<Value = (SchemaDescriptor, Vec<FoldRow>)
             });
         (Just(s), rows)
     })
-}
-
-/// `n` rows of keys of `stride` that differ in their first byte's low bit and
-/// their last byte alone — so a batch of at least 256 of them takes the radix
-/// sort — with repeats, cancels and payload ties.
-pub fn radix_fold_rows(stride: usize, n: u64) -> Vec<FoldRow> {
-    (0..n)
-        .map(|i| {
-            let r = gnitz_foundation::rng::mix(i);
-            let mut pk = vec![0u8; stride];
-            pk[0] = (r >> 40) as u8 & 1;
-            pk[stride - 1] = (r >> 48) as u8;
-            let w = (r >> 20) as i64 % 4 - 1;
-            (pk, w, Some((r >> 8) as u8 % 4), Some((r >> 12) as u8 % 4))
-        })
-        .collect()
 }
 
 /// `rows` as an unconsolidated batch over a `fold_schemas` schema. A NULL and a
@@ -633,18 +548,6 @@ pub fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
     }
 }
 
-/// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column,
-/// in the order given.
-pub fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
-    let mut b = BatchBuilder::new(&make_schema_pk_u64_payload_string());
-    for (pk, v) in rows {
-        b.begin_row(*pk as u128, 1);
-        b.put_string(v.as_ref());
-        b.end_row();
-    }
-    b.finish()
-}
-
 /// Payload column 0's string on every row, in order.
 pub fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
     (0..batch.len())
@@ -669,7 +572,7 @@ pub fn prose(i: usize) -> String {
 
 /// Strings that are prefixes of one another, one escaping `0x00`, and two that
 /// share more leading bytes than an index key's lead slot holds.
-pub const STRS: [&str; 10] = [
+pub(crate) const STRS: [&str; 10] = [
     "",
     "a",
     "ab",
@@ -684,4 +587,17 @@ pub const STRS: [&str; 10] = [
 
 /// Floats `total_cmp` tells apart though `==` does not, and the ones it places
 /// past every finite value.
-pub const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];
+pub(crate) const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];
+
+/// `schema` as a shape record. A descriptor holds no DECIMAL scale, so every
+/// scale is zero: this is a relation's own shape record only where none of its
+/// columns is a DECIMAL.
+pub fn encode_schema_record(schema: &SchemaDescriptor) -> Vec<u8> {
+    let cols = schema.columns().iter().map(|c| gnitz_wire::schema_record::RecordCol {
+        ty: gnitz_wire::ColType::of(c.type_code),
+        nullable: c.nullable,
+        hidden: false,
+        name: "",
+    });
+    gnitz_wire::schema_record::encode(cols, schema.pk_cols())
+}

@@ -8,9 +8,9 @@ use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::sal::format::payload_rows;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::fixtures::id;
-use crate::test_support::{make_batch, make_schema_u64_i64};
+use crate::test_support::encode_schema_record;
+use crate::test_support::{certified, make_batch, make_schema_u64_i64};
 use gnitz_store::relation::PkRule;
-use gnitz_zset::schema::encode_schema_record;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -372,7 +372,7 @@ fn a_checkpoint_may_admit_a_unit_within_the_limit_refused_past_its_floor() {
 #[test]
 fn a_committed_zoned_push_marks_the_writer_as_holding_pushes() {
     let log = test_log(1 << 20, 1, 1);
-    let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
+    let batch = certified(make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]));
     let record = encode_schema_record(batch.schema());
     let push = |scope: &mut SalScope, recovered| {
         scope.push(

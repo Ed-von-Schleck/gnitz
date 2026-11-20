@@ -12,7 +12,7 @@ use gnitz_wire::{AggDescriptor, AggFunc, OrderKey, TypeCode};
 
 use super::{At, Element, OrderIndex, OrderedKind, OrderedPlan, Walk, with_row};
 use crate::runs::Run;
-use gnitz_zset::algebra::{Agg, AggValues, RangeGroups, resolve_aggs};
+use gnitz_zset::algebra::{Agg, AggValues, FoldGroups, resolve_aggs};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -146,7 +146,7 @@ impl<'a> Running<'a> {
                     let mb = b.as_mem_batch();
                     let ranges = [(at.start, at.end)];
                     for k in 0..n {
-                        aggs.fold(k, &mb, &ranges, RangeGroups::One(NEW));
+                        aggs.fold(k, &mb, &ranges, FoldGroups::One(NEW));
                     }
                     *rows = rows.wrapping_add(mb.sum_weights(at.start, at.end));
                 }
@@ -199,7 +199,7 @@ impl<'a> Running<'a> {
     /// again. δ_out holds each element once, in the order of the walk.
     #[inline]
     pub(super) fn group(&mut self, out: &mut Batch, out_pk: &[u8], walk: &mut Walk<'_>) {
-        self.aggs.clear();
+        self.aggs.reset(2);
         (self.rows, self.groups) = ([0; 2], [0; 2]);
         while walk.pending() {
             self.fold_to_entry(walk);

@@ -5,6 +5,9 @@
 //!
 //! A server dies with the thread that started it, so no server outlives a
 //! test process that is killed rather than unwound.
+//!
+//! It also re-runs one test of the calling test binary in a child process,
+//! for a test that needs its own environment or must outlive a fail-stop.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -606,11 +609,7 @@ impl SyscallCounts {
 ///
 /// `None` when `strace` is not installed — the caller skips.
 pub fn strace_test(module: &str, child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCounts> {
-    // libtest's filter path is the module path minus the crate segment.
-    let child_test = &match module.split_once("::") {
-        Some((_krate, path)) => format!("{path}::{child_test}"),
-        None => child_test.to_string(),
-    };
+    let child_test = &child_filter(module, child_test);
     let strace =
         env::var_os("PATH").and_then(|p| env::split_paths(&p).map(|d| d.join("strace")).find(|c| c.is_file()))?;
     let exe = env::current_exe().expect("current_exe");
@@ -652,4 +651,58 @@ pub fn strace_test(module: &str, child_test: &str, env: &[(&str, &str)]) -> Opti
         })
         .collect();
     Some(SyscallCounts { calls, report })
+}
+
+/// The libtest filter naming `test` of the caller's `module` (its
+/// `module_path!()`): the module path minus the crate segment.
+fn child_filter(module: &str, test: &str) -> String {
+    match module.split_once("::") {
+        Some((_krate, path)) => format!("{path}::{test}"),
+        None => test.to_string(),
+    }
+}
+
+/// Set by [`run_test_in_child`] on the child it spawns; the body test guards on
+/// [`in_child_test`] so a normal sweep skips it.
+const CHILD_TEST_VAR: &str = "GNITZ_RUN_CHILD_TEST";
+
+/// True only inside a re-exec'd child spawned by [`run_test_in_child`].
+pub fn in_child_test() -> bool {
+    std::env::var(CHILD_TEST_VAR).is_ok()
+}
+
+/// Re-run the current test binary filtered to `internal_test`, with `envs` set,
+/// and hand back the child's exit status and captured output.
+///
+/// The reason a test needs a child at all rather than setting the variable
+/// itself: a fault seam — and the `io_uring` verdict — reads its variable once per
+/// process, and the test runner runs a crate's tests as
+/// threads of one process, so an in-process `set_var` would race every other
+/// test and lose to whichever read first. A direct in-process fail-stop would
+/// also terminate the runner. `internal_test` must return early unless
+/// [`in_child_test`], so a normal test sweep skips it.
+///
+/// `--exact`, so the filter cannot also pick up a sibling whose name contains
+/// this one. Pass the caller's `module_path!()` as `module`, so the filter stays
+/// right when a test module moves.
+pub fn run_test_in_child(module: &str, internal_test: &str, envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(env::current_exe().unwrap());
+    cmd.args(["--exact", &child_filter(module, internal_test), "--nocapture"]);
+    cmd.env(CHILD_TEST_VAR, "1");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// Assert the child exited cleanly **and** ran its one test. The exit code alone
+/// proves nothing: `libtest` exits 0 when its filter matches nothing, so
+/// renaming a child would otherwise leave its caller green covering nothing.
+pub fn assert_child_ok(out: &std::process::Output, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.code() == Some(0) && stdout.contains("1 passed"),
+        "{what}\n-- child stdout --\n{stdout}-- child stderr --\n{stderr}",
+    );
 }

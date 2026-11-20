@@ -2,8 +2,12 @@
 //! two-way galloping batch merge, and in-batch consolidation; and the loser
 //! tree every N-way merge plays its tournament on (`loser_tree`).
 //!
-//! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
-//! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
+//! The N-way merge reads its sources as [`ColumnarSource`]s and emits
+//! [`Pick`]s for the scatter to copy, a [dominated](RunMerge::dominated)
+//! merge's stretches each as one span. [`run_merge`] plays one to its end; a
+//! [`RunMerge`] is one held open, which the read cursor repositions and
+//! drives a group or a chunk at a time. The two-way merge reads two in-memory
+//! batches and writes its output itself, a stretch at a time.
 //!
 //! Every merge fuses its walk with consolidation: rows with the same
 //! (PK, payload) have their weights summed; rows whose net weight is zero are
@@ -17,7 +21,8 @@ use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
-use super::scatter::{ColumnarSource, Pick};
+use super::pool::vec_bytes;
+use super::scatter::{ColumnarSource, Pick, span_pick};
 use super::seek::gallop_from;
 use super::string_heap::{BlobCache, rebase_string_cells, row_long_bytes};
 use super::writer::DirectWriter;
@@ -28,7 +33,7 @@ use crate::schema::{
 use gnitz_wire::{Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT, RowSource, ScalarKind, native_key_image};
 
 mod loser_tree;
-pub use loser_tree::{LoserTree, Player};
+use loser_tree::{LoserTree, Player};
 
 // ---------------------------------------------------------------------------
 // Z-Set `+` over consolidated batches
@@ -104,7 +109,7 @@ fn merge_interleaved(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Bat
 /// it.
 #[inline(never)]
 fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let rows = run_merge(sources, schema, sources.iter().map(|s| 0..s.count), false);
+    let (rows, _) = run_merge(sources, schema, sources.iter().map(|s| 0..s.count), false);
     super::scatter::materialize_carrying(sources, schema, &rows)
 }
 
@@ -127,14 +132,16 @@ macro_rules! with_spans {
         }
     };
 }
+pub use crate::with_spans;
 
 /// The consolidated merge of sorted `sources`, source `i` walked over the `i`-th
 /// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
-/// zero, at that sum, in (PK, payload) order.
+/// zero, at that sum, in (PK, payload) order; and whether any of them may be a
+/// [span](super::scatter::SPAN).
 ///
 /// `distinct` says each source holds each element of the merge's order at most
-/// once and at a nonzero weight, which lets the merge emit a [dominated](dominated)
-/// merge's stretches whole.
+/// once and at a nonzero weight, which lets the merge emit a
+/// [dominated](RunMerge::dominated) merge's stretches as spans.
 ///
 /// Dispatches the payload order, monomorphizing one branch-free copy of the
 /// merge loop, [`merge_picks`]. Out of line, so its callers compile as they
@@ -145,11 +152,11 @@ pub fn run_merge<S: ColumnarSource>(
     schema: &SchemaDescriptor,
     windows: impl IntoIterator<Item = Range<usize>>,
     distinct: bool,
-) -> Vec<Pick> {
+) -> (Vec<Pick>, bool) {
     if sources.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
-    let mut cursors: Vec<Range<usize>> = windows.into_iter().collect();
+    let cursors: Vec<Range<usize>> = windows.into_iter().collect();
     debug_assert_eq!(cursors.len(), sources.len(), "run_merge: one window per source");
     debug_assert!(
         cursors.iter().all(|c| c.end < u32::MAX as usize),
@@ -159,10 +166,12 @@ pub fn run_merge<S: ColumnarSource>(
         schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
         "a skeleton row merges under the PK-only schema: this order is never coarsened"
     );
-    with_spans!(distinct && dominated(&cursors), |SPANS| with_payload_cmp!(
-        schema,
-        |payload| merge_picks::<_, _, SPANS>(sources, schema, &mut cursors, payload)
-    ))
+    with_spans!(distinct && dominated(&cursors), |SPANS| {
+        let rows = with_payload_cmp!(schema, |payload| merge_picks::<_, _, SPANS>(
+            sources, schema, cursors, payload
+        ));
+        (rows, SPANS)
+    })
 }
 
 /// How many times the rows of all the other windows the largest must hold for
@@ -173,7 +182,7 @@ const SPAN_SKEW: usize = 8;
 /// of all the others: the stretches of it between their rows then run long, and
 /// a merge of distinct sources gallops them. A merge whose stretches are short
 /// keeps a loop with no stretch arm, which the arm would slow.
-pub fn dominated(windows: &[Range<usize>]) -> bool {
+fn dominated(windows: &[Range<usize>]) -> bool {
     let (total, most) = (windows.iter()).fold((0, 0), |(t, m), w| (t + w.len(), m.max(w.len())));
     (total - most) * SPAN_SKEW <= most
 }
@@ -185,28 +194,179 @@ pub fn dominated(windows: &[Range<usize>]) -> bool {
 fn merge_picks<S: ColumnarSource, P: PayloadOrder, const SPANS: bool>(
     sources: &[S],
     schema: &SchemaDescriptor,
-    cursors: &mut [Range<usize>],
+    cursors: Vec<Range<usize>>,
     payload: P,
 ) -> Vec<Pick> {
     let mut rows = Vec::with_capacity(cursors.iter().map(|c| c.len()).sum());
-    let order = MergeOrder::past_shared_prefix(sources, cursors, schema.pk_stride());
-    let mut tree = LoserTree::with_buffer(cursors.len(), Vec::new());
-    tree.rebuild(
-        |i| order.head(sources, i, &cursors[i]),
-        merge_less(schema, sources, order, payload),
-    );
-    drive::<_, _, SPANS>(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
+    let mut merge = RunMerge::played(sources, schema, cursors, payload);
+    merge.drive::<_, _, SPANS>(schema, sources, payload, |src, row, w| {
         rows.push((src as u32, row as u32, w));
         ControlFlow::Continue(())
     });
     rows
 }
 
-/// The order of two players whose keys under `order` tie, which [`drive`] and
-/// the read cursor share. Generic over the source type, so each caller
+/// An N-way (PK, payload) merge in progress over sources its caller holds and
+/// hands to every operation: the tournament, the order it plays by, and per
+/// source the rows still to walk. [`run_merge`] plays one to its end; the read
+/// cursor keeps one for its life, repositioning it by moving
+/// [its walks](Self::cursors_mut) and [rebuilding](Self::rebuild).
+pub struct RunMerge {
+    tree: LoserTree,
+    order: MergeOrder,
+    /// Per source, the rows still to walk: `start` is the next row, `end` the
+    /// walk's end. A `start` past `end` leaves the walk empty.
+    cursors: Vec<Range<usize>>,
+}
+
+impl Default for RunMerge {
+    fn default() -> Self {
+        RunMerge {
+            tree: LoserTree::with_buffer(0, Vec::new()),
+            order: MergeOrder::leading(0, false),
+            cursors: Vec::new(),
+        }
+    }
+}
+
+impl RunMerge {
+    /// The merge of `cursors`, the walks of `sources`, keyed past the prefix
+    /// every row they walk shares, its tournament played. Out of line, so the
+    /// merge loop of its caller compiles alike whatever the replay inlines.
+    #[inline(never)]
+    fn played<S: ColumnarSource, P: PayloadOrder>(
+        sources: &[S],
+        schema: &SchemaDescriptor,
+        cursors: Vec<Range<usize>>,
+        payload: P,
+    ) -> Self {
+        let mut merge = RunMerge {
+            order: MergeOrder::past_shared_prefix(sources, &cursors, schema.pk_stride()),
+            tree: LoserTree::with_buffer(cursors.len(), Vec::new()),
+            cursors,
+        };
+        merge.rebuild(schema, sources, payload);
+        merge
+    }
+
+    /// Open the merge over every row of each of `sources`, keyed by the leading
+    /// bytes of a `stride`-byte PK and coarsened iff one of them is a skeleton
+    /// run, reusing the buffers it holds. Its tournament is unplayed until
+    /// [`Self::rebuild`].
+    pub fn open<S: ColumnarSource>(&mut self, sources: &[S], stride: usize) {
+        self.cursors.clear();
+        self.cursors.extend(sources.iter().map(|s| 0..s.row_count()));
+        self.order = MergeOrder::leading(stride, sources.iter().any(S::is_skeleton));
+        self.tree = LoserTree::with_buffer(sources.len(), self.tree.take_buffer());
+    }
+
+    /// Empty the merge for reuse, freeing each buffer that holds room for more
+    /// than `max_elems` elements; returns the heap bytes it keeps.
+    pub fn clear(&mut self, max_elems: usize) -> usize {
+        if self.cursors.capacity() > max_elems {
+            self.cursors = Vec::new();
+        }
+        self.cursors.clear();
+        let mut losers = self.tree.take_buffer();
+        if losers.capacity() > max_elems {
+            losers = Vec::new();
+        }
+        let bytes = vec_bytes(&self.cursors) + vec_bytes(&losers);
+        self.tree = LoserTree::with_buffer(0, losers);
+        bytes
+    }
+
+    /// Per source, the rows still to walk.
+    #[inline(always)]
+    pub fn cursors(&self) -> &[Range<usize>] {
+        &self.cursors
+    }
+
+    /// [`Self::cursors`], to move: the tournament holds the old heads until
+    /// [`Self::rebuild`].
+    #[inline(always)]
+    pub fn cursors_mut(&mut self) -> &mut [Range<usize>] {
+        &mut self.cursors
+    }
+
+    /// Whether the order folds a PK group holding a skeleton row into that row.
+    #[inline]
+    pub fn coarsens(&self) -> bool {
+        self.order.coarsen
+    }
+
+    /// Whether the largest walk holds at least [`SPAN_SKEW`] times the rows of
+    /// all the others: a [`Self::drive`] of distinct sources under `SPANS`
+    /// then gallops its stretches.
+    #[inline]
+    pub fn dominated(&self) -> bool {
+        dominated(&self.cursors)
+    }
+
+    /// Re-play the tournament over each source's current head. The order and
+    /// the walks are read into locals first: through `self`, which the replay
+    /// writes the tree through, they would be reloaded at every leaf.
+    #[inline(always)]
+    pub fn rebuild<S: ColumnarSource, P: PayloadOrder>(
+        &mut self,
+        schema: &SchemaDescriptor,
+        sources: &[S],
+        payload: P,
+    ) {
+        let (order, cursors) = (self.order, &self.cursors[..]);
+        self.tree.rebuild(
+            #[inline(always)]
+            |i| order.head(sources, i, &cursors[i]),
+            merge_less(schema, sources, order, payload),
+        );
+    }
+
+    /// [`drive`] this merge.
+    #[inline(always)]
+    pub fn drive<S: ColumnarSource, P: PayloadOrder, const SPANS: bool>(
+        &mut self,
+        schema: &SchemaDescriptor,
+        sources: &[S],
+        payload: P,
+        emit: impl FnMut(usize, usize, i64) -> ControlFlow<usize>,
+    ) {
+        let RunMerge { tree, order, cursors } = self;
+        drive::<_, _, SPANS>(tree, schema, sources, *order, cursors, payload, emit);
+    }
+
+    /// Move every head whose row `lags` to where `gallop` lands it, stepping
+    /// the tournament once per gallop. Only the champion can lag — it is the
+    /// least head — so the loop gallops it alone, and leaves the tournament as
+    /// a [`Self::rebuild`] at the new heads would. `lags` must hold of a
+    /// prefix of each source's walk and of no row past the gallop's landing.
+    #[inline]
+    pub fn seek_laggards<S: ColumnarSource, P: PayloadOrder>(
+        &mut self,
+        schema: &SchemaDescriptor,
+        sources: &[S],
+        payload: P,
+        lags: impl Fn(&S, usize) -> bool,
+        mut gallop: impl FnMut(&S, &Range<usize>) -> usize,
+    ) {
+        let (tree, order, cursors) = (&mut self.tree, self.order, &mut self.cursors[..]);
+        let less = merge_less(schema, sources, order, payload);
+        while let Some(Player { source_idx: src, row, .. }) = tree.peek() {
+            let (src, row) = (src as usize, row as usize);
+            // The champion is the least head, so once it no longer lags neither does any.
+            if !lags(&sources[src], row) {
+                break;
+            }
+            cursors[src].start = gallop(&sources[src], &cursors[src]);
+            tree.step_top(order.head(sources, src, &cursors[src]), &less);
+        }
+    }
+}
+
+/// The order of two players whose keys under `order` tie, which every
+/// tournament step plays by. Generic over the source type, so each caller
 /// monomorphizes its own branch-free copy.
 #[inline]
-pub fn merge_less<'a, S, P>(
+fn merge_less<'a, S, P>(
     schema: &'a SchemaDescriptor,
     sources: &'a [S],
     order: MergeOrder,
@@ -270,19 +430,19 @@ fn tie_less<const FOLD: bool, S: ColumnarSource, P: PayloadOrder>(
 /// ahead of that span are the same in every row the merge reads, and the ones
 /// behind it break a key tie.
 #[derive(Clone, Copy)]
-pub struct MergeOrder {
+struct MergeOrder {
     /// Where the key span starts in a wide PK; `None` for a narrow one.
     wide_at: Option<usize>,
     /// Collapse the payload axis at a skeleton row: it sorts before every
     /// hydrated row of its PK, making it the exemplar [`drive`] folds the whole
     /// PK group into. A runtime flag, not a second monomorphisation axis: it is
     /// constant for a merge's life and reached only on a PK tie.
-    pub coarsen: bool,
+    coarsen: bool,
 }
 
 impl MergeOrder {
     /// Keyed by the leading bytes of a `stride`-byte PK.
-    pub fn leading(stride: usize, coarsen: bool) -> Self {
+    fn leading(stride: usize, coarsen: bool) -> Self {
         MergeOrder {
             wide_at: (stride > NARROW_PK_MAX_BYTES).then_some(0),
             coarsen,
@@ -325,7 +485,7 @@ impl MergeOrder {
     /// The tournament leaf of source `src`'s walk `c`: its current row and that
     /// row's key, or `None` once the walk is exhausted.
     #[inline(always)]
-    pub fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &Range<usize>) -> Option<(u32, u128)> {
+    fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &Range<usize>) -> Option<(u32, u128)> {
         match c.start < c.end {
             true => Some((c.start as u32, self.key(&sources[src], c.start))),
             false => None,
@@ -363,28 +523,34 @@ fn span_end<S: ColumnarSource>(source: &S, order: MergeOrder, from: usize, end: 
 }
 
 /// Drive an N-way (PK, payload) merge to completion over `sources`, folding each
-/// group's weights and calling `emit(group_src, group_row, net_weight)` once per
-/// surviving (net ≠ 0) group; a `Break` returns immediately, that group consumed.
-/// Under `SPANS`, which asks that each source hold each element of the order
-/// once and at a nonzero weight, a stretch of one source below every other's
-/// head is galloped instead of stepped, each of its rows a group of one. The
-/// output PK is re-derived from `(group_src, group_row)` by the caller.
+/// group's weights and calling `emit` with the fields of the [`Pick`]
+/// `(group_src, group_row, net_weight)` once per surviving (net ≠ 0) group; a
+/// `Break` returns immediately, that group consumed. Under `SPANS`, which asks
+/// that each source hold each element of the order once and at a nonzero
+/// weight, a stretch of one source below every other's head is galloped instead
+/// of stepped, each of its rows a group of one, and emitted as the fields of
+/// one [span](super::scatter::SPAN); a `Break(k)` there takes the span's first
+/// `k` rows and returns, the rest unconsumed. The output PK is re-derived from
+/// the pick by the caller.
 ///
-/// Every N-way merge runs through this — [`run_merge`] and the read cursor's
-/// advance and drain — and it builds its order and group boundary itself, from
-/// the one [`tie_less`].
+/// The fields are passed apart: passed as one tuple, they cost the merge loop
+/// instructions on every group it emits.
+///
+/// Every N-way merge runs through this, by [`RunMerge::drive`] — [`run_merge`]
+/// and the read cursor's advance and drain — and it builds its order and group
+/// boundary itself, from the one [`tie_less`].
 ///
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
 /// forced inlining folds the branch and drops the unused arm per monomorphisation.
 #[inline(always)]
-pub fn drive<S, P, const SPANS: bool>(
+fn drive<S, P, const SPANS: bool>(
     tree: &mut LoserTree,
     schema: &SchemaDescriptor,
     sources: &[S],
     order: MergeOrder,
     cursors: &mut [Range<usize>],
     payload: P,
-    mut emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
+    mut emit: impl FnMut(usize, usize, i64) -> ControlFlow<usize>,
 ) where
     S: ColumnarSource,
     P: PayloadOrder,
@@ -409,13 +575,13 @@ pub fn drive<S, P, const SPANS: bool>(
         // A champion stepped below the bound is a group of one, as is every row
         // of its source still below it: under `SPANS`, one stretch.
         if step!(group_src) && SPANS {
-            // Its rows are emitted one group each; the champion then steps to
-            // the row past the last emitted, which replays only at the
-            // stretch's end.
-            let (c, source) = (&mut cursors[group_src], &sources[group_src]);
-            let end = span_end(source, order, c.start, c.end, tree.bound());
-            let stop = (group_row..end).find(|&r| emit(group_src, r, source.get_weight(r)).is_break());
-            c.start = stop.map_or(end, |r| r + 1);
+            // Its rows are emitted as one span; the champion then steps to the
+            // row past the last taken, which replays only at the stretch's end.
+            let c = &mut cursors[group_src];
+            let end = span_end(&sources[group_src], order, c.start, c.end, tree.bound());
+            let (src, start, len) = span_pick(group_src, group_row..end);
+            let stop = emit(src as usize, start as usize, len).break_value();
+            c.start = stop.map_or(end, |k| group_row + k);
             tree.step_top(order.head(sources, group_src, c), &less);
             if stop.is_some() {
                 return;
@@ -728,8 +894,7 @@ where
 /// Sort a single batch by (PK, payload) and consolidate: sum the weights of
 /// identical rows, drop ghosts. Appends one [`Pick`] `(0, row, net weight)` per
 /// group to `out` — [`run_merge`]'s single-source counterpart, in the shape
-/// [`super::scatter::UnifiedSet::materialize`] copies out and the caller sizes
-/// its arena from.
+/// [`super::scatter::materialize_carrying`] copies out.
 pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<Pick>) {
     if batch.count == 0 {
         return;
@@ -860,13 +1025,13 @@ impl ArgEntry for PackedEntry {
 /// a PK sorted by its payload as [`fold_runs`] folds it.
 #[inline]
 fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pick>, payload: P) {
-    let (n, schema, stride) = (batch.count, batch.schema, batch.pk_stride());
+    let (n, stride) = (batch.count, batch.pk_stride());
     if (17..=PACKED_MAX_STRIDE).contains(&stride) {
         let mut entries: Vec<PackedEntry> = (0..n as u32)
             .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))
             .collect();
         radix_sort_by_key(&mut entries, |&e| e);
-        return fold_runs(&mut entries, batch, schema, payload, out);
+        return fold_runs(&mut entries, batch, payload, out);
     }
     pk_width_dispatch!(stride, |K| {
         let mut entries: Vec<SortEntry<K>> = (0..n as u32)
@@ -876,7 +1041,7 @@ fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pic
             })
             .collect();
         radix_sort_by_key(&mut entries, |e| e.key);
-        fold_runs(&mut entries, batch, schema, payload, out);
+        fold_runs(&mut entries, batch, payload, out);
     })
 }
 
@@ -884,19 +1049,11 @@ fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pic
 /// run of a PK by its payload and push one survivor per (PK, payload) group whose
 /// weights do not cancel.
 #[inline]
-fn fold_runs<E: ArgEntry, P: PayloadOrder>(
-    entries: &mut [E],
-    batch: &MemBatch,
-    schema: &SchemaDescriptor,
-    payload: P,
-    out: &mut Vec<Pick>,
-) {
+fn fold_runs<E: ArgEntry, P: PayloadOrder>(entries: &mut [E], batch: &MemBatch, payload: P, out: &mut Vec<Pick>) {
     let weights = batch.weight().as_chunks::<8>().0;
     // Whether every payload column packs into [`fold_keyed`]'s key: none is a
     // string, none is 16 bytes wide.
-    let packable = schema
-        .payload_columns()
-        .all(|(_, c)| !c.type_code.is_german_string() && c.size() <= 8);
+    let packable = (batch.schema.payload_columns()).all(|(_, c)| !c.type_code.is_german_string() && c.size() <= 8);
     // The run in hand's payload keys and rows, in a buffer every run reuses.
     let mut keyed = Vec::new();
     for run in entries.chunk_by_mut(|a, b| a.same_pk(*b)) {
@@ -907,7 +1064,7 @@ fn fold_runs<E: ArgEntry, P: PayloadOrder>(
                     out.push((0, one.idx() as u32, weight));
                 }
             }
-            run => fold_run(run, batch, schema, payload, packable, weights, &mut keyed, out),
+            run => fold_run(run, batch, payload, packable, &mut keyed, out),
         }
     }
 }
@@ -917,18 +1074,16 @@ fn fold_runs<E: ArgEntry, P: PayloadOrder>(
 /// `packable`, else by the payload order's comparator. Out of line, so the loop
 /// over a batch of distinct PKs stays tight.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn fold_run<E: ArgEntry, P: PayloadOrder>(
     run: &mut [E],
     batch: &MemBatch,
-    schema: &SchemaDescriptor,
     payload: P,
     packable: bool,
-    weights: &[[u8; 8]],
     keyed: &mut Vec<(u128, u32)>,
     out: &mut Vec<Pick>,
 ) {
-    let cmp = |a: usize, b: usize| payload.compare(schema, batch, a, batch, b);
+    let weights = batch.weight().as_chunks::<8>().0;
+    let cmp = |a: usize, b: usize| payload.compare(batch.schema, batch, a, batch, b);
     if let [a, b] = run {
         let (a, b) = (a.idx(), b.idx());
         let weight = |i: usize| i64::from_le_bytes(weights[i]);
@@ -947,7 +1102,7 @@ fn fold_run<E: ArgEntry, P: PayloadOrder>(
     if packable {
         keyed.clear();
         keyed.extend(run.iter().map(|e| (0, e.idx() as u32)));
-        fold_keyed(batch, schema, 0, keyed, weights, out);
+        fold_keyed(batch, batch.schema, 0, keyed, weights, out);
     } else {
         run.sort_unstable_by(|a, b| cmp(a.idx(), b.idx()));
         fold_sorted(run, |e| e.idx(), |a, b| cmp(a.idx(), b.idx()).is_eq(), weights, out);

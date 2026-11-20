@@ -21,6 +21,8 @@ rustc-hash.workspace = true
 # `mmap`, for the read-only file mapping.
 libc.workspace = true
 smallvec.workspace = true
+# The FSST symbol table a store codes its shard heaps under.
+fsst-rs = "0.7"
 
 [dev-dependencies]
 gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }

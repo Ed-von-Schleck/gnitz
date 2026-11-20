@@ -42,6 +42,7 @@ slab = "0.4"
 
 [dev-dependencies]
 gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
+gnitz-test-harness = { path = "../gnitz-test-harness" }
 proptest.workspace = true
 tempfile.workspace = true
 

@@ -6,7 +6,7 @@ use crate::test_support::{
     radix_fold_rows, u64_pk_schema,
 };
 use gnitz_foundation::rng::mix;
-use gnitz_wire::TypeCode;
+use gnitz_wire::{MAX_PK_BYTES, TypeCode};
 use proptest::prelude::*;
 use std::collections::HashMap;
 
@@ -91,7 +91,8 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
     let pk: Vec<u32> = schema.pk_cols().to_vec();
     let all: Vec<u32> = (0..schema.num_columns() as u32).collect();
     let n = schema.num_columns() as u32;
-    let mut forms = vec![vec![], all];
+    let payload: Vec<u32> = (0..schema.num_columns() as u32).filter(|c| !pk.contains(c)).collect();
+    let mut forms = vec![vec![], all, payload];
     forms.extend((1..=pk.len()).map(|lead| pk[..lead].to_vec()));
     forms.extend((0..n).map(|c| vec![c]));
     forms.extend((0..n).flat_map(|a| (0..n).filter(move |&b| b != a).map(move |b| vec![a, b])));
@@ -175,6 +176,64 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                     prop_assert_eq!(ids[a] == ids[b], same_out_pk, "{:?}: rows {} and {}", cols, a, b);
                 }
             }
+            assert_prefixes_follow_out_pk(&key, cols, &mb, &ids)?;
+        }
+    }
+    Ok(())
+}
+
+/// The group prefix of an index grouped by `key` — by `cols` — ahead
+/// of a suffix of one column and of two: every row's, written a batch at a time,
+/// is its own [`GroupOutKey::prefix_of`], built from its identity `ids[row]` or
+/// not, and two rows share one iff they share an output PK.
+fn assert_prefixes_follow_out_pk(
+    key: &GroupOutKey,
+    cols: &[u32],
+    mb: &MemBatch,
+    ids: &[u128],
+) -> Result<(), TestCaseError> {
+    let (ordinal, image) = (
+        SchemaColumn::new(TypeCode::U8, false),
+        SchemaColumn::new(TypeCode::U64, false),
+    );
+    for suffix in [&[ordinal][..], &[ordinal, image]] {
+        let (prefix, b) = key.index_prefix(suffix);
+        let index = b.finish().unwrap();
+        let width = prefix.width();
+        prop_assert_eq!(
+            index.pk_stride(),
+            width + suffix.iter().map(|c| c.size()).sum::<usize>()
+        );
+        // A key past each prefix, so a write past one shows.
+        let stride = width + 1;
+        let mut keys = vec![0xA5u8; mb.len() * stride];
+        key.write_prefixes(&prefix, mb, &[(0, mb.len())], &mut keys, stride);
+        let prefix_of = |row: usize| key.prefix_of(&prefix, mb, row, None, &mut [0; MAX_PK_BYTES]).to_vec();
+        for (row, &id) in ids.iter().enumerate() {
+            let own = prefix_of(row);
+            prop_assert_eq!(
+                &keys[row * stride..][..stride],
+                &[&own[..], &[0xA5]].concat()[..],
+                "{:?}: row {}",
+                cols,
+                row
+            );
+            let mut buf = [0; MAX_PK_BYTES];
+            let from_id = key.prefix_of(&prefix, mb, row, Some(id), &mut buf);
+            prop_assert_eq!(from_id, &own[..], "{:?}: row {}", cols, row);
+        }
+        for a in 0..mb.len() {
+            for b in a + 1..mb.len() {
+                let same_out_pk = key.out_pk(mb, a).bytes() == key.out_pk(mb, b).bytes();
+                prop_assert_eq!(
+                    prefix_of(a) == prefix_of(b),
+                    same_out_pk,
+                    "{:?}: rows {} and {}",
+                    cols,
+                    a,
+                    b
+                );
+            }
         }
     }
     Ok(())
@@ -252,6 +311,39 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
         bb.put_int(u128::from(i) << 64 | u128::from(m % 3));
         bb.put_opt_int((!(m / 4).is_multiple_of(3)).then_some(u128::from(m / 12 % 3)));
         bb.put_int(((m % 9) as i64 - 4) as u128);
+        bb.end_row();
+    }
+    assert_groups_follow_out_pk(&bb.finish()).unwrap();
+}
+
+/// [`assert_groups_follow_out_pk`] over a compound PK of four columns in 15
+/// bytes and three nullable byte columns: a whole-PK group and a packed group
+/// of every nullable column each fill an index's column limit ahead of a
+/// suffix of two columns.
+#[test]
+fn groups_follow_out_pk_over_a_four_column_pk_and_nullable_bytes() {
+    use TypeCode::{I32, U8, U16, U64};
+    let c = SchemaColumn::new;
+    let schema = SchemaDescriptor::new(
+        &[
+            c(U8, false),
+            c(U16, false),
+            c(I32, false),
+            c(U64, false),
+            c(U8, true),
+            c(U8, true),
+            c(U8, true),
+        ],
+        &[0, 1, 2, 3],
+    );
+    let mut bb = BatchBuilder::new(&schema);
+    for i in 0..48u64 {
+        let m = mix(i) >> 40;
+        let pk = [m % 2, m / 2 % 3, m / 6 % 3, m / 18 % 2];
+        bb.begin_row_natives(&pk.map(u128::from), 1);
+        for k in 0..3 {
+            bb.put_opt_int((!(m >> (8 + k)).is_multiple_of(3)).then_some(u128::from(m >> (12 + 2 * k) & 1)));
+        }
         bb.end_row();
     }
     assert_groups_follow_out_pk(&bb.finish()).unwrap();

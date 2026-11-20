@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    RowKey, arb_fold_case, fold_batch, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, opk_pk, row_key, u64_pk_schema, weighted_rows, zset_of, zset_sum,
+    RowKey, arb_fold_case, certified, fold_batch, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, opk_pk, row_key, u64_pk_schema, weighted_rows, zset_add, zset_of, zset_sum,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::BatchBuilder;
@@ -48,11 +48,8 @@ proptest! {
             for key in keys {
                 let mut got: HashMap<RowKey, i64> = HashMap::new();
                 for (run, rows) in set.holding(key, probe_key(key)) {
-                    for r in rows {
-                        *got.entry(row_key(&**run, &s, r)).or_default() += run.get_weight(r);
-                    }
+                    zset_add(&mut got, rows.map(|r| (row_key(&**run, &s, r), run.get_weight(r))));
                 }
-                got.retain(|_, w| *w != 0);
                 let want_key: HashMap<RowKey, i64> =
                     want.iter().filter(|(k, _)| k.0 == key).map(|(k, w)| (k.clone(), *w)).collect();
                 prop_assert_eq!(got, want_key);
@@ -74,7 +71,7 @@ proptest! {
 }
 
 fn keyed_run(schema: &SchemaDescriptor, keys: std::ops::Range<u64>, w: i64, v: i64) -> Batch {
-    make_batch(schema, &keys.map(|k| (k, w, v)).collect::<Vec<_>>())
+    certified(make_batch(schema, &keys.map(|k| (k, w, v)).collect::<Vec<_>>()))
 }
 
 /// Whether a probe of `set` finds a row under PK `k`.
@@ -94,7 +91,7 @@ fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
     assert_eq!(set.len(), 2, "an insert-only run stays apart");
 
     let update: Vec<_> = (100..160).flat_map(|k| [(k, -1, 0), (k, 1, 1)]).collect();
-    set.push_run(Rc::new(make_batch(&schema, &update).trimmed()), &schema);
+    set.push_run(Rc::new(certified(make_batch(&schema, &update)).trimmed()), &schema);
     assert_eq!(set.len(), 2, "the update cancelled into the run before it");
     assert_eq!(set.row_count(), 200, "its retractions and their rows are gone");
 
@@ -236,8 +233,7 @@ fn a_fold_under_churn_keeps_every_run_trimmed() {
     let mut set = RunSet::new(usize::MAX);
     let mut latest = vec![0u64; KEYS as usize];
     let push = |set: &mut RunSet, rows: &[(u64, i64, Vec<u8>)]| {
-        let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(k, w, v)| (*k, *w, &v[..])).collect();
-        set.push_run(Rc::new(make_batch_bytes(&schema, &rows).trimmed()), &schema);
+        set.push_run(Rc::new(certified(make_batch_bytes(&schema, rows)).trimmed()), &schema);
     };
     push(
         &mut set,

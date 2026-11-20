@@ -27,7 +27,7 @@ impl ReadCursor {
     /// cursor on no row: only a seek positions it again.
     pub(crate) fn group_probe(&mut self) -> GroupProbe<'_> {
         // A skeleton run folds a PK group regardless of payload; a probe folds by element.
-        debug_assert!(!self.order.coarsen, "group probe over a skeleton store");
+        debug_assert!(!self.merge.coarsens(), "group probe over a skeleton store");
         // An invalid cursor's runs are spent: every key finds none.
         let pending = self.valid.then_some(self.current);
         self.valid = false;
@@ -57,7 +57,7 @@ impl GroupProbe<'_> {
     #[inline]
     pub(crate) fn copy_row_into(&self, at: CursorRow, batch: &mut Batch, weight: i64) {
         let (src, row) = self.row_at(at);
-        batch.append_row_from_source(weight, src, row, 0, None);
+        batch.append_row_from_source(weight, src, row);
     }
 
     /// The first live row of PK `key`, in (PK, payload) order, or `None` for a
@@ -76,7 +76,8 @@ impl GroupProbe<'_> {
                 Ordering::Less => self.pending = None,
             }
         }
-        let ReadCursor { sources, states, schema, .. } = &mut *self.cursor;
+        let ReadCursor { sources, merge, schema, .. } = &mut *self.cursor;
+        let states = merge.cursors_mut();
         debug_assert_eq!(key.len(), schema.pk_stride(), "a probe key is a whole PK");
         // Each run to its first row at or above the key; a run already there
         // costs one comparison.

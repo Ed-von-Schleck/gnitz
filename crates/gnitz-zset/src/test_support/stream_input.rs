@@ -98,9 +98,9 @@ pub fn shard(delta: &[(Row, i64)], w: u64) -> Batch {
 }
 
 /// Every group key form: V₀, the whole PK, its leading column, a non-leading
-/// signed PK column's image, a 16-byte payload column's image, the fold of a
-/// nullable column, of a column and a string, and of a set one column wider
-/// than a value index's key packs.
+/// signed PK column's image, a 16-byte payload column's image, the packed key
+/// of a nullable column, and the folds of a column and a string and of three
+/// columns.
 pub const GROUPS: [&[u32]; 8] = [&[], &[1, 3], &[1], &[3], &[6], &[0], &[3, 2], &[0, 1, 3]];
 
 const VALS: [i64; 5] = [i64::MIN, -1, 0, 1, i64::MAX];

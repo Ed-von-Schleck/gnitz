@@ -1,7 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
-use crate::test_support::{encode_to_wire_vec, pk_u64_two_i64_schema, string_batch, u64_pk_schema};
+use crate::test_support::{
+    encode_to_wire_vec, make_batch_bytes, make_schema_pk_u64_payload_string, pk_u64_two_i64_schema, u64_pk_schema,
+};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
@@ -58,8 +60,9 @@ fn foreign_decode_bench() {
         let (rows, instructions) = counter.measure(|| {
             (0..PASSES)
                 .map(|_| {
-                    Batch::decode_foreign_wal_block(black_box(&block), batch.schema())
+                    MemBatch::of_foreign_wal_block(black_box(&block), batch.schema())
                         .unwrap()
+                        .to_batch()
                         .len()
                 })
                 .sum::<usize>()
@@ -89,9 +92,9 @@ fn foreign_decode_bench() {
         ("512 bytes, non-ASCII", "aéb€".repeat(73)),
     ] {
         let rows: Vec<_> = (0..ROWS as u64)
-            .map(|i| (i, format!("{}{}", i % 10, &unit[1..])))
+            .map(|i| (i, 1, format!("{}{}", i % 10, &unit[1..])))
             .collect();
-        measure(label, string_batch(&rows));
+        measure(label, make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows));
     }
 }
 
@@ -105,7 +108,10 @@ fn reply_chunk_strings_bench() {
     const N: usize = 100_000;
     const BUDGET: usize = 64 << 10;
 
-    let long = string_batch(&(0..N as u64).map(|i| (i, format!("{i:040}"))).collect::<Vec<_>>());
+    let long = make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &(0..N as u64).map(|i| (i, 1, format!("{i:040}"))).collect::<Vec<_>>(),
+    );
 
     let mut cols = vec![SchemaColumn::new(TypeCode::I64, false); 6];
     cols.push(SchemaColumn::new(TypeCode::String, false));

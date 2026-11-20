@@ -10,16 +10,20 @@
 //! [`GroupOutKey::runs_into`] where a consolidated batch already stands in key
 //! order, else [`GroupOutKey::numbered_into`] — one ordinal per row, hashed
 //! while the groups are few for the rows, else sorted.
+//!
+//! An index of an operator's input rows grouped like its output — a reduce's
+//! value index, an order index — leads each entry's PK with the group's
+//! [`GroupPrefix`]: the group's columns packed, or the key's identity.
 
-use super::key_pack::{FOLD_CHUNK_MIN_ROWS, KeyPacker, locate_key_col, pk_run};
+use super::key_pack::{FOLD_CHUNK, FOLD_CHUNK_MIN_ROWS, FoldCols, KeyPacker, locate_key_col, pk_run};
 use super::zeroed;
 use crate::repr::{Batch, MemBatch, vec_bytes};
 use crate::schema::{
-    DerivedSchema, PkSortKey, ReduceOutKey, ReduceOutSlot, SchemaDescriptor, pk_width_dispatch, radix_sort_by_key,
-    reduce_out_key, reduce_out_layout,
+    DerivedSchema, PkSortKey, ReduceOutSlot, SchemaColumn, SchemaDescriptor, natural_key, pk_width_dispatch,
+    radix_sort_by_key, reduce_out_layout,
 };
-use gnitz_expr::ColumnLocator;
-use gnitz_wire::{NARROW_PK_MAX_BYTES, TypeCode};
+use gnitz_expr::{BatchView, ColumnLocator};
+use gnitz_wire::{MAX_PK_COLUMNS, NARROW_PK_MAX_BYTES, TypeCode};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
@@ -29,42 +33,64 @@ use std::collections::hash_map::Entry;
 pub(crate) enum GroupKey {
     /// The `n` PK bytes at `at`: consecutive PK columns' own images.
     PkRange { at: usize, n: usize },
-    /// The OPK image of the payload column in `slot`, at that column's width.
+    /// The OPK image of the payload column in `slot`, at that column's width: a
+    /// natural key only, since a lone column packs as itself only when it is
+    /// non-nullable and keyed by its own type, which makes it PK-eligible.
     Image { slot: u8, size: u8, type_code: TypeCode },
-    /// The group's packed key, NULLs marked: at most 16 bytes, held by the
-    /// `_group_pk` — also a join key packed off the PK region, at any width. A
-    /// group whose own images do not fit one packs to the NULL-distinct XXH3
-    /// fold of its columns alone.
+    /// The group's packed key, NULLs marked, held by the `_group_pk` — also a
+    /// join key packed off the PK region: at most 16 bytes.
     Packed(KeyPacker),
+    /// The NULL-distinct XXH3 fold of the group's columns, held by the
+    /// `_group_pk` of a group whose packed key does not fit one.
+    Fold(FoldCols),
     /// The empty group set's one group, V₀: no column is read.
     Global,
+}
+
+/// `group_cols` over `schema`, each column and where a row holds it; refused
+/// when one is out of range or has no key image.
+fn locate_group(schema: &SchemaDescriptor, group_cols: &[u32]) -> Result<Vec<(SchemaColumn, ColumnLocator)>, String> {
+    group_cols
+        .iter()
+        .map(|&c| locate_key_col(schema, c, "group key"))
+        .collect()
 }
 
 impl GroupKey {
     /// Refused when a group column is out of range or has no key image.
     pub(crate) fn new(schema: &SchemaDescriptor, group_cols: &[u32]) -> Result<Self, String> {
-        let locs: Vec<ColumnLocator> = group_cols
-            .iter()
-            .map(|&c| locate_key_col(schema, c, "group key").map(|(_, loc)| loc))
-            .collect::<Result<_, _>>()?;
-        Ok(match reduce_out_key(schema, group_cols) {
-            // The group's own columns: one PK run, or one payload column.
-            ReduceOutKey::Natural => Self::in_place(&locs).expect("a natural group key reads in place"),
-            // A `_group_pk` holds the group itself where its packed key fits one.
-            ReduceOutKey::SyntheticFold if locs.is_empty() => GroupKey::Global,
-            ReduceOutKey::SyntheticFold => match KeyPacker::new_group_key(schema, group_cols, &[])?.0 {
-                // A folded column alone fills the 16 bytes, so a packer that fits folds none.
-                p if (1..=GROUP_PK_BYTES).contains(&p.out_stride) => Self::packed(p),
-                _ => GroupKey::Packed(KeyPacker::fold_only(locs)),
-            },
-        })
+        Ok(Self::of_group(
+            &locate_group(schema, group_cols)?,
+            natural_key(schema, group_cols),
+        ))
     }
 
-    /// The key `packer` packs, read in place where the batch already spells it.
-    pub(crate) fn packed(packer: KeyPacker) -> Self {
+    /// The key of the located `group`, `natural` where its columns are the
+    /// output PK's own.
+    fn of_group(group: &[(SchemaColumn, ColumnLocator)], natural: bool) -> Self {
+        let locs = || group.iter().map(|&(_, loc)| loc).collect::<Vec<_>>();
+        if natural {
+            // The group's own columns: one PK run, or one payload column.
+            return Self::in_place(&locs()).expect("a natural group key reads in place");
+        }
+        if group.is_empty() {
+            return GroupKey::Global;
+        }
+        // A `_group_pk` holds the group itself where its packed key fits one.
+        let fits = |p: &KeyPacker| p.key_columns().count() <= MAX_PK_COLUMNS && p.out_stride() <= GROUP_PK_BYTES;
+        match KeyPacker::group(group).filter(fits) {
+            Some(p) => Self::packed(p).ok().expect("a packed key of at most 16 bytes"),
+            None => GroupKey::Fold(FoldCols::new(locs())),
+        }
+    }
+
+    /// The key `packer` packs, read in place where the batch already spells it;
+    /// else the packer back where it packs more than 16 bytes.
+    pub(crate) fn packed(packer: KeyPacker) -> Result<Self, KeyPacker> {
         match packer.identity_columns().and_then(|locs| Self::in_place(&locs)) {
-            Some(key) => key,
-            None => GroupKey::Packed(packer),
+            Some(key) => Ok(key),
+            None if packer.out_stride() <= NARROW_PK_MAX_BYTES => Ok(GroupKey::Packed(packer)),
+            None => Err(packer),
         }
     }
 
@@ -82,7 +108,7 @@ impl GroupKey {
 
     /// This key resolved against the rows of `mb`.
     #[inline(always)]
-    pub(crate) fn form<'k, 'a>(&'k self, mb: &MemBatch<'a>) -> KeyForm<'k, 'a> {
+    pub(crate) fn form<'a>(&self, mb: &MemBatch<'a>) -> KeyForm<'a> {
         match *self {
             GroupKey::PkRange { at, n } if n <= NARROW_PK_MAX_BYTES => KeyForm::Cells(KeyCells {
                 region: mb.pk(),
@@ -93,6 +119,7 @@ impl GroupKey {
                 signed: false,
             }),
             GroupKey::PkRange { at, n } => KeyForm::WidePk { at, n },
+            GroupKey::Packed(_) | GroupKey::Fold(_) => KeyForm::Chunked,
             GroupKey::Image { slot, size, type_code } => KeyForm::Cells(KeyCells {
                 region: mb.col_data(slot as usize),
                 stride: size as usize,
@@ -101,22 +128,59 @@ impl GroupKey {
                 opk: false,
                 signed: type_code.is_signed_int(),
             }),
-            GroupKey::Packed(ref p) => KeyForm::Packed(p),
             GroupKey::Global => KeyForm::Global,
+        }
+    }
+
+    /// Row `row`'s identity: the key up to 16 bytes, widened as
+    /// `gnitz_wire::widen_pk_be` does, else its XXH3-128.
+    #[inline(always)]
+    fn identity(&self, mb: &MemBatch, row: usize) -> u128 {
+        match *self {
+            GroupKey::PkRange { at, n } if n <= NARROW_PK_MAX_BYTES => {
+                gnitz_wire::widen_pk_be(mb.get_pk_range(row, at, n))
+            }
+            GroupKey::PkRange { at, n } => gnitz_wire::checksum_128(mb.get_pk_range(row, at, n)),
+            GroupKey::Image { slot, size, type_code } => {
+                ColumnLocator::Payload { slot, size, type_code }.opk_image(mb, row)
+            }
+            GroupKey::Packed(ref p) => p.narrow_image(mb, row),
+            GroupKey::Fold(ref f) => f.key_row(mb, row),
+            GroupKey::Global => gnitz_wire::global_group_key(),
+        }
+    }
+
+    /// The identities of rows `start..start + out.len()` into `out`, of a narrow
+    /// packed key or a fold.
+    #[inline]
+    pub(crate) fn identities<B: BatchView>(&self, batch: &B, start: usize, out: &mut [u128]) {
+        match self {
+            GroupKey::Packed(p) => p.identities(batch, start, out),
+            GroupKey::Fold(f) => f.identities(batch, start, out),
+            _ => unreachable!("only a packed key or a fold computes its identities ahead"),
+        }
+    }
+
+    /// Whether computing an identity hashes: a fold, a packed key with a string
+    /// column, or a PK range wider than 16 bytes.
+    fn hashes(&self) -> bool {
+        match *self {
+            GroupKey::Packed(ref p) => !p.packs_without_hashing(),
+            GroupKey::Fold(_) => true,
+            GroupKey::PkRange { n, .. } => n > NARROW_PK_MAX_BYTES,
+            GroupKey::Image { .. } | GroupKey::Global => false,
         }
     }
 }
 
 /// A [`GroupKey`] as one batch's rows hold it.
-pub(crate) enum KeyForm<'k, 'a> {
+pub(crate) enum KeyForm<'a> {
     /// One cell of 1 to 16 bytes per row.
     Cells(KeyCells<'a>),
     /// A PK range wider than a cell.
-    WidePk {
-        at: usize,
-        n: usize,
-    },
-    Packed(&'k KeyPacker),
+    WidePk { at: usize, n: usize },
+    /// A packed key or a fold: its identities computed a chunk of rows at a time.
+    Chunked,
     /// The one group, V₀.
     Global,
 }
@@ -234,6 +298,9 @@ pub struct GroupOutKey {
     key: GroupKey,
     /// The output PK is a hidden `_group_pk`, which the key is widened to.
     synthetic: bool,
+    /// Packs the group's columns as an index's [`GroupPrefix`] leads with them;
+    /// `None` where they pass the PK's column limit.
+    index_packer: Option<KeyPacker>,
     /// The input columns the output carries after its key, as the input locates them.
     carried: Vec<ColumnLocator>,
 }
@@ -246,12 +313,18 @@ impl GroupOutKey {
         group_cols: &[u32],
         row: impl IntoIterator<Item = u32>,
     ) -> Result<(Self, DerivedSchema), String> {
-        let key = GroupKey::new(input, group_cols)?;
+        let group = locate_group(input, group_cols)?;
+        let natural = natural_key(input, group_cols);
+        let key = GroupKey::of_group(&group, natural);
+        // The output PK's own columns where the key is natural; else the group as
+        // a packed `_group_pk` packs it, also where that is wider than one.
+        let index_packer = match natural {
+            true => Some(KeyPacker::of_span(group.iter().map(|&(_, loc)| loc))),
+            false => KeyPacker::group(&group),
+        };
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
-        let layout = reduce_out_layout(input, group_cols, row);
-        let synthetic = layout.first() == Some(&ReduceOutSlot::SyntheticKey);
-        for slot in layout {
+        for slot in reduce_out_layout(input, group_cols, row) {
             match slot {
                 ReduceOutSlot::SyntheticKey => b.push_pk(ReduceOutSlot::SYNTHETIC_KEY_COL),
                 ReduceOutSlot::Key(c) => b.push_pk(input.columns()[c as usize]),
@@ -261,7 +334,15 @@ impl GroupOutKey {
                 }
             }
         }
-        Ok((GroupOutKey { key, synthetic, carried }, b))
+        Ok((
+            GroupOutKey {
+                key,
+                synthetic: !natural,
+                index_packer,
+                carried,
+            },
+            b,
+        ))
     }
 
     /// Grouped by the empty set: one group, V₀.
@@ -273,30 +354,84 @@ impl GroupOutKey {
     /// The output PK of `row`'s group.
     #[inline]
     pub fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
-        let group_pk = |image| OutPk::inline(image, GROUP_PK_BYTES);
-        match &self.key {
-            &GroupKey::PkRange { at, n } if self.synthetic => {
-                group_pk(gnitz_wire::widen_pk_be(mb.get_pk_range(row, at, n)))
-            }
-            &GroupKey::PkRange { at, n } => OutPk::Borrowed(mb.get_pk_range(row, at, n)),
-            &GroupKey::Image { slot, size, type_code } => OutPk::inline(
-                ColumnLocator::Payload { slot, size, type_code }.opk_image(mb, row),
-                size as usize,
-            ),
-            GroupKey::Packed(p) => group_pk(p.narrow_image(mb, row)),
-            GroupKey::Global => group_pk(gnitz_wire::global_group_key()),
-        }
+        self.out_pk_with(mb, row, None)
     }
 
     /// [`Self::out_pk`], built from `id` — the group's [`Self::with_identity`]
-    /// identity — where one is given and the key's output PK is that identity;
-    /// a PK range is borrowed or widened from `row` whatever `id` holds.
+    /// identity — where one is given: a `_group_pk` is the identity, a natural
+    /// payload key its image, and a natural PK range is borrowed from `row`.
     #[inline]
     pub fn out_pk_with<'a>(&self, mb: &'a MemBatch, row: usize, id: Option<u128>) -> OutPk<'a> {
-        match (&self.key, id) {
-            (GroupKey::Packed(_) | GroupKey::Global, Some(id)) => OutPk::inline(id, GROUP_PK_BYTES),
-            (&GroupKey::Image { size, .. }, Some(id)) => OutPk::inline(id, size as usize),
-            _ => self.out_pk(mb, row),
+        let width = match self.key {
+            GroupKey::PkRange { at, n } if !self.synthetic => return OutPk::Borrowed(mb.get_pk_range(row, at, n)),
+            GroupKey::Image { size, .. } => size as usize,
+            _ => GROUP_PK_BYTES,
+        };
+        OutPk::inline(id.unwrap_or_else(|| self.key.identity(mb, row)), width)
+    }
+
+    /// The prefix an index's entries lead with — see [`GroupPrefix`] — and the
+    /// index's PK region: the prefix's columns, then `suffix`.
+    pub fn index_prefix(&self, suffix: &[SchemaColumn]) -> (GroupPrefix, DerivedSchema) {
+        let packer = (self.index_packer.clone()).filter(|p| p.key_columns().count() + suffix.len() <= MAX_PK_COLUMNS);
+        let mut b = DerivedSchema::new();
+        match &packer {
+            Some(p) => p.key_columns().for_each(|c| b.push_pk(c)),
+            None => b.push_pk(ReduceOutSlot::SYNTHETIC_KEY_COL),
+        }
+        suffix.iter().for_each(|&c| b.push_pk(c));
+        (GroupPrefix { packer }, b)
+    }
+
+    /// The prefix of `row`'s group into the front of `buf`, returning it; built
+    /// from `id`, where one is given, where the prefix is the key's identity.
+    #[inline]
+    pub fn prefix_of<'b>(
+        &self,
+        prefix: &GroupPrefix,
+        mb: &MemBatch,
+        row: usize,
+        id: Option<u128>,
+        buf: &'b mut [u8],
+    ) -> &'b [u8] {
+        match &prefix.packer {
+            Some(p) => p.pack_prefix(buf, mb, row),
+            None => {
+                let dst = &mut buf[..GROUP_PK_BYTES];
+                dst.copy_from_slice(&id.unwrap_or_else(|| self.key.identity(mb, row)).to_be_bytes());
+                dst
+            }
+        }
+    }
+
+    /// The prefix of each row of `runs` — ascending `[start, end)` — in order,
+    /// into the fronts of `dst`'s keys, `stride` apart.
+    #[inline(always)]
+    pub fn write_prefixes(
+        &self,
+        prefix: &GroupPrefix,
+        mb: &MemBatch,
+        runs: &[(usize, usize)],
+        dst: &mut [u8],
+        stride: usize,
+    ) {
+        match (&prefix.packer, &self.key) {
+            (Some(p), _) => p.pack_rows(dst, stride, mb, runs),
+            // A chunk of identities at a time on the stack, rather than every row's.
+            (None, GroupKey::Packed(_) | GroupKey::Fold(_)) => {
+                let mut buf = [0u128; FOLD_CHUNK];
+                let mut keys = dst.chunks_exact_mut(stride);
+                for &(s, e) in runs {
+                    for start in (s..e).step_by(FOLD_CHUNK) {
+                        let ids = &mut buf[..(e - start).min(FOLD_CHUNK)];
+                        self.key.identities(mb, start, ids);
+                        for (id, key) in ids.iter().zip(keys.by_ref()) {
+                            key[..GROUP_PK_BYTES].copy_from_slice(&id.to_be_bytes());
+                        }
+                    }
+                }
+            }
+            (None, _) => self.with_identity(mb, runs, WriteIdentities { dst, stride, runs }),
         }
     }
 
@@ -312,7 +447,7 @@ impl GroupOutKey {
                     .run(|r| cell_image::<W, OPK>(cells.cell::<W>(r), cells.signed)))
             }
             KeyForm::Global => body.run(|_| gnitz_wire::global_group_key()),
-            KeyForm::Packed(p) => packed_identity(p, mb, rows, body),
+            KeyForm::Chunked => packed_identity(&self.key, mb, rows, body),
             KeyForm::WidePk { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n))),
         }
     }
@@ -351,11 +486,11 @@ impl GroupOutKey {
         let hashable = n >= HASH_MIN_ROWS && !matches!(self.key.form(mb), KeyForm::WidePk { .. });
         let GroupScratch { groups, numbers, identities } = s;
         match &self.key {
-            GroupKey::Packed(p) => {
+            GroupKey::Packed(_) | GroupKey::Fold(_) => {
                 // Every row packed once, for the hash and for the sort it may fall back to.
                 identities.clear();
                 identities.resize(n, 0);
-                p.identities_over(mb, &[(0, n)], identities);
+                self.key.identities(mb, 0, identities);
                 let key = |i: usize| identities[i];
                 if !(hashable && Hashed { n, groups: &mut *groups, numbers }.run(key)) {
                     groups.fill_sorted(n, key, Some);
@@ -383,6 +518,34 @@ impl GroupOutKey {
     }
 }
 
+/// How a group leads the PK of an index of its operator's input rows: the
+/// group's columns packed — the output PK's own columns, the bytes a packed
+/// `_group_pk` holds, or a fold's columns packed as such a `_group_pk` packs
+/// them, at any width — where those and the index's suffix fit the PK's column
+/// limit, else the key's 16-byte identity. Equal prefixes are one group, so a
+/// group's entries are one run of the index.
+pub struct GroupPrefix {
+    /// Packs the key's own bytes; `None` for the identity.
+    packer: Option<KeyPacker>,
+}
+
+impl GroupPrefix {
+    /// The bytes of one prefix.
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.packer.as_ref().map_or(GROUP_PK_BYTES, KeyPacker::out_stride)
+    }
+
+    /// Whether computing every row's prefix hashes, so it costs about what
+    /// computing a few rows' costs.
+    pub fn hashes(&self, key: &GroupOutKey) -> bool {
+        match &self.packer {
+            Some(p) => !p.packs_without_hashing(),
+            None => key.key.hashes(),
+        }
+    }
+}
+
 /// The buffers [`GroupOutKey::numbered_into`] numbers a batch's groups with,
 /// kept by a caller that numbers batch after batch.
 #[derive(Default)]
@@ -403,29 +566,52 @@ impl GroupScratch {
     }
 }
 
-/// [`GroupOutKey::with_identity`] over a packed `_group_pk`: every row packed once
-/// for the whole loop where `rows` are all of them, or where no slot of the key
-/// is hashed and `rows` hold more than one row in `PACK_ROWS_MIN_SPARSITY`; the
-/// rows of `rows` packed a run at a time where a slot is hashed and the runs are
-/// long enough to hash a chunk of rows at a time; else each of `rows` packs its
-/// own key as it is read. Out of line, so the loops that read their key in place
-/// compile as they do without it.
+/// [`GroupOutKey::with_identity`] over a packed `_group_pk` or a fold: every row
+/// computed once for the whole loop where `rows` are all of them, or where the
+/// key hashes nothing and `rows` hold more than one row in
+/// `PACK_ROWS_MIN_SPARSITY`; the rows of `rows` a run at a time where the key
+/// hashes and the runs are long enough to hash a chunk of rows at a time; else
+/// each of `rows` computes its own identity as it is read. Out of line, so the
+/// loops that read their key in place compile as they do without it.
 #[inline(never)]
-fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
+fn packed_identity<L: IdentityLoop>(key: &GroupKey, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
     let (n, read) = (mb.len(), crate::repr::range_rows(rows));
     let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= n;
     let all = [(0, n)];
-    let packed: &[(usize, usize)] = match p.packs_without_hashing() {
+    let packed: &[(usize, usize)] = match key.hashes() {
         _ if rows == all => rows,
         // Packing every row costs less than packing the rows of `rows` alone.
-        true if !(few(rows.len()) && few(read)) => &all,
-        false if read >= FOLD_CHUNK_MIN_ROWS * rows.len() => rows,
-        _ => return body.run(|r| p.narrow_image(mb, r)),
+        false if !(few(rows.len()) && few(read)) => &all,
+        true if read >= FOLD_CHUNK_MIN_ROWS * rows.len() => rows,
+        _ => return body.run(|r| key.identity(mb, r)),
     };
-    // Indexed by row; a row left unpacked keeps its zero, which nothing reads.
+    // Indexed by row; a row left uncomputed keeps its zero, which nothing reads.
     let mut identities = vec![0u128; n];
-    p.identities_over(mb, packed, &mut identities);
+    for &(s, e) in packed {
+        key.identities(mb, s, &mut identities[s..e]);
+    }
     body.run(|r| identities[r])
+}
+
+/// [`GroupOutKey::write_prefixes`] of a prefix that is the identity: each row's,
+/// big-endian, into the front of its key.
+struct WriteIdentities<'a> {
+    dst: &'a mut [u8],
+    stride: usize,
+    runs: &'a [(usize, usize)],
+}
+
+impl IdentityLoop for WriteIdentities<'_> {
+    type Out = ();
+
+    fn run(self, identity: impl Fn(usize) -> u128) {
+        let mut keys = self.dst.chunks_exact_mut(self.stride);
+        for &(s, e) in self.runs {
+            for (row, key) in (s..e).zip(keys.by_ref()) {
+                key[..GROUP_PK_BYTES].copy_from_slice(&identity(row).to_be_bytes());
+            }
+        }
+    }
 }
 
 /// Fewest rows per row read at which [`packed_identity`] packs a key that hashes

@@ -14,8 +14,8 @@ use crate::runtime::sal::log::SalMessage;
 use crate::runtime::sal::reader::SalReader;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::fixtures::id;
-use crate::test_support::{make_batch, make_schema_u64_i64};
-use gnitz_zset::schema::encode_schema_record;
+use crate::test_support::encode_schema_record;
+use crate::test_support::{certified, make_batch, make_schema_u64_i64};
 use std::fs::File;
 use std::ops::Range;
 
@@ -34,7 +34,7 @@ pub(in crate::runtime::sal) fn unanswered<'a>(read: &'a Read<'_>) -> Group<'a> {
 
 /// The two rows every push of [`SalWriter::push_zone`] carries.
 pub(crate) fn zone_rows() -> Batch {
-    make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)])
+    certified(make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)]))
 }
 
 /// A writer over a fresh `size`-byte ring written at `workers` workers, rewound
@@ -291,7 +291,7 @@ pub(crate) fn scan(tid: u64, spec: &[u8]) -> Read<'_> {
 /// Run the test `internal` of the module `module` in a re-exec'd child and
 /// require it to fail-stop with `reason` on stderr.
 pub(in crate::runtime::sal) fn assert_fail_stops(module: &str, internal: &str, reason: &str) {
-    let out = crate::test_support::run_test_in_child(module, internal, &[]);
+    let out = gnitz_test_harness::run_test_in_child(module, internal, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),

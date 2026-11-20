@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::{BatchBuilder, merge_consolidated};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    encode_to_wire_vec, make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
+    certified, encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, ragged_batch, ragged_schema, u64_pk_schema, weighted_rows,
 };
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, TypeCode};
@@ -19,10 +19,16 @@ fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
 fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
-    let clean = encode_to_wire_vec(&make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]));
-    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+    let clean = encode_to_wire_vec(&certified(make_batch_bytes(
+        &schema,
+        &[(1, 1, b"short".as_slice()), (2, 1, long)],
+    )));
+    assert_eq!(
+        Batch::decode_foreign_wal_blocks(&[&clean], &schema).map(|b| b.len()),
+        Ok(2)
+    );
     assert!(
-        !Batch::decode_foreign_wal_block(&clean, &schema)
+        !Batch::decode_foreign_wal_blocks(&[&clean], &schema)
             .unwrap()
             .is_consolidated(),
         "a foreign block carries no consolidation claim"
@@ -40,7 +46,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
         forge(&mut buf[cells + row * 16..cells + (row + 1) * 16]);
         assert!(MemBatch::of_wal_block(&buf, &schema).is_ok(), "row {row}");
         assert_eq!(
-            Batch::decode_foreign_wal_block(&buf, &schema).err(),
+            Batch::decode_foreign_wal_blocks(&[&buf], &schema).err(),
             Some("data WAL German string is not in canonical form"),
             "row {row}"
         );
@@ -73,7 +79,10 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
         encode_to_wire_vec(&b.finish())
     };
     let clean = block(false);
-    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+    assert_eq!(
+        Batch::decode_foreign_wal_blocks(&[&clean], &schema).map(|b| b.len()),
+        Ok(2)
+    );
 
     let cell = region_offset(&schema, 2, REG_PAYLOAD_START + 1) + 8;
     let mut valued_null = clean.clone();
@@ -89,7 +98,7 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
         (stray_bit, "a null bit on a NOT NULL column"),
     ] {
         assert!(MemBatch::of_wal_block(&forged, &schema).is_ok(), "{why}");
-        assert_eq!(Batch::decode_foreign_wal_block(&forged, &schema).err(), Some(why));
+        assert_eq!(Batch::decode_foreign_wal_blocks(&[&forged], &schema).err(), Some(why));
     }
 }
 
@@ -114,7 +123,10 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
         b.end_row();
     }
     let clean = encode_to_wire_vec(&b.finish());
-    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+    assert_eq!(
+        Batch::decode_foreign_wal_blocks(&[&clean], &schema).map(|b| b.len()),
+        Ok(2)
+    );
 
     let second_key = wal::WAL_HEADER_SIZE + schema.pk_stride();
     let first_cell = region_offset(&schema, 2, REG_PAYLOAD_START);
@@ -123,7 +135,7 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
         forged[at] = 2;
         assert!(MemBatch::of_wal_block(&forged, &schema).is_ok(), "byte {at}");
         assert_eq!(
-            Batch::decode_foreign_wal_block(&forged, &schema).err(),
+            Batch::decode_foreign_wal_blocks(&[&forged], &schema).err(),
             Some("a BOOLEAN cell is neither 0 nor 1"),
             "byte {at}"
         );
@@ -132,7 +144,7 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
 
 /// Twenty rows naming one 200-byte span, as a join's fan-out writes them.
 fn shared_span() -> Batch {
-    let one = string_batch(&[(1, "v".repeat(200))]);
+    let one = make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, "v".repeat(200))]);
     let mut shared = Batch::with_capacity(one.schema(), 20);
     let src = one.as_mem_batch();
     shared.write_rows(20, |w| crate::repr::scatter::copy_ranges(&src, None, &[(0, 1); 20], w));
@@ -146,15 +158,24 @@ fn shared_span() -> Batch {
 /// regions unaligned.
 fn wire_batches() -> Vec<Batch> {
     use TypeCode::*;
-    let mut mixed = vec![(0u64, "a".repeat(64))];
-    mixed.extend((1..30).map(|i| (i, "abcdefghijkl".to_string())));
+    let mut mixed = vec![(0u64, 1, "a".repeat(64))];
+    mixed.extend((1..30).map(|i| (i, 1, "abcdefghijkl".to_string())));
     let fixed: Vec<(u64, i64, i64)> = (1..=30).map(|i| (i, 1, i as i64)).collect();
     let mut batches = vec![
-        make_batch(&make_schema_u64_i64(), &fixed),
-        string_batch(&(0..30u64).map(|i| (i, "abcdefghijkl")).collect::<Vec<_>>()),
-        string_batch(&mixed),
-        string_batch(&(0..20u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>()),
-        string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]),
+        certified(make_batch(&make_schema_u64_i64(), &fixed)),
+        make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
+            &(0..30u64).map(|i| (i, 1, "abcdefghijkl")).collect::<Vec<_>>(),
+        ),
+        make_batch_bytes(&make_schema_pk_u64_payload_string(), &mixed),
+        make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
+            &(0..20u64).map(|i| (i, 1, format!("{i:-<200}"))).collect::<Vec<_>>(),
+        ),
+        make_batch_bytes(
+            &make_schema_pk_u64_payload_string(),
+            &[(1, 1, "w".repeat(4096)), (2, 1, "w".repeat(4096))],
+        ),
         shared_span(),
     ];
     for (pk, payload) in [
@@ -181,8 +202,9 @@ fn wire_batches() -> Vec<Batch> {
 }
 
 /// A row run, and a scattered prefix, is the longest run whose block — sized as
-/// `encode_listed` writes it under span dedup — fits; each reads back its rows.
-/// No rows is no block.
+/// `encode_listed` writes it under span dedup, which a block of rows sharing no
+/// span matches cell by cell — fits; each reads back its rows. No rows is no
+/// block.
 #[test]
 fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
     for b in wire_batches() {
@@ -195,7 +217,7 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
         };
         assert!(b.wire_rows_within(b.len(), usize::MAX).is_none());
         assert!(Batch::empty_with_schema(b.schema()).wire_whole().is_none());
-        let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, b.schema()).unwrap());
+        let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_blocks(&[block], b.schema()).unwrap());
         assert_eq!(read_back(&encode_to_wire_vec(&b)), weighted_rows(&b), "whole");
         for start in [0, 1] {
             let rest = b.len() - start;
@@ -241,7 +263,7 @@ fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
                 buf.len(),
                 "{list:?}: the size is the bytes written"
             );
-            let decoded = Batch::decode_foreign_wal_block(&buf, b.schema()).unwrap();
+            let decoded = Batch::decode_foreign_wal_blocks(&[&buf], b.schema()).unwrap();
             let all = weighted_rows(&b);
             let want: Vec<_> = list.iter().map(|&r| all[r as usize].clone()).collect();
             assert_eq!(weighted_rows(&decoded), want, "{list:?}");
@@ -295,11 +317,11 @@ fn a_viewed_wal_block_reads_as_its_batch() {
 #[test]
 fn foreign_blocks_decode_to_their_sum() {
     let schema = make_schema_u64_i64();
-    let a = encode_to_wire_vec(&make_batch(&schema, &[(1, 1, 10), (3, 1, 30), (5, -1, 50)]));
-    let b = encode_to_wire_vec(&make_batch(&schema, &[(2, 1, 20), (5, 1, 50), (6, 2, 60)]));
-    let unsorted = encode_to_wire_vec(&make_batch_raw(&schema, &[(9, 1, 90), (7, 1, 70)]));
-    let ghost = encode_to_wire_vec(&make_batch_raw(&schema, &[(8, 0, 80)]));
-    let sum = |rows: &[(u64, i64, i64)]| weighted_rows(&make_batch(&schema, rows));
+    let a = encode_to_wire_vec(&certified(make_batch(&schema, &[(1, 1, 10), (3, 1, 30), (5, -1, 50)])));
+    let b = encode_to_wire_vec(&certified(make_batch(&schema, &[(2, 1, 20), (5, 1, 50), (6, 2, 60)])));
+    let unsorted = encode_to_wire_vec(&make_batch(&schema, &[(9, 1, 90), (7, 1, 70)]));
+    let ghost = encode_to_wire_vec(&make_batch(&schema, &[(8, 0, 80)]));
+    let sum = |rows: &[(u64, i64, i64)]| weighted_rows(&certified(make_batch(&schema, rows)));
 
     let merged = Batch::decode_foreign_wal_blocks(&[&a, &b], &schema).unwrap();
     assert!(merged.is_consolidated());
@@ -330,7 +352,11 @@ fn foreign_blocks_decode_to_their_sum() {
 #[test]
 fn dead_heap_round_trips_an_engine_block() {
     let schema = make_schema_pk_u64_payload_string();
-    let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]).padded(7);
+    let b = certified(make_batch_bytes(
+        &schema,
+        &[(1, 1, [b'a'; 20].as_slice()), (2, 1, &[b'b'; 30])],
+    ))
+    .padded(7);
     let block = encode_to_wire_vec(&b);
     let decoded = MemBatch::of_wal_block(&block, &schema).unwrap().to_batch();
     assert_eq!((decoded.dead_heap(), decoded.blob().len()), (7, b.blob().len()));
@@ -359,7 +385,7 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
     for claimed in [0, 5, heap.len()] {
         let mut block = Vec::new();
         wal::append_block(&regions, claimed, &mut block);
-        let decoded = Batch::decode_foreign_wal_block(&block, &schema).unwrap();
+        let decoded = Batch::decode_foreign_wal_blocks(&[&block], &schema).unwrap();
         assert_eq!(decoded.dead_heap(), 70, "header claimed {claimed}");
         assert_eq!(
             MemBatch::of_wal_block(&block, &schema).unwrap().to_batch().dead_heap(),
@@ -371,7 +397,7 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
         let certified = CertifiedBlock::certify(&frame, 7..7 + block.len(), &schema).unwrap();
         let view = certified.view(&frame, &schema);
         assert_eq!(view.dead_heap(), 70);
-        assert_eq!(view.wire_regions(), decoded.wire_regions());
+        assert_eq!(view.regions(), decoded.regions());
     }
 }
 
@@ -428,7 +454,7 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
             b.end_row();
         }
         let block = encode_to_wire_vec(&b.finish());
-        let got = Batch::decode_foreign_wal_block(&block, &schema);
+        let got = Batch::decode_foreign_wal_blocks(&[&block], &schema);
         assert_eq!(got.is_ok(), valid, "{:?}", got.err());
         if valid { ok_n += 1 } else { bad_n += 1 }
     }
@@ -451,7 +477,7 @@ fn foreign_decode_utf8_spans_split_across_cells() {
             b.put_blob(x);
             b.end_row();
         }
-        Batch::decode_foreign_wal_block(&encode_to_wire_vec(&b.finish()), &schema).is_ok()
+        Batch::decode_foreign_wal_blocks(&[&encode_to_wire_vec(&b.finish())], &schema).is_ok()
     };
     let long = |pre: &[u8], post: &[u8]| [pre, b"0123456789abcdef", post].concat();
     // Valid, long and short, with the heap wholly UTF-8.

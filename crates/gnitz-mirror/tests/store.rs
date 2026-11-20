@@ -17,8 +17,8 @@ use gnitz_core::{MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_wire::multi_frame::DeltaCursor;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
-use gnitz_zset::schema::{SchemaDescriptor, encode_schema_record};
-use gnitz_zset_testkit::{make_batch, make_schema_u64_i64, make_schema_u128_i64};
+use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset_testkit::{certified, encode_schema_record, make_batch, make_schema_u64_i64, make_schema_u128_i64};
 use tempfile::TempDir;
 
 #[path = "support/common.rs"]
@@ -77,7 +77,7 @@ fn cursor(tick: u64) -> DeltaCursor {
 /// One wire block of the view's own rows, in the view's own schema — the shape
 /// a bootstrap and a poll both reply in.
 fn plain(rows: &[(u64, i64, i64)]) -> Vec<u8> {
-    gnitz_zset_testkit::encode_to_wire_vec(&make_batch(&make_schema_u64_i64(), rows))
+    gnitz_zset_testkit::encode_to_wire_vec(&certified(make_batch(&make_schema_u64_i64(), rows)))
 }
 
 /// Register `desc.tid` as `s.<name>` and replace its copy with `blocks`, the

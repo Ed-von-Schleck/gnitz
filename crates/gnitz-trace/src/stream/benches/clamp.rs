@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{TestTrace, make_batch, make_schema_u64_i64, make_string_batch};
+use crate::test_support::{
+    TestTrace, certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+};
 use gnitz_wire::ClampKind::Distinct;
 
 /// Instructions per delta row of `op_weight_clamp` per shape, opening its cursor
@@ -9,7 +11,8 @@ use gnitz_wire::ClampKind::Distinct;
 fn weight_clamp_bench() {
     const N: u64 = 4096;
     let ints = make_schema_u64_i64();
-    let batch = |rows: &mut dyn Iterator<Item = (u64, i64, i64)>| make_batch(&ints, &rows.collect::<Vec<_>>());
+    let batch =
+        |rows: &mut dyn Iterator<Item = (u64, i64, i64)>| certified(make_batch(&ints, &rows.collect::<Vec<_>>()));
     let dense = |w: i64| batch(&mut (0..N).map(|k| (k, w, 0)));
     let evens = |w: i64| batch(&mut (0..N).map(|k| (2 * k, w, 0)));
     // `pk` 1 holding the payloads `2, 4, ..= 2g`.
@@ -19,7 +22,7 @@ fn weight_clamp_bench() {
     let strings = |keys: &mut dyn Iterator<Item = (u64, i64)>| {
         let rows: Vec<(u64, i64, Vec<u8>)> = keys.map(|(k, w)| (k, w, format!("{k:040}").into_bytes())).collect();
         let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(k, w, s)| (*k, *w, &s[..])).collect();
-        make_string_batch(&rows)
+        certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows))
     };
 
     // The trace, the runs it is dealt into, the delta, and the rows it emits.

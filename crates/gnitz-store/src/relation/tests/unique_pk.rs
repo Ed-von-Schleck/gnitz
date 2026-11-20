@@ -1,8 +1,8 @@
 use super::{PkRule, enforce_unique_pk, under_pk_rule};
 use crate::storage::flush_barrier;
 use crate::test_support::{
-    make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
-    scratch_table, table_shards, zset_of,
+    certified, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64,
+    pk_payload_schema, scratch_table, table_shards, zset_of,
 };
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
@@ -142,19 +142,22 @@ fn enforce_unique_pk_keeps_heap_strings_intact() {
     let long2: &[u8] = b"the replacing payload, also on the heap";
     let long3: &[u8] = b"a fresh key's payload, on the heap as well";
 
-    let seed = enforce_unique_pk(&pt, make_batch_bytes(&schema, &[(1, 1, long1)]));
+    let seed = enforce_unique_pk(&pt, certified(make_batch_bytes(&schema, &[(1, 1, long1)])));
     pt.ingest(seed).unwrap();
     flush_barrier([&mut pt], 0).unwrap();
     assert!(!table_shards(&pt).is_empty());
 
     let eff = enforce_unique_pk(
         &pt,
-        make_batch_bytes(&schema, &[(1, 1, long2), (2, -1, b""), (3, 1, long3)]),
+        certified(make_batch_bytes(&schema, &[(1, 1, long2), (2, -1, b""), (3, 1, long3)])),
     );
     assert_eq!(
         zset_of(&eff, &schema),
         zset_of(
-            &make_batch_bytes(&schema, &[(1, 1, long2), (1, -1, long1), (3, 1, long3)]),
+            &certified(make_batch_bytes(
+                &schema,
+                &[(1, 1, long2), (1, -1, long1), (3, 1, long3)]
+            )),
             &schema
         ),
     );

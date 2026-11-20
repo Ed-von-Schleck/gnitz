@@ -169,7 +169,7 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
         block(&circuits),
     ];
     let mut payload = Vec::new();
-    encode_ddl_txn(&mut payload, bundle.iter().map(|(f, b)| (*f, b.wire_regions())));
+    encode_ddl_txn(&mut payload, bundle.iter().map(|(f, b)| (*f, b.regions())));
     let ctrl = gnitz_wire::peek_control_block(&payload).expect("control header");
     let items = decode_items(&payload, ctrl.body, gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
     let ids: Vec<u64> = items.iter().map(|item| item.hdr.target_id).collect();

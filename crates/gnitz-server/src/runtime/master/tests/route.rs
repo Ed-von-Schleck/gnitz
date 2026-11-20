@@ -1,15 +1,15 @@
 use super::*;
 use crate::runtime::sal::SalWriter;
 use crate::runtime::sal::fixtures::{group_at, scan, test_log};
+use crate::test_support::encode_schema_record;
 use crate::test_support::{
-    make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    pk_only_schema, pk_payload_schema, weighted_rows, zset_of,
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
+    pk_payload_schema, weighted_rows, zset_of,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::encode_schema_record;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::num::NonZeroU64;
 
@@ -51,25 +51,25 @@ fn a_push_group_decodes_to_each_workers_rows() {
     let cases: [(&str, (Placement, Batch), LaidOut); 6] = [
         (
             "keyed single row: framed from the batch, its owner alone addressed",
-            keyed(make_batch(&fixed, &[(1, 1, 10)])),
+            keyed(certified(make_batch(&fixed, &[(1, 1, 10)]))),
             |g, _| matches!(g, Routed::Each(_)),
         ),
         (
             "keyed fixed-width: framed from the batch",
-            keyed(make_batch_raw(&narrow, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)])),
+            keyed(make_batch(&narrow, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)])),
             |g, _| matches!(g, Routed::Each(_)),
         ),
         (
             "keyed inline strings: framed from the batch",
-            keyed(make_batch_bytes_raw(
+            keyed(make_batch_bytes(
                 &string,
-                &[(1, 1, b"a"), (2, 3, b"twelve bytes"), (3, 1, b"")],
+                &[(1, 1, "a"), (2, 3, "twelve bytes"), (3, 1, "")],
             )),
             |g, _| matches!(g, Routed::Each(_)),
         ),
         (
             "keyed heap strings: framed from the batch, one entry per worker",
-            keyed(make_batch_bytes_raw(
+            keyed(make_batch_bytes(
                 &string,
                 &long
                     .iter()
@@ -81,12 +81,12 @@ fn a_push_group_decodes_to_each_workers_rows() {
         ),
         (
             "replicated live rows: the batch itself",
-            replicated(make_batch(&fixed, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)])),
+            replicated(certified(make_batch(&fixed, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)]))),
             |g, batch| matches!(g, Routed::Same(Some(d)) if d.rows() == batch.len()),
         ),
         (
             "replicated with a weight-0 row: one whole batch",
-            replicated(make_batch_bytes_raw(
+            replicated(make_batch_bytes(
                 &string,
                 &[(1, 1, long[0].as_bytes()), (2, 0, b"dropped"), (3, 2, b"c")],
             )),
@@ -167,7 +167,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
     let cells = cell.repeat(rows as usize);
     let mut block = Vec::new();
     gnitz_wire::wal::append_block(&[&pks, &weights, &nulls, &cells, &heap], 0, &mut block);
-    let batch = Batch::decode_foreign_wal_block(&block, &schema).expect("a canonical block");
+    let batch = Batch::decode_foreign_wal_blocks(&[&block], &schema).expect("a canonical block");
     assert_eq!(batch.blob().len(), heap.len());
 
     let placement = Placement::full_pk(&schema);

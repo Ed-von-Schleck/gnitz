@@ -14,7 +14,7 @@ use crate::runs::MappedShard;
 use gnitz_zset::repr::gallop_by;
 use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::repr::{ColumnarSource, Pick};
-use gnitz_zset::repr::{LoserTree, MergeOrder, Player, drive, merge_consolidated, merge_less};
+use gnitz_zset::repr::{RunMerge, merge_consolidated};
 use gnitz_zset::repr::{recycle, take, vec_bytes};
 use gnitz_zset::schema::{PayloadOrder, SchemaDescriptor, compare_pk_ordering, group_floor, with_payload_cmp};
 
@@ -137,22 +137,18 @@ pub struct ReadCursor {
     /// clamps them all, so an identity two runs share cannot reach single-source
     /// mode.
     sources: Vec<Run>,
-    /// Per source, the rows still to walk: `start` is the next row, `end` the row
-    /// count or a range seek's clamp for the cursor's life. A reposition may
-    /// leave `start` past `end`, which leaves the walk empty.
-    states: Vec<Range<usize>>,
-    /// The N-way merge tournament over `sources.len()` leaves — which never
-    /// changes — re-played in place by each reposition. Idle while `mode` is
-    /// `Some`.
-    tree: LoserTree,
-    /// The one source live at the last absolute reposition, walked without `tree`.
-    /// `None` drives `tree`, and may be pessimistic: only a reposition re-derives it.
+    /// The N-way merge over `sources`, re-played in place by each reposition.
+    /// Its walks end at the row count or a range seek's clamp for the cursor's
+    /// life. Its order is keyed by the PK's leading bytes: finding a shared
+    /// prefix would read every run's last row at each open; and it coarsens iff
+    /// a source is a capacity-bounded view's skeleton shard. Its tournament is
+    /// idle while `mode` is `Some`.
+    merge: RunMerge,
+    /// The one source live at the last absolute reposition, walked without the
+    /// tournament. `None` drives it, and may be pessimistic: only a reposition
+    /// re-derives it.
     mode: Option<usize>,
     schema: SchemaDescriptor,
-    /// The merge's order, coarsened iff a source is a capacity-bounded view's
-    /// skeleton shard. Keyed by the PK's leading bytes: finding a shared prefix
-    /// would read every run's last row at each open.
-    order: MergeOrder,
     /// The drain's per-source row windows, reused across chunks.
     drain_windows: Vec<Range<usize>>,
     /// Whether the cursor stands on a row. Written only by `commit_emitted`.
@@ -192,7 +188,7 @@ impl ReadCursor {
     /// Re-derive the drive mode after the per-source positions moved, then advance
     /// to the first live row.
     fn rebuild_and_advance(&mut self) {
-        self.mode = Self::live_single(&self.states);
+        self.mode = Self::live_single(self.merge.cursors());
         match self.mode {
             Some(i) => self.advance_single(i),
             None => with_payload_cmp!(self.schema, |p| self.rebuild_and_advance_merge_with(p)),
@@ -200,18 +196,11 @@ impl ReadCursor {
     }
 
     /// One payload dispatch for the tournament re-play and the advance after it.
-    /// Ties go to [`merge_less`], as in the advance and forward seek that
-    /// step the tree afterwards.
-    #[inline]
+    /// Out of line: a replay costs far more than the call, and inlined it
+    /// would grow every reposition, the single-source ones included.
+    #[inline(never)]
     fn rebuild_and_advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
-        {
-            let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
-            tree.rebuild(
-                #[inline(always)]
-                |i| order.head(sources, i, &states[i]),
-                merge_less(schema, sources, *order, payload),
-            );
-        }
+        self.merge.rebuild(&self.schema, &self.sources, payload);
         self.advance_merge_with(payload);
     }
 
@@ -220,7 +209,7 @@ impl ReadCursor {
     fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) {
         debug_assert_eq!(start.len(), self.schema.pk_stride());
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
-        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+        for (src, state) in self.sources.iter().zip(self.merge.cursors_mut()) {
             state.start = src.seek(start, None);
             if let Some(end) = end {
                 // `end` lands at or after `start`'s landing.
@@ -234,7 +223,7 @@ impl ReadCursor {
     /// row in storage order — by row index, so no key has to be spelled.
     #[cfg(test)]
     pub(crate) fn rewind(&mut self) {
-        for state in self.states.iter_mut() {
+        for state in self.merge.cursors_mut() {
             state.start = 0;
         }
         self.rebuild_and_advance();
@@ -272,7 +261,7 @@ impl ReadCursor {
     /// what every path that cannot maintain the tree in place takes.
     /// Backward-capable: each source searches its full row range.
     fn reposition_to(&mut self, key: &[u8]) {
-        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+        for (src, state) in self.sources.iter().zip(self.merge.cursors_mut()) {
             state.start = src.seek(key, Some(state.start));
         }
         self.rebuild_and_advance();
@@ -296,16 +285,7 @@ impl ReadCursor {
         payload: P,
         mut skipped: impl FnMut(&Run, Range<usize>),
     ) {
-        let ReadCursor {
-            tree,
-            sources,
-            states,
-            schema,
-            order,
-            mode,
-            ..
-        } = &mut *self;
-        let sources = &*sources;
+        let ReadCursor { sources, merge, schema, mode, .. } = &mut *self;
         let lags = |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less;
         let mut gallop = |s: &Run, at: &Range<usize>| {
             let to = s.seek(key, Some(at.start));
@@ -314,38 +294,13 @@ impl ReadCursor {
         };
         match *mode {
             // The other sources' windows are empty, and a forward seek keeps them so.
-            Some(src) => states[src].start = gallop(&sources[src], &states[src]),
-            None => {
-                let less = merge_less(schema, sources, *order, payload);
-                Self::seek_phase(tree, sources, *order, states, lags, gallop, &less);
+            Some(src) => {
+                let walk = &mut merge.cursors_mut()[src];
+                walk.start = gallop(&sources[src], walk);
             }
+            None => merge.seek_laggards(schema, sources, payload, lags, gallop),
         }
         self.advance_with(payload);
-    }
-
-    /// Advance every laggard head (`lags` its row) to its own lower bound via
-    /// `gallop`, restoring the loser tree with one `step_top` per gallop. Only the
-    /// root can lag — it is the global min — so the loop gallops it alone, and
-    /// leaves the tree positioned exactly as a from-scratch rebuild at the bound
-    /// would.
-    fn seek_phase(
-        tree: &mut LoserTree,
-        sources: &[Run],
-        order: MergeOrder,
-        states: &mut [Range<usize>],
-        lags: impl Fn(&Run, usize) -> bool,
-        mut gallop: impl FnMut(&Run, &Range<usize>) -> usize,
-        less: &impl Fn(&Player, &Player) -> bool,
-    ) {
-        while let Some(Player { source_idx: src, row, .. }) = tree.peek() {
-            let (src, row) = (src as usize, row as usize);
-            // The root is the global min, so once it no longer lags neither does any head.
-            if !lags(&sources[src], row) {
-                break;
-            }
-            states[src].start = gallop(&sources[src], &states[src]);
-            tree.step_top(order.head(sources, src, &states[src]), less);
-        }
     }
 
     /// Position on `key`'s PK group; `true` when the cursor stands on it. `key` is
@@ -403,7 +358,7 @@ impl ReadCursor {
     /// row walked costs more than one source's seek.
     #[inline]
     pub fn passed_more_than_a_seek(&self) -> bool {
-        self.states.iter().map(|s| s.start).sum::<usize>() > self.sources.len()
+        self.merge.cursors().iter().map(|s| s.start).sum::<usize>() > self.sources.len()
     }
 
     /// Whether the current row came out of a capacity-bounded view's skeleton
@@ -477,7 +432,7 @@ impl ReadCursor {
     /// are probed in order, each moving the cursor forward from where the last left it.
     pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, mut f: F) {
         // A skeleton run folds a PK group regardless of payload; no history holds one.
-        debug_assert!(!self.order.coarsen, "element walk over a skeleton store");
+        debug_assert!(!self.merge.coarsens(), "element walk over a skeleton store");
         with_payload_cmp!(self.schema, |payload| for i in 0..mb.len() {
             let w = self.weight_of_with(mb, i, payload);
             f(i, w);
@@ -525,25 +480,16 @@ impl ReadCursor {
     /// Inside `mb[i]`'s PK group, forward-seek to the first live element `>= mb[i]`.
     /// Every head already sits at or above the cursor's element, which shares the PK.
     fn seek_element_forward_with<P: PayloadOrder>(&mut self, mb: &MemBatch, i: usize, payload: P) {
-        let ReadCursor {
-            tree,
-            sources,
-            states,
-            schema,
-            order,
-            mode,
-            ..
-        } = &mut *self;
-        let (sources, schema) = (&*sources, &*schema);
+        let ReadCursor { sources, merge, schema, mode, .. } = &mut *self;
         let lags = |s: &Run, r: usize| payload.compare_full(schema, s, r, mb, i).is_lt();
         let gallop = |s: &Run, at: &Range<usize>| gallop_by(s.row_count(), Some(at.start), |r| lags(s, r));
         match *mode {
             // The other sources' windows are empty, and a forward seek keeps them so.
-            Some(src) => states[src].start = gallop(&sources[src], &states[src]),
-            None => {
-                let less = merge_less(schema, sources, *order, payload);
-                Self::seek_phase(tree, sources, *order, states, lags, gallop, &less);
+            Some(src) => {
+                let walk = &mut merge.cursors_mut()[src];
+                walk.start = gallop(&sources[src], walk);
             }
+            None => merge.seek_laggards(schema, sources, payload, lags, gallop),
         }
         self.advance_with(payload);
     }
@@ -645,7 +591,7 @@ impl ReadCursor {
     /// emit-ready or past-end.
     #[inline]
     fn advance_single(&mut self, i: usize) {
-        let state = &mut self.states[i];
+        let state = &mut self.merge.cursors_mut()[i];
         let emitted = (state.start < state.end).then(|| {
             let row = state.start;
             state.start += 1;
@@ -664,27 +610,27 @@ impl ReadCursor {
         }
     }
 
-    /// [`drive`] over the cursor's tournament: `advance_merge_with` takes
-    /// one group, `drain_sorted_into` a whole chunk.
+    /// [`RunMerge::drive`] over the cursor's sources: `advance_merge_with`
+    /// takes one group, `drain_sorted_into` a whole chunk.
     #[inline(always)]
     fn drive<P: PayloadOrder, const SPANS: bool>(
         &mut self,
         payload: P,
-        emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
+        emit: impl FnMut(usize, usize, i64) -> ControlFlow<usize>,
     ) {
-        let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
-        drive::<_, _, SPANS>(tree, schema, sources, *order, states, payload, emit);
+        self.merge
+            .drive::<_, _, SPANS>(&self.schema, &self.sources, payload, emit);
     }
 
     /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.
-    /// [`drive`] folds tied rows; `emit` `Break`s on the first non-ghost
+    /// [`RunMerge::drive`] folds tied rows; `emit` `Break`s on the first non-ghost
     /// group, so ghosts are passed over rather than surfaced.
     #[inline(always)]
     fn advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
         let mut emitted: Option<(usize, usize, i64)> = None;
         self.drive::<_, false>(payload, |gs, gr, nw| {
             emitted = Some((gs, gr, nw));
-            ControlFlow::Break(())
+            ControlFlow::Break(0)
         });
         self.commit_emitted(emitted);
     }
@@ -694,7 +640,7 @@ impl ReadCursor {
     /// it) PLUS the row the cursor sits on: a drive CONSUMES the group it emits,
     /// so `start` is already past a row still to be visited.
     pub fn estimated_length(&self) -> usize {
-        let ahead: usize = self.states.iter().map(|s| s.len()).sum();
+        let ahead: usize = self.merge.cursors().iter().map(|s| s.len()).sum();
         ahead + usize::from(self.valid)
     }
 }
@@ -733,10 +679,9 @@ fn build(
     position: impl FnOnce(&mut ReadCursor),
 ) -> ReadCursor {
     let runs = runs.into_iter();
-    let CursorBufs { mut sources, mut states, losers, windows } = take(&CURSOR_BUFS, |_| true).unwrap_or_default();
+    let CursorBufs { mut sources, mut merge, windows } = take(&CURSOR_BUFS, |_| true).unwrap_or_default();
     let (hint, _) = runs.size_hint();
     sources.reserve(hint);
-    states.reserve(hint);
     // `for_each`, not `for`: the stores hand in nested adaptors, which fold
     // far cheaper than they step.
     runs.for_each(|run| {
@@ -751,16 +696,13 @@ fn build(
                 "merge source exceeds the tournament's u32 row"
             );
             sources.push(run);
-            states.push(0..count);
         }
     });
-    let order = MergeOrder::leading(schema.pk_stride(), sources.iter().any(ColumnarSource::is_skeleton));
+    // `rebuild_and_advance` plays the tournament.
+    merge.open(&sources, schema.pk_stride());
     let mut cursor = ReadCursor {
-        // Sized for the source count; `rebuild_and_advance` plays it.
-        tree: LoserTree::with_buffer(sources.len(), losers),
         sources,
-        order,
-        states,
+        merge,
         drain_windows: windows,
         mode: None,
         schema,
@@ -777,8 +719,7 @@ fn build(
 #[derive(Default)]
 struct CursorBufs {
     sources: Vec<Run>,
-    states: Vec<Range<usize>>,
-    losers: Vec<Player>,
+    merge: RunMerge,
     windows: Vec<Range<usize>>,
 }
 
@@ -807,11 +748,11 @@ impl Drop for ReadCursor {
     /// drops its runs, so a pooled buffer holds no batch or shard alive.
     fn drop(&mut self) {
         let (sources, a) = emptied(std::mem::take(&mut self.sources));
-        let (states, b) = emptied(std::mem::take(&mut self.states));
-        let (losers, c) = emptied(self.tree.take_buffer());
-        let (windows, d) = emptied(std::mem::take(&mut self.drain_windows));
-        let bufs = CursorBufs { sources, states, losers, windows };
-        recycle(&CURSOR_BUFS, bufs, a + b + c + d);
+        let mut merge = std::mem::take(&mut self.merge);
+        let b = merge.clear(MAX_POOLED_ELEMS);
+        let (windows, c) = emptied(std::mem::take(&mut self.drain_windows));
+        let bufs = CursorBufs { sources, merge, windows };
+        recycle(&CURSOR_BUFS, bufs, a + b + c);
     }
 }
 

@@ -8,7 +8,7 @@ use crate::runtime::sal::{Routed, SalExcl, SalFull, SalWriter};
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, pk_only_schema, register_count_of, register_full_pk, register_identity_view,
+    make_batch, make_schema_u64_i64, pk_only_schema, register_count_of, register_full_pk, register_identity_view,
     scan_all, table_engine, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::read::Probe;
@@ -107,7 +107,7 @@ fn in_wait_dispositions() {
     let schema = make_schema_u64_i64();
     let spec = all_rows();
     let record = engine.shape_target(tid).unwrap().1.to_vec();
-    let row = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let row = make_batch(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     let spans = Read::KeySpans { tid, cols, claim: false };
@@ -167,7 +167,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
         );
         engine
             .registry
-            .ingest_with(tid, make_batch_raw(&schema, &[(tid, 1, 10)]), PkRule::Enforce, true)
+            .ingest_with(tid, make_batch(&schema, &[(tid, 1, 10)]), PkRule::Enforce, true)
             .unwrap();
     }
     let (mut wp, sal, rx) = test_worker(&mut engine);
@@ -194,7 +194,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let schema = make_schema_u64_i64();
     let spec = all_rows();
     let record = engine.shape_target(tid).unwrap().1.to_vec();
-    let row = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let row = make_batch(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     ask(&mut sal.excl(), scan(tid, &schema, &spec), 1).expect("group fits");
@@ -219,7 +219,7 @@ fn a_parked_view_read_answers_ahead_of_the_read_behind_it_on_its_lease() {
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let held = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let held = make_batch(&schema, &[(1, 1, 10)]);
     engine.registry.ingest(tid, held.clone()).unwrap();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -287,7 +287,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     ask(&mut sal.excl(), scan(tid, &schema, &spec), 2).expect("group fits");
 
     // One worker: its own publish completes the round.
-    let part = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let part = make_batch(&schema, &[(1, 1, 10)]);
     let plan = ScatterPlan::broadcast();
     let lane = Lane {
         view: 9,
@@ -313,7 +313,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
 fn exchange_answers_the_rounds_verdict() {
     let (_dir, mut engine, _) = table_engine(1, &u64_i64_cols());
     let (mut wp, _sal, _rx) = test_worker(&mut engine);
-    let part = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
+    let part = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let plan = ScatterPlan::broadcast();
     for (own, peers, all) in [(true, true, true), (true, false, false), (false, true, false)] {
         let parks = crate::runtime::park::WorkerParks::create(2).unwrap();
@@ -354,9 +354,9 @@ fn a_train_advances_with_every_request() {
 /// A train queued for a 40-row reply, cut into frames of four rows.
 fn queue_train(wp: &mut WorkerProcess) {
     let fixed = make_schema_u64_i64();
-    let rows = make_batch_raw(&fixed, &(0..40).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let rows = make_batch(&fixed, &(0..40).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     wp.replies
-        .set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
+        .set_frame_budget(frame_size(&make_batch(&fixed, &[(0, 1, 0); 4])));
     wp.replies.reply(route(1, 11), Ok(Rows::from(rows)));
 }
 
@@ -381,7 +381,7 @@ fn a_wait_behind_a_seal_sends_but_serves_nothing() {
     let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let record = engine.shape_target(tid).unwrap().1.to_vec();
-    let row = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let row = make_batch(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
     queue_train(&mut wp);
     sal.excl()
@@ -407,7 +407,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
     let held: Vec<_> = (0..5).map(|i| (i, 1, -(i as i64))).collect();
     engine
         .registry
-        .ingest(tid, make_batch_raw(&make_schema_u64_i64(), &held))
+        .ingest(tid, make_batch(&make_schema_u64_i64(), &held))
         .unwrap();
     let cols = PkColList::from_slice(&[1]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
@@ -454,10 +454,10 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     register_count_of(&mut engine, v1, counts.output_schema(), &[], "total");
     let v2 = register_identity_view(&mut engine, t2, "v2", &cols);
     let record = engine.shape_target(t2).unwrap().1.to_vec();
-    let row = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let row = make_batch(&schema, &[(1, 1, 10)]);
     engine
         .registry
-        .ingest_with(t1, make_batch_raw(&schema, &[(7, 1, 70)]), PkRule::Enforce, true)
+        .ingest_with(t1, make_batch(&schema, &[(7, 1, 70)]), PkRule::Enforce, true)
         .unwrap();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 

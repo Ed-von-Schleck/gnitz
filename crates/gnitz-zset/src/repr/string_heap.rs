@@ -6,11 +6,10 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use super::batch::{MemBatch, range_rows};
-use super::codebook::Codebook;
 use super::pool::{self, is_tight};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::TypeCode;
-use gnitz_wire::{Heap, HeapValue, RowSource};
+use gnitz_wire::{Heap, HeapValue, RowSource, push_coded, push_codes};
 use rustc_hash::FxHashMap;
 
 type SpanKey = (usize, usize);
@@ -54,6 +53,7 @@ pub(crate) fn heap_is_wasteful(dead: usize, heap: usize) -> bool {
 /// `dead`, to keep `kept_rows` of its `src_rows` rows; `None` when relocating
 /// them is cheaper or the carried heap would be wasteful. `excluded`, the long
 /// bytes of the rows left behind, runs only once the prorated estimate passes.
+#[inline(always)]
 pub fn carried_dead(
     heap: usize,
     dead: usize,
@@ -84,7 +84,7 @@ const DEAD_CHECK_CELLS: usize = 1024;
 /// rows `kept`, ascending and disjoint: the string slots it leaves behind are
 /// charged dead as well. `None` when `src` has no string slot, when no kept
 /// slot reads a non-empty heap, or when carrying loses to relocating.
-#[inline]
+#[inline(always)]
 pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
     let mask = src.schema.string_payload_slots();
     if mask == 0 {
@@ -109,15 +109,57 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
             }
         }
     }
-    // The long bytes of the gaps between the kept ranges.
-    let excluded = || {
-        let ends = kept.iter().map(|&(_, e)| e);
-        let starts = kept.iter().map(|&(s, _)| s).chain([src.count]);
-        (std::iter::once(0).chain(ends).zip(starts))
-            .map(|(gap_start, gap_end)| long_bytes(src, mask, gap_start..gap_end))
-            .sum()
-    };
+    let excluded = || gaps(kept, src.count).map(|gap| long_bytes(src, mask, gap)).sum();
     carried_dead(heap, dead, src.count, range_rows(kept), excluded)
+}
+
+/// [`carry_dead`] for copying every string slot of `n` rows of `src`, named in
+/// any order. `named` answers a bitset over `src`'s rows with each row named
+/// set; it runs only once carrying passes the prorated estimate for `n` rows,
+/// and not where the heap is empty or `distinct` promises no row is named twice
+/// and `n` covers every row.
+///
+/// Out of line: it runs once per source, and inlined it changes how its
+/// callers' row loops compile.
+#[inline(never)]
+pub(super) fn carry_dead_rows(
+    src: &MemBatch<'_>,
+    n: usize,
+    distinct: bool,
+    named: impl FnOnce() -> Vec<u64>,
+) -> Option<usize> {
+    let (count, slots) = (src.count, src.schema.string_payload_slots());
+    // The prorated estimate, before any row named is counted.
+    if slots == 0 || carried_dead(src.blob.len(), src.dead_heap, count, n.min(count), || 0).is_none() {
+        return None;
+    }
+    // An empty heap is carried whatever is named, as no cell references it.
+    if src.blob.is_empty() || (distinct && n == count) {
+        return carry_dead(src, slots, &[(0, count)]);
+    }
+    let mut runs = Vec::new();
+    gnitz_wire::set_bit_runs(named(), count, &mut runs);
+    carry_dead(src, slots, &runs)
+}
+
+/// A bitset of `count` rows with each of `rows` set.
+pub(super) fn named_rows(count: usize, rows: impl Iterator<Item = usize>) -> Vec<u64> {
+    let mut named = vec![0u64; count.div_ceil(64)];
+    for row in rows {
+        named[row / 64] |= 1 << (row % 64);
+    }
+    named
+}
+
+/// The rows of `0..count` outside the ascending, disjoint ranges `kept`, as
+/// ranges; some may be empty.
+fn gaps(kept: &[(usize, usize)], count: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let ends = kept.iter().map(|&(_, e)| e);
+    let starts = kept.iter().map(|&(s, _)| s).chain([count]);
+    std::iter::once(0)
+        .chain(ends)
+        .zip(starts)
+        .map(|(start, end)| start..end)
 }
 
 /// The heap bytes the long cells of rows `rows` of `src` name in the
@@ -135,13 +177,10 @@ pub fn long_bytes(src: &MemBatch<'_>, mask: u64, rows: std::ops::Range<usize>) -
 /// [`row_long_bytes`] summed over every row of `src` outside the ascending,
 /// disjoint `kept` ranges.
 pub fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usize, usize)]) -> usize {
-    let bounds = kept.iter().copied().chain([(src.row_count(), src.row_count())]);
-    let gaps = bounds.scan(0, |next, (start, end)| {
-        let gap = *next..start;
-        *next = end;
-        Some(gap)
-    });
-    gaps.flatten().map(|row| row_long_bytes(src, mask, row)).sum()
+    gaps(kept, src.row_count())
+        .flatten()
+        .map(|row| row_long_bytes(src, mask, row))
+        .sum()
 }
 
 /// The heap bytes `row`'s long cells in the German-string slots `mask` name.
@@ -161,8 +200,8 @@ pub enum StringDest<'b> {
     /// each cell's offset is shifted by it.
     Carried(usize),
     /// Each value is placed on its own: decoded into a plain heap, or coded
-    /// under the codebook where one is given (see [`Codebook::append`]).
-    Placed(Option<&'b Codebook>),
+    /// under the coder where one is given (see [`append_value`]).
+    Placed(Option<&'b dyn HeapCoder>),
 }
 
 impl From<Option<usize>> for StringDest<'_> {
@@ -175,7 +214,7 @@ impl From<Option<usize>> for StringDest<'_> {
 /// Rebase `cells`, whole German-string cells copied verbatim from a source
 /// whose heap is `src`, onto the destination heap `dst_blob` as `dest` says,
 /// under `cache` when there is one.
-#[inline]
+#[inline(always)]
 pub(super) fn rebase_string_cells(
     cells: &mut [u8],
     src: Heap<'_>,
@@ -294,11 +333,11 @@ fn place_span(content: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCac
 }
 
 /// [`place_span`] of a value of any heap into `dst_blob`: decoded into a plain
-/// one, or coded under `book` (see [`Codebook::append`]).
+/// one, or coded under `book` (see [`append_value`]).
 fn place_value(
     value: HeapValue<'_>,
     dst_blob: &mut Vec<u8>,
-    book: Option<&Codebook>,
+    book: Option<&dyn HeapCoder>,
     cache: Option<&mut BlobCache>,
 ) -> usize {
     let at = dst_blob.len();
@@ -314,12 +353,34 @@ fn place_value(
     }
 }
 
+/// The symbol table a coded heap's long values are coded under, as a writer
+/// appends values to such a heap. The table itself, its training and when a
+/// store replaces it are the store's.
+pub trait HeapCoder {
+    /// The table's [`gnitz_wire::SymbolTable::digest`].
+    fn digest(&self) -> u64;
+
+    /// Append `value`'s codes to `dst`.
+    fn encode_into(&self, value: &[u8], dst: &mut Vec<u8>);
+}
+
 /// Append `value` to `dst_blob`: decoded, or coded under `book`.
 #[inline(always)]
-pub fn append_value(value: HeapValue<'_>, dst_blob: &mut Vec<u8>, book: Option<&Codebook>) {
+pub fn append_value<C: HeapCoder + ?Sized>(value: HeapValue<'_>, dst_blob: &mut Vec<u8>, book: Option<&C>) {
     match book {
         None => value.append_to(dst_blob),
-        Some(book) => book.append(value, dst_blob),
+        Some(book) => append_coded(value, dst_blob, book),
+    }
+}
+
+/// Append `value` to `dst_blob`, a heap coded under `book`: the codes it is
+/// stored as, where it is coded under that same table, else its bytes coded.
+/// Out of line: a plain heap's append inlines without it.
+#[inline(never)]
+fn append_coded<C: HeapCoder + ?Sized>(value: HeapValue<'_>, dst_blob: &mut Vec<u8>, book: &C) {
+    match value.table_digest() == Some(book.digest()) {
+        true => push_codes(dst_blob, value.stored()),
+        false => push_coded(dst_blob, |dst| book.encode_into(&value.bytes(), dst)),
     }
 }
 

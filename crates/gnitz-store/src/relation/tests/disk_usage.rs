@@ -1,6 +1,6 @@
 use super::*;
 use crate::storage::flush_barrier;
-use crate::test_support::{make_batch, make_schema_u64_i64, scratch_table};
+use crate::test_support::{certified, make_batch, make_schema_u64_i64, scratch_table};
 use gnitz_zset::algebra::Slot;
 
 /// `(files, rows, bytes)` of relation `id`'s store `store` across its levels.
@@ -21,7 +21,7 @@ fn store_dir(base: &str, id: u64, kind: ChildKind) -> String {
 fn publish(dir: &str, rows: &[(u64, i64, i64)]) {
     let schema = make_schema_u64_i64();
     let mut table = scratch_table(dir, schema);
-    table.ingest(make_batch(&schema, rows)).unwrap();
+    table.ingest(certified(make_batch(&schema, rows))).unwrap();
     flush_barrier([&mut table], 0).unwrap();
 }
 

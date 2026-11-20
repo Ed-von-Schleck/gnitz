@@ -1,16 +1,17 @@
 use super::super::encoding::{SYMBOLS_AT, SYMBOLS_COUNT_AT};
 use super::super::file::ShardWriteOpts;
 use super::*;
+use crate::runs::Codebook;
 use crate::runs::StorageError;
 use crate::runs::write_shard;
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64, map_coded_shard,
-    payload0_i64, pk_only_schema, prose, string_batch, sweep_bit_flips, u64_pk_schema,
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    make_schema_u128_i64, map_coded_shard, payload0_i64, pk_only_schema, prose, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::{MAX_SYMBOL_LEN, write_u64_le};
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, TypeCode, num_regions};
-use gnitz_zset::repr::Codebook;
+use gnitz_zset::repr::HeapCoder;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::repr::{ColumnarSource, Pick, UnifiedSet};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -32,7 +33,7 @@ fn write(dir: &std::path::Path, name: &str, batch: &Batch) -> String {
 /// `dir/test.db` — the fixture the integrity tests patch.
 fn small_shard(dir: &std::path::Path, rows: u64, mul: i64) -> String {
     let rows: Vec<(u64, i64, i64)> = (1..=rows).map(|i| (i, 1, i as i64 * mul)).collect();
-    write(dir, "test.db", &make_batch(&make_schema_u64_i64(), &rows))
+    write(dir, "test.db", &certified(make_batch(&make_schema_u64_i64(), &rows)))
 }
 
 /// Open `base` patched and written back over `path`: the digest is left stale,
@@ -160,6 +161,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
             schema,
             std::iter::once(w.clone()),
             0,
+            false,
             |set| set.materialize(&rows, None),
         );
         assert_eq!(
@@ -247,7 +249,7 @@ fn shapes() -> Vec<Shape> {
         // One row: every region Constant-encoded.
         Shape {
             label: "all-constant",
-            written: make_batch(&u64_i64, &[(1, 1, 7)]),
+            written: certified(make_batch(&u64_i64, &[(1, 1, 7)])),
             reader: u64_i64,
             encodings: vec![
                 (REG_PK, Constant),
@@ -927,7 +929,7 @@ fn shard_wider_than_reader_schema_opens() {
     // The surplus column is NULL in every row; its bit names no column of the
     // reader's schema, so every surface reads the narrow batch, null word and all.
     let want = rows_of(
-        &make_batch(&narrow, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).as_mem_batch(),
+        &certified(make_batch(&narrow, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)])).as_mem_batch(),
         &narrow,
     );
     let shard = MappedShard::open(&shard_path, &narrow).unwrap();
@@ -982,7 +984,10 @@ fn a_symbol_table_its_image_cannot_hold_is_refused() {
 fn a_table_under_a_corrupt_body_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.db");
-    let batch = string_batch(&(0..400).map(|i| (i as u64, prose(i))).collect::<Vec<_>>());
+    let batch = make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &(0..400).map(|i| (i as u64, 1, prose(i))).collect::<Vec<_>>(),
+    );
     let book = Codebook::for_batch(None, &batch).unwrap();
     map_coded_shard(&path, &batch, &book);
     let mut image = std::fs::read(&path).unwrap();
@@ -1185,7 +1190,7 @@ fn a_filterless_shard_has_an_empty_trailing_entry() {
         skip_pk_filter: true,
         ..Default::default()
     };
-    write_shard(&make_batch(&schema, &[(1, 1, 7)]), &shard_path, no_filter).unwrap();
+    write_shard(&certified(make_batch(&schema, &[(1, 1, 7)])), &shard_path, no_filter).unwrap();
     let image = std::fs::read(&shard_path).unwrap();
     let filter = spans_of(&image).pop().unwrap();
     assert_eq!((filter.size, filter.encoding), (0, Encoding::Raw));
@@ -1332,11 +1337,14 @@ fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
 #[test]
 fn a_table_read_back_codes_as_the_one_trained() {
     let dir = tempfile::tempdir().unwrap();
-    let batch = string_batch(&(0..400).map(|i| (i as u64, prose(i))).collect::<Vec<_>>());
+    let batch = make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &(0..400).map(|i| (i as u64, 1, prose(i))).collect::<Vec<_>>(),
+    );
     let book = Codebook::for_batch(None, &batch).expect("enough long bytes to train");
     let shard = map_coded_shard(&dir.path().join("s.db"), &batch, &book);
     let read = shard.codebook().unwrap();
-    assert_eq!(read.digest(), book.digest());
+    assert_eq!(read.table().digest(), book.table().digest());
     assert_eq!(read.trained_sixteenths(), book.trained_sixteenths());
     for i in 0..2000 {
         let (mut a, mut b) = (Vec::new(), Vec::new());

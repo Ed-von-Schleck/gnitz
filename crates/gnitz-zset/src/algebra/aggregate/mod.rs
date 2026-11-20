@@ -10,5 +10,5 @@ mod agg;
 mod shape;
 
 pub(crate) use adhoc_fold::AdhocFold;
-pub use agg::{Agg, AggValues, FoldGroups, RangeGroups};
+pub use agg::{Agg, AggValues, FoldGroups};
 pub use shape::{ReduceShape, resolve_aggs};

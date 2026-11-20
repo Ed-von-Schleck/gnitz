@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    TID, assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture,
-    solo, spec, zset_of,
+    TID, assert_index_holds, id_rows, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo,
+    spec, zset_of,
 };
 use gnitz_zset::schema::pk_keys;
 
@@ -154,7 +154,7 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
     let schema = make_schema_u64_i64();
     let spec = spec(9, RelationKind::View(ViewBudget::Plain), schema);
     let indexes = [(index(1, false), PkColList::from_slice(&[1]))];
-    let rows = make_batch_raw(&schema, &[(1, 1, 30), (2, 1, 10), (3, 1, 20)]);
+    let rows = make_batch(&schema, &[(1, 1, 30), (2, 1, 10), (3, 1, 20)]);
     {
         let mut origin = solo(tmp.path());
         origin

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, u64_i64_cols};
+use crate::test_support::{make_batch, make_schema_u64_i64, u64_i64_cols};
 use gnitz_wire::TypeCode;
 
 /// A write to a parent referenced through its lone PK column probes nothing
@@ -25,7 +25,7 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
         vec![TxnFamily::new(
             parent,
             WireConflictMode::Update,
-            FamilyRows::Built(make_batch_raw(&schema, rows)),
+            FamilyRows::Built(make_batch(&schema, rows)),
         )]
     };
     let mut upsert = write(&[(1, 1, 10), (2, 1, 20)]);
@@ -191,11 +191,7 @@ fn a_filter_takes_the_spans_of_an_admitted_write_alone() {
 fn only_a_lone_positive_error_family_is_fresh() {
     let family = |tid, mode, weights: &[i64]| {
         let rows: Vec<(u64, i64, i64)> = weights.iter().enumerate().map(|(i, &w)| (i as u64, w, 0)).collect();
-        TxnFamily::new(
-            tid,
-            mode,
-            FamilyRows::Built(make_batch_raw(&make_schema_u64_i64(), &rows)),
-        )
+        TxnFamily::new(tid, mode, FamilyRows::Built(make_batch(&make_schema_u64_i64(), &rows)))
     };
     let mut families = vec![
         family(1, WireConflictMode::Error, &[1, 1]),

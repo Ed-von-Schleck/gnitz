@@ -13,13 +13,13 @@ use crate::runtime::sal::Routed;
 use crate::runtime::test_support::{try_poll_once, within};
 use crate::test_support::empty_catalog;
 use crate::test_support::{
-    col_def, make_batch_bytes, make_batch_raw, make_schema_u64_i64, register_identity_view, u64_i64_cols,
+    certified, col_def, make_batch, make_batch_bytes, make_schema_u64_i64, register_identity_view, u64_i64_cols,
 };
 use gnitz_wire::{TableDistribution, TableProps, TypeCode, WireConflictMode, WireStatus};
 use std::time::Duration;
 
 fn batch_of(rows: usize) -> Batch {
-    make_batch_raw(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
+    make_batch(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
 }
 
 fn push_of(rows: usize) -> CommitRequest {
@@ -218,7 +218,7 @@ fn sized_row(shared: &Shared, tid: u64, footprint: Option<usize>) -> Batch {
     let cat = shared.cat();
     let (rel, record) = cat.shape_target(tid).unwrap();
     let sized = |len: usize| {
-        let batch = make_batch_bytes(&rel.schema(), &[(1, 1, &vec![b'x'; len])]);
+        let batch = certified(make_batch_bytes(&rel.schema(), &[(1, 1, &vec![b'x'; len])]));
         let bytes = sal.push_footprint(record, Routed::Same(batch.wire_whole()));
         (batch, bytes)
     };

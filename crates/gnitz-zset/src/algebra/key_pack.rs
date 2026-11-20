@@ -1,7 +1,6 @@
 //! The operator key composers: [`FoldCols`], the XXH3-128 row digest — a
-//! packed group key's fold slot, a fold-keyed `_group_pk`, a hash-row map's PK —
-//! and [`KeyPacker`], which packs a join key, a group key or an index span into a
-//! contiguous OPK region. The reindex Map keys rows through it and the exchange
+//! fold-keyed `_group_pk`, a hash-row map's PK — and [`KeyPacker`], which packs a
+//! join key, a group key or an index span into a contiguous OPK region. The reindex Map keys rows through it and the exchange
 //! scatter routes by the bytes it packs, so the reindexed trace side and the
 //! scattered delta co-partition byte-for-byte.
 
@@ -60,8 +59,8 @@ pub(crate) fn pk_run(locs: &[ColumnLocator]) -> Option<(usize, usize)> {
 }
 
 // ---------------------------------------------------------------------------
-// Row digest — the hashed key a group key's fold slot, a fold-keyed `_group_pk`
-// and a hash-row map's PK hold.
+// Row digest — the hashed key a fold-keyed `_group_pk` and a hash-row map's PK
+// hold.
 // ---------------------------------------------------------------------------
 
 thread_local! {
@@ -76,10 +75,10 @@ const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 /// The most key bytes one row of a stack-assembled fold holds.
 const FOLD_INLINE_BYTES: usize = 8 + FOLD_BYTES * FOLD_INLINE_COLS;
 
-/// The most rows one [`FoldCols::keys_chunk`] call digests.
+/// The most rows [`FoldCols::identities`] digests a column at a time at once.
 pub(crate) const FOLD_CHUNK: usize = 256;
 
-/// Fewest rows at which [`FoldCols::keys_chunk`] assembling them a column at a
+/// Fewest rows at which [`FoldCols::identities`] assembling them a column at a
 /// time costs less than digesting each with [`FoldCols::key_row`].
 pub(crate) const FOLD_CHUNK_MIN_ROWS: usize = 4;
 
@@ -98,11 +97,6 @@ impl FoldCols {
     pub(crate) fn new(locs: Vec<ColumnLocator>) -> Self {
         let mask = locs.iter().fold(0, |m, l| m | l.null_bit());
         FoldCols { locs, mask }
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.locs.is_empty()
     }
 
     /// The bytes of one row's key.
@@ -143,40 +137,22 @@ impl FoldCols {
         gnitz_wire::checksum_128(key)
     }
 
-    /// Call `f` with each chunk of the rows of `runs`, in order: its first row and
-    /// its rows' [`Self::key_row`], staged on the stack.
-    #[inline(always)]
-    pub(crate) fn for_each_chunk<B: BatchView>(
-        &self,
-        src: &B,
-        runs: &[(usize, usize)],
-        mut f: impl FnMut(usize, &[u128]),
-    ) {
-        let mut buf = [MaybeUninit::<u128>::uninit(); FOLD_CHUNK];
-        for &(s, e) in runs {
-            for start in (s..e).step_by(FOLD_CHUNK) {
-                let keys = filled(&mut buf[..(e - start).min(FOLD_CHUNK)], 0);
-                self.keys_chunk(src, start, keys);
-                f(start, keys);
-            }
-        }
-    }
-
     /// [`Self::key_row`] of rows `start..start + out.len()` of `src` into `out`,
-    /// at most [`FOLD_CHUNK`] of them.
+    /// [`FOLD_CHUNK`] rows at a time.
     #[inline]
-    pub(crate) fn keys_chunk<B: BatchView>(&self, src: &B, start: usize, out: &mut [u128]) {
-        assert!(out.len() <= FOLD_CHUNK, "a fold chunk is at most {FOLD_CHUNK} rows");
-        if out.len() < FOLD_CHUNK_MIN_ROWS {
-            for (key, row) in out.iter_mut().zip(start..) {
-                *key = self.key_row(src, row);
+    pub(crate) fn identities<B: BatchView>(&self, src: &B, start: usize, out: &mut [u128]) {
+        for (start, out) in (start..).step_by(FOLD_CHUNK).zip(out.chunks_mut(FOLD_CHUNK)) {
+            if out.len() < FOLD_CHUNK_MIN_ROWS {
+                for (key, row) in out.iter_mut().zip(start..) {
+                    *key = self.key_row(src, row);
+                }
+            } else {
+                self.keys_by_column(src, start, out);
             }
-        } else {
-            self.keys_by_column(src, start, out);
         }
     }
 
-    /// [`Self::keys_chunk`] with the rows' key bytes assembled a column at a time,
+    /// One chunk of [`Self::identities`] with the rows' key bytes assembled a column at a time,
     /// then each row digested. Out of line, so a chunk too short for it keeps a
     /// small frame.
     #[inline(never)]
@@ -222,16 +198,16 @@ pub(super) fn filled<T: Copy>(s: &mut [MaybeUninit<T>], v: T) -> &mut [T] {
 // Packed group key
 // ---------------------------------------------------------------------------
 
-/// The two slots a packed group key carries besides its columns: a leading
-/// presence bitmap and a trailing overflow fold.
+/// The slot a packed group key with a nullable column leads with: a presence
+/// bitmap.
 const BITMAP_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
-const FOLD_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 const BITMAP_BYTES: usize = BITMAP_COL.size();
-const FOLD_BYTES: usize = FOLD_COL.size();
-// `pack_into` writes the bitmap as a `u8` and the fold as a `u128`.
-const _: () = assert!(BITMAP_BYTES == size_of::<u8>() && FOLD_BYTES == size_of::<u128>());
+/// The bytes a fold gives each column's value.
+const FOLD_BYTES: usize = size_of::<u128>();
+// `pack_into` writes the bitmap as a `u8`.
+const _: () = assert!(BITMAP_BYTES == size_of::<u8>());
 // The bitmap has a bit for every column packed behind it.
-const _: () = assert!(MAX_PK_COLUMNS - 1 <= 8 * BITMAP_BYTES);
+const _: () = assert!(MAX_PK_COLUMNS <= 8 * BITMAP_BYTES);
 // Any join key fits the PK region, so `new` checks no width.
 const _: () = assert!(MAX_PK_COLUMNS * TypeCode::U128.wire_stride() <= MAX_PK_BYTES);
 
@@ -295,18 +271,15 @@ fn pack_column<B: BatchView>(
 
 /// Packs a join key, a group key or an index span into a contiguous OPK region.
 #[derive(Clone)]
-pub struct KeyPacker {
-    /// The packed columns in key order, between the bitmap and the fold: the
-    /// first `n_cols`. Inline, so a span's packer cloned per push allocates nothing.
+pub(crate) struct KeyPacker {
+    /// The packed columns in key order, behind the bitmap: the first `n_cols`.
+    /// Inline, so a span's packer cloned per push allocates nothing.
     cols: [KeyCol; MAX_PK_COLUMNS],
     n_cols: u8,
-    pub out_stride: usize,
+    out_stride: usize,
     /// Group key only: a leading `U8` slot, bit *i* set iff packed column *i* is
     /// NULL.
     has_bitmap: bool,
-    /// Group key only: the columns past the packed ones, hashed into a trailing
-    /// 16-byte slot.
-    fold: FoldCols,
 }
 
 impl KeyPacker {
@@ -328,26 +301,33 @@ impl KeyPacker {
             }
             cols.push((loc, t));
         }
-        Ok(Self::finish(cols, false, FoldCols::new(Vec::new())))
+        Ok(Self::finish(cols, false))
     }
 
-    /// The packer of a group key whose own images do not fit 16 bytes: the
-    /// fold of `locs`, one or more columns, alone.
-    pub(crate) fn fold_only(locs: Vec<ColumnLocator>) -> Self {
-        debug_assert!(!locs.is_empty(), "a fold of no columns has no slot");
-        Self::finish([], false, FoldCols::new(locs))
+    /// The packer of a group key over `group`: each column at its reindex output
+    /// type, behind a bitmap where one is nullable; `None` where `group` passes
+    /// [`MAX_PK_COLUMNS`] columns.
+    pub(crate) fn group(group: &[(SchemaColumn, ColumnLocator)]) -> Option<Self> {
+        if group.len() > MAX_PK_COLUMNS {
+            return None;
+        }
+        let has_bitmap = group.iter().any(|(col, _)| col.nullable);
+        let packed = group
+            .iter()
+            .map(|&(col, loc)| (loc, col.type_code.reindex_output_type()));
+        Some(Self::finish(packed, has_bitmap))
     }
 
-    /// The packer of a span over `locs`, each column at its own type: no bitmap,
-    /// no fold.
+    /// The packer of a span over `locs`, each column at its own type, with no
+    /// bitmap.
     pub(crate) fn of_span(locs: impl IntoIterator<Item = ColumnLocator>) -> Self {
         let cols = locs.into_iter().map(|loc| (loc, loc.type_code()));
-        Self::finish(cols, false, FoldCols::new(Vec::new()))
+        Self::finish(cols, false)
     }
 
     /// The packer over `packed` — each column and its slot type — its stride the
     /// sum of [`Self::key_columns`].
-    fn finish(packed: impl IntoIterator<Item = (ColumnLocator, TypeCode)>, has_bitmap: bool, fold: FoldCols) -> Self {
+    fn finish(packed: impl IntoIterator<Item = (ColumnLocator, TypeCode)>, has_bitmap: bool) -> Self {
         let mut cols = [KeyCol { loc: PADDING_LOCATOR, out: BITMAP_COL }; MAX_PK_COLUMNS];
         let mut n_cols = 0;
         for (loc, tc) in packed {
@@ -359,7 +339,6 @@ impl KeyPacker {
             n_cols: n_cols as u8,
             out_stride: 0,
             has_bitmap,
-            fold,
         };
         packer.out_stride = packer.key_columns().map(|c| c.size()).sum();
         packer
@@ -371,11 +350,16 @@ impl KeyPacker {
         &self.cols[..self.n_cols as usize]
     }
 
+    /// The bytes of one packed key.
+    #[inline(always)]
+    pub(crate) fn out_stride(&self) -> usize {
+        self.out_stride
+    }
+
     /// The output PK columns this packer's bytes fill, in key order.
     pub(super) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> {
         let bitmap = self.has_bitmap.then_some(BITMAP_COL);
-        let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
-        bitmap.into_iter().chain(self.cols().iter().map(|c| c.out)).chain(fold)
+        bitmap.into_iter().chain(self.cols().iter().map(|c| c.out))
     }
 
     /// The columns, when the packed key is their own OPK images laid end to end.
@@ -387,8 +371,7 @@ impl KeyPacker {
                 && gnitz_wire::opk_bias(src) == gnitz_wire::opk_bias(c.out.type_code)
         };
         let cols = self.cols();
-        (!self.has_bitmap && self.fold.is_empty() && cols.iter().all(identity))
-            .then(|| cols.iter().map(|c| c.loc).collect())
+        (!self.has_bitmap && cols.iter().all(identity)).then(|| cols.iter().map(|c| c.loc).collect())
     }
 
     /// `row`'s packed key of at most 16 bytes, widened as `widen_pk_be` does.
@@ -401,29 +384,13 @@ impl KeyPacker {
         u128::from_be_bytes(be)
     }
 
-    /// The packed key of each row of `runs` — ascending `[start, end)` — widened as
-    /// [`Self::narrow_image`] widens it, into `out[row]`; a row outside them keeps
-    /// what it held.
-    pub(crate) fn identities_over<B: BatchView>(&self, batch: &B, runs: &[(usize, usize)], out: &mut [u128]) {
-        for &(s, e) in runs {
-            self.identities(batch, s, &mut out[s..e]);
-        }
-    }
-
     /// The packed key of rows `start..start + out.len()`, widened as
-    /// [`Self::narrow_image`] widens it, into `out`. A key of the fold alone is its
-    /// digest, taken a chunk of rows at a time; any other packs into the front of
-    /// each row's identity, read big-endian.
+    /// [`Self::narrow_image`] widens it, into `out`: packed into the front of each
+    /// row's identity, read big-endian.
     #[inline]
     pub(crate) fn identities<B: BatchView>(&self, batch: &B, start: usize, out: &mut [u128]) {
         let w = self.out_stride;
         debug_assert!((1..=16).contains(&w), "a narrow key is 1 to 16 bytes");
-        if self.n_cols == 0 && !self.has_bitmap {
-            for (start, ids) in (start..).step_by(FOLD_CHUNK).zip(out.chunks_mut(FOLD_CHUNK)) {
-                self.fold.keys_chunk(batch, start, ids);
-            }
-            return;
-        }
         let runs = [(start, start + out.len())];
         self.pack_rows(gnitz_wire::as_le_bytes_mut(out), 16, batch, &runs);
         // A constant shift: a `u128` shifted by a runtime amount costs several times more.
@@ -453,57 +420,10 @@ impl KeyPacker {
         b.finish().map_err(|e| format!("reindex map: output {e}"))
     }
 
-    /// Build the packer for a **group** key over `group_cols`, and the PK region
-    /// of an index keyed by it: [`Self::key_columns`], then `suffix`.
-    ///
-    /// Leading columns pack while the PK budget lasts; the rest fold into one
-    /// hash slot, so no group set is too wide.
-    pub fn new_group_key(
-        schema: &SchemaDescriptor,
-        group_cols: &[u32],
-        suffix: &[SchemaColumn],
-    ) -> Result<(Self, DerivedSchema), String> {
-        let max_cols = MAX_PK_COLUMNS - suffix.len();
-        let max_bytes = MAX_PK_BYTES - suffix.iter().map(|c| c.size()).sum::<usize>();
-        assert!(
-            max_cols >= 2 && max_bytes >= BITMAP_BYTES + FOLD_BYTES,
-            "a group-key suffix must leave room for a bitmap byte and a fold slot",
-        );
-        let group: Vec<(SchemaColumn, ColumnLocator)> = group_cols
-            .iter()
-            .map(|&c| locate_key_col(schema, c, "group key"))
-            .collect::<Result<_, String>>()?;
-        let has_bitmap = group.iter().any(|(col, _)| col.nullable);
-
-        // The bitmap occupies one leading slot, so both budgets start spent by it.
-        let lead = usize::from(has_bitmap);
-        let mut packed = Vec::with_capacity(max_cols);
-        let mut stride = lead * BITMAP_BYTES;
-        for (i, &(col, loc)) in group.iter().enumerate() {
-            let out_tc = col.type_code.reindex_output_type();
-            let w = out_tc.wire_stride();
-            // Reserve the fold slot the columns behind this one would need.
-            let tail_cols = usize::from(i + 1 < group.len());
-            if lead + packed.len() + 1 + tail_cols > max_cols || stride + w + tail_cols * FOLD_BYTES > max_bytes {
-                break;
-            }
-            packed.push((loc, out_tc));
-            stride += w;
-        }
-        let fold = FoldCols::new(group[packed.len()..].iter().map(|&(_, loc)| loc).collect());
-        let packer = Self::finish(packed, has_bitmap, fold);
-        let mut b = DerivedSchema::new();
-        packer
-            .key_columns()
-            .chain(suffix.iter().copied())
-            .for_each(|c| b.push_pk(c));
-        Ok((packer, b))
-    }
-
     /// [`Self::pack_into`] over the leading `out_stride` bytes of `buf`,
     /// returning them.
     #[inline]
-    pub fn pack_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], batch: &R, row: usize) -> &'a [u8] {
+    pub(crate) fn pack_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], batch: &R, row: usize) -> &'a [u8] {
         let n = self.out_stride;
         self.pack_into(&mut buf[..n], batch, row);
         &buf[..n]
@@ -530,21 +450,17 @@ impl KeyPacker {
         if self.has_bitmap {
             dst[0] = null_bits;
         }
-        if !self.fold.is_empty() {
-            let h = self.fold.key_row(batch, row);
-            dst[off..off + FOLD_BYTES].copy_from_slice(&h.to_be_bytes());
-        }
     }
 
     /// Whether every slot packs without hashing, so packing all of a batch's rows costs
     /// about what packing the rows read costs.
-    pub fn packs_without_hashing(&self) -> bool {
-        self.fold.is_empty() && self.cols().iter().all(|c| !c.loc.type_code().is_german_string())
+    pub(crate) fn packs_without_hashing(&self) -> bool {
+        self.cols().iter().all(|c| !c.loc.type_code().is_german_string())
     }
 
     /// [`Self::pack_into`] for the rows of `runs` — ascending `[start, end)` — in order,
     /// into the fronts of `dst`'s slots `stride` apart.
-    pub fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, runs: &[(usize, usize)]) {
+    pub(crate) fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, runs: &[(usize, usize)]) {
         let dst = &mut dst[..range_rows(runs) * stride];
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         if self.has_bitmap {
@@ -575,29 +491,6 @@ impl KeyPacker {
             }
             off += dw;
         }
-        if !self.fold.is_empty() {
-            self.pack_fold_slots(dst, stride, off, batch, runs);
-        }
-    }
-
-    /// [`Self::pack_rows`]' fold slot, at `off` of each key: the rows of `runs`
-    /// digested a chunk at a time. Out of line, so a packer without one compiles
-    /// as it does without it.
-    #[inline(never)]
-    fn pack_fold_slots<B: BatchView>(
-        &self,
-        dst: &mut [u8],
-        stride: usize,
-        off: usize,
-        batch: &B,
-        runs: &[(usize, usize)],
-    ) {
-        let mut keys = dst.chunks_exact_mut(stride);
-        self.fold.for_each_chunk(batch, runs, |_, digests| {
-            for (h, key) in digests.iter().zip(keys.by_ref()) {
-                key[off..off + FOLD_BYTES].copy_from_slice(&h.to_be_bytes());
-            }
-        });
     }
 }
 

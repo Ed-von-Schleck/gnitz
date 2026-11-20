@@ -3,7 +3,7 @@ use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::test_support::try_poll_once;
-use crate::test_support::{apply_ddl, col_def, idx_tab_batch, make_batch_raw, table_engine, u64_i64_cols};
+use crate::test_support::{apply_ddl, col_def, idx_tab_batch, make_batch, table_engine, u64_i64_cols};
 use gnitz_foundation::perf::Counter;
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::TypeCode;
@@ -122,12 +122,12 @@ fn preflight_sink_bench() {
         let families = vec![TxnFamily::new(
             parent,
             WireConflictMode::Update,
-            FamilyRows::Built(make_batch_raw(&schema, &upserts)),
+            FamilyRows::Built(make_batch(&schema, &upserts)),
         )];
         let frames: Vec<Batch> = (0..4)
             .map(|w| {
                 let replies: Vec<_> = (0..rows).filter(|i| i % 4 == w).map(|i| (i, 1, i as i64)).collect();
-                make_batch_raw(&reply, &replies)
+                make_batch(&reply, &replies)
             })
             .collect();
 

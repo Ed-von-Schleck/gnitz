@@ -34,7 +34,7 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-// This crate publishes an API to the store and the server above it, so an
+// This crate publishes an API to the crates above it, so an
 // over-wide `pub` inside a private module is an error (`warnings = "deny"`).
 #![warn(unreachable_pub)]
 

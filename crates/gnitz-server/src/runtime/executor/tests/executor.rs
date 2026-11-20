@@ -2,7 +2,7 @@ use super::*;
 use crate::runtime::reactor::test_support::{train_lease, train_of};
 use crate::runtime::test_support::read_nonblocking;
 use crate::runtime::test_support::try_poll_once;
-use crate::test_support::{make_batch, make_schema_u64_i64};
+use crate::test_support::{certified, make_batch, make_schema_u64_i64};
 
 /// Worker `w`'s next frame is still routed: a drain that returned early left it
 /// unread.
@@ -21,10 +21,10 @@ fn forward_scan_sends_every_row_frame_in_worker_order() {
     let (reactor, mut lease, mut writers) = train_lease(3, "ScanSpec");
     let req = lease.id();
     let train = train_of(&mut lease);
-    let mut want = writers[0].send_train_frame(req, false, Some(&make_batch(&schema, &[(1, 1, 10)])));
+    let mut want = writers[0].send_train_frame(req, false, Some(&certified(make_batch(&schema, &[(1, 1, 10)]))));
     writers[0].send_train_frame(req, true, None);
     writers[1].send_train_frame(req, true, None);
-    want.extend(writers[2].send_train_frame(req, true, Some(&make_batch(&schema, &[(2, 1, 20)]))));
+    want.extend(writers[2].send_train_frame(req, true, Some(&certified(make_batch(&schema, &[(2, 1, 20)])))));
 
     let (mut peer, partner) = Peer::over_socketpair(&reactor);
     reactor.block_on(async {
@@ -39,7 +39,7 @@ fn forward_scan_sends_every_row_frame_in_worker_order() {
 #[test]
 fn forward_scan_stops_at_a_failed_send() {
     let schema = make_schema_u64_i64();
-    let rows = make_batch(&schema, &[(1, 1, 10)]);
+    let rows = certified(make_batch(&schema, &[(1, 1, 10)]));
     let (reactor, mut lease, mut writers) = train_lease(2, "ScanSpec");
     let req = lease.id();
     let train = train_of(&mut lease);

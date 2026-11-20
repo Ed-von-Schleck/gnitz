@@ -8,8 +8,8 @@ use crate::runtime::sal::{Apply, SalExcl};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::RequestId;
 use crate::runtime::w2m::fixtures::{id, test_rings};
-use crate::test_support::{make_batch, make_schema_u64_i64};
-use gnitz_zset::schema::encode_schema_record;
+use crate::test_support::encode_schema_record;
+use crate::test_support::{certified, make_batch, make_schema_u64_i64};
 
 /// A reader steps past a `Flush` into the next epoch on its own: what follows
 /// in the old epoch is never read, and the next epoch's first group is. A
@@ -212,7 +212,7 @@ fn the_live_path_aborts_on_a_damaged_header() {
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn the_live_path_aborts_on_a_damaged_header_internal() {
-    if !crate::test_support::in_child_test() {
+    if !gnitz_test_harness::in_child_test() {
         return;
     }
     let mut log = test_log(1 << 20, 1, 1);
@@ -241,7 +241,7 @@ fn a_read_group_without_a_request_id_aborts() {
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn a_read_group_without_a_request_id_aborts_internal() {
-    if !crate::test_support::in_child_test() {
+    if !gnitz_test_harness::in_child_test() {
         return;
     }
     let log = test_log(1 << 20, 1, 1);
@@ -272,7 +272,7 @@ fn an_apply_group_naming_a_request_id_aborts() {
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn an_apply_group_naming_a_request_id_aborts_internal() {
-    if !crate::test_support::in_child_test() {
+    if !gnitz_test_harness::in_child_test() {
         return;
     }
     let tick = Apply::Tick { first_round: 2, tids: vec![1].into() };
@@ -306,7 +306,7 @@ fn an_undecodable_payload_aborts() {
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn an_undecodable_payload_aborts_internal() {
-    if !crate::test_support::in_child_test() {
+    if !gnitz_test_harness::in_child_test() {
         return;
     }
     let log = test_log(1 << 20, 1, 1);
@@ -330,10 +330,10 @@ fn rows_on_a_group_that_carries_none_abort() {
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn rows_on_a_group_that_carries_none_abort_internal() {
-    if !crate::test_support::in_child_test() {
+    if !gnitz_test_harness::in_child_test() {
         return;
     }
-    let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
+    let batch = certified(make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]));
     let record = encode_schema_record(batch.schema());
     let sent = batch.wire_whole();
     let mut rows = vec![0; payload_size(&record, sent)];

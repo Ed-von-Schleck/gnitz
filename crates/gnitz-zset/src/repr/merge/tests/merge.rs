@@ -1,9 +1,9 @@
 use super::*;
-use crate::repr::BatchBuilder;
+use crate::repr::{BatchBuilder, UnifiedSet};
 use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    FoldRow, arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, make_string_batch, radix_fold_rows, u64_pk_schema,
+    FoldRow, arb_fold_case, assert_folds, certified, fold_batch, fold_schemas, make_batch, make_batch_bytes,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, radix_fold_rows, u64_pk_schema,
 };
 
 // ── The Z-set fold, over every path that runs it ────────────────────────
@@ -52,8 +52,8 @@ proptest::proptest! {
             ("N-way", merge_rows(&mem, &s)),
             ("N-way spans", {
                 let windows = consolidated_mem.iter().map(|m| 0..m.count);
-                let rows = run_merge(&consolidated_mem, &s, windows, true);
-                crate::repr::scatter::materialize_carrying(&consolidated_mem, &s, &rows)
+                let (rows, spans) = run_merge(&consolidated_mem, &s, windows.clone(), true);
+                UnifiedSet::with(&consolidated_mem, &s, windows, 0, spans, |set| set.materialize(&rows, None))
             }),
             ("N-way sum", merge_consolidated(&consolidated_mem, &s)),
             ("pairwise", pairwise),
@@ -166,13 +166,16 @@ fn a_radix_sorted_batch_folds_to_the_zset() {
 fn a_two_way_sum_charges_exactly_the_dropped_rows() {
     let schema = make_schema_pk_u64_payload_string();
     let (x, y) = ([b'x'; 20], [b'y'; 30]);
-    let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
+    let a = certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(1, 1, x.as_slice()), (2, 1, &y)],
+    ));
     for (b_rows, dead) in [
         (&[(1, -1, &x[..])][..], 2 * x.len()),
         (&[(1, 2, &x[..])], x.len()),
         (&[(3, 1, &x[..])], 0),
     ] {
-        let b = make_string_batch(b_rows);
+        let b = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), b_rows));
         let out = merge_consolidated(&[a.as_mem_batch(), b.as_mem_batch()], &schema);
         assert_folds(&[a.clone(), b.clone()], &out, "merge");
         out.debug_verify_dead_heap();
@@ -196,8 +199,8 @@ fn a_carried_merge_reads_back_every_string() {
     let b_rows: Vec<(u64, i64, &[u8])> = vec![(3, 1, &r), (4, 1, &p), (5, 1, &r), (5, -2, &s), (8, 1, &q)];
     for (pad_a, pad_b) in [(0, 0), (1000, 0), (0, 1000)] {
         let (a, b) = (
-            make_string_batch(&a_rows).padded(pad_a),
-            make_string_batch(&b_rows).padded(pad_b),
+            certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &a_rows)).padded(pad_a),
+            certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &b_rows)).padded(pad_b),
         );
         let out = merge_consolidated(&[a.as_mem_batch(), b.as_mem_batch()], &schema);
         assert_folds(&[a, b], &out, &format!("padding ({pad_a}, {pad_b})"));
@@ -215,14 +218,20 @@ fn a_carried_merge_reads_back_every_string() {
 #[test]
 fn a_dominated_merge_folds_across_its_stretches() {
     let s = make_schema_u64_i64();
-    let large = make_batch(&s, &(0..600u64).map(|k| (k, 1, k as i64)).collect::<Vec<_>>());
+    let large = certified(make_batch(
+        &s,
+        &(0..600u64).map(|k| (k, 1, k as i64)).collect::<Vec<_>>(),
+    ));
     let small = [
-        make_batch(&s, &[(0, -1, 0), (250, 3, 250), (599, 1, 600)]),
-        make_batch(&s, &[(13, 1, 12), (250, -3, 250), (251, 1, 251)]),
+        certified(make_batch(&s, &[(0, -1, 0), (250, 3, 250), (599, 1, 600)])),
+        certified(make_batch(&s, &[(13, 1, 12), (250, -3, 250), (251, 1, 251)])),
     ];
     let inputs = [large, small[0].clone(), small[1].clone()];
     let mem: Vec<MemBatch> = inputs.iter().map(Batch::as_mem_batch).collect();
-    let rows = run_merge(&mem, &s, mem.iter().map(|m| 0..m.count), true);
-    let got = crate::repr::scatter::materialize_carrying(&mem, &s, &rows);
+    let (rows, spans) = run_merge(&mem, &s, mem.iter().map(|m| 0..m.count), true);
+    assert!(spans, "the large input dominates");
+    let got = UnifiedSet::with(&mem, &s, mem.iter().map(|m| 0..m.count), 0, spans, |set| {
+        set.materialize(&rows, None)
+    });
     assert_folds(&inputs, &got, "dominated N-way");
 }

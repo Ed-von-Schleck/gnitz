@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::IoSlice;
 use std::os::unix::fs::OpenOptionsExt;
 
+use super::codebook::Codebook;
 use super::encoding::*;
 use super::error::StorageError;
 use super::layout::*;
@@ -13,7 +14,6 @@ use super::pk_filter;
 use gnitz_expr::Level;
 use gnitz_wire::{FIXED_REGION_BYTES, FixedInt, Heap, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, RowSource};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::Codebook;
 use gnitz_zset::schema::SchemaColumn;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -254,7 +254,7 @@ pub(crate) fn write_shard_over(
         batch.debug_verify_dead_heap();
     }
     batch.debug_verify_consolidated(rows);
-    let regions = batch.wire_regions();
+    let regions = batch.regions();
     let npc = schema.num_payload_cols();
     // A skeleton weight sums a per-key time prefix of a positive integral.
     debug_assert!(

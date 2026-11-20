@@ -2,8 +2,8 @@ use super::*;
 use crate::runtime::w2m::W2mReceiver;
 use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::test_support::{
-    chunked, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    pk_only_schema, table_engine_with, u64_i64_cols, weighted_rows,
+    chunked, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
+    table_engine_with, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{DecodedControl, PkColList, TypeCode, WireStatus, peek_control_block};
@@ -129,19 +129,19 @@ fn weight(i: u64) -> i64 {
 fn reply_trains_drain_in_order_and_reassemble_exactly() {
     let fixed = make_schema_u64_i64();
     let strings = make_schema_pk_u64_payload_string();
-    let budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4]));
+    let budget = frame_size(&make_batch(&fixed, &[(0, 1, 0); 4]));
 
-    let a = make_batch_raw(&fixed, &(0..10).map(|i| (i, weight(i), i as i64)).collect::<Vec<_>>());
+    let a = make_batch(&fixed, &(0..10).map(|i| (i, weight(i), i as i64)).collect::<Vec<_>>());
     let b_vals: Vec<String> = (0..25).map(|i| format!("value-{i}-{}", "p".repeat(40))).collect();
-    let b = make_batch_bytes_raw(
+    let b = make_batch_bytes(
         &strings,
         &(0..25u64)
             .map(|i| (i, weight(i), b_vals[i as usize].as_bytes()))
             .collect::<Vec<_>>(),
     );
     let wide = ["x".repeat(4096), "y".repeat(4096)];
-    let c = make_batch_bytes_raw(&strings, &[(1, 1, wide[0].as_bytes()), (2, -2, wide[1].as_bytes())]);
-    let one = make_batch_raw(&fixed, &[(9, -3, 90)]);
+    let c = make_batch_bytes(&strings, &[(1, 1, wide[0].as_bytes()), (2, -2, wide[1].as_bytes())]);
+    let one = make_batch(&fixed, &[(9, -3, 90)]);
     let empty = Batch::empty_with_schema(&fixed);
     let sources = [
         (11, &a, fixed),
@@ -212,7 +212,7 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
         [
             (4, budget),
             (4, budget),
-            (2, frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 2])))
+            (2, frame_size(&make_batch(&fixed, &[(0, 1, 0); 2])))
         ]
     );
     // Heap strings: several rows a frame, each frame compacted to its own heap.
@@ -236,14 +236,11 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
 #[test]
 fn a_fitting_reply_is_the_source_batch_verbatim() {
     let schema = make_schema_pk_u64_payload_string();
-    let live = make_batch_bytes_raw(
-        &schema,
-        &[(1, 1, b"a long enough value"), (2, 1, b"another long value")],
-    );
+    let live = make_batch_bytes(&schema, &[(1, 1, "a long enough value"), (2, 1, "another long value")]);
     // The same rows over a heap padded with 4096 unreferenced bytes, framed as
     // an engine block that states them.
     let padded = [live.blob(), &[0u8; 4096]].concat();
-    let mut regions: Vec<&[u8]> = live.wire_regions().to_vec();
+    let mut regions: Vec<&[u8]> = live.regions().to_vec();
     *regions.last_mut().unwrap() = &padded;
     let mut block = Vec::new();
     gnitz_wire::wal::append_block(&regions, 4096, &mut block);
@@ -279,11 +276,11 @@ fn a_fitting_reply_is_the_source_batch_verbatim() {
 fn a_row_wider_than_the_frame_cap_faults_its_train_alone() {
     let schema = make_schema_pk_u64_payload_string();
     // One row whose string alone exceeds what a client can read in one frame.
-    let batch = make_batch_bytes_raw(
+    let batch = make_batch_bytes(
         &schema,
         &[(1, 1, "z".repeat(gnitz_wire::MAX_FRAME_PAYLOAD + 4096).as_bytes())],
     );
-    let next = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
+    let next = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
 
     let (mut q, rx) = queue_over(1 << 22);
     q.reply(route(1, 5), Ok(Rows::from(batch)));
@@ -308,7 +305,7 @@ fn a_row_wider_than_the_frame_cap_faults_its_train_alone() {
 #[test]
 fn a_row_wider_than_the_ring_faults_its_train() {
     let schema = make_schema_pk_u64_payload_string();
-    let batch = make_batch_bytes_raw(&schema, &[(1, 1, "z".repeat(8192).as_bytes())]);
+    let batch = make_batch_bytes(&schema, &[(1, 1, "z".repeat(8192).as_bytes())]);
     let (mut q, rx) = queue_over(4096);
     q.reply(route(1, 5), Ok(Rows::from(batch)));
     drain(&mut q);
@@ -324,9 +321,9 @@ fn a_row_wider_than_the_ring_faults_its_train() {
 #[test]
 fn an_ordered_fault_stays_behind_its_leases_queued_train() {
     let fixed = make_schema_u64_i64();
-    let rows = make_batch_raw(&fixed, &(0..10).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let rows = make_batch(&fixed, &(0..10).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (mut q, rx) = queue_over(1 << 22);
-    q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
+    q.set_frame_budget(frame_size(&make_batch(&fixed, &[(0, 1, 0); 4])));
 
     q.reply(route(1, 11), Ok(Rows::from(rows)));
     q.reply(route(1, 11), Err("of the train's lease".into()));
@@ -350,7 +347,7 @@ fn an_ordered_fault_stays_behind_its_leases_queued_train() {
 #[test]
 fn a_full_ring_owes_instead_of_blocking() {
     let fixed = make_schema_u64_i64();
-    let one = make_batch_raw(&fixed, &[(9, -3, 90)]);
+    let one = make_batch(&fixed, &[(9, -3, 90)]);
     let (mut q, rx) = queue_over(4096);
     while q.w2m.try_send_msg(id(1), false, &WireMsg::default()).is_ok() {}
 
@@ -409,7 +406,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         let held: Vec<_> = (0..n).map(|i| (i, 1, -(i as i64))).collect();
         engine
             .registry
-            .ingest(tid, make_batch_raw(&make_schema_u64_i64(), &held))
+            .ingest(tid, make_batch(&make_schema_u64_i64(), &held))
             .unwrap();
         let (mut q, rx) = queue_over(1 << 22);
         q.set_frame_budget(budget);
@@ -452,9 +449,9 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
 #[test]
 fn a_refusal_names_a_shortage_only_behind_another_leases_bytes() {
     let fixed = make_schema_u64_i64();
-    let rows = make_batch_raw(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let rows = make_batch(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (mut q, rx) = queue_over(4096);
-    q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16])));
+    q.set_frame_budget(frame_size(&make_batch(&fixed, &[(0, 1, 0); 16])));
 
     q.reply(route(1, 11), Ok(Rows::from(rows)));
     while !q.waits_on_master() {
@@ -463,7 +460,7 @@ fn a_refusal_names_a_shortage_only_behind_another_leases_bytes() {
     assert!(!rx.answer_shortage(0), "a train held up by its own frames asks nothing");
 
     // As large as the train's frame the ring just refused.
-    let behind = make_batch_raw(&fixed, &(0..16).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let behind = make_batch(&fixed, &(0..16).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     q.reply(route(2, 11), Ok(Rows::from(behind.clone())));
     assert_eq!(owed(&q), [("train", 11), ("train", 11)]);
     assert!(
@@ -485,9 +482,9 @@ fn a_refusal_names_a_shortage_only_behind_another_leases_bytes() {
 #[test]
 fn a_refused_train_waits_on_the_master_past_a_passing_reply() {
     let fixed = make_schema_u64_i64();
-    let rows = make_batch_raw(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let rows = make_batch(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (mut q, rx) = queue_over(4096);
-    q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16])));
+    q.set_frame_budget(frame_size(&make_batch(&fixed, &[(0, 1, 0); 16])));
 
     q.reply(route(1, 11), Ok(Rows::from(rows)));
     while !q.waits_on_master() {
@@ -510,9 +507,9 @@ fn a_refused_train_waits_on_the_master_past_a_passing_reply() {
 #[test]
 fn a_held_train_steps_aside_until_its_hold_ends() {
     let fixed = make_schema_u64_i64();
-    let rows = make_batch_raw(&fixed, &(0..100).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let rows = make_batch(&fixed, &(0..100).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (mut q, rx) = queue_over(1 << 22);
-    q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16])));
+    q.set_frame_budget(frame_size(&make_batch(&fixed, &[(0, 1, 0); 16])));
 
     q.reply(route(1, 11), Ok(Rows::from(rows.clone())));
     q.reply(route(1, 11), Ok(Rows::from(rows)));

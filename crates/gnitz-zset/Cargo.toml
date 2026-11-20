@@ -17,8 +17,8 @@ gnitz-expr.workspace = true
 rustc-hash.workspace = true
 # The UTF-8 check on a pushed block's STRING cells.
 simdutf8 = "0.1"
-fsst-rs = "0.7"
-# Inline storage for the per-materialize index tables of `repr::scatter`.
+# Inline storage for the small per-call lists of the batch kernels, which would
+# otherwise each take a heap allocation.
 smallvec.workspace = true
 
 [dev-dependencies]

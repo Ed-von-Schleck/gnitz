@@ -19,8 +19,10 @@ use crate::runs::{CursorRow, GroupProbe, ReadCursor};
 use crate::stream::OpenAt;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
-use gnitz_wire::RowSource;
-use gnitz_zset::algebra::{Agg, AggValues, GroupOrdinals, GroupScratch, OutPk, RangeGroups, ReduceShape, ground_pk};
+use gnitz_wire::{MAX_PK_BYTES, PkBuf, RowSource};
+use gnitz_zset::algebra::{
+    Agg, AggValues, FoldGroups, GroupOrdinals, GroupPrefix, GroupScratch, OutPk, ReduceShape, ground_pk,
+};
 use gnitz_zset::repr::{Batch, DirectWriter, MemBatch, vec_bytes};
 use gnitz_zset::schema::SchemaDescriptor;
 use value_index::ValueIndex;
@@ -176,7 +178,7 @@ impl ReducePlan {
             "the ground row carries no group columns"
         );
         let (shape, _) = ReduceShape::new(input, group_cols, aggs)?;
-        let value_index = ValueIndex::new(input, group_cols, &shape.aggs)?;
+        let value_index = ValueIndex::new(&shape.key, &shape.aggs)?;
         Ok(ReducePlan {
             shape,
             seeds_ground,
@@ -216,7 +218,9 @@ impl ReducePlan {
     /// The index entries `delta` contributes, each at its row's weight,
     /// unsorted; `None` for a reduce without a value index.
     pub fn index_entries(&self, delta: &Batch) -> Option<Batch> {
-        self.value_index.as_ref().map(|index| index.entries(delta))
+        self.value_index
+            .as_ref()
+            .map(|index| index.entries(&self.shape.key, delta))
     }
 
     /// True iff every aggregate is a count or an integer sum, whose value is the
@@ -323,10 +327,10 @@ fn reduce_epoch(
                 false if agg.is_wide() => unprobed,
                 false => uncapped,
             };
-            vals.fold(k, &mb, folded, RangeGroups::Each);
+            vals.fold(k, &mb, folded, FoldGroups::Each);
         }
         if probes.contains(&Probe::Retracts) {
-            retracted.fold_retracted(&mb, uncapped, RangeGroups::Each, vals);
+            retracted.fold_retracted(&mb, uncapped, FoldGroups::Each, vals);
         }
         grouping.groups.fill_heads(ranges);
     } else {
@@ -352,12 +356,12 @@ fn reduce_epoch(
         vals.reset(groups.len());
         for (k, agg) in aggs.iter().enumerate() {
             match retracting > 0 && agg.is_wide() {
-                true => vals.fold_wide(k, &mb, all, &groups.ord[..], |g| probes[g] != Probe::No),
-                false => vals.fold(k, &mb, all, &groups.ord[..]),
+                true => vals.fold_wide(k, &mb, all, &groups.ord, |g| probes[g] != Probe::No),
+                false => vals.fold(k, &mb, all, FoldGroups::Rows(&groups.ord)),
             }
         }
         if retracting * RETRACTED_FOLD_ROWS >= delta.len() {
-            retracted.fold_retracted(&mb, all, &groups.ord[..], vals);
+            retracted.fold_retracted(&mb, all, FoldGroups::Rows(&groups.ord), vals);
         } else if retracting > 0 {
             probes
                 .iter_mut()
@@ -431,7 +435,7 @@ fn emit_groups(
 /// Group `g`'s new row against its stored row, `Less` where it has none;
 /// `None` where it has no new row. A group has one while it has rows, and the
 /// one group of a global aggregate always: emptied, it publishes its values
-/// over no rows, to which this resets `vals`.
+/// over no rows, to which this resets group `g` of `vals`.
 #[inline(always)]
 fn new_row(
     plan: &ReducePlan,
@@ -448,7 +452,7 @@ fn new_row(
         if !plan.seeds_ground {
             return None;
         }
-        vals.clear();
+        vals.clear(g);
     }
     Some(stored.map_or(Ordering::Less, |(rows, row)| vals.cmp_stored(g, rows, row)))
 }
@@ -478,6 +482,17 @@ impl<'a> GroupHeads<'a, '_> {
     fn out_pk(&self, g: u32) -> OutPk<'a> {
         let id = self.groups.ids.get(g as usize).copied();
         self.plan.shape.key.out_pk_with(self.delta, self.first(g), id)
+    }
+
+    /// Group `g`'s prefix in the value index `prefix` leads, written into the
+    /// front of `buf`.
+    #[inline(always)]
+    fn index_prefix<'b>(&self, prefix: &GroupPrefix, g: u32, buf: &'b mut [u8]) -> &'b [u8] {
+        let id = self.groups.ids.get(g as usize).copied();
+        self.plan
+            .shape
+            .key
+            .prefix_of(prefix, self.delta, self.first(g), id, buf)
     }
 
     /// The new rows of groups `fresh`, none with a stored row, onto `w` a
@@ -538,15 +553,23 @@ impl GroupEmit<'_, '_, '_> {
             .expect("a reduce that probes has a value index");
         let open = index.as_mut().expect("a value-indexed reduce is handed its index");
         let gi = g as usize;
+        let prefix = &value_index.prefix;
         let open = || {
+            // The least and the greatest prefix among the probed groups.
             let probed = heads.groups.by_pk.iter().filter(|&&g| probes[g as usize] != Probe::No);
-            let (lo, hi) = value_index
-                .group_span(heads.delta, probed.map(|&g| heads.first(g)))
-                .expect("a probed group spans its own key");
+            let (lo, hi) = probed
+                .map(|&g| PkBuf::from_bytes(heads.index_prefix(prefix, g, &mut [0; MAX_PK_BYTES])))
+                .fold(None, |span, p| match span {
+                    None => Some((p, p)),
+                    Some((lo, hi)) => Some((lo.min(p), hi.max(p))),
+                })
+                .expect("a probed group spans its own prefix");
             open(lo.pk_bytes(), hi.pk_bytes())
         };
         let retracted = (probe == Probe::Retracts).then_some(&*retracted);
-        value_index.seed_extremes((index_cursor, open), heads.delta, heads.first(g), vals, gi, retracted);
+        let mut buf = [0; MAX_PK_BYTES];
+        let prefix = heads.index_prefix(prefix, g, &mut buf);
+        value_index.seed_extremes((index_cursor, open), prefix, vals, gi, retracted);
     }
 
     /// Append the new row of group `g` under `out_pk`, its group columns read

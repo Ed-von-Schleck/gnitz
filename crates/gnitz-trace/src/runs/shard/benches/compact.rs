@@ -120,7 +120,8 @@ fn distinct_compaction_bench() {
             // is the output batch.
             let (rows, merge) = instructions.measure(|| {
                 let windows: Vec<_> = inputs.iter().map(|s| s.window(0..s.row_count())).collect();
-                let rows = run_merge(&windows, &schema, windows.iter().map(|w| 0..w.row_count()), true);
+                let (rows, _) = run_merge(&windows, &schema, windows.iter().map(|w| 0..w.row_count()), true);
+                // Every row weighs 1, so a span's length is its rows' weight.
                 black_box(rows).iter().map(|r| r.2 as u64).sum::<u64>()
             });
             assert_eq!(rows, TOTAL);

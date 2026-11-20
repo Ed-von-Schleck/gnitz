@@ -1,13 +1,13 @@
 use super::tests::{pk_set, registry};
 use super::*;
 use crate::runtime::sal::fixtures::{scan, test_log};
+use crate::test_support::encode_schema_record;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::encode_schema_record;
 
 #[derive(Clone, Copy, Debug)]
 enum Cell {

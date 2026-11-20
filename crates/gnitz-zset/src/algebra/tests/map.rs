@@ -5,7 +5,7 @@ use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_int_batch, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan, u64_pk_schema,
+    certified, make_batch, make_int_batch, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan, u64_pk_schema,
     weighted_rows,
 };
 use gnitz_wire::MAX_COLUMNS;
@@ -350,7 +350,7 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
 fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
     let schema = make_schema_u64_i64();
     let rows = [(1, 1, 200), (2, -3, 100), (3, 1, -300)];
-    let batch = make_batch(&schema, &rows);
+    let batch = certified(make_batch(&schema, &rows));
     let out = rekey_plan(&schema, &[1], &[1], NullKeys::Keep).evaluate_map_batch(&batch.as_mem_batch());
     assert_eq!(out.len(), rows.len());
     for (r, &(_, w, v)) in rows.iter().enumerate() {

@@ -9,7 +9,7 @@ use gnitz_wire::{ReadSink, RowsCut, SinkKind};
 
 use super::aggregate::AdhocFold;
 use super::map::MapPlan;
-use super::order::{OrderLocator, RowRanking, order_locators};
+use super::order::{OrderCol, RowRanking, order_cols};
 use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 
@@ -40,7 +40,7 @@ enum Kind {
 /// Every survivor, trimmed back down to the smallest under `order` whose summed
 /// weight covers `window`.
 struct TopK {
-    order: Vec<OrderLocator>,
+    order: Vec<OrderCol>,
     window: i64,
     /// The weight the keeper holds.
     summed: i64,
@@ -75,7 +75,7 @@ impl SinkPlan {
                             Kind::Prefix { keeper, left: window }
                         } else {
                             let top = TopK {
-                                order: order_locators(order, &sink_in, true)?,
+                                order: order_cols(order, &sink_in, true)?,
                                 window,
                                 summed: 0,
                                 bound: None,

@@ -70,7 +70,7 @@ impl Relation {
         let schema = self.schema();
         match probe {
             // `project_unique`'s layout, which the probe writes.
-            Probe::Pk => project_schema(&schema, &[]),
+            Probe::Pk => Ok(schema.pk_only()),
             Probe::PkColumn(col) => project_schema(&schema, &[col]),
             Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.key_spec().index_schema(&schema)),
         }

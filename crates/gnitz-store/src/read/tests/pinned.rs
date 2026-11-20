@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::{RelationKind, Snapshot};
 use crate::test_support::{
-    TID, make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spec, spilling,
+    TID, make_batch, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spec, spilling,
 };
 use gnitz_wire::PkBuf;
 
@@ -31,7 +31,7 @@ fn pinned(slot: Slot) -> Snapshot {
     let all: Vec<_> = (0..100).map(|k| (k, 1, 0)).collect();
     // Every third key retracted in a later round, so a drain meets cancelled groups.
     let cancelled: Vec<_> = (0..100).step_by(3).map(|k| (k, -1, 0)).collect();
-    let rounds = [make_batch_raw(&schema, &all), make_batch_raw(&schema, &cancelled)];
+    let rounds = [make_batch(&schema, &all), make_batch(&schema, &cancelled)];
     relation_fixture_with(
         spilling(),
         slot,

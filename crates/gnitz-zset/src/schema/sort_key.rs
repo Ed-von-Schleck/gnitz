@@ -128,6 +128,7 @@ impl PkSortKey<'_> for u128 {
     /// share with them below 16 bytes: the key left-aligned, with no length
     /// dispatch, so a search's comparison closure stays small enough to inline.
     /// A byte stands in the key once, so a radix sort passes over it once.
+    /// `opk` is 9..=16 bytes.
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u128 {
         let len = opk.len();
@@ -161,6 +162,7 @@ impl<'a> PkSortKey<'a> for &'a [u8] {
 }
 
 impl PkSortKey<'_> for [u128; 2] {
+    /// `opk` is 17..=32 bytes.
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> [u128; 2] {
         // The leading 16 bytes, then the trailing 1..=16 left-aligned: array `Ord`

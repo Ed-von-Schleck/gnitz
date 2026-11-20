@@ -8,12 +8,12 @@
 
 use std::ops::Range;
 
+use super::codebook::Codebook;
 use gnitz_expr::{Level, null_bits};
 use gnitz_wire::{
     CodedHeap, FixedInt, GERMAN_INLINE_OFF, Heap, HeapValue, MAX_PK_COLUMNS, MAX_SYMBOL_LEN, MAX_SYMBOLS,
     SHORT_STRING_THRESHOLD, ScalarKind, SymbolTable, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
 };
-use gnitz_zset::repr::Codebook;
 use gnitz_zset::repr::PooledBuf;
 use gnitz_zset::repr::append_value;
 use gnitz_zset::repr::{gallop_by, lower_bound_by};
@@ -1065,7 +1065,7 @@ impl<'a> HeapWriter<'a> {
     }
 
     /// Append `value`; where it starts, as its cell names it. See
-    /// [`Codebook::append`] for a coded heap.
+    /// [`append_value`] for a coded heap.
     pub(crate) fn push(&mut self, value: HeapValue<'_>) -> usize {
         let at = self.next_at();
         self.plain_len += value.len();

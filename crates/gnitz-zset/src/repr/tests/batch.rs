@@ -3,9 +3,9 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, make_string_batch, payload0_i64, pk_only_schema, ragged_batch, ragged_schema, read_strings,
-    u64_pk_schema, weighted_rows,
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, payload0_i64, pk_only_schema, ragged_batch, ragged_schema, read_strings, u64_pk_schema,
+    weighted_rows,
 };
 use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
@@ -15,10 +15,10 @@ use gnitz_wire::TypeCode;
 #[test]
 fn append_row_from_source_carries_the_callers_weight() {
     let schema = make_schema_u64_i64();
-    let src = make_batch(&schema, &[(0xDEAD_BEEF, 1, 0x4242)]);
+    let src = certified(make_batch(&schema, &[(0xDEAD_BEEF, 1, 0x4242)]));
 
     let mut dst = Batch::with_capacity(&schema, 1);
-    dst.append_row_from_source(-1, &src, 0, 0, None);
+    dst.append_row_from_source(-1, &src, 0);
 
     assert_eq!(dst.count, 1);
     assert_eq!(dst.get_pk_bytes(0), &0xDEAD_BEEFu64.to_be_bytes());
@@ -86,7 +86,7 @@ fn mem_batch_row_accessors_match_its_regions() {
 #[test]
 #[should_panic(expected = "not strictly")]
 fn certify_consolidated_panics_on_a_duplicate() {
-    make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 5), (1, 1, 5)]).certify_consolidated();
+    make_batch(&make_schema_u64_i64(), &[(1, 1, 5), (1, 1, 5)]).certify_consolidated();
 }
 
 // Ghost clause: strictly ordered, but carrying a net-zero row.
@@ -94,7 +94,7 @@ fn certify_consolidated_panics_on_a_duplicate() {
 #[test]
 #[should_panic(expected = "ghost not eliminated")]
 fn certify_consolidated_panics_on_a_ghost() {
-    make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 0), (2, 0, 0), (3, 1, 0)]).certify_consolidated();
+    make_batch(&make_schema_u64_i64(), &[(1, 1, 0), (2, 0, 0), (3, 1, 0)]).certify_consolidated();
 }
 
 // A weight map that makes a ghost falsifies the claim it keeps.
@@ -102,7 +102,7 @@ fn certify_consolidated_panics_on_a_ghost() {
 #[test]
 #[should_panic(expected = "mapped to zero")]
 fn map_weights_panics_on_a_ghost_under_the_claim() {
-    make_batch(&make_schema_u64_i64(), &[(1, 1, 5), (2, 1, 6)]).map_weights(|_| 0);
+    certified(make_batch(&make_schema_u64_i64(), &[(1, 1, 5), (2, 1, 6)])).map_weights(|_| 0);
 }
 
 /// `is_consolidated` holds structurally for a batch nothing can mis-fold, and
@@ -111,12 +111,9 @@ fn map_weights_panics_on_a_ghost_under_the_claim() {
 fn is_consolidated_without_a_claim_only_where_nothing_can_fold() {
     let schema = make_schema_u64_i64();
     assert!(Batch::with_capacity(&schema, 4).is_consolidated());
-    assert!(make_batch_raw(&schema, &[(7, 1, 70)]).is_consolidated());
-    assert!(
-        !make_batch_raw(&schema, &[(7, 0, 70)]).is_consolidated(),
-        "a lone ghost"
-    );
-    let mut two = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    assert!(make_batch(&schema, &[(7, 1, 70)]).is_consolidated());
+    assert!(!make_batch(&schema, &[(7, 0, 70)]).is_consolidated(), "a lone ghost");
+    let mut two = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
     assert!(!two.is_consolidated());
     two.certify_consolidated();
     assert!(two.is_consolidated());
@@ -133,13 +130,13 @@ fn every_producer_states_its_claim() {
         SchemaColumn::new(TypeCode::I64, false),
         SchemaColumn::new(TypeCode::I64, true),
     ]);
-    let src = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    let src = certified(make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
     let mut appended = src.clone();
     appended.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
     let mut cleared = src.clone();
     cleared.clear();
-    let mut above = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-    above.append_above(make_batch(&schema, &[(3, 1, 30), (4, 1, 40)]));
+    let mut above = certified(make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]));
+    above.append_above(certified(make_batch(&schema, &[(3, 1, 30), (4, 1, 40)])));
     for (what, b, want) in [
         ("with_capacity", Batch::with_capacity(&schema, 4), RAW),
         ("clone", src.clone(), CONSOLIDATED),
@@ -254,7 +251,7 @@ fn key_rows_at_minus_one_are_minus_one_rows_of_zeroed_non_null_cells() {
 #[test]
 fn trimmed_copies_only_oversized_batches() {
     let schema = make_schema_u64_i64();
-    let src = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+    let src = certified(make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]));
 
     let mut loose = Batch::with_capacity(&schema, 1000);
     loose.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
@@ -307,7 +304,7 @@ fn from_ranges_resolves_long_values_under_both_heap_arms() {
             .enumerate()
             .map(|(i, v)| (i as u64, 1, &v[..]))
             .collect();
-        make_batch_bytes(&make_schema_pk_u64_payload_blob(), &rows)
+        certified(make_batch_bytes(&make_schema_pk_u64_payload_blob(), &rows))
     };
     let carried = Batch::from_ranges(&src(8), &[(0, 7)], 0);
     assert_eq!(read_strings(&carried), vals[..7]);
@@ -332,7 +329,7 @@ fn from_ranges_resolves_long_values_under_both_heap_arms() {
 #[test]
 fn widened_with_nulls_places_the_fill_on_either_side() {
     let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-    let b = make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, long)]);
+    let b = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, long)]));
 
     let cols = |first: bool| -> SchemaDescriptor {
         let pk = SchemaColumn::new(TypeCode::U64, false);
@@ -374,23 +371,23 @@ fn consolidation_certifies_rows_already_in_order() {
     let schema = make_schema_u64_i64();
     let ordered: &[(u64, i64, i64)] = &[(1, 1, 10), (1, -1, 11), (2, 1, 5)];
 
-    let mut in_place = make_batch_raw(&schema, ordered);
+    let mut in_place = make_batch(&schema, ordered);
     let arena = in_place.data.as_ptr();
     in_place.consolidate_in_place();
     assert!(in_place.consolidated);
     assert_eq!(in_place.data.as_ptr(), arena, "no refold");
 
-    let owned = make_batch_raw(&schema, ordered);
+    let owned = make_batch(&schema, ordered);
     let arena = owned.data.as_ptr();
     let owned = owned.into_consolidated();
     assert!(owned.consolidated);
     assert_eq!(owned.data.as_ptr(), arena, "returned by move");
 
-    let copy = make_batch_raw(&schema, ordered).to_consolidated();
+    let copy = make_batch(&schema, ordered).to_consolidated();
     assert!(copy.consolidated);
     assert_eq!(weighted_rows(&copy), weighted_rows(&in_place));
 
-    let mut already = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    let mut already = certified(make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]));
     let arena = already.data.as_ptr();
     already.consolidate_in_place();
     assert_eq!(already.data.as_ptr(), arena, "a certified batch is not refolded");
@@ -419,7 +416,7 @@ fn keyed_by_prefix_cuts_each_key_to_the_output_stride() {
 #[test]
 fn keyed_by_prefix_drops_the_payload() {
     let schema = make_schema_u64_i64();
-    let out = make_batch(&schema, &[(1, 1, 10), (2, 3, 20)]).keyed_by_prefix(&schema.pk_only());
+    let out = certified(make_batch(&schema, &[(1, 1, 10), (2, 3, 20)])).keyed_by_prefix(&schema.pk_only());
     assert_eq!(out.schema().num_payload_cols(), 0);
     let got: Vec<_> = (0..out.count)
         .map(|i| (out.get_pk_bytes(i).to_vec(), out.get_weight(i)))
@@ -435,8 +432,8 @@ fn keyed_by_prefix_drops_the_payload() {
 #[test]
 fn negate_flips_every_weight() {
     let schema = make_schema_u64_i64();
-    let out = make_batch(&schema, &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)]).negated();
-    let want = make_batch_raw(&schema, &[(1, -3, 10), (2, 1, 20), (3, i64::MIN, 30)]);
+    let out = certified(make_batch(&schema, &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)])).negated();
+    let want = make_batch(&schema, &[(1, -3, 10), (2, 1, 20), (3, i64::MIN, 30)]);
     assert_eq!(weighted_rows(&out), weighted_rows(&want));
 }
 
@@ -450,7 +447,7 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
     let mut rows: Vec<(u64, i64, &[u8])> = (1..=8).map(|pk| (pk, 1, &[b'x'; 40][..])).collect();
     rows[2].2 = &[b'c'; 30];
     rows[3].2 = b"short";
-    let src = make_string_batch(&rows).padded(5);
+    let src = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows)).padded(5);
     let mask = src.schema().string_payload_slots();
     let mb = src.as_mem_batch();
 
@@ -480,12 +477,43 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
     );
 }
 
+/// `indexed_rows` copies the named rows in list order at their own weights,
+/// any row any number of times. Naming most rows carries the heap whole, with
+/// the long bytes of the rows named nowhere charged dead, however often the
+/// others are named; naming few relocates them into a heap of their own.
+#[test]
+fn indexed_rows_carry_the_heap_when_most_rows_are_named() {
+    let strings: Vec<[u8; 40]> = (1..=8).map(|pk| [b'a' + pk; 40]).collect();
+    let rows: Vec<(u64, i64, &[u8])> = (1..=8)
+        .map(|pk| (pk, pk as i64, &strings[pk as usize - 1][..]))
+        .collect();
+    let src = make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows).padded(5);
+    let want = |list: &[u32]| -> Vec<_> {
+        let all = weighted_rows(&src);
+        list.iter().map(|&i| all[i as usize].clone()).collect()
+    };
+    for (list, carried, dead) in [
+        (&[7u32, 6, 5, 4, 3, 2, 1, 0][..], true, 5),
+        (&[0, 0, 1, 1, 2, 3, 4, 5, 6, 6], true, 5 + 40),
+        (&[3, 3, 3, 3, 3, 3, 3, 3], false, 0),
+        (&[5, 1], false, 0),
+    ] {
+        let out = src.indexed_rows(list);
+        assert_eq!(weighted_rows(&out), want(list), "{list:?}");
+        let strings_of = list.iter().map(|&i| strings[i as usize].to_vec()).collect::<Vec<_>>();
+        assert_eq!(read_strings(&out), strings_of, "{list:?}");
+        assert_eq!(out.blob.len() == src.blob.len(), carried, "{list:?}");
+        assert_eq!(out.dead_heap, dead, "{list:?}");
+        out.debug_verify_dead_heap();
+    }
+}
+
 /// The room a carry is asked for is reserved past the carried heap, and past
 /// the kept rows' share of it when the carry is refused.
 #[test]
 fn carry_heap_reserves_room_past_either_outcome() {
     let rows: Vec<(u64, i64, &[u8])> = (1..=8).map(|pk| (pk, 1, &[b'x'; 40][..])).collect();
-    let src = make_string_batch(&rows);
+    let src = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows));
     let mask = src.schema().string_payload_slots();
     let mb = src.as_mem_batch();
     let heap = src.blob().len();
@@ -535,8 +563,16 @@ fn carry_heap_charges_the_dropped_slots() {
 /// heap is the sum of its inputs', and so is its dead-byte bound.
 #[test]
 fn concat_carries_every_heap_whole() {
-    let a = make_string_batch(&[(1, 1, &[b'a'; 20]), (2, 1, b"tiny")]).padded(3);
-    let b = make_string_batch(&[(3, 1, &[b'b'; 30]), (4, 1, &[b'c'; 25])]).padded(4);
+    let a = certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(1, 1, [b'a'; 20].as_slice()), (2, 1, b"tiny")],
+    ))
+    .padded(3);
+    let b = certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(3, 1, [b'b'; 30].as_slice()), (4, 1, &[b'c'; 25])],
+    ))
+    .padded(4);
     let out = Batch::concat(a.schema(), [a.as_mem_batch(), b.as_mem_batch()].into_iter());
     assert_eq!(
         read_strings(&out),
@@ -550,8 +586,15 @@ fn concat_carries_every_heap_whole() {
 /// padding never reaches the output.
 #[test]
 fn a_wasteful_source_relocates_rather_than_adopts() {
-    let live = make_string_batch(&[(1, 1, &[b'a'; 20])]);
-    let wasteful = make_string_batch(&[(2, 1, &[b'b'; 20])]).padded(100);
+    let live = certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(1, 1, &[b'a'; 20])],
+    ));
+    let wasteful = certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(2, 1, &[b'b'; 20])],
+    ))
+    .padded(100);
     assert!(super::super::string_heap::heap_is_wasteful(
         wasteful.dead_heap,
         wasteful.blob.len()
@@ -571,10 +614,12 @@ fn a_wasteful_source_relocates_rather_than_adopts() {
 fn trimmed_compacts_past_a_quarter_dead() {
     // 60 live bytes: 20 dead is exactly a quarter of 80, 21 is past it.
     let rows: [(u64, i64, &[u8]); 2] = [(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 40])];
-    let kept = make_string_batch(&rows).padded(20).trimmed();
+    let kept = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows))
+        .padded(20)
+        .trimmed();
     assert_eq!((kept.blob.len(), kept.dead_heap), (80, 20), "a quarter dead is carried");
 
-    let mut overcounted = make_string_batch(&rows);
+    let mut overcounted = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows));
     overcounted.dead_heap = 60;
     let measured = overcounted.trimmed();
     assert_eq!(
@@ -583,7 +628,9 @@ fn trimmed_compacts_past_a_quarter_dead() {
         "an overcount is measured down"
     );
 
-    let compacted = make_string_batch(&rows).padded(21).trimmed();
+    let compacted = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows))
+        .padded(21)
+        .trimmed();
     assert_eq!((compacted.blob.len(), compacted.dead_heap), (60, 0));
     assert_eq!(read_strings(&compacted), [vec![b'a'; 20], vec![b'b'; 40]]);
     assert!(compacted.consolidated);
@@ -718,8 +765,8 @@ fn holds_element_of_matches_pk_and_payload() {
     let schema = make_schema_u64_i64();
     let mut rows: Vec<(u64, i64, i64)> = (0..50).map(|v| (7, 1, 2 * v)).collect();
     rows.extend([(3, 1, 10), (9, -2, 4)]);
-    let held = make_batch_raw(&schema, &rows).into_consolidated();
-    let probes = make_batch_raw(
+    let held = make_batch(&schema, &rows).into_consolidated();
+    let probes = make_batch(
         &schema,
         &[(3, -1, 10), (3, 1, 11), (7, -1, 48), (7, -1, 49), (8, 1, 0), (9, 1, 4)],
     )
@@ -780,11 +827,11 @@ fn runs_where_zip_matches_a_per_position_scan_across_word_boundaries() {
 /// doubles rather than growing by each reserve.
 #[test]
 fn append_source_rows_one_row_at_a_time_grows_the_heap_geometrically() {
-    use crate::test_support::string_batch;
     const N: usize = 1000;
-    let src = string_batch(
+    let src = make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
         &(0..N as u64)
-            .map(|i| (i, format!("long string number {i:>8}")))
+            .map(|i| (i, 1, format!("long string number {i:>8}")))
             .collect::<Vec<_>>(),
     );
     let mut dst = Batch::empty_with_schema(src.schema());

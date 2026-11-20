@@ -855,6 +855,7 @@ dependencies = [
  "gnitz-foundation",
  "gnitz-fuzz",
  "gnitz-store",
+ "gnitz-test-harness",
  "gnitz-trace",
  "gnitz-wire",
  "gnitz-zset",
@@ -931,6 +932,7 @@ dependencies = [
 name = "gnitz-trace"
 version = "0.1.8"
 dependencies = [
+ "fsst-rs",
  "gnitz-expr",
  "gnitz-foundation",
  "gnitz-wire",
@@ -957,7 +959,6 @@ dependencies = [
 name = "gnitz-zset"
 version = "0.1.8"
 dependencies = [
- "fsst-rs",
  "gnitz-expr",
  "gnitz-foundation",
  "gnitz-wire",
@@ -972,7 +973,6 @@ name = "gnitz-zset-testkit"
 version = "0.1.8"
 dependencies = [
  "gnitz-expr",
- "gnitz-foundation",
  "gnitz-wire",
  "gnitz-zset",
  "proptest",

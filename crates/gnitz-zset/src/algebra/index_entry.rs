@@ -57,7 +57,7 @@ impl KeySpec {
     /// Span width in bytes — the sum of the column widths.
     #[inline]
     pub fn key_size(&self) -> usize {
-        self.packer.out_stride
+        self.packer.out_stride()
     }
 
     /// One row's leading-key span, `key_size()` bytes; `None` when any indexed

@@ -3,7 +3,7 @@ use super::Fold;
 use crate::storage::Cut;
 use crate::storage::manifest::{self, StoreDir};
 use crate::test_support::{
-    make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
+    make_batch, make_batch_opk, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_trace::runs::write_shard;
@@ -118,7 +118,7 @@ fn gk(v: u64) -> PkBuf {
 /// A `(U64 PK | I64 payload)` batch at weight 1.
 fn test_batch(pks: &[u64], values: &[i64]) -> Batch {
     let rows: Vec<(u64, i64, i64)> = pks.iter().zip(values).map(|(&p, &v)| (p, 1, v)).collect();
-    make_batch_raw(&make_schema_u64_i64(), &rows)
+    make_batch(&make_schema_u64_i64(), &rows)
 }
 
 /// A payload for row `i` that spans the whole I64 range across a batch, so the
@@ -291,7 +291,7 @@ fn guards_over_the_file_threshold_fold_in_place() {
     // Alternating inserts and retractions of the same rows, netting to zero.
     for i in 0..GUARD_FILE_THRESHOLD[L1] as i64 + 2 {
         let rows: Vec<(u64, i64, i64)> = (100..104).map(|k| (k, if i % 2 == 0 { 1 } else { -1 }, 0)).collect();
-        seed_guard(&mut idx, L1, gk(100), &make_batch_raw(&schema, &rows), 1);
+        seed_guard(&mut idx, L1, gk(100), &make_batch(&schema, &rows), 1);
     }
 
     idx.split_overfull_guards(L1).unwrap();
@@ -1748,7 +1748,7 @@ fn tier_folds_keep_the_zset() {
             for &(k, w, val) in &rows {
                 m.add(k.to_be_bytes().to_vec(), val, w);
             }
-            idx.append_l0_run(&make_batch_raw(&schema, &rows).into_consolidated())
+            idx.append_l0_run(&make_batch(&schema, &rows).into_consolidated())
                 .unwrap();
             idx.drain().unwrap();
             for (level, threshold) in idx.levels.iter().zip(GUARD_FILE_THRESHOLD) {
@@ -1785,10 +1785,10 @@ fn the_newest_shard_holding_a_key_holds_its_live_row() {
     // Rewrite `keys` from version `v - 1` to `v`.
     let rewrite = |keys: std::ops::Range<u64>, v: i64| -> Batch {
         let rows: Vec<(u64, i64, i64)> = keys.flat_map(|k| [(k, -1, v - 1), (k, 1, v)]).collect();
-        make_batch_raw(&schema, &rows).into_consolidated()
+        make_batch(&schema, &rows).into_consolidated()
     };
     let inserts: Vec<(u64, i64, i64)> = (0..40).map(|k| (k, 1, 0)).collect();
-    idx.append_l0_run(&make_batch_raw(&schema, &inserts).into_consolidated())
+    idx.append_l0_run(&make_batch(&schema, &inserts).into_consolidated())
         .unwrap();
     idx.run_compact().unwrap();
     while !idx.levels[L1].guards.is_empty() {

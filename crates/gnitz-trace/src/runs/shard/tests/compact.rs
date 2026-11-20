@@ -3,8 +3,8 @@ use super::super::file::ShardWriteOpts;
 use super::super::layout::{ShardHeader, spans_of};
 use super::*;
 use crate::test_support::{
-    FoldRow, arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, make_string_batch, map_coded_shard, map_shard, prose, u64_pk_schema,
+    FoldRow, arb_fold_case, assert_folds, certified, fold_batch, make_batch, make_batch_bytes,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, map_coded_shard, map_shard, prose, u64_pk_schema,
 };
 use gnitz_wire::{PkBuf, REG_NULL_BMP, TypeCode};
 use gnitz_zset::repr::{BatchBuilder, merge_consolidated};
@@ -63,7 +63,7 @@ fn a_merge_refuses_a_corrupt_input() {
     let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64, i64)> = (1..=100).map(|i| (i, 1, i as i64)).collect();
-    let intact = map_shard(&dir.path().join("s.db"), &make_batch(&schema, &rows));
+    let intact = map_shard(&dir.path().join("s.db"), &certified(make_batch(&schema, &rows)));
     let mut image = std::fs::read(dir.path().join("s.db")).unwrap();
     *image.last_mut().unwrap() ^= 1;
     // The same basename, which the prefix digest is seeded with.
@@ -84,7 +84,7 @@ fn a_descending_guard_key_panics() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64, i64)> = (1..=100).map(|i| (i, 1, i as i64)).collect();
-    let shard = map_shard(&dir.path().join("s.db"), &make_batch(&schema, &rows));
+    let shard = map_shard(&dir.path().join("s.db"), &certified(make_batch(&schema, &rows)));
     let keys = [60u64, 30].map(|k| PkBuf::from_bytes(&k.to_be_bytes())).to_vec();
     let _ = GuardMerge::begin(vec![shard], keys, false);
 }
@@ -174,10 +174,10 @@ fn a_dominated_dehydrating_merge_folds_each_pk_group() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64, i64)> = (0..300u64).flat_map(|k| [(k, 1, 0), (k, 2, 1)]).collect();
-    let large = map_shard(&dir.path().join("large.db"), &make_batch(&schema, &rows));
+    let large = map_shard(&dir.path().join("large.db"), &certified(make_batch(&schema, &rows)));
     let small = map_shard(
         &dir.path().join("small.db"),
-        &make_batch(&schema, &[(7, 1, 5), (150, -3, 1)]),
+        &certified(make_batch(&schema, &[(7, 1, 5), (150, -3, 1)])),
     );
     let [(_, true, coarse)] = &route(&[large, small], &[PkBuf::zeroed(8)], true)[..] else {
         panic!("one skeleton output");
@@ -216,9 +216,9 @@ fn u64_i64_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
 fn ascending_inputs_fold_as_their_merge() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let low = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (2, 2, 21), (3, 1, 30)]);
-    let high = make_batch(&schema, &[(7, 1, 70), (8, 3, 80)]);
-    let meeting = make_batch(&schema, &[(3, 1, 30), (3, 1, 31), (4, 1, 40)]);
+    let low = certified(make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (2, 2, 21), (3, 1, 30)]));
+    let high = certified(make_batch(&schema, &[(7, 1, 70), (8, 3, 80)]));
+    let meeting = certified(make_batch(&schema, &[(3, 1, 30), (3, 1, 31), (4, 1, 40)]));
     let shard = |name: &str, b: &Batch| map_shard(&dir.path().join(name), b);
     let (low_s, high_s, meeting_s) = (
         shard("low.db", &low),
@@ -238,7 +238,7 @@ fn ascending_inputs_fold_as_their_merge() {
     };
 
     // Below 5 only `low` holds rows; from 5 `top` precedes `high` but lies above it.
-    let top = make_batch(&schema, &[(9, 1, 90)]);
+    let top = certified(make_batch(&schema, &[(9, 1, 90)]));
     assert_eq!(
         folded(&[Rc::clone(&low_s), shard("top.db", &top), Rc::clone(&high_s)]),
         merged(&[&low, &top, &high])
@@ -265,7 +265,7 @@ fn ascending_inputs_fold_as_their_merge() {
 fn a_skeleton_input_makes_every_output_a_skeleton() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let hydrated = make_batch(&schema, &[(1, 1, 10), (9, 1, 90)]);
+    let hydrated = certified(make_batch(&schema, &[(1, 1, 10), (9, 1, 90)]));
     let [(_, true, coarse)] = &route(
         &[map_shard(&dir.path().join("a.db"), &hydrated)],
         &[PkBuf::zeroed(8)],
@@ -285,7 +285,7 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
     let skeleton = Rc::new(MappedShard::open(path.to_str().unwrap(), &schema).unwrap());
     let fresh = map_shard(
         &dir.path().join("c.db"),
-        &make_batch(&schema, &[(1, 2, 11), (5, 1, 50)]),
+        &certified(make_batch(&schema, &[(1, 2, 11), (5, 1, 50)])),
     );
 
     let guards = [PkBuf::zeroed(8), PkBuf::from_bytes(&5u64.to_be_bytes())];
@@ -330,7 +330,7 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
     let values: Vec<String> = (0..1000).map(prose).collect();
     let rows = |pks: std::ops::RangeInclusive<u64>, w: i64| -> Batch {
         let rows: Vec<(u64, i64, &[u8])> = pks.map(|pk| (pk, w, values[pk as usize].as_bytes())).collect();
-        make_string_batch(&rows)
+        certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows))
     };
     let own = rows(1..=300, 1);
     let book = Codebook::for_batch(None, &own).unwrap();
@@ -389,7 +389,7 @@ fn ascending_windows_are_the_merge_of_their_rows() {
     let values: Vec<String> = (0..1000).map(prose).collect();
     let rows = |pks: std::ops::RangeInclusive<u64>, w: i64| -> Batch {
         let rows: Vec<(u64, i64, &[u8])> = pks.map(|pk| (pk, w, values[pk as usize].as_bytes())).collect();
-        make_string_batch(&rows)
+        certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows))
     };
     let (low, mid, high) = (rows(1..=300, 1), rows(301..=600, 2), rows(601..=900, 1));
     let book = Codebook::for_batch(None, &low).unwrap();
@@ -557,7 +557,7 @@ fn ascending_plain_windows_carry_their_heaps() {
     let block = |pks: std::ops::Range<u64>| -> Batch {
         let rows: Vec<(u64, i64, String)> = pks.map(|pk| (pk, 1, prose(pk as usize))).collect();
         let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(pk, w, s)| (*pk, *w, s.as_bytes())).collect();
-        make_string_batch(&rows)
+        certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows))
     };
     let shards = vec![
         map_shard(&dir.path().join("a.db"), &block(0..400)),

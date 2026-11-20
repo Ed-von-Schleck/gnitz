@@ -289,3 +289,25 @@ fn layout_digest_separates_every_region_axis() {
     assert_ne!(base, digest(&[I64, U64], &[0]), "region order");
     assert_eq!(base, digest(&[I64, U64], &[1]), "column numbering");
 }
+
+/// An identity digest moves with everything a descriptor holds: the column
+/// count, a type code, a column's nullability, and which columns the PK names.
+#[test]
+fn identity_digest_separates_every_descriptor_axis() {
+    use TypeCode::{I64, String as Str, U64};
+    let digest = |cols: &[(TypeCode, bool)], pk: &[u32]| {
+        let cols: Vec<SchemaColumn> = cols.iter().map(|&(tc, n)| SchemaColumn::new(tc, n)).collect();
+        SchemaDescriptor::new(&cols, pk).identity_digest()
+    };
+    let base = digest(&[(U64, false), (I64, false)], &[0]);
+    assert_eq!(base, digest(&[(U64, false), (I64, false)], &[0]), "equal descriptors");
+    assert_ne!(
+        base,
+        digest(&[(U64, false), (I64, false), (I64, false)], &[0]),
+        "column count"
+    );
+    assert_ne!(base, digest(&[(U64, false), (Str, false)], &[0]), "type code");
+    assert_ne!(base, digest(&[(U64, false), (I64, true)], &[0]), "nullability");
+    assert_ne!(base, digest(&[(U64, false), (I64, false)], &[0, 1]), "PK arity");
+    assert_ne!(base, digest(&[(I64, false), (U64, false)], &[1]), "column numbering");
+}

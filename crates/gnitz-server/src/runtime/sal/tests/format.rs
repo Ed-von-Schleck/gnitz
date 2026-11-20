@@ -8,11 +8,14 @@ use crate::runtime::sal::fixtures::{assert_fail_stops, group_at, test_log};
 use crate::runtime::sal::format::RequestHead;
 use crate::runtime::sal::{Apply, Inbound};
 use crate::runtime::w2m::fixtures::id;
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows};
+use crate::test_support::encode_schema_record;
+use crate::test_support::{
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, weighted_rows,
+};
 use gnitz_wire::TypeCode;
 use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_zset::repr::{Batch, BatchBuilder, WireRows};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, encode_schema_record};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // The header codec: every field round-trips, the bytes are pinned, and a value
@@ -248,7 +251,7 @@ fn the_live_path_aborts_on_a_damaged_request_argument() {
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn the_live_path_aborts_on_a_damaged_request_argument_internal() {
-    if !crate::test_support::in_child_test() {
+    if !gnitz_test_harness::in_child_test() {
         return;
     }
     let mut log = test_log(1 << 20, 1, 1);
@@ -310,14 +313,17 @@ fn padded_batch() -> Batch {
 #[test]
 fn every_payload_shape_round_trips_and_no_prefix_decodes() {
     let fixed = make_schema_u64_i64();
-    let consolidated = make_batch(&fixed, &[(1, 2, -5), (2, -1, 7), (9, 3, 0)]);
+    let consolidated = certified(make_batch(&fixed, &[(1, 2, -5), (2, -1, 7), (9, 3, 0)]));
     let empty = Batch::empty_with_schema(&fixed);
-    let raw = make_batch_raw(
+    let raw = make_batch(
         &fixed,
         &(0..8).map(|i| (7 - i, i as i64 + 1, i as i64 * 10)).collect::<Vec<_>>(),
     );
     let long = b"a string long enough to leave the inline prefix".as_slice();
-    let strings = make_string_batch(&[(1, 1, b"inline".as_slice()), (2, -2, long), (3, 1, long)]);
+    let strings = certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &[(1, 1, b"inline".as_slice()), (2, -2, long), (3, 1, long)],
+    ));
     let padded = padded_batch();
     let row_width = (raw.wire_whole().unwrap().byte_size() - WAL_HEADER_SIZE) / raw.len();
     let range = raw.wire_rows_within(2, WAL_HEADER_SIZE + 3 * row_width).unwrap();
@@ -390,7 +396,7 @@ fn every_payload_shape_round_trips_and_no_prefix_decodes() {
 #[test]
 fn a_payload_with_bytes_it_does_not_declare_is_refused() {
     let sd = make_schema_u64_i64();
-    let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
+    let batch = certified(make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]));
     let record = encode_schema_record(&sd);
 
     let mut no_rows = payload(b"blob", None);
@@ -412,7 +418,7 @@ fn a_payload_with_bytes_it_does_not_declare_is_refused() {
 #[test]
 fn a_payload_lays_its_rows_out_under_the_known_schema_or_its_record() {
     let sd = make_schema_u64_i64();
-    let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
+    let batch = certified(make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]));
     let junk = [0xFFu8; 12];
     let wire = payload(&junk, Some(batch.wire_whole().unwrap()));
     let got = payload_rows(&wire, |record| {
@@ -436,7 +442,7 @@ fn a_payload_lays_its_rows_out_under_the_known_schema_or_its_record() {
 #[test]
 fn a_payload_is_its_blob_length_the_blob_and_the_block() {
     let sd = make_schema_u64_i64();
-    let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
+    let batch = certified(make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]));
     let record = encode_schema_record(&sd);
     let rows = batch.wire_whole().unwrap();
     let mut block = vec![0; rows.byte_size()];

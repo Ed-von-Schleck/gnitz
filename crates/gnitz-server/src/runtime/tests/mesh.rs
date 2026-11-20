@@ -1,8 +1,8 @@
 use super::*;
 use crate::query::Lane;
 use crate::test_support::{
-    make_batch, make_batch_bytes_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch,
-    opk_pk, weighted_rows,
+    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk,
+    weighted_rows,
 };
 use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_zset::algebra::{Placement, Slot};
@@ -62,7 +62,7 @@ fn owned_by(r: usize, from: u64, n: usize) -> Vec<u64> {
 /// block read from the wrong worker or round shows.
 pub(super) fn partition(w: usize, round: u64, n: u64) -> Batch {
     let rows: Vec<(u64, i64, i64)> = (0..n).map(|i| (round * n + i, 1 + w as i64, (i % 7) as i64)).collect();
-    make_batch(&make_schema_u64_i64(), &rows)
+    certified(make_batch(&make_schema_u64_i64(), &rows))
 }
 
 /// Receiver `r`'s close of a round of `parts` under `spec`: its share of every
@@ -199,12 +199,13 @@ fn a_second_open_before_the_round_closes_is_refused() {
 fn string_partition(mut pks: Vec<u64>, text: impl Fn(u64) -> String) -> Batch {
     pks.sort_unstable();
     let texts: Vec<String> = pks.iter().map(|&pk| text(pk)).collect();
-    make_string_batch(
+    certified(make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
         &pks.iter()
             .zip(&texts)
             .map(|(&pk, t)| (pk, 1, t.as_bytes()))
             .collect::<Vec<_>>(),
-    )
+    ))
 }
 
 /// A round too large for one part crosses in several, and every receiver
@@ -225,9 +226,9 @@ fn a_round_too_large_for_one_part_crosses_in_several() {
             .map(|pk| (pk, 1 + w, texts[pk as usize].as_bytes()))
             .collect::<Vec<_>>()
     };
-    let heap = make_string_batch(&heap_rows(0));
+    let heap = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &heap_rows(0)));
     assert!(heap.blob().len() > SMALL_OUTBOX, "the heap alone overflows a part");
-    let raw_heap = make_batch_bytes_raw(&strings, &heap_rows(1).into_iter().rev().collect::<Vec<_>>());
+    let raw_heap = make_batch_bytes(&strings, &heap_rows(1).into_iter().rev().collect::<Vec<_>>());
     // Twenty short rows for receiver 0; one long row for receiver 1.
     let pks = owned_by(0, 0, 20).into_iter().chain(owned_by(1, 100_000, 1)).collect();
     let one_long = string_partition(pks, |pk| match pk >= 100_000 {

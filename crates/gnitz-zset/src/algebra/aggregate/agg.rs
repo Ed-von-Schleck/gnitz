@@ -238,14 +238,14 @@ impl AggValues {
 }
 
 /// One aggregate's scalar values, one per group, borrowed for a kernel.
-pub(crate) struct Slots<'a> {
+struct Slots<'a> {
     acc: &'a mut [i64],
     has: &'a mut [bool],
 }
 
 /// A group's running value as a kernel carries it, and what a row's
 /// contribution does to it.
-pub(crate) trait Reg: Copy {
+trait Reg: Copy {
     /// A row's contribution.
     type In;
     fn load(vals: &Slots, g: usize) -> Self;
@@ -345,7 +345,7 @@ impl Reg for Least {
 }
 
 /// Which group each row of a fold belongs to.
-pub(crate) trait Groups: Copy {
+trait Groups: Copy {
     /// The group of the fold's `i`-th row, which lies in its `range`-th range.
     fn of(self, range: usize, i: usize) -> usize;
 
@@ -367,7 +367,7 @@ pub(crate) trait Groups: Copy {
 
 /// The rows of a fold's `i`-th range in one group.
 #[derive(Clone, Copy)]
-pub enum RangeGroups {
+enum RangeGroups {
     /// Group `i`.
     Each,
     /// This group.
@@ -408,24 +408,27 @@ impl Groups for &[u32] {
     }
 }
 
-/// Which group each row of a fold belongs to, as a caller outside this crate
-/// names it: whole ranges, or one group per row.
+/// Which group each row of a fold belongs to.
 #[derive(Clone, Copy)]
 pub enum FoldGroups<'a> {
-    Ranges(RangeGroups),
+    /// The rows of the fold's `i`-th range in group `i`.
+    Each,
+    /// Every row in this group.
+    One(usize),
     /// Row `i` of the fold in group `self[i]`.
     Rows(&'a [u32]),
 }
 
-impl From<RangeGroups> for FoldGroups<'_> {
-    fn from(g: RangeGroups) -> Self {
-        FoldGroups::Ranges(g)
-    }
-}
-
-impl<'a> From<&'a [u32]> for FoldGroups<'a> {
-    fn from(g: &'a [u32]) -> Self {
-        FoldGroups::Rows(g)
+impl<'a> FoldGroups<'a> {
+    /// Whole ranges, or one group per row: the two [`Groups`] a fold is
+    /// monomorphized for.
+    #[inline(always)]
+    fn split(self) -> Result<RangeGroups, &'a [u32]> {
+        match self {
+            FoldGroups::Each => Ok(RangeGroups::Each),
+            FoldGroups::One(g) => Ok(RangeGroups::One(g)),
+            FoldGroups::Rows(ord) => Err(ord),
+        }
     }
 }
 
@@ -433,9 +436,9 @@ impl<'a> From<&'a [u32]> for FoldGroups<'a> {
 /// kind, so the fold beneath is monomorphized for each.
 macro_rules! with_groups {
     ($groups:expr, |$g:ident| $body:expr) => {
-        match $groups.into() {
-            FoldGroups::Ranges($g) => $body,
-            FoldGroups::Rows($g) => $body,
+        match $groups.split() {
+            Ok($g) => $body,
+            Err($g) => $body,
         }
     };
 }
@@ -505,7 +508,9 @@ impl AggValues {
     }
 
     /// Seed group `g` of MIN/MAX `k` with the extreme image the value index
-    /// holds for it.
+    /// holds for it: a scalar's image is the leading 8 bytes of `image`,
+    /// big-endian, as [`image_slot_col`](crate::algebra::order_image::image_slot_col)
+    /// lays it out; a wide one's is all of it.
     pub fn seed_from_index(&mut self, k: usize, g: usize, image: &[u8]) {
         let StepKind::Extreme { max, kind } = self.aggs[k].kind else {
             unreachable!("only an extreme is seeded from the value index")
@@ -585,32 +590,28 @@ impl AggValues {
     /// Step aggregate `k` over rows `ranges` of `mb`, each into its group: one
     /// pass over its column, in row order. A row at a non-positive weight steps no
     /// extreme.
-    pub fn fold<'g>(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Into<FoldGroups<'g>>) {
+    #[inline(always)]
+    pub fn fold(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: FoldGroups) {
+        with_groups!(groups, |g| self.fold_by(k, mb, ranges, g));
+    }
+
+    /// [`Self::fold`] under one kind of [`Groups`], compiled once per kind
+    /// apart from its callers.
+    fn fold_by(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Groups) {
         let Agg { kind, src, .. } = self.aggs[k];
-        with_groups!(groups, |g| self.fold_column(k, (kind, src), mb, ranges, g));
+        self.fold_column(k, (kind, src), mb, ranges, groups);
     }
 
-    /// [`Self::fold`] of wide extreme `k`, stepping no row of a group `g` that
-    /// `skips(g)`: one whose wide extremes the caller reads elsewhere. A wide
-    /// extreme compares native bytes a row at a time, so skipping a row costs
-    /// less than stepping it.
-    pub fn fold_wide<'g>(
+    /// [`Self::fold`] of wide extreme `k` into group `groups[i]` of the fold's
+    /// row `i`, stepping no row of a group `g` that `skips(g)`: one whose wide
+    /// extremes the caller reads elsewhere. A wide extreme compares native
+    /// bytes a row at a time, so skipping a row costs less than stepping it.
+    pub fn fold_wide(
         &mut self,
         k: usize,
         mb: &MemBatch,
         ranges: &[(usize, usize)],
-        groups: impl Into<FoldGroups<'g>>,
-        skips: impl Fn(usize) -> bool,
-    ) {
-        with_groups!(groups, |g| self.fold_wide_by(k, mb, ranges, g, &skips));
-    }
-
-    fn fold_wide_by(
-        &mut self,
-        k: usize,
-        mb: &MemBatch,
-        ranges: &[(usize, usize)],
-        groups: impl Groups,
+        groups: &[u32],
         skips: impl Fn(usize) -> bool,
     ) {
         let Agg { kind, src, .. } = self.aggs[k];
@@ -631,11 +632,12 @@ impl AggValues {
     /// `ranges` of `mb` retract, NULLs aside, where `inserted`, the fold of the
     /// same rows' inserts, holds none at or below it. Every other value is
     /// left empty; a list without a scalar extreme is left as it is.
-    pub fn fold_retracted<'g>(
+    #[inline(always)]
+    pub fn fold_retracted(
         &mut self,
         mb: &MemBatch,
         ranges: &[(usize, usize)],
-        groups: impl Into<FoldGroups<'g>>,
+        groups: FoldGroups,
         inserted: &AggValues,
     ) {
         with_groups!(groups, |g| self.fold_retracted_by(mb, ranges, g, inserted));
@@ -781,10 +783,15 @@ impl AggValues {
         }
     }
 
-    /// Empty every group.
-    pub fn clear(&mut self) {
-        self.acc.fill(0);
-        self.has.fill(false);
+    /// Empty group `g`.
+    pub fn clear(&mut self, g: usize) {
+        for k in 0..self.aggs.len() {
+            let at = self.at(k, g);
+            self.acc[at] = 0;
+            if let Some(has) = self.has.get_mut(at) {
+                *has = false;
+            }
+        }
     }
 
     /// Give group `to` the values group `from` holds.

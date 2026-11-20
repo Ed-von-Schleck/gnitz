@@ -11,7 +11,7 @@
 use std::hint::black_box;
 
 use crate::relation::RelationKind;
-use crate::test_support::{RelationFixture, TID, fed_view, relation_fixture};
+use crate::test_support::{RelationFixture, TID, fed_view, relation_fixture, u64_pk_schema};
 use gnitz_foundation::perf::{Counter, Resident};
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode, ViewBudget};
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -24,8 +24,8 @@ fn schema(strings: bool) -> SchemaDescriptor {
     let c = SchemaColumn::new;
     let i = c(TypeCode::I64, false);
     match strings {
-        false => SchemaDescriptor::new(&[c(TypeCode::U64, false), i, i, i], &[0]),
-        true => SchemaDescriptor::new(&[c(TypeCode::U64, false), i, c(TypeCode::String, false)], &[0]),
+        false => u64_pk_schema(&[i, i, i]),
+        true => u64_pk_schema(&[i, c(TypeCode::String, false)]),
     }
 }
 

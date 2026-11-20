@@ -3,9 +3,10 @@
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::runs::Codebook;
 use crate::runs::{MappedShard, ReadCursor, Run, ShardWriteOpts, from_runs, from_runs_in_band, write_shard};
 use gnitz_wire::PkBuf;
-use gnitz_zset::repr::{Batch, Codebook};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{SchemaDescriptor, group_band};
 
 /// An operator's trace in a test: one consolidated run per ingest, read through

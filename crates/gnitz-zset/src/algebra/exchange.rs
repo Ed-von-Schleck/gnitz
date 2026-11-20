@@ -6,23 +6,34 @@ use super::key_pack::{FOLD_CHUNK, KeyPacker, filled};
 use super::route::{Placement, Slot, ground_owner, worker_for_key, worker_for_wide_pk};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{MAX_PK_BYTES, NARROW_PK_MAX_BYTES, zip_cells};
+use gnitz_wire::{MAX_PK_BYTES, zip_cells};
 use std::mem::MaybeUninit;
 
 /// A scatter key resolved against one schema: each row goes to the owner of the
 /// PK its consumer gives it. Without a key every worker is sent every
 /// nonzero-weight row, as list 0.
-pub struct ScatterPlan(Option<GroupKey>);
+pub struct ScatterPlan(Option<Route>);
+
+/// The PK a row is routed by.
+enum Route {
+    Key(GroupKey),
+    /// A join key packed wider than 16 bytes, routed by its packed bytes' hash.
+    WidePacked(KeyPacker),
+}
 
 impl ScatterPlan {
     /// Rows grouped by `cols`, keyed by the output PK a reduce over them stamps.
     pub fn group(schema: &SchemaDescriptor, cols: &[u32]) -> Result<Self, String> {
-        Ok(ScatterPlan(Some(GroupKey::new(schema, cols)?)))
+        Ok(ScatterPlan(Some(Route::Key(GroupKey::new(schema, cols)?))))
     }
 
     /// An equi-join key, keyed by the `_join_pk` a reindex `Map` packs from `slots`.
     pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
-        Ok(ScatterPlan(Some(GroupKey::packed(KeyPacker::new(schema, slots)?))))
+        let route = match GroupKey::packed(KeyPacker::new(schema, slots)?) {
+            Ok(key) => Route::Key(key),
+            Err(wide) => Route::WidePacked(wide),
+        };
+        Ok(ScatterPlan(Some(route)))
     }
 
     /// The route a relation's own rows are placed by. Panics on `Placement::Local`,
@@ -30,7 +41,9 @@ impl ScatterPlan {
     pub fn native(placement: Placement) -> Self {
         match placement {
             Placement::Replicated => Self::broadcast(),
-            Placement::Keyed { dist_stride } => ScatterPlan(Some(GroupKey::PkRange { at: 0, n: dist_stride as usize })),
+            Placement::Keyed { dist_stride } => {
+                ScatterPlan(Some(Route::Key(GroupKey::PkRange { at: 0, n: dist_stride as usize })))
+            }
             Placement::Local => panic!("ScatterPlan::native: a Local relation's rows have no key owner"),
         }
     }
@@ -49,7 +62,7 @@ impl ScatterPlan {
     /// so an exchange by it over rows so placed moves nothing.
     pub fn routes_to_native_owner(&self, placement: Placement) -> bool {
         matches!((&self.0, placement),
-            (Some(GroupKey::PkRange { at: 0, n }), Placement::Keyed { dist_stride }) if *n == dist_stride as usize)
+            (Some(Route::Key(GroupKey::PkRange { at: 0, n })), Placement::Keyed { dist_stride }) if *n == dist_stride as usize)
     }
 
     /// Reset `out` to one ascending list per worker of the nonzero-weight rows of
@@ -81,13 +94,13 @@ impl ScatterPlan {
 
     fn route_into(&self, mb: &MemBatch, nw: usize, sink: &mut impl RowSink) {
         match self.0 {
-            Some(ref key) if nw > 1 => match key.form(mb) {
+            Some(Route::WidePacked(ref p)) if nw > 1 => route_rows_packed(mb, sink, p, nw),
+            Some(Route::Key(ref key)) if nw > 1 => match key.form(mb) {
                 KeyForm::Cells(cells) => {
                     for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw))
                 }
                 KeyForm::WidePk { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
-                KeyForm::Packed(p) if p.out_stride <= NARROW_PK_MAX_BYTES => route_identities(mb, sink, p, nw),
-                KeyForm::Packed(p) => route_rows_packed(mb, sink, p, nw),
+                KeyForm::Chunked => route_identities(mb, sink, key, nw),
                 // The one group of no columns has one owner, and no key to hash.
                 KeyForm::Global => route_rows(mb, sink, Owner(ground_owner(nw))),
             },
@@ -179,16 +192,16 @@ fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8]
     });
 }
 
-/// [`route_rows`] for a packed key of at most 16 bytes: each nonzero-weight row to the
-/// owner of its [`KeyPacker::identities`], taken a chunk of rows at a time.
+/// [`route_rows`] for a packed key of at most 16 bytes or a fold: each nonzero-weight row
+/// to the owner of its [`GroupKey::identities`], taken a chunk of rows at a time.
 #[inline(never)]
-fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
+fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, key: &GroupKey, nw: usize) {
     let (rows, weights) = (mb.len(), mb.weight().as_chunks::<8>().0);
     let mut buf = [MaybeUninit::<u128>::uninit(); FOLD_CHUNK];
     let ids = filled(&mut buf[..rows.min(FOLD_CHUNK)], 0);
     for start in (0..rows).step_by(FOLD_CHUNK) {
         let ids = &mut ids[..(rows - start).min(FOLD_CHUNK)];
-        packer.identities(mb, start, ids);
+        key.identities(mb, start, ids);
         for ((id, weight), row) in ids.iter().zip(&weights[start..]).zip(start as u32..) {
             if *weight != [0; 8] {
                 sink.put(worker_for_key(*id, nw), row);
@@ -203,7 +216,7 @@ fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, 
 /// it packs, so a chunk reads no key left by the one before.
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
-    let (rows, width, weights) = (mb.len(), packer.out_stride, mb.weight().as_chunks::<8>().0);
+    let (rows, width, weights) = (mb.len(), packer.out_stride(), mb.weight().as_chunks::<8>().0);
     let mut buf = [MaybeUninit::<u8>::uninit(); FOLD_CHUNK * MAX_PK_BYTES];
     let keys = filled(&mut buf[..rows.min(FOLD_CHUNK) * width], 0);
     for start in (0..rows).step_by(FOLD_CHUNK) {

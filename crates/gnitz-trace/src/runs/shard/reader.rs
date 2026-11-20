@@ -8,6 +8,7 @@ use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
 
+use super::codebook::Codebook;
 use super::encoding::*;
 use super::error::StorageError;
 use super::layout::*;
@@ -18,7 +19,6 @@ use gnitz_wire::{
     read_u64_le,
 };
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::Codebook;
 use gnitz_zset::repr::DirectWriter;
 use gnitz_zset::repr::PooledBuf;
 use gnitz_zset::repr::{ColPtr, ZERO_CELL, seek_lower_bound, seek_pk_rows};
@@ -605,7 +605,9 @@ impl MappedShard {
                 })
                 .map(|dead| (blob, dead))
             }
-            (Heap::Coded(c), Some(book)) if rows.len() == n && c.table.digest() == book.digest() => Some((c.codes, 0)),
+            (Heap::Coded(c), Some(book)) if rows.len() == n && c.table.digest() == book.table().digest() => {
+                Some((c.codes, 0))
+            }
             _ => None,
         }
     }

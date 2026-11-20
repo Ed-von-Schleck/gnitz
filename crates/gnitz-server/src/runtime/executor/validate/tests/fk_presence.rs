@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch_raw, u64_pk_schema};
+use crate::test_support::{make_batch, u64_pk_schema};
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaColumn;
@@ -7,7 +7,7 @@ use gnitz_zset::schema::SchemaColumn;
 fn batch(rows: impl IntoIterator<Item = (u64, i64)>) -> Batch {
     let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false)]);
     let rows: Vec<_> = rows.into_iter().map(|(pk, weight)| (pk, weight, 0)).collect();
-    make_batch_raw(&schema, &rows)
+    make_batch(&schema, &rows)
 }
 
 fn held(cache: &FkPresence, keys: impl IntoIterator<Item = u64>) -> Vec<u64> {

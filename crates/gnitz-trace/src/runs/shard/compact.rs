@@ -3,15 +3,15 @@
 //! windows that ascend without overlap are taken in key order unmerged, each
 //! decoded straight into the run.
 
+use super::codebook::Codebook;
 use super::file::ShardWriteOpts;
 use super::reader::MappedShard;
 use crate::runs::StorageError;
 use gnitz_wire::RowSource;
 use gnitz_wire::{CodedHeap, Heap, PkBuf};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::Codebook;
 use gnitz_zset::repr::UnifiedSet;
-use gnitz_zset::repr::{BlobCache, StringDest, long_bytes, prorated_blob_cap};
+use gnitz_zset::repr::{BlobCache, HeapCoder, StringDest, long_bytes, prorated_blob_cap};
 use gnitz_zset::repr::{disjoint_order, run_merge};
 use gnitz_zset::schema::{SchemaDescriptor, compare_pk_ordering};
 use smallvec::SmallVec;
@@ -201,12 +201,12 @@ impl GuardMerge {
         let shards: Vec<_> = (self.shards.iter().zip(&windows))
             .map(|(s, w)| s.window(w.clone()))
             .collect();
-        let survivors = run_merge(&shards, &self.out_schema, windows.iter().cloned(), self.distinct);
+        let (survivors, spans) = run_merge(&shards, &self.out_schema, windows.iter().cloned(), self.distinct);
         if survivors.is_empty() {
             return None;
         }
-        Some(UnifiedSet::with(&shards, &self.out_schema, windows, 0, |set| {
-            set.materialize(&survivors, codebook)
+        Some(UnifiedSet::with(&shards, &self.out_schema, windows, 0, spans, |set| {
+            set.materialize(&survivors, codebook.map(|b| b as &dyn HeapCoder))
         }))
     }
 
@@ -258,7 +258,7 @@ impl GuardMerge {
         for (s, w, carry) in shards {
             let dest = match carry {
                 Some((heap, dead)) => StringDest::Carried(batch.adopt_heap(heap, dead, 0)),
-                None => StringDest::Placed(codebook),
+                None => StringDest::Placed(codebook.map(|b| b as &dyn HeapCoder)),
             };
             batch.write_at_most(w.len(), &mut cache, |dw| {
                 s.decode_rows_into(w.clone(), dw, dest, 0);

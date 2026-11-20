@@ -8,8 +8,7 @@ use super::{ReadCursor, SkeletonKeys, hydrate_skeletons};
 use gnitz_expr::RowFilter;
 use gnitz_wire::{PkKeys, RowSource};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::dominated;
-use gnitz_zset::repr::{ColumnarSource, Pick, UnifiedSet, with_picks};
+use gnitz_zset::repr::{ColumnarSource, Pick, UnifiedSet, span_of, span_pick, with_picks, with_spans};
 use gnitz_zset::schema::with_payload_cmp;
 
 impl ReadCursor {
@@ -21,7 +20,7 @@ impl ReadCursor {
             "a skeleton row has no payload to copy; hydrate its key"
         );
         let (src, row) = self.row_at(self.current);
-        batch.append_row_from_source(weight, src, row, 0, None);
+        batch.append_row_from_source(weight, src, row);
     }
 
     /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)
@@ -78,12 +77,12 @@ impl ReadCursor {
         // Per source, the rows this drain can emit: its current row on to where the drive stops.
         let mut windows = std::mem::take(&mut self.drain_windows);
         windows.clear();
-        windows.extend(self.states.iter().map(|s| s.start..s.start));
+        windows.extend(self.merge.cursors().iter().map(|s| s.start..s.start));
         windows[self.current.src as usize].start = self.current.row as usize;
         let mut decided = true;
         let mut batch = with_picks(|picks| {
-            self.drain_sorted_into(max_rows, picks);
-            for (w, s) in windows.iter_mut().zip(&self.states) {
+            let spans = self.drain_sorted_into(max_rows, picks);
+            for (w, s) in windows.iter_mut().zip(self.merge.cursors()) {
                 w.end = s.start;
             }
             decided = !self
@@ -91,25 +90,34 @@ impl ReadCursor {
                 .iter()
                 .zip(&windows)
                 .any(|(src, w)| matches!(src, Run::Shard(_)) && !w.is_empty());
-            if self.order.coarsen {
+            if self.merge.coarsens() {
                 let sources = &self.sources;
-                picks.retain(|&(e, r, w)| {
-                    let src = &sources[e as usize];
-                    let skeleton = src.is_skeleton();
-                    if skeleton {
-                        skeletons.push(src.get_pk_bytes(r as usize), w);
+                picks.retain(|&pick| match span_of(pick) {
+                    Some((s, rows)) => match &sources[s] {
+                        Run::Shard(shard) if shard.is_skeleton() => {
+                            skeletons.extend(shard, rows);
+                            false
+                        }
+                        _ => true,
+                    },
+                    None => {
+                        let (src, (_, r, w)) = (&sources[pick.0 as usize], pick);
+                        if src.is_skeleton() {
+                            skeletons.push(src.get_pk_bytes(r as usize), w);
+                        }
+                        !src.is_skeleton()
                     }
-                    !skeleton
                 });
             }
             if !filter.keeps_all() {
-                retain_kept(&self.sources, &windows, picks, filter);
+                retain_kept(&self.sources, &windows, picks, filter, spans);
             }
             UnifiedSet::with(
                 &self.sources,
                 &self.schema,
                 windows.iter().cloned(),
                 self.skip_payload,
+                spans,
                 |set| set.materialize(picks, None),
             )
         });
@@ -121,7 +129,7 @@ impl ReadCursor {
     /// Every remaining row in merge order, consolidated.
     pub fn materialize(mut self) -> Rc<Batch> {
         if let [Run::Mem(rc)] = &self.sources[..] {
-            let whole = self.valid && self.current.row == 0 && self.states[0].end == rc.len();
+            let whole = self.valid && self.current.row == 0 && self.merge.cursors()[0].end == rc.len();
             if whole {
                 return Rc::clone(rc);
             }
@@ -140,10 +148,10 @@ impl ReadCursor {
         skeletons: &mut SkeletonKeys,
         filter: &mut RowFilter,
     ) -> Batch {
-        // `states[i].start` is already past the committed row, so the slice
+        // The walk's `start` is already past the committed row, so the slice
         // starts at `current.row`.
         let start = self.current.row as usize;
-        let row_count = (self.states[i].end - start).min(max_rows);
+        let row_count = (self.merge.cursors()[i].end - start).min(max_rows);
         let batch = match &self.sources[i] {
             Run::Shard(shard) if shard.is_skeleton() => {
                 skeletons.extend(shard, start..start + row_count);
@@ -163,42 +171,67 @@ impl ReadCursor {
                 slice
             }
         };
-        self.states[i].start = start + row_count;
+        self.merge.cursors_mut()[i].start = start + row_count;
         self.advance_single(i);
         batch
     }
 
     /// Replace `out` with up to `max_rows` merge groups, one [`Pick`] each at its
-    /// net weight, in merge order. A [dominated](dominated) drain gallops
-    /// its stretches: every run is folded, so each holds an element once.
-    fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<Pick>) {
+    /// net weight, in merge order; `true` where some are spans. A
+    /// [dominated](gnitz_zset::repr::RunMerge::dominated) drain gallops its
+    /// stretches and emits each as a span: every run is folded, so each holds
+    /// an element once.
+    fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<Pick>) -> bool {
         out.clear();
         out.reserve(max_rows.min(self.estimated_length()));
         out.push(self.current_pick());
-        let mut first_undrained = None;
-        gnitz_zset::with_spans!(dominated(&self.states), |SPANS| with_payload_cmp!(
-            self.schema,
-            |payload| {
-                self.drive::<_, SPANS>(payload, |gs, gr, nw| {
-                    if out.len() == max_rows {
-                        first_undrained = Some((gs, gr, nw));
-                        ControlFlow::Break(())
+        with_spans!(self.merge.dominated(), |SPANS| {
+            with_payload_cmp!(self.schema, |payload| {
+                let mut first_undrained = None;
+                // The rows the spans in `out` hold past one each.
+                let mut extra = 0usize;
+                // Whether a span was cut at `max_rows`, its rest left unconsumed.
+                let mut cut = false;
+                self.drive::<_, SPANS>(payload, |src, row, w| {
+                    let pick = (src as u32, row as u32, w);
+                    if SPANS && let Some((src, rows)) = span_of(pick) {
+                        let take = rows.len().min(max_rows - out.len() - extra);
+                        if take > 0 {
+                            out.push(span_pick(src, rows.start..rows.start + take));
+                            extra += take - 1;
+                        }
+                        cut = take < rows.len();
+                        return match cut {
+                            true => ControlFlow::Break(take),
+                            false => ControlFlow::Continue(()),
+                        };
+                    }
+                    if out.len() + extra == max_rows {
+                        first_undrained = Some((src, row, w));
+                        ControlFlow::Break(0)
                     } else {
-                        out.push((gs as u32, gr as u32, nw));
+                        out.push(pick);
                         ControlFlow::Continue(())
                     }
-                })
-            }
-        ));
-        self.commit_emitted(first_undrained);
+                });
+                match cut {
+                    // The cut span's next row is the cursor's next group.
+                    true => self.advance_merge_with(payload),
+                    false => self.commit_emitted(first_undrained),
+                }
+            });
+            SPANS
+        })
     }
 }
 
 /// Drop from `picks` every row of an in-memory run that `filter` drops. A pick
 /// stands for its whole (PK, payload) group, which the predicate reads alone, so
-/// one row decides the group. A shard's picks stay: its regions may be encoded,
-/// and are read only through the scatter.
-fn retain_kept(sources: &[Run], windows: &[Range<usize>], picks: &mut Vec<Pick>, filter: &mut RowFilter) {
+/// one row decides the group; a span of an in-memory run, which `spans` says
+/// `picks` may hold, is cut to the stretches of it `filter` keeps. A shard's
+/// picks stay: its regions may be encoded, and are read only through the
+/// scatter.
+fn retain_kept(sources: &[Run], windows: &[Range<usize>], picks: &mut Vec<Pick>, filter: &mut RowFilter, spans: bool) {
     // Per source, its first word in `bits`, or `None` for a source kept whole.
     let mut first_word = Vec::with_capacity(sources.len());
     let mut bits = Vec::new();
@@ -212,11 +245,39 @@ fn retain_kept(sources: &[Run], windows: &[Range<usize>], picks: &mut Vec<Pick>,
             _ => None,
         });
     }
-    picks.retain(|&(s, r, _)| match first_word[s as usize] {
+    let kept = |s: usize, r: usize| match first_word[s] {
         Some(at) => {
-            let i = r as usize - windows[s as usize].start;
+            let i = r - windows[s].start;
             bits[at + i / 64] >> (i % 64) & 1 == 1
         }
         None => true,
-    });
+    };
+    if !spans {
+        return picks.retain(|&(s, r, _)| kept(s as usize, r as usize));
+    }
+    let mut out = Vec::with_capacity(picks.len());
+    for &pick in picks.iter() {
+        match span_of(pick) {
+            Some((s, rows)) if first_word[s].is_some() => {
+                let mut from = None;
+                for r in rows.start..=rows.end {
+                    match (r < rows.end && kept(s, r), from) {
+                        (true, None) => from = Some(r),
+                        (false, Some(f)) => {
+                            out.push(span_pick(s, f..r));
+                            from = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(_) => out.push(pick),
+            None => {
+                if kept(pick.0 as usize, pick.1 as usize) {
+                    out.push(pick)
+                }
+            }
+        }
+    }
+    *picks = out;
 }

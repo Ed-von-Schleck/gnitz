@@ -1,6 +1,6 @@
 use super::*;
 use crate::storage::manifest_path;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, pk_only_schema, solo, spec, zset_of};
+use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, solo, spec, zset_of};
 use gnitz_wire::TypeCode;
 
 /// A master creates each relation's directory, so it exists once the DDL is
@@ -88,7 +88,7 @@ fn a_held_id_is_not_registered_again() {
     registry
         .register(spec(9, RelationKind::BaseTable, schema), schema)
         .unwrap();
-    let rows = make_batch_raw(&schema, &[(1, 1, 10)]);
+    let rows = make_batch(&schema, &[(1, 1, 10)]);
     registry.ingest(9, rows.clone()).unwrap();
 
     let err = registry

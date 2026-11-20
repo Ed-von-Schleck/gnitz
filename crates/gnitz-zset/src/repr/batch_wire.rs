@@ -12,7 +12,7 @@ use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::wal;
-use gnitz_wire::{Regions, RowSource, TypeCode};
+use gnitz_wire::{RowSource, TypeCode};
 use std::ops::Range;
 
 /// One or more rows of a batch as one WAL block: which rows, and the heap
@@ -25,15 +25,16 @@ pub struct WireRows<'a> {
     heap: usize,
 }
 
-/// Which rows of the batch a block holds.
+/// Which rows of the batch a block holds. A selection other than the whole
+/// batch relocates its strings into the block's own heap: under span dedup when
+/// `dedup`, else each cell on its own, as [`MemBatch::fit_plain`] decides.
 #[derive(Clone, Copy)]
 enum Selection<'a> {
     /// Every row, over the batch's heap as it stands.
     Whole,
-    /// Rows `[start, start + rows)`, their strings relocated.
-    Range { start: usize, rows: usize },
-    /// The listed rows, their strings relocated: under span dedup when `dedup`,
-    /// else each cell on its own.
+    /// Rows `[start, start + rows)`.
+    Range { start: usize, rows: usize, dedup: bool },
+    /// The listed rows.
     Listed { rows: &'a [u32], dedup: bool },
 }
 
@@ -58,10 +59,10 @@ impl WireRows<'_> {
         match self.selection {
             Selection::Whole => {
                 b.debug_verify_dead_heap();
-                wal::write_block(&b.wire_regions(), b.dead_heap, out)
+                wal::write_block(&b.regions(), b.dead_heap, out)
             }
-            Selection::Range { start, rows } => b
-                .encode_relocating(rows, self.heap, out, true, |writer| {
+            Selection::Range { start, rows, dedup } => b
+                .encode_relocating(rows, self.heap, out, dedup, |writer| {
                     // An empty heap is carried: its cells name no byte of it.
                     let heap_at = b.blob().is_empty().then_some(0);
                     copy_ranges(&b, heap_at, &[(start, start + rows)], writer);
@@ -70,6 +71,31 @@ impl WireRows<'_> {
             Selection::Listed { rows, dedup } => b
                 .encode_listed(rows, self.heap, out, dedup)
                 .expect("a sized list fits the bytes its size reserved"),
+        }
+    }
+}
+
+/// The rows a block is sized over, in order: a run of the batch's rows, or a
+/// list of them.
+enum Rows<'r> {
+    Run(Range<usize>),
+    Listed(&'r [u32]),
+}
+
+impl Rows<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Rows::Run(r) => r.len(),
+            Rows::Listed(ids) => ids.len(),
+        }
+    }
+
+    /// The `i`-th row.
+    #[inline(always)]
+    fn at(&self, i: usize) -> usize {
+        match self {
+            Rows::Run(r) => r.start + i,
+            Rows::Listed(ids) => ids[i] as usize,
         }
     }
 }
@@ -98,17 +124,12 @@ impl<'a> MemBatch<'a> {
         {
             return Some(whole);
         }
-        let (rows, heap) = match self.heap_referencing_slots() {
-            0 => (
-                (self.len() - start)
-                    .min((budget.saturating_sub(wal::WAL_HEADER_SIZE) / self.schema().row_width()).max(1)),
-                0,
-            ),
-            slots => self.rows_with_heap(start..self.len(), slots, budget),
-        };
+        // Relocation is decided over the rows that fit by width alone.
+        let by_width = (budget.saturating_sub(wal::WAL_HEADER_SIZE) / self.schema().row_width()).max(1);
+        let (rows, heap, dedup) = self.relocation(Rows::Run(start..self.len().min(start + by_width)), budget);
         let out = WireRows {
             batch: *self,
-            selection: Selection::Range { start, rows },
+            selection: Selection::Range { start, rows, dedup },
             heap,
         };
         debug_assert!(
@@ -120,9 +141,7 @@ impl<'a> MemBatch<'a> {
 
     /// The rows `indices` lists, in that order; `None` for an empty list. A
     /// list of every row in batch order is the batch itself, over its heap as
-    /// it stands. Any other sends each row with its own copy of its long
-    /// strings, unless that would send more heap than the batch holds: listed
-    /// cells then share spans, and the block keeps each span once.
+    /// it stands; any other relocates as [`Self::fit_plain`] decides.
     pub fn wire_listed<'b>(&self, indices: &'b [u32]) -> Option<WireRows<'b>>
     where
         'a: 'b,
@@ -133,23 +152,7 @@ impl<'a> MemBatch<'a> {
         if indices.len() == self.len() && indices.iter().zip(0..).all(|(&row, at)| row == at) {
             return self.wire_whole();
         }
-        let slots = self.heap_referencing_slots();
-        let rows = || indices.iter().map(|&row| row as usize);
-        let blob_len = self.blob().len();
-        let copied: usize = gnitz_wire::BitIter(slots)
-            .map(|pi| {
-                let cells = self.col_data(pi).as_chunks::<16>().0;
-                rows()
-                    .filter_map(|row| gnitz_wire::german_string_heap(&cells[row], blob_len))
-                    .map(|span| span.len())
-                    .sum::<usize>()
-            })
-            .sum();
-        let dedup = copied > blob_len;
-        let heap = match dedup {
-            true => self.rows_with_heap(rows(), slots, usize::MAX).1,
-            false => copied,
-        };
+        let (_, heap, dedup) = self.relocation(Rows::Listed(indices), usize::MAX);
         Some(WireRows {
             batch: *self,
             selection: Selection::Listed { rows: indices, dedup },
@@ -167,49 +170,103 @@ impl<'a> MemBatch<'a> {
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they
-    /// relocate under span dedup are charged, and those heap bytes. `slots`
-    /// names the German-string payload slots.
-    fn rows_with_heap(&self, rows: impl ExactSizeIterator<Item = usize>, slots: u64, budget: usize) -> (usize, usize) {
-        let slope = self.schema().row_width();
-        let base = wal::WAL_HEADER_SIZE;
+    /// relocate are charged, those heap bytes, and whether they relocate under
+    /// span dedup, as [`Self::fit_plain`] decides.
+    fn relocation(&self, rows: Rows<'_>, budget: usize) -> (usize, usize, bool) {
+        let slots = self.heap_referencing_slots();
+        let (n, heap, dedup) = self.fit_plain(&rows, slots, budget);
+        if !dedup {
+            return (n, heap, false);
+        }
+        let (n, heap) = self.deduped_fit(&rows, slots, budget);
+        (n, heap, true)
+    }
+
+    /// How many of `rows`, from the front, fit `budget` once the heap bytes they
+    /// relocate under span dedup are charged — each span once — and those heap
+    /// bytes. `slots` names the German-string payload slots.
+    fn deduped_fit(&self, rows: &Rows<'_>, slots: u64, budget: usize) -> (usize, usize) {
         let mut seen = BlobCache::for_rows(self.schema, rows.len());
-        let mut heap = 0usize;
-        let mut fit = 0usize;
-        for row in rows {
-            let row_heap = heap + self.row_heap_cost(row, slots, &mut seen);
+        let costs = (0..rows.len()).map(|i| self.row_heap_cost(rows.at(i), slots, &mut seen));
+        self.fit_rows(costs, budget)
+    }
+
+    /// How many rows, from the front, fit `budget`, each taking its fixed width
+    /// and the heap bytes `costs` charges it, and those heap bytes.
+    fn fit_rows(&self, costs: impl Iterator<Item = usize>, budget: usize) -> (usize, usize) {
+        let slope = self.schema().row_width();
+        let (mut fit, mut heap) = (0usize, 0usize);
+        for cost in costs {
             // The first row goes in whatever it costs; a frame carries whole rows.
-            if fit > 0 && base + (fit + 1) * slope + row_heap > budget {
+            if fit > 0 && wal::WAL_HEADER_SIZE + (fit + 1) * slope + heap + cost > budget {
                 break;
             }
-            heap = row_heap;
+            heap += cost;
             fit += 1;
         }
         (fit, heap)
     }
 
-    /// Heap bytes row `row` adds to a chunk whose spans are already in `seen`:
-    /// the spans its long cells in the string slots `slots` name, each new one
-    /// charged once.
+    /// How many of `rows`, from the front, fit `budget` once the heap bytes
+    /// their long cells in the German-string slots `slots` take relocated each
+    /// on its own are charged, and those heap bytes — summed a column at a time
+    /// over a chunk of rows, up to the chunk whose row passes `budget` — and
+    /// whether the block relocates under span dedup instead: where the cells of
+    /// the rows read take more heap than the extent of the heap they name, some
+    /// name a byte twice, and the block keeps each span once.
+    fn fit_plain(&self, rows: &Rows<'_>, slots: u64, budget: usize) -> (usize, usize, bool) {
+        const CHUNK: usize = 256;
+        let (blob_len, slope) = (self.blob().len(), self.schema().row_width());
+        let (mut fit, mut heap) = (0usize, 0usize);
+        // The plain heap of the rows read, and the extent of the heap they name.
+        let (mut plain, mut lo, mut hi) = (0usize, usize::MAX, 0usize);
+        let mut costs = [0usize; CHUNK];
+        for s in (0..rows.len()).step_by(CHUNK) {
+            let e = (s + CHUNK).min(rows.len());
+            let costs = &mut costs[..e - s];
+            costs.fill(0);
+            for pi in gnitz_wire::BitIter(slots) {
+                let cells = self.col_data(pi).as_chunks::<16>().0;
+                let mut charge = |cost: &mut usize, cell: &[u8; 16]| {
+                    if let Some(span) = gnitz_wire::german_string_heap(cell, blob_len) {
+                        *cost += span.len();
+                        (lo, hi) = (lo.min(span.start), hi.max(span.end));
+                    }
+                };
+                match rows {
+                    Rows::Run(r) => costs
+                        .iter_mut()
+                        .zip(&cells[r.start + s..r.start + e])
+                        .for_each(|(c, cell)| charge(c, cell)),
+                    Rows::Listed(ids) => costs
+                        .iter_mut()
+                        .zip(&ids[s..e])
+                        .for_each(|(c, &row)| charge(c, &cells[row as usize])),
+                }
+            }
+            for &cost in costs.iter() {
+                plain += cost;
+                // The first row goes in whatever it costs; a frame carries whole rows.
+                if fit > 0 && wal::WAL_HEADER_SIZE + (fit + 1) * slope + heap + cost > budget {
+                    return (fit, heap, plain > hi.saturating_sub(lo));
+                }
+                heap += cost;
+                fit += 1;
+            }
+        }
+        (fit, heap, plain > hi.saturating_sub(lo))
+    }
+
+    /// Heap bytes row `row` adds to a chunk: the spans its long cells in the
+    /// string slots `slots` name, each charged once, `seen` holding the chunk's
+    /// spans so far.
     #[inline]
     fn row_heap_cost(&self, row: usize, slots: u64, seen: &mut BlobCache) -> usize {
         let blob = self.blob();
-        let mut cost = 0;
-        for pi in gnitz_wire::BitIter(slots) {
-            if let Some(span) = gnitz_wire::german_string_heap(self.german_cell(row, pi), blob.len()) {
-                cost += charge_span(&blob[span], seen);
-            }
-        }
-        cost
-    }
-
-    /// Every fixed region followed by the blob heap, in canonical order.
-    pub fn wire_regions(&self) -> Regions<'a> {
-        let mut out = Regions::new();
-        for r in 0..self.schema().num_fixed_regions() {
-            out.push(self.region(r));
-        }
-        out.push(self.blob());
-        out
+        gnitz_wire::BitIter(slots)
+            .filter_map(|pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), blob.len()))
+            .map(|span| charge_span(&blob[span], seen))
+            .sum()
     }
 
     /// The rows `indices` selects, in order, as one WAL block at the front of
@@ -220,7 +277,7 @@ impl<'a> MemBatch<'a> {
     fn encode_listed(&self, indices: &[u32], heap_bytes: usize, out: &mut [u8], dedup: bool) -> Option<usize> {
         let count = indices.len();
         self.encode_relocating(count, heap_bytes, out, dedup, |writer| {
-            scatter_copy(self, indices, writer);
+            scatter_copy(self, indices, None, writer);
         })
     }
 
@@ -262,8 +319,13 @@ impl<'a> MemBatch<'a> {
 
     /// The longest front run of the rows `indices` selects, ascending, that fits
     /// `out` as one block, written there: its row count and bytes. `None` when
-    /// not even the first row fits.
+    /// not even the first row fits. Strings relocate as [`Self::fit_plain`]
+    /// decides over the rows that fit by width.
     pub fn encode_scattered_prefix(&self, indices: &[u32], out: &mut [u8]) -> Option<(usize, usize)> {
+        debug_assert!(
+            indices.is_sorted_by(|a, b| a < b),
+            "encode_scattered_prefix: a list that is not strictly ascending"
+        );
         let width = self.schema().row_width();
         let fixed_fit = out.len().saturating_sub(wal::WAL_HEADER_SIZE) / width;
         let rows = &indices[..indices.len().min(fixed_fit)];
@@ -277,20 +339,26 @@ impl<'a> MemBatch<'a> {
             return Some((self.len(), whole.encode(out)));
         }
         let slots = self.heap_referencing_slots();
-        // A heap-free block fits by width alone, and the sizing pass is skipped
-        // when the source's whole heap fits too.
-        if slots == 0 || wal::WAL_HEADER_SIZE + rows.len() * width + self.blob().len() <= out.len() {
-            // Dedup copies each distinct span once, so the whole source heap
-            // bounds the block's unless cells name overlapping spans, which a
-            // certified foreign block may; a block that then overruns `out` is
-            // refused here and sized exactly below.
-            let heap = if slots == 0 { 0 } else { self.blob().len() };
-            if let Some(len) = self.encode_listed(rows, heap, out, true) {
-                return Some((rows.len(), len));
-            }
+        let listed = Rows::Listed(rows);
+        let (_, copied, dedup) = self.fit_plain(&listed, slots, usize::MAX);
+        // Dedup copies each distinct span once, so the whole source heap bounds
+        // the block's unless cells name overlapping spans, which a certified
+        // foreign block may; a block that then overruns `out` is refused here
+        // and sized exactly below.
+        let heap = if dedup { self.blob().len() } else { copied };
+        if wal::WAL_HEADER_SIZE + rows.len() * width + heap <= out.len()
+            && let Some(len) = self.encode_listed(rows, heap, out, dedup)
+        {
+            return Some((rows.len(), len));
         }
-        let (n, heap) = self.rows_with_heap(rows.iter().map(|&i| i as usize), slots, out.len());
-        self.encode_listed(&rows[..n], heap, out, true).map(|len| (n, len))
+        let (n, heap) = match dedup {
+            false => {
+                let (n, heap, _) = self.fit_plain(&listed, slots, out.len());
+                (n, heap)
+            }
+            true => self.deduped_fit(&listed, slots, out.len()),
+        };
+        self.encode_listed(&rows[..n], heap, out, dedup).map(|len| (n, len))
     }
 }
 
@@ -305,28 +373,15 @@ impl Batch {
         self.as_mem_batch().wire_rows_within(start, budget)
     }
 
-    /// [`MemBatch::wire_regions`].
-    pub fn wire_regions(&self) -> Regions<'_> {
-        self.as_mem_batch().wire_regions()
-    }
-
-    /// A WAL block a peer wrote, validated — its string cells canonical and
-    /// STRING ones UTF-8, its null bits, its BOOLEAN cells 0 or 1, its heap
-    /// measured rather than its header's dead-byte bound trusted — and copied
-    /// into an owned unconsolidated batch.
-    pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
-        Ok(MemBatch::of_foreign_wal_block(data, schema)?.to_batch())
-    }
-
     /// The sum of `blocks`, WAL blocks a peer wrote, as one batch, every block
-    /// validated as [`Self::decode_foreign_wal_block`] validates one before any is
-    /// read. Several blocks that each stand consolidated are merged into one
+    /// validated as [`MemBatch::of_foreign_wal_block`] validates one before any
+    /// is read. Several blocks that each stand consolidated are merged into one
     /// consolidated batch; a lone block is copied as it stands and any other
     /// mix concatenated, both unconsolidated.
     pub fn decode_foreign_wal_blocks(blocks: &[&[u8]], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         match blocks {
             [] => Ok(Batch::empty_with_schema(schema)),
-            [one] => Batch::decode_foreign_wal_block(one, schema),
+            [one] => Ok(MemBatch::of_foreign_wal_block(one, schema)?.to_batch()),
             _ => {
                 let views = (blocks.iter())
                     .map(|b| MemBatch::of_foreign_wal_block(b, schema))
@@ -456,8 +511,7 @@ impl<'a> MemBatch<'a> {
     ///
     /// Its string cells and dead-heap bound are taken as the engine wrote
     /// them; a block a peer wrote is read through [`Self::of_foreign_wal_block`],
-    /// [`Batch::decode_foreign_wal_block`], [`Batch::decode_foreign_wal_blocks`]
-    /// or a [`CertifiedBlock`].
+    /// [`Batch::decode_foreign_wal_blocks`] or a [`CertifiedBlock`].
     pub fn of_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
         let block = wal::parse_block(data, schema.row_width())?;
         Ok(MemBatch::of_block(&block, schema))
@@ -507,7 +561,7 @@ pub struct CertifiedBlock {
 
 impl CertifiedBlock {
     /// Validate the block at `range` of `data` under `schema` as
-    /// [`Batch::decode_foreign_wal_block`] validates one. Inline: compiled out of
+    /// [`MemBatch::of_foreign_wal_block`] validates one. Inline: compiled out of
     /// line, with the validation inlined into it, the cell loop measured slower
     /// per row.
     #[inline]

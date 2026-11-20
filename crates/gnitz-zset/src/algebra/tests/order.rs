@@ -2,11 +2,23 @@
 
 use std::cmp::Ordering;
 
-use super::{OrderLocator, RowRanking, cmp_order_keys, order_bits, order_locators};
+use super::super::order_image::order_bits;
+use super::{ImageCol, OrderCol, RowRanking, cmp_order_keys, order_cols};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::test_support::{make_int_batch, pk_only_schema, u64_pk_schema};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{FixedInt, Heap, OrderKey, RowSource, ScalarKind, TypeCode, image_mask};
+
+/// The key over `loc`, never a 16-byte integer's low half.
+fn key(loc: ColumnLocator, desc: bool, nulls_first: bool, nullable: bool) -> OrderCol {
+    OrderCol {
+        image: ImageCol::new(loc, desc),
+        nulls_first,
+        nullable,
+        low_half: false,
+    }
+}
 
 /// Key values that tie, that differ only in the low half of 16 bytes, that cross
 /// each width's sign bit, and one whose every byte differs.
@@ -33,25 +45,6 @@ const PATTERNS: &[u128] = &[
 /// `v` cut to the low bytes a `tc` cell holds.
 fn native(tc: TypeCode, v: u128) -> u128 {
     v & image_mask(tc.wire_stride())
-}
-
-/// A `U64` PK plus `n` `I64` payload columns.
-fn schema_pk_ints(n: usize, nullable: bool) -> SchemaDescriptor {
-    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend((0..n).map(|_| SchemaColumn::new(TypeCode::I64, nullable)));
-    SchemaDescriptor::new(&cols, &[0])
-}
-
-/// `rows` over a `U64` PK plus `I64` payload columns, row `r` keyed `r + 1`.
-fn int_rows(schema: &SchemaDescriptor, rows: &[&[Option<i64>]]) -> Batch {
-    let mut b = BatchBuilder::new(schema);
-    for (row, cells) in rows.iter().enumerate() {
-        b.begin_row(row as u128 + 1, 1);
-        for &c in cells.iter() {
-            b.put_opt_int(c.map(|v| v as u128));
-        }
-    }
-    b.finish()
 }
 
 /// `order_bits` of a float payload slot is the order image of the slot's bits.
@@ -119,7 +112,7 @@ fn order_bits_reads_an_integer_as_its_image() {
 /// PK-list order (here the reverse of column order), then payload columns in slot
 /// order, all ASC NULLS FIRST.
 #[test]
-fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
+fn order_cols_append_the_identity_tiebreak_in_pk_list_order() {
     // `PRIMARY KEY (c3, c0)`.
     let schema = SchemaDescriptor::new(
         &[
@@ -151,22 +144,12 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
         size: 8,
         type_code: TypeCode::I64,
     };
-    let asc = |loc| OrderLocator {
-        loc,
-        desc: false,
-        nulls_first: true,
-        shift: 0,
-    };
-    let own = OrderLocator {
-        loc: c2,
-        desc: true,
-        nulls_first: false,
-        shift: 0,
-    };
-    assert_eq!(order_locators(&[written], &schema, false).unwrap(), vec![own]);
+    let asc = |loc, nullable| key(loc, false, true, nullable);
+    let own = key(c2, true, false, false);
+    assert_eq!(order_cols(&[written], &schema, false).unwrap(), vec![own]);
     assert_eq!(
-        order_locators(&[written], &schema, true).unwrap(),
-        vec![own, asc(c3), asc(c0), asc(c1), asc(c2)],
+        order_cols(&[written], &schema, true).unwrap(),
+        vec![own, asc(c3, false), asc(c0, false), asc(c1, true), asc(c2, false)],
     );
 }
 
@@ -174,13 +157,13 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
 /// direction, and two NULLs tie.
 #[test]
 fn null_placement_ignores_the_direction() {
-    let schema = schema_pk_ints(1, true);
-    let v = int_rows(&schema, &[&[None], &[Some(5)], &[None]]);
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
+    let v = make_int_batch(&schema, &[(1, 1, &[None]), (2, 1, &[Some(5)]), (3, 1, &[None])]);
     let loc = schema.locate(1);
     for nulls_first in [false, true] {
         let want = if nulls_first { Ordering::Less } else { Ordering::Greater };
         for desc in [false, true] {
-            let keys = [OrderLocator { loc, desc, nulls_first, shift: 0 }];
+            let keys = [key(loc, desc, nulls_first, true)];
             assert_eq!(
                 cmp_order_keys(&keys, &v, 0, 1),
                 want,
@@ -221,13 +204,12 @@ impl RowSource for AllNull<'_> {
 /// value, where a NULL arm would call the rows tied.
 #[test]
 fn a_pk_key_never_takes_the_null_arm() {
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
-    // Keys 1 and 2.
-    let b = int_rows(&schema, &[&[], &[]]);
+    let schema = pk_only_schema(&[TypeCode::U64]);
+    let b = make_int_batch(&schema, &[(1, 1, &[]), (2, 1, &[])]);
     let v = AllNull(&b);
     let loc = schema.locate(0);
     for desc in [false, true] {
-        let keys = [OrderLocator { loc, desc, nulls_first: true, shift: 0 }];
+        let keys = [key(loc, desc, true, false)];
         let want = if desc { Ordering::Greater } else { Ordering::Less };
         assert_eq!(cmp_order_keys(&keys, &v, 0, 1), want, "desc={desc}");
     }
@@ -235,7 +217,7 @@ fn a_pk_key_never_takes_the_null_arm() {
 
 /// `RowRanking` against the comparator it stands in for, over `keys` on `v`: `sorted` is the
 /// stable comparator sort, and under a total order `keep_smallest` keeps that sort's prefix.
-fn assert_ranks_as_the_comparator(keys: &[OrderLocator], total: bool, v: &Batch, label: &str) {
+fn assert_ranks_as_the_comparator(keys: &[OrderCol], total: bool, v: &Batch, label: &str) {
     let n = v.len();
     let mut want: Vec<u32> = (0..n as u32).collect();
     want.sort_by(|&a, &b| cmp_order_keys(keys, v, a as usize, b as usize));
@@ -318,16 +300,11 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
             for (desc, nulls_first) in [(false, false), (false, true), (true, false), (true, true)] {
                 let label = format!("{tc} column {col} desc={desc} nulls_first={nulls_first}");
                 let first = OrderKey { col: *col, desc, nulls_first };
-                assert_ranks_as_the_comparator(&order_locators(&[first], schema, false).unwrap(), false, v, &label);
-                assert_ranks_as_the_comparator(&order_locators(&[first], schema, true).unwrap(), true, v, &label);
+                assert_ranks_as_the_comparator(&order_cols(&[first], schema, false).unwrap(), false, v, &label);
+                assert_ranks_as_the_comparator(&order_cols(&[first], schema, true).unwrap(), true, v, &label);
                 // A second written key, ranked by its own image inside the first's ties.
                 let second = OrderKey { col: 2, desc: !desc, nulls_first };
-                assert_ranks_as_the_comparator(
-                    &order_locators(&[first, second], schema, false).unwrap(),
-                    false,
-                    v,
-                    &label,
-                );
+                assert_ranks_as_the_comparator(&order_cols(&[first, second], schema, false).unwrap(), false, v, &label);
             }
         }
     }
@@ -338,16 +315,20 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
 #[test]
 fn max_lead_after_a_sort_is_the_leading_keys() {
     // `(id, v, w)`: v ties on rows 0 and 1, which w tells apart far above any v.
-    let schema = schema_pk_ints(2, false);
-    let v = int_rows(
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, false); 2]);
+    let v = make_int_batch(
         &schema,
-        &[&[Some(1), Some(100)], &[Some(1), Some(50)], &[Some(0), Some(7)]],
+        &[
+            (1, 1, &[Some(1), Some(100)]),
+            (2, 1, &[Some(1), Some(50)]),
+            (3, 1, &[Some(0), Some(7)]),
+        ],
     );
     let order = [
         OrderKey { col: 1, desc: false, nulls_first: false },
         OrderKey { col: 2, desc: false, nulls_first: false },
     ];
-    let keys = order_locators(&order, &schema, false).unwrap();
+    let keys = order_cols(&order, &schema, false).unwrap();
     let mb = v.as_mem_batch();
     let want = RowRanking::new(&keys, &mb).max_lead();
     let mut ranking = RowRanking::new(&keys, &mb);

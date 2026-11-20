@@ -9,11 +9,11 @@ use std::rc::Rc;
 
 use super::manifest::{ManifestEntry, RecoverySource, ShardSet, StoreDir};
 use super::pk_ranges_overlap;
+use gnitz_trace::runs::Codebook;
 use gnitz_trace::runs::StorageError;
 use gnitz_trace::runs::{MappedShard, guard_slot};
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
-use gnitz_zset::repr::Codebook;
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod index;

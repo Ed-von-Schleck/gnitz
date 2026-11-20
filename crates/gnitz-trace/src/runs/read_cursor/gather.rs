@@ -106,7 +106,7 @@ impl PkSetGather {
         if self.remaining_keys() == 0 {
             return None;
         }
-        let split = self.cursor.order.coarsen;
+        let split = self.cursor.merge.coarsens();
         with_picks(|picks| {
             picks.reserve(self.remaining_keys().min(max_rows));
             let visited = self.for_each_live_row(max_rows, |c| {

@@ -1,6 +1,7 @@
 use super::super::file::ShardWriteOpts;
 use super::tests::{build, wide_string};
 use super::*;
+use crate::runs::Codebook;
 use crate::runs::write_shard;
 use crate::test_support::{
     make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_payload_schema, pk_u64_two_i64_schema,
@@ -10,7 +11,6 @@ use gnitz_foundation::perf::{Counter, Counters, Event};
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::Codebook;
 use gnitz_zset::repr::{Pick, UnifiedSet};
 use gnitz_zset::repr::{carried_dead, long_bytes_outside};
 use gnitz_zset::schema::{SchemaColumn, probe_key};

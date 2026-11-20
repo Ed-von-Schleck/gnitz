@@ -1,11 +1,11 @@
 //! The operators that read their groups in ORDER BY order — the top-N (`topn`)
 //! and the window (`window`) — and the order index they are maintained through:
 //! every input row, keyed so that a prefix walk of one group visits its rows in
-//! that order. It shares its group-key packer and its order images with the
+//! that order. It shares its group prefix and its order images with the
 //! reduce's aggregate-value index.
 //!
 //! ```text
-//! PK      = group key ‖ rank_0 ‖ image_0, a string's cut to its slot
+//! PK      = group prefix ‖ rank_0 ‖ image_0, a string's cut to its slot
 //! payload = image_0 when a string's ‖ rank_i ‖ image_i for i ≥ 1   (BLOB each)
 //!         ‖ the output row's payload columns, in output order
 //!         ‖ each other column the operator reads
@@ -24,13 +24,13 @@ use std::ops::Range;
 use crate::runs::{CursorRow, ReadCursor, Run};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
-use gnitz_wire::{OrderKey, TypeCode, WeightSlots};
-use gnitz_zset::algebra::{GroupOutKey, KeyPacker};
+use gnitz_wire::{OrderKey, WeightSlots};
+use gnitz_zset::algebra::{GroupOutKey, GroupPrefix};
 use gnitz_zset::repr::{Batch, MemBatch, pk_group_end};
 use gnitz_zset::schema::{DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, compare_pk_ordering};
 
 use gnitz_expr::{ColCopy, ColumnLocator};
-use gnitz_zset::algebra::{ColMoves, IMAGE_COL, ImageCol, copy_columns, image_slot_col};
+use gnitz_zset::algebra::{ColMoves, IMAGE_COL, OrderCol, copy_columns};
 
 use window::{Running, Window};
 
@@ -39,118 +39,6 @@ mod window;
 
 /// The most rows an epoch's output batch reserves up front; it grows past that.
 const MAX_OUT_CAP_HINT: usize = 1 << 16;
-
-/// The rank byte leading a nullable key's image.
-const RANK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
-
-/// One ORDER BY key, resolved against the input: its image, complemented for
-/// DESC, and where a NULL — which has no image — stands.
-struct OrderSpec {
-    image: ImageCol,
-    nulls_first: bool,
-    nullable: bool,
-}
-
-impl OrderSpec {
-    #[inline]
-    fn is_null(&self, src: &impl RowSource, row: usize) -> bool {
-        self.nullable && self.image.loc.is_null(src, row)
-    }
-
-    /// The rank byte that places a row of a nullable key. `desc` does not flip
-    /// it, exactly as [`gnitz_zset::algebra::cmp_order_keys`] orders NULLs.
-    #[inline]
-    fn rank(&self, is_null: bool) -> u8 {
-        (is_null != self.nulls_first) as u8
-    }
-
-    /// Append the key's image for `row`: the rank byte of a nullable key, then —
-    /// non-NULL only — the order image.
-    #[inline]
-    fn append_image(&self, src: &impl RowSource, row: usize, out: &mut Vec<u8>) {
-        let is_null = self.is_null(src, row);
-        if self.nullable {
-            out.push(self.rank(is_null));
-        }
-        if !is_null {
-            self.image.append(src, row, out);
-        }
-    }
-
-    /// Write the key's lead for `row` into `lead`, [`Self::lead_cols`] wide: the
-    /// rank byte of a nullable key, then the image, zero-padded or cut to its
-    /// slot. A string's whole image is appended to `image`.
-    #[inline]
-    fn write_lead(&self, src: &impl RowSource, row: usize, lead: &mut [u8], image: &mut Vec<u8>) {
-        let is_null = self.is_null(src, row);
-        let slot = match self.nullable {
-            true => {
-                lead[0] = self.rank(is_null);
-                &mut lead[1..]
-            }
-            false => lead,
-        };
-        match is_null {
-            true => slot.fill(0),
-            false => self.image.write_slot(src, row, slot, image),
-        }
-    }
-
-    /// Over `keys`, whose `n`-th `stride`-byte key holds the `n`-th row's
-    /// scalar image at `at + 1` as if the row were non-NULL: each row's rank
-    /// byte at `at`, and a NULL row's image zeroed, as [`Self::write_lead`]
-    /// leaves it. `stamp` then gets each key and whether its row is NULL. A
-    /// key without a rank byte is left as it is.
-    #[inline]
-    fn stamp_ranks(
-        &self,
-        mb: &MemBatch<'_>,
-        keys: &mut [u8],
-        stride: usize,
-        at: usize,
-        mut stamp: impl FnMut(&mut [u8], bool),
-    ) {
-        if !self.nullable {
-            return;
-        }
-        let bit = self.image.loc.null_bit();
-        let words = mb.null_bmp().as_chunks::<8>().0;
-        for (key, word) in keys.chunks_exact_mut(stride).zip(words) {
-            let is_null = u64::from_le_bytes(*word) & bit != 0;
-            key[at] = self.rank(is_null);
-            if is_null {
-                key[at + 1..at + 9].fill(0);
-            }
-            stamp(key, is_null);
-        }
-    }
-
-    /// Every row's image of a scalar key into `cells`, one 16-byte inline
-    /// string cell per row, as `encode_german_string` writes the rank byte and
-    /// image [`Self::append_image`] appends: at most 9 bytes, so always inline.
-    fn write_inline_images(&self, mb: &MemBatch<'_>, cells: &mut [u8]) {
-        const OFF: usize = gnitz_wire::GERMAN_INLINE_OFF;
-        cells.fill(0);
-        let scalar = (self.image).write_slots(mb, &[(0, cells.len() / 16)], cells, 16, OFF + self.nullable as usize, 8);
-        debug_assert!(scalar, "a wide image is written a row at a time");
-        let len = (8 + self.nullable as u32).to_le_bytes();
-        for cell in cells.as_chunks_mut::<16>().0 {
-            cell[..4].copy_from_slice(&len);
-        }
-        self.stamp_ranks(mb, cells, 16, OFF, |cell, is_null| {
-            if is_null {
-                cell[..4].copy_from_slice(&1u32.to_le_bytes());
-            }
-        });
-    }
-
-    /// The PK columns holding the image's lead: the rank byte of a nullable
-    /// key, then the image slot.
-    fn lead_cols(&self) -> impl Iterator<Item = SchemaColumn> {
-        let slot = image_slot_col(self.image.is_wide());
-        self.nullable.then_some(RANK_COL).into_iter().chain([slot])
-    }
-}
 
 /// The baked plan of an operator maintained through an order index of every
 /// input row: a top-N or a window.
@@ -216,8 +104,8 @@ impl OrderedPlan {
                 index_entries: folded,
             };
         }
-        // Entries of one group, and no others, agree on the group key leading their PK.
-        let width = index.key_packer.out_stride;
+        // Entries of one group, and no others, agree on the group prefix leading their PK.
+        let width = index.prefix.width();
         let prefix = |row: usize| &entries.get_pk_bytes(row)[..width];
         let mut history = open(prefix(0), prefix(n - 1));
 
@@ -428,13 +316,14 @@ impl Walk<'_> {
 
 /// The index resources a plan carries, baked once at compile time.
 struct OrderIndex {
-    key_packer: KeyPacker,
     /// How a row's group is keyed in the output.
     key: GroupOutKey,
+    /// The group prefix leading an entry's PK.
+    prefix: GroupPrefix,
     schema: SchemaDescriptor,
     /// The first ORDER BY key, whose image leads the PK.
-    lead: OrderSpec,
-    rest: Vec<OrderSpec>,
+    lead: OrderCol,
+    rest: Vec<OrderCol>,
     /// The columns an entry carries, each from the input into its payload slot:
     /// the output row's payload, then every other column asked for.
     moves: ColMoves,
@@ -455,24 +344,19 @@ impl OrderIndex {
         order: &[OrderKey],
         also: impl IntoIterator<Item = u32>,
     ) -> Result<(Self, DerivedSchema), String> {
-        let mut order = order.iter().map(|key| {
-            let (col, loc) = input.wire_col("order index: order column", key.col)?;
-            Ok(OrderSpec {
-                image: ImageCol::new(loc, key.desc),
-                nulls_first: key.nulls_first,
-                nullable: col.nullable,
-            })
-        });
+        let mut order = order
+            .iter()
+            .map(|key| OrderCol::resolve(input, key).map_err(|e| format!("order index: {e}")));
         // An index is of an order: the first key's image leads its PK.
         let lead = order.next().ok_or_else(|| "order index: no order keys".to_string())??;
         let rest = order.collect::<Result<Vec<_>, String>>()?;
         let suffix: Vec<SchemaColumn> = lead.lead_cols().collect();
-        let (key_packer, mut b) = KeyPacker::new_group_key(input, group_cols, &suffix)?;
+        let (key, row) = GroupOutKey::new(input, group_cols, 0..input.num_columns() as u32)?;
+        let (prefix, mut b) = key.index_prefix(&suffix);
         let images = rest.len() + usize::from(!lead.image.fits_slot());
         for _ in 0..images {
             b.push(IMAGE_COL);
         }
-        let (key, row) = GroupOutKey::new(input, group_cols, 0..input.num_columns() as u32)?;
         row.payload().iter().for_each(|&c| b.push(c));
         let mut carried = key.carried().to_vec();
         let row_cols = carried.len();
@@ -491,8 +375,8 @@ impl OrderIndex {
             .map(|(&src, slot)| ColCopy { src, slot, width: src.size() })
             .collect();
         let index = OrderIndex {
-            key_packer,
             key,
+            prefix,
             lead,
             rest,
             row: (first..first + row_cols).map(|c| schema.locate(c)).collect(),
@@ -533,10 +417,11 @@ impl OrderIndex {
             0 => None,
             strings => out.carry_heap(&mb, strings, &[(0, n)], 0),
         };
-        let (stride, group) = (self.schema.pk_stride(), self.key_packer.out_stride);
+        let (stride, group) = (self.schema.pk_stride(), self.prefix.width());
         let mut image = Vec::new();
         out.write_rows(n, |w| {
-            self.key_packer.pack_rows(w.pk_mut(), stride, &mb, &[(0, n)]);
+            self.key
+                .write_prefixes(&self.prefix, &mb, &[(0, n)], w.pk_mut(), stride);
             let (keys, cells, blob) = w.pk_and_payload_mut(0..self.images.len());
             let mut cells: Vec<_> = cells.collect();
             // The image columns: a string lead's whole image, then the rest's.
@@ -546,9 +431,7 @@ impl OrderIndex {
             let lead = &self.lead;
             let lead_wide = lead.image.is_wide();
             if !lead_wide {
-                lead.image
-                    .write_slots(&mb, &[(0, n)], keys, stride, group + lead.nullable as usize, 8);
-                lead.stamp_ranks(&mb, keys, stride, group, |_, _| {});
+                lead.write_leads(&mb, keys, stride, group);
             }
             for (spec, col) in self.rest.iter().zip(rest.iter_mut()) {
                 if !spec.image.is_wide() {

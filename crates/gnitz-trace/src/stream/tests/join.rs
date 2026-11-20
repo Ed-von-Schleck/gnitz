@@ -2,7 +2,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::test_support::{
-    TestTrace, join_reference, make_batch, make_schema_u64_i64, make_schema_u128_i64, pk_only_schema,
+    TestTrace, certified, join_reference, make_batch, make_schema_u64_i64, make_schema_u128_i64, pk_only_schema,
     pk_payload_schema, rekey_plan, zset_of,
 };
 use gnitz_wire::{NullKeys, TypeCode};
@@ -107,7 +107,10 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
 #[test]
 fn an_equi_join_claims_the_output_it_writes_in_order() {
     let schema = make_schema_u64_i64();
-    let trace = TestTrace::dealt(&make_batch(&schema, &[(1, 1, 100), (1, 1, 200), (2, 1, 300)]), 1);
+    let trace = TestTrace::dealt(
+        &certified(make_batch(&schema, &[(1, 1, 100), (1, 1, 200), (2, 1, 300)])),
+        1,
+    );
     let cases = [
         (&[(1, 1, 10), (2, 1, 20)], &[false, true][..]),
         (&[(2, 1, 20), (2, 1, 21)], &[false, true]),
@@ -117,7 +120,7 @@ fn an_equi_join_claims_the_output_it_writes_in_order() {
         for &delta_is_right in ports {
             let p = plan(JoinKind::Equi, delta_is_right, &schema, &schema);
             let out = op_join_delta_trace(
-                &make_batch(&schema, &rows[..]),
+                &certified(make_batch(&schema, &rows[..])),
                 &mut |f, l| trace.cursor_within(f, l),
                 &p,
             );
@@ -135,16 +138,16 @@ fn a_clamped_trace_joins_the_clamp_of_its_history() {
     use gnitz_wire::ClampKind;
     let schema = make_schema_u64_i64();
     // Several delta rows per key, so a dropped pairing sits between kept ones.
-    let delta = make_batch(
+    let delta = certified(make_batch(
         &schema,
         &[(1, 1, 10), (1, 2, 11), (2, 1, 20), (3, 3, 30), (3, 1, 31), (4, 1, 40)],
-    );
-    let summed = make_batch(
+    ));
+    let summed = certified(make_batch(
         &schema,
         &[(1, 2, 100), (1, -1, 101), (2, 1, 200), (3, 3, 300), (3, -2, 301)],
-    );
+    ));
     // Two runs summing to `summed`, the last row cancelling across them.
-    let older = make_batch(
+    let older = certified(make_batch(
         &schema,
         &[
             (1, 1, 100),
@@ -154,8 +157,8 @@ fn a_clamped_trace_joins_the_clamp_of_its_history() {
             (3, -2, 301),
             (4, 1, 400),
         ],
-    );
-    let newer = make_batch(&schema, &[(1, 1, 100), (3, 2, 300), (4, -1, 400)]);
+    ));
+    let newer = certified(make_batch(&schema, &[(1, 1, 100), (3, 2, 300), (4, -1, 400)]));
     let mut one_run = TestTrace::new(schema);
     one_run.ingest(summed);
     let mut two_runs = TestTrace::new(schema);
@@ -165,7 +168,7 @@ fn a_clamped_trace_joins_the_clamp_of_its_history() {
         (ClampKind::Distinct, [(1, 1, 100), (2, 1, 200), (3, 1, 300)]),
         (ClampKind::PositivePart, [(1, 2, 100), (2, 1, 200), (3, 3, 300)]),
     ] {
-        let clamped = make_batch(&schema, &clamped);
+        let clamped = certified(make_batch(&schema, &clamped));
         for delta_is_right in [false, true] {
             let (want, _) = join_reference(JoinKind::Equi, delta_is_right, &schema, &schema, &delta, &clamped);
             assert!(!want.is_empty(), "premise: the clamped trace matches something");

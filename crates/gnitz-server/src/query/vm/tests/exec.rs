@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::test_support::{
-    cmp_all, full_pk_spec, join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64,
-    register_full_pk, weighted_rows, zset_of,
+    certified, cmp_all, full_pk_spec, join_reference, make_batch_u128, make_schema_u128_i64, register_full_pk,
+    weighted_rows, zset_of,
 };
 use gnitz_store::relation::{PkRule, RelationKind, StoreConfig};
 use gnitz_wire::{AggDescriptor, AggFunc, JoinKind, TypeCode, ViewBudget, WeightSlots};
@@ -177,10 +177,7 @@ impl std::ops::Deref for TestVm {
 /// `make_schema_u128_i64`-shaped schema — in that order.
 #[track_caller]
 fn assert_rows(out: &Batch, rows: &[(u128, i64, i64)]) {
-    assert_eq!(
-        weighted_rows(out),
-        weighted_rows(&make_batch_u128_raw(out.schema(), rows))
-    );
+    assert_eq!(weighted_rows(out), weighted_rows(&make_batch_u128(out.schema(), rows)));
 }
 
 /// Each row's payload cells as signed integers of their own width, with its
@@ -234,7 +231,7 @@ fn a_union_sums_its_operands_in_every_epoch() {
         (&[], &[]),
     ];
     for (rows, want) in cases {
-        let got = vm.epoch(a, make_batch_u128(&make_schema_u128_i64(), rows));
+        let got = vm.epoch(a, certified(make_batch_u128(&make_schema_u128_i64(), rows)));
         assert_eq!(*got.schema(), schema);
         assert_rows(&got, want);
     }
@@ -251,7 +248,7 @@ fn a_self_union_doubles_every_weight() {
     let out = p.push(r0, schema, Op::Union { in_b: r0 });
     let mut vm = TestVm::open(p, out);
     let rows = [(1, 1, 10), (2, 3, 20), (3, i64::MIN, 30), (4, i64::MAX, 40)];
-    let got = vm.epoch(r0, make_batch_u128(&schema, &rows));
+    let got = vm.epoch(r0, certified(make_batch_u128(&schema, &rows)));
     assert!(got.is_consolidated());
     assert_rows(&got, &[(1, 2, 10), (2, 6, 20), (3, i64::MIN, 30), (4, i64::MAX, 40)]);
 }
@@ -270,7 +267,7 @@ fn a_history_is_read_before_the_epoch_integrates_into_it() {
     let mut vm = TestVm::open(p, out);
 
     for (w, want) in [(3, &[(1, 1, 42)][..]), (-1, &[]), (-2, &[(1, -1, 42)])] {
-        assert_rows(&vm.epoch(r0, make_batch_u128(&schema, &[(1, w, 42)])), want);
+        assert_rows(&vm.epoch(r0, certified(make_batch_u128(&schema, &[(1, w, 42)]))), want);
     }
 }
 
@@ -320,7 +317,7 @@ fn a_two_term_join_joins_each_delta_with_the_other_sides_past() {
         // raw batches denotes the product of the Z-sets they denote.
         let mut past = [Batch::empty_with_schema(&schema), Batch::empty_with_schema(&schema)];
         for (i, (from_b, rows)) in epochs.into_iter().enumerate() {
-            let delta = make_batch_u128_raw(&schema, rows);
+            let delta = make_batch_u128(&schema, rows);
             let (want, _) = join_reference(kind, from_b, &schema, &schema, &delta, &past[!from_b as usize]);
             assert!(i < 2 || !want.is_empty(), "premise: {kind:?} epoch {i} matches");
             let got = vm.epoch(if from_b { b } else { a }, delta.clone());
@@ -357,12 +354,12 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
     );
     let mut vm = TestVm::open(p, out);
     register_full_pk(&mut vm.registry, TABLE, RelationKind::BaseTable, make_schema_u128_i64());
-    let sealed = make_batch_u128(&schema, &[(1, 1, 100), (2, 1, 200)]);
+    let sealed = certified(make_batch_u128(&schema, &[(1, 1, 100), (2, 1, 200)]));
     vm.registry.ingest(TABLE, sealed.clone()).unwrap();
-    let pending = make_batch_u128(&schema, &[(2, -1, 200), (3, 1, 300)]);
+    let pending = certified(make_batch_u128(&schema, &[(2, -1, 200), (3, 1, 300)]));
     vm.registry.ingest_with(TABLE, pending, PkRule::Enforce, true).unwrap();
 
-    let delta = make_batch_u128(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    let delta = certified(make_batch_u128(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
     let (want, rows) = join_reference(JoinKind::Equi, false, &schema, &schema, &delta, &sealed);
     assert_eq!(rows, 2, "premise: keys 1 and 2 pair, 3 does not");
     assert_eq!(zset_of(&vm.epoch(a, delta.clone()), &out_schema), want);
@@ -391,13 +388,19 @@ fn a_replay_runs_past_what_its_seed_does_not_reach_and_integrates_nothing() {
     assert!(vm.replayable(nb).is_err(), "the clamp reads it");
     assert!(vm.replayable(b).is_err(), "the clamp reads it through the negate");
 
-    assert_rows(&vm.epoch(b, make_batch_u128(&schema, &[(1, -1, 10)])), &[(1, 1, 10)]);
+    assert_rows(
+        &vm.epoch(b, certified(make_batch_u128(&schema, &[(1, -1, 10)]))),
+        &[(1, 1, 10)],
+    );
     let held = |vm: &TestVm| [hist, trace].map(|t| weighted_rows(&vm.held(t)));
     let before = held(&vm);
     let rows = [(2, 1, 20)];
-    assert_rows(&vm.replay(a, make_batch_u128(&schema, &rows)), &[(2, -1, 20)]);
-    assert_rows(&vm.replay(mid, make_batch_u128(&schema, &rows)), &rows);
-    assert_rows(&vm.replay(clamped, make_batch_u128(&schema, &rows)), &rows);
+    assert_rows(
+        &vm.replay(a, certified(make_batch_u128(&schema, &rows))),
+        &[(2, -1, 20)],
+    );
+    assert_rows(&vm.replay(mid, certified(make_batch_u128(&schema, &rows))), &rows);
+    assert_rows(&vm.replay(clamped, certified(make_batch_u128(&schema, &rows))), &rows);
     assert_eq!(held(&vm), before);
 }
 
@@ -432,7 +435,7 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
         vec![(vec![None, Some(0)], 1)],
         "V₀ in the trace"
     );
-    let mut epoch = |rows: &[(u128, i64, i64)]| int_rows(&vm.epoch(r0, make_batch_u128_raw(&schema, rows)));
+    let mut epoch = |rows: &[(u128, i64, i64)]| int_rows(&vm.epoch(r0, make_batch_u128(&schema, rows)));
     assert!(epoch(&[]).is_empty(), "an empty epoch mints nothing");
     assert_eq!(
         epoch(&[(1, 1, 10), (3, 1, 7), (2, 1, 5), (3, -1, 7)]),
@@ -461,11 +464,11 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
     let mut vm = TestVm::open(p, out);
 
     // The output row carries the input row whole: its PK, then its value.
-    let first = vm.epoch(r0, make_batch_u128(&schema, &[(1, 1, 10)]));
+    let first = vm.epoch(r0, certified(make_batch_u128(&schema, &[(1, 1, 10)])));
     assert_eq!(int_rows(&first), vec![(vec![Some(1), Some(10)], 1)]);
     // A strictly greater value displaces the top row entirely.
     assert_eq!(
-        int_rows(&vm.epoch(r0, make_batch_u128(&schema, &[(2, 1, 99)]))),
+        int_rows(&vm.epoch(r0, certified(make_batch_u128(&schema, &[(2, 1, 99)])))),
         vec![(vec![Some(1), Some(10)], -1), (vec![Some(2), Some(99)], 1)],
     );
 }
@@ -486,15 +489,19 @@ fn a_round_sends_its_operand_and_resumes_from_what_it_gathered() {
     let mut vm = TestVm::open(p, out);
 
     // The seed comes under its producer's narrower label.
-    let mut seed = make_batch_u128(&make_schema_u128_i64(), &[(1, 1, 10)]);
+    let mut seed = certified(make_batch_u128(&make_schema_u128_i64(), &[(1, 1, 10)]));
     let mut sent = Vec::new();
     let got = vm.epoch_with(r0, &mut seed, true, |rows, lent| {
         sent.push((*rows.schema() == schema, lent, weighted_rows(rows)));
-        make_batch_u128(&schema, &[(7, 2, 70)])
+        certified(make_batch_u128(&schema, &[(7, 2, 70)]))
     });
     assert_eq!(
         sent,
-        [(true, true, weighted_rows(&make_batch_u128(&schema, &[(1, -1, 10)])))]
+        [(
+            true,
+            true,
+            weighted_rows(&certified(make_batch_u128(&schema, &[(1, -1, 10)])))
+        )]
     );
     assert_rows(&got, &[(1, -1, 10), (7, 2, 70)]);
 }
@@ -518,14 +525,16 @@ fn a_run_after_an_epoch_dropped_at_its_round_starts_from_empty_registers() {
         registry: &vm.registry,
         unfed: &vm.unfed,
     };
-    let mut seed = make_batch_u128(&schema, &[(1, 1, 10)]);
+    let mut seed = certified(make_batch_u128(&schema, &[(1, 1, 10)]));
     let ran = start(&mut vm.vm, &mut stores, r0, Some(&mut seed), true).unwrap();
     assert!(matches!(ran, Ran::Round(_)));
     drop(ran);
     assert!(vm.vm.batches.is_empty(), "the dropped epoch held the registers");
 
     let mut seed = Batch::empty_with_schema(&schema);
-    let got = vm.epoch_with(r0, &mut seed, true, |_, _| make_batch_u128(&schema, &[(7, 2, 70)]));
+    let got = vm.epoch_with(r0, &mut seed, true, |_, _| {
+        certified(make_batch_u128(&schema, &[(7, 2, 70)]))
+    });
     assert_rows(&got, &[(7, 2, 70)]);
 }
 
@@ -543,7 +552,7 @@ fn a_round_over_the_seed_sends_it_as_the_caller_made_it() {
         let (out, _) = distinct(&mut p, gathered);
         let mut vm = TestVm::open(p, out);
 
-        let mut seed = make_batch_u128_raw(&schema, &raw);
+        let mut seed = make_batch_u128(&schema, &raw);
         let mut sent = Vec::new();
         let got = vm.epoch_with(r0, &mut seed, take, |rows, lent| {
             sent.push((rows.is_consolidated(), lent));
@@ -554,7 +563,7 @@ fn a_round_over_the_seed_sends_it_as_the_caller_made_it() {
         let back: &[_] = if take { &[] } else { &raw };
         assert_eq!(
             weighted_rows(&seed),
-            weighted_rows(&make_batch_u128_raw(&schema, back)),
+            weighted_rows(&make_batch_u128(&schema, back)),
             "take {take}"
         );
     }
@@ -578,14 +587,14 @@ fn a_lent_seed_is_the_callers_again_at_the_first_round() {
         };
         let mut vm = TestVm::open(p, out);
 
-        let mut seed = make_batch_u128(&schema, &rows);
+        let mut seed = certified(make_batch_u128(&schema, &rows));
         let got = vm.drive(|vm, stores| {
             let Ran::Round(mut epoch) = start(vm, stores, r0, Some(&mut seed), false)? else {
                 panic!("the epoch stands at its round")
             };
             assert_rows(&seed, &rows);
             assert_rows(&epoch.round().0, &[(1, -1, 10)]);
-            match resume(vm, stores, epoch, make_batch_u128(&schema, &[(7, 2, 70)]))? {
+            match resume(vm, stores, epoch, certified(make_batch_u128(&schema, &[(7, 2, 70)])))? {
                 Ran::Done(out) => Ok(out),
                 Ran::Round(_) => panic!("the program has one round"),
             }
@@ -621,10 +630,13 @@ fn a_round_runs_by_what_its_epoch_seeds_not_by_what_the_seed_holds() {
     };
     let mut none = Batch::empty_with_schema(&schema);
     assert!(vm.epoch_with(a, &mut none, true, &mut echo).is_empty());
-    let mut rows = make_batch_u128(&schema, &[(1, 1, 10)]);
+    let mut rows = certified(make_batch_u128(&schema, &[(1, 1, 10)]));
     assert_rows(&vm.epoch_with(b, &mut rows, true, &mut echo), &[(1, 1, 10)]);
     assert_eq!(rounds, 1, "the empty epoch of `a`, and not the epoch of `b`");
 
     assert!(vm.replayable(a).is_err());
-    assert_rows(&vm.replay(b, make_batch_u128(&schema, &[(3, 1, 30)])), &[(3, 1, 30)]);
+    assert_rows(
+        &vm.replay(b, certified(make_batch_u128(&schema, &[(3, 1, 30)]))),
+        &[(3, 1, 30)],
+    );
 }

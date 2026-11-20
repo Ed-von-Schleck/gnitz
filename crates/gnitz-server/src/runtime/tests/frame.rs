@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_wire::{ClientVerb, WireFlags, WireStatus, peek_control_block};
 
 /// Walk `batch` through [`WireMsg::next_train_frame`] as a sender does, each
@@ -26,9 +26,9 @@ fn cut(batch: &Batch, budget: usize, ends: bool) -> Vec<(usize, bool)> {
 #[test]
 fn next_train_frame_cuts_every_row_once_and_flags_only_the_end() {
     let schema = make_schema_u64_i64();
-    let four = make_batch_raw(&schema, &[(0, 1, 0); 4]);
+    let four = make_batch(&schema, &[(0, 1, 0); 4]);
     let budget = WireMsg::train_frame(7, false, four.wire_whole()).size();
-    let batch = make_batch_raw(&schema, &(0..10).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let batch = make_batch(&schema, &(0..10).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
 
     assert_eq!(cut(&batch, budget, true), [(4, false), (4, false), (2, true)]);
     assert_eq!(cut(&batch, budget, false), [(4, false), (4, false), (2, false)]);

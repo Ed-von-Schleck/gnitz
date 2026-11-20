@@ -16,7 +16,7 @@
 
 use gnitz_wire::GroupAggs;
 
-use super::agg::{AggValues, RangeGroups};
+use super::agg::{AggValues, FoldGroups};
 use super::shape::ReduceShape;
 use crate::algebra::group_key::{GroupNumbers, GroupOutKey, IdentityLoop, ground_pk};
 use crate::repr::{Batch, MemBatch};
@@ -73,7 +73,7 @@ impl AdhocFold {
         );
         if self.shape.key.is_global() {
             for k in 0..self.shape.aggs.len() {
-                self.vals.fold(k, &mb, ranges, RangeGroups::One(0));
+                self.vals.fold(k, &mb, ranges, FoldGroups::One(0));
             }
             return Ok(());
         }
@@ -91,7 +91,7 @@ impl AdhocFold {
         self.shape.key.with_identity(&mb, ranges, assign)?;
         self.vals.resize(self.groups.len());
         for k in 0..self.shape.aggs.len() {
-            self.vals.fold(k, &mb, ranges, &self.ord[..]);
+            self.vals.fold(k, &mb, ranges, FoldGroups::Rows(&self.ord));
         }
         Ok(())
     }

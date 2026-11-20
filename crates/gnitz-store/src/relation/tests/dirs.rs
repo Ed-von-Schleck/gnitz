@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{IndexClaim, StateLayout, StoreConfig};
 use crate::storage::flush_barrier;
 use crate::test_support::{
-    TID, flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture_with,
+    TID, flip_last_byte_in_place, make_batch, make_schema_u64_i64, pk_only_schema, relation_fixture_with,
     scratch_table, solo, spec, spilling, zset_of,
 };
 use gnitz_wire::{TypeCode, ViewBudget};
@@ -128,11 +128,11 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
         spec(TID, RelationKind::BaseTable, schema),
         schema,
         &[&[1]],
-        [make_batch_raw(&schema, &rows)],
+        [make_batch(&schema, &rows)],
     );
     r.checkpoint_base().unwrap();
     // After the checkpoint, so only the SAL would carry it: not in the copy.
-    r.ingest(TID, make_batch_raw(&schema, &[(99, 1, 0)])).unwrap();
+    r.ingest(TID, make_batch(&schema, &[(99, 1, 0)])).unwrap();
 
     let dest = tempfile::tempdir().unwrap();
     let dest = dest.path().to_str().unwrap();
@@ -148,7 +148,7 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
         .unwrap();
     assert_eq!(
         zset_of(&copy.relation(TID).unwrap().full_scan(), &schema),
-        zset_of(&make_batch_raw(&schema, &rows), &schema)
+        zset_of(&make_batch(&schema, &rows), &schema)
     );
 }
 
@@ -210,7 +210,7 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         )],
     )
     .unwrap();
-    r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();
+    r.ingest(TID, make_batch(&schema, &[(1, 1, 7)])).unwrap();
     r.checkpoint_ephemeral([], 0, |_| true).unwrap();
 
     let rel = relation_dir(base, TID);
@@ -245,7 +245,7 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     }
     assert_eq!(
         zset_of(&r.relation(TID).unwrap().full_scan(), &schema),
-        zset_of(&make_batch_raw(&schema, &[(1, 1, 7)]), &schema)
+        zset_of(&make_batch(&schema, &[(1, 1, 7)]), &schema)
     );
 }
 

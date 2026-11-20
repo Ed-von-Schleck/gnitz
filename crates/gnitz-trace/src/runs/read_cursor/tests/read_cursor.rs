@@ -2,8 +2,9 @@ use super::*;
 use crate::runs::MappedShard;
 use crate::runs::ShardWriteOpts;
 use crate::test_support::{
-    RowKey, arb_fold_case, assert_folds, fold_batch, make_batch, make_batch_u128, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, make_schema_u128_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of,
+    RowKey, arb_fold_case, assert_folds, certified, fold_batch, make_batch, make_batch_u128,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64, map_shard, payload0_i64, row_key,
+    u64_pk_schema, weighted_rows, zset_of,
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::{PkKeys, TypeCode};
@@ -31,7 +32,7 @@ pub(super) fn create_read_cursor(
 /// A consolidated `Rc<Batch>` over [`make_schema_u128_i64`]: `(pk, weight, payload)`
 /// rows, (PK, payload)-sorted.
 fn u128_run(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
-    Rc::new(make_batch_u128(&make_schema_u128_i64(), rows))
+    Rc::new(certified(make_batch_u128(&make_schema_u128_i64(), rows)))
 }
 
 /// `(pk, weight, payload)` of every row a walk from here emits, over a
@@ -434,6 +435,107 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
     }
 }
 
+/// A dominated drain whose large run is a skeleton shard hands back every one of
+/// its keys at its coarse weight, the one a hydrated row shares folded into it,
+/// and copies only the hydrated rows that share no skeleton key.
+#[test]
+fn a_dominated_drain_sets_aside_every_skeleton_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut sk = BatchBuilder::new(&schema.pk_only());
+    for pk in (0..200u128).step_by(2) {
+        sk.begin_row(pk, 1);
+        sk.end_row();
+    }
+    let sk_path = dir.path().join("sk.db");
+    let sk_path = sk_path.to_str().unwrap();
+    let sk = sk.finish();
+    crate::runs::shard::write_shard_over(&sk, &sk, sk_path, ShardWriteOpts::default(), true).unwrap();
+    let sk = Rc::new(MappedShard::open(sk_path, &schema).unwrap());
+    let mem = Rc::new(certified(make_batch(
+        &schema,
+        &[(50, 2, 7), (51, 1, 51), (153, 3, 153)],
+    )));
+    for chunk in [1, 5, 64, usize::MAX] {
+        let mut c = create_read_cursor(std::slice::from_ref(&mem), std::slice::from_ref(&sk), schema);
+        let (mut keys, mut coarse, mut live) = (Vec::new(), Vec::new(), Vec::new());
+        loop {
+            let mut skeletons = SkeletonKeys::default();
+            let Some((b, _)) = c.drain_live_chunk(chunk, &mut skeletons, &mut gnitz_expr::RowFilter::default()) else {
+                break;
+            };
+            keys.extend(skeletons.keys);
+            coarse.extend(skeletons.coarse);
+            live.extend((0..b.len()).map(|i| (gnitz_wire::widen_pk_be(b.get_pk_bytes(i)), b.get_weight(i))));
+        }
+        let want_keys: Vec<u8> = (0..200u64).step_by(2).flat_map(u64::to_be_bytes).collect();
+        assert_eq!(keys, want_keys, "chunks of {chunk}");
+        if cfg!(debug_assertions) {
+            let want: Vec<i64> = (0..200).step_by(2).map(|pk| if pk == 50 { 3 } else { 1 }).collect();
+            assert_eq!(coarse, want, "chunks of {chunk}: coarse weights");
+        }
+        assert_eq!(live, [(51, 1), (153, 3)], "chunks of {chunk}");
+    }
+}
+
+/// A dominated drain cuts the stretches of an in-memory run to the rows the
+/// filter keeps, weights included, and keeps a shard's rows whatever it says.
+#[test]
+fn a_filter_cuts_a_dominated_drain_to_its_survivors() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut filter = crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Gt, 1, 2)])
+        .resolve_filter(&schema)
+        .unwrap();
+    let rows = |ids: &[u64]| -> Vec<(u64, i64, i64)> {
+        ids.iter().map(|&id| (id, 1 + (id % 3) as i64, id as i64 % 5)).collect()
+    };
+    let large: Vec<u64> = (0..800).step_by(2).collect();
+    let tiny = [101u64, 301, 503];
+    let kept = |ids: &[u64]| -> Vec<(u64, i64)> {
+        ids.iter()
+            .filter(|&&id| id % 5 > 2)
+            .map(|&id| (id, 1 + (id % 3) as i64))
+            .collect()
+    };
+    let all = |ids: Vec<(u64, i64)>| {
+        let mut ids = ids;
+        ids.sort_unstable();
+        ids
+    };
+    let large_mem = Rc::new(certified(make_batch(&schema, &rows(&large))));
+    let tiny_mem = Rc::new(certified(make_batch(&schema, &rows(&tiny))));
+    let tiny_shard = map_shard(&dir.path().join("tiny.db"), &make_batch(&schema, &rows(&tiny)));
+    let cases = [
+        (
+            "in memory",
+            vec![Rc::clone(&large_mem), tiny_mem],
+            vec![],
+            all([kept(&large), kept(&tiny)].concat()),
+        ),
+        (
+            "beside a shard",
+            vec![large_mem],
+            vec![tiny_shard],
+            all([kept(&large), tiny.iter().map(|&id| (id, 1 + (id % 3) as i64)).collect()].concat()),
+        ),
+    ];
+    for (name, batches, shards, want) in cases {
+        for chunk in [1, 7, 64, usize::MAX] {
+            let mut c = create_read_cursor(&batches, &shards, schema);
+            let mut got = Vec::new();
+            loop {
+                let mut skeletons = SkeletonKeys::default();
+                let Some((b, _)) = c.drain_live_chunk(chunk, &mut skeletons, &mut filter) else {
+                    break;
+                };
+                got.extend((0..b.len()).map(|i| (gnitz_wire::widen_pk_be(b.get_pk_bytes(i)) as u64, b.get_weight(i))));
+            }
+            assert_eq!(got, want, "{name}, chunks of {chunk}");
+        }
+    }
+}
+
 /// A drain reports its filter decided the chunk only when in-memory runs alone
 /// supplied it, every row then a survivor; a shard's rows stay whatever the
 /// filter says, and the chunk is reported undecided.
@@ -447,8 +549,9 @@ fn a_drain_decides_only_a_chunk_of_in_memory_rows() {
     let rows = |ids: &[u64]| -> Vec<(u64, i64, i64)> { ids.iter().map(|&id| (id, 1, id as i64 % 5)).collect() };
     let even: Vec<u64> = (0..20).step_by(2).collect();
     let odd: Vec<u64> = (1..20).step_by(2).collect();
-    let mem = |ids: &[u64]| Rc::new(make_batch(&schema, &rows(ids)));
-    let shard = |name: &str, ids: &[u64]| map_shard(&dir.path().join(name), &make_batch(&schema, &rows(ids)));
+    let mem = |ids: &[u64]| Rc::new(certified(make_batch(&schema, &rows(ids))));
+    let shard =
+        |name: &str, ids: &[u64]| map_shard(&dir.path().join(name), &certified(make_batch(&schema, &rows(ids))));
     let survivors = |ids: &[u64]| -> Vec<u64> { ids.iter().copied().filter(|&id| id % 5 > 2).collect() };
     let all: Vec<u64> = (0..20).collect();
     let cases = [
@@ -566,7 +669,7 @@ proptest! {
                     *sum.entry(id).or_default() += w;
                 }
                 sum.retain(|_, w| *w != 0);
-                make_batch_u128(&s, &sum.into_iter().map(|((pk, v), w)| (pk, w, v)).collect::<Vec<_>>())
+                certified(make_batch_u128(&s, &sum.into_iter().map(|((pk, v), w)| (pk, w, v)).collect::<Vec<_>>()))
             })
             .collect();
         // The oldest stretches as shards, the rest as heap runs, newest first.
@@ -722,11 +825,14 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
 fn chunks_cut_a_dominated_drain_anywhere() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let large = make_batch(&schema, &(0..400u64).map(|k| (k, 1, k as i64)).collect::<Vec<_>>());
-    let tiny = make_batch(
+    let large = certified(make_batch(
+        &schema,
+        &(0..400u64).map(|k| (k, 1, k as i64)).collect::<Vec<_>>(),
+    ));
+    let tiny = certified(make_batch(
         &schema,
         &[(37, -1, 37), (90, 1, 0), (90, 2, 90), (201, 1, 7), (399, 2, 1)],
-    );
+    ));
     let (large_rc, tiny_rc) = (Rc::new(large.clone()), Rc::new(tiny.clone()));
     let shard = map_shard(&dir.path().join("large.db"), &large);
     for chunk in [1, 3, 7, 64, usize::MAX] {
@@ -862,7 +968,7 @@ fn gather_rows_reads_every_backing_alike() {
 fn pick_scratch_interleaves_across_kernels() {
     use crate::runs::{PkSetGather, Run, from_runs};
     use crate::stream::{History, op_weight_clamp};
-    use crate::test_support::{TestTrace, make_batch, make_batch_raw, make_schema_u64_i64, weighted_rows};
+    use crate::test_support::{TestTrace, make_batch, make_schema_u64_i64, weighted_rows};
     use gnitz_wire::ClampKind::Distinct;
     use gnitz_wire::PkKeys;
     use std::borrow::Cow;
@@ -882,7 +988,7 @@ fn pick_scratch_interleaves_across_kernels() {
             .filter(|e| e.1 != 0)
             .map(|((pk, v), w)| (pk, w, v))
             .collect();
-        (make_batch_raw(&schema, rows), make_batch(&schema, &want))
+        (make_batch(&schema, rows), certified(make_batch(&schema, &want)))
     };
     // Descending PKs, each row twice and a third of them cancelled: the batch
     // must sort and fold.
@@ -908,11 +1014,14 @@ fn pick_scratch_interleaves_across_kernels() {
     // Keys 0..64 at payload `key`, and the even ones a second time at `-1 - key`.
     let stored = || {
         [
-            make_batch(&schema, &(0..64).map(|i| (i, 1, i as i64)).collect::<Vec<_>>()),
-            make_batch(
+            certified(make_batch(
+                &schema,
+                &(0..64).map(|i| (i, 1, i as i64)).collect::<Vec<_>>(),
+            )),
+            certified(make_batch(
                 &schema,
                 &(0..64).step_by(2).map(|i| (i, 1, -1 - i as i64)).collect::<Vec<_>>(),
-            ),
+            )),
         ]
     };
     let mut trace = TestTrace::new(schema);
@@ -943,7 +1052,7 @@ fn pick_scratch_interleaves_across_kernels() {
             want_rows.push((k, 1, k as i64));
         }
         want_rows.sort_by_key(|&(pk, _, v)| (pk, v));
-        assert_eq!(gathered, weighted_rows(&make_batch(&schema, &want_rows)));
+        assert_eq!(gathered, weighted_rows(&certified(make_batch(&schema, &want_rows))));
 
         // Both runs merged by a plain cursor, drained in chunks of `round + 1`.
         let mut cursor = from_runs(stored().into_iter().map(|b| Run::Mem(Rc::new(b))), schema);
@@ -954,10 +1063,13 @@ fn pick_scratch_interleaves_across_kernels() {
         let mut want_rows: Vec<(u64, i64, i64)> = (0..64).map(|i| (i, 1, i as i64)).collect();
         want_rows.extend((0..64).step_by(2).map(|i| (i, 1, -1 - i as i64)));
         want_rows.sort_by_key(|&(pk, _, v)| (pk, v));
-        assert_eq!(drained, weighted_rows(&make_batch(&schema, &want_rows)));
+        assert_eq!(drained, weighted_rows(&certified(make_batch(&schema, &want_rows))));
 
         // Keys 64.. are absent from the trace: distinct passes the delta through.
-        let fresh = make_batch(&schema, &(64..64 + round).map(|i| (i, 1, 0)).collect::<Vec<_>>());
+        let fresh = certified(make_batch(
+            &schema,
+            &(64..64 + round).map(|i| (i, 1, 0)).collect::<Vec<_>>(),
+        ));
         let open = &mut |f: &[u8], l: &[u8]| trace.cursor_within(f, l);
         let out = op_weight_clamp(Cow::Borrowed(&fresh), History::Before(open), Distinct);
         assert_eq!(weighted_rows(&out), weighted_rows(&fresh));
@@ -966,9 +1078,12 @@ fn pick_scratch_interleaves_across_kernels() {
         // past them is emitted.
         let mut mixed: Vec<(u64, i64, i64)> = (0..round).map(|i| (i, 1, i as i64)).collect();
         mixed.push((100, 1, 0));
-        let mixed = make_batch(&schema, &mixed);
+        let mixed = certified(make_batch(&schema, &mixed));
         let open = &mut |f: &[u8], l: &[u8]| trace.cursor_within(f, l);
         let out = op_weight_clamp(Cow::Borrowed(&mixed), History::Before(open), Distinct);
-        assert_eq!(weighted_rows(&out), weighted_rows(&make_batch(&schema, &[(100, 1, 0)])));
+        assert_eq!(
+            weighted_rows(&out),
+            weighted_rows(&certified(make_batch(&schema, &[(100, 1, 0)])))
+        );
     }
 }

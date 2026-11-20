@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::{IndexClaim, PkRule, RelationKind};
 use crate::test_support::{
-    RelationFixture, TID, batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema,
+    RelationFixture, TID, batch_rows, col_range, img, make_batch, make_schema_u64_i64, pk_only_schema,
     relation_fixture, zset_of,
 };
 use gnitz_foundation::rng::Rng;
@@ -17,7 +17,7 @@ const NBASE: u64 = 200;
 fn fixture(kind: RelationKind, val_of: impl Fn(u64) -> i64) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let rows: Vec<_> = (0..NBASE).map(|id| (id, 1, val_of(id))).collect();
-    relation_fixture(kind, schema, &[&[1]], [make_batch_raw(&schema, &rows)])
+    relation_fixture(kind, schema, &[&[1]], [make_batch(&schema, &rows)])
 }
 
 fn x10(id: u64) -> i64 {
@@ -107,7 +107,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
 #[test]
 fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
     let schema = make_schema_u64_i64();
-    let base = make_batch_raw(&schema, &rows(0..NBASE));
+    let base = make_batch(&schema, &rows(0..NBASE));
     let keys = || ReadBound::PkSet(pk_keys_of_images(8, [2, 5, 7, 300]));
     for (kind, probed) in [
         (RelationKind::BaseTable, true),
@@ -115,7 +115,7 @@ fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
         (RelationKind::View(ViewBudget::Plain), false),
     ] {
         let mut r = relation_fixture(kind, schema, &[], [base.clone()]);
-        r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
+        r.ingest(TID, make_batch(&schema, &[(5, -1, 50)])).unwrap();
         let relation = r.relation(TID).unwrap();
         let (mut read, unapplied) = relation.open_read(keys(), u64::MAX).unwrap();
         assert_eq!(unapplied, None);
@@ -146,7 +146,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     assert_eq!(drain_all(&mut cur, 7), rows(50..60));
 
     // One pending row inside the range, one outside it.
-    let pending = make_batch_raw(&make_schema_u64_i64(), &[(NBASE, 1, 555), (NBASE + 1, 1, 9_000)]);
+    let pending = make_batch(&make_schema_u64_i64(), &[(NBASE, 1, 555), (NBASE + 1, 1, 9_000)]);
     r.ingest_with(TID, pending, PkRule::Enforce, true).unwrap();
     let with_pending = || {
         let mut rows = rows(50..60);
@@ -211,7 +211,7 @@ fn a_walk_follows_the_relations_writes() {
     ];
     for (kind, delta, want) in cases {
         let mut r = fixture(kind, x10);
-        r.ingest(TID, make_batch_raw(&make_schema_u64_i64(), delta)).unwrap();
+        r.ingest(TID, make_batch(&make_schema_u64_i64(), delta)).unwrap();
         let (mut cur, unapplied) = r
             .relation(TID)
             .unwrap()
@@ -378,7 +378,7 @@ fn an_index_walk_over_a_repeating_key_trips_the_gather() {
         .chain((2..64).map(|pk| (pk, 1, 1000)))
         .collect();
     let view = RelationKind::View(ViewBudget::Plain);
-    let r = relation_fixture(view, schema, &[&[1]], [make_batch_raw(&schema, &rows)]);
+    let r = relation_fixture(view, schema, &[&[1]], [make_batch(&schema, &rows)]);
     let mut cur = r.relation(TID).unwrap().open_sealed(val_range(5, 6), u64::MAX).unwrap();
     assert!(walks_index(&cur));
     cur.drain_chunk(1024);
@@ -423,7 +423,7 @@ fn keyed(reply: &Batch) -> Vec<(u128, i64)> {
 #[test]
 fn a_pk_probe_answers_each_key_a_live_row_carries() {
     let mut r = fixture(RelationKind::BaseTable, x10);
-    r.ingest(TID, make_batch_raw(&make_schema_u64_i64(), &[(5, -1, 50)]))
+    r.ingest(TID, make_batch(&make_schema_u64_i64(), &[(5, -1, 50)]))
         .unwrap();
     let keys = pk_keys_of_images(8, [2, 5, 7, 300]);
     assert_eq!(keyed(&r.probe(TID, Probe::Pk, keys.clone()).unwrap()), [(2, 1), (7, 1)]);

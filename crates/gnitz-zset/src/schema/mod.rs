@@ -1,11 +1,10 @@
 //! The key and payload-order kernels over a schema, the radix sort under every
 //! key sort, the shaping of a derived schema (an operator's output, a reduce's
-//! output key and layout, or an index's layout), and a descriptor read from and
-//! written as a meta-schema record. The descriptor itself is `gnitz-expr`'s.
+//! output key and layout, or an index's layout), and a descriptor read from a
+//! meta-schema record. The descriptor itself is `gnitz-expr`'s.
 
 use gnitz_expr::{SchemaRefusal, leading_pk};
-use gnitz_wire::schema_record::RecordCol;
-use gnitz_wire::{ColType, MAX_COLUMNS};
+use gnitz_wire::MAX_COLUMNS;
 use smallvec::SmallVec;
 
 mod key;
@@ -17,13 +16,13 @@ mod sort_key;
 /// The schema descriptor, homed in `gnitz-expr` because its evaluator reads
 /// through it. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{SchemaColumn, SchemaDescriptor};
-pub use key::{PROBE_KEY_INJECTIVE_BYTES, group_band, key_above, probe_key, range_band};
-
-pub use key::{band, compare_pk_ordering, group_floor};
+pub use key::{
+    PROBE_KEY_INJECTIVE_BYTES, band, compare_pk_ordering, group_band, group_floor, key_above, probe_key, range_band,
+};
 pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
 pub(crate) use radix::stable_radix_sort_by_key;
 pub use radix::{RadixKey, radix_sort_by_key};
-pub(crate) use reduce_out::{ReduceOutKey, reduce_out_key};
+pub(crate) use reduce_out::natural_key;
 pub use reduce_out::{ReduceOutSlot, reduce_out_layout};
 pub(crate) use sort_key::{PkSortKey, pack_pk_be, pk_width_dispatch};
 pub use sort_key::{pk_keys, pk_keys_of_images};
@@ -37,20 +36,6 @@ pub fn decode_schema_record(data: &[u8]) -> Result<SchemaDescriptor, String> {
         Ok(())
     })?;
     Ok(SchemaDescriptor::try_new(&cols, pk.as_slice())?)
-}
-
-/// `schema` as a shape record. A descriptor holds no DECIMAL scale, so every
-/// scale is zero: this is a relation's own shape record only where none of its
-/// columns is a DECIMAL. A relation's is built from its column definitions
-/// (`ColumnDef::shape_col`).
-pub fn encode_schema_record(schema: &SchemaDescriptor) -> Vec<u8> {
-    let cols = schema.columns().iter().map(|c| RecordCol {
-        ty: ColType::of(c.type_code),
-        nullable: c.nullable,
-        hidden: false,
-        name: "",
-    });
-    gnitz_wire::schema_record::encode(cols, schema.pk_cols())
 }
 
 /// Builder for a derived schema: its PK columns, then its payload columns.

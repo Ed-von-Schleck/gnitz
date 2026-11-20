@@ -1,8 +1,8 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    assert_folds, make_batch, make_int_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows,
-    zset_of, zset_sum,
+    assert_folds, certified, make_batch, make_int_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema,
+    weighted_rows, zset_of, zset_sum,
 };
 use gnitz_wire::TypeCode;
 
@@ -106,11 +106,14 @@ fn filter_keeps_exactly_the_matching_rows() {
             .unwrap()
     };
     let rows = [(1, 3, 5), (2, -2, 15), (3, 1, 10), (4, 2, 20), (5, 1, 0)];
-    let input = make_batch(&schema, &rows);
+    let input = certified(make_batch(&schema, &rows));
 
     let out = op_filter(Cow::Borrowed(&input), &mut gt(10));
     let want: Vec<_> = rows.iter().copied().filter(|&(.., v)| v > 10).collect();
-    assert_eq!(weighted_rows(&out), weighted_rows(&make_batch(&schema, &want)));
+    assert_eq!(
+        weighted_rows(&out),
+        weighted_rows(&certified(make_batch(&schema, &want)))
+    );
     assert!(out.is_consolidated());
     // Every row passes: an owned input is the output, not a copy of it.
     let owned = input.clone();
@@ -140,7 +143,7 @@ fn union_of_mismatched_input_layouts_is_rejected() {
 #[test]
 fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
     let in_schema = make_schema_u64_i64();
-    let input = make_batch(&in_schema, &[(1, 1, 42)]);
+    let input = certified(make_batch(&in_schema, &[(1, 1, 42)]));
     for nulls_first in [false, true] {
         let out_schema = null_extend_output_schema(&in_schema, &[TypeCode::I64, TypeCode::String], nulls_first)
             .expect("two fill columns extend cleanly");

@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use gnitz_zset_testkit::assert_ladder;
+use crate::test_support::assert_ladder;
 
 const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 

@@ -17,9 +17,8 @@ const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 ///
 /// It reads the name each `crate::` path leads with, so a crate-root item other
 /// than an exported macro and a grouped `crate::{…}` import are refused along
-/// with a higher rung. It does
-/// not see `super::`-relative reaches, so it is a regression guard and not a
-/// proof.
+/// with a higher rung. It does not see `super::`-relative reaches, so it is a
+/// regression guard and not a proof.
 pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
     for p in entries(src_root) {
         let name = p.file_stem().unwrap().to_str().unwrap();

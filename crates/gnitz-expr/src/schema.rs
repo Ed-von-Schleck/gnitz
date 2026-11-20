@@ -1,7 +1,6 @@
 //! The schema descriptor: a column table and PK list with every layout fact
 //! derived from them — the *schema* peer of [`crate::BatchView`]'s *access*
-//! contract, linked by the engine and the client alike. A reduce's output key is
-//! one of those facts.
+//! contract, linked by the engine and the client alike.
 
 use gnitz_wire::{KeyListRefusal, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PkListRole, TypeCode};
 
@@ -473,6 +472,26 @@ impl SchemaDescriptor {
         for tc in self.region_types() {
             buf[n] = tc.as_wire();
             n += 1;
+        }
+        gnitz_wire::checksum(&buf[..n])
+    }
+
+    /// The digest of the whole descriptor: its PK list, then each column's type
+    /// and nullability in schema order. Equal descriptors digest alike.
+    pub fn identity_digest(&self) -> u64 {
+        // A PK count and list, then two bytes per column.
+        let mut buf = [0u8; 1 + MAX_PK_COLUMNS + 2 * MAX_COLUMNS];
+        let pk = self.pk_cols();
+        buf[0] = pk.len() as u8;
+        let mut n = 1;
+        for &ci in pk {
+            buf[n] = ci as u8;
+            n += 1;
+        }
+        for c in self.columns() {
+            buf[n] = c.type_code.as_wire();
+            buf[n + 1] = c.nullable as u8;
+            n += 2;
         }
         gnitz_wire::checksum(&buf[..n])
     }

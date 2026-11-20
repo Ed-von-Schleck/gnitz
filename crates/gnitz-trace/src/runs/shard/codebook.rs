@@ -8,9 +8,8 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::{HeapValue, MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable, push_coded, push_codes};
-
-use super::batch::Batch;
+use gnitz_wire::{MAX_SYMBOL_LEN, MAX_SYMBOLS, SymbolTable};
+use gnitz_zset::repr::{Batch, HeapCoder};
 
 const _: () = assert!(
     fsst::ESCAPE_CODE == gnitz_wire::SYMBOL_ESCAPE,
@@ -65,37 +64,10 @@ impl Codebook {
         &self.table
     }
 
-    /// The table's [`SymbolTable::digest`].
-    pub fn digest(&self) -> u64 {
-        self.table.digest()
-    }
-
     /// How the table coded a probe of its training values, in sixteenths of
     /// their plain bytes.
     pub fn trained_sixteenths(&self) -> usize {
         self.trained_sixteenths
-    }
-
-    /// Append `value`'s codes to `dst`.
-    pub fn encode_into(&self, value: &[u8], dst: &mut Vec<u8>) {
-        let at = dst.len();
-        // Every byte an escape, at worst: two code bytes each.
-        dst.reserve(2 * value.len());
-        // SAFETY: the spare capacity holds two bytes per input byte, the most
-        // `compress_into` writes, and it reports how many it wrote.
-        unsafe {
-            let n = self.encoder.compress_into(value, dst.spare_capacity_mut());
-            dst.set_len(at + n);
-        }
-    }
-
-    /// Append `value` to `dst`, a heap coded under this table: the codes it is
-    /// stored as, where it is coded under this table, else its bytes coded.
-    pub(crate) fn append(&self, value: HeapValue<'_>, dst: &mut Vec<u8>) {
-        match value.table_digest() == Some(self.table.digest()) {
-            true => push_codes(dst, value.stored()),
-            false => push_coded(dst, |dst| self.encode_into(&value.bytes(), dst)),
-        }
     }
 
     /// What the table codes values spread evenly over `values`, about
@@ -135,6 +107,24 @@ impl Codebook {
                 book.trained_sixteenths = book.probe_sixteenths(&values);
                 Some(Rc::new(book))
             }
+        }
+    }
+}
+
+impl HeapCoder for Codebook {
+    fn digest(&self) -> u64 {
+        self.table.digest()
+    }
+
+    fn encode_into(&self, value: &[u8], dst: &mut Vec<u8>) {
+        let at = dst.len();
+        // Every byte an escape, at worst: two code bytes each.
+        dst.reserve(2 * value.len());
+        // SAFETY: the spare capacity holds two bytes per input byte, the most
+        // `compress_into` writes, and it reports how many it wrote.
+        unsafe {
+            let n = self.encoder.compress_into(value, dst.spare_capacity_mut());
+            dst.set_len(at + n);
         }
     }
 }

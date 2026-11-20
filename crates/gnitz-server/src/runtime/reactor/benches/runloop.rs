@@ -96,7 +96,7 @@ fn reactor_pass_bench() {
     let (r, lease, mut writers) = train_lease(1, "ScanSpec");
     let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
-    let rows = crate::test_support::make_batch(&schema, &[(1, 1, 0)]);
+    let rows = crate::test_support::certified(crate::test_support::make_batch(&schema, &[(1, 1, 0)]));
     // Leaked: the task parks on the lease's one train for as long as it runs.
     let train = train_of(Box::leak(Box::new(lease)));
     let next = async move || assert!(matches!(black_box(train.next().await), Ok(Some(_))));
