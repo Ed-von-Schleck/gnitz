@@ -144,7 +144,7 @@ def main():
     run.add_argument("--family", default="", help="comma-separated scenario families")
     run.add_argument("--workers", default="4", help="comma-separated worker counts")
     run.add_argument("--regime", default="l0",
-                     help="comma-separated storage regimes (l0, compacted, checkpointed), or `every` for each "
+                     help="comma-separated storage regimes (l0, compacted, checkpointed, large), or `every` for each "
                           "scenario's own list")
     run.add_argument("--rows", type=int, default=200_000, help="rows a scenario loads")
     run.add_argument("--server", default=str(REPO_ROOT / "gnitz-server-release"))

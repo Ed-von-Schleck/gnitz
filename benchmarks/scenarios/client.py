@@ -15,7 +15,7 @@ from gnitz import ColumnDef, Schema, TypeCode, ZSetBatch, aio
 
 from harness.run import time_pushes
 
-from .base import Scenario
+from .base import Scenario, ops_for
 
 N = 10_000
 
@@ -172,7 +172,7 @@ class Async(Scenario):
     released GIL costs a switch interval per call."""
 
     def run(self, run):
-        n = max(run.rows // 100, 1000)
+        n = ops_for(run, 100, 1000)
         run.ddl("CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
         for name, busy in (("idle", False), ("beside_a_busy_thread", True)):
             stop = threading.Event()

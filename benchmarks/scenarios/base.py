@@ -8,13 +8,17 @@ from typing import Callable
 
 LOAD_BATCH = 20_000     # a bulk load: every push is past the tick-coalesce threshold
 INGEST_BATCH = 1_000    # a stream of deltas whose ticks the server paces
-TRICKLE_BATCH = 100     # small writes, each read back at once
 
 BYTES = ("l0", "compacted", "checkpointed")     # scenarios read for their bytes run every regime
 
 WORDS = [f"{a}{b}{c}" for a in ("in", "con", "re", "de", "trans", "per", "sub", "ex")
          for b in ("struct", "form", "port", "duc", "scrib", "mit", "vers", "clud")
          for c in ("", "ion", "ed", "ing", "or", "ive", "able", "ure")]
+
+
+def ops_for(run, per=1000, least=200):
+    """How many single operations a phase runs."""
+    return max(run.rows // per, least)
 
 
 def scatter(k: int, bits: int = 64) -> int:
@@ -54,8 +58,10 @@ class Shape(Scenario):
     load      `rows` rows in bulk, each push's tick finished before the next
     checkpoint, boot   a graceful stop, the disk reading, and the boot after it
     ingest    half as many again, in batches the server's own ticks pace
-    trickle   a tenth as many, in small batches each read back at once
+    trickle   one-row pushes, each read back at once: an application's write
+              unit, so the views' fixed cost per tick is paid per row
     churn     rows rewritten and rows deleted
+    retire    with `retire`, each named table's oldest rows deleted oldest first
     recover   a kill, and the boot that replays the log
 
     With `rescale`, `boot` runs at `rescale` times the run's worker count and
@@ -69,6 +75,10 @@ class Shape(Scenario):
     data: Callable = None
     rewrites: float = 0.25      # rows rewritten in `churn`, per loaded row
     deletes: float = 0.05       # rows deleted in `churn`, per loaded row
+    # `{table: share}`: the share of the table's rows `retire` deletes, lowest
+    # `k` first, which is the order its `make` hands out keys in time. `churn`
+    # deletes none of them.
+    retire: dict = field(default_factory=dict)
     read: str | None = None     # the view `trickle` reads; the last one by default
     rescale: int = 1
 
@@ -98,30 +108,38 @@ class Shape(Scenario):
         with run.phase("ingest") as ph:
             ph.replay(ops)
 
-        ops = fresh(at, at + max(n // 10, TRICKLE_BATCH), TRICKLE_BATCH)
-        at += max(n // 10, TRICKLE_BATCH)
+        trickled = ops_for(run, 200, 20)
+        ops = fresh(at, at + trickled, 1)
+        at += trickled
         with run.phase("trickle") as ph:
             ph.replay(ops, read=self.read or last)
 
         mutable = {t: f for t, f in facts.items() if not run.tables[t].stream}
+        assert self.retire.keys() <= mutable.keys(), "retire names a table that is no mutable fact"
+        have = {t: int(at * f.share) for t, f in mutable.items()}
+        cut = {t: int(share * have[t]) for t, share in self.retire.items()}     # `retire` takes the `k`s below
+
+        def deletes(t, ks):
+            pk, f = run.tables[t].pk, facts[t]
+            keys = [tuple(f.make(k)[c] for c in pk) for k in ks]
+            return run.delete_ops(t, [k[0] for k in keys] if len(pk) == 1 else keys, INGEST_BATCH)
+
         if mutable and (self.rewrites or self.deletes):
             ops, gone = [], []
             for t, f in mutable.items():
-                have = int(at * f.share)
                 left = int(self.rewrites * n * f.share)
                 while left > 0:                                         # a round rewrites no row twice
-                    take = min(left, max(have // 2, 1))
-                    ops += run.ops(t, (f.make(k) for k in rng.sample(range(have), take)), INGEST_BATCH)
+                    take = min(left, max(have[t] // 2, 1))
+                    ops += run.ops(t, (f.make(k) for k in rng.sample(range(have[t]), take)), INGEST_BATCH)
                     left -= take
-                pk = run.tables[t].pk
-                keys = [tuple(f.make(k)[c] for c in pk) for k in rng.sample(range(have), int(self.deletes * n * f.share))]
-                keys = [k[0] for k in keys] if len(pk) == 1 else keys
-                gone += [(t, keys[i:i + INGEST_BATCH]) for i in range(0, len(keys), INGEST_BATCH)]
+                gone += deletes(t, rng.sample(range(cut.get(t, 0), have[t]), int(self.deletes * n * f.share)))
             with run.phase("churn") as ph:
+                ph.replay(ops + gone)
+
+        if cut:
+            ops = [op for t in cut for op in deletes(t, range(cut[t]))]
+            with run.phase("retire") as ph:
                 ph.replay(ops)
-                for t, keys in gone:
-                    table = run.tables[t]
-                    ph.timed("delete", run.conn.delete, table.tid, table.schema, keys, rows=len(keys))
 
         run.crash(workers=home)
         if self.rescale != 1:

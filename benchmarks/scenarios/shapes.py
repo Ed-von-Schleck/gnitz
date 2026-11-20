@@ -126,6 +126,13 @@ CHURN_DDL = [
 ]
 
 
+def readings(n, rng):
+    """A reading every ten time units, so a row's key orders it in time; a
+    rewrite keeps its time."""
+    return [], {"readings": Fact(lambda k: dict(
+        id=k + 1, ts=1_700_000_000 + k * 10, device=rng.randrange(1000), v=rng.randrange(1000)))}
+
+
 def clicks(n, rng):
     users = max(n // 40, 1)
     countries = ["de", "fr", "us", "gb", "jp", "br", "in", "pl"]
@@ -287,6 +294,17 @@ SCENARIOS = [
         "churn_long", "mutation",
         "the churn scenario with every row rewritten six times on average",
         BYTES, CHURN_DDL, accounts, rewrites=6.0, deletes=0.2),
+    Shape(
+        "retention", "mutation",
+        "time-keyed readings under per-device counts, first and last readings, and the earliest overall, "
+        "with the oldest fifth deleted oldest first: each delete retracts a group's current minimum",
+        BYTES,
+        ["CREATE TABLE readings (id BIGINT NOT NULL PRIMARY KEY, ts BIGINT NOT NULL, device INT NOT NULL, "
+         "v BIGINT NOT NULL)",
+         "CREATE VIEW v_dev AS SELECT device, COUNT(*) AS n, SUM(v) AS total FROM readings GROUP BY device",
+         "CREATE VIEW v_span AS SELECT device, MIN(ts) AS first, MAX(ts) AS last FROM readings GROUP BY device",
+         "CREATE VIEW v_first AS SELECT MIN(ts) AS first, COUNT(*) AS n FROM readings"],
+        readings, retire={"readings": 0.2}),
     Shape(
         "stream", "policy",
         "a stream, which holds no row of its own, under two aggregates and a join to a table: every view "

@@ -37,6 +37,11 @@ def workers_of(phase):
     return sorted(g for g in phase["groups"] if g.startswith("worker"))
 
 
+def worker_instr(phase):
+    """Each worker's user instructions, the workers that counted them."""
+    return [g["instr_user"] for w in workers_of(phase) if "instr_user" in (g := phase["groups"][w])]
+
+
 def server(phase):
     return fold(phase["groups"], ["master", *workers_of(phase)])
 
@@ -53,6 +58,10 @@ def metrics(phase):
             out[name] = value / rows if per_row else value
 
     put("server_instr_per_row", srv.get("instr_user"), True)
+    # The sum over workers cannot see work shifted onto one of them; the
+    # busiest worker's own count, which the others wait for, does.
+    if len(workers := worker_instr(phase)) > 1:
+        put("busiest_worker_instr_per_row", max(workers), True)
     put("server_kernel_instr_per_row", srv.get("instr_kernel"), True)
     put("client_instr_per_row", phase.get("client_instr_exact", cli.get("instr_user")), True)
     put("server_cpu_s", srv.get("run_ns", 0) / 1e9)
@@ -95,7 +104,7 @@ def print_phase(phase):
               f"{_n(g.get('io_uring_enters'), 7)} {_n(g.get('syncs'), 6)} {_n(g.get('voluntary_switches'), 8)} "
               f"{_n(g.get('minor_faults'), 7)} {_n(g.get('write_bytes'), 11)} "
               f"{_n(g.get('rss_peak_bytes', 0) / 2**20 or None, 7, 1)}")
-    per_worker = [phase["groups"][g].get("instr_user", 0) for g in w]
+    per_worker = worker_instr(phase)
     if len(per_worker) > 1 and sum(per_worker):
         print(f"    busiest worker ran {max(per_worker) / sum(per_worker):.0%} of the workers' instructions, "
               f"the idlest {min(per_worker) / sum(per_worker):.0%}")
@@ -175,7 +184,8 @@ def print_disk(records):
 # fraction of a percent, a duration does not, and the bytes a process is charged
 # for follow the page cache's own timing.
 NOISE = {
-    "server_instr_per_row": 0.01, "client_instr_per_row": 0.10, "server_kernel_instr_per_row": 0.30,
+    "server_instr_per_row": 0.01, "busiest_worker_instr_per_row": 0.01, "client_instr_per_row": 0.10,
+    "server_kernel_instr_per_row": 0.30,
     "server_syscalls": 0.15, "server_syncs": 0.0, "server_switches": 0.25, "written_bytes_per_row": 0.35,
     "server_rss_peak_mb": 0.10, "server_cpu_s": 0.40, "wall_s": 0.50, "ready_s": 0.50,
 }

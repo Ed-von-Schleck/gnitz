@@ -29,14 +29,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WIDTHS = {"U8": 1, "I8": 1, "U16": 2, "I16": 2, "U32": 4, "I32": 4, "F32": 4, "U64": 8, "I64": 8,
           "F64": 8, "U128": 16, "UUID": 16, "I128": 16, "DATE": 4, "TIMESTAMP": 8, "DECIMAL": 8}
 
-# What each storage regime sets on the server. `l0` leaves the RAM tier, which a
-# store of a benchmark's size never fills; `compacted` shrinks it so the same
-# rows spill, fold and compact; `checkpointed` shrinks the SAL's checkpoint
-# threshold instead, so the run is cut by checkpoints.
+@dataclass(frozen=True)
+class Regime:
+    env: dict = field(default_factory=dict)     # what it sets on the server
+    scale: int = 1                              # rows loaded per row a run asks for
+
+
+# `l0` leaves the RAM tier, which a store of a benchmark's size never fills;
+# `compacted` shrinks it so the same rows spill, fold and compact; `checkpointed`
+# shrinks the SAL's checkpoint threshold instead, so the run is cut by
+# checkpoints. `large` sets nothing and loads ten times the rows, so the stores
+# outgrow the RAM tier the server ships with; a per-row cost that grows with the
+# state it reads shows only there, and a shrunk tier does not reproduce it.
 REGIMES = {
-    "l0": {},
-    "compacted": {"GNITZ_RAM_TIER_BYTES": str(1 << 20)},
-    "checkpointed": {"GNITZ_CHECKPOINT_BYTES": str(256 << 10)},
+    "l0": Regime(),
+    "compacted": Regime({"GNITZ_RAM_TIER_BYTES": str(1 << 20)}),
+    "checkpointed": Regime({"GNITZ_CHECKPOINT_BYTES": str(256 << 10)}),
+    "large": Regime(scale=10),
 }
 
 SAL_BYTES = 256 << 20
@@ -72,11 +81,13 @@ class Table:
 
 @dataclass
 class Op:
-    """One prepared push: built before the phase that sends it, so the phase is
-    charged the push and not the row generator."""
+    """One prepared push, or with `delete` a delete of the keys `batch`: built
+    before the phase that sends it, so the phase is charged the request and
+    not the row generator."""
     table: Table
     batch: object
     rows: int
+    delete: bool = False
 
 
 def _client(sock, barrier, queue, fn, args):
@@ -153,7 +164,11 @@ class Phase:
 
     def push(self, op, conn=None):
         """`op` on `conn`, the run's own connection by default."""
-        self.timed("push", (conn or self.run.conn).push, op.table.tid, op.batch, rows=op.rows)
+        conn, t = conn or self.run.conn, op.table
+        if op.delete:
+            self.timed("delete", conn.delete, t.tid, t.schema, op.batch, rows=op.rows)
+        else:
+            self.timed("push", conn.push, t.tid, op.batch, rows=op.rows)
 
     def replay(self, ops, read=None, conn=None):
         """Send `ops` in order; with `read`, read that view after each."""
@@ -228,7 +243,8 @@ class Phase:
 class Run:
     def __init__(self, scenario, params: Params, out_dir: Path):
         self.scenario, self.params = scenario, params
-        self.rows = scenario.fixed_rows or params.rows
+        regime = REGIMES[params.regime]
+        self.rows = scenario.fixed_rows or params.rows * regime.scale
         self.phases = []
         self.tables = {}
         self.views = {}            # name -> body, in the order created
@@ -242,7 +258,7 @@ class Run:
         env = self.server.extra_env
         env["GNITZ_SAL_BYTES"] = str(SAL_BYTES)
         env["GNITZ_CPU_AFFINITY"] = "1"
-        env.update(REGIMES[params.regime])
+        env.update(regime.env)
         env.update(params.env)
         self.layers = profile.Layers(params.layers, out_dir)
 
@@ -308,6 +324,13 @@ class Run:
         if held:
             out.append(Op(t, batch, held))
         return out
+
+    def delete_ops(self, table, keys, batch_rows):
+        """`keys` (a column's values, or tuples for a compound key) as prepared
+        deletes of `batch_rows` each."""
+        t = self.tables[table]
+        return [Op(t, part, len(part), delete=True)
+                for part in (keys[i:i + batch_rows] for i in range(0, len(keys), batch_rows))]
 
     def base_rows(self):
         """The rows the base tables hold."""

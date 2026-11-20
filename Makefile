@@ -14,7 +14,7 @@ WORKERS    ?= 1                              # e2e and the benchmarks override t
 ROWS       ?=                                # bench: rows a scenario loads
 SCENARIO   ?=                                # bench: comma-separated scenario names
 FAMILY     ?=                                # bench: comma-separated scenario families
-REGIME     ?=                                # bench: comma-separated regimes (l0, compacted, checkpointed), or every
+REGIME     ?=                                # bench: comma-separated regimes (l0, compacted, checkpointed, large), or every
 RAM_TIER   ?=                                # bench: GNITZ_RAM_TIER_BYTES of the server
 PROFILE    ?=                                # bench-profile: comma-separated layers (default: all of them)
 LABEL      ?=                                # bench: a label in the results directory's name
@@ -288,8 +288,8 @@ bench: WORKERS = 4
 bench: release-server pyext-release ## Whole-program benchmark: every scenario, 4 workers (knobs: SCENARIO, FAMILY, REGIME, ROWS, WORKERS, LABEL)
 	$(BENCH_RUN) $(if $(REGIME),--regime=$(REGIME))
 
-bench-full: WORKERS = 1,4
-bench-full: release-server pyext-release ## Every scenario under each of its storage regimes, at 1 and at 4 workers
+bench-full: WORKERS = 1,4,8
+bench-full: release-server pyext-release ## Every scenario under each of its storage regimes, at 1, 4 and 8 workers
 	$(BENCH_RUN) --regime=$(or $(REGIME),every)
 
 # Bytes, not time: the same scenarios, read for what the data directory holds

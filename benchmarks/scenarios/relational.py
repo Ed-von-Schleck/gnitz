@@ -158,7 +158,7 @@ FANOUT = Shape(
     "fanout", "join",
     "six views and an index that each read an order table by its customer: three joins, a join under an "
     "aggregate, a MIN/MAX and a SUM per customer",
-    BYTES,
+    (*BYTES, "large"),
     [CUSTOMERS, ORDERS, "CREATE INDEX ON orders(customer_id)", *FANOUT_VIEWS], orders(1))
 
 

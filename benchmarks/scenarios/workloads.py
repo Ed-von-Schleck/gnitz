@@ -16,13 +16,8 @@ from gnitz import aio
 
 from harness.run import bag, time_calls, time_pushes
 
-from .base import INGEST_BATCH, LOAD_BATCH, Fact, Scenario, Shape, Zipf, scatter
+from .base import INGEST_BATCH, LOAD_BATCH, Fact, Scenario, Shape, Zipf, ops_for, scatter
 from .relational import FANOUT, FLOAT, NATIONS, SHIPMODES
-
-
-def ops_for(run, per=1000, least=200):
-    """How many single operations a phase runs."""
-    return max(run.rows // per, least)
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +672,7 @@ class Follow(Scenario):
     same pushes with the follower on a connection of its own."""
 
     def run(self, run):
-        n = max(run.rows // 100, 1000)
+        n = ops_for(run, 100, 1000)
         run.ddl("CREATE TABLE w (pk BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL)",
                 "CREATE VIEW v_kinds WITH (delta = '16 MB') AS SELECT kind, COUNT(*) AS n FROM w GROUP BY kind")
         lo = 0
@@ -721,8 +716,9 @@ def tpch(n, rng):
 TPCH = Shape(
     "tpch", "analytics",
     "TPC-H's schema under five of its queries as views — pricing summary, shipping priority, revenue forecast, "
-    "shipping modes, order priority — with Zipfian customers and orders",
-    ("l0", "compacted"),
+    "shipping modes, order priority — with Zipfian customers and orders, and the oldest tenth of the orders and "
+    "the oldest tenth of the line items deleted oldest first",
+    ("l0", "compacted", "large"),
     ["CREATE TABLE region (r_key BIGINT NOT NULL PRIMARY KEY, r_name TEXT NOT NULL)",
      "CREATE TABLE nation (n_key BIGINT NOT NULL PRIMARY KEY, n_name TEXT NOT NULL, n_region BIGINT NOT NULL)",
      "CREATE TABLE customer (c_key BIGINT NOT NULL PRIMARY KEY, c_name TEXT NOT NULL, c_nation BIGINT NOT NULL, "
@@ -754,7 +750,7 @@ TPCH = Shape(
      "CREATE VIEW v_q4_orders AS SELECT orders.o_key AS o_key, orders.o_status AS o_status FROM orders "
      "WHERE EXISTS (SELECT 1 FROM lineitem WHERE lineitem.l_order = orders.o_key)",
      "CREATE VIEW v_q4 AS SELECT o_status, COUNT(*) AS order_count FROM v_q4_orders GROUP BY o_status"],
-    tpch, read="v_q1", unverified={v: FLOAT for v in ("v_q1", "v_q3", "v_q6")})
+    tpch, retire={"orders": 0.1, "lineitem": 0.1}, read="v_q1", unverified={v: FLOAT for v in ("v_q1", "v_q3", "v_q6")})
 
 
 SCENARIOS = [
