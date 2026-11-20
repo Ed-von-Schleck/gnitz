@@ -69,6 +69,7 @@ pub(super) enum ReadCase {
 }
 
 /// The relation a `ReadSpec` names, and what ships.
+#[derive(Clone)]
 pub(super) struct SpecRead {
     /// As the query names it.
     pub(super) name: String,
@@ -135,6 +136,21 @@ impl ReadPlan {
         match &self.case {
             ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => Some(read),
             ReadCase::Constant { .. } => None,
+        }
+    }
+
+    /// A copy of a rows read; `None` for the other cases, whose client finish
+    /// is built once per plan.
+    pub(crate) fn rows_copy(&self) -> Option<ReadPlan> {
+        match &self.case {
+            ReadCase::Rows { read, copied } => Some(ReadPlan {
+                case: ReadCase::Rows {
+                    read: read.clone(),
+                    copied: copied.clone(),
+                },
+                cut: self.cut.clone(),
+            }),
+            ReadCase::Fold { .. } | ReadCase::Constant { .. } => None,
         }
     }
 

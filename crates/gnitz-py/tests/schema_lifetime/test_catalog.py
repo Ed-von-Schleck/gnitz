@@ -8,7 +8,7 @@ The verdicts the catalog refuses live in `admissibility/test_errors.py`.
 import gnitz
 import pytest
 from _catalog import family
-from _read import bag
+from _read import bag, rows
 from _schemas import KV, kv
 
 
@@ -70,3 +70,34 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):
     with pytest.raises(gnitz.GnitzNotFoundError):
         client.scan(tid, KV)
 
+
+
+def test_a_select_run_again_reads_a_relation_another_connection_replaced(client, peer):
+    """The same SELECT text, run often enough on one connection to be kept,
+    answers from the relation its name names now: another connection dropping
+    it and creating one of another shape under that name, or dropping it for
+    good, is what the next run reads."""
+    other = peer()
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL); "
+        "INSERT INTO t VALUES (1, 10), (2, 20); "
+        "CREATE VIEW v AS SELECT id, a FROM t WHERE a > 10")
+    for _ in range(3):
+        assert bag(rows(client, "SELECT * FROM t"), "id", "a") == {(1, 10): 1, (2, 20): 1}
+        assert bag(rows(client, "SELECT * FROM v LIMIT 5"), "id", "a") == {(2, 20): 1}
+
+    other.execute_sql(
+        "DROP VIEW v; DROP TABLE t; "
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, a BIGINT NOT NULL); "
+        "INSERT INTO t VALUES (7, 'x', 70); "
+        "CREATE VIEW v AS SELECT id, s FROM t")
+    for _ in range(3):
+        assert bag(rows(client, "SELECT * FROM t"), "id", "s", "a") == {(7, "x", 70): 1}
+        assert bag(rows(client, "SELECT * FROM v LIMIT 5"), "id", "s") == {(7, "x"): 1}
+
+    other.execute_sql("DROP VIEW v; DROP TABLE t")
+    for _ in range(2):
+        with pytest.raises(gnitz.GnitzNotFoundError, match="relation 't' not found"):
+            client.execute_sql("SELECT * FROM t")
+        with pytest.raises(gnitz.GnitzNotFoundError, match="relation 'v' not found"):
+            client.execute_sql("SELECT * FROM v LIMIT 5")

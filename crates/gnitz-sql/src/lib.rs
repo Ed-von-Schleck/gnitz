@@ -24,6 +24,7 @@ mod literal;
 mod names;
 mod project;
 mod rules;
+mod select_cache;
 mod source;
 #[cfg(test)]
 mod suites;
@@ -49,6 +50,7 @@ pub use sqlparser;
 pub use types::type_names;
 
 use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subscription};
+use select_cache::Script;
 use sqlparser::ast::Statement;
 use std::sync::Arc;
 
@@ -80,8 +82,20 @@ pub enum SqlResult {
 /// Parse `sql` and run each statement, one `SqlResult` per statement. A `SELECT`
 /// (and its `EXPLAIN`) over a relation the client's local copy holds is answered
 /// off that copy; everything else runs on the connection.
+///
+/// A script of one `SELECT` run again on its thread is parsed no more. A rows
+/// read also keeps its plan, made again only when the session's schema name
+/// changes or a relation it reads resolves to another descriptor; any other
+/// read is planned on every run.
 pub async fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
-    let stmts = source::split_statements(sql)?;
+    let stmts = match select_cache::parse(sql)? {
+        Script::Select(select) => {
+            return Ok(vec![
+                dispatch::execute_select(client, schema_name, |cat| select.plan(cat)).await?,
+            ]);
+        }
+        Script::Statements(stmts) => stmts,
+    };
     let mut results = Vec::with_capacity(stmts.len());
     // One begun by an earlier call is the caller's to end.
     let mut began_here = false;

@@ -3,6 +3,7 @@
 
 use crate::SqlResult;
 use crate::catalog::Catalog;
+use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
 use crate::error::reject_if;
 use crate::source::StatementText;
@@ -158,6 +159,24 @@ async fn planned_kept<P>(
     }
 }
 
+/// Plan a `SELECT` with `plan` and run it: what [`execute_statement`] does
+/// with one.
+pub(crate) async fn execute_select(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    plan: impl Fn(&dyn Catalog) -> Result<ReadPlan, GnitzSqlError>,
+) -> Result<SqlResult, GnitzSqlError> {
+    planned_kept(
+        client,
+        schema_name,
+        Descriptors::MIRRORED_OR_KEPT,
+        plan,
+        |plan| !plan.answers_from_schema(),
+        dml::execute_select,
+    )
+    .await
+}
+
 /// Route one statement, each planned from the [`Descriptors`] it admits: an
 /// EXPLAIN sends no request to check a kept one.
 pub(crate) async fn execute_statement(
@@ -178,17 +197,7 @@ pub(crate) async fn execute_statement(
             .0?;
             Ok(dml::execute_explain(client, &plan))
         }
-        Statement::Query(query) => {
-            planned_kept(
-                client,
-                schema_name,
-                Descriptors::MIRRORED_OR_KEPT,
-                |cat| dml::plan_read(query, cat),
-                |plan| !plan.answers_from_schema(),
-                dml::execute_select,
-            )
-            .await
-        }
+        Statement::Query(query) => execute_select(client, schema_name, |cat| dml::plan_read(query, cat)).await,
         // Transaction control is a pure client-state-machine transition, so the
         // arm is the whole consumer: `transaction already open` and `no
         // transaction open` come from the `client.txn_*` calls below.

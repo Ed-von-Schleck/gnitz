@@ -13,6 +13,7 @@ use crate::error::GnitzSqlError;
 /// ORDER BY / OFFSET / LIMIT over a finished result, resolved against its schema at plan
 /// time. The schema is the result's, carried for the reply; [`ResultCut::apply`] reads
 /// only the keys and the slice.
+#[derive(Clone)]
 pub(crate) struct ResultCut {
     schema: Arc<Schema>,
     /// The written keys, hidden appended ones included; under a cut, extended to a total

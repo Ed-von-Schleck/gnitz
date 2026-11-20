@@ -16,7 +16,5 @@ mod write;
 #[cfg(test)]
 pub(crate) use explain::explain_lines;
 pub(crate) use explain::{execute_explain, explained_query};
-#[cfg(test)]
-pub(crate) use select::ReadPlan;
-pub(crate) use select::{execute_select, plan_read};
+pub(crate) use select::{ReadPlan, execute_select, plan_read};
 pub(crate) use write::{execute_write, plan_write};

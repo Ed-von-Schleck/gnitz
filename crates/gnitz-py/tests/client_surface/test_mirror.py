@@ -92,6 +92,38 @@ def test_what_the_copy_does_not_hold_is_read_upstream(client, mirror):
     agree(mirror, client, "SELECT * FROM f", local=False)
 
 
+def test_a_select_run_again_is_answered_where_its_view_is_held_now(client, mirror):
+    """The same SELECT text run again and again on the mirroring client is
+    answered off the copy while the view is mirrored, and upstream from the
+    first run after it is forgotten, each run weight-exact. Its runs alternated
+    with a client that mirrors nothing are answered the same way."""
+    queries = ("SELECT * FROM f", "SELECT id, v FROM f WHERE v > 30 LIMIT 1000")
+    fed_view(client)
+    vid = mirror.mirror_view("f").view_id
+    churn(client, 1, 60)
+    mirror.sync()
+    for q in queries:
+        for _ in range(4):
+            before = mirror.requests_sent
+            got = bag(rows(mirror, q))
+            assert mirror.requests_sent == before, f"{q}: a run went upstream"
+        assert got and got == bag(rows(client, q))
+        for _ in range(3):
+            agree(mirror, client, q)
+        for _ in range(3):
+            rows(mirror, q)
+
+    mirror.forget_view(vid)
+    for q in queries:
+        for _ in range(3):
+            before = mirror.requests_sent
+            got = bag(rows(mirror, q))
+            assert mirror.requests_sent > before, f"{q}: answered off the forgotten copy"
+        assert got and got == bag(rows(client, q))
+        for _ in range(3):
+            agree(mirror, client, q, local=False)
+
+
 def test_a_point_read_is_answered_off_the_copy(client, mirror):
     """`seek` and `seek_by_index` over a mirrored view send nothing, carry no
     LSN, and agree with the same read through a client that mirrors nothing."""

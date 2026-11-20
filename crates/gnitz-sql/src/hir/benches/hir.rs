@@ -209,7 +209,8 @@ fn median(counter: &gnitz_foundation::perf::Counter, n: usize, mut f: impl FnMut
 /// Instructions to plan one statement, per case: a view body through
 /// `bind_and_lower`, an ad-hoc SELECT through the client's whole read plan, each from its parsed
 /// AST, the result dropped inside the measurement. The parse is measured alongside
-/// for scale and is not part of the plan.
+/// for scale and is not part of the plan. An ad-hoc SELECT is also taken from the
+/// thread's select cache, its text and its kept plan, in place of both.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hir_plan_bench() {
@@ -248,8 +249,20 @@ fn hir_plan_bench() {
         let instr = median(&counter, RUNS, || {
             std::hint::black_box(plan());
         });
+        let cached = || match crate::select_cache::parse(sql).unwrap() {
+            crate::select_cache::Script::Select(select) => select.plan(&cat).unwrap(),
+            crate::select_cache::Script::Statements(_) => panic!("{name}: not kept"),
+        };
+        // Its first run is noted, its second kept.
+        for _ in 0..2 {
+            let _ = crate::select_cache::parse(sql).unwrap();
+        }
+        cached();
+        let cached = median(&counter, RUNS, || {
+            std::hint::black_box(cached());
+        });
         println!(
-            "hir_plan_bench adhoc {name:<26} {instr:>9} instr  (parse {:>8})",
+            "hir_plan_bench adhoc {name:<26} {instr:>9} instr  (parse {:>8}; cached {cached:>6})",
             parse_cost(sql)
         );
     }
