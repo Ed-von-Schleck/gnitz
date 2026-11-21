@@ -710,6 +710,12 @@ impl JoinClass {
     }
 }
 
+/// Reject a float among `keys`, columns of `input`, as a hashed key of clause `role`.
+fn reject_float_group(input: &RelExpr, keys: &[ColId], role: &str) -> Result<(), GnitzSqlError> {
+    let cols = input.cols();
+    crate::rules::reject_float_keys(keys.iter().map(|&k| &hircol_of(&cols, k).def), role)
+}
+
 /// `key`, a set of `from`'s columns, as the columns at the same positions of `to`.
 fn rename_key(key: Vec<ColId>, from: &[HirCol], to: &[HirCol]) -> Option<Vec<ColId>> {
     key.iter()
@@ -751,13 +757,17 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
+    /// A reduce of `input` grouped by `group_cols`. `role` names the clause the
+    /// keys were written in, in the refusal of a float key.
     pub(crate) fn reduce(
         input: Rc<RelExpr>,
         group_cols: Vec<ColId>,
         aggs: Vec<AggCol>,
         kind: ReduceKind,
-    ) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Reduce { input, group_cols, aggs, kind })
+        role: &str,
+    ) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        reject_float_group(&input, &group_cols, role)?;
+        Ok(Rc::new(RelExpr::Reduce { input, group_cols, aggs, kind }))
     }
 
     /// A DISTINCT over every column of `input`, or `input` itself when it is
@@ -772,19 +782,21 @@ impl RelExpr {
     }
 
     /// A top-N over `input`. `slots.keep ≥ 1`, and every key names an input column.
+    /// A partition is a window's PARTITION BY.
     pub(crate) fn top_n(
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
         order: Vec<OrderCol>,
         slots: WeightSlots,
-    ) -> Rc<RelExpr> {
+    ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         debug_assert!(slots.keep >= 1, "a top-N selects at least one slot");
-        Rc::new(RelExpr::Ordered {
+        reject_float_group(&input, &partition, "window PARTITION BY")?;
+        Ok(Rc::new(RelExpr::Ordered {
             input,
             partition,
             order,
             op: OrderedOp::TopN(slots),
-        })
+        }))
     }
 
     /// The running values of `input` over `partition` in `order`. Every key
@@ -796,14 +808,15 @@ impl RelExpr {
         aggs: Vec<AggCol>,
         rank: Option<HirCol>,
         dense_rank: Option<HirCol>,
-    ) -> Rc<RelExpr> {
+    ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         debug_assert!(!order.is_empty() && (!aggs.is_empty() || rank.is_some() || dense_rank.is_some()));
-        Rc::new(RelExpr::Ordered {
+        reject_float_group(&input, &partition, "window PARTITION BY")?;
+        Ok(Rc::new(RelExpr::Ordered {
             input,
             partition,
             order,
             op: OrderedOp::Window { aggs, rank, dense_rank },
-        })
+        }))
     }
 
     /// A fresh read of `input` under `defs`, one per input column in order, each

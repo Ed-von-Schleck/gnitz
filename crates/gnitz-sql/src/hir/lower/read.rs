@@ -93,9 +93,15 @@ impl Linear<'_> {
         match self.base.as_ref() {
             RelExpr::Get { desc, cols } => Ok((desc, cols)),
             // What the CTE or derived table derives under its grouping is named first.
-            RelExpr::Reduce { input, .. } | RelExpr::Distinct { input } => {
+            RelExpr::Reduce { input, .. } => {
                 linear(input)?;
                 Err(derivation("an aggregate over a grouped CTE or derived table"))
+            }
+            // A DISTINCT CTE or derived table, or a DISTINCT aggregate's set: the
+            // fold is one stateless pass over one scan.
+            RelExpr::Distinct { input } => {
+                linear(input)?;
+                Err(derivation("a grouping over a DISTINCT set"))
             }
             // A DISTINCT over no relation is a set already, so only an aggregate meets it.
             _ => Err(GnitzSqlError::rejected(

@@ -77,6 +77,13 @@ struct InnerResolved<'e> {
     correlation: Vec<HirExpr>,
 }
 
+impl InnerResolved<'_> {
+    /// The one plain column the subquery selects; every rejection is `err`.
+    fn single_col(&self, err: &str) -> Result<ColId, GnitzSqlError> {
+        bind_plain_col(single_projection_expr(self.inner_select, err)?, &self.inner, err)
+    }
+}
+
 /// Resolve a subquery's inner relation and split its WHERE into inner-local vs
 /// correlation conjuncts. The inner FROM must be one plain relation (no JOINs, no
 /// derived table, no GROUP BY / HAVING / DISTINCT); a conjunct referencing only
@@ -173,8 +180,7 @@ fn bind_exists_sub(
     in_operand: Option<&Expr>,
     negated: bool,
 ) -> Result<HirExpr, GnitzSqlError> {
-    let ir = resolve_inner(cx, subquery)?;
-    let mut correlation = ir.correlation;
+    let mut ir = resolve_inner(cx, subquery)?;
     let mut nullable = false;
     if in_operand.is_none() && body_is_grouped(ir.inner_select) {
         // An ungrouped aggregate yields one row over any input, so the subquery
@@ -195,24 +201,17 @@ fn bind_exists_sub(
             cx.outer,
             "IN (SELECT …): the outer operand must be a plain column",
         )?;
-        let inner_proj = single_projection_expr(
-            ir.inner_select,
-            "IN (SELECT …): the subquery must select exactly one plain column",
-        )?;
-        let inner = bind_plain_col(
-            inner_proj,
-            &ir.inner,
-            "IN (SELECT …): the subquery must select exactly one plain column",
-        )?;
+        let inner = ir.single_col("IN (SELECT …): the subquery must select exactly one plain column")?;
         nullable = hircol_of(&cx.outer.combined, outer).def.is_nullable
             || hircol_of(&ir.inner.combined, inner).def.is_nullable;
-        correlation.push(BExpr::bin(BExpr::ColRef(outer), BinOp::Eq, BExpr::ColRef(inner)));
+        ir.correlation
+            .push(BExpr::bin(BExpr::ColRef(outer), BinOp::Eq, BExpr::ColRef(inner)));
     }
     let subref = SubqueryRef {
         id: cx.cx.ids.next(),
         kind: SubqueryKind::Exists { nullable },
         rel: ir.rel,
-        correlation,
+        correlation: ir.correlation,
     };
     Ok(maybe_negate(cx.record(subref), negated))
 }
@@ -222,10 +221,21 @@ fn bind_exists_sub(
 fn bind_scalar_sub(cx: SubCtx<'_>, q: &Query) -> Result<HirExpr, GnitzSqlError> {
     let ir = resolve_inner(cx, q)?;
     let err = "a scalar subquery must be a single aggregate over its correlation group";
-    let proj_expr = single_projection_expr(ir.inner_select, err)?;
-    let (func, arg) = classify_scalar_agg(proj_expr, &ir.inner, err)?;
-    let subref = scalar_leaf(cx, ir, func, arg)?;
-    Ok(cx.record(subref))
+    let f = match peel_nested(single_projection_expr(ir.inner_select, err)?) {
+        Expr::Function(f) if is_agg_call(f) => f,
+        _ => return Err(GnitzSqlError::rejected(err)),
+    };
+    let (func, arg_expr) = classify_agg_call(f)?;
+    let arg = (arg_expr.reject_distinct("a scalar subquery aggregate")?)
+        .map(|a| {
+            bind_plain_col(
+                a,
+                &ir.inner,
+                "a scalar subquery aggregate must be over a plain column or `*`",
+            )
+        })
+        .transpose()?;
+    Ok(cx.record(scalar_leaf(cx, ir, func, arg)?))
 }
 
 /// Bind an ANY/ALL quantified comparison. `= ANY`/`<> ALL` route to IN/NOT IN;
@@ -272,9 +282,7 @@ fn bind_quantifier_sub(
         AggFunc::Min
     };
     let ir = resolve_inner(cx, q)?;
-    let err = "a range ANY/ALL subquery must select a single non-nullable column";
-    let proj_expr = single_projection_expr(ir.inner_select, err)?;
-    let inner_col = bind_plain_col(proj_expr, &ir.inner, err)?;
+    let inner_col = ir.single_col("a range ANY/ALL subquery must select a single non-nullable column")?;
     if hircol_of(&ir.inner.combined, inner_col).def.is_nullable {
         return Err(GnitzSqlError::rejected(
             "a range ANY/ALL subquery's column must be NOT NULL — a NULL in the set makes ANY/ALL \
@@ -300,34 +308,21 @@ fn bind_plain_col(e: &Expr, scope: &JoinScope, err: &str) -> Result<ColId, Gnitz
         .ok_or_else(|| GnitzSqlError::rejected(err))
 }
 
-/// Classify a scalar subquery's single-aggregate projection into `(func, arg)`.
-fn classify_scalar_agg(e: &Expr, inner: &JoinScope, non_agg: &str) -> Result<(AggFunc, Option<ColId>), GnitzSqlError> {
-    let Expr::Function(f) = peel_nested(e) else {
-        return Err(GnitzSqlError::rejected(non_agg));
-    };
-    if !is_agg_call(f) {
-        return Err(GnitzSqlError::rejected(non_agg));
-    }
-    let (func, arg_expr) = classify_agg_call(f)?;
-    let arg = match arg_expr.reject_distinct("a scalar subquery aggregate")? {
-        Some(a) => Some(bind_plain_col(
-            a,
-            inner,
-            "a scalar subquery aggregate must be over a plain column or `*`",
-        )?),
-        None => None,
-    };
-    Ok((func, arg))
-}
-
-/// The `Reduce` group columns of a scalar/quantifier subquery: the inner-side
-/// `ColId` of each equality correlation conjunct. A range or non-equality
-/// correlation is rejected (aggregation needs an equality GROUP BY key).
-fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]) -> Result<Vec<ColId>, GnitzSqlError> {
-    let mut cols = Vec::with_capacity(correlation.len());
-    for conj in correlation {
-        match cross_comparison(conj, outer, inner) {
-            Some((_, inner, BinOp::Eq)) => cols.push(inner.id),
+/// A scalar subquery: `func(arg)` reduced per correlation group, finalized as its
+/// column. The groups are the inner-side column of each equality correlation
+/// conjunct; any other correlation is rejected (aggregation needs an equality
+/// GROUP BY key).
+fn scalar_leaf(
+    cx: SubCtx<'_>,
+    ir: InnerResolved<'_>,
+    func: AggFunc,
+    arg: Option<ColId>,
+) -> Result<SubqueryRef, GnitzSqlError> {
+    let (ids, inner_cols) = (cx.cx.ids, &ir.inner.combined);
+    let mut group_cols = Vec::with_capacity(ir.correlation.len());
+    for conj in &ir.correlation {
+        match cross_comparison(conj, &cx.outer.combined, inner_cols) {
+            Some((_, inner, BinOp::Eq)) => group_cols.push(inner.id),
             Some((_, _, op)) if op.as_range_rel().is_some() => {
                 return Err(GnitzSqlError::rejected(
                     "a scalar/quantifier subquery cannot use a range correlation (only equality \
@@ -342,27 +337,15 @@ fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]
             }
         }
     }
-    Ok(cols)
-}
-
-/// A scalar subquery: `func(arg)` reduced per correlation group, finalized as its
-/// column.
-fn scalar_leaf(
-    cx: SubCtx<'_>,
-    ir: InnerResolved<'_>,
-    func: AggFunc,
-    arg: Option<ColId>,
-) -> Result<SubqueryRef, GnitzSqlError> {
-    let (ids, inner_cols) = (cx.cx.ids, &ir.inner.combined);
-    let group_cols = scalar_group_cols(&ir.correlation, &cx.outer.combined, inner_cols)?;
     let arg = arg.map_or(AggArg::Star, AggArg::All);
     let agg = HirAgg::new(ids, func, arg, inner_cols, group_cols.is_empty(), &[])?;
-    let ty = crate::agg::agg_view_type(func, agg.out.col.def.ty);
-    // A companion carries the null-ness; otherwise the raw column's own.
-    let nullable = agg.companion.is_some() || agg.out.col.def.is_nullable;
+    // Typed as a grouped body's item is: its finalize over the reduce's columns.
+    let fin = agg.finalize();
+    let raw: Vec<HirCol> = agg.cols().map(|c| c.col.clone()).collect();
+    let (ty, nullable) = fin.declared(&raw[..]);
     let value = HirCol::new(ids.next(), ColumnDef::new("_agg", ty, nullable).hidden());
     let mut items = ProjEntry::passthroughs(group_cols.iter().map(|&id| hircol_of(inner_cols, id).clone()));
-    items.push(ProjEntry { expr: agg.finalize(), out: value.clone() });
+    items.push(ProjEntry { expr: fin, out: value.clone() });
     Ok(SubqueryRef {
         id: value.id,
         kind: SubqueryKind::Scalar { ty, count: func == AggFunc::Count },
@@ -372,7 +355,8 @@ fn scalar_leaf(
                 group_cols,
                 HirAgg::physical(std::slice::from_ref(&agg)),
                 ReduceKind::Aggregate,
-            ),
+                "a scalar subquery correlation",
+            )?,
             items,
         ),
         correlation: ir.correlation,

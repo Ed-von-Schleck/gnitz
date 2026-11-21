@@ -20,21 +20,43 @@ pub(super) fn decorrelate(
     }
     let (preds, input) = split_filter(&source);
     let mut joins = Joins {
-        subs,
+        pending: subs.iter().collect(),
         cur: Rc::clone(input),
-        joined: Vec::new(),
     };
     let mut kept = Vec::new();
     for pred in preds {
-        if !joins.consume(pred)? {
-            kept.push(pred.clone());
+        // A bare WHERE conjunct reading an EXISTS/IN is a Semi/Anti join, and
+        // leaves the filter.
+        let (bare, negated) = peel_not(pred);
+        if let Some(s) = bare
+            .as_col()
+            .and_then(|id| joins.find(id))
+            .filter(|s| matches!(s.kind, SubqueryKind::Exists { .. }))
+        {
+            joins.join(
+                s,
+                JoinType::Exists(if negated { ExistsKind::Anti } else { ExistsKind::Semi }),
+            )?;
+            continue;
         }
+        kept.push(pred.clone());
     }
+    // Every other subquery read: EXISTS/IN as a Mark join, a scalar as INNER when
+    // uncorrelated — its reduce always publishes one row — else LEFT. A kept
+    // conjunct reading one stays a filter, which placement keys when it can.
     let mut counts = Vec::new();
-    for s in joins.unjoined_reads(kept.iter().chain(items.iter().map(|it| &it.expr))) {
-        if joins.join_read(s)? {
-            counts.push(s.id);
-        }
+    for s in joins.reads(kept.iter().chain(items.iter().map(|it| &it.expr))) {
+        let kind = match s.kind {
+            SubqueryKind::Exists { .. } => JoinType::Exists(ExistsKind::Mark(s.id)),
+            SubqueryKind::Scalar { .. } if s.correlation.is_empty() => JoinType::Inner,
+            SubqueryKind::Scalar { count, .. } => {
+                if count {
+                    counts.push(s.id);
+                }
+                JoinType::Left
+            }
+        };
+        joins.join(s, kind)?;
     }
     let kept = kept.into_iter().map(|e| zero_absent_counts(e, &counts)).collect();
     let items = items
@@ -47,80 +69,36 @@ pub(super) fn decorrelate(
     Ok(RelExpr::project(RelExpr::filter(joins.cur, kept)?, items))
 }
 
-/// The relation the subqueries are joined onto, and which of them are.
+/// The relation the subqueries are joined onto, and those not joined yet.
 struct Joins<'s> {
-    subs: &'s [SubqueryRef],
+    pending: Vec<&'s SubqueryRef>,
     cur: Rc<RelExpr>,
-    joined: Vec<ColId>,
 }
 
 impl<'s> Joins<'s> {
-    fn unjoined(&self, id: ColId) -> Option<&'s SubqueryRef> {
-        self.subs.iter().find(|s| s.id == id && !self.joined.contains(&id))
+    fn find(&self, id: ColId) -> Option<&'s SubqueryRef> {
+        self.pending.iter().copied().find(|s| s.id == id)
     }
 
     /// Join `s` in as `kind` on its correlation.
     fn join(&mut self, s: &SubqueryRef, kind: JoinType) -> Result<(), GnitzSqlError> {
         reject_nullable_in(kind, s)?;
         self.cur = RelExpr::join(Rc::clone(&self.cur), Rc::clone(&s.rel), kind, s.correlation.clone())?;
-        self.joined.push(s.id);
+        self.pending.retain(|p| p.id != s.id);
         Ok(())
     }
 
-    /// Join in the EXISTS/IN a bare WHERE conjunct reads as a Semi/Anti join;
-    /// whether it did.
-    fn consume(&mut self, pred: &HirExpr) -> Result<bool, GnitzSqlError> {
-        let (bare, negated) = peel_not(pred);
-        if let Some(s) = bare
-            .as_col()
-            .and_then(|id| self.unjoined(id))
-            .filter(|s| matches!(s.kind, SubqueryKind::Exists { .. }))
-        {
-            let kind = JoinType::Exists(if negated { ExistsKind::Anti } else { ExistsKind::Semi });
-            self.join(s, kind)?;
-            return Ok(true);
-        }
-        // An uncorrelated scalar joins where its conjunct stands; the conjunct
-        // stays a filter, which placement keys when it can.
-        for s in self.unjoined_reads(std::iter::once(pred)) {
-            if matches!(s.kind, SubqueryKind::Scalar { .. }) && s.correlation.is_empty() {
-                self.join(s, JoinType::Inner)?;
-            }
-        }
-        Ok(false)
-    }
-
-    /// The unjoined subqueries `exprs` read, in the order they read them.
-    fn unjoined_reads<'e>(&self, exprs: impl Iterator<Item = &'e HirExpr>) -> Vec<&'s SubqueryRef> {
+    /// The pending subqueries `exprs` read, in the order they read them.
+    fn reads<'e>(&self, exprs: impl Iterator<Item = &'e HirExpr>) -> Vec<&'s SubqueryRef> {
         let mut read: Vec<&'s SubqueryRef> = Vec::new();
         for e in exprs {
             e.for_each_ref(&mut |id| {
-                if let Some(s) = self.unjoined(*id).filter(|s| !read.iter().any(|r| r.id == s.id)) {
+                if let Some(s) = self.find(*id).filter(|s| !read.iter().any(|r| r.id == s.id)) {
                     read.push(s);
                 }
             });
         }
         read
-    }
-
-    /// Join in a subquery a WHERE conjunct did not consume: EXISTS/IN as a Mark
-    /// join, a scalar as INNER when uncorrelated — its reduce always publishes one
-    /// row — else LEFT. Whether it is a COUNT joined as LEFT.
-    fn join_read(&mut self, s: &SubqueryRef) -> Result<bool, GnitzSqlError> {
-        match s.kind {
-            SubqueryKind::Exists { .. } => {
-                self.join(s, JoinType::Exists(ExistsKind::Mark(s.id)))?;
-                Ok(false)
-            }
-            SubqueryKind::Scalar { count, .. } => {
-                let kind = match s.correlation.is_empty() {
-                    true => JoinType::Inner,
-                    false => JoinType::Left,
-                };
-                self.join(s, kind)?;
-                Ok(count && kind == JoinType::Left)
-            }
-        }
     }
 }
 

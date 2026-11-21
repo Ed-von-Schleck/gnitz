@@ -91,6 +91,16 @@ pub(crate) fn reject_unhonored_select_clauses(
         context,
         "GROUP BY",
     )?;
+    // Only the plain list form groups: `ALL` and a trailing `WITH …` / `GROUPING
+    // SETS (…)` modifier produce multiple grouping keys per row, which no reduce
+    // shape models.
+    use sqlparser::ast::GroupByExpr;
+    reject_if(matches!(group_by, GroupByExpr::All(_)), context, "GROUP BY ALL")?;
+    reject_if(
+        matches!(group_by, GroupByExpr::Expressions(_, mods) if !mods.is_empty()),
+        context,
+        "GROUP BY WITH ROLLUP / WITH CUBE / WITH TOTALS / GROUPING SETS",
+    )?;
     reject_if(!grouping && having.is_some(), context, "HAVING")?;
     reject_if(top.is_some(), context, "TOP")?;
     reject_if(prewhere.is_some(), context, "PREWHERE")?;

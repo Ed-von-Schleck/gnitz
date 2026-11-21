@@ -9,7 +9,8 @@
 //! The body's shape-specific parts are this module's children: `join` folds the
 //! FROM clause's join steps, `subquery` binds the subqueries a linear body reads
 //! and `decorrelate` joins them in where the projection is built, `group` binds
-//! the GROUP BY / aggregate / HAVING suffix, `window` desugars window calls, and
+//! the GROUP BY / aggregate / HAVING suffix, `window` binds the SELECT list and
+//! desugars its window calls, and
 //! `wildcard` expands `SELECT *`.
 
 mod decorrelate;
@@ -48,7 +49,6 @@ use sqlparser::ast::{
     SetOperator, SetQuantifier, TableAliasColumnDef, TableFactor,
 };
 use sqlparser::tokenizer::Span;
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -264,7 +264,40 @@ pub(crate) struct BoundRef {
 /// declares: the CTE it names, else the catalog relation. Every relation a body
 /// names in FROM resolves here.
 fn resolve_table_ref(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr>, Vec<HirCol>), GnitzSqlError> {
-    let rel = resolve_relation(cx, tref)?;
+    let name = &tref.name;
+    // A CTE lives in no schema.
+    let rel = match (!name.is_qualified()).then(|| cx.ctes.get(name.name())).flatten() {
+        Some(cte) => RelExpr::alias(cx.ids, Rc::clone(&cte.rel), cte.defs.iter().cloned()),
+        None => {
+            let rel = cx.cat.probe_relation(name)?;
+            let want = match cx.surface {
+                Surface::Adhoc => ClassWant::Readable,
+                // The replaced view is retracted in the same bundle, taking the body's input with it.
+                Surface::View(ViewBody { stmt, replacing, .. }) if replacing == Some(rel.tid) => {
+                    return Err(GnitzSqlError::rejected(format!(
+                        "{stmt} '{name}' AS a query referencing the view itself is not supported"
+                    )));
+                }
+                Surface::View(_) => ClassWant::ViewSource,
+            };
+            require_class(&rel, name, want, cx.surface.stmt())?;
+            let columns = (cx.surface.is_view() && tref.columns.is_empty()).then(|| {
+                rel.schema
+                    .visible_columns()
+                    .map(|(_, c)| String::from(&*c.name))
+                    .collect()
+            });
+            cx.refs.borrow_mut().push(BoundRef {
+                tid: rel.tid,
+                name: name.to_string(),
+                name_span: tref.name_span,
+                alias_span: tref.alias_span,
+                alias: tref.alias.clone(),
+                columns,
+            });
+            RelExpr::get(cx.ids, rel)
+        }
+    };
     let mut cols = rel.cols().into_owned();
     if !tref.columns.is_empty() {
         apply_alias_columns(
@@ -276,133 +309,91 @@ fn resolve_table_ref(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr
     Ok((rel, cols))
 }
 
-/// The subtree a relation name reads: the CTE it names, else the catalog relation.
-fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let name = &tref.name;
-    // A CTE lives in no schema.
-    let cte = (!name.is_qualified()).then(|| cx.ctes.get(name.name())).flatten();
-    if let Some(cte) = cte {
-        return Ok(RelExpr::alias(cx.ids, Rc::clone(&cte.rel), cte.defs.iter().cloned()));
-    }
-    let rel = cx.cat.probe_relation(name)?;
-    let (want, op) = match cx.surface {
-        Surface::Adhoc => (ClassWant::Readable, cx.surface.stmt()),
-        // The replaced view is retracted in the same bundle, taking the body's input with it.
-        Surface::View(ViewBody { stmt, replacing, .. }) if replacing == Some(rel.tid) => {
-            return Err(GnitzSqlError::rejected(format!(
-                "{stmt} '{name}' AS a query referencing the view itself is not supported"
-            )));
-        }
-        Surface::View(v) => (ClassWant::ViewSource, v.stmt),
-    };
-    require_class(&rel, name, want, op)?;
-    let columns = (cx.surface.is_view() && tref.columns.is_empty()).then(|| {
-        rel.schema
-            .visible_columns()
-            .map(|(_, c)| String::from(&*c.name))
-            .collect()
-    });
-    cx.refs.borrow_mut().push(BoundRef {
-        tid: rel.tid,
-        name: name.to_string(),
-        name_span: tref.name_span,
-        alias_span: tref.alias_span,
-        alias: tref.alias.clone(),
-        columns,
-    });
-    Ok(RelExpr::get(cx.ids, rel))
-}
-
-/// A view body's `ORDER BY … LIMIT n [OFFSET m]` tail — the top-N the body
-/// maintains. Parsed once here so every body shape reads one rule: the two
-/// clauses need each other (a view is unordered, and a LIMIT with no order names
-/// no rows), and the counts are literals.
-struct QueryTail<'a> {
-    keys: Vec<OrderKey<'a>>,
-    slots: WeightSlots,
-}
-
-impl<'a> QueryTail<'a> {
-    fn parse(query: &'a Query, stmt: &str) -> Result<Option<Self>, GnitzSqlError> {
-        let keys = parse_order_by(query.order_by.as_ref())?;
-        let (limit, offset) = extract_limit_offset(query)?;
-        match (keys.is_empty(), limit, offset) {
-            (true, None, Some(_)) => Err(unsupported_clause(stmt, "OFFSET without ORDER BY … LIMIT")),
-            (true, None, None) => Ok(None),
-            (false, None, _) => Err(GnitzSqlError::rejected(format!(
-                "{stmt}: ORDER BY without LIMIT — a view holds an unordered set, so an order alone \
-                 maintains nothing; add LIMIT n to maintain the top n rows"
-            ))),
-            (true, Some(_), _) => Err(GnitzSqlError::rejected(format!(
-                "{stmt}: LIMIT without ORDER BY names no rows in particular; add ORDER BY"
-            ))),
-            (false, Some(0), _) => Err(GnitzSqlError::rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
-            (false, Some(limit), offset) => Ok(Some(QueryTail {
-                keys,
-                slots: WeightSlots {
-                    skip: offset.unwrap_or(0) as u64,
-                    keep: limit as u64,
-                },
-            })),
-        }
-    }
-
-    /// Wrap `rel` in the top-N this tail names, sorted on `order`.
-    fn wrap(&self, rel: Rc<RelExpr>, order: Vec<OrderCol>) -> Rc<RelExpr> {
-        RelExpr::top_n(rel, Vec::new(), order, self.slots)
-    }
-
-    /// [`Self::wrap`] over a body whose keys can only be its output columns — a
-    /// set operation or a parenthesized query, which has no scope of its own.
-    fn wrap_by_output(&self, rel: Rc<RelExpr>, stmt: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        let cols = rel.cols();
-        let order = (self.keys.iter())
-            .map(|key| {
-                let col = output_key(&key.target, cols.iter())?.map_err(|_| {
-                    GnitzSqlError::rejected(format!(
-                        "{stmt}: ORDER BY over a set operation names an output column or position"
-                    ))
-                })?;
-                Ok(OrderCol::of(key, col))
-            })
-            .collect::<Result<_, GnitzSqlError>>()?;
-        drop(cols);
-        Ok(self.wrap(rel, order))
-    }
-}
-
 /// Bind a whole view query: its envelope checked, its CTEs, its body, then the
-/// `ORDER BY … LIMIT` tail as a top-N over it. A SELECT body places the keys in
-/// its own scope; any other body orders by its output columns.
+/// `ORDER BY … LIMIT n [OFFSET m]` tail as a top-N over it. A SELECT body places
+/// the keys in its own scope; any other body (a set operation or a parenthesized
+/// query, which has no scope of its own) orders by its output columns.
+///
+/// The two tail clauses need each other — a view is unordered, and a LIMIT with no
+/// order names no rows — and the counts are literals.
 pub(super) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, cx.surface.stmt())?;
+    let stmt = cx.surface.stmt();
+    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, stmt)?;
     bind_ctes(cx, query)?;
     let cx = &*cx;
-    let tail = QueryTail::parse(query, cx.surface.stmt())?;
-    match (query.body.as_ref(), tail) {
-        (SetExpr::Select(select), tail) => {
-            let keys = tail.as_ref().map_or(&[][..], |t| &t.keys);
-            let (rel, order) = bind_select(cx, select, keys)?;
-            Ok(match tail {
-                Some(t) => t.wrap(rel, order),
-                None => rel,
-            })
+    let keys = parse_order_by(query.order_by.as_ref())?;
+    let slots = match (keys.is_empty(), extract_limit_offset(query)?) {
+        (true, (None, Some(_))) => return Err(unsupported_clause(stmt, "OFFSET without ORDER BY … LIMIT")),
+        (true, (None, None)) => None,
+        (false, (None, _)) => {
+            return Err(GnitzSqlError::rejected(format!(
+                "{stmt}: ORDER BY without LIMIT — a view holds an unordered set, so an order alone \
+                 maintains nothing; add LIMIT n to maintain the top n rows"
+            )));
         }
-        (body, None) => bind_body(cx, body),
-        (body, Some(tail)) => {
+        (true, (Some(_), _)) => {
+            return Err(GnitzSqlError::rejected(format!(
+                "{stmt}: LIMIT without ORDER BY names no rows in particular; add ORDER BY"
+            )));
+        }
+        (false, (Some(0), _)) => return Err(GnitzSqlError::rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
+        (false, (Some(limit), offset)) => Some(WeightSlots {
+            skip: offset.unwrap_or(0) as u64,
+            keep: limit as u64,
+        }),
+    };
+    let (rel, order) = match query.body.as_ref() {
+        SetExpr::Select(select) => bind_select(cx, select, &keys)?,
+        body => {
             let rel = bind_body(cx, body)?;
-            tail.wrap_by_output(rel, cx.surface.stmt())
+            let order = keys
+                .iter()
+                .map(|key| {
+                    let col = output_key(&key.target, rel.cols().iter())?.map_err(|_| {
+                        GnitzSqlError::rejected(format!(
+                            "{stmt}: ORDER BY over a set operation names an output column or position"
+                        ))
+                    })?;
+                    Ok(OrderCol::of(key, col))
+                })
+                .collect::<Result<_, GnitzSqlError>>()?;
+            (rel, order)
         }
+    };
+    match slots {
+        Some(slots) => RelExpr::top_n(rel, Vec::new(), order, slots),
+        None => Ok(rel),
     }
 }
 
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
-/// a set operation whose sides bind recursively. A parenthesized side is a whole
-/// `Query`, whose envelope is rejected before its body binds.
+/// a set operation whose sides bind recursively as any body. A parenthesized side
+/// is a whole `Query`, whose envelope is rejected before its body binds. The
+/// `SetOp` constructor pairs a set operation's columns positionally and promotes
+/// cross-width types.
 fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
         SetExpr::Select(select) => Ok(bind_select(cx, select, &[])?.0),
-        SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
+        SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            reject_if(
+                matches!(
+                    set_quantifier,
+                    SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
+                ),
+                "set operations",
+                "BY NAME",
+            )?;
+            // Exhaustive (no `_`): a set operator a future `sqlparser` adds stops the
+            // build here rather than reaching `RelExpr::set_op` as a silent EXCEPT.
+            let kind = match op {
+                SetOperator::Union => SetOpKind::Union,
+                SetOperator::Intersect => SetOpKind::Intersect,
+                // MINUS is Oracle's spelling of EXCEPT, quantifier included.
+                SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
+            };
+            let all = matches!(set_quantifier, SetQuantifier::All);
+            RelExpr::set_op(cx.ids, kind, all, bind_body(cx, left)?, bind_body(cx, right)?)
+        }
         SetExpr::Query(q) => bind_body(
             cx,
             reject_unhonored_query_clauses(q, QueryEnvelope::Bare, "parenthesized query")?,
@@ -518,10 +509,7 @@ pub(super) fn bind_select(
     // outranks a grouped shape, and either sits above a join, which lowering
     // cuts. The projection is bound in SELECT order (`place_pk_front` is
     // physical, applied at lowering).
-    let ctx: &str = &match surface {
-        Surface::Adhoc => Cow::Borrowed("SELECT projection"),
-        Surface::View(v) => Cow::Owned(format!("{} projection", v.stmt)),
-    };
+    let ctx = &format!("{stmt} projection");
     if let Some(where_expr) = &select.selection {
         let leaf = ScopeLeaf { scope: &scope, sub };
         let preds = bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("WHERE"))?;
@@ -533,11 +521,17 @@ pub(super) fn bind_select(
     if grouped && !distinct {
         return bind_grouped_suffix(cx, select, left, &leaf, order);
     }
-    let (projected, order) = bind_select_list(cx, select, || Ok(left), &leaf, ctx, order)?;
+    let (projected, order) = window::bind_select_list(cx, select, || Ok(left), &leaf, ctx, order)?;
     if !distinct {
         return Ok((projected, order));
     }
-    reject_unselected_distinct_keys(&projected, &order, ctx)?;
+    // DISTINCT dedups the selected columns, so an ORDER BY key that is not one of
+    // them — a hidden item `place_order_keys` appended — would change the set it orders.
+    if (order.iter()).any(|o| hircol_of(&projected.cols(), o.col).def.is_hidden) {
+        return Err(GnitzSqlError::rejected(format!(
+            "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
+        )));
+    }
     Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, order))
 }
 
@@ -547,39 +541,6 @@ fn adhoc_subquery(e: &Expr) -> GnitzSqlError {
         Expr::Exists { .. } | Expr::In { target: InTarget::Subquery(_), .. } => "EXISTS/IN subquery",
         _ => "scalar subquery",
     })
-}
-
-/// The SELECT list over the relation `rel` builds, and the column each ORDER BY
-/// key sorts on; a view body also binds its window calls and its QUALIFY. `rel` is
-/// called once everything that binds through `leaf` has, so a leaf that
-/// registers what it binds builds its relation from all of it.
-fn bind_select_list<L: ItemLeaf>(
-    cx: &BindCx<'_>,
-    select: &Select,
-    rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
-    leaf: &L,
-    ctx: &str,
-    order: &[OrderKey<'_>],
-) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
-    let ids = cx.ids;
-    if cx.surface.is_view() {
-        return window::bind_view_select_list(ids, select, rel, leaf, ctx, order);
-    }
-    let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
-    let order = place_order_keys(order, &mut items, ids, leaf)?;
-    Ok((leaf.project(rel()?, items)?, order))
-}
-
-/// DISTINCT dedups the selected columns, so an ORDER BY key that is not one of them —
-/// a hidden item `place_order_keys` appended — would change the set it orders.
-fn reject_unselected_distinct_keys(projected: &RelExpr, order: &[OrderCol], ctx: &str) -> Result<(), GnitzSqlError> {
-    let cols = projected.cols();
-    if order.iter().any(|o| hircol_of(&cols, o.col).def.is_hidden) {
-        return Err(GnitzSqlError::rejected(format!(
-            "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
-        )));
-    }
-    Ok(())
 }
 
 /// What a SELECT list needs of the leaf it binds through, beyond expression
@@ -609,7 +570,7 @@ fn bind_projection<L: ItemLeaf>(
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
     let mut items = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
-        // A wildcard the leaf does not expand falls to `scalar_projection_item`,
+        // A wildcard the leaf does not expand falls to the scalar match below,
         // which names it.
         let star = match item {
             SelectItem::Wildcard(o) => Some((None, o)),
@@ -628,7 +589,26 @@ fn bind_projection<L: ItemLeaf>(
             }));
             continue;
         }
-        let (expr, alias) = scalar_projection_item(item, ctx)?;
+        // Anything that is not one scalar expression rejects, naming the shape written.
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(GnitzSqlError::rejected(format!(
+                    "{ctx}: a multi-alias (`AS (a, b)`) SELECT item is not a supported SELECT item"
+                )));
+            }
+            SelectItem::Wildcard(_) => {
+                return Err(GnitzSqlError::rejected(format!(
+                    "{ctx}: SELECT * is not a supported SELECT item"
+                )));
+            }
+            SelectItem::QualifiedWildcard(..) => {
+                return Err(GnitzSqlError::rejected(format!(
+                    "{ctx}: SELECT <table>.* is not a supported SELECT item"
+                )));
+            }
+        };
         items.push(bind_scalar_item(expr, alias, idx, leaf, ids).map_err(|e| e.in_clause(ctx))?);
     }
     // A projection naming nothing of its own (`*`, `* EXCEPT/EXCLUDE`) is exempt: a
@@ -637,25 +617,6 @@ fn bind_projection<L: ItemLeaf>(
         reject_duplicate_names(items.iter().map(|e| &*e.out.def.name), ctx)?;
     }
     Ok(items)
-}
-
-/// A non-wildcard SELECT item as `(expr, alias)` — the alias-carrying sibling of
-/// `crate::ast_util::projection_item_expr`. Anything that is not one scalar
-/// expression rejects, naming the shape written; `ctx` names the clause.
-fn scalar_projection_item<'a>(item: &'a SelectItem, ctx: &str) -> Result<(&'a Expr, Option<String>), GnitzSqlError> {
-    match item {
-        SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
-        SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
-        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::rejected(format!(
-            "{ctx}: a multi-alias (`AS (a, b)`) SELECT item is not a supported SELECT item"
-        ))),
-        SelectItem::Wildcard(_) => Err(GnitzSqlError::rejected(format!(
-            "{ctx}: SELECT * is not a supported SELECT item"
-        ))),
-        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::rejected(format!(
-            "{ctx}: SELECT <table>.* is not a supported SELECT item"
-        ))),
-    }
 }
 
 /// Bind one scalar SELECT item to its output column. Unaliased, the item at
@@ -718,14 +679,6 @@ impl<'a> ScopeLeaf<'a> {
             sub: SubPolicy::Reject(unsupported_subquery),
         }
     }
-
-    /// The kind of the subquery `id` is the column of, when this leaf bound one.
-    fn recorded(&self, id: ColId) -> Option<SubqueryKind> {
-        match self.sub {
-            SubPolicy::Bind { subs, .. } => subs.borrow().iter().find(|s| s.id == id).map(|s| s.kind),
-            SubPolicy::Reject(_) => None,
-        }
-    }
 }
 
 impl ItemLeaf for ScopeLeaf<'_> {
@@ -753,7 +706,11 @@ impl LeafTyping<ColId> for ScopeLeaf<'_> {
     /// A subquery's column by its shape (an EXISTS/IN over NOT NULL operands or
     /// a COUNT never is NULL); every other column by its definition.
     fn decl(&self, id: &ColId) -> (ColType, bool) {
-        match self.recorded(*id) {
+        let recorded = match self.sub {
+            SubPolicy::Bind { subs, .. } => subs.borrow().iter().find(|s| s.id == *id).map(|s| s.kind),
+            SubPolicy::Reject(_) => None,
+        };
+        match recorded {
             Some(SubqueryKind::Exists { nullable }) => (BOOL, nullable),
             Some(SubqueryKind::Scalar { ty, count }) => (ty, !count),
             None => self.scope.combined[..].decl(id),
@@ -852,13 +809,6 @@ impl JoinScope {
         Ok(&self.combined[span.clone()])
     }
 
-    fn resolve_qualified(&self, alias: &str, name: &str) -> Result<ColId, GnitzSqlError> {
-        let cols = self.relation(alias)?;
-        let idx = find_unique_column(cols.iter().map(|c| &c.def), name)?
-            .ok_or_else(|| GnitzSqlError::rejected(format!("column '{name}' not found in table '{alias}'")))?;
-        Ok(cols[idx].id)
-    }
-
     /// Look up an unqualified reference across the whole scope — one lookup, so a
     /// name two relations both carry is the same ambiguity as one relation carrying
     /// it twice. Merged columns are skipped, which is what makes a merged name
@@ -866,12 +816,6 @@ impl JoinScope {
     fn find_unqualified(&self, name: &str) -> Result<Option<ColId>, GnitzSqlError> {
         let at = find_unique_column(self.unmerged().map(|c| &c.def), name)?;
         Ok(at.and_then(|i| self.unmerged().nth(i)).map(|c| c.id))
-    }
-
-    fn resolve_unqualified(&self, name: &str) -> Result<ColId, GnitzSqlError> {
-        let scope = if self.relations.is_empty() { "" } else { " in any table" };
-        self.find_unqualified(name)?
-            .ok_or_else(|| GnitzSqlError::rejected(format!("column '{name}' not found{scope}")))
     }
 
     /// Resolve a column reference, qualified by `qual` or not.
@@ -885,8 +829,16 @@ impl JoinScope {
             return Ok(self.combined[single_relation_col_idx(cols, only, qual, name)?].id);
         }
         match qual {
-            None => self.resolve_unqualified(name),
-            Some(qual) => self.resolve_qualified(qual, name),
+            None => self.find_unqualified(name)?.ok_or_else(|| {
+                let scope = if self.relations.is_empty() { "" } else { " in any table" };
+                GnitzSqlError::rejected(format!("column '{name}' not found{scope}"))
+            }),
+            Some(alias) => {
+                let cols = self.relation(alias)?;
+                let idx = find_unique_column(cols.iter().map(|c| &c.def), name)?
+                    .ok_or_else(|| GnitzSqlError::rejected(format!("column '{name}' not found in table '{alias}'")))?;
+                Ok(cols[idx].id)
+            }
         }
     }
 }
@@ -961,40 +913,6 @@ fn place_order_keys<L: ItemLeaf>(
         order.push(OrderCol::of(key, col));
     }
     Ok(order)
-}
-
-/// Bind a set operation, binding both sides recursively; the `SetOp` constructor
-/// pairs columns positionally and promotes cross-width types.
-fn bind_set_op(
-    cx: &BindCx<'_>,
-    op: SetOperator,
-    quantifier: SetQuantifier,
-    left: &SetExpr,
-    right: &SetExpr,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    reject_if(
-        matches!(
-            quantifier,
-            SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
-        ),
-        "set operations",
-        "BY NAME",
-    )?;
-    // Exhaustive (no `_`): a set operator a future `sqlparser` adds stops the
-    // build here rather than reaching `RelExpr::set_op` as a silent EXCEPT.
-    let kind = match op {
-        SetOperator::Union => SetOpKind::Union,
-        SetOperator::Intersect => SetOpKind::Intersect,
-        // MINUS is Oracle's spelling of EXCEPT, quantifier included.
-        SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
-    };
-    let all = matches!(quantifier, SetQuantifier::All);
-    // Each side binds as any relational body — a plain SELECT, a join, a grouped
-    // query, a nested set operation, or a derived table (all handled by
-    // `bind_body` → `resolve_table_factor`).
-    let left_rel = bind_body(cx, left)?;
-    let right_rel = bind_body(cx, right)?;
-    RelExpr::set_op(cx.ids, kind, all, left_rel, right_rel)
 }
 
 #[cfg(test)]

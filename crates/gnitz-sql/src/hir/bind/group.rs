@@ -4,33 +4,17 @@
 use super::super::{
     ColId, ColIdGen, HirAgg, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, col_by_id, hircol_of, reduce_reads,
 };
-use super::{BindCx, ItemLeaf, ScopeLeaf, bind_select_list};
+use super::{BindCx, ItemLeaf, ScopeLeaf, window};
 use crate::agg::{AggArg, AggFunc};
 use crate::bind::{LeafBinder, bind_conjuncts, bind_structural};
-use crate::error::{GnitzSqlError, unsupported_clause};
+use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, LeafTyping};
-use crate::rules::reject_float_keys;
 use crate::tail::{OrderKey, group_by_target};
 use gnitz_wire::{ColType, ColumnDef, ReduceKind};
 use sqlparser::ast::{Expr, GroupByExpr, Select};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-
-/// The GROUP BY clause's expression list. Only the plain list form is supported —
-/// `GROUPING SETS` / `CUBE` / `ROLLUP` / `ALL`, written in the list or as a trailing
-/// `WITH …` / `GROUPING SETS (…)` modifier, produce multiple grouping keys per row,
-/// which no reduce shape models.
-fn group_by_exprs(select: &Select) -> Result<&[Expr], GnitzSqlError> {
-    match &select.group_by {
-        GroupByExpr::Expressions(exprs, mods) if mods.is_empty() => Ok(exprs),
-        GroupByExpr::Expressions(..) => Err(unsupported_clause(
-            "GROUP BY",
-            "WITH ROLLUP / WITH CUBE / WITH TOTALS / GROUPING SETS",
-        )),
-        _ => Err(GnitzSqlError::rejected("GROUP BY: only expression list supported")),
-    }
-}
 
 /// The columns a grouped query computes below its reduce: a GROUP BY key or an
 /// aggregate argument that is not already a bare column reference becomes one
@@ -41,31 +25,38 @@ fn group_by_exprs(select: &Select) -> Result<&[Expr], GnitzSqlError> {
 /// One column per distinct expression, keyed by its **bound** form — which is what
 /// makes `GROUP BY t.a + b` and `SELECT a + b` one expression, and folds `Nested`
 /// away so `SUM((a * b))` and `SUM(a * b)` reach one aggregate.
-struct PreMap<'a> {
-    ids: &'a ColIdGen,
+///
+/// Grown as a grouped body's expressions bind, with the reduce's aggregates.
+struct Grouping {
     /// The reduce input's columns: the source's, then one per materialized
     /// expression.
     env: Vec<HirCol>,
     /// The materialized columns and the expressions computing them — also the
     /// memo, since `extra[i].expr` is what `extra[i].out.id` holds.
     extra: Vec<ProjEntry>,
+    /// Each aggregate call once, in the order first bound.
+    aggs: Vec<HirAgg>,
 }
 
-impl<'a> PreMap<'a> {
-    fn new(ids: &'a ColIdGen, env: Vec<HirCol>) -> Self {
-        PreMap { ids, env, extra: Vec::new() }
+impl Grouping {
+    /// The column already holding `bound`'s value: its own when it is a bare
+    /// column reference, else the pre-map column computing an equal expression.
+    /// One rule for minting and for looking up, so an expression cannot resolve to
+    /// one column in the reduce and another above it.
+    fn find(&self, bound: &HirExpr) -> Option<ColId> {
+        (bound.as_col()).or_else(|| self.extra.iter().find(|x| &x.expr == bound).map(|x| x.out.id))
     }
 
     /// The column `e` names, materializing one on first sight.
-    fn column_for(&mut self, e: &Expr, leaf: &ScopeLeaf<'_>) -> Result<ColId, GnitzSqlError> {
+    fn column_for(&mut self, ids: &ColIdGen, e: &Expr, leaf: &ScopeLeaf<'_>) -> Result<ColId, GnitzSqlError> {
         let bound = bind_structural(e, leaf)?;
-        if let Some(id) = find_bound(&self.extra, &bound) {
+        if let Some(id) = self.find(&bound) {
             return Ok(id);
         }
         let (ty, nullable) = bound.declared(&self.env[..]);
         // Hidden because only the expression that minted it may reach it.
         let out = HirCol::new(
-            self.ids.next(),
+            ids.next(),
             ColumnDef::new(format!("_pre{}", self.extra.len()), ty, nullable).hidden(),
         );
         let id = out.id;
@@ -86,75 +77,10 @@ impl<'a> PreMap<'a> {
     }
 }
 
-/// The column already holding `bound`'s value: its own when it is a bare column
-/// reference, else the pre-map column computing an equal expression. One rule for
-/// minting and for looking up, so an expression cannot resolve to one column in
-/// the reduce and another above it.
-fn find_bound(extra: &[ProjEntry], bound: &HirExpr) -> Option<ColId> {
-    bound
-        .as_col()
-        .or_else(|| extra.iter().find(|x| &x.expr == bound).map(|x| x.out.id))
-}
-
-/// Resolve the GROUP BY list to the `ColId`s the reduce groups by: a 1-based
-/// position names its SELECT item, a bare reference is its own column, and
-/// anything computed is materialized below the reduce by `pre`.
-fn resolve_group_cols(
-    select: &Select,
-    leaf: &ScopeLeaf<'_>,
-    pre: &mut PreMap<'_>,
-) -> Result<Vec<ColId>, GnitzSqlError> {
-    let mut cols = Vec::new();
-    for ge in group_by_exprs(select)? {
-        let target = group_by_target(ge, select)?;
-        // The key binds through the FROM leaf, whose rejection names the column but
-        // not the clause it was written in.
-        let id = pre.column_for(target, leaf).map_err(|e| e.in_clause("GROUP BY"))?;
-        reject_float_keys([&hircol_of(&pre.env, id).def], "GROUP BY")?;
-        cols.push(id);
-    }
-    Ok(cols)
-}
-
 /// Whether dedup cannot move this aggregate's value: `MIN`/`MAX` read the same
 /// extremum from a set as from the multiset it collapses.
 fn dedup_is_inert(func: AggFunc) -> bool {
     matches!(func, AggFunc::Min | AggFunc::Max)
-}
-
-/// Whether `call` reads the same value from `Distinct(group cols, arg)` as from
-/// the raw input — which every aggregate of the reduce must, since that set is
-/// its only input.
-fn survives_dedup(call: &HirAgg, arg: ColId) -> bool {
-    match call.arg {
-        AggArg::Distinct(a) => a == arg,
-        AggArg::All(a) => a == arg && dedup_is_inert(call.func),
-        AggArg::Star => false,
-    }
-}
-
-/// The column a body's DISTINCT aggregates all read, or `None` when it has none.
-/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`,
-/// so every aggregate of the reduce reads that one set.
-fn distinct_arg(calls: &[HirAgg]) -> Result<Option<ColId>, GnitzSqlError> {
-    let Some(arg) = calls.iter().find_map(|c| match c.arg {
-        AggArg::Distinct(a) => Some(a),
-        _ => None,
-    }) else {
-        return Ok(None);
-    };
-    if calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != arg)) {
-        return Err(GnitzSqlError::rejected(
-            "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument",
-        ));
-    }
-    if calls.iter().any(|c| !survives_dedup(c, arg)) {
-        return Err(GnitzSqlError::rejected(
-            "DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the \
-             DISTINCT argument",
-        ));
-    }
-    Ok(Some(arg))
 }
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input`, producing
@@ -168,15 +94,33 @@ pub(super) fn bind_grouped_suffix(
     order: &[OrderKey<'_>],
 ) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
     let ids = cx.ids;
-    let mut pre = PreMap::new(ids, leaf.scope.combined.clone());
-    let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
+    let mut st = Grouping {
+        env: leaf.scope.combined.clone(),
+        extra: Vec::new(),
+        aggs: Vec::new(),
+    };
+    // The clause guard admits only the plain list form.
+    let GroupByExpr::Expressions(exprs, _) = &select.group_by else {
+        return Err(GnitzSqlError::Internal(
+            "a grouped body's GROUP BY is not a list".into(),
+        ));
+    };
+    // A 1-based position names its SELECT item, a bare reference is its own
+    // column, and anything computed is materialized below the reduce.
+    let mut group_cols = Vec::new();
+    for ge in exprs {
+        let target = group_by_target(ge, select)?;
+        // The key binds through the FROM leaf, whose rejection names the column but
+        // not the clause it was written in.
+        group_cols.push(st.column_for(ids, target, leaf).map_err(|e| e.in_clause("GROUP BY"))?);
+    }
     let grouped = GroupedLeaf {
         leaf,
         ids,
         group_cols: &group_cols,
         // `extra` holds only key columns until the first aggregate binds.
-        computed_keys: !pre.extra.is_empty(),
-        state: RefCell::new(Grouping { pre, aggs: Vec::new() }),
+        computed_keys: !st.extra.is_empty(),
+        state: RefCell::new(st),
     };
     // The reduce, under its HAVING. HAVING binds last, so its aggregates are the
     // reduce's too.
@@ -185,39 +129,46 @@ pub(super) fn bind_grouped_suffix(
             Some(having) => bind_conjuncts(having, &grouped).map_err(|e| e.in_clause("HAVING"))?,
             None => Vec::new(),
         };
-        let Grouping { pre, aggs } = &*grouped.state.borrow();
-        // An ad-hoc read lowers to one stateless fold over one scan, which has no
-        // room for the `Distinct` below the reduce.
-        if !cx.surface.is_view() && aggs.iter().any(|a| matches!(a.arg, AggArg::Distinct(_))) {
-            return Err(GnitzSqlError::rejected(
-                "DISTINCT aggregates are supported in a CREATE VIEW body only",
-            ));
+        let st = &*grouped.state.borrow();
+        // A DISTINCT aggregate is the plain aggregate over `Distinct(group cols,
+        // arg)`, so every aggregate of the reduce reads that one set, and must read
+        // the same value from it as from the raw input.
+        let distinct = st.aggs.iter().find_map(|c| match c.arg {
+            AggArg::Distinct(a) => Some(a),
+            _ => None,
+        });
+        if let Some(d) = distinct {
+            if st.aggs.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != d)) {
+                return Err(GnitzSqlError::rejected(
+                    "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument",
+                ));
+            }
+            let survives =
+                |c: &HirAgg| c.arg == AggArg::Distinct(d) || c.arg == AggArg::All(d) && dedup_is_inert(c.func);
+            if !st.aggs.iter().all(survives) {
+                return Err(GnitzSqlError::rejected(
+                    "DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the \
+                     DISTINCT argument",
+                ));
+            }
         }
-        let phys = HirAgg::physical(aggs);
+        let phys = HirAgg::physical(&st.aggs);
         // What the reduce reads, and under a DISTINCT aggregate the set it reduces over.
-        let distinct = distinct_arg(aggs)?;
         let mut reads = reduce_reads(&group_cols, &phys);
         if let Some(d) = distinct.filter(|d| !reads.contains(d)) {
             reads.push(d);
         }
         let input = match distinct {
-            Some(_) => RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)), "DISTINCT aggregate")?,
-            None if pre.extra.is_empty() => input,
-            None => RelExpr::project(input, pre.items_for(&reads)),
+            Some(_) => RelExpr::distinct(RelExpr::project(input, st.items_for(&reads)), "DISTINCT aggregate")?,
+            None if st.extra.is_empty() => input,
+            None => RelExpr::project(input, st.items_for(&reads)),
         };
         RelExpr::filter(
-            RelExpr::reduce(input, group_cols.clone(), phys, ReduceKind::Aggregate),
+            RelExpr::reduce(input, group_cols.clone(), phys, ReduceKind::Aggregate, "GROUP BY")?,
             having,
         )
     };
-    bind_select_list(cx, select, rel, &grouped, "GROUP BY", order)
-}
-
-/// What a grouped body's reduce computes, grown as its expressions bind.
-struct Grouping<'a> {
-    pre: PreMap<'a>,
-    /// Each aggregate call once, in the order first bound.
-    aggs: Vec<HirAgg>,
+    window::bind_select_list(cx, select, rel, &grouped, "GROUP BY", order)
 }
 
 /// The leaf for an expression over the grouped relation — the SELECT list, the
@@ -232,7 +183,7 @@ struct GroupedLeaf<'a> {
     group_cols: &'a [ColId],
     /// Whether a GROUP BY key is computed, so a written expression can name one.
     computed_keys: bool,
-    state: RefCell<Grouping<'a>>,
+    state: RefCell<Grouping>,
 }
 
 impl GroupedLeaf<'_> {
@@ -242,7 +193,10 @@ impl GroupedLeaf<'_> {
     /// holding it, and `l.v` in a join resolves the way the body resolves it.
     fn group_key(&self, e: &Expr) -> Option<ColId> {
         let bound = bind_structural(e, self.leaf).ok()?;
-        find_bound(&self.state.borrow().pre.extra, &bound).filter(|id| self.group_cols.contains(id))
+        self.state
+            .borrow()
+            .find(&bound)
+            .filter(|id| self.group_cols.contains(id))
     }
 }
 
@@ -260,7 +214,7 @@ impl LeafTyping<ColId> for GroupedLeaf<'_> {
     /// A reduce input column, or an aggregate's raw value or companion.
     fn decl(&self, id: &ColId) -> (ColType, bool) {
         let st = self.state.borrow();
-        let def = match col_by_id(&st.pre.env, *id) {
+        let def = match col_by_id(&st.env, *id) {
             Some(c) => &c.def,
             None => {
                 let mut cols = st.aggs.iter().flat_map(HirAgg::cols);
@@ -303,7 +257,7 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
     fn bind_aggregate(&self, func: AggFunc, arg: AggArg<&Expr>) -> Result<HirExpr, GnitzSqlError> {
         let st = &mut *self.state.borrow_mut();
         // Through the pre-map, so `SUM(a * b)` twice names one column.
-        let mut arg = arg.try_map(|e| st.pre.column_for(e, self.leaf))?;
+        let mut arg = arg.try_map(|e| st.column_for(self.ids, e, self.leaf))?;
         if dedup_is_inert(func) {
             arg = arg.without_distinct();
         }
@@ -311,7 +265,7 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
             Some(at) => at,
             None => {
                 let is_global = self.group_cols.is_empty();
-                let agg = HirAgg::new(self.ids, func, arg, &st.pre.env, is_global, &st.aggs)?;
+                let agg = HirAgg::new(self.ids, func, arg, &st.env, is_global, &st.aggs)?;
                 st.aggs.push(agg);
                 st.aggs.len() - 1
             }

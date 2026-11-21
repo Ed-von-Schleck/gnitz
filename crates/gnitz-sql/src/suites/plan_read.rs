@@ -720,7 +720,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ),
         (
             "WITH x AS (SELECT DISTINCT v, w FROM t) SELECT DISTINCT v FROM x",
-            "(an aggregate over a grouped CTE or derived table)",
+            "(a grouping over a DISTINCT set)",
         ),
         (
             "WITH x AS (SELECT v FROM t UNION SELECT w FROM t) SELECT v FROM x",
@@ -768,7 +768,10 @@ fn a_read_the_planner_rejects_names_its_rule() {
             "only supported in the SELECT list, QUALIFY and ORDER BY of a CREATE VIEW",
         ),
         // The fold is one stateless pass over one scan: no DISTINCT segment.
-        ("SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v", "CREATE VIEW body only"),
+        (
+            "SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v",
+            "(a grouping over a DISTINCT set)",
+        ),
     ] {
         assert_rejects(sql, read(&cat, sql), msg);
     }

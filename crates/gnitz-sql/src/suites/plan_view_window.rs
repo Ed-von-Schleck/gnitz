@@ -218,7 +218,7 @@ fn a_bounded_row_number_takes_a_top_ns_keys() {
     for (body, needle) in [
         (
             "SELECT id FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY f ORDER BY a) = 1",
-            "window PARTITION BY: a float-valued expression",
+            "window PARTITION BY: float column 'f'",
         ),
         // No ORDER BY and no unique key: nothing orders the partition.
         (
@@ -253,10 +253,14 @@ fn every_unsupported_window_names_its_clause() {
         ),
         (
             "SELECT id, SUM(a) OVER (PARTITION BY f) FROM t",
-            "window PARTITION BY: a float-valued expression",
+            "window PARTITION BY: float column 'f'",
         ),
         (
             "SELECT id, RANK() OVER (PARTITION BY f ORDER BY a) FROM t",
+            "window PARTITION BY: float column 'f'",
+        ),
+        (
+            "SELECT id, RANK() OVER (PARTITION BY f + 1 ORDER BY a) FROM t",
             "window PARTITION BY: a float-valued expression",
         ),
         // Frames and functions outside the supported set.
