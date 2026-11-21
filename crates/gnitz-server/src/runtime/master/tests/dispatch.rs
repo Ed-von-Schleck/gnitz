@@ -11,7 +11,7 @@ use crate::test_support::empty_catalog;
 use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 
 /// An ACKed group ends once every worker has applied the log through it; one
-/// the SAL has no room for is refused with the SAL's own status.
+/// wider than the whole SAL is refused as one no retry fits.
 #[test]
 fn an_acked_group_ends_on_its_acks_or_is_refused() {
     within(|| {
@@ -36,7 +36,10 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
             });
             match (refused, got) {
                 (false, Ok(())) => {}
-                (true, Err(e)) => assert_eq!(e.status, WireStatus::SalFull, "{e}"),
+                (true, Err(e)) => assert!(
+                    e.status == WireStatus::Error && e.text.contains("no retry fits it"),
+                    "{e}"
+                ),
                 (refused, got) => panic!("refused={refused}: {got:?}"),
             }
         }
@@ -58,7 +61,7 @@ fn a_refused_tick_takes_no_round() {
         .write_tick(&alone, &mut excl, &vec![0; 2 << 17])
         .map(drop)
         .expect_err("no room for the tick");
-    assert_eq!(e.status, WireStatus::SalFull, "{e}");
+    assert_eq!(e.status, WireStatus::Error, "{e}");
     assert_eq!(disp.ticks.round.get(), before, "the refused tick took no round");
 
     disp.write_tick(&alone, &mut excl, &[7, 8]).expect("the tick fits");

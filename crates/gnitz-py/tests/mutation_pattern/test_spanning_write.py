@@ -94,3 +94,22 @@ def test_a_reference_refused_in_the_last_frame_commits_nothing(client, spanning)
     assert rows(client, "SELECT * FROM c") == []
     spanning.push(tid, gnitz.ZSetBatch(schema).extend(refs), "error")
     assert len(rows(client, "SELECT * FROM c")) == _N
+
+
+def test_a_write_past_the_log_is_refused_as_no_retry_fits(own_server, monkeypatch):
+    """A write over many frames whose rows a 16 MiB SAL cannot hold even empty
+    is refused as a request no retry fits, not as a full log a retry may get
+    room in; it commits nothing, and the connection serves the next write."""
+    monkeypatch.setenv("GNITZ_WRITE_FRAME_BYTES", str(64 << 10))
+    srv = own_server.start(extra_env={"GNITZ_SAL_BYTES": str(16 << 20)})
+    with gnitz.connect(srv.target) as client:
+        client.execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, pad TEXT)")
+        tid, schema = client.resolve_table("t")
+        pad = "x" * 8_000
+        big = gnitz.ZSetBatch(schema).extend([{"id": i, "pad": pad} for i in range(2_600)])
+        with pytest.raises(gnitz.GnitzRefusedError, match="no retry fits it") as refused:
+            client.push(tid, big)
+        assert type(refused.value) is gnitz.GnitzRefusedError, "not one a retry may fit"
+        assert rows(client, "SELECT * FROM t") == []
+        client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": 1, "pad": "y"}]))
+        assert bag(rows(client, "SELECT * FROM t")) == {(1, "y"): 1}

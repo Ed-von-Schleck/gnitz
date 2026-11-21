@@ -667,7 +667,8 @@ wire_enum! {
         /// A delta cursor below a worker's retention floor: re-read at `after_tick = 0`.
         DeltaExpired = 4,
         /// The SAL had no room for this request's group. A reclaim frees it within
-        /// a tick, so it is retryable.
+        /// a tick, so it is retryable. A request past what the server's log holds
+        /// even empty is refused as `Error` instead: no retry fits it.
         SalFull = 5,
         /// The named relation does not exist.
         NotFound = 6,

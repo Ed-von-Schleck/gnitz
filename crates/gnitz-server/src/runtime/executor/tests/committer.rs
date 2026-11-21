@@ -338,11 +338,11 @@ fn a_write_past_the_threshold_is_checkpointed_unasked() {
 /// refused past the checkpoint's floor. A write of exactly the room a
 /// checkpoint leaves commits behind one checkpoint. A write larger than that
 /// room is answered `SalFull` once it is refused directly behind a checkpoint,
-/// which calls for no further one; a write over the limit is answered `SalFull`
-/// where it is first refused. A write of several families is measured whole,
-/// its families behind the one refused included: over the limit, it fails at
-/// once; within it, it goes again. The committer goes on to commit what
-/// follows.
+/// which calls for no further one; a write over the limit is refused where it
+/// is first refused, as one no retry fits. A write of several families is
+/// measured whole, its families behind the one refused included: over the
+/// limit, it fails at once; within it, it goes again. The committer goes on to
+/// commit what follows.
 #[test]
 fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
     within(|| {
@@ -401,9 +401,10 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
         assert_eq!(sal.epoch(), 4);
 
         // Over the limit: refused behind the small write, and no checkpoint
-        // helps.
+        // helps, so it is not answered as one a retry may fit.
         let e = commit(Some(limit + 8)).expect_err("no log holds it");
-        assert_eq!(e.status, WireStatus::SalFull, "{e}");
+        assert_eq!(e.status, WireStatus::Error, "{e}");
+        assert!(e.text.contains("no retry fits it"), "{e}");
         commit(None).expect("the committer serves the next write");
         assert_eq!(sal.epoch(), 4, "no checkpoint is run for a write over the limit");
 
@@ -411,7 +412,7 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
         // the small write: the third counted, the write is over the limit.
         let half = Some(room / 2);
         let e = commit_all(&[(tid, half), (tid_b, half), (tid_c, half)]).expect_err("no log holds it");
-        assert_eq!(e.status, WireStatus::SalFull, "{e}");
+        assert_eq!(e.status, WireStatus::Error, "{e}");
         commit(None).expect("the committer serves the next write");
         assert_eq!(sal.epoch(), 4, "no checkpoint is run for it, nor called for by it");
 

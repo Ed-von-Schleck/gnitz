@@ -128,7 +128,8 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames
 def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
     """Each family fits the 16 MiB SAL alone, the two together do not: the
     second one's refusal takes back the first, already laid out, and the SAL is
-    left able to commit the next write."""
+    left able to commit the next write. No log of that size holds the bundle,
+    so it is refused as a request no retry fits, not as a full log."""
     schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
                            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)], [0])
     pad = "x" * 8_000
@@ -139,10 +140,11 @@ def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
     with gnitz.connect(own_server.start(extra_env={
             "GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024)}).target) as client:
         a, b = (client.create_table(n, schema) for n in "ab")
-        with pytest.raises(gnitz.GnitzSalFullError):
+        with pytest.raises(gnitz.GnitzRefusedError, match="no retry fits it") as refused:
             with client.transaction() as txn:
                 txn.push(a, wide(1_300), "update")
                 txn.push(b, wide(1_300), "update")
+        assert type(refused.value) is gnitz.GnitzRefusedError, "not one a retry may fit"
         assert (bag(scanned(client, "a")), bag(scanned(client, "b"))) == ({}, {})
 
         client.push(a, gnitz.ZSetBatch(schema).extend([{"pk": 1, "pad": "y"}]))

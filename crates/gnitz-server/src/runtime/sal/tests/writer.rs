@@ -314,6 +314,8 @@ fn a_checkpoint_may_admit_a_unit_within_the_limit_refused_past_its_floor() {
     let span = |from: u64, bytes: usize| SalFull {
         kind: SalMessageKind::Push,
         end: from + bytes as u64,
+        span: bytes as u64,
+        limit: limit as u64,
         may_admit: false,
     };
     // Asked of a span at the published end, then of one behind a staged group.

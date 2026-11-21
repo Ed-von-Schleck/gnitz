@@ -74,6 +74,12 @@ pub(crate) struct SalFull {
     kind: SalMessageKind,
     /// Where the span would have ended.
     end: u64,
+    /// The span's bytes, from where a retry lays it out again: the refused
+    /// group's, until [`SalWriter::judge`] measures the span it owns.
+    span: u64,
+    /// The [`group_limit`] of `kind`: the most a span of it may fill in an
+    /// empty log.
+    limit: u64,
     /// See [`Self::checkpoint_may_admit`].
     may_admit: bool,
 }
@@ -84,10 +90,26 @@ impl SalFull {
     pub(crate) fn checkpoint_may_admit(&self) -> bool {
         self.may_admit
     }
+
+    /// Whether the span is past what the log holds for its kind even empty:
+    /// no checkpoint or retry in this boot makes room for it.
+    fn never_fits(&self) -> bool {
+        self.span > self.limit
+    }
 }
 
+/// A span that may fit once the log is reclaimed is answered `SalFull`, which a
+/// client may retry; one that never fits, as a plain refusal naming the limit.
 impl From<SalFull> for WireFault {
     fn from(full: SalFull) -> Self {
+        if full.never_fits() {
+            return format!(
+                "a {:?} request needs {} bytes of the server's log, past the {} one request may fill \
+                 (GNITZ_SAL_BYTES): no retry fits it, and nothing was written",
+                full.kind, full.span, full.limit
+            )
+            .into();
+        }
         WireFault {
             status: WireStatus::SalFull,
             text: format!("SAL full: {:?} group did not fit", full.kind),
@@ -185,8 +207,8 @@ impl SalWriter {
     }
 
     /// Whether a checkpoint may make room for the span refused on `full`, which
-    /// starts at `from`: `from` lies past
-    /// `checkpoint_floor`, and the span is within its kind's [`group_limit`],
+    /// starts at `from` and whose `span` is measured from there: `from` lies
+    /// past `checkpoint_floor`, and the span is within its kind's [`group_limit`],
     /// so something other than a checkpoint's own groups is ahead of it in the
     /// log. A checkpoint removes that and nothing else; what it leaves ahead in
     /// its place is its own groups, whose size this does not predict, so the
@@ -194,14 +216,14 @@ impl SalWriter {
     /// epoch without an ephemeral round — has nothing ahead of it a checkpoint
     /// would remove.
     fn checkpoint_may_admit(&self, from: u64, full: &SalFull) -> bool {
-        let limit = group_limit(full.kind, self.log.ring_len) as u64;
-        from > self.checkpoint_floor.get() && full.end - from <= limit
+        from > self.checkpoint_floor.get() && !full.never_fits()
     }
 
-    /// Answer [`Self::checkpoint_may_admit`] on `full`, and call for a
-    /// checkpoint if so. Judged by whoever owns the span: what a retry lays
-    /// out again.
+    /// Measure `full`'s span from `from`, answer [`Self::checkpoint_may_admit`]
+    /// on it, and call for a checkpoint if so. Judged by whoever owns the span:
+    /// what a retry lays out again.
     fn judge(&self, from: u64, full: &mut SalFull) {
+        full.span = full.end - from;
         full.may_admit = self.checkpoint_may_admit(from, full);
         if full.may_admit {
             self.refused_transient.set(true);
@@ -261,6 +283,8 @@ impl SalWriter {
             return Err(SalFull {
                 kind: head.request.kind,
                 end: base + total as u64,
+                span: total as u64,
+                limit: cap as u64,
                 may_admit: false,
             });
         }
