@@ -74,8 +74,7 @@ pub fn encode_items(out: &mut Vec<u8>, verb: ClientVerb, items: &[FrameItem<'_>]
     let body = items.iter().map(|it| frame_size(it.blob, Some(&it.data[..]))).sum();
     multi_frame(out, verb, 0, body, |out| {
         for it in items {
-            let mut hdr = ControlHeader::naming(verb, it.target, it.basis);
-            hdr.flags.conflict_mode = it.conflict_mode;
+            let hdr = ControlHeader::item(verb, it.target, it.basis, it.conflict_mode);
             append_frame(out, &hdr, it.blob, Some(&it.data[..]));
         }
     })

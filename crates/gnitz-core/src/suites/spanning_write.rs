@@ -34,7 +34,7 @@ fn answer(s: &mut Session, req: Request<'_>) -> Result<u64, ClientError> {
     drive(s, sent).0
 }
 
-fn push(tid: u64, batch: &ZSetBatch, mode: WireConflictMode) -> Request<'_> {
+fn push(tid: u64, batch: &Arc<ZSetBatch>, mode: WireConflictMode) -> Request<'_> {
     Request::Push { target: tid.into(), batch, mode }
 }
 
@@ -46,14 +46,14 @@ fn a_push_over_several_frames_commits_whole_or_not_at_all() {
     let srv = ServerHandle::start_n(4);
     let (mut client, mut s, tid, schema) = spanning_session(&srv);
     let n = 5_000u64;
-    let all = rows(&schema, 0..n);
+    let all = Arc::new(rows(&schema, 0..n));
     answer(&mut s, push(tid, &all, WireConflictMode::Error)).unwrap();
     assert_eq!(scan_all(&mut client, tid, &schema).len() as u64, n);
 
     // Fresh keys, the first of them repeated at the very end.
     let mut again = rows(&schema, n..2 * n);
     again.extend_from_owned(rows(&schema, [n]));
-    let refused = answer(&mut s, push(tid, &again, WireConflictMode::Error));
+    let refused = answer(&mut s, push(tid, &Arc::new(again), WireConflictMode::Error));
     let e = refused.expect_err("a duplicate in the last frame").to_string();
     assert!(e.contains("Batch contains multiple rows with key"), "{e}");
     assert_eq!(
@@ -69,6 +69,7 @@ fn a_push_over_several_frames_commits_whole_or_not_at_all() {
     for pk in 0..n {
         app.begin_row(pk as u128, 1).put_int(pk as u128 + 7).put_int(9);
     }
+    let upsert = Arc::new(upsert);
     answer(&mut s, push(tid, &upsert, WireConflictMode::Update)).unwrap();
     assert_eq!(
         weighted_rows(&scan_all(&mut client, tid, &schema)),
@@ -103,7 +104,11 @@ fn an_occ_conflict_in_the_last_frame_refuses_the_whole_txn() {
     let srv = ServerHandle::start_n(4);
     let (mut client, mut s, t1, schema) = spanning_session(&srv);
     let (_, t2, _) = create_table(&mut client, (*schema).clone());
-    answer(&mut s, push(t2, &rows(&schema, [0]), WireConflictMode::Update)).unwrap();
+    answer(
+        &mut s,
+        push(t2, &Arc::new(rows(&schema, [0])), WireConflictMode::Update),
+    )
+    .unwrap();
     let family = |tid: u64, batch, basis| PushFamily {
         target: tid.into(),
         batch: Arc::new(batch),
@@ -187,11 +192,11 @@ fn a_frame_inside_a_writes_frames_refuses_it_and_closes() {
 fn a_write_past_the_server_limit_is_refused_and_the_connection_kept() {
     let srv = ServerHandle::start_with_env(4, &[("GNITZ_WRITE_SPAN_BYTES", "100000")]);
     let (mut client, mut s, tid, schema) = spanning_session(&srv);
-    let big = rows(&schema, 0..20_000);
+    let big = Arc::new(rows(&schema, 0..20_000));
     let e = answer(&mut s, push(tid, &big, WireConflictMode::Update));
     let e = e.expect_err("past the limit").to_string();
     assert!(e.contains("100000-byte limit"), "{e}");
-    let small = rows(&schema, 0..100);
+    let small = Arc::new(rows(&schema, 0..100));
     answer(&mut s, push(tid, &small, WireConflictMode::Update)).unwrap();
     assert_eq!(scan_all(&mut client, tid, &schema).len(), 100);
 }

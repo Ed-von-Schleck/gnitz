@@ -12,7 +12,7 @@ fn push_encode_bench() {
     for (nrows, iters) in [(1usize, 2000u64), (100_000, 20)] {
         for null_every in [0usize, 4] {
             let schema = wide_schema(5, true);
-            let batch = wide_rows(&schema, nrows, null_every);
+            let batch = Arc::new(wide_rows(&schema, nrows, null_every));
             let target = Target { tid: 7, token: 1 };
             let mut e = 0;
             let mut out = Vec::new();
@@ -26,7 +26,7 @@ fn push_encode_bench() {
                 e += counter
                     .measure(|| {
                         let (verb, families) = push().write_families().expect("a write");
-                        let write = SpanningWrite::cut(verb, &families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
+                        let write = SpanningWrite::cut(verb, families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
                         write.encode(0, black_box(&mut out))
                     })
                     .1;
@@ -45,7 +45,7 @@ fn push_encode_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn submit_write_bench() {
     let schema = wide_schema(5, true);
-    let batch = wide_rows(&schema, 1, 0);
+    let batch = Arc::new(wide_rows(&schema, 1, 0));
     let reply_schema = Arc::new(wide_schema(5, true));
     let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
     submit_write("alloc ids", |s| drop(s.submit(Request::AllocIds(1))));
@@ -78,4 +78,51 @@ fn submit_write(name: &str, submit: impl Fn(&mut Session)) {
         black_box(peer.recv());
     }
     println!("submit_write_bench {name}: {} instr", total / ROUNDS);
+}
+
+/// Instructions per row to submit a write cut into many frames and write it
+/// all to a socket a peer drains, and the most frame bytes queued at once.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn spanning_write_bench() {
+    const ROWS: usize = 200_000;
+    let counter = gnitz_foundation::perf::Counter::instructions();
+    let schema = wide_schema(5, true);
+    let batch = Arc::new(wide_rows(&schema, ROWS, 4));
+    for ceiling in [64 << 10, 1 << 20] {
+        let (mut s, peer) = session_pair();
+        s.set_write_frame_bytes(ceiling);
+        let drain = std::thread::spawn(move || {
+            let mut n = 0usize;
+            loop {
+                let f = peer.recv();
+                n += f.len();
+                if !gnitz_wire::peek_control_block(&f).unwrap().hdr.flags.continuation {
+                    return n;
+                }
+            }
+        });
+        let mut peak = 0;
+        let ((), instr) = counter.measure(|| {
+            drop(s.submit(Request::Push {
+                target: Target { tid: 7, token: 1 },
+                batch: &batch,
+                mode: WireConflictMode::Update,
+            }));
+            peak = peak.max(s.transport.queued_bytes());
+            while s.interest().write {
+                if s.refused {
+                    crate::test_support::park(&s, Interest::WRITE);
+                }
+                s.step(Interest::WRITE);
+                peak = peak.max(s.transport.queued_bytes());
+            }
+        });
+        let sent = drain.join().unwrap();
+        println!(
+            "spanning_write_bench {ROWS} rows, {} KiB frames: {:.2} instr/row, {sent} B sent, peak queued {peak} B",
+            ceiling >> 10,
+            instr as f64 / ROWS as f64
+        );
+    }
 }

@@ -8,44 +8,48 @@
 use gnitz_wire::{
     CTRL_HEADER_SIZE, ClientVerb, ControlHeader, MAX_FRAME_PAYLOAD, Target, append_frame, encode_frame_head,
 };
-use gnitz_zset::repr::{MemBatch, WireRows};
+use gnitz_zset::repr::WireCut;
 use smallvec::SmallVec;
+use std::sync::Arc;
 
-/// One family of a write: the item header each of its chunks carries, its
-/// shape record, and its rows.
-pub(crate) struct WriteFamily<'a> {
+use crate::ZSetBatch;
+
+/// One family of a write: the item header each of its chunks carries, and its
+/// rows, whose schema's shape record each chunk carries too.
+#[derive(Clone)]
+pub(crate) struct WriteFamily {
     pub(crate) hdr: ControlHeader,
-    pub(crate) blob: &'a [u8],
-    pub(crate) rows: MemBatch<'a>,
+    pub(crate) batch: Arc<ZSetBatch>,
 }
 
 /// One family's rows within a frame: a chunk of them, or `None` for a family
 /// with no rows, which goes as a `PUSH` with no data block, or a `PUSH_TXN`
 /// item with a block of no rows.
-struct Chunk<'a> {
+struct Chunk {
     family: usize,
-    rows: Option<WireRows<'a>>,
+    rows: Option<WireCut>,
 }
 
 /// A write of `verb` — `PUSH`, whose one family is `families[0]`, or
 /// `PUSH_TXN` — cut into frames of at most `ceiling` payload bytes. A frame
 /// carries at least one row, so a row wider than `ceiling` goes in a frame of
-/// its own past it.
-pub(crate) struct SpanningWrite<'a> {
+/// its own past it. It holds its families, so its frames can be encoded one
+/// at a time as a socket takes them.
+pub(crate) struct SpanningWrite {
     verb: ClientVerb,
-    families: &'a [WriteFamily<'a>],
+    families: SmallVec<[WriteFamily; 1]>,
     /// Every frame's chunks, in send order.
-    chunks: SmallVec<[Chunk<'a>; 1]>,
+    chunks: SmallVec<[Chunk; 1]>,
     /// Each frame, in send order: where its chunks end in `chunks`, and its
     /// payload bytes.
     frames: SmallVec<[(usize, usize); 1]>,
 }
 
-impl<'a> SpanningWrite<'a> {
+impl SpanningWrite {
     /// Cut `families` into frames of at most `ceiling` bytes, filling each
     /// before the next opens; `Err` with a frame's size where one row's
     /// frame is past [`MAX_FRAME_PAYLOAD`].
-    pub(crate) fn cut(verb: ClientVerb, families: &'a [WriteFamily<'a>], ceiling: usize) -> Result<Self, usize> {
+    pub(crate) fn cut(verb: ClientVerb, families: SmallVec<[WriteFamily; 1]>, ceiling: usize) -> Result<Self, usize> {
         debug_assert!(matches!(verb, ClientVerb::Push | ClientVerb::PushTxn));
         debug_assert!(
             verb == ClientVerb::PushTxn || families.len() == 1,
@@ -58,7 +62,7 @@ impl<'a> SpanningWrite<'a> {
         let no_rows = if txn { gnitz_wire::wal::WAL_HEADER_SIZE } else { 0 };
         let mut write = SpanningWrite {
             verb,
-            families,
+            families: SmallVec::new(),
             chunks: SmallVec::new(),
             frames: SmallVec::new(),
         };
@@ -73,8 +77,9 @@ impl<'a> SpanningWrite<'a> {
             Ok(())
         };
         for (family, f) in families.iter().enumerate() {
-            let head = CTRL_HEADER_SIZE + f.blob.len();
-            if f.rows.is_empty() {
+            let (blob, rows) = (f.batch.schema().shape_record(), f.batch.view());
+            let head = CTRL_HEADER_SIZE + blob.len();
+            if rows.is_empty() {
                 if write.chunks.len() > open && size + head + no_rows > ceiling {
                     close(&mut write, &mut open, &mut size)?;
                 }
@@ -84,29 +89,30 @@ impl<'a> SpanningWrite<'a> {
             }
             // A family that fits the open frame whole goes over its heap as it
             // stands.
-            if let Some(whole) = f.rows.wire_whole()
+            if let Some(whole) = rows.wire_whole()
                 && size + head + whole.byte_size() <= ceiling
             {
                 size += head + whole.byte_size();
-                write.chunks.push(Chunk { family, rows: Some(whole) });
+                write.chunks.push(Chunk { family, rows: Some(whole.cut()) });
                 continue;
             }
             let mut start = 0;
-            while let Some(rows) = f.rows.wire_rows_within(start, ceiling.saturating_sub(size + head)) {
+            while let Some(chunk) = rows.wire_rows_within(start, ceiling.saturating_sub(size + head)) {
                 // A chunk past what the frame has left goes in a frame of its own.
-                if write.chunks.len() > open && size + head + rows.byte_size() > ceiling {
+                if write.chunks.len() > open && size + head + chunk.byte_size() > ceiling {
                     close(&mut write, &mut open, &mut size)?;
                     continue;
                 }
-                start += rows.rows();
-                size += head + rows.byte_size();
-                write.chunks.push(Chunk { family, rows: Some(rows) });
-                if start < f.rows.len() {
+                start += chunk.rows();
+                size += head + chunk.byte_size();
+                write.chunks.push(Chunk { family, rows: Some(chunk.cut()) });
+                if start < rows.len() {
                     close(&mut write, &mut open, &mut size)?;
                 }
             }
         }
         close(&mut write, &mut open, &mut size)?;
+        write.families = families;
         Ok(write)
     }
 
@@ -130,14 +136,15 @@ impl<'a> SpanningWrite<'a> {
         }
         for chunk in &self.chunks[first..end] {
             let f = &self.families[chunk.family];
+            let (blob, view) = (f.batch.schema().shape_record(), f.batch.view());
             let mut hdr = f.hdr;
             hdr.flags.continuation = more && !txn;
-            let Some(rows) = chunk.rows else {
-                append_frame(out, &hdr, f.blob, txn.then(|| f.rows.regions()).as_deref());
+            let Some(rows) = chunk.rows.map(|cut| view.wire_cut(cut)) else {
+                append_frame(out, &hdr, blob, txn.then(|| view.regions()).as_deref());
                 continue;
             };
             let item = out.len();
-            let len = CTRL_HEADER_SIZE + f.blob.len() + rows.byte_size();
+            let len = CTRL_HEADER_SIZE + blob.len() + rows.byte_size();
             // SAFETY: the frame's `size` bytes are reserved above, and the
             // item's are written whole below: the control header and blob by
             // `encode_frame_head`, the block by `WireRows::encode`, which
@@ -147,7 +154,7 @@ impl<'a> SpanningWrite<'a> {
             unsafe {
                 out.set_len(item + len);
             }
-            let block = item + encode_frame_head(&mut out[item..], &hdr, f.blob, true);
+            let block = item + encode_frame_head(&mut out[item..], &hdr, blob, true);
             let written = rows.encode(&mut out[block..]);
             debug_assert_eq!(block + written, out.len(), "a chunk encodes to its size");
         }

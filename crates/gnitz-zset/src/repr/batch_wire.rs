@@ -65,6 +65,30 @@ impl WireRows<'_> {
     }
 }
 
+/// The rows a [`WireRows`] holds, without the batch it borrows:
+/// [`MemBatch::wire_cut`] takes them again from that batch, sized as they were
+/// cut and with no second fit.
+#[derive(Clone, Copy)]
+pub struct WireCut {
+    selection: Selection<'static>,
+    heap: usize,
+}
+
+impl WireRows<'_> {
+    /// The rows this holds, to take again with [`MemBatch::wire_cut`]. Only a
+    /// run of rows is cut: a list is borrowed.
+    pub fn cut(&self) -> WireCut {
+        let selection = match self.selection {
+            Selection::Whole => Selection::Whole,
+            Selection::Relocated { rows: Rows::Run { start, len }, dedup } => {
+                Selection::Relocated { rows: Rows::Run { start, len }, dedup }
+            }
+            Selection::Relocated { rows: Rows::Listed(_), .. } => unreachable!("a list of rows is cut"),
+        };
+        WireCut { selection, heap: self.heap }
+    }
+}
+
 /// Rows of a batch, in order: the run of `len` rows from `start`, or a list of
 /// them.
 #[derive(Clone, Copy)]
@@ -132,6 +156,18 @@ impl<'a> MemBatch<'a> {
             "a run of {rows} rows encodes past {budget}"
         );
         Some(out)
+    }
+
+    /// The rows `cut` names, which a [`WireRows`] of this same batch was cut to.
+    pub fn wire_cut(&self, cut: WireCut) -> WireRows<'a> {
+        if let Selection::Relocated { rows: Rows::Run { start, len }, .. } = cut.selection {
+            debug_assert!(start + len <= self.len(), "a cut of another batch");
+        }
+        WireRows {
+            batch: *self,
+            selection: cut.selection,
+            heap: cut.heap,
+        }
     }
 
     /// The rows `indices` lists, in that order; `None` for an empty list. A

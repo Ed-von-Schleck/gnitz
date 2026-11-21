@@ -190,6 +190,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     };
     assert!(matches!(s.submit_scan_multi(&[]).try_take(), Some(Err(_))));
     untouched(&s, "an empty multi-read");
+    let oversize = Arc::new(oversize);
     let req = Request::Push {
         target: 4.into(),
         batch: &oversize,
@@ -225,7 +226,7 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
 #[test]
 fn replies_completed_before_a_fatal_frame_are_delivered() {
     let (mut s, peer) = pair();
-    let (sa, rows) = (schema_a(), batch_a(&[1]));
+    let (sa, rows) = (schema_a(), Arc::new(batch_a(&[1])));
     let mut a = s.submit(COMMIT);
     let push = Request::Push {
         target: 5.into(),
@@ -321,7 +322,7 @@ fn end_abandons_every_pending_slot_and_refuses_further_work() {
 fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     let (mut s, _peer) = pair();
     // Large enough that a few dozen of them reach the cap.
-    let b = batch_a(&(0..32_768).collect::<Vec<_>>());
+    let b = Arc::new(batch_a(&(0..32_768).collect::<Vec<_>>()));
     let push = |s: &mut Session| {
         let push = Request::Push {
             target: 4.into(),
@@ -1154,52 +1155,81 @@ fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
 
 /// A push past the session's write ceiling goes as several PUSH frames, sent
 /// back to back, and is one request: one slot, answered by the one ACK the
-/// server sends after the last frame. A push within it goes as one frame,
-/// byte for byte the frame `append` writes.
+/// server sends after the last frame. Its frames are encoded one at a time as
+/// the queue is written, so beside its rows it holds one frame, and what is
+/// submitted behind it — another such write, a write within the ceiling, a
+/// request of one frame — waits its turn and counts only the frames it
+/// encoded. A push within the ceiling is one frame, byte for byte the frame
+/// `append` writes.
 #[test]
-fn a_write_past_the_ceiling_goes_as_several_frames_and_is_one_request() {
+fn a_write_past_the_ceiling_goes_as_several_frames_a_frame_at_a_time() {
     let (mut s, peer) = pair();
     s.set_write_frame_bytes(1024);
-    let big = kv_rows(&(0..200).map(|pk| (pk, pk as i64, 1)).collect::<Vec<_>>());
-    let small = batch_a(&[1, 2]);
+    let rows = |base: u64| {
+        Arc::new(kv_rows(
+            &(base..base + 200).map(|pk| (pk, pk as i64, 1)).collect::<Vec<_>>(),
+        ))
+    };
+    let (a, b, small) = (rows(0), rows(1000), Arc::new(batch_a(&[1, 2])));
     let push = |batch| Request::Push {
         target: 4.into(),
         batch,
         mode: WireConflictMode::Update,
     };
-    let first = s.submit(push(&big));
-    let second = s.submit(push(&small));
-    assert_eq!(s.requests_sent(), 2);
+    let first = s.submit(push(&a));
+    let one = s.transport.queued_bytes();
+    assert!(one <= gnitz_wire::FRAME_LEN_PREFIX_BYTES + 1024, "{one} bytes queued");
+    let second = s.submit(push(&b));
+    let third = s.submit(push(&small));
+    let fourth = s.submit(Request::AllocIds(3));
+    assert_eq!(s.requests_sent(), 4);
+    let ids_frame = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::CTRL_HEADER_SIZE;
+    assert_eq!(
+        s.transport.queued_bytes(),
+        one + ids_frame,
+        "writes behind are held as rows"
+    );
     while s.interest().write {
         s.step(Interest::WRITE);
     }
-    let mut got = ZSetBatch::new(big.schema());
-    loop {
-        let frame = peer.recv();
-        assert!(frame.len() <= 1024);
-        let ctrl = peek_control_block(&frame).unwrap();
-        assert_eq!(ctrl.client_verb(), Ok(ClientVerb::Push));
-        got.extend_from_owned(frame_data(&frame, &ctrl, big.schema()).unwrap());
-        if !ctrl.hdr.flags.continuation {
-            break;
+    for want in [&a, &b] {
+        let mut got = ZSetBatch::new(want.schema());
+        loop {
+            let frame = peer.recv();
+            assert!(frame.len() <= 1024);
+            let ctrl = peek_control_block(&frame).unwrap();
+            assert_eq!(ctrl.client_verb(), Ok(ClientVerb::Push));
+            got.extend_from_owned(frame_data(&frame, &ctrl, want.schema()).unwrap());
+            if !ctrl.hdr.flags.continuation {
+                break;
+            }
         }
+        assert_eq!(got, **want);
     }
-    assert_eq!(got, big);
     assert_eq!(
         peer.recv(),
         one_frame(push(&small)),
         "a write within the ceiling is one frame"
     );
+    let ids = peer.recv();
+    assert_eq!(
+        peek_control_block(&ids).unwrap().client_verb(),
+        Ok(ClientVerb::AllocIds)
+    );
     peer.send(&reply_ctrl(4, 11));
     peer.send(&reply_ctrl(4, 12));
+    peer.send(&reply_ctrl(4, 13));
+    peer.send(&reply_ctrl(0, 14));
     assert_eq!(await_reply(&mut s, first).unwrap(), 11);
     assert_eq!(await_reply(&mut s, second).unwrap(), 12);
+    assert_eq!(await_reply(&mut s, third).unwrap(), 13);
+    assert_eq!(await_reply(&mut s, fourth).unwrap(), 14);
 }
 
 /// The one frame `req`, a write within the frame ceiling, goes as.
 fn one_frame(req: Request<'_>) -> Vec<u8> {
     let (verb, families) = req.write_families().expect("a write");
-    let write = SpanningWrite::cut(verb, &families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
+    let write = SpanningWrite::cut(verb, families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
     assert_eq!(write.frames(), 1);
     let mut out = Vec::new();
     write.encode(0, &mut out);
@@ -1223,7 +1253,7 @@ fn a_write_within_the_ceiling_is_the_wire_encoders_frame() {
         family(ZSetBatch::new(&schema)),
         family(batch_b(&[3])),
     ];
-    let (rows, empty) = (batch_b(&[1, 2, 3]), ZSetBatch::new(&schema));
+    let (rows, empty) = (Arc::new(batch_b(&[1, 2, 3])), Arc::new(ZSetBatch::new(&schema)));
     let push = |batch| Request::Push {
         target: 3.into(),
         batch,
@@ -1233,7 +1263,7 @@ fn a_write_within_the_ceiling_is_the_wire_encoders_frame() {
     hdr.flags.conflict_mode = WireConflictMode::Update;
     for batch in [&rows, &empty] {
         let mut want = Vec::new();
-        append_payload(&mut want, hdr, schema.shape_record(), Some(batch));
+        append_payload(&mut want, hdr, schema.shape_record(), Some(&**batch));
         assert_eq!(one_frame(push(batch)), want);
     }
     let items: Vec<_> = (families.iter())

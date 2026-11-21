@@ -35,8 +35,9 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 /// Unwritten frame bytes one connection may hold; `submit` refuses past it. An
 /// encoded push is a full copy of its batch, so the count above bounds no
 /// memory on its own. Checked before queueing, so one request always goes
-/// through, a write spanning several frames whole — what it bounds is a driver
-/// that submits without flushing.
+/// through — what it bounds is a driver that submits without flushing. A write
+/// queued behind others, or past the frame ceiling, is held as its batches and
+/// counts only its frames encoded.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
 /// One relation's read result.
@@ -111,10 +112,11 @@ pub(crate) enum Request<'a> {
     /// An atomic user-table push transaction: the server refuses it if some
     /// family's relation was written after that family's `basis`.
     PushTxn(&'a [PushFamily]),
-    /// PUSH. Its blob is always the batch's schema's record.
+    /// PUSH. Its blob is always the batch's schema's record. Held, not
+    /// copied, by a write spanning several frames until its last is encoded.
     Push {
         target: Target,
-        batch: &'a ZSetBatch,
+        batch: &'a Arc<ZSetBatch>,
         mode: WireConflictMode,
     },
     /// SNAPSHOT_OPEN; the ACK names the snapshot.
@@ -141,27 +143,19 @@ impl<'a> Request<'a> {
 
     /// A write's families, as frames carry them: a PUSH's one, a PUSH_TXN's
     /// every one; `None` for a request that writes no user rows.
-    fn write_families(&self) -> Option<(ClientVerb, SmallVec<[WriteFamily<'a>; 1]>)> {
+    fn write_families(&self) -> Option<(ClientVerb, SmallVec<[WriteFamily; 1]>)> {
         match *self {
             Request::Push { target, batch, mode } => {
-                let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
-                hdr.flags.conflict_mode = mode;
                 let family = WriteFamily {
-                    hdr,
-                    blob: batch.schema().shape_record(),
-                    rows: batch.view(),
+                    hdr: ControlHeader::item(ClientVerb::Push, target, 0, mode),
+                    batch: Arc::clone(batch),
                 };
                 Some((ClientVerb::Push, smallvec::smallvec![family]))
             }
             Request::PushTxn(families) => {
-                let families = families.iter().map(|f| {
-                    let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis);
-                    hdr.flags.conflict_mode = f.mode;
-                    WriteFamily {
-                        hdr,
-                        blob: f.batch.schema().shape_record(),
-                        rows: f.batch.view(),
-                    }
+                let families = (families.iter()).map(|f| WriteFamily {
+                    hdr: f.head(),
+                    batch: Arc::clone(&f.batch),
                 });
                 Some((ClientVerb::PushTxn, families.collect()))
             }
@@ -222,6 +216,13 @@ pub(crate) struct PushFamily {
     /// watermark among the reads this family's writes were built from; `BLIND`
     /// when none was.
     pub(crate) basis: u64,
+}
+
+impl PushFamily {
+    /// The item header its chunks carry.
+    fn head(&self) -> ControlHeader {
+        ControlHeader::item(ClientVerb::PushTxn, self.target, self.basis, self.mode)
+    }
 }
 
 /// One request in flight, or a pushed train: how its reply decodes, the reply
@@ -557,11 +558,7 @@ impl Session {
         };
         let ceiling = self.write_frame_bytes;
         let queued = self.admit_with(|t| {
-            let write = SpanningWrite::cut(verb, &families, ceiling).map_err(oversize)?;
-            for at in 0..write.frames() {
-                t.frame(|out| write.encode(at, out))
-                    .expect("a frame cut within the ceiling");
-            }
+            t.write(SpanningWrite::cut(verb, families, ceiling).map_err(oversize)?);
             Ok(())
         });
         match queued {

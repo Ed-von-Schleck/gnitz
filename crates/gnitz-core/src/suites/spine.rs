@@ -39,7 +39,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     // A push, then a scan, `n` times over.
     let (mut pushes, mut scans) = (Vec::new(), Vec::new());
     for i in 0..n {
-        let batch = rows(&schema, i * per..(i + 1) * per);
+        let batch = Arc::new(rows(&schema, i * per..(i + 1) * per));
         pushes.push(s.submit(push_req(tid, &batch)));
         scans.push(s.submit_scan(tid.into(), &all, &schema));
     }

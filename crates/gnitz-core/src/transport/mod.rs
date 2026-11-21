@@ -3,11 +3,13 @@
 //! [`ClientTransport::connect`].
 //!
 //! It is the frame layer under a [`Session`](crate::connection::Session), which knows which
-//! request a frame answers; this layer knows only frames. A connection of a
+//! request a frame answers; this layer knows only frames, and the writes it
+//! encodes into frames as the socket takes them. A connection of a
 //! process that records ([`crate::recording`]) records every frame it queues to
 //! send or receives after its HELLO.
 
 use gnitz_wire::FrameBytes;
+use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
@@ -19,6 +21,7 @@ use std::time::Instant;
 use gnitz_wire::{AuthStatus, Deframer, HelloError};
 
 use crate::recording::{Direction, Tap};
+use crate::write_frames::SpanningWrite;
 use crate::{ClientError, ProtocolError};
 
 mod tls;
@@ -33,6 +36,13 @@ pub struct ClientTransport {
     /// A read ended with bytes of it unfed, so the stream has lost its framing.
     torn: bool,
     queue: OutBuf,
+    /// What is queued behind `queue`, in send order, and goes into it once it
+    /// is written: a write past the frame ceiling is encoded a frame at a
+    /// time, so beside its rows it holds the frame being written, and what is
+    /// queued behind such a write waits its turn.
+    owed: VecDeque<Owed>,
+    /// The bytes of every [`Owed::Framed`].
+    owed_bytes: usize,
     /// Where this connection records its frames, when its process records.
     tap: Option<Tap>,
 }
@@ -218,6 +228,8 @@ impl ClientTransport {
             window: Box::new_uninit_slice(WINDOW_BYTES),
             torn: false,
             queue: OutBuf::default(),
+            owed: VecDeque::new(),
+            owed_bytes: 0,
             tap: None,
         }
     }
@@ -305,27 +317,72 @@ impl ClientTransport {
     /// handed, behind everything already queued. A payload past
     /// [`gnitz_wire::MAX_FRAME_PAYLOAD`] is taken back out and refused with
     /// its length. Nothing is written here; `flush` ships the queue. A
-    /// recording connection records the frame as sent here.
+    /// recording connection records the frame as it goes into the queue.
     pub(crate) fn frame(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), usize> {
-        let q = &mut self.queue;
-        q.compact();
-        let at = q.buf.len();
-        let body = at + gnitz_wire::FRAME_LEN_PREFIX_BYTES;
-        q.buf.resize(body, 0);
-        encode(&mut q.buf);
-        let len = q.buf.len() - body;
-        if len > gnitz_wire::MAX_FRAME_PAYLOAD {
-            q.buf.truncate(at);
-            if q.is_empty() {
-                q.settle();
+        if self.owed.is_empty() {
+            return self.queue.frame(self.tap.as_ref(), encode);
+        }
+        self.owe_frame(encode)
+    }
+
+    /// Queue the frame `encode`'s payload makes behind what is owed.
+    fn owe_frame(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), usize> {
+        if !matches!(self.owed.back(), Some(Owed::Framed(_))) {
+            self.owed.push_back(Owed::Framed(Vec::new()));
+        }
+        let Some(Owed::Framed(framed)) = self.owed.back_mut() else {
+            unreachable!("a framed run was just made last")
+        };
+        let at = framed.len();
+        if let Err(len) = append_framed(framed, encode) {
+            // A refused frame leaves no run of its own.
+            if framed.is_empty() {
+                self.owed.pop_back();
             }
             return Err(len);
         }
-        q.buf[at..body].copy_from_slice(&gnitz_wire::frame_len_prefix(len));
-        if let Some(tap) = &self.tap {
-            tap.note(Direction::Sent, &q.buf[body..]);
-        }
+        self.owed_bytes += framed.len() - at;
         Ok(())
+    }
+
+    /// Queue `write`'s frames behind everything already queued, each encoded
+    /// once what is ahead of it is written; its first at once when nothing
+    /// is owed ahead of it.
+    pub(crate) fn write(&mut self, write: SpanningWrite) {
+        let mut next = 0;
+        if self.owed.is_empty() {
+            let first = self.queue.frame(self.tap.as_ref(), |out| write.encode(0, out));
+            first.expect("a frame cut within the ceiling");
+            next = 1;
+        }
+        if next < write.frames() {
+            self.owed.push_back(Owed::Write { write, next });
+        }
+    }
+
+    /// Move what is owed next into the written queue; false when nothing is.
+    fn refill(&mut self) -> bool {
+        let Some(owed) = self.owed.front_mut() else {
+            return false;
+        };
+        let tap = self.tap.as_ref();
+        let done = match owed {
+            Owed::Write { write, next } => {
+                let frame = self.queue.frame(tap, |out| write.encode(*next, out));
+                frame.expect("a frame cut within the ceiling");
+                *next += 1;
+                *next == write.frames()
+            }
+            Owed::Framed(framed) => {
+                self.owed_bytes -= framed.len();
+                self.queue.extend_framed(tap, framed);
+                true
+            }
+        };
+        if done {
+            self.owed.pop_front();
+        }
+        true
     }
 
     /// Write what the fd accepts from the queue cursor. Never parks; what is
@@ -333,7 +390,7 @@ impl ClientTransport {
     pub fn flush(&mut self) -> Result<(), ProtocolError> {
         loop {
             self.inner.ship_ciphertext()?;
-            if self.inner.has_pending_ciphertext() || self.queue.is_empty() {
+            if self.inner.has_pending_ciphertext() || (self.queue.is_empty() && !self.refill()) {
                 return Ok(());
             }
             match self.inner.write_bytes(self.queue.pending())? {
@@ -343,16 +400,17 @@ impl ClientTransport {
         }
     }
 
-    /// Frame bytes queued and not yet written.
+    /// Frame bytes encoded and not yet written; an owed write counts only
+    /// the frames it has encoded.
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.queue.pending().len()
+        self.queue.pending().len() + self.owed_bytes
     }
 
-    /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
+    /// Frames queued, or ciphertext pending: the `WRITE` half of a driver's
     /// interest. On TLS the ciphertext can outlast the queue that emptied into
     /// it.
     pub fn wants_write(&self) -> bool {
-        !self.queue.is_empty() || self.inner.has_pending_ciphertext()
+        !self.queue.is_empty() || !self.owed.is_empty() || self.inner.has_pending_ciphertext()
     }
 
     /// Shut the socket down so the peer sees EOF, and drop every queued frame.
@@ -363,6 +421,8 @@ impl ClientTransport {
             Inner::Tls(t) => t.sock.shutdown(Shutdown::Both),
         };
         self.queue = OutBuf::default();
+        self.owed.clear();
+        self.owed_bytes = 0;
     }
 
     /// One read of the socket, handing `on_frame` every frame it completes.
@@ -419,6 +479,31 @@ impl ClientTransport {
 
 // ── Framing: the outbound queue ──────────────────────────────────────────────
 
+/// What the outbound queue is owed: a write's frames from frame `next` on, or
+/// frames already encoded, each behind its length prefix.
+enum Owed {
+    Write { write: SpanningWrite, next: usize },
+    Framed(Vec<u8>),
+}
+
+/// Append to `out` the frame whose payload `encode` appends to it: its length
+/// prefix, then the payload. A payload past [`gnitz_wire::MAX_FRAME_PAYLOAD`]
+/// is taken back out and refused with its length.
+#[inline(always)]
+fn append_framed(out: &mut Vec<u8>, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), usize> {
+    let at = out.len();
+    let body = at + gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+    out.resize(body, 0);
+    encode(out);
+    let len = out.len() - body;
+    if len > gnitz_wire::MAX_FRAME_PAYLOAD {
+        out.truncate(at);
+        return Err(len);
+    }
+    out[at..body].copy_from_slice(&gnitz_wire::frame_len_prefix(len));
+    Ok(())
+}
+
 /// Capacity the outbound buffer keeps once everything in it is written; a
 /// larger allocation goes back to [`gnitz_wire::frame_buf`]'s pool, which the
 /// encoders reserve a large frame from.
@@ -442,6 +527,38 @@ impl OutBuf {
     /// The bytes queued and not yet written.
     fn pending(&self) -> &[u8] {
         &self.buf[self.off..]
+    }
+
+    /// Append the frame `encode`'s payload makes, as [`ClientTransport::frame`]
+    /// queues it, recording it on `tap`.
+    fn frame(&mut self, tap: Option<&Tap>, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), usize> {
+        self.compact();
+        let at = self.buf.len();
+        if let Err(len) = append_framed(&mut self.buf, encode) {
+            if self.is_empty() {
+                self.settle();
+            }
+            return Err(len);
+        }
+        if let Some(tap) = tap {
+            tap.note(Direction::Sent, &self.buf[at + gnitz_wire::FRAME_LEN_PREFIX_BYTES..]);
+        }
+        Ok(())
+    }
+
+    /// Append `framed`, whole frames each behind its length prefix as
+    /// [`append_framed`] writes them, recording each on `tap`.
+    fn extend_framed(&mut self, tap: Option<&Tap>, framed: &[u8]) {
+        self.compact();
+        gnitz_wire::frame_buf::reserve(&mut self.buf, framed.len());
+        self.buf.extend_from_slice(framed);
+        let Some(tap) = tap else { return };
+        let mut rest = framed;
+        while let Some((prefix, tail)) = rest.split_first_chunk::<{ gnitz_wire::FRAME_LEN_PREFIX_BYTES }>() {
+            let (frame, after) = tail.split_at(u32::from_le_bytes(*prefix) as usize);
+            tap.note(Direction::Sent, frame);
+            rest = after;
+        }
     }
 
     /// Advance the cursor by `n` written bytes.

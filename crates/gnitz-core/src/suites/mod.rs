@@ -105,7 +105,7 @@ fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
 }
 
 /// `batch` pushed into `tid` as an upsert.
-fn push_req(tid: u64, batch: &ZSetBatch) -> Request<'_> {
+fn push_req(tid: u64, batch: &Arc<ZSetBatch>) -> Request<'_> {
     Request::Push {
         target: tid.into(),
         batch,

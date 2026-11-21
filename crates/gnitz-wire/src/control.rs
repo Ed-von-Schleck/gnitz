@@ -73,6 +73,14 @@ impl ControlHeader {
         }
     }
 
+    /// The header of one family of a `PUSH` or a transaction's item: `verb`
+    /// naming `target` at `basis`, its rows written under `mode`.
+    pub fn item(verb: ClientVerb, target: Target, basis: u64, mode: WireConflictMode) -> Self {
+        let mut hdr = ControlHeader::naming(verb, target, basis);
+        hdr.flags.conflict_mode = mode;
+        hdr
+    }
+
     /// The relation a [`Self::naming`] header names.
     pub fn target(&self) -> Target {
         Target { tid: self.target_id, token: self.arg1 }

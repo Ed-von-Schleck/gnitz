@@ -382,7 +382,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         let (n_pushes, per) = (30u64, 25_000u64);
         let pushes: Vec<_> = (0..n_pushes)
             .map(|i| {
-                let batch = rows(&schema, i * per..(i + 1) * per);
+                let batch = Arc::new(rows(&schema, i * per..(i + 1) * per));
                 s.submit(push_req(tid, &batch))
             })
             .collect();
@@ -451,7 +451,7 @@ fn a_stalled_client_flooding_pushes_is_held_off_and_evicted() {
         let _unread = s.submit_scan(tid.into(), &all, &schema);
 
         // ~140 MB of rows the table does not hold, ~1 MB a frame.
-        let flood = rows(&schema, 200_000..225_000);
+        let flood = Arc::new(rows(&schema, 200_000..225_000));
         let mut sent = 0;
         while sent < 140 && s.submit(push_req(tid, &flood)).try_take().is_none() && write_out(&mut s) {
             sent += 1;

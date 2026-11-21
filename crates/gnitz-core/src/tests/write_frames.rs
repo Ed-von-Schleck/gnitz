@@ -29,18 +29,20 @@ fn string_rows(first: u64, n: u64) -> ZSetBatch {
     b
 }
 
-fn family<'a>(verb: ClientVerb, tid: u64, mode: WireConflictMode, basis: u64, batch: &'a ZSetBatch) -> WriteFamily<'a> {
-    let mut hdr = ControlHeader::naming(verb, Target { tid, token: tid + 100 }, basis);
-    hdr.flags.conflict_mode = mode;
+fn family(verb: ClientVerb, tid: u64, mode: WireConflictMode, basis: u64, batch: &ZSetBatch) -> WriteFamily {
     WriteFamily {
-        hdr,
-        blob: batch.schema().shape_record(),
-        rows: batch.view(),
+        hdr: ControlHeader::item(verb, Target { tid, token: tid + 100 }, basis, mode),
+        batch: Arc::new(batch.clone()),
     }
 }
 
+/// `families`, cut as a write of `verb` at `ceiling`.
+fn cut(verb: ClientVerb, families: &[WriteFamily], ceiling: usize) -> Result<SpanningWrite, usize> {
+    SpanningWrite::cut(verb, families.iter().cloned().collect(), ceiling)
+}
+
 /// Every frame of `write`, encoded.
-fn encoded(write: &SpanningWrite<'_>) -> Vec<Vec<u8>> {
+fn encoded(write: &SpanningWrite) -> Vec<Vec<u8>> {
     (0..write.frames())
         .map(|at| {
             let mut out = Vec::new();
@@ -71,7 +73,7 @@ fn a_push_is_cut_into_whole_push_frames_at_row_boundaries() {
     ] {
         let fams = [family(ClientVerb::Push, 7, WireConflictMode::Error, 0, &batch)];
         let ceiling = 4096;
-        let write = SpanningWrite::cut(ClientVerb::Push, &fams, ceiling).unwrap();
+        let write = cut(ClientVerb::Push, &fams, ceiling).unwrap();
         let frames = encoded(&write);
         assert!(frames.len() > 2, "{} frames", frames.len());
         let mut got = ZSetBatch::new(batch.schema());
@@ -107,7 +109,7 @@ fn a_push_txn_is_cut_into_whole_txn_frames_keeping_family_order() {
         family(ClientVerb::PushTxn, 2, WireConflictMode::Update, 14, &c),
     ];
     let ceiling = 8192;
-    let write = SpanningWrite::cut(ClientVerb::PushTxn, &fams, ceiling).unwrap();
+    let write = cut(ClientVerb::PushTxn, &fams, ceiling).unwrap();
     let frames = encoded(&write);
     assert!(frames.len() > 3, "{} frames", frames.len());
     // Each item as (family index it names, its rows), folding a family's chunks.
@@ -145,7 +147,7 @@ fn a_push_txn_is_cut_into_whole_txn_frames_keeping_family_order() {
 fn a_row_past_the_ceiling_goes_alone_unless_past_the_frame_cap() {
     let batch = string_rows(0, 3);
     let fams = [family(ClientVerb::Push, 7, WireConflictMode::Update, 0, &batch)];
-    let write = SpanningWrite::cut(ClientVerb::Push, &fams, 1).unwrap();
+    let write = cut(ClientVerb::Push, &fams, 1).unwrap();
     assert_eq!(write.frames(), 3, "a frame per row");
 
     let mut wide = ZSetBatch::new(batch.schema());
@@ -154,7 +156,7 @@ fn a_row_past_the_ceiling_goes_alone_unless_past_the_frame_cap() {
         .put_string(&"x".repeat(MAX_FRAME_PAYLOAD))
         .put_int(1);
     let fams = [family(ClientVerb::Push, 7, WireConflictMode::Update, 0, &wide)];
-    let refused = SpanningWrite::cut(ClientVerb::Push, &fams, 4096).err();
+    let refused = cut(ClientVerb::Push, &fams, 4096).err();
     assert!(refused.is_some_and(|size| size > MAX_FRAME_PAYLOAD), "{refused:?}");
 }
 
@@ -171,7 +173,7 @@ fn an_empty_family_fits_its_frame_at_every_ceiling() {
         family(ClientVerb::PushTxn, 1, WireConflictMode::Update, 13, &a),
     ];
     for ceiling in 200..2000 {
-        let write = SpanningWrite::cut(ClientVerb::PushTxn, &fams, ceiling).unwrap();
+        let write = cut(ClientVerb::PushTxn, &fams, ceiling).unwrap();
         let mut bases = Vec::new();
         for (i, f) in encoded(&write).iter().enumerate() {
             assert!(f.len() <= ceiling, "ceiling {ceiling}: frame {i} is {} bytes", f.len());
@@ -190,7 +192,7 @@ fn an_empty_family_fits_its_frame_at_every_ceiling() {
 fn an_empty_push_goes_without_a_data_block() {
     let empty = ZSetBatch::new(&kv_schema(TypeCode::I64));
     let fams = [family(ClientVerb::Push, 7, WireConflictMode::Update, 0, &empty)];
-    let write = SpanningWrite::cut(ClientVerb::Push, &fams, 1).unwrap();
+    let write = cut(ClientVerb::Push, &fams, 1).unwrap();
     let frames = encoded(&write);
     assert_eq!(frames.len(), 1);
     assert!(peek_control_block(&frames[0]).unwrap().data.is_none());
