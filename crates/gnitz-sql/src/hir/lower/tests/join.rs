@@ -45,36 +45,36 @@ fn join_keep_rules() {
         cols: [col(0, 3), col(1, 2)],
         ty: TypeCode::U64.into(),
     };
-    /// The shape, the kind, what is read above the join, and each side's keep list and
-    /// pinned PK arity.
-    type Case = (Shape, JoinType, &'static [(usize, usize)], [(&'static [u32], usize); 2]);
+    /// The shape, the kind, what is read above the join, and each side's keep list,
+    /// a pinned PK at its front.
+    type Case = (Shape, JoinType, &'static [(usize, usize)], [&'static [u32]; 2]);
     #[rustfmt::skip]
     let cases: &[Case] = &[
         // Rule 4: a pair-PK side keeps its PK, in PK-list order; an INNER keeps no key
         // for a ν it lacks.
-        (Band,  Inner, &[], [(&[1], 1), (&[3, 0], 2)]),
-        (PureRange, Inner, &[], [(&[1], 1), (&[3, 0], 2)]),
-        (Cross, Inner, &[], [(&[1], 1), (&[3, 0], 2)]),
+        (Band,  Inner, &[], [&[1], &[3, 0]]),
+        (PureRange, Inner, &[], [&[1], &[3, 0]]),
+        (Cross, Inner, &[], [&[1], &[3, 0]]),
         // Rule 3: each side with a ν keeps its keys, behind its pinned PK.
-        (Band,  Left,  &[], [(&[1, 2, 3], 1), (&[3, 0], 2)]),
-        (Band,  Right, &[], [(&[1], 1), (&[3, 0, 1, 2], 2)]),
-        (Band,  Full,  &[], [(&[1, 2, 3], 1), (&[3, 0, 1, 2], 2)]),
-        (PureRange, Left,  &[], [(&[1, 3], 1), (&[3, 0], 2)]),
+        (Band,  Left,  &[], [&[1, 2, 3], &[3, 0]]),
+        (Band,  Right, &[], [&[1], &[3, 0, 1, 2]]),
+        (Band,  Full,  &[], [&[1, 2, 3], &[3, 0, 1, 2]]),
+        (PureRange, Left,  &[], [&[1, 3], &[3, 0]]),
         // A decorrelated kind has a ν over its left and pins that side alone.
-        (Band,  Exists(Semi),  &[], [(&[1, 2, 3], 1), (&[], 0)]),
-        (PureRange, Exists(Anti),  &[], [(&[1, 3], 1), (&[], 0)]),
+        (Band,  Exists(Semi),  &[], [&[1, 2, 3], &[]]),
+        (PureRange, Exists(Anti),  &[], [&[1, 3], &[]]),
         // The pinned PK leads even ahead of a lower slot read above, and appears once.
-        (Band,  Left,  &[(0, 0), (0, 1)], [(&[1, 0, 2, 3], 1), (&[3, 0], 2)]),
-        (Band,  Left,  &[(1, 1)], [(&[1, 2, 3], 1), (&[3, 0, 1], 2)]),
+        (Band,  Left,  &[(0, 0), (0, 1)], [&[1, 0, 2, 3], &[3, 0]]),
+        (Band,  Left,  &[(1, 1)], [&[1, 2, 3], &[3, 0, 1]]),
         // An equi side keeps only what is read above the join; its ν is a linear difference.
-        (Equi, Left,  &[], [(&[], 0), (&[], 0)]),
-        (Equi, Right, &[], [(&[], 0), (&[], 0)]),
-        (Equi, Full,  &[], [(&[], 0), (&[], 0)]),
-        (Equi, Exists(Mark(mark)), &[], [(&[], 0), (&[], 0)]),
-        (Equi, Exists(Mark(mark)), &[(0, 3)], [(&[3], 0), (&[], 0)]),
-        (Equi, Left,  &[(0, 3)], [(&[3], 0), (&[], 0)]),
-        (Equi, Inner, &[(1, 3)], [(&[], 0), (&[3], 0)]),
-        (Equi, Inner, &[], [(&[], 0), (&[], 0)]),
+        (Equi, Left,  &[], [&[], &[]]),
+        (Equi, Right, &[], [&[], &[]]),
+        (Equi, Full,  &[], [&[], &[]]),
+        (Equi, Exists(Mark(mark)), &[], [&[], &[]]),
+        (Equi, Exists(Mark(mark)), &[(0, 3)], [&[3], &[]]),
+        (Equi, Left,  &[(0, 3)], [&[3], &[]]),
+        (Equi, Inner, &[(1, 3)], [&[], &[3]]),
+        (Equi, Inner, &[], [&[], &[]]),
     ];
     for &(shape, kind, reads, want) in cases {
         let class = JoinClass {
@@ -96,7 +96,7 @@ fn join_keep_rules() {
             .chain(matches!(kind, Exists(Mark(_))).then_some(mark))
             .collect();
         let got = join_keep(&refs, &class, kind, out_key(plan, kind), &frames).unwrap();
-        let got = got.each_ref().map(|(keep, pa)| (keep.as_slice(), *pa));
+        let got = got.each_ref().map(Vec::as_slice);
         assert_eq!(got, want, "{shape:?} {kind:?} reads={reads:?}");
     }
 }

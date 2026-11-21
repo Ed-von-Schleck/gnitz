@@ -15,6 +15,7 @@ mod bind;
 mod lower;
 mod physical;
 mod place;
+mod read;
 
 pub(crate) use bind::{BoundRef, ViewBody};
 
@@ -69,8 +70,7 @@ pub(crate) fn bind_and_lower<'a>(
 }
 
 pub(crate) use bind::ranking_names;
-pub(crate) use lower::fold::FoldPieces;
-pub(crate) use lower::read::{AdhocRead, AdhocShape, RowsReply};
+pub(crate) use read::{AdhocRead, AdhocShape, FoldPieces, RowsReply};
 
 /// The ad-hoc read path's entry to the same core: bind a query that reads one
 /// relation — its CTEs, then its body — and lower it to one read of that
@@ -99,7 +99,7 @@ pub(crate) fn bind_adhoc_read(
     let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc);
     bind::bind_ctes(&mut cx, query)?;
     let (rel, order) = bind::bind_select(&cx, select, &keys)?;
-    lower::read::lower_read(&rel, order, cx.refs.into_inner())
+    read::lower_read(&rel, order, cx.refs.into_inner())
 }
 
 /// An `INSERT … RETURNING` list as the reply items of a read of `desc`.
@@ -110,7 +110,7 @@ pub(crate) fn bind_returning(
 ) -> Result<RowsReply, GnitzSqlError> {
     let ids = ColIdGen::new();
     let (source, items) = bind::bind_returning(&ids, projection, &desc.schema, alias)?;
-    lower::read::reply_rows(physical::Frame::scan(desc, &source), items, Vec::new(), false)
+    read::reply_rows(physical::Frame::scan(desc, &source), items, Vec::new(), false)
 }
 
 /// Opaque column identity, unique within one bind (one [`ColIdGen`]), never
@@ -947,7 +947,7 @@ impl RelExpr {
                     Cow::Owned(cols)
                 }
                 JoinType::Exists(_) => left.cols(),
-                // Null-widened per `JoinType::widen_sides`, as `join_frame` does.
+                // Null-widened per `JoinType::widen_sides`, as the join shell's frame is.
                 _ => {
                     let mut cols = left.cols().into_owned();
                     let mut rcols = right.cols().into_owned();

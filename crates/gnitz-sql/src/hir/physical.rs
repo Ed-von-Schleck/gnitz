@@ -5,12 +5,14 @@
 //! expression, a bare `ColRef` being a copy, under the PK-front convention, whose
 //! single home is `place_pk_front`.
 
-use super::{ColId, HirCol, HirExpr, ProjEntry};
+use super::{AggCol, ColId, HirCol, HirExpr, OrderCol, ProjEntry};
+use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use crate::project::{compute_map, payload_program};
 use gnitz_core::{RelDescriptor, Schema};
-use gnitz_wire::{ColumnDef, ComputeMap};
+use gnitz_wire::{AggDescriptor, ColumnDef, ComputeMap, GroupAggs, OrderKey};
+use gnitz_zset::schema::{ReduceOutSlot, reduce_out_layout};
 use std::sync::Arc;
 
 /// A frame slot: the identity that names it, if any, and its column.
@@ -71,6 +73,54 @@ impl Frame {
     /// [`Self::slot`] for each of `ids`, in order.
     pub(crate) fn slots(&self, ids: impl IntoIterator<Item = ColId>) -> Result<Vec<usize>, GnitzSqlError> {
         ids.into_iter().map(|id| self.slot(id)).collect()
+    }
+
+    /// A group-keyed operator's group and aggregate columns over this frame: its
+    /// group list as [`Self::reduce_group`] sends it, and one spec per aggregate.
+    pub(crate) fn group_aggs(&self, group: &[ColId], aggs: &[AggCol]) -> Result<GroupAggs, GnitzSqlError> {
+        let specs = (aggs.iter())
+            .map(|c| {
+                // COUNT(*) reads no column; slot 0 is the placeholder.
+                let col_idx = c.arg.map(|id| self.slot(id)).transpose()?.unwrap_or(0) as u32;
+                Ok(AggDescriptor { agg_op: c.op, col_idx })
+            })
+            .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+        Ok(GroupAggs {
+            group_cols: self.reduce_group(group)?,
+            aggs: specs,
+        })
+    }
+
+    /// A group-keyed operator's output frame over this one: the reduce output
+    /// layout of `group` and `row`, then `tail`.
+    pub(crate) fn keyed_by(
+        &self,
+        group: &[u32],
+        row: impl IntoIterator<Item = u32>,
+        tail: Vec<Slot>,
+    ) -> Result<Frame, GnitzSqlError> {
+        let slots = reduce_out_layout(self.schema.layout(), group, row);
+        let npk = slots.iter().filter(|s| !matches!(s, ReduceOutSlot::Carried(_))).count();
+        let lead = slots.into_iter().map(|s| match s {
+            ReduceOutSlot::SyntheticKey => (None, group_pk_def()),
+            ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {
+                (self.layout[c as usize], self.schema.columns()[c as usize].clone())
+            }
+        });
+        Frame::new(lead.chain(tail), npk)
+    }
+
+    /// `order` as wire sort keys over this frame's slots.
+    pub(crate) fn order_keys(&self, order: &[OrderCol]) -> Result<Vec<OrderKey>, GnitzSqlError> {
+        (order.iter())
+            .map(|k| {
+                Ok(OrderKey {
+                    col: self.slot(k.col)? as u32,
+                    desc: k.desc,
+                    nulls_first: k.nulls_first,
+                })
+            })
+            .collect()
     }
 
     /// The group list to send a reduce, top-N or window grouped by `ids`' slots: SQL's

@@ -2,9 +2,9 @@
 //! key chosen by [`out_key`]; the output-key PK columns it mints; the re-keys onto
 //! join keys and source PKs; and the equi, range/band and cross emitters over them.
 
-use super::super::{ColId, ColSet, ExistsKind, HirExpr, JoinClass, JoinPlan, JoinType, RelExpr};
-use super::spine::{self, Peeled, Spine, Top};
-use super::{EmitPieces, ViewChain, materialize};
+use super::super::{ColSet, ExistsKind, JoinClass, JoinPlan, JoinType, RelExpr};
+use super::spine::{self, Head, Peeled, Spine, Top};
+use super::{EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
@@ -33,17 +33,6 @@ enum OutKey {
     OuterPk { owned: bool },
 }
 
-impl OutKey {
-    /// Which sides pin their `pk_cols` to the front of the keep list.
-    fn pins(self) -> [bool; 2] {
-        match self {
-            OutKey::JoinKey => [false, false],
-            OutKey::PairPk => [true, true],
-            OutKey::OuterPk { .. } => [true, false],
-        }
-    }
-}
-
 /// The key a step of `kind` planned as `plan` emits its rows under.
 fn out_key(plan: JoinPlan, kind: JoinType) -> OutKey {
     match plan {
@@ -52,6 +41,13 @@ fn out_key(plan: JoinPlan, kind: JoinType) -> OutKey {
         JoinPlan::PureRange(_) if matches!(kind, JoinType::Exists(_)) => OutKey::OuterPk { owned: true },
         JoinPlan::Band(_) | JoinPlan::PureRange(..) | JoinPlan::Cross => OutKey::PairPk,
     }
+}
+
+/// `schema`'s PK as a reindex key: each column at its key slot's type.
+fn pk_slots(schema: &Schema) -> Vec<ReindexSlot> {
+    (schema.pk_cols().iter())
+        .map(|&c| (c, schema.columns()[c as usize].ty.tc.reindex_output_type()))
+        .collect()
 }
 
 /// Lower the join of `left` and `right` with `above` over each of its branches to
@@ -65,14 +61,30 @@ pub(super) fn lower_join_view(
     class: &JoinClass,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let plan = class.plan();
-    let refs = &above.read;
-
-    let mut cb = Circuit::default();
     let out_key = out_key(plan, kind);
-    let sides = emit_join_inputs(chain, &mut cb, refs, [left, right], kind, class, out_key)?;
+    let mut cb = Circuit::default();
+    let sides = emit_join_inputs(chain, &mut cb, &above.read, [left, right], kind, class, out_key)?;
 
-    let out_pk = match out_key {
-        OutKey::JoinKey => join_pk_coldefs(class),
+    // The output PK columns: hidden, non-nullable, a source PK column re-keyed onto
+    // at its key slot type.
+    let rekeyed = |i: usize| {
+        let s: &JoinSide = &sides[i];
+        (s.frame.schema.hidden_key_columns().zip(&s.pk)).map(|(c, &(_, tc))| ColumnDef { ty: c.ty.with_code(tc), ..c })
+    };
+    let out_pk: Vec<ColumnDef> = match out_key {
+        // One per key slot at its pair's common type.
+        OutKey::JoinKey => {
+            let named = |i| -> Arc<str> {
+                match class.arity() {
+                    1 => "_join_pk".into(),
+                    _ => format!("_join_pk_{i}").into(),
+                }
+            };
+            (class.key_types().enumerate())
+                .map(|(i, ty)| ColumnDef::new(named(i), ty, false).hidden())
+                .collect()
+        }
+        // A's then B's source PK, numbered across both sides.
         OutKey::PairPk => {
             let surface = match plan {
                 JoinPlan::Cross => "CROSS JOIN output PK",
@@ -80,12 +92,18 @@ pub(super) fn lower_join_view(
             };
             reject_arity(
                 surface,
-                sides[0].pk_arity + sides[1].pk_arity,
+                sides[0].pk.len() + sides[1].pk.len(),
                 gnitz_wire::PK_LIST_MAX_COLS,
             )?;
-            pair_pk_coldefs(&sides[0].frame.schema, &sides[1].frame.schema)
+            (rekeyed(0).chain(rekeyed(1)).enumerate())
+                .map(|(i, c)| ColumnDef {
+                    name: format!("_pair_pk_{i}").into(),
+                    ..c
+                })
+                .collect()
         }
-        OutKey::OuterPk { .. } => src_pk_coldefs(&sides[0].frame.schema),
+        // The outer source PK under its own names: it also rides the payload verbatim.
+        OutKey::OuterPk { .. } => rekeyed(0).collect(),
     };
 
     if class.range.is_some() {
@@ -97,26 +115,45 @@ pub(super) fn lower_join_view(
             gnitz_wire::MAX_COLUMNS,
         )?;
     }
+    let k = class.arity();
     let branches = match plan {
-        JoinPlan::Equi => emit_equi(&mut cb, class, kind, &sides),
-        JoinPlan::Band(rel) => emit_band(&mut cb, class, rel, kind, &sides),
+        JoinPlan::Equi => emit_equi(&mut cb, k, kind, &sides),
+        JoinPlan::Band(rel) => emit_band(&mut cb, k, rel, kind, &sides),
         JoinPlan::PureRange(rel) => emit_pure_range(&mut cb, rel, kind, &sides),
-        JoinPlan::Cross => emit_cross(&mut cb, &sides),
+        // The keyless join `A × B`, INNER only. Each side is keyed on its own source
+        // PK, which takes no part in the match; a keyless term keys on `[left PK…,
+        // right PK…]`, which is the pair-PK itself, so both terms already share one
+        // schema: `[pair-PK, A, B]`.
+        JoinPlan::Cross => {
+            let deltas = [sides[0].on_pk(&mut cb), sides[1].on_pk(&mut cb)];
+            let traces = integrals(&mut cb, &sides, deltas);
+            vec![(cb.join(deltas, traces, JoinKind::Cross), None)]
+        }
     };
 
-    // The frame every branch filters and projects against.
-    let frame = join_frame(out_pk, &sides, kind)?;
+    // The frame every branch filters and projects against: the output PK, then both
+    // sides' kept payload with the null-providing side widened per `kind`, through
+    // the same `JoinType::widen_sides` the logical join output uses.
+    let [mut l, mut r] = sides.each_ref().map(|s| s.kept_defs().cloned().collect::<Vec<_>>());
+    kind.widen_sides(l.iter_mut(), r.iter_mut());
+    let ids = (sides.iter()).flat_map(|s| s.keep.iter().map(|&i| s.frame.layout[i as usize]));
+    let frame = Frame::keyed(out_pk, ids.zip(l.into_iter().chain(r)))?;
+
     let mut acc: Option<(NodeId, Frame)> = None;
     for (node, mark) in branches {
-        let (node, out) = match (kind, mark) {
+        let marked: Vec<_>;
+        let levels = match (kind, mark) {
+            // The mark column is in no layout: each branch reads it as its constant.
             (JoinType::Exists(ExistsKind::Mark(id)), Some(val)) => {
-                let levels: Vec<_> = (above.levels.iter())
-                    .map(|(level, read)| (level.rebuilt(&mut |c| mark_lit(c, id, val)), read.clone()))
+                let val = BExpr::LitBool(val);
+                marked = (above.levels.iter())
+                    .map(|(level, read)| (level.substituted(id, &val), read.clone()))
                     .collect();
-                spine::emit_over(&mut cb, &levels, node, frame.clone(), Top::Output)?
+                &marked
             }
-            _ => spine::emit_over(&mut cb, &above.levels, node, frame.clone(), Top::Output)?,
+            _ => &above.levels,
         };
+        let (node, out) = spine::emit_levels(&mut cb, levels, Top::Output, frame.clone(), Head::Node(node))?;
         acc = Some(match acc {
             None => (node, out),
             Some((prior, out)) => (cb.union(node, prior), out),
@@ -149,8 +186,8 @@ fn emit_join_inputs(
 ) -> Result<[JoinSide; 2], GnitzSqlError> {
     let live = [0, 1].map(|i| -> ColSet { refs.iter().chain(class.key_cols(i)).collect() });
     let mut spines = [
-        spine::open(chain, rels[0], &live[0])?,
-        spine::open(chain, rels[1], &live[1])?,
+        spine::peel(chain, rels[0], &live[0]).open(chain)?,
+        spine::peel(chain, rels[1], &live[1]).open(chain)?,
     ];
     // Each outer row is decided on the worker owning its PK, the output key. An
     // INNER step with no equality slot against a side of at most one row — unique
@@ -166,11 +203,13 @@ fn emit_join_inputs(
         one_row[1],
     ];
     // The key each side's delta is co-located by ahead of the circuit: its source
-    // PK, or the equality slots the sides meet on — broadcast by none.
+    // PK, or the equality slots the sides meet on — broadcast by none — each the
+    // column of the opened relation it copies; a computed one states no key.
     let scatter = |spine: &Spine<'_>, i: usize| match pk_placed[i] {
-        true => Some(spine.pk_key()),
-        false => spine.source_cols(class.key_cols(i).take(class.eq.len())).map(|cols| {
-            cols.into_iter()
+        true => Some(pk_slots(&spine.seg.frame.schema)),
+        false => spine.source_slots(class.key_cols(i).take(class.eq.len())).map(|slots| {
+            slots
+                .into_iter()
                 .zip(class.key_types())
                 .map(|(c, ty)| (c, ty.tc))
                 .collect()
@@ -178,37 +217,39 @@ fn emit_join_inputs(
     };
     // A scatter key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`)
     // is no column of the scanned relation, so nothing over that relation can state
-    // where its delta scatters. Cut to a segment, the computed column is one.
+    // where its delta scatters. Cut to a segment, the computed column is one. A join
+    // reads two distinct sources, one delta per epoch: a right side over the left's
+    // source is re-read as a second relation. A side cut here reads a fresh segment,
+    // so it collides with nothing.
+    let mut keys: [Vec<ReindexSlot>; 2] = Default::default();
     for i in 0..2 {
-        if scatter(&spines[i], i).is_none() {
-            spines[i] = Spine::segment(materialize(chain, rels[i], &live[i])?);
-        }
+        let collides = i == 1 && spines[0].seg.tid == spines[1].seg.tid;
+        keys[i] = match scatter(&spines[i], i).filter(|_| !collides) {
+            Some(key) => key,
+            None => {
+                let seg = chain.materialize(rels[i], &live[i])?;
+                spines[i] = Spine { seg, levels: Vec::new() };
+                scatter(&spines[i], i)
+                    .ok_or_else(|| GnitzSqlError::Internal("a segment states no scatter key".into()))?
+            }
+        };
     }
-    // A join reads two distinct sources, one delta per epoch: a right side over the
-    // left's source is re-read as a second relation. A side cut above reads a fresh
-    // segment, so it collides with nothing.
-    if spines[0].tid() == spines[1].tid() {
-        spines[1] = Spine::segment(materialize(chain, rels[1], &live[1])?);
-    }
-    for (i, spine) in spines.iter_mut().enumerate() {
-        let key = scatter(spine, i).ok_or_else(|| GnitzSqlError::Internal("a segment states no scatter key".into()))?;
-        spine.scatter(key);
-    }
-    let pk_repeats = spines.each_ref().map(Spine::pk_repeats);
+    let [s0, s1] = keys;
+    let pk_repeats = spines.each_ref().map(|s| s.seg.pk_repeats);
     // A backfill feeds the sources in scan order, and the first is joined against
     // nothing: where one side alone outputs its unmatched rows, it goes second.
     let [l, r] = spines;
     let [(a, frame_l), (b, frame_r)] = match kind.emits_unmatched(0) && !kind.emits_unmatched(1) {
         true => {
-            let b = r.emit(cb, Top::Slots)?;
-            [l.emit(cb, Top::Slots)?, b]
+            let b = r.emit(cb, Top::Slots, Some(s1))?;
+            [l.emit(cb, Top::Slots, Some(s0))?, b]
         }
-        false => [l.emit(cb, Top::Slots)?, r.emit(cb, Top::Slots)?],
+        false => [l.emit(cb, Top::Slots, Some(s0))?, r.emit(cb, Top::Slots, Some(s1))?],
     };
     let frames = [frame_l, frame_r];
     let [kept_l, kept_r] = join_keep(refs, class, kind, out_key, &frames)?;
     let [frame_l, frame_r] = frames;
-    let side = |i: usize, input, frame: Frame, (keep, pk_arity)| -> Result<JoinSide, GnitzSqlError> {
+    let side = |i: usize, input, frame: Frame, keep| -> Result<JoinSide, GnitzSqlError> {
         let slots = frame.slots(class.key_cols(i))?;
         Ok(JoinSide {
             input,
@@ -218,7 +259,7 @@ fn emit_join_inputs(
                 .map(|(c, t)| (c as u32, t.tc))
                 .collect(),
             keep,
-            pk_arity,
+            pk: pk_slots(&frame.schema),
             unique: unique[i],
             pk_repeats: pk_repeats[i],
             pk_placed: pk_placed[i],
@@ -238,9 +279,9 @@ struct JoinSide {
     /// The join key, [`JoinClass::key_cols`] order: each column as a `frame` slot,
     /// typed at its pair's common type.
     key: Vec<ReindexSlot>,
-    /// The pinned source PK's arity — `0` when this shape packs no PK out of the
-    /// payload.
-    pk_arity: usize,
+    /// The source PK as a reindex key, each column at its key slot's type. A side
+    /// the output key packs a PK out of keeps it at the front of `keep`.
+    pk: Vec<ReindexSlot>,
     /// Rows unique on this join's equality columns, so a row of the other side
     /// matches at most one.
     unique: bool,
@@ -257,11 +298,6 @@ impl JoinSide {
         self.keep.len()
     }
 
-    /// The kept payload's `ColId`s, in keep order.
-    fn ids(&self) -> impl Iterator<Item = Option<ColId>> {
-        self.keep.iter().map(|&i| self.frame.layout[i as usize])
-    }
-
     /// The kept payload columns' defs, in keep order.
     fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> {
         self.keep.iter().map(|&i| &self.frame.schema.columns()[i as usize])
@@ -272,10 +308,20 @@ impl JoinSide {
     fn kept_type_codes(&self) -> Vec<TypeCode> {
         self.kept_defs().map(|c| c.ty.tc).collect()
     }
+
+    /// This side's input re-keyed onto its join key, carrying the kept payload.
+    fn on_key(&self, cb: &mut Circuit, nulls: NullKeys) -> NodeId {
+        cb.map_reindex(self.input, &self.key, &self.keep, nulls)
+    }
+
+    /// This side's input re-keyed onto its source's PK, carrying the kept payload.
+    fn on_pk(&self, cb: &mut Circuit) -> NodeId {
+        cb.map_reindex(self.input, &self.pk, &self.keep, NullKeys::Keep)
+    }
 }
 
 /// Each side's reindex payload under the keep rule — which source columns survive
-/// into the join's traces, and so onto disk — and its pinned source PK's arity.
+/// into the join's traces, and so onto disk.
 /// A keep list is the pinned PK, then every other kept column in source order: it
 /// need not ascend, and the PK at the front is what makes every pair-PK slot list
 /// a range.
@@ -285,7 +331,7 @@ fn join_keep(
     kind: JoinType,
     out_key: OutKey,
     frames: &[Frame; 2],
-) -> Result<[(Vec<u32>, usize); 2], GnitzSqlError> {
+) -> Result<[Vec<u32>; 2], GnitzSqlError> {
     let mut keep = frames.each_ref().map(|f| vec![false; f.layout.len()]);
     // Rules 1 + 2: the projection and the WHERE over the join. The mark column is
     // in neither layout: the shell substitutes it per branch by its BOOLEAN constant.
@@ -293,7 +339,12 @@ fn join_keep(
         let side = usize::from(!frames[0].layout.contains(&Some(id)));
         keep[side][frames[side].slot(id)?] = true;
     }
-    let pins = out_key.pins();
+    // Which sides the output key packs a source PK out of.
+    let pins = match out_key {
+        OutKey::JoinKey => [false, false],
+        OutKey::PairPk => [true, true],
+        OutKey::OuterPk { .. } => [true, false],
+    };
     let banded = class.range.is_some();
     for side in 0..2 {
         // Rule 3: a band or pure-range side with a ν keeps its key columns. A band
@@ -315,125 +366,29 @@ fn join_keep(
     Ok([0, 1].map(|side| {
         let pinned: &[u32] = if pins[side] { frames[side].schema.pk_cols() } else { &[] };
         let rest = (0..keep[side].len() as u32).filter(|&i| keep[side][i as usize] && !pinned.contains(&i));
-        (pinned.iter().copied().chain(rest).collect(), pinned.len())
+        pinned.iter().copied().chain(rest).collect()
     }))
 }
 
-/// The leaf `id` with the mark column `mark_id` as its per-branch constant `val`.
-fn mark_lit(id: ColId, mark_id: ColId, val: bool) -> HirExpr {
-    match id == mark_id {
-        true => BExpr::LitBool(val),
-        false => BExpr::ColRef(id),
-    }
-}
-
-/// One half of the outer input split by match existence.
-#[derive(Clone, Copy)]
-enum Split {
-    Matched(NodeId),
-    Unmatched(NodeId),
-}
-
-/// `kind`'s branches, from one half of `all`; the other half is `all − known`.
-fn exists_branches(cb: &mut Circuit, kind: ExistsKind, split: Split, all: NodeId) -> Vec<Branch> {
-    let (Split::Matched(known) | Split::Unmatched(known)) = split;
-    let complement = |cb: &mut Circuit| cb.difference(all, known);
-    match (kind, split) {
-        (ExistsKind::Semi, Split::Matched(half)) | (ExistsKind::Anti, Split::Unmatched(half)) => vec![(half, None)],
-        (ExistsKind::Semi | ExistsKind::Anti, _) => vec![(complement(cb), None)],
-        (ExistsKind::Mark(_), Split::Matched(matched)) => vec![(matched, Some(true)), (complement(cb), Some(false))],
-        (ExistsKind::Mark(_), Split::Unmatched(unmatched)) => {
-            vec![(complement(cb), Some(true)), (unmatched, Some(false))]
+/// `kind`'s branches from one half of the outer input `all` split by match
+/// existence — the matched half where `matched`, else the unmatched one; the other
+/// half is `all − known`.
+fn exists_branches(cb: &mut Circuit, kind: ExistsKind, known: NodeId, matched: bool, all: NodeId) -> Vec<Branch> {
+    let half = |cb: &mut Circuit, want: bool| match want == matched {
+        true => known,
+        false => cb.difference(all, known),
+    };
+    match kind {
+        ExistsKind::Semi => vec![(half(cb, true), None)],
+        ExistsKind::Anti => vec![(half(cb, false), None)],
+        ExistsKind::Mark(_) => {
+            let yes = half(cb, true);
+            vec![(yes, Some(true)), (half(cb, false), Some(false))]
         }
     }
 }
 
-/// The frame a join step's filters and projection read: `pk_cols`, then both
-/// sides' kept payload with the null-providing side widened per `kind`, through
-/// the same [`JoinType::widen_sides`] the logical join output uses.
-fn join_frame(pk_cols: Vec<ColumnDef>, sides: &[JoinSide; 2], kind: JoinType) -> Result<Frame, GnitzSqlError> {
-    let kept = |s: &JoinSide| s.kept_defs().cloned().collect::<Vec<_>>();
-    let (mut l, mut r) = (kept(&sides[0]), kept(&sides[1]));
-    kind.widen_sides(l.iter_mut(), r.iter_mut());
-    Frame::keyed(
-        pk_cols,
-        sides[0].ids().chain(sides[1].ids()).zip(l.into_iter().chain(r)),
-    )
-}
-
-// ── Output-key PK columns ───────────────────────────────────────────────────────
-
-/// The hidden `_join_pk` output PK columns of an equi join, one per key slot at
-/// its pair's common type.
-fn join_pk_coldefs(class: &JoinClass) -> Vec<ColumnDef> {
-    let k = class.arity();
-    class
-        .key_types()
-        .enumerate()
-        .map(|(i, ty)| {
-            let name: Arc<str> = if k == 1 {
-                "_join_pk".into()
-            } else {
-                format!("_join_pk_{i}").into()
-            };
-            ColumnDef::new(name, ty, false).hidden()
-        })
-        .collect()
-}
-
-/// The output PK columns a re-key onto source PKs mints: one per listed
-/// `(schema, pk column)`, at the column's own key slot type, non-nullable, and
-/// hidden. The two producers below differ only in `name`.
-fn rekey_pk_coldefs<'a>(
-    cols: impl IntoIterator<Item = (&'a Schema, u32)>,
-    name: impl Fn(usize, &ColumnDef) -> Arc<str>,
-) -> Vec<ColumnDef> {
-    cols.into_iter()
-        .enumerate()
-        .map(|(slot, (schema, c))| {
-            let src = &schema.columns()[c as usize];
-            let ty = src.ty.with_code(src.ty.tc.reindex_output_type());
-            ColumnDef::new(name(slot, src), ty, false).hidden()
-        })
-        .collect()
-}
-
-/// The leading output PK columns of a range/band or cross join: A's then B's
-/// source PK, `_pair_pk_{slot}`-numbered across both sides.
-fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Vec<ColumnDef> {
-    rekey_pk_coldefs(
-        left_schema
-            .pk_cols()
-            .iter()
-            .map(|&c| (left_schema, c))
-            .chain(right_schema.pk_cols().iter().map(|&c| (right_schema, c))),
-        |slot, _| format!("_pair_pk_{slot}").into(),
-    )
-}
-
-/// The output PK columns of a range-correlated EXISTS/IN view: the outer source
-/// PK under its own names (it also rides the payload verbatim).
-fn src_pk_coldefs(schema: &Schema) -> Vec<ColumnDef> {
-    rekey_pk_coldefs(schema.pk_cols().iter().map(|&c| (schema, c)), |_, src| src.name.clone())
-}
-
 // ── Re-keys ─────────────────────────────────────────────────────────────────────
-
-/// `(all, reindex)`: `side`'s input re-keyed onto its join key, `reindex` without
-/// its NULL-keyed rows and `all` with them where `emits_unmatched`.
-fn keyed_side(cb: &mut Circuit, side: &JoinSide, emits_unmatched: bool) -> (NodeId, NodeId) {
-    let key = &side.key;
-    let reindex = cb.map_reindex(side.input, key, &side.keep, NullKeys::Drop);
-    // With no nullable key column the two re-keys keep the same rows.
-    let nullable = key
-        .iter()
-        .any(|&(c, _)| side.frame.schema.columns()[c as usize].is_nullable);
-    let all = match emits_unmatched && nullable {
-        true => cb.map_reindex(side.input, key, &side.keep, NullKeys::Keep),
-        false => reindex,
-    };
-    (all, reindex)
-}
 
 /// Re-key `node`, laid out `[lead…, each of `sides`' kept payload in order]`, onto
 /// those sides' pinned source PKs — each at the front of its kept payload —
@@ -441,42 +396,39 @@ fn keyed_side(cb: &mut Circuit, side: &JoinSide, emits_unmatched: bool) -> (Node
 fn rekey_pinned(cb: &mut Circuit, node: NodeId, lead: usize, sides: &[JoinSide]) -> NodeId {
     let (mut key, mut at) = (Vec::new(), lead);
     for s in sides {
-        let pinned = &s.keep[..s.pk_arity];
-        key.extend(pinned.iter().enumerate().map(|(j, &c)| {
-            let tc = s.frame.schema.columns()[c as usize].ty.tc;
-            ((at + j) as u32, tc.reindex_output_type())
-        }));
+        key.extend(s.pk.iter().enumerate().map(|(j, &(_, tc))| ((at + j) as u32, tc)));
         at += s.n();
     }
     let keep: Vec<u32> = (lead as u32..at as u32).collect();
     cb.map_reindex(node, &key, &keep, NullKeys::Keep)
 }
 
-/// Re-key `side`'s input onto its source's PK.
-fn rekey_on_source_pk(cb: &mut Circuit, side: &JoinSide) -> NodeId {
-    cb.map_reindex(
-        side.input,
-        &spine::pk_slots(&side.frame.schema),
-        &side.keep,
-        NullKeys::Keep,
-    )
-}
-
 /// A range/band outer join's null-fill branch: `ν_P` of the preserved side
-/// `sides[p]`, the other side's half all-NULL, keyed on the pair-PK like the inner terms.
-fn emit_range_null_fill_tail(cb: &mut Circuit, sides: &[JoinSide; 2], nf_keyed: NodeId, p: usize) -> NodeId {
-    // [P.pk × P.pk_arity, A, B], one of the two payload halves all-NULL.
-    let nullfill = cb.null_extend(nf_keyed, &sides[1 - p].kept_type_codes(), p == 1);
-    rekey_pinned(cb, nullfill, sides[p].pk_arity, sides)
+/// `sides[p]`, keyed `[P.pk, A, B]` with the other side's half
+/// all-NULL, re-keyed on the pair-PK like the inner terms.
+fn range_null_fill(cb: &mut Circuit, sides: &[JoinSide; 2], nu: NodeId, p: usize) -> NodeId {
+    let nullfill = cb.null_extend(nu, &sides[1 - p].kept_type_codes(), p == 1);
+    rekey_pinned(cb, nullfill, sides[p].pk.len(), sides)
 }
 
 // ── Equi emission ───────────────────────────────────────────────────────────────
 
 /// `inner ∪ ν_A ∪ ν_B`, a union over each preserved side's null-fill; a
 /// decorrelated kind's branches split A by whether it matched B's key set.
-fn emit_equi(cb: &mut Circuit, class: &JoinClass, kind: JoinType, sides: &[JoinSide; 2]) -> Vec<Branch> {
-    let k = class.arity();
-    let keyed = |cb: &mut Circuit, i: usize| keyed_side(cb, &sides[i], kind.emits_unmatched(i));
+fn emit_equi(cb: &mut Circuit, k: usize, kind: JoinType, sides: &[JoinSide; 2]) -> Vec<Branch> {
+    // `(all, reindex)`: a side re-keyed onto its join key, `reindex` without its
+    // NULL-keyed rows and `all` with them where it emits its unmatched rows. With no
+    // nullable key column the two re-keys keep the same rows.
+    let keyed = |cb: &mut Circuit, i: usize| {
+        let s = &sides[i];
+        let reindex = s.on_key(cb, NullKeys::Drop);
+        let nullable = (s.key.iter()).any(|&(c, _)| s.frame.schema.columns()[c as usize].is_nullable);
+        let all = match kind.emits_unmatched(i) && nullable {
+            true => s.on_key(cb, NullKeys::Keep),
+            false => reindex,
+        };
+        (all, reindex)
+    };
     let (all_b, reindex_b) = keyed(cb, 1);
     let (all_a, reindex_a) = keyed(cb, 0);
     let all = [all_a, all_b];
@@ -491,7 +443,7 @@ fn emit_equi(cb: &mut Circuit, class: &JoinClass, kind: JoinType, sides: &[JoinS
     let reindex = [reindex_a, b_delta];
     let inner = cb.join(reindex, reindex, JoinKind::Equi);
     if let JoinType::Exists(e) = kind {
-        return exists_branches(cb, e, Split::Matched(inner), all[0]);
+        return exists_branches(cb, e, inner, true, all[0]);
     }
     // Each `[_join_pk, A, B]`, the other side's half all-NULL.
     let nus: Vec<NodeId> = (0..2)
@@ -534,9 +486,8 @@ fn emit_equi(cb: &mut Circuit, class: &JoinClass, kind: JoinType, sides: &[JoinS
 /// A band join over both sides re-keyed on `[eq slots…, range slot]`, NULL keys
 /// dropped: the pair terms and each preserved side's null-fill; a decorrelated
 /// kind's branches split A by its ν.
-fn emit_band(cb: &mut Circuit, class: &JoinClass, op: RangeRel, kind: JoinType, sides: &[JoinSide; 2]) -> Vec<Branch> {
-    let k = class.arity();
-    let reindex = [range_keyed(cb, &sides[0]), range_keyed(cb, &sides[1])];
+fn emit_band(cb: &mut Circuit, k: usize, op: RangeRel, kind: JoinType, sides: &[JoinSide; 2]) -> Vec<Branch> {
+    let reindex = [sides[0].on_key(cb, NullKeys::Drop), sides[1].on_key(cb, NullKeys::Drop)];
     // The two range terms over `[key region, A, B]`, each carrying the ON clause's
     // left-to-right range relation verbatim.
     let merged = cb.join(reindex, reindex, JoinKind::Range { rel: op });
@@ -545,7 +496,7 @@ fn emit_band(cb: &mut Circuit, class: &JoinClass, op: RangeRel, kind: JoinType, 
     let nu = |cb: &mut Circuit, p: usize| -> (NodeId, NodeId) {
         let base = k + if p == 0 { 0 } else { sides[0].n() };
         let pi = rekey_pinned(cb, merged, base, std::slice::from_ref(&sides[p]));
-        let all = rekey_on_source_pk(cb, &sides[p]);
+        let all = sides[p].on_pk(cb);
         // `π` is P's matched multiplicity, which only a side unique on the
         // equality key bounds by `all`; otherwise the difference is clamped at 0.
         let nu = match sides[1 - p].unique {
@@ -557,14 +508,14 @@ fn emit_band(cb: &mut Circuit, class: &JoinClass, op: RangeRel, kind: JoinType, 
     if let JoinType::Exists(e) = kind {
         // ν over A, keyed on A's source PK behind the output exchange.
         let (all, nu_a) = nu(cb, 0);
-        return exists_branches(cb, e, Split::Unmatched(nu_a), all);
+        return exists_branches(cb, e, nu_a, false, all);
     }
     // The pairs re-keyed onto `_pair_pk`, dropping the key region: every branch
     // lands on `[pair-PK, kept-A, kept-B]`.
     let mut acc = rekey_pinned(cb, merged, k, sides);
     for p in (0..2).filter(|&p| kind.preserves(p)) {
         let (_, nu_p) = nu(cb, p);
-        let branch = emit_range_null_fill_tail(cb, sides, nu_p, p);
+        let branch = range_null_fill(cb, sides, nu_p, p);
         acc = cb.union(branch, acc);
     }
     vec![(acc, None)]
@@ -580,9 +531,9 @@ fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[Join
         // worker owning its output key.
         JoinType::Exists(e) => {
             let (owned, int_a) = own_a(cb, &sides[0]);
-            let reindex_b = range_keyed(cb, &sides[1]);
+            let reindex_b = sides[1].on_key(cb, NullKeys::Drop);
             let matched = threshold(cb, &sides[0], reindex_b, int_a, op);
-            return exists_branches(cb, e, Split::Matched(matched), owned);
+            return exists_branches(cb, e, matched, true, owned);
         }
         JoinType::Inner => false,
         JoinType::Left => true,
@@ -590,9 +541,9 @@ fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[Join
     };
     // Each branch below lands on `[pair-PK, kept-A, kept-B]`; a LEFT join's pair
     // terms integrate A's owned slice, which its ν subtracts from.
-    let reindex_a = range_keyed(cb, &sides[0]);
+    let reindex_a = sides[0].on_key(cb, NullKeys::Drop);
     let owned = left.then(|| own_a(cb, &sides[0]));
-    let reindex_b = range_keyed(cb, &sides[1]);
+    let reindex_b = sides[1].on_key(cb, NullKeys::Drop);
     let [int_a, int_b] = match owned {
         Some((_, int_a)) => [int_a, cb.shard(reindex_b)],
         None => integrals(cb, sides, [reindex_a, reindex_b]),
@@ -604,7 +555,7 @@ fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[Join
     };
     let matched = threshold(cb, &sides[0], reindex_b, int_a, op);
     let nu_a = cb.difference(owned, matched);
-    let branch = emit_range_null_fill_tail(cb, sides, nu_a, 0);
+    let branch = range_null_fill(cb, sides, nu_a, 0);
     vec![(cb.union(branch, pairs), None)]
 }
 
@@ -619,11 +570,6 @@ fn integrals(cb: &mut Circuit, sides: &[JoinSide; 2], [a, b]: [NodeId; 2]) -> [N
         true => [a, b],
         false => [cb.shard(a), cb.shard(b)],
     }
-}
-
-/// `side`'s input re-keyed onto a range join's key, NULL keys dropped.
-fn range_keyed(cb: &mut Circuit, side: &JoinSide) -> NodeId {
-    keyed_side(cb, side, false).1
 }
 
 /// The rows of A's range-keyed slice `int_a` matching the one-row threshold
@@ -662,7 +608,7 @@ fn threshold(cb: &mut Circuit, side_a: &JoinSide, reindex_b: NodeId, int_a: Node
 /// keys dropped. Unless A's delta is placed by its PK, it is broadcast, and an
 /// exchange keeps each worker its own.
 fn own_a(cb: &mut Circuit, side: &JoinSide) -> (NodeId, NodeId) {
-    let owned = rekey_on_source_pk(cb, side);
+    let owned = side.on_pk(cb);
     // [a.pk, kept A]
     let owned = match side.pk_placed {
         true => owned,
@@ -672,25 +618,12 @@ fn own_a(cb: &mut Circuit, side: &JoinSide) -> (NodeId, NodeId) {
         unreachable!("a pure range keys on its range column alone")
     };
     let at = side.keep.iter().position(|&c| c == range_slot);
-    let at = side.pk_arity + at.expect("the keep rule keeps a pure range's range column");
-    let keep: Vec<u32> = (side.pk_arity as u32..(side.pk_arity + side.n()) as u32).collect();
+    let npk = side.pk.len();
+    let at = npk + at.expect("the keep rule keeps a pure range's range column");
+    let keep: Vec<u32> = (npk as u32..(npk + side.n()) as u32).collect();
     // [range key, kept A]
     let int_a = cb.map_reindex(owned, &[(at as u32, range_tc)], &keep, NullKeys::Drop);
     (owned, int_a)
-}
-
-// ── Cross emission ──────────────────────────────────────────────────────────────
-
-/// The keyless join `A × B`, INNER only. Each side is keyed on its own source PK,
-/// which takes no part in the match; its integrals are placed by [`integrals`].
-fn emit_cross(cb: &mut Circuit, sides: &[JoinSide; 2]) -> Vec<Branch> {
-    let reindex_a = rekey_on_source_pk(cb, &sides[0]);
-    let reindex_b = rekey_on_source_pk(cb, &sides[1]);
-    let [int_a, int_b] = integrals(cb, sides, [reindex_a, reindex_b]);
-    // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
-    // so both terms already share one schema.
-    let inner = cb.join([reindex_a, reindex_b], [int_a, int_b], JoinKind::Cross);
-    vec![(inner, None)] // [pair-PK, A, B]
 }
 
 #[cfg(test)]

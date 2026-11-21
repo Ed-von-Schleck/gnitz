@@ -2,17 +2,17 @@
 //! filters and projections — over a relation read in place fuse into the
 //! consumer's circuit, and a node below them that no relation is read in place
 //! for is cut to a hidden segment: whole where the body reads it more than once,
-//! else pruned to what its one reader reads.
+//! else pruned to what its one reader reads. The same levels over a combine are
+//! emitted over its node.
 
-use super::super::physical::Frame;
+use super::super::physical::{self, Frame};
 use super::super::{ColId, ColSet, HirExpr, ProjEntry, RelExpr};
-use super::{EmitPieces, SegInput, SegSource, ViewChain, collect_live_cols, cut_segment, filter, project_front};
+use super::{SegInput, ViewChain};
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
-use crate::ir::BoundExpr;
-use gnitz_core::Schema;
-use gnitz_wire::ReadBound;
-use gnitz_wire::{Circuit, NodeId, ReindexSlot};
+use crate::ir::{BExpr, BoundExpr};
+use gnitz_core::RelDescriptor;
+use gnitz_wire::{Circuit, NodeId, ReadBound, ReindexSlot};
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,11 +21,8 @@ use std::sync::Arc;
 /// in place, or a hidden segment — under the linear levels fused above it,
 /// outermost first, each with the columns read of it.
 pub(super) struct Spine<'a> {
-    seg: SegInput,
-    levels: Vec<(Level<'a>, ColSet)>,
-    /// The key the source's delta is co-located by ahead of the circuit, in the
-    /// source's own columns; `None` leaves it where the source's store places it.
-    scatter: Option<Vec<ReindexSlot>>,
+    pub(super) seg: SegInput,
+    pub(super) levels: Vec<(Level<'a>, ColSet)>,
 }
 
 /// One linear level: a `Filter` or a `Project`.
@@ -34,37 +31,23 @@ pub(super) enum Level<'a> {
     Project(Cow<'a, [ProjEntry]>),
 }
 
-impl<'a> Level<'a> {
-    /// What is read of this level's input when `above` is read of its output.
-    fn reads(&self, above: &ColSet) -> ColSet {
-        let mut below = ColSet::default();
+impl Level<'_> {
+    /// This level reading the column `id` as the constant `value`.
+    pub(super) fn substituted(&self, id: ColId, value: &HirExpr) -> Level<'static> {
+        let mut leaf = |c: &ColId| match *c == id {
+            true => value.clone(),
+            false => BExpr::ColRef(*c),
+        };
         match self {
-            Level::Where(preds) => {
-                below.clone_from(above);
-                collect_live_cols(preds.iter(), &mut below);
-            }
-            Level::Project(items) => collect_live_cols(
-                items.iter().filter(|it| above.contains(it.out.id)).map(|it| &it.expr),
-                &mut below,
-            ),
-        }
-        below
-    }
-
-    /// This level with every `ColRef(id)` leaf replaced by `f(id)`.
-    pub(super) fn rebuilt(&self, f: &mut impl FnMut(ColId) -> HirExpr) -> Level<'a> {
-        let mut leaf = |id: &ColId| f(*id);
-        match self {
-            Level::Where(preds) => Level::Where(Cow::Owned(preds.iter().map(|p| p.rebuild(&mut leaf)).collect())),
-            Level::Project(items) => Level::Project(Cow::Owned(
-                items
-                    .iter()
+            Level::Where(preds) => Level::Where(preds.iter().map(|p| p.rebuild(&mut leaf)).collect()),
+            Level::Project(items) => Level::Project(
+                (items.iter())
                     .map(|it| ProjEntry {
                         expr: it.expr.rebuild(&mut leaf),
                         out: it.out.clone(),
                     })
                     .collect(),
-            )),
+            ),
         }
     }
 }
@@ -77,21 +60,16 @@ pub(super) struct Peeled<'a> {
     pub(super) bottom: &'a Rc<RelExpr>,
     /// What is read of `bottom`.
     pub(super) read: ColSet,
-    /// The node a reader not reading `bottom` in place cuts, with the number of
-    /// levels above it: `rel` itself, or the deepest level's input the body reads
-    /// more than once — a subtree its readers share, so nothing above it is cut
-    /// with it.
-    cut: (usize, &'a Rc<RelExpr>),
+    /// The node a reader cuts unless `bottom` is a relation read in place, with
+    /// the number of levels above it: `rel` itself, or the deepest level's input the
+    /// body reads more than once — a subtree its readers share, so nothing above it
+    /// is cut with it.
+    pub(super) cut: (usize, &'a Rc<RelExpr>),
 }
 
 impl<'a> Peeled<'a> {
-    /// Whether the bottom node is this body's own, under no shared subtree.
-    pub(super) fn owns_bottom(&self) -> bool {
-        self.cut.0 == 0
-    }
-
     /// These levels opened for their consumer. They fuse when the node below them
-    /// is a relation read in place; otherwise [`Self::cut`] is cut, and only the
+    /// is a relation read in place; otherwise the cut node is cut, and only the
     /// levels above it fuse.
     pub(super) fn open(self, chain: &mut ViewChain) -> Result<Spine<'a>, GnitzSqlError> {
         let Peeled {
@@ -102,53 +80,68 @@ impl<'a> Peeled<'a> {
         } = self;
         let seg = match bottom.as_ref() {
             RelExpr::Get { desc, cols } => SegInput {
-                src: SegSource::Catalog(Arc::clone(desc)),
+                tid: desc.tid,
+                pk_repeats: desc.pk_repeats,
+                catalog: Some(Arc::clone(desc)),
                 frame: Frame::scan(desc, cols),
             },
-            // `live` prunes only `rel` itself: a shared node is cut whole.
+            // What is read of `rel`, the outermost level's set, prunes only `rel`
+            // itself: a shared node is cut whole.
             _ => {
-                // What is read of `rel`: the outermost level's set, else `bottom`'s.
                 let live = levels.first().map_or(read, |(_, r)| r.clone());
                 levels.truncate(above);
-                cut_segment(chain, node, &live)?
+                chain.cut(node, &live)?
             }
         };
-        Ok(Spine { seg, levels, scatter: None })
+        Ok(Spine { seg, levels })
     }
 }
 
 /// `rel`'s linear levels, for a reader of `live` of it. The cut is the deepest
 /// node below `rel` more than one node reads.
 pub(super) fn peel<'a>(chain: &ViewChain, rel: &'a Rc<RelExpr>, live: &ColSet) -> Peeled<'a> {
+    fn reads<'e>(exprs: impl IntoIterator<Item = &'e HirExpr>, into: &mut ColSet) {
+        for e in exprs {
+            e.for_each_ref(&mut |id| into.insert(*id));
+        }
+    }
     let mut bottom = rel;
     let mut levels: Vec<(Level<'a>, ColSet)> = Vec::new();
     let mut read = live.clone();
     let mut cut = (0, rel);
     loop {
-        let (level, input) = match bottom.as_ref() {
-            RelExpr::Filter { input, preds } => (Level::Where(Cow::Borrowed(preds)), input),
-            RelExpr::Project { input, items } => (Level::Project(Cow::Borrowed(items)), input),
+        // Each level with what is read of its input.
+        let (level, input, below) = match bottom.as_ref() {
+            RelExpr::Filter { input, preds } => {
+                let mut below = read.clone();
+                reads(preds.iter(), &mut below);
+                (Level::Where(Cow::Borrowed(preds)), input, below)
+            }
+            RelExpr::Project { input, items } => {
+                let mut below = ColSet::default();
+                reads(
+                    items.iter().filter(|it| read.contains(it.out.id)).map(|it| &it.expr),
+                    &mut below,
+                );
+                (Level::Project(Cow::Borrowed(items)), input, below)
+            }
             _ => break,
         };
-        let below = level.reads(&read);
         levels.push((level, std::mem::replace(&mut read, below)));
         bottom = input;
-        if chain.is_shared(input) {
+        if chain.shared.contains_key(&Rc::as_ptr(input)) {
             cut = (levels.len(), input);
         }
-    }
-    // Only a node no relation is read in place for is cut.
-    if matches!(bottom.as_ref(), RelExpr::Get { .. }) {
-        cut = (0, rel);
     }
     Peeled { levels, bottom, read, cut }
 }
 
-/// What the consumer needs of the top projection: its exact columns under any
-/// numbering (a view's output), its exact columns key first (a top-N or window
+/// What the consumer needs of the outermost projection: its exact columns under
+/// any numbering (a view's output), its exact columns key first (a top-N or window
 /// carrying every input column), only a slot per column it reads (a reduce, a set
-/// operation's leaves), or its columns in their written order beside whatever else
-/// the node below holds (a reduce's output the view stores).
+/// operation's leaves, a join's inputs), or its columns in their written order
+/// beside whatever else the node below holds (a reduce's output the view stores).
+/// Every inner projection is read as a slot per column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Top {
     Output,
@@ -157,179 +150,127 @@ pub(super) enum Top {
     Store,
 }
 
-/// `schema`'s PK as a reindex key: each column at its key slot's type.
-pub(super) fn pk_slots(schema: &Schema) -> Vec<ReindexSlot> {
-    (schema.pk_cols().iter())
-        .map(|&c| (c, schema.columns()[c as usize].ty.tc.reindex_output_type()))
-        .collect()
-}
-
-/// Open `rel` for a consumer reading `live` of it.
-pub(super) fn open<'a>(chain: &mut ViewChain, rel: &'a Rc<RelExpr>, live: &ColSet) -> Result<Spine<'a>, GnitzSqlError> {
-    peel(chain, rel, live).open(chain)
+/// Where the levels' rows start.
+pub(super) enum Head {
+    /// The source `tid`, its delta co-located by `scatter` ahead of the circuit —
+    /// broadcast by an empty key, left where its store places it by none — and its
+    /// scan bounded by the leading WHERE levels over the relation `catalog` reads in
+    /// place.
+    Source {
+        tid: u64,
+        catalog: Option<Arc<RelDescriptor>>,
+        scatter: Option<Vec<ReindexSlot>>,
+    },
+    /// A node the circuit already holds.
+    Node(NodeId),
 }
 
 impl Spine<'_> {
-    pub(super) fn tid(&self) -> u64 {
-        self.seg.src.tid()
-    }
-
-    /// The opened source's, since no fused level re-keys.
-    pub(super) fn pk_repeats(&self) -> bool {
-        self.seg.src.pk_repeats()
-    }
-
-    /// A hidden segment read whole, with nothing fused above it.
-    pub(super) fn segment(seg: SegInput) -> Spine<'static> {
-        Spine { seg, levels: Vec::new(), scatter: None }
-    }
-
-    /// The source's delta co-located by `key`, its own columns, ahead of the
-    /// circuit; broadcast by an empty one.
-    pub(super) fn scatter(&mut self, key: Vec<ReindexSlot>) {
-        self.scatter = Some(key);
-    }
-
-    /// The source's PK as a scatter key.
-    pub(super) fn pk_key(&self) -> Vec<ReindexSlot> {
-        pk_slots(&self.seg.frame.schema)
-    }
-
-    /// The column of the opened relation each of `ids` is a verbatim copy of, or
-    /// `None` where one is computed. A bare column reference copies its column
-    /// verbatim, whether [`Self::emit`] relabels it or emits it; anything else
-    /// ends that column's chain.
-    pub(super) fn source_cols(&self, ids: impl IntoIterator<Item = ColId>) -> Option<Vec<u32>> {
-        ids.into_iter()
+    /// The slot of the opened source each of `ids` is a verbatim copy of, or `None`
+    /// where one is computed. A bare column reference copies its column verbatim,
+    /// whether [`emit_levels`] relabels it or emits it; anything else ends that
+    /// column's chain.
+    pub(super) fn source_slots(&self, ids: impl IntoIterator<Item = ColId>) -> Option<Vec<u32>> {
+        (ids.into_iter())
             .map(|mut id| {
                 for (level, _) in &self.levels {
-                    id = match level {
-                        Level::Where(_) => id,
-                        Level::Project(items) => items.iter().find(|it| it.out.id == id)?.expr.as_col()?,
-                    };
+                    if let Level::Project(items) = level {
+                        id = items.iter().find(|it| it.out.id == id)?.expr.as_col()?;
+                    }
                 }
-                self.seg.frame.slot(id).ok().map(|slot| slot as u32)
+                Some(self.seg.frame.slot(id).ok()? as u32)
             })
             .collect()
     }
 
-    /// Emit the source and the levels into `cb`. A rename-only projection
-    /// relabels the frame instead of emitting a node, except the outermost one
-    /// under `Top::KeyFirst`, under `Top::Output` one that would move or drop a
-    /// payload column, and under `Top::Store` one that would move a column.
-    pub(super) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
-        let Spine { seg, levels, scatter } = self;
-        let SegInput { src, frame } = seg;
-        let read = |cb: &mut Circuit, frame: &Frame, leading| source(cb, &src, frame, leading, scatter);
-        emit_levels(cb, &levels, top, frame, read)
+    /// Emit the source, co-located by `scatter`, and the levels into `cb`.
+    pub(super) fn emit(
+        self,
+        cb: &mut Circuit,
+        top: Top,
+        scatter: Option<Vec<ReindexSlot>>,
+    ) -> Result<(NodeId, Frame), GnitzSqlError> {
+        let Spine { seg, levels } = self;
+        let SegInput { tid, catalog, frame, .. } = seg;
+        emit_levels(cb, &levels, top, frame, Head::Source { tid, catalog, scatter })
     }
 }
 
-/// `levels` over `node`, whose rows `frame` addresses, as the consumer's output.
-pub(super) fn emit_over(
-    cb: &mut Circuit,
-    levels: &[(Level<'_>, ColSet)],
-    node: NodeId,
-    frame: Frame,
-    top: Top,
-) -> Result<(NodeId, Frame), GnitzSqlError> {
-    let start = |cb: &mut Circuit, frame: &Frame, preds: Vec<BoundExpr>| filter(cb, node, &preds, &frame.schema);
-    emit_levels(cb, levels, top, frame, start)
-}
-
-/// Emit `levels`, innermost first, over the node `start` emits filtered by the
-/// leading WHERE levels — a source they bound — whose rows `frame` addresses. The
-/// WHERE levels between two emitted nodes are one filter: a relabel moves no slot.
-fn emit_levels(
+/// Emit `levels`, innermost first, over `head`, whose rows `frame` addresses. A
+/// rename-only projection relabels the frame instead of emitting a node, except
+/// the outermost one under `Top::KeyFirst`, under `Top::Output` one that would move
+/// or drop a payload column, and under `Top::Store` one that would move a column.
+/// The WHERE levels between two emitted nodes are one filter: a relabel moves no
+/// slot.
+pub(super) fn emit_levels(
     cb: &mut Circuit,
     levels: &[(Level<'_>, ColSet)],
     top: Top,
     mut frame: Frame,
-    start: impl FnOnce(&mut Circuit, &Frame, Vec<BoundExpr>) -> Result<NodeId, GnitzSqlError>,
+    mut head: Head,
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
-    let output_at = match top {
-        Top::Output | Top::KeyFirst | Top::Store => levels.iter().position(|(l, _)| !matches!(l, Level::Where(_))),
-        Top::Slots => None,
-    };
-    let mut start = Some(start);
-    let mut node = None;
+    let outermost = levels.iter().position(|(l, _)| matches!(l, Level::Project(_)));
     let mut pending: Vec<BoundExpr> = Vec::new();
-    let mut at = |cb: &mut Circuit, node: Option<NodeId>, frame: &Frame, pending: &mut Vec<BoundExpr>| {
-        let preds = std::mem::take(pending);
-        match node {
-            Some(at) => filter(cb, at, &preds, &frame.schema),
-            None => start.take().expect("the start is emitted once")(cb, frame, preds),
-        }
-    };
     for (i, (level, read)) in levels.iter().enumerate().rev() {
-        match level {
-            Level::Where(preds) => pending.extend(frame.resolve_preds(preds)?),
-            Level::Project(items) => {
-                let items: Cow<'_, [ProjEntry]> = match items.iter().all(|it| read.contains(it.out.id)) {
-                    true => Cow::Borrowed(items),
-                    false => items.iter().filter(|it| read.contains(it.out.id)).cloned().collect(),
-                };
-                let relabeled = match (output_at == Some(i), top) {
-                    (false, _) => frame.relabeled(&items)?,
-                    (true, Top::Store) => frame.relabeled_in_order(&items)?,
-                    (true, Top::Output) => frame.relabeled_whole(&items, false)?,
-                    (true, _) => None,
-                };
-                if let Some(relabeled) = relabeled {
-                    frame = relabeled;
-                    continue;
-                }
-                let input = at(cb, node, &frame, &mut pending)?;
-                let (out_node, out) = project_front(cb, input, &items, &frame)?;
-                node = Some(out_node);
-                frame = out;
+        let items = match level {
+            Level::Where(preds) => {
+                pending.extend(frame.resolve_preds(preds)?);
+                continue;
             }
+            Level::Project(items) => items,
+        };
+        let items: Cow<'_, [ProjEntry]> = match items.iter().all(|it| read.contains(it.out.id)) {
+            true => Cow::Borrowed(items),
+            false => items.iter().filter(|it| read.contains(it.out.id)).cloned().collect(),
+        };
+        let relabeled = match (outermost == Some(i)).then_some(top) {
+            None | Some(Top::Slots) => frame.relabeled(&items)?,
+            Some(Top::Store) => frame.relabeled_in_order(&items)?,
+            Some(Top::Output) => frame.relabeled_whole(&items, false)?,
+            Some(Top::KeyFirst) => None,
+        };
+        if let Some(relabeled) = relabeled {
+            frame = relabeled;
+            continue;
         }
+        let input = settle(cb, head, &frame, std::mem::take(&mut pending))?;
+        let (map, out) = physical::projection_map(&items, &frame)?;
+        head = Head::Node(map.map_or(input, |map| cb.map_expr(input, map)));
+        frame = out;
     }
-    let node = at(cb, node, &frame, &mut pending)?;
+    let node = settle(cb, head, &frame, pending)?;
     Ok((node, frame))
 }
 
-/// `src`'s delta node, co-located by `scatter` and bounded by what `conjuncts`
-/// give a catalog source, then filtered by them.
-fn source(
-    cb: &mut Circuit,
-    src: &SegSource,
-    frame: &Frame,
-    conjuncts: Vec<BoundExpr>,
-    scatter: Option<Vec<ReindexSlot>>,
-) -> Result<NodeId, GnitzSqlError> {
-    // The bound only narrows the scan; every conjunct is still filtered below.
-    let bound = match src {
-        SegSource::Segment { .. } => ReadBound::None,
-        SegSource::Catalog(d) => {
-            candidates(&conjuncts, &frame.schema, &d.indexes)
-                .into_iter()
-                .map(|c| c.bound)
-                // Every conjunct is filtered below, so no candidate past the scan serves.
-                .take_while(|b| !matches!(b, ReadBound::None))
-                // A backfill never routes, and the engine may trade an index walk for the
-                // full scan, which it cannot do for a PK range.
-                .min_by_key(|b| match b {
-                    ReadBound::PkSet(_) => 0,
-                    ReadBound::Range(r) if !r.walks_pk(frame.schema.pk_cols()) => 1,
-                    _ => 2,
-                })
-                .unwrap_or(ReadBound::None)
+/// `head` as a node, filtered by `conjuncts` over `frame`: a source's delta node
+/// first, bounded by what they give a relation read in place.
+fn settle(cb: &mut Circuit, head: Head, frame: &Frame, conjuncts: Vec<BoundExpr>) -> Result<NodeId, GnitzSqlError> {
+    let node = match head {
+        Head::Node(node) => node,
+        Head::Source { tid, catalog, scatter } => {
+            // The bound only narrows the scan; every conjunct is still filtered below.
+            let bound = catalog.and_then(|d| {
+                candidates(&conjuncts, &frame.schema, &d.indexes)
+                    .into_iter()
+                    .map(|c| c.bound)
+                    // Every conjunct is filtered below, so no candidate past the scan serves.
+                    .take_while(|b| !matches!(b, ReadBound::None))
+                    // A backfill never routes, and the engine may trade an index walk for the
+                    // full scan, which it cannot do for a PK range.
+                    .min_by_key(|b| match b {
+                        ReadBound::PkSet(_) => 0,
+                        ReadBound::Range(r) if !r.walks_pk(frame.schema.pk_cols()) => 1,
+                        _ => 2,
+                    })
+            });
+            cb.input_scattered(tid, bound.unwrap_or(ReadBound::None), scatter)
+                .map_err(GnitzSqlError::rejected)?
         }
     };
-    let node = cb
-        .input_scattered(src.tid(), bound, scatter)
-        .map_err(GnitzSqlError::rejected)?;
-    filter(cb, node, &conjuncts, &frame.schema)
-}
-
-/// Lower a linear body: `spine`'s levels over its one source. The emitted circuit
-/// carries no exchange: a filter or map neither re-keys nor redistributes its
-/// source.
-pub(super) fn lower_linear(spine: Spine<'_>) -> Result<EmitPieces, GnitzSqlError> {
-    let mut cb = Circuit::default();
-    let pk_repeats = spine.pk_repeats();
-    let (_, out) = spine.emit(&mut cb, Top::Output)?;
-    Ok(EmitPieces { circuit: cb, out, pk_repeats })
+    Ok(
+        match crate::expr_lower::compile_filter_program(&conjuncts, frame.schema.columns())? {
+            Some(prog) => cb.filter(node, prog.to_blob_bytes()),
+            None => node,
+        },
+    )
 }

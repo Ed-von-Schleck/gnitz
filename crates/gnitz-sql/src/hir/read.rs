@@ -1,17 +1,17 @@
 //! HIR → ad-hoc read lowering: a bound query that reads one relation, as the
 //! bound, predicate and reply of one read of it. The filters and projections over
 //! the relation — a CTE reference is one — compose by substitution into the tree
-//! the flat query binds to, which the rows reply and [`super::fold`] then lower.
+//! the flat query binds to, which the rows reply or the fold then lower.
 
-use super::super::physical::{self, Frame};
-use super::super::{AggCol, BoundRef, ColId, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, hircol_of, reduce_reads};
-use super::fold::{FoldPieces, fold};
+use super::physical::{self, Frame};
+use super::{AggCol, BoundRef, ColId, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, hircol_of, reduce_reads};
 use crate::error::{GnitzSqlError, derivation};
 use crate::ir::{BExpr, BoundExpr};
 use crate::project::payload_program;
 use gnitz_core::{RelDescriptor, Schema};
-use gnitz_wire::OrderKey;
+use gnitz_wire::{ColumnDef, ComputeMap, GroupAggs, OrderKey};
 use rustc_hash::FxHashMap as HashMap;
+use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -66,49 +66,6 @@ impl Linear<'_> {
                 .ok_or_else(|| GnitzSqlError::Internal("a read references a column its source does not expose".into()))
         })
     }
-
-    /// AND `preds`, over this level's columns, into the read's predicate.
-    fn filter(&mut self, preds: &[HirExpr]) -> Result<(), GnitzSqlError> {
-        for p in preds {
-            let p = self.subst(p)?;
-            self.preds.push(p);
-        }
-        Ok(())
-    }
-
-    fn items(&self, items: &[ProjEntry]) -> Result<Vec<ProjEntry>, GnitzSqlError> {
-        items
-            .iter()
-            .map(|it| {
-                Ok(ProjEntry {
-                    expr: self.subst(&it.expr)?,
-                    out: it.out.clone(),
-                })
-            })
-            .collect()
-    }
-
-    /// The relation read, when `base` is one.
-    fn source(&self) -> Result<(&Arc<RelDescriptor>, &[HirCol]), GnitzSqlError> {
-        match self.base.as_ref() {
-            RelExpr::Get { desc, cols } => Ok((desc, cols)),
-            // What the CTE or derived table derives under its grouping is named first.
-            RelExpr::Reduce { input, .. } => {
-                linear(input)?;
-                Err(derivation("an aggregate over a grouped CTE or derived table"))
-            }
-            // A DISTINCT CTE or derived table, or a DISTINCT aggregate's set: the
-            // fold is one stateless pass over one scan.
-            RelExpr::Distinct { input } => {
-                linear(input)?;
-                Err(derivation("a grouping over a DISTINCT set"))
-            }
-            // A DISTINCT over no relation is a set already, so only an aggregate meets it.
-            _ => Err(GnitzSqlError::rejected(
-                "an aggregate over a SELECT without FROM is not supported",
-            )),
-        }
-    }
 }
 
 /// `rel` down to the first node that is no filter or projection.
@@ -121,7 +78,10 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
         }),
         RelExpr::Filter { input, preds } => {
             let mut l = linear(input)?;
-            l.filter(preds)?;
+            for p in preds {
+                let p = l.subst(p)?;
+                l.preds.push(p);
+            }
             Ok(l)
         }
         RelExpr::Project { input, items } => {
@@ -149,6 +109,33 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
     }
 }
 
+/// Everything an ad-hoc grouped read needs, in layout terms: what the workers
+/// fold, and what the client does with the partials — the reduce or `SELECT
+/// DISTINCT`, a fold with no aggregate, as layout for a stateless fold the client
+/// finishes. It shares the view reduce's rules, output key included, and builds no
+/// evaluator.
+pub(crate) struct FoldPieces {
+    /// The reduce input: the source relabelled by a pre-map that only copies its
+    /// columns, else the pre-map's output. The schema `agg`'s columns index, and the
+    /// one that names them (a computed pre-map column is a hidden `_preN`).
+    pub(crate) reduce_schema: Arc<Schema>,
+    /// What the workers fold. It carries no cardinality COUNT: nothing stateless
+    /// gates on one.
+    pub(crate) agg: GroupAggs,
+    /// The fold sink's pre-map over the source schema, `None` when the reduce
+    /// groups and aggregates source columns directly.
+    pub(crate) pre: Option<ComputeMap>,
+    /// HAVING over the workers' partial reply, laid out as a view's reduce output over
+    /// the same group set — `finalize`'s source; empty when the body has none or it
+    /// folded to true.
+    pub(crate) having: Vec<BoundExpr>,
+    /// The finalize projection over the partial reply: the rows reply a read of it
+    /// would answer. An aggregate's finalize composite (AVG's divide, a SUM's null
+    /// gate) is *in* its item, exactly as it is in the view path's finalize map — so
+    /// the client finisher has no per-aggregate shape switch to keep in step.
+    pub(crate) finalize: RowsReply,
+}
+
 /// Lower a bound ad-hoc body ordered by `order`, over its output columns; `refs` are
 /// the catalog relations the bind read.
 pub(crate) fn lower_read(
@@ -159,7 +146,14 @@ pub(crate) fn lower_read(
     let (top, items) = match rel.as_ref() {
         RelExpr::Project { input, items } => {
             let top = linear(input)?;
-            let items = top.items(items)?;
+            let items = (items.iter())
+                .map(|it| {
+                    Ok(ProjEntry {
+                        expr: top.subst(&it.expr)?,
+                        out: it.out.clone(),
+                    })
+                })
+                .collect::<Result<_, GnitzSqlError>>()?;
             (top, items)
         }
         // A DISTINCT body is read whole, each column as itself.
@@ -170,33 +164,128 @@ pub(crate) fn lower_read(
             ));
         }
     };
-    let folded = |pieces, is_distinct| AdhocShape::Fold { pieces: Box::new(pieces), is_distinct };
-    let (lin, shape) = match top.base.as_ref() {
-        RelExpr::Unit => return constant(&top, items, order),
+    // The levels over the relation read, and the reduce over them: its input, group
+    // columns, aggregates and HAVING.
+    let base = top.base;
+    let (lin, reduce) = match base.as_ref() {
+        // The one row `items` compute over the global ground row: one hidden
+        // `_group_pk`, keyed by the global group key.
+        RelExpr::Unit => {
+            if !top.preds.is_empty() {
+                return Err(GnitzSqlError::rejected(
+                    "a WHERE over a SELECT without FROM is not supported",
+                ));
+            }
+            let ground = Frame::keyed(vec![crate::agg::group_pk_def()], [])?;
+            return Ok(AdhocRead::Constant(reply_rows(ground, items, order, false)?));
+        }
         // Everything over the reduce is its HAVING and its finalize projection.
         RelExpr::Reduce { input, group_cols, aggs, .. } => {
-            let lin = linear(input)?;
-            let pieces = flat_reduce(&lin, &input.cols(), group_cols, aggs, &top.preds, items, order)?;
-            (lin, folded(pieces, false))
+            let having = top.preds;
+            (
+                linear(input)?,
+                Some((input, Cow::Borrowed(&group_cols[..]), &aggs[..], having)),
+            )
         }
         // A DISTINCT is the reduce grouping every column of its input, with no
         // aggregate, so a filter over it reads only group columns and is one under it.
         RelExpr::Distinct { input } => {
             let mut lin = linear(input)?;
-            lin.filter(&top.preds)?;
-            let in_cols = input.cols();
-            let group_cols: Vec<ColId> = in_cols.iter().map(|c| c.id).collect();
-            let pieces = flat_reduce(&lin, &in_cols, &group_cols, &[], &[], items, order)?;
-            (lin, folded(pieces, true))
+            for p in &top.preds {
+                let p = lin.subst(p)?;
+                lin.preds.push(p);
+            }
+            let group_cols = input.cols().iter().map(|c| c.id).collect();
+            (lin, Some((input, Cow::Owned(group_cols), &[][..], Vec::new())))
         }
+        _ => (top, None),
+    };
+    let (desc, source) = match lin.base.as_ref() {
+        RelExpr::Get { desc, cols } => (desc, cols),
+        // What the CTE or derived table derives under its grouping is named first.
+        RelExpr::Reduce { input, .. } => {
+            linear(input)?;
+            return Err(derivation("an aggregate over a grouped CTE or derived table"));
+        }
+        // A DISTINCT CTE or derived table, or a DISTINCT aggregate's set: the
+        // fold is one stateless pass over one scan.
+        RelExpr::Distinct { input } => {
+            linear(input)?;
+            return Err(derivation("a grouping over a DISTINCT set"));
+        }
+        // A DISTINCT over no relation is a set already, so only an aggregate meets it.
         _ => {
-            let (desc, source) = top.source()?;
-            let rows = reply_rows(Frame::scan(desc, source), items, order, desc.class.is_view())?;
-            (top, AdhocShape::Rows(rows))
+            return Err(GnitzSqlError::rejected(
+                "an aggregate over a SELECT without FROM is not supported",
+            ));
         }
     };
-    let (desc, source) = lin.source()?;
-    let conjuncts = Frame::scan(desc, source).resolve_preds(&lin.preds)?;
+    let src = Frame::scan(desc, source);
+    let shape = match reduce {
+        None => AdhocShape::Rows(reply_rows(src.clone(), items, order, desc.class.is_view())?),
+        Some((input, group_cols, aggs, having)) => {
+            // The reduce's pre-map over the relation: each column it reads as `lin`
+            // composes it. Reads equal in expression are one column: each later one
+            // is read as the first, so a column copied twice still relabels the
+            // source. A copy keeps its source column's definition; a computed column
+            // is a hidden `_preN`.
+            let in_cols = input.cols();
+            let mut pre: Vec<ProjEntry> = Vec::new();
+            let mut same: Vec<(ColId, ColId)> = Vec::new();
+            let mut computed = 0;
+            for r in reduce_reads(&group_cols, aggs) {
+                let expr = &lin.map[&r];
+                if let Some(k) = pre.iter().find(|k| k.expr == *expr) {
+                    same.push((r, k.out.id));
+                    continue;
+                }
+                let def = match expr.as_col() {
+                    Some(id) => src.schema.columns()[src.slot(id)?].clone(),
+                    None => {
+                        let c = &hircol_of(&in_cols, r).def;
+                        computed += 1;
+                        ColumnDef::new(format!("_pre{}", computed - 1), c.ty, c.is_nullable).hidden()
+                    }
+                };
+                pre.push(ProjEntry {
+                    expr: expr.clone(),
+                    out: HirCol::new(r, def),
+                });
+            }
+            let at = |id: ColId| same.iter().find(|(dup, _)| *dup == id).map_or(id, |&(_, k)| k);
+            let read = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(at(*id)));
+            let groups: Vec<ColId> = group_cols.iter().map(|&g| at(g)).collect();
+            let aggs: Vec<AggCol> = (aggs.iter())
+                .map(|c| AggCol { arg: c.arg.map(at), ..c.clone() })
+                .collect();
+            let having: Vec<HirExpr> = having.iter().map(read).collect();
+            let finalize = (items.into_iter())
+                .map(|it| ProjEntry { expr: read(&it.expr), out: it.out })
+                .collect();
+            // The pre-map over the source, under the spine's rule: one copying distinct
+            // source columns relabels the source, which the reduce then reads in place;
+            // anything else is a map.
+            let (map, reduce_in) = match src.relabeled(&pre)? {
+                Some(relabeled) => (None, relabeled),
+                None => physical::projection_map(&pre, &src)?,
+            };
+            let agg = reduce_in.group_aggs(&groups, &aggs)?;
+            let cols = aggs.iter().map(|c| c.col.slot()).collect();
+            let partial = reduce_in.keyed_by(&agg.group_cols, agg.group_cols.iter().copied(), cols)?;
+            let having = partial.resolve_preds(&having)?;
+            let finalize = reply_rows(partial, finalize, order, false)?;
+            let pieces = FoldPieces {
+                reduce_schema: reduce_in.schema,
+                agg,
+                pre: map,
+                having,
+                finalize,
+            };
+            let is_distinct = matches!(base.as_ref(), RelExpr::Distinct { .. });
+            AdhocShape::Fold { pieces: Box::new(pieces), is_distinct }
+        }
+    };
+    let conjuncts = src.resolve_preds(&lin.preds)?;
     let name = refs
         .into_iter()
         .find(|r| r.tid == desc.tid)
@@ -208,40 +297,6 @@ pub(crate) fn lower_read(
         conjuncts,
         shape,
     })
-}
-
-/// The constant row `items` compute over the global ground row: one hidden
-/// `_group_pk`, keyed by the global group key.
-fn constant(lin: &Linear<'_>, items: Vec<ProjEntry>, order: Vec<OrderCol>) -> Result<AdhocRead, GnitzSqlError> {
-    if !lin.preds.is_empty() {
-        return Err(GnitzSqlError::rejected(
-            "a WHERE over a SELECT without FROM is not supported",
-        ));
-    }
-    let ground = Frame::keyed(vec![crate::agg::group_pk_def()], [])?;
-    Ok(AdhocRead::Constant(reply_rows(ground, items, order, false)?))
-}
-
-/// `Project(having?(Reduce))` over `lin`'s relation, as the flat query binds it:
-/// each column the reduce reads — one of `in_cols`, its input's — as `lin`
-/// composes it over the relation.
-fn flat_reduce(
-    lin: &Linear<'_>,
-    in_cols: &[HirCol],
-    group_cols: &[ColId],
-    aggs: &[AggCol],
-    having: &[HirExpr],
-    items: Vec<ProjEntry>,
-    order: Vec<OrderCol>,
-) -> Result<FoldPieces, GnitzSqlError> {
-    let (desc, source) = lin.source()?;
-    let pre: Vec<ProjEntry> = (reduce_reads(group_cols, aggs).into_iter())
-        .map(|r| ProjEntry {
-            expr: lin.map[&r].clone(),
-            out: hircol_of(in_cols, r).clone(),
-        })
-        .collect();
-    fold(Frame::scan(desc, source), pre, group_cols, aggs, having, items, order)
 }
 
 /// The rows reply a projection over a source produces.
@@ -309,22 +364,9 @@ pub(crate) fn reply_rows(
     let k = src.pk_cols().len();
     let visible = items.iter().filter(|c| !c.out.def.is_hidden).map(|c| c.out.id);
     let (schema, column_of) = out.schema_in_order(visible, |_| None)?;
-    // Each key with its slot of the projection's output.
-    let slots = order
-        .into_iter()
-        .map(|key| Ok((out.slot(key.col)?, key)))
-        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-    let source_col = |slot: usize| proj[slot].as_col();
-    let numbered = |col: &dyn Fn(usize) -> usize| -> Vec<OrderKey> {
-        slots
-            .iter()
-            .map(|&(slot, key)| OrderKey {
-                col: col(slot) as u32,
-                desc: key.desc,
-                nulls_first: key.nulls_first,
-            })
-            .collect()
-    };
+    // The worker's sink numbers its input: the program's output, or the relation
+    // itself, which an identity projection numbers alike.
+    let sink_order = out.order_keys(&order)?;
     let mut copied: Vec<(u32, u32)> = Vec::with_capacity(proj.len());
     for (slot, item) in proj.iter().enumerate() {
         let src = item.as_col().map(|s| s as u32);
@@ -333,16 +375,14 @@ pub(crate) fn reply_rows(
         }
     }
     // A walk in PK order yields keys ascending a leading run of the PK columns.
-    let pk_ordered = slots.len() <= k
-        && slots
-            .iter()
-            .zip(src.pk_cols())
-            .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize));
+    let pk_ordered = sink_order.len() <= k
+        && (sink_order.iter().zip(src.pk_cols()))
+            .all(|(key, &pk)| !key.desc && proj[key.col as usize].as_col() == Some(pk as usize));
     Ok(RowsReply {
-        order: numbered(&|slot| column_of[slot] as usize),
-        // The worker's sink numbers its input: the program's output, or the relation
-        // itself, which an identity projection numbers alike.
-        sink_order: numbered(&|slot| slot),
+        order: (sink_order.iter())
+            .map(|&key| OrderKey { col: column_of[key.col as usize], ..key })
+            .collect(),
+        sink_order,
         pk_ordered,
         copied,
         program,

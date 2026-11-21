@@ -1,10 +1,10 @@
 //! The set-operation and DISTINCT shell: each leaf, opened through the spine, is
 //! keyed by its element's identity and combined by weight arithmetic.
 
-use super::super::physical::Frame;
+use super::super::physical::{self, Frame};
 use super::super::{HirCol, ProjEntry, RelExpr, SetOpKind};
-use super::spine::{Top, open};
-use super::{EmitPieces, ViewChain, project_front};
+use super::spine::{Top, peel};
+use super::{EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{Circuit, ColumnDef, NARROW_PK_MAX_BYTES, NodeId, NullKeys, ReadBound, ReindexSlot, TypeCode};
 use std::rc::Rc;
@@ -19,10 +19,10 @@ struct Leaf {
 
 /// What every leaf is keyed by.
 enum ElementKey {
-    /// The PK every leaf carries: each leaf's columns in `order`, the first `npk` the key.
-    Carried { order: Vec<usize>, npk: usize },
-    /// Every column, as this frame keys them.
-    Natural(Frame),
+    /// The PK every leaf carries: each leaf's columns in this order, key first.
+    Carried(Vec<usize>),
+    /// Every column.
+    Natural,
     /// A hash of every column.
     Hash,
 }
@@ -38,62 +38,92 @@ pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<Em
     let mut leaves: Vec<Leaf> = Vec::new();
     combine(&mut Circuit::default(), rel, false, &mut |dry, side| {
         let cols = side.cols().into_owned();
-        let spine = open(chain, side, &cols.iter().map(|c| c.id).collect())?;
-        let (node, frame) = spine.emit(&mut cb, Top::Slots)?;
+        let spine = peel(chain, side, &cols.iter().map(|c| c.id).collect()).open(chain)?;
+        let (node, frame) = spine.emit(&mut cb, Top::Slots, None)?;
         leaves.push(Leaf { cols, node, frame });
         Ok(dry.input_delta(0, ReadBound::None))
     })?;
+    // The positions in its columns of each leaf's PK slots, where every leaf names
+    // them all, at the same positions and at `out`'s column types.
+    let carried = 'carried: {
+        let mut key: Option<Vec<usize>> = None;
+        for leaf in &leaves {
+            if leaf.cols.iter().zip(out.iter()).any(|(c, o)| c.def.ty != o.def.ty) {
+                break 'carried None;
+            }
+            let at = (leaf.frame.schema.pk_cols().iter())
+                .map(|&s| {
+                    let id = leaf.frame.layout[s as usize]?;
+                    leaf.cols.iter().position(|c| c.id == id)
+                })
+                .collect::<Option<Vec<usize>>>();
+            match (at, &key) {
+                (Some(at), Some(seen)) if *seen == at => {}
+                (Some(at), None) => key = Some(at),
+                _ => break 'carried None,
+            }
+        }
+        key
+    };
     // A set's key covers its unique key, so its PK repeats only where it is a bag.
     let covers = |key: &Vec<usize>| {
         unique
             .as_ref()
             .is_none_or(|u| u.iter().all(|id| key.iter().any(|&p| out[p].id == *id)))
     };
-    let key = match carried_key(&leaves, &out).filter(covers) {
-        Some(key) => ElementKey::Carried {
-            npk: key.len(),
-            order: key
-                .iter()
-                .copied()
+    // The element key, and the output frame it keys.
+    let (key, frame) = match carried.filter(covers) {
+        Some(key) => {
+            let order: Vec<usize> = (key.iter().copied())
                 .chain((0..out.len()).filter(|p| !key.contains(p)))
-                .collect(),
-        },
-        None => natural_frame(&out).map_or(ElementKey::Hash, ElementKey::Natural),
+                .collect();
+            let frame = Frame::new(order.iter().map(|&p| out[p].slot()), key.len())?;
+            (ElementKey::Carried(order), frame)
+        }
+        // `out` keyed by all of its columns, where they can be its own key: the
+        // reindex packs each column at its own type, and a wider key leaves every
+        // key kernel's narrow path.
+        None => {
+            let packs = out.iter().all(|c| c.def.ty.tc.packs_at(c.def.ty.tc));
+            let natural = Frame::new(out.iter().map(HirCol::slot), out.len()).ok();
+            match natural.filter(|f| packs && f.schema.layout().pk_stride() <= NARROW_PK_MAX_BYTES) {
+                Some(frame) => (ElementKey::Natural, frame),
+                None => {
+                    let pk = vec![ColumnDef::new("_set_pk", TypeCode::U128, false).hidden()];
+                    (ElementKey::Hash, Frame::keyed(pk, out.iter().map(HirCol::slot))?)
+                }
+            }
+        }
     };
 
     let mut next = leaves.iter();
     combine(&mut cb, rel, false, &mut |cb, _| {
         let leaf = next.next().expect("one leaf per `combine` read, in the same order");
-        if let ElementKey::Carried { order, .. } = &key {
-            let items = ProjEntry::passthroughs(order.iter().map(|&p| leaf.cols[p].clone()));
-            let (node, _) = project_front(cb, leaf.node, &items, &leaf.frame)?;
-            return Ok(cb.shard(node));
-        }
-        let slots: Vec<ReindexSlot> = leaf
-            .frame
-            .slots(leaf.cols.iter().map(|c| c.id))?
-            .into_iter()
-            .zip(out.iter())
+        let slots = || -> Result<Vec<ReindexSlot>, GnitzSqlError> {
+            Ok((leaf
+                .frame
+                .slots(leaf.cols.iter().map(|c| c.id))?
+                .into_iter()
+                .zip(out.iter()))
             .map(|(s, o)| (s as u32, o.def.ty.tc))
-            .collect();
-        Ok(match key {
-            // A leaf row NULL where `out` is NOT NULL is of no element of the result.
-            ElementKey::Natural(_) => {
-                let node = cb.map_reindex(leaf.node, &slots, &[], NullKeys::Drop);
+            .collect())
+        };
+        Ok(match &key {
+            ElementKey::Carried(order) => {
+                let items = ProjEntry::passthroughs(order.iter().map(|&p| leaf.cols[p].clone()));
+                let (map, _) = physical::projection_map(&items, &leaf.frame)?;
+                let node = map.map_or(leaf.node, |map| cb.map_expr(leaf.node, map));
                 cb.shard(node)
             }
-            _ => cb.map_hash_row(leaf.node, &slots),
+            // A leaf row NULL where `out` is NOT NULL is of no element of the result.
+            ElementKey::Natural => {
+                let node = cb.map_reindex(leaf.node, &slots()?, &[], NullKeys::Drop);
+                cb.shard(node)
+            }
+            ElementKey::Hash => cb.map_hash_row(leaf.node, &slots()?),
         })
     })?;
 
-    let frame = match key {
-        ElementKey::Carried { order, npk } => Frame::new(order.iter().map(|&p| out[p].slot()), npk)?,
-        ElementKey::Natural(frame) => frame,
-        ElementKey::Hash => Frame::keyed(
-            vec![ColumnDef::new("_set_pk", TypeCode::U128, false).hidden()],
-            out.iter().map(HirCol::slot),
-        )?,
-    };
     Ok(EmitPieces {
         circuit: cb,
         out: frame,
@@ -136,40 +166,4 @@ fn combine<'r>(
         }
         _ => leaf(cb, rel),
     }
-}
-
-/// The positions in its columns of each leaf's PK slots, where every leaf names
-/// them all, at the same positions and at `out`'s column types.
-fn carried_key(leaves: &[Leaf], out: &[HirCol]) -> Option<Vec<usize>> {
-    let mut key: Option<Vec<usize>> = None;
-    for leaf in leaves {
-        if leaf.cols.iter().zip(out).any(|(c, o)| c.def.ty != o.def.ty) {
-            return None;
-        }
-        let at = leaf
-            .frame
-            .schema
-            .pk_cols()
-            .iter()
-            .map(|&s| {
-                let id = leaf.frame.layout[s as usize]?;
-                leaf.cols.iter().position(|c| c.id == id)
-            })
-            .collect::<Option<Vec<usize>>>()?;
-        match &key {
-            Some(seen) if *seen != at => return None,
-            _ => key = Some(at),
-        }
-    }
-    key
-}
-
-/// `out` keyed by all of its columns, where they can be its own key.
-fn natural_frame(out: &[HirCol]) -> Option<Frame> {
-    let frame = Frame::new(out.iter().map(HirCol::slot), out.len()).ok()?;
-    // The reindex packs each column at its own type.
-    let packs = out.iter().all(|c| c.def.ty.tc.packs_at(c.def.ty.tc));
-    // A wider key leaves every key kernel's narrow path.
-    let narrow = frame.schema.layout().pk_stride() <= NARROW_PK_MAX_BYTES;
-    (packs && narrow).then_some(frame)
 }
