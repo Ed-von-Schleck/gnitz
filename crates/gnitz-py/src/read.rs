@@ -143,12 +143,19 @@ impl RowType {
         Ok(ty.cast_into::<PyType>()?.unbind())
     }
 
+    /// A row of `values`, [`row_values`], at `weight`, left to no cycle
+    /// collection: the row refers only to its values and to its type, which
+    /// the type cache keeps for the life of the process, and has no `__dict__`
+    /// to hand a cycle in through. Tracked, every row a caller keeps would be
+    /// traversed by each collection its allocations trigger.
     fn row(&self, py: Python<'_>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Py<PyAny>> {
         let init = PyClassInitializer::from(PyRow { values: values.unbind(), weight });
         // SAFETY: `build` is the only source of the type: a `PyRow` subclass
-        // that adds no instance state.
+        // that adds no instance state. The row is live, and by the above can
+        // be in no cycle.
         unsafe {
             let ptr = pyo3::impl_::pymethods::tp_new_impl::<_, PyRow>(py, init, self.0.bind(py).as_type_ptr())?;
+            pyo3::ffi::PyObject_GC_UnTrack(ptr.cast());
             Ok(Bound::from_owned_ptr(py, ptr).unbind())
         }
     }
@@ -391,7 +398,7 @@ impl PyScanResult {
     }
 
     fn __iter__(slf: Py<Self>) -> PyRowIterator {
-        PyRowIterator { data: slf, row_buf: Vec::new(), pos: 0 }
+        PyRowIterator { data: slf, pos: 0 }
     }
 
     /// Truthiness follows from this: CPython derives `__bool__` from `__len__`
@@ -406,10 +413,34 @@ impl PyScanResult {
     }
 }
 
+/// The tuple of a row's `cells`, left to no cycle collection: a cell is an
+/// int, float, bool, str, bytes, `Decimal`, naive `date`/`datetime` or `None`,
+/// none of which refers to anything. Untracked from the start, so no
+/// collection can hand the tuple to Python while a slot is unset; one freed
+/// so releases only the cells it holds.
+fn row_values<'py>(
+    py: Python<'py>,
+    cells: impl ExactSizeIterator<Item = PyResult<Py<PyAny>>>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    // SAFETY: `PyTuple_New` returns a new reference or null with an exception
+    // set; a new tuple is tracked, and by the above can be in no cycle.
+    let values = unsafe {
+        let values = Bound::from_owned_ptr_or_err(py, pyo3::ffi::PyTuple_New(cells.len() as _))?;
+        pyo3::ffi::PyObject_GC_UnTrack(values.as_ptr().cast());
+        values
+    };
+    for (i, cell) in cells.enumerate() {
+        // SAFETY: slot `i` of a tuple of `cells.len()` slots that nothing else
+        // can reach; the slot takes the cell's reference.
+        unsafe { pyo3::ffi::PyTuple_SET_ITEM(values.as_ptr(), i as _, cell?.into_ptr()) };
+    }
+    // SAFETY: `PyTuple_New` made it a tuple.
+    Ok(unsafe { values.cast_into_unchecked::<PyTuple>() })
+}
+
 #[pyclass(name = "RowIterator", module = "gnitz._native")]
 struct PyRowIterator {
     data: Py<PyScanResult>,
-    row_buf: Vec<Py<PyAny>>,
     pos: usize,
 }
 
@@ -426,14 +457,9 @@ impl PyRowIterator {
         if row >= batch.len() {
             return Ok(None);
         }
-        self.row_buf.clear();
         let rows = batch.view();
-        for &(loc, ty) in &data.cols {
-            self.row_buf.push(cell_to_py(py, &rows, loc, ty, row)?);
-        }
-        // `drain` hands the values over already-owned, so the tuple build costs no
-        // refcount traffic, and the Vec keeps its capacity for the next row.
-        let values = PyTuple::new(py, self.row_buf.drain(..))?;
+        let cells = data.cols.iter().map(|&(loc, ty)| cell_to_py(py, &rows, loc, ty, row));
+        let values = row_values(py, cells)?;
         let obj = data.row_type.row(py, values, rows.get_weight(row))?;
         self.pos += 1;
         Ok(Some(obj))
