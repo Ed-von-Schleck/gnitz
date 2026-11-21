@@ -336,7 +336,7 @@ fn a_negated_literal_folds_and_keeps_the_wide_invariant() {
         b("-170141183460469231731687303715884105728"),
         BExpr::LitWide(NumLit { mag: 1 << 127, neg: true })
     );
-    assert_eq!(b("-1.5"), BExpr::LitFloat { v: -1.5, dec: Some((-15, 1)) });
+    assert_eq!(b("-1.5"), BExpr::LitFloat { v: F64Bits(-1.5), dec: Some((-15, 1)) });
 }
 
 /// A constant position peels parentheses and signs, in any order, into the
@@ -389,7 +389,7 @@ fn bind_constant_reads_a_literal_through_parens_and_signs() {
 fn each_unsupported_form_is_rejected_by_name() {
     const AGG: &str = "aggregate functions are not allowed here";
     const WINDOW: &str = "window functions (OVER) are only supported";
-    const SUBQUERY: &str = "only supported in a single-table CREATE VIEW";
+    const SUBQUERY: &str = "only supported in a CREATE VIEW body's";
     for (src, want) in [
         // Columns.
         ("nope", "column 'nope' not found"),
@@ -564,10 +564,13 @@ fn a_numeric_literal_binds_as_its_narrowest_exact_form() {
         ("340282366920938463463374607431768211455", wide(u128::MAX)),
         (
             "340282366920938463463374607431768211456",
-            BExpr::LitFloat { v: 3.402823669209385e38, dec: None },
+            BExpr::LitFloat {
+                v: F64Bits(3.402823669209385e38),
+                dec: None,
+            },
         ),
-        ("1.5", BExpr::LitFloat { v: 1.5, dec: Some((15, 1)) }),
-        ("1e3", BExpr::LitFloat { v: 1000.0, dec: Some((1000, 0)) }),
+        ("1.5", BExpr::LitFloat { v: F64Bits(1.5), dec: Some((15, 1)) }),
+        ("1e3", BExpr::LitFloat { v: F64Bits(1000.0), dec: Some((1000, 0)) }),
     ] {
         let got = bind_literal(&Value::Number(src.into(), false)).unwrap();
         assert_eq!(got, want, "{src}");

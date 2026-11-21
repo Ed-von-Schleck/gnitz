@@ -38,10 +38,7 @@ use crate::rules::{
     single_relation_col_idx,
 };
 use crate::tail::{OrderKey, OrderTarget, extract_limit_offset, parse_order_by, reject_position_out_of_range};
-use crate::validate::{
-    HonoredClauses, QueryEnvelope, reject_query_envelope_body, reject_unhonored_query_clauses,
-    reject_unhonored_select_clauses,
-};
+use crate::validate::{QueryEnvelope, SelectSite, reject_unhonored_query_clauses, reject_unhonored_select_clauses};
 use gnitz_core::Schema;
 use gnitz_wire::{ColType, ColumnDef, WeightSlots};
 use group::bind_grouped_suffix;
@@ -90,7 +87,7 @@ pub(super) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzS
             )));
         }
         reject_if(from.is_some(), &ctx, "a trailing FROM")?;
-        let rel = bind_body(cx, reject_query_envelope_body(query, &ctx)?)?;
+        let rel = bind_body(cx, reject_unhonored_query_clauses(query, QueryEnvelope::Bare, &ctx)?)?;
         let (rel, mut defs) = collapse_identity(rel);
         apply_alias_columns(&alias.columns, defs.iter_mut(), &ctx)?;
         cx.ctes.insert(canonical, Cte { rel, defs });
@@ -406,7 +403,10 @@ fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlErr
     match body {
         SetExpr::Select(select) => Ok(bind_select(cx, select, &[])?.0),
         SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
-        SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
+        SetExpr::Query(q) => bind_body(
+            cx,
+            reject_unhonored_query_clauses(q, QueryEnvelope::Bare, "parenthesized query")?,
+        ),
         _ => Err(GnitzSqlError::rejected(format!(
             "{} only supports SELECT and set operations",
             cx.surface.stmt()
@@ -433,7 +433,7 @@ fn resolve_table_factor(
         reject_if(*lateral, &ctx, "LATERAL")?;
         // Silently dropping TABLESAMPLE would return all rows — a wrong result.
         reject_if(sample.is_some(), &ctx, "TABLESAMPLE")?;
-        let body = reject_query_envelope_body(subquery, &ctx)?;
+        let body = reject_unhonored_query_clauses(subquery, QueryEnvelope::Bare, &ctx)?;
         let (subtree, mut defs) = collapse_identity(bind_body(cx, body)?);
         apply_alias_columns(&alias.columns, defs.iter_mut(), &ctx)?;
         let cols = (subtree.cols().iter())
@@ -464,13 +464,12 @@ pub(super) fn bind_select(
     let (stmt, surface) = (cx.surface.stmt(), cx.surface);
     let grouped = body_is_grouped(select);
     let distinct = select_is_distinct(select);
-    let honored = HonoredClauses::for_body(distinct);
-    let honored = if surface.is_view() {
-        honored.with_windows()
+    let site = if surface.is_view() {
+        SelectSite::View
     } else {
-        honored
+        SelectSite::Read
     };
-    reject_unhonored_select_clauses(select, honored, stmt)?;
+    reject_unhonored_select_clauses(select, site, stmt)?;
 
     // The first FROM relation (a table, a CTE, or a derived table) seeds the
     // accumulator and the scope; its cols are what name resolution starts from.
@@ -503,24 +502,17 @@ pub(super) fn bind_select(
     }
 
     // Whether a subquery may stand in this body is settled by what the body is:
-    // only a view's one-relation body, neither grouped nor DISTINCT, binds one.
+    // only a view's body that is not grouped binds one.
     let subs = RefCell::new(Vec::new());
-    let sub = match (surface, scope.relations.len()) {
-        (Surface::Adhoc, _) => SubPolicy::Reject(adhoc_subquery),
-        (Surface::View(_), 1) if grouped => SubPolicy::Reject(|_| {
+    let sub = match surface {
+        Surface::Adhoc => SubPolicy::Reject(adhoc_subquery),
+        Surface::View(_) if grouped => SubPolicy::Reject(|_| {
             GnitzSqlError::rejected(
                 "a subquery is not supported together with GROUP BY/aggregates; put the subquery in an inner view",
             )
         }),
-        (Surface::View(_), 1) if distinct => SubPolicy::Reject(|_| {
-            GnitzSqlError::rejected(
-                "a subquery is not supported together with SELECT DISTINCT; put the subquery in an inner view",
-            )
-        }),
-        (Surface::View(_), 1) => SubPolicy::Bind { cx, subs: &subs },
-        (Surface::View(_), _) => SubPolicy::Reject(unsupported_subquery),
+        Surface::View(_) => SubPolicy::Bind { cx, subs: &subs },
     };
-    let leaf = ScopeLeaf { scope: &scope, sub };
 
     // WHERE, then the projection in whichever shape the body carries. DISTINCT
     // outranks a grouped shape, and either sits above a join, which lowering
@@ -531,9 +523,13 @@ pub(super) fn bind_select(
         Surface::View(v) => Cow::Owned(format!("{} projection", v.stmt)),
     };
     if let Some(where_expr) = &select.selection {
+        let leaf = ScopeLeaf { scope: &scope, sub };
         let preds = bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("WHERE"))?;
         left = RelExpr::filter(left, preds)?;
+        // A WHERE that narrows an outer join leaves the side it null-filled as declared.
+        scope.adopt_nullability(&left.cols());
     }
+    let leaf = ScopeLeaf { scope: &scope, sub };
     if grouped && !distinct {
         return bind_grouped_suffix(cx, select, left, &leaf, order);
     }
@@ -694,6 +690,7 @@ fn bind_scalar_item<L: ItemLeaf>(
 }
 
 /// What a leaf does with a subquery node it meets.
+#[derive(Clone, Copy)]
 enum SubPolicy<'a> {
     /// Bind it in `cx` as the column its decorrelation produces, recording it in
     /// `subs`.
@@ -836,18 +833,12 @@ impl JoinScope {
         Ok(())
     }
 
-    /// Take the nullability of `cols`, the output of the join step over every
-    /// relation pushed: the scope's columns, same ids in the same order. The
-    /// names stay the scope's, since a column alias list renames only these.
+    /// Take the nullability `cols` give each scope column among them.
     fn adopt_nullability(&mut self, cols: &[HirCol]) {
-        debug_assert_eq!(
-            cols.len(),
-            self.combined.len(),
-            "a join step's output is its scope's columns"
-        );
-        for (c, out) in self.combined.iter_mut().zip(cols) {
-            debug_assert_eq!(c.id, out.id, "a join step's output is its scope's columns");
-            c.def.is_nullable = out.def.is_nullable;
+        for c in &mut self.combined {
+            if let Some(out) = col_by_id(cols, c.id) {
+                c.def.is_nullable = out.def.is_nullable;
+            }
         }
     }
 

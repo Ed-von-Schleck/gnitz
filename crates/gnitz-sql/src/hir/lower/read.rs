@@ -92,10 +92,10 @@ impl Linear<'_> {
     fn source(&self) -> Result<(&Arc<RelDescriptor>, &[HirCol]), GnitzSqlError> {
         match self.base.as_ref() {
             RelExpr::Get { desc, cols } => Ok((desc, cols)),
-            // What the CTE derives under its grouping is named first.
+            // What the CTE or derived table derives under its grouping is named first.
             RelExpr::Reduce { input, .. } | RelExpr::Distinct { input } => {
                 linear(input)?;
-                Err(derivation("an aggregate over a grouped CTE"))
+                Err(derivation("an aggregate over a grouped CTE or derived table"))
             }
             // A DISTINCT over no relation is a set already, so only an aggregate meets it.
             _ => Err(GnitzSqlError::rejected(
@@ -238,18 +238,6 @@ fn flat_reduce(
     fold(Frame::scan(desc, source), pre, group_cols, aggs, having, items, order)
 }
 
-/// `items` over `src` as a relabel of its regions, where every column no item names
-/// is a key column or a hidden payload column of `src`: the reply hides both.
-fn ride(src: &Frame, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
-    let Some(out) = src.relabeled_in_order(items)? else {
-        return Ok(None);
-    };
-    let schema = &src.schema;
-    let drops_visible = (0..out.layout.len())
-        .any(|s| out.layout[s].is_none() && !schema.columns()[s].is_hidden && !schema.layout().is_pk_col(s));
-    Ok((!drops_visible).then_some(out))
-}
-
 /// The rows reply a projection over a source produces.
 pub(crate) struct RowsReply {
     /// The schema of the source the items read: a relation, a fold's partials, or the
@@ -300,33 +288,19 @@ pub(crate) fn reply_rows(
             None => items.push(it),
         }
     }
-    // A reply moving no column carries a view's hidden columns along hidden, so the
-    // view's stored regions ship as they are instead of the others being copied out
+    // A reply moving no column ships the relation's regions as they are, a view's
+    // hidden columns carried along hidden instead of the others being copied out
     // from beside them.
-    let ridden = match rides_hidden {
-        true => ride(&src, &items)?,
-        false => None,
-    };
-    let (proj, out, unmapped) = match ridden {
-        Some(out) => ((0..out.layout.len()).map(BoundExpr::ColRef).collect(), out, true),
+    let (proj, out, program) = match src.relabeled_whole(&items, rides_hidden)? {
+        Some(out) => ((0..out.layout.len()).map(BoundExpr::ColRef).collect(), out, None),
         None => {
             let (proj, out) = physical::physicalize_projection(&items, &src)?;
-            let k = src.schema.pk_cols().len();
-            // The relation's payload columns, each copied in place at its own type: the
-            // reply's regions are the relation's.
-            let payload = proj[k..]
-                .iter()
-                .zip(&out.schema.columns()[k..])
-                .map(|(item, def)| (item.as_col(), def.ty));
-            let unmapped = payload.eq(src.schema.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
-            (proj, out, unmapped)
+            let program = payload_program(&proj, &out.schema, &src.schema)?;
+            (proj, out, Some(program))
         }
     };
     let src = src.schema;
     let k = src.pk_cols().len();
-    let program = (!unmapped)
-        .then(|| payload_program(&proj, &out.schema, &src))
-        .transpose()?;
     let visible = items.iter().filter(|c| !c.out.def.is_hidden).map(|c| c.out.id);
     let (schema, column_of) = out.schema_in_order(visible, |_| None)?;
     // Each key with its slot of the projection's output.
@@ -360,11 +334,9 @@ pub(crate) fn reply_rows(
             .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize));
     Ok(RowsReply {
         order: numbered(&|slot| column_of[slot] as usize),
-        // The worker's sink numbers its input: the program's output, or the relation.
-        sink_order: match unmapped {
-            true => numbered(&|slot| source_col(slot).expect("an unmapped reply copies every column")),
-            false => numbered(&|slot| slot),
-        },
+        // The worker's sink numbers its input: the program's output, or the relation
+        // itself, which an identity projection numbers alike.
+        sink_order: numbered(&|slot| slot),
         pk_ordered,
         copied,
         program,

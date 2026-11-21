@@ -24,6 +24,8 @@ fn ranked_of(sql: &str, schema: &Schema, indexes: &[RelIndex]) -> Vec<Ranked> {
     let conjuncts = bind_where(sql, schema);
     ranked(&conjuncts, schema, indexes)
         .into_iter()
+        // Every WHERE has the scan.
+        .filter(|(tier, _)| *tier != T::Scan)
         .map(|(tier, c)| {
             let left = (0..conjuncts.len()).filter(|i| !c.consumed.contains(i)).collect();
             (tier, c.bound, left)
@@ -436,6 +438,15 @@ fn an_index_is_bounded_by_its_point_prefix_and_one_interval() {
             index(&[1], &[], img(Date, 19723), image_max(Date).unwrap(), vec![]),
         )],
     );
+    // A conjunct every row satisfies bounds nothing, so the scan outranks the walk.
+    check(
+        &schema3(U64, false),
+        vec![(
+            vec![ix(&[1])],
+            "a >= 0 AND a <= 18446744073709551615",
+            vec![(T::UnboundedIndex, rng(&[1], &[], 0, U64_MAX), vec![])],
+        )],
+    );
     // A 16-byte column has no register, so its bound consumes the conjunct.
     check(
         &schema3(U128, false),
@@ -634,7 +645,19 @@ fn an_unsupported_residual_reports_the_best_candidates_blocker() {
                 .to_string()
         })
         .collect();
-    assert!(blockers.len() == 2 && blockers[0] != blockers[1], "{blockers:?}");
+    assert!(blockers.len() == 3 && blockers[0] != blockers[1], "{blockers:?}");
     let err = bound_and_predicate(&schema, &conjuncts, &indexes).expect_err("no residual compiles");
     assert_eq!(err.to_string(), blockers[0]);
+}
+
+/// An index walk bounding nothing still serves a WHERE whose conjunct no residual
+/// carries, since the scan cannot.
+#[test]
+fn an_unbounded_index_walk_serves_what_the_scan_cannot() {
+    let s = schema3(TypeCode::U128, false);
+    let indexes = [ix(&[1])];
+    let conjuncts = bind_where("a > -1", &s);
+    let (bound, predicate) = bound_and_predicate(&s, &conjuncts, &indexes).expect("the walk consumes `a > -1`");
+    assert_eq!(bound, rng(&[1], &[], 0, u128::MAX));
+    assert_eq!(predicate, compile_wire_conjuncts(&[], s.columns()).unwrap());
 }

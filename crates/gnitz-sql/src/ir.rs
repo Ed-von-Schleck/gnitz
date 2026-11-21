@@ -9,6 +9,17 @@ use gnitz_wire::{
 /// definitions; the IR carries each verbatim rather than restating it.
 pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
 
+/// A float literal's value, equal to another only bit for bit: a NaN is the
+/// literal it is, and `-0.0` is not `0.0`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct F64Bits(pub(crate) f64);
+
+impl PartialEq for F64Bits {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
 /// The bound-expression IR, generic over its leaf reference type `R`, which only
 /// `ColRef` carries. `R` has three instantiations: `usize` (the [`BoundExpr`]
 /// alias), a resolved column index into a batch schema; `ColId`, the view
@@ -16,7 +27,7 @@ pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
 /// `Infallible`, in a written constant, where no column can occur.
 /// `PartialEq` is structural equality over the *bound* form — what makes "the same
 /// expression written twice" decidable after names resolve, so `t.a + b` and
-/// `a + b` are one expression. Not `Eq`, because `LitFloat` compares by `f64`.
+/// `a + b` are one expression.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BExpr<R> {
     ColRef(R),
@@ -25,7 +36,7 @@ pub(crate) enum BExpr<R> {
     /// its text spells at its smallest exact scale — `None` past `i128` or
     /// [`gnitz_wire::MAX_DECIMAL_TEXT_SCALE`] fractional digits. A DECIMAL consumer reads `dec`, never `v`.
     LitFloat {
-        v: f64,
+        v: F64Bits,
         dec: Option<(i128, u8)>,
     },
     LitStr(String),
@@ -694,7 +705,7 @@ impl<R> BExpr<R> {
     pub(crate) fn float_literal(&self) -> Option<f64> {
         match self {
             BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v as f64),
-            BExpr::LitFloat { v, .. } => Some(*v),
+            BExpr::LitFloat { v, .. } => Some(v.0),
             BExpr::LitWide(n) if n.is_negative() => Some(-(n.mag as f64)),
             BExpr::LitWide(n) => Some(n.mag as f64),
             _ => None,
@@ -722,7 +733,7 @@ impl<R> BExpr<R> {
         match self {
             BExpr::LitInt(v) => v.to_string(),
             BExpr::LitFloat { dec: Some((u, scale)), .. } => scaled_text(*u, *scale),
-            BExpr::LitFloat { v, dec: None } => FloatText(*v).to_string(),
+            BExpr::LitFloat { v, dec: None } => FloatText(v.0).to_string(),
             BExpr::LitWide(n) => n.to_string(),
             BExpr::LitTemporal { tc: TypeCode::Date, v } => format!("DATE '{}'", write_date(*v, buf)),
             BExpr::LitTemporal { v, .. } => format!("TIMESTAMP '{}'", write_timestamp(*v, buf)),
@@ -739,7 +750,10 @@ impl<R> BExpr<R> {
             BExpr::LitInt(v) => v
                 .checked_neg()
                 .map_or(BExpr::LitWide(NumLit { mag: 1 << 63, neg: false }), BExpr::LitInt),
-            BExpr::LitFloat { v, dec } => BExpr::LitFloat { v: -v, dec: dec.map(|(u, s)| (-u, s)) },
+            BExpr::LitFloat { v, dec } => BExpr::LitFloat {
+                v: F64Bits(-v.0),
+                dec: dec.map(|(u, s)| (-u, s)),
+            },
             // A negated wide literal that fits i64 is the LitInt it is.
             BExpr::LitWide(n) => {
                 let n = NumLit { mag: n.mag, neg: !n.neg };

@@ -20,7 +20,7 @@ pub(crate) use bind::{BoundRef, ViewBody};
 
 use crate::agg::{AggArg, AggFunc};
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp, LeafTyping};
+use crate::ir::{BExpr, BinOp, F64Bits, LeafTyping};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, RangeRel, ReduceKind, TypeCode, WeightSlots};
@@ -80,19 +80,20 @@ pub(crate) fn bind_adhoc_read(
     cat: &dyn crate::catalog::Catalog,
     query: &sqlparser::ast::Query,
 ) -> Result<AdhocRead, GnitzSqlError> {
-    use crate::ast_util::{FromShape, classify_from};
     use crate::error::derivation;
     let keys = crate::tail::parse_order_by(query.order_by.as_ref())?;
     // The top-level body reads through one relation's sink, so a set operation or a
-    // FROM that derives is refused before anything is resolved; a CTE may derive,
-    // and the read lowering refuses what it cannot compose to one read.
+    // join is refused before anything is resolved; a CTE or a derived table may
+    // derive, and the read lowering refuses what it cannot compose to one read.
     let select = match query.body.as_ref() {
         sqlparser::ast::SetExpr::SetOperation { .. } => return Err(derivation("set operation")),
         // Not the derivation template: CREATE VIEW refuses these bodies too.
         body => crate::validate::as_plain_select(body, "direct SELECT")?,
     };
-    if let FromShape::Derived(construct) = classify_from(&select.from) {
-        return Err(derivation(construct));
+    match select.from.as_slice() {
+        [_, _, ..] => return Err(derivation("comma-join FROM")),
+        [single] if !single.joins.is_empty() => return Err(derivation("JOIN")),
+        _ => {}
     }
     let ids = ColIdGen::new();
     let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc);
@@ -500,7 +501,7 @@ impl HirAgg {
             return value;
         };
         let some = |c: &AggCol| BExpr::bin(BExpr::ColRef(c.col.id), BinOp::Ne, BExpr::LitInt(0));
-        let float = |v: f64| BExpr::LitFloat { v, dec: None };
+        let float = |v: f64| BExpr::LitFloat { v: F64Bits(v), dec: None };
         BExpr::Case {
             branches: vec![
                 (BExpr::bin(some(pos), BinOp::And, some(neg)), float(f64::NAN)),
@@ -560,13 +561,10 @@ pub(crate) enum JoinType {
     Left,
     Right,
     Full,
-    /// EXISTS/IN: keep each left row by match existence.
-    Semi,
-    /// NOT EXISTS / NOT IN: drop each left row by match existence.
-    Anti,
-    /// EXISTS/IN in a mark position, carrying the `ColId` of the synthetic BOOLEAN
-    /// column tagging each left row — the column the subquery is read through.
-    Mark(ColId),
+    /// The decorrelation-only kind an EXISTS/IN subquery lowers to, never produced
+    /// by a FROM-clause JOIN: it preserves neither side and carries only the left
+    /// (outer) columns.
+    Exists(ExistsKind),
 }
 
 impl JoinType {
@@ -596,43 +594,30 @@ impl JoinType {
         }
     }
 
-    /// The decorrelation-only kind an EXISTS/IN subquery lowers to, never produced
-    /// by a FROM-clause JOIN: it preserves neither side and carries only the left
-    /// (outer) columns. `None` for a FROM-clause kind.
-    pub(crate) fn exists(self) -> Option<ExistsKind> {
-        match self {
-            JoinType::Semi => Some(ExistsKind::Semi),
-            JoinType::Anti => Some(ExistsKind::Anti),
-            JoinType::Mark(id) => Some(ExistsKind::Mark(id)),
-            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => None,
-        }
-    }
-
-    /// Whether this is an [`Self::exists`] kind.
-    pub(crate) fn is_decorrelated(self) -> bool {
-        self.exists().is_some()
-    }
-
     /// Whether this side gets a **ν** — the unmatched set `w_P · [S = 0]`, its
     /// rows no row of the other side matches. Wider than [`Self::preserves`], which
-    /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
-    /// neither side yet all three decide per left row by match existence.
+    /// answers "emit an outer null-fill branch": an `Exists` kind preserves
+    /// neither side yet decides per left row by match existence.
     pub(crate) fn has_nu(self, side: usize) -> bool {
-        self.preserves(side) || (side == 0 && self.is_decorrelated())
+        self.preserves(side) || (side == 0 && matches!(self, JoinType::Exists(_)))
     }
 
     /// Whether this side's unmatched rows are an output: a null-fill, an anti row,
     /// or a mark-0 row. A Semi reads no complement.
     pub(crate) fn emits_unmatched(self, side: usize) -> bool {
-        self.preserves(side) || (side == 0 && matches!(self, JoinType::Anti | JoinType::Mark(_)))
+        self.preserves(side) || (side == 0 && matches!(self, JoinType::Exists(ExistsKind::Anti | ExistsKind::Mark(_))))
     }
 }
 
-/// A [`JoinType`] an EXISTS/IN subquery lowers to.
+/// A [`JoinType::Exists`] join's kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExistsKind {
+    /// EXISTS/IN: keep each left row by match existence.
     Semi,
+    /// NOT EXISTS / NOT IN: drop each left row by match existence.
     Anti,
+    /// EXISTS/IN in a mark position, carrying the `ColId` of the synthetic BOOLEAN
+    /// column tagging each left row — the column the subquery is read through.
     Mark(ColId),
 }
 
@@ -778,11 +763,11 @@ impl RelExpr {
     /// A DISTINCT over every column of `input`, or `input` itself when it is
     /// already a set. `role` names the clause in the refusal of a float column.
     pub(crate) fn distinct(input: Rc<RelExpr>, role: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        crate::rules::reject_float_keys(input.cols().iter().map(|c| &c.def), role)?;
         // Already a set: nothing to deduplicate.
         if input.unique_key().is_some() {
             return Ok(input);
         }
+        crate::rules::reject_float_keys(input.cols().iter().map(|c| &c.def), role)?;
         Ok(Rc::new(RelExpr::Distinct { input }))
     }
 
@@ -866,7 +851,7 @@ impl RelExpr {
             }
             RelExpr::Join { left, right, kind, on, .. } => match kind {
                 // One output row per left row.
-                k if k.is_decorrelated() => left.unique_key(),
+                JoinType::Exists(_) => left.unique_key(),
                 JoinType::Inner | JoinType::Left if on.side_unique(right, 1) => left.unique_key(),
                 JoinType::Inner | JoinType::Right if on.side_unique(left, 0) => right.unique_key(),
                 _ => None,
@@ -938,8 +923,7 @@ impl RelExpr {
             RelExpr::Filter { input, .. } | RelExpr::Distinct { input } => input.cols(),
             RelExpr::Project { items, .. } => Cow::Owned(items.iter().map(|e| e.out.clone()).collect()),
             RelExpr::Join { left, right, kind, .. } => match kind {
-                JoinType::Semi | JoinType::Anti => left.cols(),
-                JoinType::Mark(id) => {
+                JoinType::Exists(ExistsKind::Mark(id)) => {
                     let mut cols = left.cols().into_owned();
                     // Hidden: nothing but the expressions reading the subquery
                     // reach it, and it is addressed by id, never by name.
@@ -949,6 +933,7 @@ impl RelExpr {
                     ));
                     Cow::Owned(cols)
                 }
+                JoinType::Exists(_) => left.cols(),
                 // Null-widened per `JoinType::widen_sides`, as `join_frame` does.
                 _ => {
                     let mut cols = left.cols().into_owned();

@@ -308,6 +308,11 @@ enum Tier {
     Index,
     /// Bounds nothing, but consumes conjuncts a residual may not carry (`u128pk > -1`).
     UnboundedPkRange,
+    /// No bound: the whole WHERE is the residual.
+    Scan,
+    /// Bounds nothing and reads every row out of PK order, so it serves only a
+    /// WHERE the scan's residual cannot carry.
+    UnboundedIndex,
 }
 
 /// Every bound `conjuncts` admit, best first. A list, because a candidate whose
@@ -317,8 +322,8 @@ pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[Re
 }
 
 /// Bind-once WHERE → the access path that serves it: the first of [`candidates`]
-/// whose residual compiles, else an unbounded scan under the whole WHERE.
-/// `indexes` is the relation's declared secondary-index list.
+/// whose residual compiles. `indexes` is the relation's declared secondary-index
+/// list.
 pub(crate) fn bound_and_predicate(
     schema: &Schema,
     conjuncts: &[BoundExpr],
@@ -336,11 +341,8 @@ pub(crate) fn bound_and_predicate(
             Err(e) => return Err(e),
         }
     }
-    // A candidate's residual is part of the whole WHERE, which then fails too.
-    if let Some(e) = blocked {
-        return Err(e);
-    }
-    Ok((ReadBound::None, compile_wire_conjuncts(conjuncts, schema.columns())?))
+    // The scan is a candidate, so a WHERE no candidate serves blocked each.
+    Err(blocked.expect("the scan is a candidate"))
 }
 
 /// [`candidates`], each beside the tier that placed it.
@@ -389,6 +391,14 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
             },
         ));
     }
+    out.push((
+        Tier::Scan,
+        IndexRank::default(),
+        Candidate {
+            bound: ReadBound::None,
+            consumed: Vec::new(),
+        },
+    ));
     for meta in indexes {
         let Some(b) = bound_column_list(meta.cols, &terms, schema) else {
             continue;
@@ -396,8 +406,10 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
         let n_cols = meta.cols.as_slice().len();
         let tier = if meta.is_unique && b.pinned == n_cols {
             Tier::UniqueIndexPoint
-        } else {
+        } else if b.pinned > 0 || b.bounded_sides > 0 {
             Tier::Index
+        } else {
+            Tier::UnboundedIndex
         };
         let rank = IndexRank {
             pinned: b.pinned,

@@ -77,8 +77,6 @@ pub(super) struct Peeled<'a> {
     pub(super) bottom: &'a Rc<RelExpr>,
     /// What is read of `bottom`.
     pub(super) read: ColSet,
-    /// What is read of `rel`.
-    live: ColSet,
     /// The node a reader not reading `bottom` in place cuts, with the number of
     /// levels above it: `rel` itself, or the deepest level's input the body reads
     /// more than once — a subtree its readers share, so nothing above it is cut
@@ -99,9 +97,8 @@ impl<'a> Peeled<'a> {
         let Peeled {
             mut levels,
             bottom,
-            live,
+            read,
             cut: (above, node),
-            ..
         } = self;
         let seg = match bottom.as_ref() {
             RelExpr::Get { desc, cols } => SegInput {
@@ -110,6 +107,8 @@ impl<'a> Peeled<'a> {
             },
             // `live` prunes only `rel` itself: a shared node is cut whole.
             _ => {
+                // What is read of `rel`: the outermost level's set, else `bottom`'s.
+                let live = levels.first().map_or(read, |(_, r)| r.clone());
                 levels.truncate(above);
                 cut_segment(chain, node, &live)?
             }
@@ -142,22 +141,18 @@ pub(super) fn peel<'a>(chain: &ViewChain, rel: &'a Rc<RelExpr>, live: &ColSet) -
     if matches!(bottom.as_ref(), RelExpr::Get { .. }) {
         cut = (0, rel);
     }
-    Peeled {
-        levels,
-        bottom,
-        read,
-        live: live.clone(),
-        cut,
-    }
+    Peeled { levels, bottom, read, cut }
 }
 
-/// What the consumer needs of the top projection: its exact columns (a view's
-/// output, a top-N or window carrying every input column), only a slot per column it
-/// reads (a reduce, a set operation's leaves), or its columns in their written order
-/// beside whatever else the node below holds (a reduce's output the view stores).
+/// What the consumer needs of the top projection: its exact columns under any
+/// numbering (a view's output), its exact columns key first (a top-N or window
+/// carrying every input column), only a slot per column it reads (a reduce, a set
+/// operation's leaves), or its columns in their written order beside whatever else
+/// the node below holds (a reduce's output the view stores).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Top {
     Output,
+    KeyFirst,
     Slots,
     Store,
 }
@@ -220,7 +215,8 @@ impl Spine<'_> {
 
     /// Emit the source and the levels into `cb`. A rename-only projection
     /// relabels the frame instead of emitting a node, except the outermost one
-    /// under `Top::Output`, and under `Top::Store` one that would move a column.
+    /// under `Top::KeyFirst`, under `Top::Output` one that would move or drop a
+    /// payload column, and under `Top::Store` one that would move a column.
     pub(super) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels, scatter } = self;
         let SegInput { src, frame } = seg;
@@ -252,7 +248,7 @@ fn emit_levels(
     start: impl FnOnce(&mut Circuit, &Frame, Vec<BoundExpr>) -> Result<NodeId, GnitzSqlError>,
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
     let output_at = match top {
-        Top::Output | Top::Store => levels.iter().position(|(l, _)| !matches!(l, Level::Where(_))),
+        Top::Output | Top::KeyFirst | Top::Store => levels.iter().position(|(l, _)| !matches!(l, Level::Where(_))),
         Top::Slots => None,
     };
     let mut start = Some(start);
@@ -276,6 +272,7 @@ fn emit_levels(
                 let relabeled = match (output_at == Some(i), top) {
                     (false, _) => frame.relabeled(&items)?,
                     (true, Top::Store) => frame.relabeled_in_order(&items)?,
+                    (true, Top::Output) => frame.relabeled_whole(&items, false)?,
                     (true, _) => None,
                 };
                 if let Some(relabeled) = relabeled {
@@ -309,6 +306,8 @@ fn source(
             candidates(&conjuncts, &frame.schema, &d.indexes)
                 .into_iter()
                 .map(|c| c.bound)
+                // Every conjunct is filtered below, so no candidate past the scan serves.
+                .take_while(|b| !matches!(b, ReadBound::None))
                 // A backfill never routes, and the engine may trade an index walk for the
                 // full scan, which it cannot do for a PK range.
                 .min_by_key(|b| match b {

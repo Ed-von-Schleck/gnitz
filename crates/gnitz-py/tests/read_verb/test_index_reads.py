@@ -175,9 +175,8 @@ def ranged(module_client):
     ("x > -10 AND x > 10", lambda x: x > 10),
     ("x > 10 AND x > -10", lambda x: x > 10),
     # An out-of-type-range bound saturates rather than wrapping: provably empty
-    # above I32::MAX, unbounded below it.
+    # above I32::MAX.
     ("x > 3000000000", lambda x: False),
-    ("x < 3000000000", lambda x: True),
 ])
 def test_index_range_walks_the_signed_interval(ranged, predicate, keep):
     """A range over a signed indexed column returns exactly the contiguous
@@ -188,6 +187,15 @@ def test_index_range_walks_the_signed_interval(ranged, predicate, keep):
     q = f"SELECT pk FROM ranged WHERE {predicate}"
     assert access(ranged, q) == "index range on (x)"
     assert bag(rows(ranged, q)) == {(pk,): 1 for pk in range(1, 16) if keep((pk - 8) * 5)}
+
+
+def test_a_saturated_bound_spanning_the_whole_domain_scans(ranged):
+    """An out-of-type-range bound below I32::MAX saturates to the whole domain, so
+    an index walk would bound nothing: the scan serves it, and its NULL rows
+    still fail the compare."""
+    q = "SELECT pk FROM ranged WHERE x < 3000000000"
+    assert access(ranged, q) == "full scan"
+    assert bag(rows(ranged, q)) == {(pk,): 1 for pk in range(1, 16)}
 
 
 def test_max_arity_composite_descriptor_crosses_the_inline_cap(client):

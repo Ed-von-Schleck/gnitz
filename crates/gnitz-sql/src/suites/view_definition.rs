@@ -30,7 +30,7 @@ fn renamed() -> TestCatalog {
 }
 
 fn source(name: &str) -> Arc<RelDescriptor> {
-    base().probe(&in_sn(name)).unwrap().unwrap()
+    base().probe(&in_sn(name)).unwrap()
 }
 
 fn renamed_desc(d: &RelDescriptor) -> Arc<RelDescriptor> {
@@ -51,7 +51,7 @@ fn client_catalog(cat: &TestCatalog, names: &[String]) -> Catalog {
     let relations = names
         .iter()
         .map(|name| {
-            let d = cat.probe(&in_sn(name)).unwrap().unwrap();
+            let d = cat.probe(&in_sn(name)).unwrap();
             CatalogRelation {
                 id: d.tid,
                 schema: SN.to_string(),
@@ -262,7 +262,7 @@ fn a_view_over_a_view_records_the_view_it_reads() {
     let cat = base();
     let chain = view(&cat, "SELECT tv.id FROM tv JOIN t ON tv.id = t.id");
     let tids: Vec<u64> = definition(&chain).refs.iter().map(|r| r.tid).collect();
-    let tv = cat.probe(&in_sn("tv")).unwrap().unwrap().tid;
+    let tv = cat.probe(&in_sn("tv")).unwrap().tid;
     assert_eq!(tids, [tv, source("t").tid]);
-    assert_eq!(cat.probe(&in_sn("tv")).unwrap().unwrap().class, RelClass::View);
+    assert_eq!(cat.probe(&in_sn("tv")).unwrap().class, RelClass::View);
 }

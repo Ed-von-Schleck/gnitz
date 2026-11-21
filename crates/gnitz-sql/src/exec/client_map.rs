@@ -14,6 +14,7 @@ use crate::hir::RowsReply;
 /// A projection program resolved over a source schema, and the output schema it fills.
 /// The output keeps its source's key region; its column list may name those key columns
 /// anywhere.
+#[derive(Clone)]
 pub(crate) struct ClientMap {
     src: Arc<Schema>,
     out_schema: Arc<Schema>,

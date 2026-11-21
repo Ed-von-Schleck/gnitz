@@ -2,8 +2,9 @@
 //! place each conjunct as low as it is exact — in an input, in the join's keys, or
 //! in a `Filter` above the join.
 
-use super::{HirCol, HirExpr, JoinClass, JoinType, KeyPair, RelExpr, Side, cross_comparison, side};
+use super::{HirCol, HirExpr, JoinClass, JoinType, KeyPair, RelExpr, Side, col_by_id, cross_comparison, side};
 use crate::error::GnitzSqlError;
+use crate::ir::BExpr;
 use crate::ir::BinOp;
 use crate::rules::{reject_arity, reject_float_keys};
 use gnitz_wire::{ColType, ColumnDef, JoinKeyRule};
@@ -29,7 +30,7 @@ impl RelExpr {
         reject_arity("join key list", placed.class.arity(), gnitz_wire::PK_LIST_MAX_COLS)?;
         placed.class.admit(kind)?;
         reject_outer_with_residual(kind, &placed.above)?;
-        placed.build(&left, &right, kind)
+        placed.build(&left, &right)
     }
 
     /// `input` filtered by `preds`, each conjunct placed as low as it is exact.
@@ -44,16 +45,17 @@ impl RelExpr {
             }
             // Only an INNER join keys a filter conjunct, and it admits every key.
             RelExpr::Join { left, right, kind, on } => {
-                place(left, right, *kind, on.clone(), preds, Origin::Filter)?.build(left, right, *kind)
+                place(left, right, *kind, on.clone(), preds, Origin::Filter)?.build(left, right)
             }
             _ => Ok(Rc::new(RelExpr::Filter { input, preds })),
         }
     }
 }
 
-/// A join's conjuncts once placed: its keys, what each input evaluates, and what
-/// stays above it.
+/// A join's conjuncts once placed: its kind, its keys, what each input evaluates,
+/// and what stays above it.
 struct Placed {
+    kind: JoinType,
     class: JoinClass,
     below: [Vec<HirExpr>; 2],
     above: Vec<HirExpr>,
@@ -61,18 +63,44 @@ struct Placed {
 
 impl Placed {
     /// The join node.
-    fn build(self, left: &Rc<RelExpr>, right: &Rc<RelExpr>, kind: JoinType) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    fn build(self, left: &Rc<RelExpr>, right: &Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let [l, r] = self.below;
         let join = Rc::new(RelExpr::Join {
             left: RelExpr::filter(Rc::clone(left), l)?,
             right: RelExpr::filter(Rc::clone(right), r)?,
-            kind,
+            kind: self.kind,
             on: self.class,
         });
         Ok(match self.above.is_empty() {
             true => join,
             false => Rc::new(RelExpr::Filter { input: join, preds: self.above }),
         })
+    }
+}
+
+/// `kind` less the preservation `preds` undo: a comparison with a bare column of
+/// one side as an operand is NULL on every row that side's columns are null-filled
+/// in, so a filter conjunct of that shape drops the other side's unmatched rows.
+fn narrowed(kind: JoinType, preds: &[HirExpr], cols: [&[HirCol]; 2]) -> JoinType {
+    if !(kind.preserves(0) || kind.preserves(1)) {
+        return kind;
+    }
+    let rejects_null = |side: usize| {
+        preds.iter().any(|p| match p {
+            BExpr::BinOp(a, op, b) if op.as_cmp().is_some() => [a, b]
+                .iter()
+                .any(|e| e.as_col().is_some_and(|id| col_by_id(cols[side], id).is_some())),
+            _ => false,
+        })
+    };
+    match (
+        kind.preserves(0) && !rejects_null(1),
+        kind.preserves(1) && !rejects_null(0),
+    ) {
+        (false, false) => JoinType::Inner,
+        (true, false) => JoinType::Left,
+        (false, true) => JoinType::Right,
+        (true, true) => JoinType::Full,
     }
 }
 
@@ -86,8 +114,9 @@ fn admits(kind: JoinType, origin: Origin, side: usize) -> bool {
     }
 }
 
-/// Place `conjs` over the join of `left` and `right`, keying into `class`. Fails
-/// only on an ON comparison whose column pair cannot be a key.
+/// Place `conjs` over the join of `left` and `right`, keying into `class`; a
+/// filter's conjuncts first narrow `kind`. Fails only on an ON comparison whose
+/// column pair cannot be a key.
 fn place(
     left: &Rc<RelExpr>,
     right: &Rc<RelExpr>,
@@ -97,6 +126,10 @@ fn place(
     origin: Origin,
 ) -> Result<Placed, GnitzSqlError> {
     let (lcols, rcols) = (left.cols(), right.cols());
+    let kind = match origin {
+        Origin::Filter => narrowed(kind, &conjs, [&lcols, &rcols]),
+        Origin::On => kind,
+    };
     let (mut below, mut above) = ([Vec::new(), Vec::new()], Vec::new());
     for conj in conjs {
         let input = match side(&conj, &lcols, &rcols) {
@@ -115,7 +148,7 @@ fn place(
         }
         above.extend(class.key(conj, &lcols, &rcols, origin)?);
     }
-    Ok(Placed { class, below, above })
+    Ok(Placed { kind, class, below, above })
 }
 
 impl JoinClass {
@@ -176,7 +209,7 @@ fn reject_outer_with_residual(kind: JoinType, residual: &[HirExpr]) -> Result<()
              would have to participate in the outer null-fill. Use INNER JOIN, or \
              move the predicate to a WHERE over a wrapping view.",
         )),
-        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => Err(GnitzSqlError::rejected(
+        JoinType::Exists(_) => Err(GnitzSqlError::rejected(
             "EXISTS/IN correlation contains a conjunct the semi-join cannot consume \
              (a non-equality/non-range comparison, a second range conjunct, or an OR \
              group spanning both relations); it would have to participate in the \

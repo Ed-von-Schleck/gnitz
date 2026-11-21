@@ -410,6 +410,25 @@ fn alter_results_and_if_exists_no_ops() {
     );
 }
 
+/// `IF EXISTS` skips an ALTER of a name whose schema is missing, as it skips a
+/// drop; without it, the ALTER is refused as a missing schema.
+#[test]
+fn if_exists_skips_an_alter_in_a_missing_schema() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY);
+         ALTER TABLE IF EXISTS nosuchschema.t RENAME TO u;
+         ALTER VIEW IF EXISTS nosuchschema.v AS SELECT id FROM t",
+    );
+    for sql in [
+        "ALTER TABLE nosuchschema.t RENAME TO u",
+        "ALTER VIEW nosuchschema.v AS SELECT id FROM t",
+        "CREATE VIEW IF NOT EXISTS nosuchschema.v AS SELECT id FROM t",
+    ] {
+        db.refuses(sql, NotFound, "schema 'nosuchschema' not found");
+    }
+}
+
 #[test]
 fn alter_rejection_matrix() {
     let mut db = Db::boot(1);

@@ -34,7 +34,7 @@ impl Descriptors {
 }
 
 /// One run of a plan: the names the server answered in earlier runs, then what
-/// the client holds, else a miss that ends the run.
+/// the client holds, else a miss, answered as absent, that voids the run.
 struct Run<'a> {
     client: &'a GnitzClient,
     schema_name: &'a str,
@@ -43,7 +43,7 @@ struct Run<'a> {
     resolved: &'a [(RelName, Option<Arc<RelDescriptor>>)],
     /// Whether a kept descriptor went into this run.
     kept: Cell<bool>,
-    /// The name this run asked for that nothing above answers.
+    /// The first name this run asked for that nothing above answers.
     missed: RefCell<Option<RelName>>,
 }
 
@@ -52,31 +52,30 @@ impl Catalog for Run<'_> {
         self.schema_name
     }
 
-    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+    fn probe(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
         if let Some((_, desc)) = self.resolved.iter().find(|(n, _)| n == name) {
-            return Ok(desc.clone());
+            return desc.clone();
         }
         if self.descriptors.mirrored
             && let Some(desc) = self.client.mirrored_desc(name)
         {
-            return Ok(Some(desc));
+            return Some(desc);
         }
         if self.descriptors.kept
             && let Some(desc) = self.client.kept_desc(name)
         {
             self.kept.set(true);
-            return Ok(Some(desc));
+            return Some(desc);
         }
-        *self.missed.borrow_mut() = Some(name.clone());
-        Err(GnitzSqlError::Internal(format!(
-            "relation '{name}' was planned before it was resolved"
-        )))
+        self.missed.borrow_mut().get_or_insert_with(|| name.clone());
+        None
     }
 }
 
 /// Plan against the descriptors `client` supplies for the names the plan asks
-/// for: one it holds that `descriptors` admits, else the server's. Also answers
-/// whether a kept one went into the plan.
+/// for: one it holds that `descriptors` admits, else the server's. A name in a
+/// missing schema is absent, and a plan that fails over one reports the missing
+/// schema. Also answers whether a kept one went into the plan.
 async fn planned<T>(
     client: &mut GnitzClient,
     schema_name: &str,
@@ -84,6 +83,7 @@ async fn planned<T>(
     plan: impl Fn(&dyn Catalog) -> Result<T, GnitzSqlError>,
 ) -> (Result<T, GnitzSqlError>, bool) {
     let mut resolved = Vec::new();
+    let mut missing_schema = None;
     loop {
         // `run` borrows `client`, so it ends before the resolve below.
         let missing = {
@@ -96,14 +96,23 @@ async fn planned<T>(
                 missed: RefCell::new(None),
             };
             let planned = plan(&run);
-            // Read before `planned`: a plan may swallow the miss's error.
+            // A run that missed planned from an absence the server may not
+            // confirm, so only a run that missed nothing stands.
             match run.missed.into_inner() {
-                None => return (planned, run.kept.get()),
+                None => {
+                    let planned = planned.map_err(|e| missing_schema.map_or(e, GnitzSqlError::Client));
+                    return (planned, run.kept.get());
+                }
                 Some(name) => name,
             }
         };
         match client.resolve(&missing).await {
             Ok(desc) => resolved.push((missing, desc)),
+            // RESOLVE refuses `NotFound` only for a missing schema.
+            Err(e) if e.status() == Some(WireStatus::NotFound) => {
+                missing_schema.get_or_insert(e);
+                resolved.push((missing, None));
+            }
             // The server's answer for a name the client did not hold: no kept
             // descriptor decided it, so it stands.
             Err(e) => return (Err(e.into()), false),
@@ -254,36 +263,20 @@ pub(crate) async fn execute_statement(
             )
             .await
         }
+        // Refused, not failed: the transaction stays open.
         Statement::CreateTable(_)
         | Statement::CreateSchema { .. }
         | Statement::Drop { .. }
         | Statement::CreateView(_)
         | Statement::CreateIndex(_)
         | Statement::AlterTable(_)
-        | Statement::AlterView(_) => {
-            // Refused, not failed: the transaction stays open.
-            if client.txn_active() {
-                return Err(GnitzSqlError::rejected(
-                    "this statement is not allowed inside a transaction",
-                ));
-            }
-            Ok(SqlResult::Ddl {
-                tag: execute_ddl(client, schema_name, stmt, text).await?,
-            })
+        | Statement::AlterView(_)
+            if client.txn_active() =>
+        {
+            Err(GnitzSqlError::rejected(
+                "this statement is not allowed inside a transaction",
+            ))
         }
-        _ => Err(GnitzSqlError::rejected(format!("unsupported SQL statement: {stmt}"))),
-    }
-}
-
-/// Run one DDL statement and return its command tag; [`execute_statement`]
-/// has refused it inside a transaction.
-async fn execute_ddl(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    stmt: &Statement,
-    text: StatementText<'_>,
-) -> Result<&'static str, GnitzSqlError> {
-    match stmt {
         Statement::CreateTable(create) => {
             if let Some(plan) = planned(client, schema_name, Descriptors::SERVER, |cat| {
                 ddl::plan_create_table(create, cat)
@@ -293,7 +286,7 @@ async fn execute_ddl(
             {
                 client.create_table(&plan).await?;
             }
-            Ok("CREATE TABLE")
+            Ok(SqlResult::Ddl { tag: "CREATE TABLE" })
         }
         // `Drop` and `CreateSchema` reject their clauses in the router: sqlparser
         // gives neither a payload struct, so their executors could destructure
@@ -314,7 +307,8 @@ async fn execute_ddl(
             reject_if(*purge, CTX, "PURGE")?;
             reject_if(*temporary, CTX, "TEMPORARY")?;
             reject_if(table.is_some(), CTX, "ON <table> (MySQL DROP INDEX target)")?;
-            ddl::execute_drop(client, schema_name, object_type, names, *if_exists, *cascade).await
+            let tag = ddl::execute_drop(client, schema_name, object_type, names, *if_exists, *cascade).await?;
+            Ok(SqlResult::Ddl { tag })
         }
         Statement::CreateSchema {
             schema_name: name,
@@ -332,7 +326,7 @@ async fn execute_ddl(
             reject_if(default_collate_spec.is_some(), CTX, "DEFAULT COLLATE")?;
             reject_if(clone.is_some(), CTX, "CLONE")?;
             ddl::execute_create_schema(client, name, *if_not_exists).await?;
-            Ok("CREATE SCHEMA")
+            Ok(SqlResult::Ddl { tag: "CREATE SCHEMA" })
         }
         Statement::CreateView(cv) => {
             if let Some(chain) = planned(client, schema_name, Descriptors::SERVER, |cat| {
@@ -343,15 +337,22 @@ async fn execute_ddl(
             {
                 client.create_view_chain(chain).await?;
             }
-            Ok("CREATE VIEW")
+            Ok(SqlResult::Ddl { tag: "CREATE VIEW" })
         }
         Statement::CreateIndex(ci) => {
             ddl::execute_create_index(client, schema_name, ci).await?;
-            Ok("CREATE INDEX")
+            Ok(SqlResult::Ddl { tag: "CREATE INDEX" })
         }
         Statement::AlterTable(a) => {
-            ddl::execute_alter_table(client, schema_name, a).await?;
-            Ok("ALTER TABLE")
+            if let Some(plan) = planned(client, schema_name, Descriptors::SERVER, |cat| {
+                ddl::plan_alter_table(a, cat)
+            })
+            .await
+            .0?
+            {
+                ddl::execute_alter_table(client, plan).await?;
+            }
+            Ok(SqlResult::Ddl { tag: "ALTER TABLE" })
         }
         Statement::AlterView(av) => {
             if let Some(chain) = planned(client, schema_name, Descriptors::SERVER, |cat| {
@@ -362,9 +363,9 @@ async fn execute_ddl(
             {
                 client.create_view_chain(chain).await?;
             }
-            Ok("ALTER VIEW")
+            Ok(SqlResult::Ddl { tag: "ALTER VIEW" })
         }
-        _ => unreachable!("execute_statement routes only DDL here"),
+        _ => Err(GnitzSqlError::rejected(format!("unsupported SQL statement: {stmt}"))),
     }
 }
 

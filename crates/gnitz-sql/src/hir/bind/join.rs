@@ -72,6 +72,7 @@ pub(super) fn fold_join_step(
         JoinConstraint::On(_) | JoinConstraint::None => (Vec::new(), ""),
     };
 
+    let split = scope.combined.len();
     scope.push(&ralias, rcols)?;
 
     // Every other form states its keys as `pairs`, empty for a keyless step — so a
@@ -105,10 +106,10 @@ pub(super) fn fold_join_step(
         scope.merged.push(if kind == JoinType::Right { l } else { r });
     }
 
-    let out = RelExpr::join(left, right_src, kind, on)?;
     // A later ON, the WHERE and the projection resolve against the widened columns.
-    scope.adopt_nullability(&out.cols());
-    Ok(out)
+    let (l, r) = scope.combined.split_at_mut(split);
+    kind.widen_sides(l.iter_mut().map(|c| &mut c.def), r.iter_mut().map(|c| &mut c.def));
+    RelExpr::join(left, right_src, kind, on)
 }
 
 /// The `(left col, right col)` pair for each merged column name: the left copy

@@ -2,7 +2,7 @@
 //! Bind reads each subquery through its column ([`SubqueryRef::id`]); its join
 //! produces that column.
 
-use super::super::{ColId, HirExpr, JoinType, ProjEntry, RelExpr, split_filter};
+use super::super::{ColId, ExistsKind, HirExpr, JoinType, ProjEntry, RelExpr, split_filter};
 use super::subquery::{SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
@@ -76,7 +76,7 @@ impl<'s> Joins<'s> {
             .and_then(|id| self.unjoined(id))
             .filter(|s| matches!(s.kind, SubqueryKind::Exists { .. }))
         {
-            let kind = if negated { JoinType::Anti } else { JoinType::Semi };
+            let kind = JoinType::Exists(if negated { ExistsKind::Anti } else { ExistsKind::Semi });
             self.join(s, kind)?;
             return Ok(true);
         }
@@ -109,7 +109,7 @@ impl<'s> Joins<'s> {
     fn join_read(&mut self, s: &SubqueryRef) -> Result<bool, GnitzSqlError> {
         match s.kind {
             SubqueryKind::Exists { .. } => {
-                self.join(s, JoinType::Mark(s.id))?;
+                self.join(s, JoinType::Exists(ExistsKind::Mark(s.id)))?;
                 Ok(false)
             }
             SubqueryKind::Scalar { count, .. } => {
@@ -156,12 +156,12 @@ fn reject_nullable_in(kind: JoinType, s: &SubqueryRef) -> Result<(), GnitzSqlErr
         return Ok(());
     }
     match kind {
-        JoinType::Anti => Err(GnitzSqlError::rejected(
+        JoinType::Exists(ExistsKind::Anti) => Err(GnitzSqlError::rejected(
             "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
              NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
              use NOT EXISTS with an explicit equality instead",
         )),
-        JoinType::Mark(_) => Err(GnitzSqlError::rejected(
+        JoinType::Exists(ExistsKind::Mark(_)) => Err(GnitzSqlError::rejected(
             "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
              the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
              from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \

@@ -140,6 +140,10 @@ const SHAPES: &[Row] = &[
     ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k AND n.id = b.w", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
     // An ON conjunct over the null-supplying side filters that input.
     ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1), (Filter, 1)]),
+    // A WHERE comparison over the null-supplying side drops every null-fill row,
+    // so the join is an inner one and the conjunct filters that input.
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k WHERE b.w > 3", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a FULL JOIN b ON a.k = b.k WHERE b.w > 3", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1), (Filter, 1)]),
     // A filtered derived-table input fuses into the join, cutting no segment.
     ("SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
     // Band join: one range join, one output exchange on the pair-PK.
@@ -389,6 +393,8 @@ fn indexed_predicates_bound_the_backfill_scan() {
         // A WHERE placed into a join input bounds that input's scan.
         (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", &["[2]"]),
         (&unindexed, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &[]),
+        // A conjunct every row satisfies bounds no index walk.
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind >= -9223372036854775808 GROUP BY g", &[]),
     ];
     for &(cat, body, want) in rows {
         let chain = view(cat, body);
@@ -679,5 +685,36 @@ fn a_set_op_is_keyed_by_the_key_its_leaves_carry() {
         let chain = view(&cat, body);
         assert!(hashes(&chain), "`{body}` is not hashed");
         assert!(!final_view(&chain).pk_repeats, "`{body}`");
+    }
+}
+
+/// A subquery over a join body compiles to the circuits of the same body with
+/// the join written as a derived table, which binds to the same join tree.
+#[test]
+fn a_subquery_over_a_join_body_plans_as_its_derived_table_spelling() {
+    let cat = cat();
+    for (joined, derived) in [
+        (
+            "SELECT a.id, b.w FROM a JOIN b ON a.k = b.k WHERE EXISTS (SELECT 1 FROM n WHERE n.k = b.w)",
+            "SELECT d.id, d.w FROM (SELECT a.id, b.w FROM a JOIN b ON a.k = b.k) d \
+             WHERE EXISTS (SELECT 1 FROM n WHERE n.k = d.w)",
+        ),
+        (
+            "SELECT a.id, b.w FROM a LEFT JOIN b ON a.k = b.k WHERE NOT EXISTS (SELECT 1 FROM n WHERE n.k = a.k)",
+            "SELECT d.id, d.w FROM (SELECT a.id, a.k, b.w FROM a LEFT JOIN b ON a.k = b.k) d \
+             WHERE NOT EXISTS (SELECT 1 FROM n WHERE n.k = d.k)",
+        ),
+        (
+            "SELECT a.id, (SELECT COUNT(*) FROM n WHERE n.k = a.k) AS c FROM a JOIN b ON a.k = b.k",
+            "SELECT d.id, (SELECT COUNT(*) FROM n WHERE n.k = d.k) AS c \
+             FROM (SELECT a.id, a.k FROM a JOIN b ON a.k = b.k) d",
+        ),
+    ] {
+        let circuits = |body| {
+            all_views(&view(&cat, body))
+                .map(|v| v.circuit.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(circuits(joined), circuits(derived), "`{joined}`");
     }
 }

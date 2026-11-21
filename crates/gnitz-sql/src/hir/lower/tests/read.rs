@@ -80,6 +80,8 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
         (&t,   "SELECT id, id AS again, v FROM t ORDER BY again DESC", true, "id again v", &[0], "again", false),
         // A hidden key the ORDER BY computes, behind the SELECT list.
         (&t,   "SELECT * FROM t ORDER BY v + 1",             true,  "id v w [_order0]", &[0], "[_order0]", false),
+        // A float literal is the same literal only bit for bit: `-0.0` is not `0.0`.
+        (&t,   "SELECT v * 0.0 AS a FROM t ORDER BY v * -0.0", true, "[id] a [_order0]", &[0], "[_order0]", false),
     ];
     for &(desc, sql, mapped, cols, key, order_cols, pk_ordered) in cases {
         let r = rows_reply_of(sql, desc);

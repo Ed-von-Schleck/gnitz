@@ -15,7 +15,7 @@ fn a_rows_plan_is_reused_while_its_descriptors_stand() {
     let cat = catalog(vec![("t", table(1, vec![u("pk"), u("a")], vec![0]))]);
     let select = cached("SELECT * FROM t");
     let first = select.plan(&cat).unwrap();
-    assert!(select.repeated(&cat).unwrap().is_some());
+    assert!(select.repeated(&cat).is_some());
     let again = select.plan(&cat).unwrap();
     assert_eq!(again.spec(), first.spec());
     assert_eq!(again.reply_schema(), first.reply_schema());
@@ -29,21 +29,29 @@ fn a_relation_that_resolves_anew_is_planned_anew() {
 
     // An equal descriptor that is another one is still a new answer.
     cat.insert(&in_sn("t"), table(1, vec![u("pk"), u("a")], vec![0]));
-    assert!(select.repeated(&cat).unwrap().is_none());
+    assert!(select.repeated(&cat).is_none());
 
     cat.insert(&in_sn("t"), table(2, vec![u("pk"), u("a"), u("b")], vec![0]));
     let plan = select.plan(&cat).unwrap();
     let names: Vec<_> = plan.reply_schema().columns().iter().map(|c| &*c.name).collect();
     assert_eq!(names, ["pk", "a", "b"]);
-    assert!(select.repeated(&cat).unwrap().is_some());
+    assert!(select.repeated(&cat).is_some());
 }
 
 #[test]
-fn a_fold_or_a_failed_plan_is_not_kept() {
+fn a_fold_or_a_constant_plan_is_kept_and_a_failed_one_is_not() {
     let cat = catalog(vec![("t", table(1, vec![u("pk"), u("a")], vec![0]))]);
-    let fold = cached("SELECT a, COUNT(*) AS n FROM t GROUP BY a");
-    fold.plan(&cat).unwrap();
-    assert!(fold.plan.lock().unwrap().is_none());
+    for sql in [
+        "SELECT a, COUNT(*) AS n FROM t GROUP BY a",
+        "SELECT DISTINCT a FROM t",
+        "SELECT 1 + 2 AS x",
+    ] {
+        let select = cached(sql);
+        let first = select.plan(&cat).unwrap();
+        let again = select.repeated(&cat).expect(sql);
+        assert_eq!(again.spec(), first.spec(), "{sql}");
+        assert_eq!(again.reply_schema(), first.reply_schema(), "{sql}");
+    }
 
     let missing = cached("SELECT * FROM nowhere");
     assert!(missing.plan(&cat).is_err());

@@ -7,7 +7,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use crate::literal::assign;
-use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_wire::ColumnDef;
 
 /// Write one literal into `cell`, one cell of its column's region, spilling a string into
 /// `blob`. Dispatch is on the *column type*, never on the literal: `5` into a UUID column is
@@ -24,7 +24,9 @@ pub(crate) fn write_value_cell<R>(
         // NULL is the one value every column type encodes alike: a zeroed cell
         // of the type's own stride, with the null bit set by the caller.
         (BExpr::LitNull, _) => cell.fill(0),
-        (BExpr::LitStr(s), TypeCode::String) => {
+        // A string literal spells a BLOB as its bytes, as a comparison with a
+        // BLOB column reads it.
+        (BExpr::LitStr(s), tc) if tc.is_german_string() => {
             cell.copy_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob))
         }
         _ => cell.copy_from_slice(&native_value(lit, def)?.to_le_bytes()[..tc.wire_stride()]),

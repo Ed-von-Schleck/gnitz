@@ -10,10 +10,10 @@ pub(crate) trait Catalog {
     fn schema_name(&self) -> &str;
 
     /// The relation `name` resolves to, `None` for a free name.
-    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError>;
+    fn probe(&self, name: &RelName) -> Option<Arc<RelDescriptor>>;
 
     /// The relation `name` a statement reads: [`Self::probe`], with absence an error.
     fn probe_relation(&self, name: &RelName) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-        self.probe(name)?.ok_or_else(|| missing_relation(name))
+        self.probe(name).ok_or_else(|| missing_relation(name))
     }
 }

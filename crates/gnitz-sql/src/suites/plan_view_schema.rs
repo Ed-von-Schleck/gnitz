@@ -697,6 +697,22 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
     }
 }
 
+/// An ORDER BY naming an aggregate the SELECT list already computes sorts on that
+/// column, a float SUM or AVG included, whose value carries a NaN literal.
+#[test]
+fn an_order_by_aggregate_sorts_on_its_select_item() {
+    let cat = base();
+    for body in [
+        "SELECT i32c, SUM(f) AS s FROM ty GROUP BY i32c ORDER BY SUM(f) LIMIT 3",
+        "SELECT i32c, AVG(f) AS s FROM ty GROUP BY i32c ORDER BY AVG(f) LIMIT 3",
+        "SELECT i32c, SUM(i16c) AS s FROM ty GROUP BY i32c ORDER BY SUM(i16c) LIMIT 3",
+    ] {
+        let chain = view(&cat, body);
+        let names: Vec<&str> = final_view(&chain).schema.columns().iter().map(|c| &*c.name).collect();
+        assert_eq!(names, ["_group_pk", "i32c", "s"], "`{body}`");
+    }
+}
+
 /// Every item is declared at its expression's type, under its alias or
 /// `_expr{idx}`, and is nullable unless provably never NULL: a copied column
 /// keeps the nullability its leaf answers for it, whatever minted it.
@@ -952,6 +968,14 @@ fn a_join_view_is_keyed_on_its_join_key() {
             &[0, 1],
             &[i, i, i, i],
         ),
+        // A WHERE comparing the null-filled side's column makes the join inner.
+        (
+            "SELECT ba.id AS aid, bb.id AS bid FROM ba LEFT JOIN bb ON ba.k = bb.k AND ba.lo <= bb.t \
+             WHERE bb.id > 0",
+            [pair_pks(), sh(&[("aid", false, false), ("bid", false, false)])].concat(),
+            &[0, 1],
+            &[i, i, i, i],
+        ),
         (
             "SELECT ra.id AS aid, rb.id AS bid FROM ra LEFT JOIN rb ON ra.x < rb.y",
             [pair_pks(), sh(&[("aid", false, false), ("bid", false, true)])].concat(),
@@ -1061,5 +1085,5 @@ fn a_registered_bounded_view_carries_its_class() {
         bounded.props.unwrap().budget.into(),
         final_view(&bounded),
     );
-    assert_eq!(cat.probe(&in_sn("bnd")).unwrap().unwrap().class, RelClass::BoundedView);
+    assert_eq!(cat.probe(&in_sn("bnd")).unwrap().class, RelClass::BoundedView);
 }

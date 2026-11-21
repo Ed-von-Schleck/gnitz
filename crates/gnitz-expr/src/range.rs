@@ -10,6 +10,7 @@ use crate::simd::Level;
 use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaDescriptor};
 
 /// A range walk over a column list, as a batch filter.
+#[derive(Clone)]
 pub(crate) struct RangeMembership {
     /// The null-word bits of the list's payload columns: no index entry holds a NULL.
     null_mask: u64,

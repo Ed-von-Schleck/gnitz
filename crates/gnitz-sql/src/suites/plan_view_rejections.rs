@@ -283,6 +283,15 @@ fn subquery_rules() {
         // as an ORDER BY key with no other subquery in the body.
         "SELECT id FROM a WHERE (EXISTS (SELECT 1 FROM b WHERE b.k = a.k)) IS TRUE",
         "SELECT id FROM a ORDER BY (SELECT MAX(w) FROM b) LIMIT 3",
+        // A join body correlates to every relation it reads.
+        "SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)",
+        "SELECT a.id, b.w FROM a JOIN b ON a.k = b.k WHERE EXISTS (SELECT 1 FROM n WHERE n.k = b.w)",
+        "SELECT a.id, b.w FROM a LEFT JOIN b ON a.k = b.k WHERE NOT EXISTS (SELECT 1 FROM n WHERE n.k = a.k)",
+        "SELECT a.id, b.w, (SELECT COUNT(*) FROM n WHERE n.k = a.k) AS c FROM a, b WHERE a.k = b.k",
+        "SELECT a.id, EXISTS (SELECT 1 FROM n AS z WHERE z.k = b.w) AS e FROM a JOIN b ON a.k = b.k",
+        // DISTINCT dedups the projection the subqueries are joined below.
+        "SELECT DISTINCT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+        "SELECT DISTINCT k, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a",
     ] {
         view(&cat, body);
     }
@@ -323,10 +332,6 @@ fn subquery_rules() {
             (
                 "SELECT k, COUNT(*) FROM a GROUP BY k HAVING COUNT(*) > (SELECT COUNT(*) FROM b)",
                 "HAVING: a subquery is not supported together with GROUP BY/aggregates",
-            ),
-            (
-                "SELECT DISTINCT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
-                "a subquery is not supported together with SELECT DISTINCT",
             ),
             (
                 "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)",
@@ -386,8 +391,8 @@ fn subquery_rules() {
                 "single FROM table without JOINs",
             ),
             (
-                "SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)",
-                "scalar subqueries are not supported",
+                "SELECT a.id, b.w FROM a JOIN b ON a.k = b.k WHERE EXISTS (SELECT 1 FROM n WHERE n.k = a.k) GROUP BY a.id, b.w",
+                "a subquery is not supported together with GROUP BY/aggregates",
             ),
             (
                 "SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a",
@@ -555,6 +560,9 @@ fn set_op_and_distinct_rules() {
     let cat = cat();
     view(&cat, "SELECT id FROM ty UNION SELECT id FROM w");
     view(&cat, "SELECT DISTINCT g FROM t");
+    // A DISTINCT over a set is no operator, so a float column keys nothing.
+    view(&cat, "SELECT DISTINCT * FROM ty");
+    view(&cat, "SELECT DISTINCT id, f FROM ty");
     view(&cat, "(SELECT g FROM t WHERE g > 0) UNION SELECT g FROM t");
     // A grouped set-op side becomes a hidden segment, so its clauses are
     // consumed there rather than refused.
@@ -588,7 +596,6 @@ fn set_op_and_distinct_rules() {
                 "float column 'f' cannot be a key",
             ),
             ("SELECT DISTINCT f FROM ty", "float column 'f' cannot be a key"),
-            ("SELECT DISTINCT * FROM ty", "float column 'f' cannot be a key"),
             ("SELECT * FROM t UNION ALL SELECT * FROM ty", "column count mismatch"),
             ("SELECT id, g FROM t UNION ALL SELECT id, s FROM ty", "type mismatch"),
             ("SELECT g FROM t UNION ALL BY NAME SELECT g FROM u", "BY NAME"),

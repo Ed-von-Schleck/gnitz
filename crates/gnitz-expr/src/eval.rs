@@ -68,13 +68,14 @@ impl LogicalProgram {
 // ---------------------------------------------------------------------------
 
 /// A predicate's evaluator and the register its verdict lands in.
+#[derive(Clone)]
 struct FilterEval {
     ev: Evaluator,
     result_reg: usize,
 }
 
 /// Which rows of a batch survive a predicate and a range walk, either optional.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RowFilter {
     pred: Option<FilterEval>,
     walk: Option<RangeMembership>,

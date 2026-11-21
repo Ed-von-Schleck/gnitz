@@ -1,7 +1,8 @@
 use super::*;
 use crate::hir::{ColIdGen, KeyPair};
 use crate::test_support::{col, schema};
-use JoinType::{Anti, Full, Inner, Left, Mark, Right, Semi};
+use ExistsKind::{Anti, Mark, Semi};
+use JoinType::{Exists, Full, Inner, Left, Right};
 use Shape::{Band, Cross, Equi, PureRange};
 use gnitz_wire::RangeRel;
 use std::sync::Arc;
@@ -60,8 +61,8 @@ fn join_keep_rules() {
         (Band,  Full,  &[], [(&[1, 2, 3], 1), (&[3, 0, 1, 2], 2)]),
         (PureRange, Left,  &[], [(&[1, 3], 1), (&[3, 0], 2)]),
         // A decorrelated kind has a ν over its left and pins that side alone.
-        (Band,  Semi,  &[], [(&[1, 2, 3], 1), (&[], 0)]),
-        (PureRange, Anti,  &[], [(&[1, 3], 1), (&[], 0)]),
+        (Band,  Exists(Semi),  &[], [(&[1, 2, 3], 1), (&[], 0)]),
+        (PureRange, Exists(Anti),  &[], [(&[1, 3], 1), (&[], 0)]),
         // The pinned PK leads even ahead of a lower slot read above, and appears once.
         (Band,  Left,  &[(0, 0), (0, 1)], [(&[1, 0, 2, 3], 1), (&[3, 0], 2)]),
         (Band,  Left,  &[(1, 1)], [(&[1, 2, 3], 1), (&[3, 0, 1], 2)]),
@@ -69,8 +70,8 @@ fn join_keep_rules() {
         (Equi, Left,  &[], [(&[], 0), (&[], 0)]),
         (Equi, Right, &[], [(&[], 0), (&[], 0)]),
         (Equi, Full,  &[], [(&[], 0), (&[], 0)]),
-        (Equi, Mark(mark), &[], [(&[], 0), (&[], 0)]),
-        (Equi, Mark(mark), &[(0, 3)], [(&[3], 0), (&[], 0)]),
+        (Equi, Exists(Mark(mark)), &[], [(&[], 0), (&[], 0)]),
+        (Equi, Exists(Mark(mark)), &[(0, 3)], [(&[3], 0), (&[], 0)]),
         (Equi, Left,  &[(0, 3)], [(&[3], 0), (&[], 0)]),
         (Equi, Inner, &[(1, 3)], [(&[], 0), (&[3], 0)]),
         (Equi, Inner, &[], [(&[], 0), (&[], 0)]),
@@ -92,7 +93,7 @@ fn join_keep_rules() {
         let refs: ColSet = reads
             .iter()
             .map(|&(side, slot)| col(side, slot))
-            .chain(matches!(kind, Mark(_)).then_some(mark))
+            .chain(matches!(kind, Exists(Mark(_))).then_some(mark))
             .collect();
         let got = join_keep(&refs, &class, kind, out_key(plan, kind), &frames).unwrap();
         let got = got.each_ref().map(|(keep, pa)| (keep.as_slice(), *pa));

@@ -19,7 +19,7 @@ fn plan(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
 
 /// An UPDATE plan's SET list.
 fn set_list(plan: WritePlan) -> Vec<SetCol> {
-    let Write::Update { set, .. } = plan.write else {
+    let Write::Rmw { set: Some(set), .. } = plan.write else {
         panic!("not an UPDATE plan")
     };
     set
@@ -340,7 +340,11 @@ fn a_delete_plans_the_read_of_its_where() {
         let plan = plan(&cat, &format!("DELETE FROM t WHERE {pred}")).unwrap();
         let schema = &plan.target.schema;
         let want = bound_and_predicate(schema, &bind_where(pred, schema), &plan.target.indexes).unwrap();
-        let Write::Delete { bound, predicate } = plan.write else {
+        let Write::Rmw {
+            read: RmwRead::Where { bound, predicate },
+            set: None,
+        } = plan.write
+        else {
             panic!("not a DELETE plan")
         };
         assert_eq!((bound, predicate), want, "{pred}");

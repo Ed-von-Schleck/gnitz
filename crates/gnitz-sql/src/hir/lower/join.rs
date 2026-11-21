@@ -48,8 +48,8 @@ impl OutKey {
 fn out_key(plan: JoinPlan, kind: JoinType) -> OutKey {
     match plan {
         JoinPlan::Equi => OutKey::JoinKey,
-        JoinPlan::Band(_) if kind.is_decorrelated() => OutKey::OuterPk { owned: false },
-        JoinPlan::PureRange(_) if kind.is_decorrelated() => OutKey::OuterPk { owned: true },
+        JoinPlan::Band(_) if matches!(kind, JoinType::Exists(_)) => OutKey::OuterPk { owned: false },
+        JoinPlan::PureRange(_) if matches!(kind, JoinType::Exists(_)) => OutKey::OuterPk { owned: true },
         JoinPlan::Band(_) | JoinPlan::PureRange(..) | JoinPlan::Cross => OutKey::PairPk,
     }
 }
@@ -109,7 +109,7 @@ pub(super) fn lower_join_view(
     let mut acc: Option<(NodeId, Frame)> = None;
     for (node, mark) in branches {
         let (node, out) = match (kind, mark) {
-            (JoinType::Mark(id), Some(val)) => {
+            (JoinType::Exists(ExistsKind::Mark(id)), Some(val)) => {
                 let levels: Vec<_> = (above.levels.iter())
                     .map(|(level, read)| (level.rebuilt(&mut |c| mark_lit(c, id, val)), read.clone()))
                     .collect();
@@ -289,7 +289,7 @@ fn join_keep(
     let mut keep = frames.each_ref().map(|f| vec![false; f.layout.len()]);
     // Rules 1 + 2: the projection and the WHERE over the join. The mark column is
     // in neither layout: the shell substitutes it per branch by its BOOLEAN constant.
-    for id in refs.iter().filter(|&id| kind != JoinType::Mark(id)) {
+    for id in refs.iter().filter(|&id| kind != JoinType::Exists(ExistsKind::Mark(id))) {
         let side = usize::from(!frames[0].layout.contains(&Some(id)));
         keep[side][frames[side].slot(id)?] = true;
     }
@@ -482,7 +482,7 @@ fn emit_equi(cb: &mut Circuit, class: &JoinClass, kind: JoinType, sides: &[JoinS
     let all = [all_a, all_b];
     // A decorrelated join asks only whether a key exists: B as a set weighs every
     // match 1, so the joined A rows are the matched set at their own weight.
-    let b_delta = match kind.is_decorrelated() && !sides[1].unique {
+    let b_delta = match matches!(kind, JoinType::Exists(_)) && !sides[1].unique {
         true => cb.distinct(reindex_b),
         false => reindex_b,
     };
@@ -490,7 +490,7 @@ fn emit_equi(cb: &mut Circuit, class: &JoinClass, kind: JoinType, sides: &[JoinS
     // side's delta probes; the symmetric 2-term join over `[_join_pk, kept-A, kept-B]`.
     let reindex = [reindex_a, b_delta];
     let inner = cb.join(reindex, reindex, JoinKind::Equi);
-    if let Some(e) = kind.exists() {
+    if let JoinType::Exists(e) = kind {
         return exists_branches(cb, e, Split::Matched(inner), all[0]);
     }
     // Each `[_join_pk, A, B]`, the other side's half all-NULL.
@@ -554,7 +554,7 @@ fn emit_band(cb: &mut Circuit, class: &JoinClass, op: RangeRel, kind: JoinType, 
         };
         (all, nu)
     };
-    if let Some(e) = kind.exists() {
+    if let JoinType::Exists(e) = kind {
         // ν over A, keyed on A's source PK behind the output exchange.
         let (all, nu_a) = nu(cb, 0);
         return exists_branches(cb, e, Split::Unmatched(nu_a), all);
@@ -575,18 +575,18 @@ fn emit_band(cb: &mut Circuit, class: &JoinClass, op: RangeRel, kind: JoinType, 
 /// slice of B. A's ν is `A_owned − matched` against the one-row [`threshold`].
 fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[JoinSide; 2]) -> Vec<Branch> {
     let rel = JoinKind::Range { rel: op };
-    let left = match (kind, kind.exists()) {
+    let left = match kind {
         // The threshold decides existence over A's owned slice, already on the
         // worker owning its output key.
-        (_, Some(e)) => {
+        JoinType::Exists(e) => {
             let (owned, int_a) = own_a(cb, &sides[0]);
             let reindex_b = range_keyed(cb, &sides[1]);
             let matched = threshold(cb, &sides[0], reindex_b, int_a, op);
             return exists_branches(cb, e, Split::Matched(matched), owned);
         }
-        (JoinType::Inner, None) => false,
-        (JoinType::Left, None) => true,
-        (_, None) => unreachable!("JoinClass::admit refuses a pure-range RIGHT/FULL join"),
+        JoinType::Inner => false,
+        JoinType::Left => true,
+        JoinType::Right | JoinType::Full => unreachable!("JoinClass::admit refuses a pure-range RIGHT/FULL join"),
     };
     // Each branch below lands on `[pair-PK, kept-A, kept-B]`; a LEFT join's pair
     // terms integrate A's owned slice, which its ν subtracts from.

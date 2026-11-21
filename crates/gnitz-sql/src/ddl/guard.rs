@@ -73,7 +73,8 @@ pub(super) fn reject_unhonored_pk_fields(
         characteristics,
         include,
     } = pk;
-    reject_index_constraint_extras(index_type, index_options, include, characteristics, context)
+    reject_index_type_and_options(index_type, index_options, include, context)?;
+    reject_constraint_characteristics(characteristics, context)
 }
 
 /// Reject every UNIQUE constraint field beyond the column list and the
@@ -111,13 +112,14 @@ pub(super) fn reject_unhonored_unique_fields(
         context,
         "NULLS [NOT] DISTINCT",
     )?;
-    reject_index_constraint_extras(index_type, index_options, include, characteristics, context)
+    reject_index_type_and_options(index_type, index_options, include, context)?;
+    reject_constraint_characteristics(characteristics, context)
 }
 
 /// The index-shape tail every index-creating surface shares: accept only the
 /// BTree default `USING` (it names gnitz's real ordered index), no index
 /// options and no INCLUDE columns. CREATE INDEX, PRIMARY KEY and UNIQUE all
-/// read it.
+/// read it; PRIMARY KEY and UNIQUE add [`reject_constraint_characteristics`].
 pub(super) fn reject_index_type_and_options(
     index_type: &Option<sqlparser::ast::IndexType>,
     index_options: &[sqlparser::ast::IndexOption],
@@ -133,19 +135,6 @@ pub(super) fn reject_index_type_and_options(
     )?;
     reject_if(!index_options.is_empty(), context, "index options")?;
     reject_if(!include.is_empty(), context, "INCLUDE (covering columns)")
-}
-
-/// The PK/UNIQUE-shared tail: the index shape above, plus no constraint
-/// characteristics (DEFERRABLE …), which a CREATE INDEX cannot carry.
-fn reject_index_constraint_extras(
-    index_type: &Option<sqlparser::ast::IndexType>,
-    index_options: &[sqlparser::ast::IndexOption],
-    include: &[sqlparser::ast::Ident],
-    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
-    context: &str,
-) -> Result<(), GnitzSqlError> {
-    reject_index_type_and_options(index_type, index_options, include, context)?;
-    reject_constraint_characteristics(characteristics, context)
 }
 
 /// A constraint one column option declares on its own column.

@@ -8,7 +8,9 @@ use std::convert::Infallible;
 use crate::agg::{AggArg, AggFunc};
 use crate::ast_util::{CallSurface, PlainCall, classify_agg_call, col_ref_parts, peel_nested, single_part_ident};
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
-use crate::ir::{BExpr, BOOL, BinOp, BoundExpr, FloatUnaryOp, LeafTyping, NumFunc, NumLit, StrArg, StrFunc, TrimMode};
+use crate::ir::{
+    BExpr, BOOL, BinOp, BoundExpr, F64Bits, FloatUnaryOp, LeafTyping, NumFunc, NumLit, StrArg, StrFunc, TrimMode,
+};
 use crate::literal::{decimal_of_number_text, invalid_literal, parse_bool, parse_temporal};
 use crate::rules::single_relation_col_idx;
 use crate::types::sql_col_type;
@@ -67,8 +69,8 @@ pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
         Expr::Subquery(_) => "scalar subqueries are not supported",
         Expr::AnyOp { .. } | Expr::AllOp { .. } => "ANY/SOME/ALL subquery comparisons are not supported",
         _ => {
-            "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
-              (in the WHERE clause or the SELECT list)"
+            "[NOT] EXISTS/IN (SELECT …) is only supported in a CREATE VIEW body's \
+              WHERE clause or SELECT list"
         }
     })
 }
@@ -89,7 +91,10 @@ fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
                 return Ok(BExpr::LitWide(NumLit { mag, neg: false }));
             }
             n.parse::<f64>()
-                .map(|v| BExpr::LitFloat { v, dec: decimal_of_number_text(n) })
+                .map(|v| BExpr::LitFloat {
+                    v: F64Bits(v),
+                    dec: decimal_of_number_text(n),
+                })
                 .map_err(|_| GnitzSqlError::rejected(format!("invalid number literal: {n}")))
         }
         Value::SingleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),

@@ -161,7 +161,8 @@ impl Frame {
 
     /// This frame under the identities of `items`, a projection that moves no data,
     /// or `None` unless each item is a bare column and none reads a column twice. A
-    /// slot no item reads loses its identity.
+    /// slot no item reads loses its identity. A hidden item keeps its slot's
+    /// definition, hidden, as [`place_pk_front`] gives a hidden key slot.
     pub(crate) fn relabeled(&self, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
         let mut layout = vec![None; self.layout.len()];
         let mut columns: Option<Vec<ColumnDef>> = None;
@@ -174,8 +175,12 @@ impl Frame {
                 return Ok(None);
             }
             layout[slot] = Some(it.out.id);
-            if self.schema.columns()[slot] != it.out.def {
-                columns.get_or_insert_with(|| self.schema.columns().to_vec())[slot] = it.out.def.clone();
+            let def = match it.out.def.is_hidden {
+                true => self.schema.columns()[slot].clone().hidden(),
+                false => it.out.def.clone(),
+            };
+            if self.schema.columns()[slot] != def {
+                columns.get_or_insert_with(|| self.schema.columns().to_vec())[slot] = def;
             }
         }
         let schema = match columns {
@@ -214,6 +219,24 @@ impl Frame {
         let schema = Schema::from_parts(columns, schema.pk_cols())
             .map_err(|e| GnitzSqlError::Internal(format!("relabeled schema: {e}")))?;
         Ok(Some(Frame { layout, schema: Arc::new(schema) }))
+    }
+
+    /// [`Self::relabeled_in_order`] where it keeps every payload column of this
+    /// frame: each payload slot no item names must already be hidden, and there must
+    /// be none unless `carry_hidden`.
+    pub(crate) fn relabeled_whole(
+        &self,
+        items: &[ProjEntry],
+        carry_hidden: bool,
+    ) -> Result<Option<Frame>, GnitzSqlError> {
+        let Some(out) = self.relabeled_in_order(items)? else {
+            return Ok(None);
+        };
+        let columns = self.schema.columns();
+        let drops = (0..out.layout.len()).any(|s| {
+            out.layout[s].is_none() && !self.schema.layout().is_pk_col(s) && !(carry_hidden && columns[s].is_hidden)
+        });
+        Ok((!drops).then_some(out))
     }
 }
 

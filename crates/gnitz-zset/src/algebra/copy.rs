@@ -21,6 +21,7 @@ pub(super) struct RowWindow {
 
 /// Columns copied verbatim from an input row into an output row, with the null
 /// bits and German-string slots that follow from them.
+#[derive(Clone)]
 pub struct ColMoves {
     copies: Box<[ColCopy]>,
     /// The nearest null move — for most copy lists the only one, held inline so

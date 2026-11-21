@@ -13,64 +13,34 @@
 //! `Statement`; a variant sqlparser gives no payload struct is destructured in
 //! the arm that already selected it. Matches that only route keep `..`.
 //!
-//! What a *surface* consumes is passed in — `HonoredClauses`, `QueryEnvelope`.
+//! What a *surface* consumes is passed in — `SelectSite`, `QueryEnvelope`.
 
 use crate::error::{GnitzSqlError, reject_if};
 
-/// The `Select` clauses a shape legitimately consumes, beyond the universal
-/// `from` + `projection` + `WHERE` (every surface binds a top-level WHERE).
-/// Passed to [`reject_unhonored_select_clauses`]; every clause not named here
-/// (and not honored unconditionally) is rejected.
-#[derive(Clone, Copy)]
-pub(crate) struct HonoredClauses {
-    /// `GROUP BY` and its `HAVING`. Honored only by the grouped-aggregate path.
-    grouping: bool,
-    /// Plain `DISTINCT`. Honored only by the DISTINCT path (which dedups after
-    /// this returns). `DISTINCT ON` is always rejected, independent of this flag.
-    distinct: bool,
-    /// `QUALIFY` and the `WINDOW` clause. Honored by a view body, whose SELECT
-    /// list binds window calls; nowhere else.
-    windows: bool,
+/// The surface a `Select` is bound on, which decides the clauses it consumes
+/// beyond the universal `from` + `projection` + `WHERE` (every surface binds a
+/// top-level WHERE). Passed to [`reject_unhonored_select_clauses`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectSite {
+    /// A subquery body: no DISTINCT, GROUP BY, HAVING, QUALIFY or WINDOW.
+    Subquery,
+    /// An ad-hoc read's body: DISTINCT, or GROUP BY with HAVING.
+    Read,
+    /// A view body: a read's clauses plus QUALIFY and the WINDOW clause, since
+    /// its SELECT list binds window calls.
+    View,
 }
 
-impl HonoredClauses {
-    /// A shape consuming neither GROUP BY nor DISTINCT: a subquery body.
-    pub(crate) const PLAIN: HonoredClauses = HonoredClauses {
-        grouping: false,
-        distinct: false,
-        windows: false,
-    };
-
-    /// The grouped-vs-DISTINCT split every SELECT-bodied surface makes, in one
-    /// home: GROUP BY and HAVING are honored on the **non**-DISTINCT path, where
-    /// either makes the body grouped, so a `SELECT DISTINCT … GROUP BY` body
-    /// keeps the pinned "GROUP BY is not supported" rejection — DISTINCT wins the
-    /// routing split and its builder does not group.
-    pub(crate) fn for_body(distinct: bool) -> Self {
-        HonoredClauses {
-            grouping: !distinct,
-            distinct,
-            windows: false,
-        }
-    }
-
-    /// The view-body surface: the one that binds window calls, so QUALIFY and
-    /// the WINDOW clause are honored — an ad-hoc read keeps rejecting both.
-    pub(crate) fn with_windows(self) -> Self {
-        HonoredClauses { windows: true, ..self }
-    }
-}
-
-/// Reject any `Select` clause the surface behind it does not consume. `honored`
-/// names the clauses *this* shape consumes; `context` names the surface for the
-/// message.
+/// Reject any `Select` clause `site` does not consume; `context` names the
+/// surface for the message.
 ///
-/// `DISTINCT` is gated by [`HonoredClauses::distinct`]: `DISTINCT ON` is always
-/// rejected (non-deterministic without an ORDER BY views forbid), while plain
-/// `DISTINCT` is rejected unless the caller honors it.
+/// `DISTINCT ON` is always rejected (non-deterministic without an ORDER BY
+/// views forbid). GROUP BY and HAVING are rejected on a DISTINCT body: DISTINCT
+/// wins the routing split and its builder does not group, so `SELECT DISTINCT …
+/// GROUP BY` reports "GROUP BY is not supported".
 pub(crate) fn reject_unhonored_select_clauses(
     select: &sqlparser::ast::Select,
-    honored: HonoredClauses,
+    site: SelectSite,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::Distinct;
@@ -79,11 +49,10 @@ pub(crate) fn reject_unhonored_select_clauses(
         from: _,
         projection: _,
         selection: _,
-        // Conditionally honored (see `HonoredClauses`); `distinct` handled below.
+        // Conditionally honored, by `site`.
         distinct,
         group_by,
         having,
-        // Conditionally honored (see `HonoredClauses::windows`).
         qualify,
         named_window,
         // Never honored: each carries semantics no view builder implements.
@@ -113,18 +82,16 @@ pub(crate) fn reject_unhonored_select_clauses(
         select_modifiers: _,
     } = select;
 
+    let plain_distinct = crate::ast_util::select_is_distinct(select);
+    let grouping = site != SelectSite::Subquery && !plain_distinct;
     reject_if(matches!(distinct, Some(Distinct::On(_))), context, "DISTINCT ON")?;
+    reject_if(site == SelectSite::Subquery && plain_distinct, context, "DISTINCT")?;
     reject_if(
-        !honored.distinct && matches!(distinct, Some(Distinct::Distinct)),
-        context,
-        "DISTINCT",
-    )?;
-    reject_if(
-        !honored.grouping && crate::ast_util::group_by_is_present(group_by),
+        !grouping && crate::ast_util::group_by_is_present(group_by),
         context,
         "GROUP BY",
     )?;
-    reject_if(!honored.grouping && having.is_some(), context, "HAVING")?;
+    reject_if(!grouping && having.is_some(), context, "HAVING")?;
     reject_if(top.is_some(), context, "TOP")?;
     reject_if(prewhere.is_some(), context, "PREWHERE")?;
     reject_if(into.is_some(), context, "SELECT INTO")?;
@@ -134,7 +101,7 @@ pub(crate) fn reject_unhonored_select_clauses(
     reject_if(!cluster_by.is_empty(), context, "CLUSTER BY")?;
     reject_if(!distribute_by.is_empty(), context, "DISTRIBUTE BY")?;
     reject_if(!sort_by.is_empty(), context, "SORT BY")?;
-    if !honored.windows {
+    if site != SelectSite::View {
         reject_if(qualify.is_some(), context, "QUALIFY")?;
         reject_if(!named_window.is_empty(), context, "WINDOW")?;
     }
@@ -154,18 +121,21 @@ pub(crate) enum QueryEnvelope {
     WithAndTail,
 }
 
-/// Reject every `Query`-envelope clause a narrowing site does not consume. Every
-/// narrowing site funnels through it. `honored` names what *this* site consumes;
-/// `context` names the surface for the message.
-pub(crate) fn reject_unhonored_query_clauses(
-    query: &sqlparser::ast::Query,
+/// Reject every `Query`-envelope clause a narrowing site does not consume, and
+/// return the query's body. Every narrowing site funnels through it. `honored`
+/// names what *this* site consumes; `context` names the surface for the message.
+/// An EXISTS/IN or scalar subquery inner, which must be a plain SELECT, layers
+/// [`as_plain_select`] on the body.
+pub(crate) fn reject_unhonored_query_clauses<'a>(
+    query: &'a sqlparser::ast::Query,
     honored: QueryEnvelope,
     context: &str,
-) -> Result<(), GnitzSqlError> {
+) -> Result<&'a sqlparser::ast::SetExpr, GnitzSqlError> {
     let whole = matches!(honored, QueryEnvelope::WithAndTail);
     let sqlparser::ast::Query {
-        // Dispatched on by the caller (the SELECT / set-op / VALUES / CTE body).
-        body: _,
+        // Returned for the caller to dispatch on (the SELECT / set-op / VALUES /
+        // CTE body).
+        body,
         // Conditionally honored (see `QueryEnvelope`).
         with,
         limit_clause,
@@ -188,20 +158,7 @@ pub(crate) fn reject_unhonored_query_clauses(
     reject_if(settings.is_some(), context, "SETTINGS")?;
     reject_if(format_clause.is_some(), context, "FORMAT")?;
     reject_if(!pipe_operators.is_empty(), context, "pipe operators (|>)")?;
-    Ok(())
-}
-
-/// Reject a sub-`Query`'s whole envelope (no honored clause) and return its body
-/// `SetExpr` — the shared front step of every narrowing site that consumes a
-/// nested query and accepts any relational body (a CTE body, a derived table).
-/// An EXISTS/IN or scalar subquery inner, which must be a plain SELECT, layers
-/// [`as_plain_select`] on top.
-pub(crate) fn reject_query_envelope_body<'a>(
-    q: &'a sqlparser::ast::Query,
-    ctx: &str,
-) -> Result<&'a sqlparser::ast::SetExpr, GnitzSqlError> {
-    reject_unhonored_query_clauses(q, QueryEnvelope::Bare, ctx)?;
-    Ok(q.body.as_ref())
+    Ok(body.as_ref())
 }
 
 /// A relational body narrowed to the plain `Select` a surface requires — one

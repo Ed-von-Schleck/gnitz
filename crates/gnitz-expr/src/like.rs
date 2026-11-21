@@ -107,6 +107,7 @@ fn is_wildcard(b: &u8) -> bool {
     matches!(*b, ANY_MANY | ANY_ONE)
 }
 
+#[derive(Clone)]
 pub struct LikeMatcher {
     kind: LikeKind,
     /// ILIKE. The literals are already lowercased.
@@ -116,6 +117,7 @@ pub struct LikeMatcher {
 /// A [`LikeShape`] compiled, its literal ASCII-lowercased under ILIKE.
 // One per LIKE instruction, so the variants' size is immaterial.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum LikeKind {
     Exact(Vec<u8>),
     Prefix(Vec<u8>),
@@ -126,6 +128,7 @@ enum LikeKind {
 
 // A handful per pattern, so the variants' size is immaterial.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum LikeTok {
     Lit(Finder<'static>),
     /// `_`.

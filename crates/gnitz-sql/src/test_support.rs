@@ -106,12 +106,12 @@ impl Catalog for TestCatalog {
         SN
     }
 
-    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+    fn probe(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
         let mut asked = self.asked.borrow_mut();
         if !asked.contains(name) {
             asked.push(name.clone());
         }
-        Ok(self.rels.borrow().get(name).cloned())
+        self.rels.borrow().get(name).cloned()
     }
 }
 

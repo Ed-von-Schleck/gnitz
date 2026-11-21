@@ -7,7 +7,7 @@ use std::convert::Infallible;
 
 use super::colwrite::{check_not_null, native_value, write_value_cell};
 use super::set::{SetClause, SetCol, apply_set, bind_set_list};
-use super::write::{Write, WritePlan};
+use super::write::{RmwRead, Write, WritePlan};
 use crate::ast_util::single_part_ident;
 use crate::bind::bind_constant;
 use crate::catalog::Catalog;
@@ -322,12 +322,12 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
                 .transpose()?,
             rows,
         },
-        Some(set) => Write::Upsert {
+        Some(set) => Write::Rmw {
             // SERIAL keys are distinct by construction, and unknown until execute.
-            rows: match serial_ci {
+            read: RmwRead::Values(match serial_ci {
                 None => first_per_key(rows, set.is_some())?,
                 Some(_) => rows,
-            },
+            }),
             set,
         },
     };

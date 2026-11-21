@@ -23,6 +23,7 @@ const COMPACT_RUN_LEN: usize = 128;
 const PACK_COMPACT_RUN_LEN: usize = 24;
 
 /// Where a map's output PK region comes from.
+#[derive(Clone)]
 enum PkSource {
     /// Copy the input PK region verbatim, into an output schema whose PK is the
     /// input's.
@@ -45,6 +46,7 @@ enum PkSource {
 
 /// Map/projection: the resolved program's column copies and computed columns,
 /// where the output PK comes from, and the output schema it stamps.
+#[derive(Clone)]
 pub struct MapPlan {
     ev: MapEval,
     /// The copied columns of `ev`'s map.

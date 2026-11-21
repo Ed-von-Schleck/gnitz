@@ -15,6 +15,7 @@ use crate::ir::BoundExpr;
 
 /// An ad-hoc fold's reply to its result: combine the partials, then the HAVING filter and
 /// finalize map a grouped view runs over its reduce output.
+#[derive(Clone)]
 pub(crate) struct FoldFinish {
     /// The aggregates over the partial reply layout, each merging its own partials.
     aggs: Box<[Agg]>,

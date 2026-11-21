@@ -58,6 +58,7 @@ _TYPES = [
     ("FLOAT", TC.F32, [-1.5, 0.0, 1.5]),
     ("DOUBLE", TC.F64, [-1.5, 0.0, 1.5]),
     ("TEXT", TC.STRING, ["", "exactly12chr", "thirteen-char"]),
+    ("BLOB", TC.BLOB, [b"", b"exactly12chr", b"thirteen-char"]),
     ("UUID", TC.UUID, ["00000000-0000-0000-0000-000000000000",
                        "550e8400-e29b-41d4-a716-446655440000",
                        "ffffffff-ffff-ffff-ffff-ffffffffffff"]),
@@ -85,7 +86,7 @@ def test_a_payload_value_reads_back_as_written_by_either_encoder(client):
 
     `1 == True`, `Decimal("1.5") == 1.5` and a `datetime` is a `date`, so the
     Python type each value reads back as is asserted beside its value."""
-    assert {tc for _, tc, _ in _TYPES} == set(TC) - {TC.BLOB}, "a column type is missing"
+    assert {tc for _, tc, _ in _TYPES} == set(TC), "a column type is missing"
     ddl = f"CREATE TABLE {{}} (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, {_PAYLOAD})"
     client.execute_sql(f"{ddl.format('ta')}; {ddl.format('tb')}")
     tid_a, schema = client.resolve_table("ta")
@@ -119,8 +120,8 @@ def test_a_payload_retracts_against_its_own_declared_width(client):
         {(1, _ROWS[0][1], *_ROWS[1][2:]): 1} | dict.fromkeys(_ROWS[2:], 1)
 
 
-# Neither a float nor a string has a key form.
-_KEYABLE = [(sql, vals) for sql, tc, vals in _TYPES if tc not in (TC.F32, TC.F64, TC.STRING)]
+# Neither a float, a string nor a BLOB has a key form.
+_KEYABLE = [(sql, vals) for sql, tc, vals in _TYPES if tc not in (TC.F32, TC.F64, TC.STRING, TC.BLOB)]
 
 
 @pytest.mark.parametrize("col_sql,vals", _KEYABLE,

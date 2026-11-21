@@ -7,13 +7,15 @@
 
 use super::guard::{ColumnConstraint, read_column, reject_unhonored_unique_fields};
 use super::table::{index_cols, index_column_names};
+use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, missing_relation, reject_if, unsupported_clause};
 use crate::names::extract_object_name;
 use crate::rules::{ClassWant, canonical_user_name, find_unique_column, require_class, require_column};
-use gnitz_core::{ColumnChange, GnitzClient, RelName};
+use gnitz_core::{ColumnChange, GnitzClient, RelDescriptor, RelName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, RenameTableNameKind, TableConstraint,
 };
+use std::sync::Arc;
 
 /// One ALTER TABLE operation with every check that needs no catalog already run,
 /// carrying the operands it uses.
@@ -72,11 +74,20 @@ fn reject_unhonored_alter_table_clauses(alter: &sqlparser::ast::AlterTable) -> R
     Ok(())
 }
 
-pub(crate) async fn execute_alter_table(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    alter: &AlterTable,
-) -> Result<(), GnitzSqlError> {
+/// An ALTER TABLE statement checked against the catalog: the relation and the one
+/// operation on it.
+pub(crate) struct AlterPlan<'a> {
+    name: RelName,
+    rel: Arc<RelDescriptor>,
+    action: Action<'a>,
+}
+
+/// Plan an `ALTER TABLE [IF EXISTS]`; `None` when `IF EXISTS` finds no relation
+/// under the name.
+pub(crate) fn plan_alter_table<'a>(
+    alter: &'a AlterTable,
+    cat: &dyn Catalog,
+) -> Result<Option<AlterPlan<'a>>, GnitzSqlError> {
     reject_unhonored_alter_table_clauses(alter)?;
     let [operation] = alter.operations.as_slice() else {
         return Err(unsupported_clause(
@@ -84,22 +95,23 @@ pub(crate) async fn execute_alter_table(
             "more than one operation per statement",
         ));
     };
-    let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
-    let (ctx, action) = parse(operation, &source_name)?;
-
-    let Some(rel) = client.resolve(&source_name).await? else {
-        return if alter.if_exists {
-            Ok(())
-        } else {
-            Err(missing_relation(&source_name))
-        };
+    let name = extract_object_name(&alter.name, cat.schema_name(), "ALTER TABLE")?;
+    let (ctx, action) = parse(operation, &name)?;
+    let rel = match cat.probe(&name) {
+        Some(rel) => rel,
+        None if alter.if_exists => return Ok(None),
+        None => return Err(missing_relation(&name)),
     };
     // `RENAME TO` accepts a view too, as Postgres does: views bind sources by id
     // and columns by ordinal, so a rename is safe under any class.
     if !matches!(action, Action::RenameRelation { .. }) {
-        require_class(&rel, &source_name, ClassWant::BaseTable, ctx)?;
+        require_class(&rel, &name, ClassWant::BaseTable, ctx)?;
     }
+    Ok(Some(AlterPlan { name, rel, action }))
+}
 
+pub(crate) async fn execute_alter_table(client: &mut GnitzClient, plan: AlterPlan<'_>) -> Result<(), GnitzSqlError> {
+    let AlterPlan { name: source_name, rel, action } = plan;
     let cols = rel.schema.columns();
     match action {
         Action::RenameRelation { new_name } => client.alter_rename_relation(&rel, &new_name).await?,

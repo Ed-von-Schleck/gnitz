@@ -20,7 +20,7 @@ pub(super) fn lower_ordered(
     let live: ColSet = input.cols().iter().map(|c| c.id).collect();
     let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
-    let (node, frame) = spine.emit(&mut cb, Top::Output)?;
+    let (node, frame) = spine.emit(&mut cb, Top::KeyFirst)?;
     debug_assert!(
         frame
             .schema

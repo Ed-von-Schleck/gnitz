@@ -21,7 +21,7 @@ pub struct ColCopy {
 }
 
 /// A computed output slot written from a register.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Emit {
     pub(crate) reg: usize,
     pub(crate) slot: usize,
@@ -155,6 +155,7 @@ impl LogicalProgram {
 
 /// A map's computed columns, which [`Self::write_computed`] writes. Its copied
 /// columns are the caller's to run.
+#[derive(Clone)]
 pub struct MapEval {
     ev: Evaluator,
     /// The computed slots, in slot order.

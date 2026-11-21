@@ -16,8 +16,12 @@ fn render(rel: &RelExpr) -> String {
         RelExpr::Get { desc, .. } => if desc.tid == 1 { "t" } else { "u" }.to_string(),
         RelExpr::Filter { input, preds } => format!("Filter[{}]({})", preds.len(), render(input)),
         RelExpr::Project { input, .. } => format!("Project({})", render(input)),
-        RelExpr::Join { left, right, on, .. } => format!(
-            "Join[eq={}{}]({}, {})",
+        RelExpr::Join { left, right, on, kind } => format!(
+            "{}Join[eq={}{}]({}, {})",
+            match kind {
+                JoinType::Inner => String::new(),
+                k => format!("{k:?}"),
+            },
             on.eq.len(),
             if on.range.is_some() { ", range" } else { "" },
             render(left),
@@ -29,10 +33,11 @@ fn render(rel: &RelExpr) -> String {
 
 /// Each conjunct lands as low as it is exact: a one-sided WHERE into an inner
 /// join's input or a LEFT join's preserved side, a LEFT join's ON into its
-/// null-supplying side, a FULL join's nowhere, an ON conjunct into the step whose
-/// input it names; a keying WHERE comparison keys a comma join, and a range
-/// comparison is a join's one range key, a second staying above it. Past the
-/// key-arity cap a WHERE comparison stays a filter.
+/// null-supplying side, an ON conjunct into the step whose input it names; a
+/// keying WHERE comparison keys a comma join, and a range comparison is a join's
+/// one range key, a second staying above it. Past the key-arity cap a WHERE
+/// comparison stays a filter. A WHERE comparing a bare column of a side drops
+/// the rows that null-fill it, so the join no longer preserves the other side.
 #[test]
 fn each_conjunct_is_placed_as_low_as_it_is_exact() {
     for (sql, want) in [
@@ -41,34 +46,70 @@ fn each_conjunct_is_placed_as_low_as_it_is_exact() {
             "Join[eq=1](Filter[1](t), u)",
         ),
         (
+            "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a WHERE t.b > 5",
+            "LeftJoin[eq=1](Filter[1](t), u)",
+        ),
+        (
             "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a WHERE t.b > 5 AND u.uid > 1",
-            "Filter[1](Join[eq=1](Filter[1](t), u))",
+            "Join[eq=1](Filter[1](t), Filter[1](u))",
+        ),
+        // A cross comparison under the narrowed join keys it.
+        (
+            "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a WHERE t.b = u.uid",
+            "Join[eq=2](t, u)",
         ),
         // The anti-join idiom names the null-supplying side, so it stays above.
         (
             "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a WHERE u.uid IS NULL",
-            "Filter[1](Join[eq=1](t, u))",
+            "Filter[1](LeftJoin[eq=1](t, u))",
+        ),
+        // A comparison under OR, or of a computed operand, is left above.
+        (
+            "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a WHERE u.uid > 1 OR t.b > 5",
+            "Filter[1](LeftJoin[eq=1](t, u))",
+        ),
+        (
+            "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a WHERE COALESCE(u.uid, 0) = 0",
+            "Filter[1](LeftJoin[eq=1](t, u))",
+        ),
+        // The narrowing reaches the nested outer join the conjunct is placed into.
+        (
+            "SELECT t.id FROM t LEFT JOIN u x ON t.a = x.a LEFT JOIN u y ON t.a = y.a \
+             WHERE x.uid > 1",
+            "LeftJoin[eq=1](Join[eq=1](t, Filter[1](u)), u)",
         ),
         (
             "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a AND u.uid > 3",
-            "Join[eq=1](t, Filter[1](u))",
+            "LeftJoin[eq=1](t, Filter[1](u))",
         ),
         // A conjunct naming no column goes wherever the rule admits it.
         (
             "SELECT t.id FROM t LEFT JOIN u ON t.a = u.a AND 1 = 0",
-            "Join[eq=1](t, Filter[1](u))",
+            "LeftJoin[eq=1](t, Filter[1](u))",
+        ),
+        (
+            "SELECT t.id FROM t RIGHT JOIN u ON t.a = u.a WHERE u.uid > 1",
+            "RightJoin[eq=1](t, Filter[1](u))",
         ),
         (
             "SELECT t.id FROM t RIGHT JOIN u ON t.a = u.a WHERE t.b > 5 AND u.uid > 1",
-            "Filter[1](Join[eq=1](t, Filter[1](u)))",
+            "Join[eq=1](Filter[1](t), Filter[1](u))",
         ),
         (
             "SELECT t.id FROM t RIGHT JOIN u ON t.a = u.a AND t.b > 5",
-            "Join[eq=1](Filter[1](t), u)",
+            "RightJoin[eq=1](Filter[1](t), u)",
+        ),
+        (
+            "SELECT t.id FROM t FULL JOIN u ON t.a = u.a WHERE t.b IS NULL",
+            "Filter[1](FullJoin[eq=1](t, u))",
         ),
         (
             "SELECT t.id FROM t FULL JOIN u ON t.a = u.a WHERE t.b > 5",
-            "Filter[1](Join[eq=1](t, u))",
+            "LeftJoin[eq=1](Filter[1](t), u)",
+        ),
+        (
+            "SELECT t.id FROM t FULL JOIN u ON t.a = u.a WHERE u.uid > 1",
+            "RightJoin[eq=1](t, Filter[1](u))",
         ),
         (
             "SELECT t.id FROM t, u WHERE t.a = u.a AND t.b <> u.uid",

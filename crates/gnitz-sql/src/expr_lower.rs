@@ -39,7 +39,7 @@ impl Lowering<'_> {
                 self.eb.emit(L::LoadConst { val: *v, unsigned: false })
             }
             BoundExpr::LitBool(b) => self.eb.emit(L::LoadConst { val: i64::from(*b), unsigned: false }),
-            BoundExpr::LitFloat { v, .. } => self.eb.const_f64(*v),
+            BoundExpr::LitFloat { v, .. } => self.eb.const_f64(v.0),
             BoundExpr::LitStr(s) => {
                 let const_idx = self.eb.add_const_bytes(s.as_bytes());
                 self.eb.emit(L::LoadConstStr { const_idx })
@@ -478,7 +478,9 @@ impl Lowering<'_> {
     fn cast(&mut self, expr: &BoundExpr, to: ColType) -> Result<Reg, GnitzSqlError> {
         let from = self.ty(expr);
         let from_class = RegClass::of(from);
-        if from_class == RegClass::Str && (to.tc.is_temporal() || to == BOOL) {
+        if from_class == RegClass::Str
+            && (to.tc.is_temporal() || to == BOOL || (to.is_decimal() && !matches!(expr, BoundExpr::LitStr(_))))
+        {
             return Err(GnitzSqlError::rejected(format!(
                 "CAST of a string to {to} is supported for a literal only"
             )));

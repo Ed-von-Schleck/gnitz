@@ -618,3 +618,50 @@ fn a_subscription_is_planned_only_from_a_select() {
         );
     }
 }
+
+/// A view over a table whose key is not its first column stores the table's rows
+/// under the table's own numbering, and every reader of it — a view over it, a
+/// reduce, a join on its key, a self-join — reads those rows at their weights.
+#[test]
+fn views_over_a_trailing_key_multiworker() {
+    let mut db = Db::boot(4);
+    db.exec(
+        "CREATE TABLE p (nm BIGINT NOT NULL, id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL);
+         CREATE VIEW pv AS SELECT * FROM p WHERE x > 0;
+         CREATE VIEW pv2 AS SELECT nm AS n, id, x AS y FROM pv WHERE x < 50;
+         CREATE VIEW pk_last AS SELECT x, nm, id FROM pv;
+         CREATE VIEW agg AS SELECT SUM(x) AS s, nm FROM pv GROUP BY nm;
+         CREATE VIEW over_agg AS SELECT * FROM agg WHERE s > 10;
+         CREATE VIEW pj AS SELECT a.nm AS an, b.nm AS bn, b.x AS bx FROM pv a JOIN pv b ON a.id = b.id;
+         CREATE VIEW pm AS SELECT a.id AS aid, b.nm AS bnm FROM pv a JOIN pv b ON a.x = b.id;
+         INSERT INTO p VALUES (1, 10, 5), (1, 11, 20), (2, 12, -3), (3, 13, 60)",
+    );
+    let check = |db: &mut Db, pv: &[[i64; 4]], agg: &[[i64; 3]], pm: &[[i64; 3]]| {
+        assert_eq!(db.scan("pv", &["nm", "id", "x"]), pv);
+        let pv2: Vec<_> = pv.iter().filter(|r| r[2] < 50).cloned().collect::<Vec<_>>();
+        assert_eq!(db.scan("pv2", &["n", "id", "y"]), pv2);
+        assert_eq!(db.scan("pk_last", &["nm", "id", "x"]), pv);
+        assert_eq!(db.scan("agg", &["nm", "s"]), agg);
+        let over: Vec<_> = agg.iter().filter(|r| r[1] > 10).cloned().collect::<Vec<_>>();
+        assert_eq!(db.scan("over_agg", &["nm", "s"]), over);
+        let mut pj: Vec<_> = pv.iter().map(|r| [r[0], r[0], r[2], 1]).collect::<Vec<_>>();
+        pj.sort();
+        assert_eq!(db.scan("pj", &["an", "bn", "bx"]), pj);
+        assert_eq!(db.scan("pm", &["aid", "bnm"]), pm);
+    };
+    check(
+        &mut db,
+        &[[1, 10, 5, 1], [1, 11, 20, 1], [3, 13, 60, 1]],
+        &[[1, 25, 1], [3, 60, 1]],
+        &[],
+    );
+    db.exec("INSERT INTO p VALUES (4, 5, 11), (5, 6, 13)");
+    db.exec("UPDATE p SET x = 30 WHERE id = 10");
+    db.exec("DELETE FROM p WHERE id = 13");
+    check(
+        &mut db,
+        &[[1, 10, 30, 1], [1, 11, 20, 1], [4, 5, 11, 1], [5, 6, 13, 1]],
+        &[[1, 50, 1], [4, 11, 1], [5, 13, 1]],
+        &[[5, 1, 1]],
+    );
+}

@@ -1,6 +1,7 @@
 use super::*;
 use crate::bind::bind_constant;
 use crate::test_support::{ncol, parse_expr_sql};
+use gnitz_wire::TypeCode;
 
 /// `src` written into a cell of a column `c` of type `tc`, every byte of which was set
 /// before: the cell and the blob spill.
@@ -45,13 +46,17 @@ fn a_cell_is_the_low_bytes_of_its_value_or_a_refusal_naming_the_column() {
     }
 }
 
+/// A STRING or BLOB cell holds the literal's bytes.
 #[test]
 fn a_string_cell_spills_past_its_inline_prefix_into_the_blob() {
     let s = "a string past the inline prefix";
-    let (col, blob) = write(TypeCode::String, &format!("'{s}'")).unwrap();
-    assert_eq!(
-        gnitz_wire::german_string_content(col.first_chunk().unwrap(), &blob),
-        s.as_bytes()
-    );
-    assert!(!blob.is_empty());
+    for tc in [TypeCode::String, TypeCode::Blob] {
+        let (col, blob) = write(tc, &format!("'{s}'")).unwrap();
+        assert_eq!(
+            gnitz_wire::german_string_content(col.first_chunk().unwrap(), &blob),
+            s.as_bytes(),
+            "{tc:?}"
+        );
+        assert!(!blob.is_empty(), "{tc:?}");
+    }
 }

@@ -132,6 +132,10 @@ fn cluster_by_is_a_leading_pk_prefix() {
         ),
         (format!("CREATE TABLE t ({two}) CLUSTER BY nope"), "not found"),
         (
+            format!("CREATE TABLE t ({two}) CLUSTER BY a, a"),
+            "CLUSTER BY: duplicate column 'a'",
+        ),
+        (
             format!("CREATE TABLE t ({two}) WITH (replicated = true) CLUSTER BY a"),
             "mutually exclusive",
         ),

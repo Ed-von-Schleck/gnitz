@@ -79,6 +79,14 @@ pub(crate) struct Evaluator {
     scratch: EvalScratch,
 }
 
+/// A clone gets a register file of its own, built fresh: nothing in one outlives
+/// the morsel that wrote it.
+impl Clone for Evaluator {
+    fn clone(&self) -> Self {
+        Evaluator::new(self.prog.clone())
+    }
+}
+
 struct EvalScratch {
     regs: Vec<RegBuf>,
     /// One view per row, per string register.

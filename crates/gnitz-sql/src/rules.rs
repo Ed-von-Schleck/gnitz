@@ -83,11 +83,7 @@ impl ClassWant {
                     | ClassWant::Indexable
             ),
             RelClass::Stream => matches!(self, ClassWant::BaseTableOrStream | ClassWant::ViewSource),
-            RelClass::View => matches!(
-                self,
-                ClassWant::View | ClassWant::Readable | ClassWant::ViewSource | ClassWant::Indexable
-            ),
-            RelClass::FedView => matches!(
+            RelClass::View | RelClass::FedView => matches!(
                 self,
                 ClassWant::View | ClassWant::Readable | ClassWant::ViewSource | ClassWant::Indexable
             ),

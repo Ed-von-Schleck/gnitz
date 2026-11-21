@@ -470,6 +470,8 @@ fn a_cut_ordered_by_the_key_stops_each_worker_early() {
         ("SELECT * FROM c ORDER BY a, b LIMIT 5", "early-stop 5"),
         ("SELECT * FROM c WHERE a = 1 ORDER BY a, b LIMIT 5", "early-stop 5"),
         ("SELECT * FROM tv ORDER BY id LIMIT 5", "early-stop 5"),
+        // A conjunct every row satisfies bounds no index walk.
+        ("SELECT * FROM t WHERE v >= 0 ORDER BY id LIMIT 5", "early-stop 5"),
         // Not a leading run of the key, not ascending, or not the column itself.
         ("SELECT * FROM c ORDER BY b LIMIT 5", "top-5"),
         ("SELECT * FROM c ORDER BY b, a LIMIT 5", "top-5"),
@@ -677,7 +679,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
             "WITH c AS (SELECT * FROM t), c AS (SELECT * FROM t WHERE v > 1) SELECT id FROM c",
             "specified more than once",
         ),
-        ("SELECT x FROM (SELECT v AS x FROM t) d", "(derived table in FROM)"),
+        ("SELECT x FROM (SELECT t.v AS x FROM t JOIN u ON t.v = u.k) d", "(JOIN)"),
         ("SELECT t.id FROM t, u WHERE t.v = u.k", "CREATE VIEW"),
         // A clause the parser accepts and the read path would otherwise drop.
         ("SELECT DISTINCT ON (id) id FROM t", "DISTINCT ON"),
@@ -718,7 +720,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ),
         (
             "WITH x AS (SELECT DISTINCT v, w FROM t) SELECT DISTINCT v FROM x",
-            "(an aggregate over a grouped CTE)",
+            "(an aggregate over a grouped CTE or derived table)",
         ),
         (
             "WITH x AS (SELECT v FROM t UNION SELECT w FROM t) SELECT v FROM x",
@@ -826,6 +828,12 @@ fn a_cte_expands_to_the_flat_query() {
             "WITH x AS (SELECT id, v FROM t), y AS (SELECT v AS w FROM x WHERE id > 2) SELECT w FROM y",
             "SELECT v AS w FROM t WHERE id > 2",
         ),
+        // A derived table expands exactly as the CTE it spells.
+        ("SELECT q FROM (SELECT id, v AS q FROM t) x", "SELECT v AS q FROM t"),
+        (
+            "SELECT r FROM (SELECT id, v + 1 AS q FROM t WHERE v > 1) x(i, r) WHERE i = 5",
+            "SELECT v + 1 AS r FROM t WHERE (v > 1) AND (id = 5)",
+        ),
         (
             "WITH x AS (SELECT g, v + 1 AS q FROM t) SELECT g, SUM(q) AS s FROM x GROUP BY g ORDER BY s",
             "SELECT g, SUM(v + 1) AS s FROM t GROUP BY g ORDER BY s",
@@ -892,7 +900,7 @@ fn a_cte_expands_to_the_flat_query() {
         ),
         (
             "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT n, COUNT(*) FROM x GROUP BY n",
-            "derives a new one (an aggregate over a grouped CTE)",
+            "derives a new one (an aggregate over a grouped CTE or derived table)",
         ),
         (
             "WITH x AS (SELECT t.id FROM t JOIN u ON t.g = u.g) SELECT id FROM x",
@@ -1120,6 +1128,7 @@ fn a_from_less_select_plans_a_constant_row() {
         ("WITH x AS (SELECT 40 + 2 AS a) SELECT a + 1 AS b FROM x", vec!["b"]),
         ("SELECT DISTINCT 1", vec!["_expr0"]),
         ("SELECT DISTINCT 1 AS a ORDER BY a", vec!["a"]),
+        ("SELECT DISTINCT 2.5", vec!["_expr0"]),
         ("WITH c AS (SELECT * FROM (SELECT 1 AS x) d) SELECT x FROM c", vec!["x"]),
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
@@ -1158,7 +1167,6 @@ fn a_from_less_select_plans_a_constant_row() {
             "WITH c AS (SELECT 1 AS x) SELECT COUNT(*) FROM c",
             "an aggregate over a SELECT without FROM",
         ),
-        ("SELECT DISTINCT 2.5", "cannot be a key"),
         ("SELECT COUNT(*)", "aggregate"),
         ("SELECT 1 AS a, 2 AS a", "duplicate column name 'a'"),
         ("SELECT 1 AS a ORDER BY 2", "ORDER BY position 2 is out of range"),

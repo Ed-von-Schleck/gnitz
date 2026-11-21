@@ -1493,6 +1493,7 @@ fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
 // ResolvedProgram — the evaluable form
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub(crate) struct ResolvedProgram {
     /// The computing instructions, as `(destination, instruction)`: the constant
     /// loads are lifted out, so a position is not a register.

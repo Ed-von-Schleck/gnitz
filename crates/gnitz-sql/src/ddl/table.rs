@@ -52,7 +52,7 @@ struct FkSite<'a> {
     on_delete: FkAction,
 }
 
-/// Resolve a PRIMARY KEY / UNIQUE / CREATE INDEX column list against `cols`, in
+/// Resolve a PRIMARY KEY / UNIQUE / CREATE INDEX / CLUSTER BY column list against `cols`, in
 /// declared order — order drives the composite index's leading-key span and its
 /// prefix seeks. `ctx` names the surface in both messages.
 fn resolve_index_columns(names: &[&str], cols: &[ColumnDef], ctx: &str) -> Result<Vec<u32>, GnitzSqlError> {
@@ -493,12 +493,11 @@ pub(crate) fn plan_create_table(
     // No clause ⇒ `k = 0` ⇒ default full-PK distribution.
     if let Some(cluster) = &create.cluster_by {
         let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;
-        let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
-            let idx = require_column(&cols, col_name).map_err(|e| e.in_clause("CLUSTER BY"))?;
-            cluster_indices.push(idx as u32);
-        }
+        let names = exprs
+            .iter()
+            .map(|e| simple_ident_expr(e, "CLUSTER BY"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cluster_indices = resolve_index_columns(&names, &cols, "CLUSTER BY")?;
         let prefix_len = dist_prefix_len(&cols, &pk_indices, &cluster_indices)?;
         props.distribution = props
             .distribution
@@ -511,7 +510,7 @@ pub(crate) fn plan_create_table(
     // two — so any relation standing under it ends the statement, whatever its
     // kind. Probed only under the clause, so a plain CREATE TABLE resolves nothing;
     // probed after every rejection the statement's text earns, which outrank it.
-    if create.if_not_exists && cat.probe(&table_name)?.is_some() {
+    if create.if_not_exists && cat.probe(&table_name).is_some() {
         return Ok(None);
     }
 

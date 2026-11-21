@@ -270,36 +270,14 @@ pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<
     }
 }
 
-/// The classified shape of a FROM clause — the one definition of "a single plain
-/// table/view FROM".
-pub(crate) enum FromShape<'a> {
-    /// No FROM item at all.
-    Empty,
-    /// Exactly one plain relation name, no joins.
-    SinglePlainRelation(&'a sqlparser::ast::TableFactor),
-    /// A FROM that derives a relation rather than naming one, carrying the
-    /// construct a rejection names.
-    Derived(&'static str),
-}
-
-pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShape<'_> {
+/// The one relation name a FROM clause holds, with no join — the one definition of
+/// "a single plain table/view FROM".
+pub(crate) fn single_plain_relation(from: &[sqlparser::ast::TableWithJoins]) -> Option<&sqlparser::ast::TableFactor> {
     match from {
-        [] => FromShape::Empty,
-        [single] => {
-            if !single.joins.is_empty() {
-                // One FROM item carrying an explicit JOIN chain.
-                FromShape::Derived("JOIN")
-            } else if matches!(single.relation, sqlparser::ast::TableFactor::Table { .. }) {
-                FromShape::SinglePlainRelation(&single.relation)
-            } else {
-                // One FROM item that is not a plain relation name (a derived
-                // table, a table function, …).
-                FromShape::Derived("derived table in FROM")
-            }
+        [single] if single.joins.is_empty() && matches!(single.relation, sqlparser::ast::TableFactor::Table { .. }) => {
+            Some(&single.relation)
         }
-        // Multiple comma-separated FROM items (an implicit comma join). A view
-        // body serves it as an INNER join keyed from the WHERE.
-        _ => FromShape::Derived("comma-join FROM"),
+        _ => None,
     }
 }
 

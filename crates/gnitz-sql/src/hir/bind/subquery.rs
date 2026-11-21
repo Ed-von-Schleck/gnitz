@@ -5,13 +5,15 @@ use super::super::{ColId, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side, cro
 use super::{BindCx, JoinScope, ScopeLeaf, SubPolicy, resolve_table_ref};
 use crate::agg::{AggArg, AggFunc};
 use crate::ast_util::{
-    FromShape, body_is_grouped, classify_agg_call, classify_from, col_ref_parts, is_agg_call, peel_nested,
+    body_is_grouped, classify_agg_call, col_ref_parts, is_agg_call, peel_nested, single_plain_relation,
 };
 use crate::bind::{bind_conjuncts, bind_structural, maybe_negate};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use crate::names::extract_table_ref;
-use crate::validate::{HonoredClauses, as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses};
+use crate::validate::{
+    QueryEnvelope, SelectSite, as_plain_select, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
+};
 use gnitz_wire::{ColType, ColumnDef, ReduceKind};
 use sqlparser::ast::{BinaryOperator, Expr, InTarget, Query, Select, SelectItem};
 use std::cell::RefCell;
@@ -45,7 +47,7 @@ pub(super) enum SubqueryKind {
 }
 
 /// Everything a subquery bind resolves against: the body bind's own context,
-/// the one-relation outer scope it correlates to, and the record of subqueries
+/// the outer scope it correlates to, and the record of subqueries
 /// bound so far.
 #[derive(Clone, Copy)]
 struct SubCtx<'a> {
@@ -81,9 +83,9 @@ struct InnerResolved<'e> {
 /// the outer relation is rejected (hoisting would be wrong for NOT EXISTS).
 fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolved<'e>, GnitzSqlError> {
     let ctx = "subquery";
-    let inner_select = as_plain_select(reject_query_envelope_body(subquery, ctx)?, ctx)?;
-    reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, ctx)?;
-    let FromShape::SinglePlainRelation(factor) = classify_from(&inner_select.from) else {
+    let inner_select = as_plain_select(reject_unhonored_query_clauses(subquery, QueryEnvelope::Bare, ctx)?, ctx)?;
+    reject_unhonored_select_clauses(inner_select, SelectSite::Subquery, ctx)?;
+    let Some(factor) = single_plain_relation(&inner_select.from) else {
         return Err(GnitzSqlError::rejected(
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views",
         ));
@@ -136,7 +138,7 @@ fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr,
     }
 }
 
-/// Bind one subquery node in `cx`, correlated to the one-relation `outer` scope,
+/// Bind one subquery node in `cx`, correlated to the `outer` scope,
 /// to the column it is read through, recording it in `subs`. ANY/ALL is normalized
 /// here (`= ANY → IN`, `<> ALL → NOT IN`, range → `x OP (SELECT MIN/MAX)`).
 pub(super) fn bind_one_subquery(

@@ -2,9 +2,9 @@
 //! (`crate::access::bound_and_predicate`), and UPDATE's SET list.
 
 use super::set::{SetClause, bind_set_list};
-use super::write::{Write, WritePlan};
+use super::write::{RmwRead, Write, WritePlan};
 use crate::access::bound_and_predicate;
-use crate::ast_util::{FromShape, classify_from};
+use crate::ast_util::single_plain_relation;
 use crate::bind::bind_single_table;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if};
@@ -101,7 +101,7 @@ fn plan_mutation(
     let verb = if set.is_some() { "UPDATE" } else { "DELETE" };
     // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
     // update all of `a`.
-    let FromShape::SinglePlainRelation(factor) = classify_from(from) else {
+    let Some(factor) = single_plain_relation(from) else {
         return Err(GnitzSqlError::rejected(format!(
             "{verb}: exactly one simple FROM table required"
         )));
@@ -124,11 +124,8 @@ fn plan_mutation(
         None => Vec::new(),
     };
     let (bound, predicate) = bound_and_predicate(schema, &conjuncts, &target.indexes)?;
-    let write = match set {
-        Some(set) => Write::Update { bound, predicate, set },
-        None => Write::Delete { bound, predicate },
-    };
-    Ok(WritePlan { target, write })
+    let read = RmwRead::Where { bound, predicate };
+    Ok(WritePlan { target, write: Write::Rmw { read, set } })
 }
 
 // ---------------------------------------------------------------------------

@@ -7,10 +7,10 @@
 //! constant row is a projection over the global ground row, computed at plan time.
 //!
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
-//! or scalar subquery, a derived table — has no single-relation sink and is
-//! rejected ([`crate::error::derivation`]), pointing at CREATE VIEW: the binder
-//! refuses a set operation, a deriving FROM and a subquery where it meets one,
-//! and the read lowering a CTE that derives. A read the direct path merely cannot
+//! or scalar subquery — has no single-relation sink and is rejected
+//! ([`crate::error::derivation`]), pointing at CREATE VIEW: the binder refuses a
+//! set operation, a joining FROM and a subquery where it meets one, and the read
+//! lowering a CTE or derived table that derives. A read the direct path merely cannot
 //! express is a feature-named rejection, never that template. The body and its
 //! CTEs bind through the view binder (`hir::bind_adhoc_read`), so a CTE reads
 //! through the sink of the flat query it composes to.
@@ -42,6 +42,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// A finished ad-hoc read: what it reads and the client finish over the result.
+#[derive(Clone)]
 pub(crate) struct ReadPlan {
     pub(super) case: ReadCase,
     /// ORDER BY / OFFSET / LIMIT over the finished result, under its schema; unordered for
@@ -49,6 +50,7 @@ pub(crate) struct ReadPlan {
     pub(super) cut: ResultCut,
 }
 
+#[derive(Clone)]
 pub(super) enum ReadCase {
     /// A read whose reply is the result, under [`ResultCut::schema`].
     Rows {
@@ -136,21 +138,6 @@ impl ReadPlan {
         match &self.case {
             ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => Some(read),
             ReadCase::Constant { .. } => None,
-        }
-    }
-
-    /// A copy of a rows read; `None` for the other cases, whose client finish
-    /// is built once per plan.
-    pub(crate) fn rows_copy(&self) -> Option<ReadPlan> {
-        match &self.case {
-            ReadCase::Rows { read, copied } => Some(ReadPlan {
-                case: ReadCase::Rows {
-                    read: read.clone(),
-                    copied: copied.clone(),
-                },
-                cut: self.cut.clone(),
-            }),
-            ReadCase::Fold { .. } | ReadCase::Constant { .. } => None,
         }
     }
 

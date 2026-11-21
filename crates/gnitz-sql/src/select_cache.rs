@@ -1,5 +1,5 @@
 //! The scripts of one `SELECT` a thread runs more than once, each kept parsed
-//! and its rows plan with it. A plan is a function of its query, the session's
+//! and its plan with it. A plan is a function of its query, the session's
 //! schema and what the catalog answers for each name the planner probes, so a
 //! plan made from answers a later run's probes repeat — the same descriptor, by
 //! identity, or the same absence — is the plan that run would make. Each kept
@@ -48,7 +48,7 @@ thread_local! {
     static SELECTS: RefCell<Selects> = RefCell::default();
 }
 
-/// A script of one `SELECT`, parsed, and its last rows plan.
+/// A script of one `SELECT`, parsed, and its last plan.
 pub(crate) struct CachedSelect {
     query: Query,
     plan: Mutex<Option<KeptPlan>>,
@@ -133,43 +133,37 @@ fn insert(sql: &str, query: Query) -> Arc<CachedSelect> {
 
 impl CachedSelect {
     /// [`plan_read`] of the kept query against `cat`: the kept plan when `cat`
-    /// repeats every answer it was made from, else a new one, which is kept
-    /// when it is a rows read.
+    /// repeats every answer it was made from, else a new one, which is kept.
     pub(crate) fn plan(&self, cat: &dyn Catalog) -> Result<ReadPlan, GnitzSqlError> {
-        if let Some(plan) = self.repeated(cat)? {
+        if let Some(plan) = self.repeated(cat) {
             return Ok(plan);
         }
         let recording = Recording { cat, answers: RefCell::new(Vec::new()) };
         let plan = plan_read(&self.query, &recording)?;
-        if let Some(copy) = plan.rows_copy() {
-            *self.plan.lock().unwrap_or_else(PoisonError::into_inner) = Some(KeptPlan {
-                schema_name: cat.schema_name().into(),
-                answers: recording.answers.into_inner(),
-                plan: copy,
-            });
-        }
+        *self.plan.lock().unwrap_or_else(PoisonError::into_inner) = Some(KeptPlan {
+            schema_name: cat.schema_name().into(),
+            answers: recording.answers.into_inner(),
+            plan: plan.clone(),
+        });
         Ok(plan)
     }
 
     /// A copy of the kept plan, if `cat` answers each name it was made from as
     /// it was answered then. Probes in the planner's order, so a run that
     /// diverges has probed what the planner would have before diverging.
-    fn repeated(&self, cat: &dyn Catalog) -> Result<Option<ReadPlan>, GnitzSqlError> {
+    fn repeated(&self, cat: &dyn Catalog) -> Option<ReadPlan> {
         let kept = self.plan.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(kept) = kept.as_ref() else { return Ok(None) };
-        if *kept.schema_name != *cat.schema_name() {
-            return Ok(None);
-        }
+        let kept = kept.as_ref().filter(|kept| *kept.schema_name == *cat.schema_name())?;
         for (name, answer) in &kept.answers {
-            let same = match (cat.probe(name)?, answer) {
+            let same = match (cat.probe(name), answer) {
                 (Some(now), Some(then)) => Arc::ptr_eq(&now, then),
                 (now, then) => now.is_none() && then.is_none(),
             };
             if !same {
-                return Ok(None);
+                return None;
             }
         }
-        Ok(kept.plan.rows_copy())
+        Some(kept.plan.clone())
     }
 }
 
@@ -184,13 +178,13 @@ impl Catalog for Recording<'_> {
         self.cat.schema_name()
     }
 
-    fn probe(&self, name: &RelName) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-        let answer = self.cat.probe(name)?;
+    fn probe(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
+        let answer = self.cat.probe(name);
         let mut answers = self.answers.borrow_mut();
         if !answers.iter().any(|(n, _)| n == name) {
             answers.push((name.clone(), answer.clone()));
         }
-        Ok(answer)
+        answer
     }
 }
 

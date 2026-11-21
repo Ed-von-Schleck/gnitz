@@ -1056,6 +1056,11 @@ fn each_refused_form_names_its_rule() {
             "CAST of a string to DATE is supported for a literal only",
         ),
         (
+            "CAST(c1 AS DECIMAL(5, 2))",
+            vec![t(T::String)],
+            "CAST of a string to DECIMAL(18, 2) is supported for a literal only",
+        ),
+        (
             "EXTRACT(YEAR FROM c1)",
             vec![t(T::I64)],
             "a calendar function takes a DATE or TIMESTAMP; column \"c1\" is BIGINT",

@@ -77,7 +77,7 @@ pub(crate) fn plan_create_view(
     // Each clause tests the name alone; a plain create leaves a taken name to
     // the engine's refusal.
     let standing = match cv.or_replace || cv.if_not_exists {
-        true => cat.probe(&view_name)?,
+        true => cat.probe(&view_name),
         false => None,
     };
     let replacing = match standing {
@@ -124,7 +124,7 @@ pub(crate) fn plan_alter_view(
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), CTX, "WITH options")?;
     let named = extract_object_name(name, cat.schema_name(), CTX)?;
-    let old = match cat.probe(&named)? {
+    let old = match cat.probe(&named) {
         Some(old) => old,
         None if *if_exists => return Ok(None),
         None => return Err(missing_relation(&named)),

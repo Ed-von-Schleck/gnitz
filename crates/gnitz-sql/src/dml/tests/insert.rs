@@ -69,7 +69,7 @@ fn insert(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
 /// The VALUES rows an INSERT plan writes.
 fn rows(plan: &WritePlan) -> &ZSetBatch {
     match &plan.write {
-        Write::Insert { rows, .. } | Write::Upsert { rows, .. } => rows,
+        Write::Insert { rows, .. } | Write::Rmw { read: RmwRead::Values(rows), .. } => rows,
         _ => panic!("not an INSERT plan"),
     }
 }
@@ -397,7 +397,7 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
     for (sql, held, want_keys, want_rows) in cases {
         let WritePlan {
             target,
-            write: Write::Upsert { rows, mut set },
+            write: Write::Rmw { read: RmwRead::Values(rows), mut set },
         } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         else {
             panic!("`{sql}` has no ON CONFLICT");
@@ -421,7 +421,7 @@ fn on_conflict_refuses_a_reply_outside_the_read_keys() {
     ] {
         let WritePlan {
             target,
-            write: Write::Upsert { rows, mut set },
+            write: Write::Rmw { read: RmwRead::Values(rows), mut set },
         } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         else {
             panic!("`{sql}` has no ON CONFLICT");

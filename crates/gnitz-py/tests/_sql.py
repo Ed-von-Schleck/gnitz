@@ -6,9 +6,12 @@ from datetime import date
 
 def lit(v):
     """One SQL literal: `None` is NULL, a `str`, `date` or `datetime` is quoted
-    in its ISO spelling, anything else its Python spelling."""
+    in its ISO spelling, `bytes` quoted as the UTF-8 text they encode, anything
+    else its Python spelling."""
     if v is None:
         return "NULL"
+    if isinstance(v, bytes):
+        v = v.decode()
     if isinstance(v, (str, date)):
         return "'" + str(v).replace("'", "''") + "'"
     return str(v)
