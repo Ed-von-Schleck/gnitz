@@ -142,7 +142,12 @@ impl<'a> MemBatch<'a> {
         // Relocation is decided over the rows that fit by width alone.
         let by_width = (budget.saturating_sub(wal::WAL_HEADER_SIZE) / self.schema().row_width()).max(1);
         let len = by_width.min(self.len() - start);
-        let (rows, heap, dedup) = self.relocation(Rows::Run { start, len }, budget);
+        // With no cell naming the heap, every row fits by width alone.
+        let (rows, heap, dedup) = if self.heap_referencing_slots() == 0 {
+            (len, 0, false)
+        } else {
+            self.relocation(Rows::Run { start, len }, budget)
+        };
         let out = WireRows {
             batch: *self,
             selection: Selection::Relocated {
@@ -352,6 +357,12 @@ impl<'a> MemBatch<'a> {
         }
         let slots = self.heap_referencing_slots();
         let listed = Rows::Listed(rows);
+        // With no cell naming the heap, the rows that fit by width are the block.
+        if slots == 0 {
+            return self
+                .encode_relocated(listed, 0, out, false)
+                .map(|len| (rows.len(), len));
+        }
         let (_, copied, dedup) = self.fit_plain(listed, slots, usize::MAX);
         // Dedup copies each distinct span once, so the whole source heap bounds
         // the block's unless cells name overlapping spans, which a certified
