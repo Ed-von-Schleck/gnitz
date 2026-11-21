@@ -362,7 +362,7 @@ fn decode_items_enforces_each_verbs_item_rules() {
         Section::Must => present,
     };
     for verb in multi {
-        let VerbShape { sections, items: shape } = VerbShape::of(verb);
+        let VerbShape { sections, items: shape, .. } = VerbShape::of(verb);
         let cap = shape.unwrap().cap;
         let hdr = ControlHeader::naming(verb, 7.into(), 0);
         let refused = |body: &[u8], want: &str| {

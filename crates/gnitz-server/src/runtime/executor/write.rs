@@ -1,6 +1,7 @@
 //! The write path: PUSH and PUSH_TXN judged under the catalog read guard,
 //! serialized per table, checked for OCC conflicts, and committed through the
-//! committer.
+//! committer; and the frames of a write spanning several, held until its last
+//! arrives ([`OpenWrite`]).
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -13,7 +14,7 @@ use super::family::{FamilyRows, PushedBlock, TxnFamily};
 use super::validate::Checks;
 use super::{Access, CatalogLock, Shared, decode_fault, target_kind};
 use crate::catalog::{CatalogEngine, LockSet};
-use crate::runtime::reactor::RecvBuf;
+use crate::runtime::reactor::{Budget, Charge, RecvBuf};
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::multi_frame::BLIND;
@@ -166,7 +167,8 @@ impl AdmittedPush {
 /// the target's columns. Its data block is certified where it lies, and the
 /// answer holds the block's range in `data`; `None` for an empty delta. A push
 /// to a stream must also pass the stream rule ([`check_stream_push`]), an empty
-/// one included.
+/// one included, which names a row by its index in the write: `first_row` and
+/// up.
 ///
 /// A handler calls this under the catalog read guard and holds the guard
 /// through its commit, so no DDL lands between the judgement and the write.
@@ -175,6 +177,7 @@ pub(super) fn admit_push(
     data: &[u8],
     ctrl: DecodedControl,
     access: Access,
+    first_row: usize,
 ) -> Result<Option<AdmittedPush>, WireFault> {
     let target = ctrl.hdr.target();
     let (tid, mode) = (target.tid, ctrl.hdr.flags.conflict_mode);
@@ -187,47 +190,136 @@ pub(super) fn admit_push(
         .transpose()
         .map_err(decode_fault)?;
     if kind == RelationKind::Stream {
-        check_stream_push(tid, block.as_ref().map(|b| b.view(data)), mode)?;
+        check_stream_push(tid, block.as_ref().map(|b| b.view(data)), mode, first_row)?;
     }
     Ok(block.map(|block| AdmittedPush { tid, mode, block }))
 }
 
-/// Handle a client push: admit the frame under the catalog read lock and
-/// [`commit`] it.
-///
-/// One handler for both batch shapes. An empty delta — a frame with no data
-/// block — is ACKed with the "nothing written" LSN `0`, but only after the same
-/// existence, writability and stream-mode gates a non-empty push passes, so a
-/// client bug that happens to produce an empty batch (a `delete` with an empty
-/// pk list) fails the way a non-empty one would instead of being masked by a
-/// no-op ACK.
-pub(super) async fn handle_push(shared: &Shared, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
-    let catalog = shared.catalog_rwlock.read().await;
-    let Some(push) = admit_push(&shared.cat(), buf.as_slice(), ctrl, Access::Write)? else {
-        return Ok(0);
-    };
-    commit(shared, &catalog, vec![push.family(&Rc::new(buf))], &[]).await
+/// A write's request frames in arrival order, each with its peeked control:
+/// one, or every frame of a write spanning several.
+pub(super) type WriteFrames = SmallVec<[(RecvBuf, DecodedControl); 1]>;
+
+/// The frames of a `PUSH` or `PUSH_TXN` spanning several whose last frame has
+/// not yet arrived. They arrive back to back: the connection takes no other
+/// request until the last.
+pub(super) struct OpenWrite {
+    /// Each frame so far with its charge to the budget every connection's
+    /// open writes share; or why the write is refused, its frames dropped from
+    /// then on as they arrive, and its last answered with this.
+    held: Result<Vec<(RecvBuf, DecodedControl, Charge)>, WireFault>,
 }
 
-/// PUSH_TXN: admit every family under the catalog read lock and [`commit`] them
-/// as one zone. Every family reads its rows from the one frame.
-pub(super) async fn handle_push_txn(shared: &Shared, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
-    let catalog = shared.catalog_rwlock.read().await;
-    let items = admit_push_txn(&shared.cat(), buf.as_slice(), ctrl.body)?;
-    let frame = Rc::new(buf);
-    let mut occ = Vec::new();
-    let mut families = Vec::with_capacity(items.len());
-    for (basis, push) in items {
-        let family = push.family(&frame);
-        // A blind family's basis is one no commit exceeds: there is nothing to check.
-        if basis != BLIND {
-            occ.push((family.tid, basis));
-        }
-        families.push(family);
+impl OpenWrite {
+    pub(super) fn new() -> Self {
+        OpenWrite { held: Ok(Vec::new()) }
     }
-    // The families hold the frame, so it is freed once they are laid out.
-    drop(frame);
-    commit(shared, &catalog, families, &occ).await
+
+    /// Hold the next frame of the write, charged to `spans`; or refuse the
+    /// write: a frame of its verb that does not decode, or one `spans` has no
+    /// room for. Whether more frames of the write follow.
+    pub(super) fn take(&mut self, buf: RecvBuf, ctrl: DecodedControl, spans: &Rc<Budget>) -> bool {
+        let more = ctrl.hdr.flags.continuation;
+        let Ok(held) = &mut self.held else { return more };
+        let why = match ctrl.client_verb() {
+            Err(e) => decode_fault(e),
+            Ok(_) => match spans.charge(buf.as_slice().len()) {
+                Some(charge) => {
+                    held.push((buf, ctrl, charge));
+                    return more;
+                }
+                None => format!(
+                    "the writes over several frames would hold more than the server's {}-byte limit \
+                     together; nothing was written",
+                    spans.cap()
+                )
+                .into(),
+            },
+        };
+        self.held = Err(why);
+        more
+    }
+
+    /// The answer to a write whose frames a request of another verb, or one
+    /// that does not decode, broke off.
+    pub(super) fn broken_off() -> WireFault {
+        "a write's frames were broken off by another request; nothing was written, and the \
+         connection is closed"
+            .into()
+    }
+
+    /// The write's frames, its last one taken, their charges released; or why
+    /// it was refused.
+    pub(super) fn finish(self) -> Result<WriteFrames, WireFault> {
+        Ok(self.held?.into_iter().map(|(buf, ctrl, _)| (buf, ctrl)).collect())
+    }
+}
+
+/// Handle a client write, a `verb` of `frames` in arrival order: admit every
+/// frame under the catalog read lock and [`commit`] every family as one zone.
+/// Each family reads its rows where they lie in the frame that carried it.
+/// `followed`: the client's connection has a request queued behind this one.
+///
+/// An empty `PUSH` — no frame with a data block — is ACKed with the "nothing
+/// written" LSN `0`, but only after the same existence, writability and
+/// stream-mode gates a non-empty push passes, so a client bug that happens to
+/// produce an empty batch (a `delete` with an empty pk list) fails the way a
+/// non-empty one would instead of being masked by a no-op ACK.
+pub(super) async fn handle_write(
+    shared: &Shared,
+    verb: ClientVerb,
+    frames: WriteFrames,
+    followed: bool,
+) -> Result<u64, WireFault> {
+    let catalog = shared.catalog_rwlock.read().await;
+    let (families, occ) = admit_write(&shared.cat(), verb, frames)?;
+    if verb == ClientVerb::Push && families.is_empty() {
+        return Ok(0);
+    }
+    commit(shared, &catalog, families, &occ, followed).await
+}
+
+/// A write's families in frame order, and its OCC checks: each a table and
+/// the read basis its family was built from.
+type AdmittedWrite = (Vec<TxnFamily>, Vec<(u64, u64)>);
+
+/// The families of a `verb` write of `frames`, in frame order; and the OCC
+/// checks of a `PUSH_TXN`'s. The frames of a `PUSH` name one relation, token
+/// and conflict mode, and its stream rule names a row by its index in the
+/// whole write.
+pub(super) fn admit_write(
+    cat: &CatalogEngine,
+    verb: ClientVerb,
+    frames: WriteFrames,
+) -> Result<AdmittedWrite, WireFault> {
+    let (mut families, mut occ) = (Vec::new(), Vec::new());
+    let first = frames[0].1.hdr;
+    let mut rows = 0;
+    for (buf, ctrl) in frames {
+        // The families hold the frame, so it is freed once they are laid out.
+        let frame = Rc::new(buf);
+        if verb == ClientVerb::PushTxn {
+            for (basis, push) in admit_push_txn(cat, frame.as_slice(), ctrl.body)? {
+                let family = push.family(&frame);
+                // A blind family's basis is one no commit exceeds: there is nothing to check.
+                if basis != BLIND {
+                    occ.push((family.tid, basis));
+                }
+                families.push(family);
+            }
+            continue;
+        }
+        let h = &ctrl.hdr;
+        if h.target() != first.target() || h.flags.conflict_mode != first.flags.conflict_mode {
+            return Err(decode_fault(
+                "the frames of a push name one relation, token and conflict mode",
+            ));
+        }
+        if let Some(push) = admit_push(cat, frame.as_slice(), ctrl, Access::Write, rows)? {
+            rows += push.block.rows();
+            families.push(push.family(&frame));
+        }
+    }
+    Ok((families, occ))
 }
 
 /// Commit `families` as one write: the table locks, OCC, the validation of a
@@ -235,16 +327,21 @@ pub(super) async fn handle_push_txn(shared: &Shared, buf: RecvBuf, ctrl: Decoded
 /// deletes cascade to ride along. Such a bundle holds its locks exclusively.
 /// Every rejection is pre-SAL, so a fault or a conflict commits nothing.
 /// The committer raises each written table's commit LSN to the write's and
-/// drops the table locks once the write is laid out; the answer waits for the
-/// fdatasync that covers it.
+/// drops the table locks once the write is laid out, and answers the LSN then:
+/// not yet durable, so the caller holds the write's ACK until it is. Workers
+/// apply a group once it is published, so from here a read, or a later write's
+/// validation, can see the write before a restart would recover it. Nothing
+/// laid out is taken back: a failed fdatasync aborts.
 ///
 /// `occ` is a transaction's OCC checks: each a table and the read basis its
-/// family was built from. [`Writes::lock_tables`] takes the locks.
+/// family was built from. [`Writes::lock_tables`] takes the locks. `followed`
+/// is the committer's: see [`Committer::write`](super::committer::Committer::write).
 async fn commit(
     shared: &Shared,
     catalog: &ReadGuard<CatalogLock>,
     mut families: Vec<TxnFamily>,
     occ: &[(u64, u64)],
+    followed: bool,
 ) -> Result<u64, WireFault> {
     let (tids, exclusive, reads_committed) = {
         let cat = shared.cat();
@@ -284,12 +381,7 @@ async fn commit(
         families.iter().all(|f| held.holds(f.tid)),
         "a commit bumps only tables whose lock it holds"
     );
-    let lsn = shared.committer.write(families, held).await?;
-    // Workers apply a group once it is published, so until here a read, or a
-    // later write's validation, can see the write before a restart would
-    // recover it. Nothing laid out is taken back: a failed fdatasync aborts.
-    shared.dispatcher.sal().durable_through(lsn).await;
-    Ok(lsn)
+    shared.committer.write(families, held, followed).await
 }
 
 /// Judge the `PUSH_TXN` frame `frame`, whose item list is at `body`: each item
@@ -305,20 +397,26 @@ pub(super) fn admit_push_txn(
         .into_iter()
         .map(|ctrl| {
             let (basis, tid) = (ctrl.hdr.arg0, ctrl.hdr.target_id);
-            let push = admit_push(cat, frame, ctrl, Access::TxnWrite)
+            let push = admit_push(cat, frame, ctrl, Access::TxnWrite, 0)
                 .map_err(|e| e.in_context(format_args!("TXN family {tid}")))?;
             Ok((basis, push.expect("a PUSH_TXN item carries a data block")))
         })
         .collect()
 }
 
-/// Refuse a push a stream cannot accept; `batch` is `None` for an empty delta.
+/// Refuse a push a stream cannot accept; `batch` is `None` for an empty delta,
+/// and its rows are rows `first_row` and up of the write.
 /// Both rules restate what a stream lacks — a unique primary key, and any
 /// retraction at all — and rejecting `Error` mode is what keeps
 /// `push_reads_committed_state` false for a stream: its push takes the shared
 /// table lock and skips the validator, which would probe a stream's absent
 /// store.
-fn check_stream_push(target_id: u64, batch: Option<MemBatch<'_>>, mode: WireConflictMode) -> Result<(), String> {
+fn check_stream_push(
+    target_id: u64,
+    batch: Option<MemBatch<'_>>,
+    mode: WireConflictMode,
+    first_row: usize,
+) -> Result<(), String> {
     if mode == WireConflictMode::Error {
         return Err(format!(
             "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \
@@ -333,8 +431,9 @@ fn check_stream_push(target_id: u64, batch: Option<MemBatch<'_>>, mode: WireConf
         .find(|&i| batch.get_weight(i) <= 0)
         .expect("just found one");
     Err(format!(
-        "table {target_id} is a stream: a stream is append-only, but row {i} of this push carries \
+        "table {target_id} is a stream: a stream is append-only, but row {} of this push carries \
          weight {}",
+        first_row + i,
         batch.get_weight(i)
     ))
 }

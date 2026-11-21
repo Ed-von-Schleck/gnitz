@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::os::fd::AsFd;
+use std::rc::Rc;
 
 use crate::runtime::reactor::Reactor;
 use crate::runtime::sync::{Level, Parked};
@@ -13,7 +14,7 @@ use crate::runtime::sync::{Level, Parked};
 #[derive(Default)]
 pub(super) struct Durable {
     /// Every group published at or below this LSN is durable.
-    through: Level,
+    through: Rc<Level>,
     /// The highest LSN asked to be made durable.
     wanted: Cell<u64>,
     /// The LSN the fdatasync in flight makes durable; `0` while none is.
@@ -43,6 +44,12 @@ impl Durable {
             reached
         })
         .await
+    }
+
+    /// The level [`Self::through`] waits on. Waiting on it directly asks for
+    /// no fdatasync.
+    pub(super) fn level(&self) -> &Rc<Level> {
+        &self.through
     }
 
     /// The LSN the fdatasync in flight makes durable; `0` while none is.

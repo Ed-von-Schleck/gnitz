@@ -1,8 +1,9 @@
 //! The deframer both ends of a connection read through: a `u32` LE length prefix,
 //! then exactly that many payload bytes.
 
-use std::borrow::Cow;
 use std::mem::MaybeUninit;
+
+use crate::FrameBytes;
 
 /// The payload ceiling of every frame, in both directions.
 pub const MAX_FRAME_PAYLOAD: usize = 64 << 20;
@@ -41,6 +42,9 @@ pub struct Deframer<A = ()> {
     pending: Option<Pending<A>>,
     /// The window a read is out on, until it lands or `feed` runs.
     lent: Option<Lent>,
+    /// Keeps [`crate::frame_buf`]'s pool holding buffers while this
+    /// connection is open.
+    _pool: crate::frame_buf::Use,
 }
 
 /// Which storage [`Deframer::window`] handed out.
@@ -51,15 +55,24 @@ enum Lent {
 
 /// The payload being filled.
 struct Pending<A> {
-    buf: Box<[MaybeUninit<u8>]>,
-    /// How much of `buf` has arrived.
-    pos: usize,
+    /// The bytes arrived so far, in a buffer of [`crate::frame_buf`]'s with
+    /// room for at least all `len`.
+    buf: Vec<u8>,
+    len: usize,
     admitted: A,
+}
+
+impl<A> Pending<A> {
+    /// The room past the bytes arrived, up to the payload's end.
+    fn tail(&mut self) -> &mut [MaybeUninit<u8>] {
+        let rest = self.len - self.buf.len();
+        &mut self.buf.spare_capacity_mut()[..rest]
+    }
 }
 
 /// One whole payload, and what `admit` answered for it. Borrowed where it lay
 /// whole in the bytes fed.
-pub type Frame<'s, A> = (Cow<'s, [u8]>, A);
+pub type Frame<'s, A> = (FrameBytes<'s>, A);
 
 impl<A> Default for Deframer<A> {
     fn default() -> Self {
@@ -68,6 +81,7 @@ impl<A> Default for Deframer<A> {
             hdr_len: 0,
             pending: None,
             lent: None,
+            _pool: crate::frame_buf::Use::new(),
         }
     }
 }
@@ -87,21 +101,15 @@ impl<A> Deframer<A> {
     ) -> Result<Option<Frame<'s, A>>, E> {
         self.lent = None;
         loop {
-            if let Some(p) = self.pending.take_if(|p| p.pos == p.buf.len()) {
-                // SAFETY: every byte below `pos` was written by `feed`'s own copy or
-                // vouched for through `landed`, and `pos` is the length.
-                return Ok(Some((
-                    Cow::Owned(unsafe { p.buf.assume_init() }.into_vec()),
-                    p.admitted,
-                )));
+            if let Some(p) = self.pending.take_if(|p| p.buf.len() == p.len) {
+                return Ok(Some((FrameBytes::Owned(p.buf.into()), p.admitted)));
             }
-            if let Some(Pending { buf, pos, .. }) = &mut self.pending {
-                let take = (buf.len() - *pos).min(src.len());
+            if let Some(Pending { buf, len, .. }) = &mut self.pending {
+                let take = (*len - buf.len()).min(src.len());
                 if take == 0 {
                     return Ok(None);
                 }
-                buf[*pos..][..take].write_copy_of_slice(&src[..take]);
-                *pos += take;
+                buf.extend_from_slice(&src[..take]);
                 *src = &src[take..];
                 continue;
             }
@@ -123,18 +131,11 @@ impl<A> Deframer<A> {
                 // A payload wholly in `src` is handed out in place.
                 if let Some((payload, rest)) = src.split_at_checked(len) {
                     *src = rest;
-                    return Ok(Some((Cow::Borrowed(payload), admitted)));
+                    return Ok(Some((FrameBytes::Borrowed(payload), admitted)));
                 }
-                let mut v: Vec<MaybeUninit<u8>> = Vec::new();
                 // A failure drops `admitted` here.
-                v.try_reserve_exact(len).map_err(|_| FrameLenError::Alloc { len })?;
-                // SAFETY: `len` elements are reserved, and `MaybeUninit` needs no init.
-                unsafe { v.set_len(len) };
-                self.pending = Some(Pending {
-                    buf: v.into_boxed_slice(),
-                    pos: 0,
-                    admitted,
-                });
+                let buf = crate::frame_buf::try_alloc(len).map_err(|_| FrameLenError::Alloc { len })?;
+                self.pending = Some(Pending { buf, len, admitted });
             }
         }
     }
@@ -143,7 +144,7 @@ impl<A> Deframer<A> {
     /// carry of it is still to come, else `carry`.
     pub fn window<'a>(&'a mut self, carry: &'a mut [MaybeUninit<u8>]) -> &'a mut [MaybeUninit<u8>] {
         let min = carry.len();
-        let tail = self.pending.as_mut().map(|p| &mut p.buf[p.pos..]);
+        let tail = self.pending.as_mut().map(Pending::tail);
         match tail.filter(|t| t.len() >= min) {
             Some(tail) => {
                 self.lent = Some(Lent::Payload);
@@ -165,8 +166,11 @@ impl<A> Deframer<A> {
         match self.lent.take().expect("a read landed with no window out") {
             Lent::Payload => {
                 let p = self.pending.as_mut().expect("a window in the payload");
-                assert!(n <= p.buf.len() - p.pos, "a read past its window");
-                p.pos += n;
+                let arrived = p.buf.len() + n;
+                assert!(arrived <= p.len, "a read past its window");
+                // SAFETY: the read initialised the `n` bytes past `buf`'s length,
+                // which are within its capacity.
+                unsafe { p.buf.set_len(arrived) };
                 &[]
             }
             // SAFETY: the window was the carry.

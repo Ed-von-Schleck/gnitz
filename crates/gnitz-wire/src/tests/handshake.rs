@@ -105,6 +105,11 @@ fn wire_layout_samples() -> Vec<u8> {
         append_frame(&mut out, &reply, &[], None);
     }
 
+    // A frame of a write spanning several.
+    let mut more = ControlHeader::naming(ClientVerb::PushTxn, Target::from(0), 0);
+    more.flags.continuation = true;
+    append_frame(&mut out, &more, &[], None);
+
     let target = Target { tid: 7, token: 9 };
     multi_frame::encode_scan_multi(&mut out, &[ScanItem { target, reply_layout: 3, spec: b"spec" }]);
     let poll = DeltaPollItem {
@@ -191,7 +196,7 @@ fn wire_layout_samples() -> Vec<u8> {
 fn the_wire_layouts_are_pinned_to_the_epoch() {
     assert_eq!(
         (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
-        (40, 0x53ce_cb29_3616_58b9),
+        (41, 0x8601_98be_6228_2deb),
         "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
     );
 }

@@ -41,7 +41,7 @@ pub(super) mod test_support;
 mod timer;
 mod uring;
 
-pub(crate) use conn::{Limits, Peer, PeerGone, RecvBuf, RecvEnd, SendBody, Session};
+pub(crate) use conn::{Budget, Charge, Limits, Peer, PeerGone, RecvBuf, RecvEnd, SendBody, Session};
 pub(crate) use lease::{AckWait, Train, TrainLease};
 pub(crate) use uring::check_host;
 

@@ -749,7 +749,7 @@ const FRAME_TAIL: usize = 5;
 fn owned_frame(block: &[u8]) -> FrameBlock<'static> {
     let frame = [&[0xA5; FRAME_HEAD][..], block, &[0x5A; FRAME_TAIL]].concat();
     FrameBlock {
-        frame: Cow::Owned(frame),
+        frame: FrameBytes::Owned(frame.into()),
         block: FRAME_HEAD..FRAME_HEAD + block.len(),
     }
 }
@@ -788,7 +788,7 @@ fn several_blocks_concatenate_into_one_arena() {
     let c = a.gathered(&[2]);
     let (ba, bb, bc) = (encode_wal_block(&a), encode_wal_block(&b), encode_wal_block(&c));
     let last = FrameBlock {
-        frame: Cow::Borrowed(&bc[..]),
+        frame: FrameBytes::Borrowed(&bc[..]),
         block: 0..bc.len(),
     };
     let got = decode_wal_blocks(vec![owned_frame(&ba), owned_frame(&bb)], Some(last), &schema).unwrap();
@@ -803,6 +803,32 @@ fn several_blocks_concatenate_into_one_arena() {
     forged.rewrite(|w| w.col_mut(0)[8..16].copy_from_slice(&u64::MAX.to_le_bytes()));
     let bf = encode_wal_block(&forged);
     assert!(decode_wal_blocks(vec![owned_frame(&ba)], Some(owned_frame(&bf)), &schema).is_err());
+}
+
+/// Once several blocks are joined, the owned frames they lay in go to the frame-buffer
+/// pool, which hands each to the next frame of its size.
+#[test]
+fn joined_frames_go_to_the_pool() {
+    // The pool holds buffers while a connection's deframer is alive.
+    let _open = gnitz_wire::Deframer::<()>::default();
+    let (schema, a) = string_batch();
+    let block = encode_wal_block(&a);
+    // Sizes no other test of the crate asks the pool for, neither within twice the other.
+    let held = [3 << 20, 7 << 20].map(|cap| {
+        let mut frame = Vec::with_capacity(cap);
+        frame.extend_from_slice(&block);
+        FrameBlock {
+            frame: FrameBytes::Owned(frame.into()),
+            block: 0..block.len(),
+        }
+    });
+    let at = held.each_ref().map(|b| b.frame.as_ptr());
+    let got = decode_wal_blocks(Vec::from(held), None, &schema).unwrap();
+    assert_eq!(got.len(), 2 * a.len());
+    for (cap, at) in [3 << 20, 7 << 20].into_iter().zip(at) {
+        let again = gnitz_wire::frame_buf::try_alloc(cap).unwrap();
+        assert_eq!((again.as_ptr(), again.capacity()), (at, cap), "the buffer given back");
+    }
 }
 
 /// No block is the empty batch.

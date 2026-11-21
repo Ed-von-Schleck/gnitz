@@ -6,7 +6,7 @@
 //! each the head slot's until its last train terminates; a pushed train and
 //! the answer to a sync arrive whole between two replies.
 
-use std::borrow::Cow;
+use gnitz_wire::FrameBytes;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -18,13 +18,15 @@ use crate::batch::{FrameBlock, decode_wal_blocks};
 use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
+use crate::write_frames::{SpanningWrite, WriteFamily};
 use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch};
 use gnitz_wire::Target;
-use gnitz_wire::multi_frame::{self, DeltaCursor, FrameItem, SubId, encode_items, kept_as};
+use gnitz_wire::multi_frame::{self, DeltaCursor, SubId, kept_as};
 use gnitz_wire::{
     CONNECT_TIMEOUT, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob, RelIndex,
     ServerLane, SysFamily, WireConflictMode, append_frame, peek_control_block,
 };
+use smallvec::SmallVec;
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
 /// on the memory a driver that never waits can pin, not a throughput knob.
@@ -32,9 +34,9 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 
 /// Unwritten frame bytes one connection may hold; `submit` refuses past it. An
 /// encoded push is a full copy of its batch, so the count above bounds no
-/// memory on its own. Checked before queueing, so one frame up to
-/// [`gnitz_wire::MAX_FRAME_PAYLOAD`] always goes through — what it bounds is a driver that submits
-/// without flushing.
+/// memory on its own. Checked before queueing, so one request always goes
+/// through, a write spanning several frames whole — what it bounds is a driver
+/// that submits without flushing.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
 /// One relation's read result.
@@ -85,11 +87,11 @@ impl From<&RelDescriptor> for Target {
 /// block's extent within it.
 pub(crate) type RawBlock = FrameBlock<'static>;
 
-/// Own `frame`'s buffer, taking it out of the Cow (a borrowed frame lives in the
-/// transport window), with its data block at `block`.
-fn own_block(frame: &mut Cow<'_, [u8]>, block: std::ops::Range<usize>) -> RawBlock {
+/// Own `frame`'s buffer, taking it out of `frame` (a borrowed frame lives in
+/// the transport window), with its data block at `block`.
+fn own_block(frame: &mut FrameBytes<'_>, block: std::ops::Range<usize>) -> RawBlock {
     FrameBlock {
-        frame: Cow::Owned(std::mem::take(frame).into_owned()),
+        frame: FrameBytes::Owned(std::mem::take(frame).into_owned()),
         block,
     }
 }
@@ -123,7 +125,7 @@ pub(crate) enum Request<'a> {
     Backup(&'a str),
 }
 
-impl Request<'_> {
+impl<'a> Request<'a> {
     /// The relation its ACK names.
     fn acked_tid(&self) -> u64 {
         match *self {
@@ -137,7 +139,38 @@ impl Request<'_> {
         }
     }
 
-    /// Append the frame payload to `out`.
+    /// A write's families, as frames carry them: a PUSH's one, a PUSH_TXN's
+    /// every one; `None` for a request that writes no user rows.
+    fn write_families(&self) -> Option<(ClientVerb, SmallVec<[WriteFamily<'a>; 1]>)> {
+        match *self {
+            Request::Push { target, batch, mode } => {
+                let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
+                hdr.flags.conflict_mode = mode;
+                let family = WriteFamily {
+                    hdr,
+                    blob: batch.schema().shape_record(),
+                    rows: batch.view(),
+                };
+                Some((ClientVerb::Push, smallvec::smallvec![family]))
+            }
+            Request::PushTxn(families) => {
+                let families = families.iter().map(|f| {
+                    let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis);
+                    hdr.flags.conflict_mode = f.mode;
+                    WriteFamily {
+                        hdr,
+                        blob: f.batch.schema().shape_record(),
+                        rows: f.batch.view(),
+                    }
+                });
+                Some((ClientVerb::PushTxn, families.collect()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Append the frame payload of a request that writes no user rows to
+    /// `out`; a write goes as [`SpanningWrite`] encodes it.
     fn append(self, out: &mut Vec<u8>) {
         // A control-only request: its verb, the relation it names, `arg0`, and its blob.
         let (verb, target, arg0, blob): (ClientVerb, Target, u64, &[u8]) = match self {
@@ -150,12 +183,7 @@ impl Request<'_> {
                 let blocks = families.iter().map(|(family, b)| (*family, b.regions()));
                 return multi_frame::encode_ddl_txn(out, blocks);
             }
-            Request::PushTxn(families) => return append_push_txn(out, families),
-            Request::Push { target, batch, mode } => {
-                let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
-                hdr.flags.conflict_mode = mode;
-                return append_payload(out, hdr, batch.schema().shape_record(), Some(batch));
-            }
+            Request::PushTxn(_) | Request::Push { .. } => unreachable!("a write goes as SpanningWrite encodes it"),
         };
         append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None)
     }
@@ -172,6 +200,14 @@ pub(crate) fn append_payload(out: &mut Vec<u8>, hdr: ControlHeader, blob: &[u8],
     );
 }
 
+/// The refusal of a request frame of `total` bytes, past the ceiling.
+fn oversize(total: usize) -> ClientError {
+    ClientError::from(format!(
+        "request frame is {total} bytes, exceeding the {}-byte server ingress cap; split the request",
+        gnitz_wire::MAX_FRAME_PAYLOAD
+    ))
+}
+
 /// One family of a user-table push transaction: a maximal run of same-mode
 /// writes into `target`.
 pub(crate) struct PushFamily {
@@ -186,23 +222,6 @@ pub(crate) struct PushFamily {
     /// watermark among the reads this family's writes were built from; `BLIND`
     /// when none was.
     pub(crate) basis: u64,
-}
-
-/// Append an atomic user-table push transaction frame (`ClientVerb::PushTxn`) to
-/// `out` (without the 4-byte frame header). Every family carries its batch's
-/// shape record, which the master validates it against.
-pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
-    let items: Vec<FrameItem> = families
-        .iter()
-        .map(|f| FrameItem {
-            target: f.target,
-            conflict_mode: f.mode,
-            basis: f.basis,
-            blob: f.batch.schema().shape_record(),
-            data: f.batch.regions(),
-        })
-        .collect();
-    encode_items(out, ClientVerb::PushTxn, &items)
 }
 
 /// One request in flight, or a pushed train: how its reply decodes, the reply
@@ -288,7 +307,7 @@ impl Train {
     /// [`Self::finish`], behind the held ones.
     fn take(
         &mut self,
-        frame: &mut Cow<'_, [u8]>,
+        frame: &mut FrameBytes<'_>,
         block: std::ops::Range<usize>,
         more: bool,
     ) -> Result<(), ProtocolError> {
@@ -401,7 +420,7 @@ struct Inbox {
 
 impl Inbox {
     /// Feed one frame to the slot it is of, whose reply arrives if that completes it.
-    fn feed(&mut self, buf: Cow<'_, [u8]>) -> Result<(), ProtocolError> {
+    fn feed(&mut self, buf: FrameBytes<'_>) -> Result<(), ProtocolError> {
         let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
         let in_train = self.pushed.is_some();
         match ctrl.server_lane() {
@@ -468,6 +487,10 @@ pub(crate) struct Session {
     /// The last flush left bytes the socket would not take, so the next one
     /// waits for it to be writable.
     refused: bool,
+    /// The payload bytes past which a write is cut into several frames
+    /// (`GNITZ_WRITE_FRAME_BYTES`, at most and by default
+    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`]).
+    write_frame_bytes: usize,
 }
 
 /// The connection's socket, for a [`Host`] to register.
@@ -496,7 +519,18 @@ impl Session {
             ended: None,
             unread: false,
             refused: false,
+            write_frame_bytes: gnitz_foundation::env::env_num_in(
+                "GNITZ_WRITE_FRAME_BYTES",
+                gnitz_wire::MAX_FRAME_PAYLOAD,
+                1..=gnitz_wire::MAX_FRAME_PAYLOAD,
+            ),
         }
+    }
+
+    /// Cut writes into frames of at most `bytes`.
+    #[cfg(test)]
+    pub(crate) fn set_write_frame_bytes(&mut self, bytes: usize) {
+        self.write_frame_bytes = bytes;
     }
 
     /// Requests submitted since this session connected — one per `submit`,
@@ -511,10 +545,29 @@ impl Session {
     /// or past the frame ceiling — is answered with the refusal, as every
     /// submit's is; the server certifies a pushed batch's shape record, and
     /// every row's NULL bits and cells, against the relation's own schema.
+    ///
+    /// A write goes as [`SpanningWrite`] cuts it at [`Self::write_frame_bytes`]:
+    /// past it as several frames, which the server commits as one write.
     pub(crate) fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
-        let tid = req.acked_tid();
         let (to, sent) = promise();
-        self.enqueue(|out| req.append(out), Slot::Ack { tid, to });
+        let mut slot = Slot::Ack { tid: req.acked_tid(), to };
+        let Some((verb, families)) = req.write_families() else {
+            self.enqueue(|out| req.append(out), slot);
+            return sent;
+        };
+        let ceiling = self.write_frame_bytes;
+        let queued = self.admit_with(|t| {
+            let write = SpanningWrite::cut(verb, &families, ceiling).map_err(oversize)?;
+            for at in 0..write.frames() {
+                t.frame(|out| write.encode(at, out))
+                    .expect("a frame cut within the ceiling");
+            }
+            Ok(())
+        });
+        match queued {
+            Ok(()) => self.inbox.pending.push_back(slot),
+            Err(why) => slot.fail(why, &mut self.inbox.polls),
+        }
         sent
     }
 
@@ -726,20 +779,24 @@ impl Session {
     /// Queue the frame `encode` appends on the transport, or the refusal this
     /// session answers it with.
     fn admit(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), ClientError> {
+        // A frame past the ceiling is refused here rather than by the server's
+        // ingress cap, which would drop the connection.
+        self.admit_with(|t| t.frame(encode).map_err(oversize))
+    }
+
+    /// Queue one request's frames, which `queue` puts on the transport, or the
+    /// refusal this session answers it with.
+    fn admit_with(
+        &mut self,
+        queue: impl FnOnce(&mut ClientTransport) -> Result<(), ClientError>,
+    ) -> Result<(), ClientError> {
         if let Some(why) = &self.ended {
             return Err(why.clone());
         }
         if let Some(why) = self.cap_refusal() {
             return Err(why);
         }
-        // A frame past the ceiling is refused here rather than by the server's
-        // ingress cap, which would drop the connection.
-        self.transport.frame(encode).map_err(|total| {
-            ClientError::from(format!(
-                "request frame is {total} bytes, exceeding the {}-byte server ingress cap; split the request",
-                gnitz_wire::MAX_FRAME_PAYLOAD
-            ))
-        })?;
+        queue(&mut self.transport)?;
         self.submitted += 1;
         Ok(())
     }
@@ -896,7 +953,12 @@ impl Slot {
     /// Take one reply frame; whether that answered the slot, with its reply
     /// or with the refusal this frame is. `Err` is a frame this slot cannot
     /// have been sent, which ends the session.
-    fn feed(&mut self, ctrl: DecodedControl, mut buf: Cow<'_, [u8]>, polls: &mut Polls) -> Result<bool, ProtocolError> {
+    fn feed(
+        &mut self,
+        ctrl: DecodedControl,
+        mut buf: FrameBytes<'_>,
+        polls: &mut Polls,
+    ) -> Result<bool, ProtocolError> {
         let named = ctrl.hdr.target_id;
         // The relation this frame must name. Replies arrive in request order,
         // so a frame naming another would decode under the wrong schema

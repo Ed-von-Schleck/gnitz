@@ -41,7 +41,16 @@ fn write_and_reply(
     let rows = families.iter().map(|f| f.rows.view().len()).sum();
     let (done, rx) = oneshot::channel();
     let held = HeldTables::default();
-    (PendingWrite { families, rows, held, done }, rx)
+    (
+        PendingWrite {
+            families,
+            rows,
+            held,
+            followed: false,
+            done,
+        },
+        rx,
+    )
 }
 
 /// A write of one family per entry of `family_rows`, to tables `1..`.
@@ -268,7 +277,7 @@ fn a_closed_committer_refuses_a_write_and_a_backup() {
         let write = || {
             let rows = FamilyRows::Built(sized_row(&shared, tid, None));
             let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
-            Box::pin(shared.committer.write(families, HeldTables::default()))
+            Box::pin(shared.committer.write(families, HeldTables::default(), false))
         };
 
         let mut admitted = write();
@@ -309,7 +318,7 @@ fn a_write_past_the_threshold_is_checkpointed_unasked() {
         let rows = FamilyRows::Built(sized_row(&shared, tid, Some(sal.push_room())));
         let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
         disp.reactor()
-            .block_on(shared.committer.write(families, HeldTables::default()))
+            .block_on(shared.committer.write(families, HeldTables::default(), false))
             .expect("the write fits behind the boot checkpoint");
         assert!(
             poll_until(disp.reactor(), || sal.epoch() == 2),
@@ -353,7 +362,7 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
                 .collect();
             // The settle answers behind any checkpoint the write called for.
             let reactor = disp.reactor();
-            let committed = reactor.block_on(shared.committer.write(families, HeldTables::default()));
+            let committed = reactor.block_on(shared.committer.write(families, HeldTables::default(), false));
             reactor.block_on(shared.committer.settle());
             committed
         };
@@ -434,7 +443,7 @@ fn a_refused_merged_run_goes_again_as_its_writes() {
         let mut pushes = [large, large + 8].map(|footprint| {
             let rows = FamilyRows::Built(sized_row(&shared, tid, Some(footprint)));
             let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
-            Box::pin(shared.committer.write(families, HeldTables::default()))
+            Box::pin(shared.committer.write(families, HeldTables::default(), false))
         });
         // Both are queued before the committer takes either, so they are one
         // batch.

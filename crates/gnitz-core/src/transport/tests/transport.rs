@@ -84,6 +84,22 @@ fn an_oversize_frame_is_refused_and_leaves_the_queue_as_it_was() {
     assert_eq!(t.queue.buf.capacity(), 0);
 }
 
+/// A queue that grew past what it retains gives its buffer to the frame-buffer
+/// pool once written, which hands it to the next frame of its size.
+#[test]
+fn a_written_queue_past_its_retained_size_goes_to_the_pool() {
+    let (mut t, _peer) = transport_pair();
+    // A size no other test of the crate asks the pool for.
+    let cap = 17 << 20;
+    t.queue.buf = Vec::with_capacity(cap);
+    t.queue.buf.extend_from_slice(b"sent");
+    let at = t.queue.buf.as_ptr();
+    t.queue.advance(4);
+    assert_eq!(t.queue.buf.capacity(), 0);
+    let again = gnitz_wire::frame_buf::try_alloc(cap).unwrap();
+    assert_eq!((again.as_ptr(), again.capacity()), (at, cap), "the buffer given back");
+}
+
 /// A peer answering `reply` to the client's HELLO, which carries `token`.
 fn hello_against(token: &[u8], reply: &[u8]) -> Result<(), ClientError> {
     let (mut t, peer) = transport_pair();
@@ -256,7 +272,7 @@ fn an_idle_read_would_block_and_a_short_read_ends_the_pass() {
     let mut got: Vec<Vec<u8>> = Vec::new();
     let mut read = |t: &mut ClientTransport| {
         t.read(|f| {
-            got.push(f.into_owned());
+            got.push(f.to_vec());
             Ok(())
         })
     };

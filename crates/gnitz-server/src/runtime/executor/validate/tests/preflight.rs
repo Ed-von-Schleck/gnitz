@@ -184,25 +184,30 @@ fn a_filter_takes_the_spans_of_an_admitted_write_alone() {
     disp.into_catalog().close();
 }
 
-/// Only a lone Error family of positive weights is held fresh: an Update
-/// family, a retraction, and a second family to the same table each keep the
-/// enforced rule.
+/// Only the families of a table whose every family is an Error family of
+/// positive weights are held fresh: an Update family or a retraction keeps
+/// the enforced rule on every family of its table.
 #[test]
-fn only_a_lone_positive_error_family_is_fresh() {
-    let family = |tid, mode, weights: &[i64]| {
-        let rows: Vec<(u64, i64, i64)> = weights.iter().enumerate().map(|(i, &w)| (i as u64, w, 0)).collect();
+fn only_a_table_of_positive_error_families_is_fresh() {
+    let family = |tid, mode, first: u64, weights: &[i64]| {
+        let rows: Vec<(u64, i64, i64)> = (weights.iter().enumerate())
+            .map(|(i, &w)| (first + i as u64, w, 0))
+            .collect();
         TxnFamily::new(tid, mode, FamilyRows::Built(make_batch(&make_schema_u64_i64(), &rows)))
     };
+    use WireConflictMode::{Error, Update};
     let mut families = vec![
-        family(1, WireConflictMode::Error, &[1, 1]),
-        family(2, WireConflictMode::Update, &[1]),
-        family(3, WireConflictMode::Error, &[1, -1]),
-        family(4, WireConflictMode::Error, &[1]),
-        family(4, WireConflictMode::Error, &[1]),
-        family(5, WireConflictMode::Error, &[]),
+        family(1, Error, 0, &[1, 1]),
+        family(2, Update, 0, &[1]),
+        family(3, Error, 0, &[1, -1]),
+        family(4, Error, 0, &[1]),
+        family(4, Error, 1, &[1]),
+        family(5, Error, 0, &[]),
+        family(6, Error, 0, &[1]),
+        family(6, Update, 1, &[1]),
     ];
     mark_fresh(&mut families);
     let rules: Vec<PkRule> = families.iter().map(|f| f.pk_rule).collect();
     use PkRule::{Enforce, Fresh};
-    assert_eq!(rules, [Fresh, Enforce, Enforce, Enforce, Enforce, Fresh]);
+    assert_eq!(rules, [Fresh, Enforce, Enforce, Fresh, Fresh, Fresh, Enforce, Enforce]);
 }

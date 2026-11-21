@@ -1120,8 +1120,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         family(17, b1, WireConflictMode::Error, blind),
         family(16, b2, WireConflictMode::Update, blind),
     ];
-    let mut payload = Vec::new();
-    append_push_txn(&mut payload, &families);
+    let payload = one_frame(Request::PushTxn(&families));
 
     let ctrl = peek_control_block(&payload).unwrap();
     let decoded = gnitz_wire::multi_frame::decode_items(&payload, ctrl.body, ClientVerb::PushTxn).unwrap();
@@ -1151,4 +1150,102 @@ fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
         let want = (!batch.is_empty()).then_some(&batch);
         assert_eq!(frame_data(&buf, &ctrl, &schema).as_ref(), want);
     }
+}
+
+/// A push past the session's write ceiling goes as several PUSH frames, sent
+/// back to back, and is one request: one slot, answered by the one ACK the
+/// server sends after the last frame. A push within it goes as one frame,
+/// byte for byte the frame `append` writes.
+#[test]
+fn a_write_past_the_ceiling_goes_as_several_frames_and_is_one_request() {
+    let (mut s, peer) = pair();
+    s.set_write_frame_bytes(1024);
+    let big = kv_rows(&(0..200).map(|pk| (pk, pk as i64, 1)).collect::<Vec<_>>());
+    let small = batch_a(&[1, 2]);
+    let push = |batch| Request::Push {
+        target: 4.into(),
+        batch,
+        mode: WireConflictMode::Update,
+    };
+    let first = s.submit(push(&big));
+    let second = s.submit(push(&small));
+    assert_eq!(s.requests_sent(), 2);
+    while s.interest().write {
+        s.step(Interest::WRITE);
+    }
+    let mut got = ZSetBatch::new(big.schema());
+    loop {
+        let frame = peer.recv();
+        assert!(frame.len() <= 1024);
+        let ctrl = peek_control_block(&frame).unwrap();
+        assert_eq!(ctrl.client_verb(), Ok(ClientVerb::Push));
+        got.extend_from_owned(frame_data(&frame, &ctrl, big.schema()).unwrap());
+        if !ctrl.hdr.flags.continuation {
+            break;
+        }
+    }
+    assert_eq!(got, big);
+    assert_eq!(
+        peer.recv(),
+        one_frame(push(&small)),
+        "a write within the ceiling is one frame"
+    );
+    peer.send(&reply_ctrl(4, 11));
+    peer.send(&reply_ctrl(4, 12));
+    assert_eq!(await_reply(&mut s, first).unwrap(), 11);
+    assert_eq!(await_reply(&mut s, second).unwrap(), 12);
+}
+
+/// The one frame `req`, a write within the frame ceiling, goes as.
+fn one_frame(req: Request<'_>) -> Vec<u8> {
+    let (verb, families) = req.write_families().expect("a write");
+    let write = SpanningWrite::cut(verb, &families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
+    assert_eq!(write.frames(), 1);
+    let mut out = Vec::new();
+    write.encode(0, &mut out);
+    out
+}
+
+/// A write within the ceiling is the one frame the wire's own encoders write
+/// for it: a `PUSH` with no data block when empty, a `PUSH_TXN` whose empty
+/// family carries a block of no rows.
+#[test]
+fn a_write_within_the_ceiling_is_the_wire_encoders_frame() {
+    let schema = schema_b();
+    let family = |batch| PushFamily {
+        target: 3.into(),
+        batch: Arc::new(batch),
+        mode: WireConflictMode::Update,
+        basis: 0,
+    };
+    let families = [
+        family(batch_b(&[1, 2])),
+        family(ZSetBatch::new(&schema)),
+        family(batch_b(&[3])),
+    ];
+    let (rows, empty) = (batch_b(&[1, 2, 3]), ZSetBatch::new(&schema));
+    let push = |batch| Request::Push {
+        target: 3.into(),
+        batch,
+        mode: WireConflictMode::Update,
+    };
+    let mut hdr = ControlHeader::naming(ClientVerb::Push, 3.into(), 0);
+    hdr.flags.conflict_mode = WireConflictMode::Update;
+    for batch in [&rows, &empty] {
+        let mut want = Vec::new();
+        append_payload(&mut want, hdr, schema.shape_record(), Some(batch));
+        assert_eq!(one_frame(push(batch)), want);
+    }
+    let items: Vec<_> = (families.iter())
+        .map(|f| gnitz_wire::multi_frame::FrameItem {
+            target: f.target,
+            conflict_mode: f.mode,
+            basis: f.basis,
+            blob: f.batch.schema().shape_record(),
+            data: f.batch.regions(),
+        })
+        .collect();
+    let mut want = Vec::new();
+    gnitz_wire::multi_frame::encode_items(&mut want, ClientVerb::PushTxn, &items);
+    assert_eq!(one_frame(Request::PushTxn(&families)), want);
 }

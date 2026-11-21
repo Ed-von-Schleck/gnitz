@@ -185,7 +185,7 @@ pub(crate) fn pass(t: &mut ClientTransport) -> (Vec<Vec<u8>>, Result<(), Protoco
     let mut frames = Vec::new();
     loop {
         let read = t.read(|f| {
-            frames.push(f.into_owned());
+            frames.push(f.to_vec());
             Ok(())
         });
         match read {
@@ -444,7 +444,7 @@ pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
 /// A WAL block decoded under `schema` into a fresh batch.
 pub(crate) fn decode_wal_block(data: &[u8], schema: &Arc<Schema>) -> Result<ZSetBatch, ProtocolError> {
     let block = crate::batch::FrameBlock {
-        frame: std::borrow::Cow::Borrowed(data),
+        frame: gnitz_wire::FrameBytes::Borrowed(data),
         block: 0..data.len(),
     };
     crate::batch::decode_wal_blocks(Vec::new(), Some(block), schema)

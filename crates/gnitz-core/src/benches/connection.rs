@@ -23,7 +23,13 @@ fn push_encode_bench() {
                     mode: WireConflictMode::Update,
                 };
                 out.clear();
-                e += counter.measure(|| push().append(black_box(&mut out))).1;
+                e += counter
+                    .measure(|| {
+                        let (verb, families) = push().write_families().expect("a write");
+                        let write = SpanningWrite::cut(verb, &families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
+                        write.encode(0, black_box(&mut out))
+                    })
+                    .1;
             }
             println!(
                 "push_encode_bench {nrows} rows, null every {null_every}: {:.2} instr/row",

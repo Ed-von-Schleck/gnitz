@@ -25,6 +25,7 @@ mod suites;
 mod test_support;
 mod transport;
 mod txn;
+mod write_frames;
 
 pub use batch::{RowMark, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, RelProps};

@@ -62,37 +62,58 @@ pub(super) struct TxnBundle<'a> {
     pub(super) tables: Vec<TxnTable<'a>>,
 }
 
+/// Each family's run: the first family of the run of consecutive families of
+/// one table and conflict mode it ends. A run is one batch of the write, which
+/// a client cuts into several families to spread it over several frames.
+pub(super) fn runs(families: &[TxnFamily]) -> SmallVec<[usize; 1]> {
+    let mut runs = SmallVec::with_capacity(families.len());
+    for (i, f) in families.iter().enumerate() {
+        let run = match i.checked_sub(1).map(|p| &families[p]) {
+            Some(p) if p.tid == f.tid && p.mode == f.mode => runs[i - 1],
+            _ => i,
+        };
+        runs.push(run);
+    }
+    runs
+}
+
 impl<'a> TxnBundle<'a> {
     pub(super) fn new(cat: &CatalogEngine, families: &'a [TxnFamily]) -> Result<Self, WireFault> {
+        // Each table in the order of its first family, with every family of
+        // it; judged by whether any of them reads committed state.
+        let mut all: Vec<(u64, bool, SmallVec<[u32; 1]>)> = Vec::new();
+        for (fi, fam) in families.iter().enumerate() {
+            let reads = cat.push_reads_committed_state(fam.tid, fam.mode);
+            match all.iter_mut().find(|(tid, ..)| *tid == fam.tid) {
+                Some((_, any, fams)) => {
+                    *any |= reads;
+                    fams.push(fi as u32);
+                }
+                None => all.push((fam.tid, reads, smallvec::smallvec![fi as u32])),
+            }
+        }
         let mut tables: Vec<TxnTable<'a>> = Vec::new();
-        // Each table judged once, at its first family.
-        for (i, fam) in families.iter().enumerate() {
-            if families[..i].iter().any(|f| f.tid == fam.tid) {
-                continue;
+        for (tid, reads, fams) in all {
+            if reads {
+                tables.push(TxnTable {
+                    tid,
+                    schema: cat.registry.relation_or_err(tid)?.schema(),
+                    cons: cat.row_constraints(tid),
+                    fold: Fold::default(),
+                    probe_keys: Vec::new(),
+                    fams,
+                    repeats: false,
+                });
             }
-            let reads_committed = families[i..]
-                .iter()
-                .any(|f| f.tid == fam.tid && cat.push_reads_committed_state(f.tid, f.mode));
-            if !reads_committed {
-                continue;
-            }
-            tables.push(TxnTable {
-                tid: fam.tid,
-                schema: cat.registry.relation_or_err(fam.tid)?.schema(),
-                cons: cat.row_constraints(fam.tid),
-                fold: Fold::default(),
-                probe_keys: Vec::new(),
-                fams: SmallVec::new(),
-                repeats: false,
-            });
         }
         let mems: SmallVec<[MemBatch<'a>; 1]> = families.iter().map(|f| f.rows.view()).collect();
+        let runs = runs(families);
         for t in &mut tables {
             let (tid, schema) = (t.tid, t.schema);
-            for (fi, fam) in families.iter().enumerate().filter(|(_, f)| f.tid == tid) {
-                let error = matches!(fam.mode, WireConflictMode::Error);
+            for at in 0..t.fams.len() {
+                let fi = t.fams[at] as usize;
+                let error = matches!(families[fi].mode, WireConflictMode::Error);
                 let batch = mems[fi];
-                t.fams.push(fi as u32);
                 t.fold.reserve(batch.len());
                 if error {
                     t.probe_keys.reserve(batch.len());
@@ -116,7 +137,7 @@ impl<'a> TxnBundle<'a> {
                             let e = o.into_mut();
                             if inserts {
                                 match e.last {
-                                    FoldOp::Inserted(f, _) if f == fi as u32 => return Err(in_batch()),
+                                    FoldOp::Inserted(f, _) if runs[f as usize] == runs[fi] => return Err(in_batch()),
                                     // Existence is cumulative in frame order, and a
                                     // cascade's families come later and only delete.
                                     FoldOp::Inserted(..) => {
@@ -187,3 +208,7 @@ impl<'a> TxnBundle<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/bundle.rs"]
+mod tests;

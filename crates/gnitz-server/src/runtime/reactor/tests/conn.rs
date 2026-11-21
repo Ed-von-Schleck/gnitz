@@ -935,3 +935,86 @@ fn a_shared_body_is_sent_behind_what_is_corked() {
     let want = [&b"reply"[..], &small, &large].concat();
     assert!(wire.join().unwrap() == want, "the body left behind what was corked");
 }
+
+/// A fenced peer sends nothing until the level reaches the fence, the highest
+/// one raised — not its cork's flush, nor a body too large to cork — and then
+/// everything, in call order. A fence the level has passed holds nothing back.
+#[test]
+fn a_fence_holds_every_send_until_its_level_reaches_it() {
+    let r = make_reactor();
+    let (mut peer, receiver) = Peer::over_socketpair(&r);
+    let level = Rc::new(Level::default());
+    level.raise(3);
+    peer.fence(&level, 3);
+    peer.cork(b"open");
+    r.block_on(peer.flush_egress()).expect("an open peer");
+    assert_eq!(
+        read_nonblocking(&receiver, 64).as_deref(),
+        Some(&b"open"[..]),
+        "a reached fence holds nothing back"
+    );
+
+    peer.cork(b"ack");
+    peer.fence(&level, 5);
+    peer.fence(&level, 4);
+    let large = Rc::new(vec![0x42u8; COALESCE_MAX_BYTES]);
+    let mut sending = Box::pin(peer.send(SendBody::Shared(Rc::clone(&large))));
+    level.raise(4);
+    let timer = r.sleep(Duration::from_millis(20));
+    assert!(
+        matches!(r.block_on(select2(sending.as_mut(), timer)), Either::B(())),
+        "the level is below the fence"
+    );
+    assert!(
+        read_nonblocking(&receiver, 64).is_none(),
+        "neither the cork nor the body left"
+    );
+
+    let wire = std::thread::spawn(move || {
+        let mut wire = vec![0u8; 3 + COALESCE_MAX_BYTES];
+        (&receiver).read_exact(&mut wire).expect("the cork and the body");
+        wire
+    });
+    level.raise(5);
+    r.block_on(sending).expect("an open peer");
+    let want = [&b"ack"[..], &large].concat();
+    assert!(wire.join().unwrap() == want, "both left, in call order");
+}
+
+/// A fence holds back sends, not requests: a request already queued is handed
+/// out while what is corked waits behind the fence.
+#[test]
+fn a_fenced_peer_still_hands_out_a_queued_request() {
+    let r = make_reactor();
+    let (mut peer, partner) = Peer::over_socketpair(&r);
+    (&partner)
+        .write_all(&[framed(b"a"), framed(b"b")].concat())
+        .expect("write");
+    let level = Rc::new(Level::default());
+
+    r.block_on(peer.next_request()).expect("the first request");
+    assert!(peer.request_queued(), "the second is queued behind it");
+    peer.cork(b"ack");
+    peer.fence(&level, 1);
+    r.block_on(peer.next_request())
+        .expect("the second request, with the fence up");
+    assert!(
+        read_nonblocking(&partner, 64).is_none(),
+        "the ACK waits behind the fence"
+    );
+
+    let mut parked = Box::pin(peer.next_request());
+    let mut wait = || {
+        let timer = r.sleep(Duration::from_millis(20));
+        let waited = r.block_on(select2(parked.as_mut(), timer));
+        assert!(matches!(waited, Either::B(())), "no request is queued");
+    };
+    wait();
+    assert!(
+        read_nonblocking(&partner, 64).is_none(),
+        "the flush ahead of the park waits"
+    );
+    level.raise(1);
+    wait();
+    assert_eq!(read_nonblocking(&partner, 64).as_deref(), Some(&b"ack"[..]));
+}

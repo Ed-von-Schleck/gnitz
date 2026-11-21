@@ -136,6 +136,7 @@ mod xxh;
 
 #[cfg(feature = "field-map")]
 pub mod fields;
+pub mod frame_buf;
 pub mod multi_frame;
 pub mod schema_record;
 pub mod snapshot;
@@ -150,6 +151,7 @@ pub use control::*;
 pub use decimal::*;
 pub use deframe::*;
 pub use float::*;
+pub use frame_buf::{FrameBuf, FrameBytes};
 pub use german_string::*;
 pub use handshake::*;
 pub use heap::*;

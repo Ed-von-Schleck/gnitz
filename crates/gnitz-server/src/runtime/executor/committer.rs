@@ -1,7 +1,7 @@
 //! The group-commit task: every user write's SAL groups, batched from whatever
 //! is queued behind the first request (see [`drain_ready_batch`]). A write's
 //! table locks are dropped once it is laid out, when its writer is answered;
-//! the writer then waits for the SAL's fdatasync to cover it. Checkpoints,
+//! the writer's ACK then waits for the SAL's fdatasync to cover it. Checkpoints,
 //! backups and a DDL's settles end a batch. Once serving, it is the one task
 //! that runs a checkpoint.
 
@@ -20,7 +20,8 @@ use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
 /// capped at this plus one whole request — and one request is itself bounded
-/// only by `MAX_FRAME_PAYLOAD`.
+/// only by the bytes its frames carry: one frame's `MAX_FRAME_PAYLOAD`, or
+/// several frames' `Limits::write_span_cap`.
 const MAX_PENDING_ROWS: usize = 100_000;
 
 /// One request to the committer.
@@ -57,6 +58,10 @@ struct PendingWrite {
     /// The rows of every family.
     rows: usize,
     held: HeldTables,
+    /// The writer's connection had a request queued behind the write when it
+    /// was dispatched; the connection runs that request once the write is laid
+    /// out.
+    followed: bool,
     done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
@@ -79,10 +84,16 @@ impl Committer {
     }
 
     /// Lay out `families` as one write, dropping `held` once it is; resolves
-    /// then to the write's commit LSN, which is not yet durable.
-    pub(super) async fn write(&self, families: Vec<TxnFamily>, held: HeldTables) -> Result<u64, WireFault> {
+    /// then to the write's commit LSN, which is not yet durable. `followed`
+    /// says the writer's connection has a request queued behind it.
+    pub(super) async fn write(
+        &self,
+        families: Vec<TxnFamily>,
+        held: HeldTables,
+        followed: bool,
+    ) -> Result<u64, WireFault> {
         let rows = families.iter().map(|f| f.rows.view().len()).sum();
-        self.admit(|done| CommitRequest::Write(PendingWrite { families, rows, held, done }))?
+        self.admit(|done| CommitRequest::Write(PendingWrite { families, rows, held, followed, done }))?
             .await
     }
 
@@ -152,11 +163,13 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
 
         let mut end = drain_ready_batch(&mut rx, first, &mut s.writes);
         // While the fdatasync in flight covers everything published, this
-        // batch is durable at the next either way. Laid out now, it releases
-        // its table locks; unless a write is parked on one, it waits that
-        // fdatasync out and takes in what queued meanwhile.
+        // batch is durable at the next either way. Unless something waits on
+        // its layout — a request behind a write on its connection, or a write
+        // parked on one of its table locks — it waits that fdatasync out and
+        // takes in what queued meanwhile. So a pipelined writer's pushes are
+        // batched by reactor pass rather than by fdatasync.
         let sal = shared.dispatcher.sal();
-        if end.is_none() && sal.syncing_all() && !s.writes.iter().any(|w| w.held.contended()) {
+        if end.is_none() && sal.syncing_all() && !s.writes.iter().any(|w| w.followed || w.held.contended()) {
             sal.durable_through(sal.watermark()).await;
             if let Some(next) = rx.try_recv() {
                 end = drain_ready_batch(&mut rx, next, &mut s.writes);

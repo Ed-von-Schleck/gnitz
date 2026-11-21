@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use super::bundle::{FoldOp, PkFold, TxnBundle, TxnTable};
 use super::violation::{Clash, pk_violation_err, unique_violation_err};
@@ -768,19 +769,27 @@ async fn removed_references(
     Ok((further, violation))
 }
 
-/// Hold to [`PkRule::Fresh`] each of `families`, a bundle [`Checks::validate_txn`]
-/// admitted, that is an Error family of positive weights and its table's one
-/// family. Validation refused a key such a family repeats, inserts at a weight
-/// above 1, or finds held; and an Error family reads committed state, so its
-/// write holds its tables' exclusive locks from that probe until the committer
-/// lays it out, which keeps every other write off the table in between. So each
-/// key is distinct, weighs 1, and is absent from the store the family lands on.
+/// Hold to [`PkRule::Fresh`] each family of every table of `families`, a
+/// bundle [`Checks::validate_txn`] admitted, whose families are all Error
+/// families of positive weights. Validation refused a key two of them insert,
+/// one inserts at a weight above 1, or the store holds; and an Error family
+/// reads committed state, so its write holds its tables' exclusive locks from
+/// that probe until the committer lays it out, which keeps every other write
+/// off the table in between. So each key is distinct, weighs 1, and is absent
+/// from the store each family lands on, behind the families before it.
 fn mark_fresh(families: &mut [TxnFamily]) {
-    for i in 0..families.len() {
-        let f = &families[i];
-        let lone = families.iter().filter(|g| g.tid == f.tid).count() == 1;
-        if lone && matches!(f.mode, WireConflictMode::Error) && f.rows.view().all_weights_positive() {
-            families[i].pk_rule = PkRule::Fresh;
+    // Per table, whether every family so far inserts only.
+    let mut fresh: SmallVec<[(u64, bool); 4]> = SmallVec::new();
+    for f in families.iter() {
+        let inserts = matches!(f.mode, WireConflictMode::Error) && f.rows.view().all_weights_positive();
+        match fresh.iter_mut().find(|(tid, _)| *tid == f.tid) {
+            Some((_, all)) => *all &= inserts,
+            None => fresh.push((f.tid, inserts)),
+        }
+    }
+    for f in families.iter_mut() {
+        if fresh.iter().any(|&(tid, all)| tid == f.tid && all) {
+            f.pk_rule = PkRule::Fresh;
         }
     }
 }

@@ -71,6 +71,11 @@ impl PushedBlock {
         Ok(PushedBlock { block, schema })
     }
 
+    /// How many rows the block holds.
+    pub(super) fn rows(&self) -> usize {
+        self.block.rows()
+    }
+
     /// The block's rows, read from `data`: the bytes it was certified in.
     pub(super) fn view<'a>(&'a self, data: &'a [u8]) -> MemBatch<'a> {
         self.block.view(data, &self.schema)

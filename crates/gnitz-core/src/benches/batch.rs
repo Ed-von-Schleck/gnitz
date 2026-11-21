@@ -195,7 +195,7 @@ fn reply_alloc_cost_bench() {
                 .measure(|| drop(black_box(ZSetBatch::with_capacity(black_box(&schema), black_box(rows)))))
                 .1;
             let frame = FrameBlock {
-                frame: std::borrow::Cow::Owned(block.clone()),
+                frame: gnitz_wire::FrameBytes::Owned(block.clone().into()),
                 block: 0..block.len(),
             };
             adopted += counter
@@ -218,7 +218,7 @@ fn reply_alloc_cost_bench() {
 /// `block` decoded out of a frame the transport lent, as a small reply arrives.
 fn decode_borrowed(block: &[u8], schema: &Arc<Schema>) -> ZSetBatch {
     let frame = FrameBlock {
-        frame: std::borrow::Cow::Borrowed(block),
+        frame: gnitz_wire::FrameBytes::Borrowed(block),
         block: 0..block.len(),
     };
     decode_wal_blocks(Vec::new(), Some(frame), schema).unwrap()

@@ -23,6 +23,7 @@ impl Limits {
         conn_inbound_share: usize::MAX,
         client_send_timeout: Duration::from_secs(30),
         max_conns: usize::MAX,
+        write_span_cap: usize::MAX,
     };
 }
 

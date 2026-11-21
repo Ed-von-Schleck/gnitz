@@ -8,11 +8,11 @@ use gnitz_foundation::{gnitz_debug, gnitz_warn};
 use std::mem::MaybeUninit;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-use gnitz_wire::{Deframer, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD};
+use gnitz_wire::{Deframer, FrameBuf, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD};
 use gnitz_zset::repr::PooledBuf;
 
 use super::*;
-use crate::runtime::sync::{Either, WakeQueue, select2};
+use crate::runtime::sync::{Either, Level, WakeQueue, select2};
 use crate::runtime::w2m::W2mSlot;
 
 /// The ceilings and deadlines a reactor's connections are held to, fixed for its
@@ -40,6 +40,12 @@ pub(crate) struct Limits {
     /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed
     /// at once.
     pub max_conns: usize,
+    /// Ceiling on the frame bytes the writes spanning several frames hold
+    /// together, across every connection (`GNITZ_WRITE_SPAN_BYTES`): half of
+    /// `inbound_cap` unless set lower, so open writes leave the other half to
+    /// the frames in progress beside them. A write whose next frame would pass
+    /// it is refused, its frames dropped as they arrive.
+    pub write_span_cap: usize,
 }
 
 impl Limits {
@@ -57,6 +63,11 @@ impl Limits {
                 30_000,
             )),
             max_conns,
+            write_span_cap: gnitz_foundation::env::env_num_in(
+                "GNITZ_WRITE_SPAN_BYTES",
+                inbound_cap / 2,
+                1..=inbound_cap / 2,
+            ),
         }
     }
 }
@@ -79,26 +90,26 @@ fn resolve_inbound_cap() -> usize {
 }
 
 /// A capped running total. Each [`Charge`] counts toward it until dropped.
-struct Budget {
+pub(crate) struct Budget {
     held: Cell<usize>,
     cap: usize,
 }
 
 impl Budget {
-    fn new(cap: usize) -> Rc<Budget> {
+    pub(crate) fn new(cap: usize) -> Rc<Budget> {
         Rc::new(Budget { held: Cell::new(0), cap })
     }
 
-    fn held(&self) -> usize {
+    pub(crate) fn held(&self) -> usize {
         self.held.get()
     }
 
-    fn cap(&self) -> usize {
+    pub(crate) fn cap(&self) -> usize {
         self.cap
     }
 
     /// Count `weight` toward the total, or `None` if that would pass the cap.
-    fn charge(self: &Rc<Self>, weight: usize) -> Option<Charge> {
+    pub(crate) fn charge(self: &Rc<Self>, weight: usize) -> Option<Charge> {
         let held = self.held.get().checked_add(weight).filter(|&h| h <= self.cap)?;
         self.held.set(held);
         Some(Charge { budget: Rc::clone(self), weight })
@@ -106,7 +117,7 @@ impl Budget {
 }
 
 /// `weight` counted toward a [`Budget`] for as long as this lives.
-struct Charge {
+pub(crate) struct Charge {
     budget: Rc<Budget>,
     weight: usize,
 }
@@ -118,9 +129,11 @@ impl Drop for Charge {
 }
 
 /// One complete inbound frame payload, charged to the inbound [`Budget`] for as
-/// long as it lives.
+/// long as it lives. The charge is the payload's length; its buffer, from
+/// [`gnitz_wire::frame_buf`]'s pool, may be up to twice that, and the pool's
+/// own bound caps the difference.
 pub(crate) struct RecvBuf {
-    buf: Box<[u8]>,
+    buf: FrameBuf,
     charge: Charge,
 }
 
@@ -131,12 +144,12 @@ impl RecvBuf {
 
     /// `bytes` as a frame charged to a budget of its own, which nothing else
     /// draws on.
-    #[cfg(all(test, fuzzing))]
+    #[cfg(test)]
     pub(crate) fn detached(bytes: &[u8]) -> RecvBuf {
         let charge = Budget::new(bytes.len())
             .charge(bytes.len())
             .expect("the budget is the frame's size");
-        RecvBuf { buf: bytes.into(), charge }
+        RecvBuf { buf: bytes.to_vec().into(), charge }
     }
 }
 
@@ -231,10 +244,7 @@ impl FrameSink {
             *held += want;
             Ok(charge)
         })? {
-            self.frames.push(RecvBuf {
-                buf: buf.into_owned().into_boxed_slice(),
-                charge,
-            });
+            self.frames.push(RecvBuf { buf: buf.into_owned(), charge });
         }
         Ok(())
     }
@@ -404,6 +414,9 @@ pub(super) struct Conns {
     /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
     /// holds one charge of it.
     slots: Rc<Budget>,
+    /// The frames every connection's open write holds, under
+    /// `Limits::write_span_cap`.
+    spans: Rc<Budget>,
     limits: Limits,
 }
 
@@ -414,6 +427,7 @@ impl Conns {
             paused: RefCell::new(Vec::new()),
             inbound: Budget::new(limits.inbound_cap),
             slots: Budget::new(limits.max_conns),
+            spans: Budget::new(limits.write_span_cap),
             limits,
         }
     }
@@ -615,6 +629,7 @@ impl Reactor {
             reactor: self.clone(),
             conn,
             egress: None,
+            fence: None,
         }
     }
 
@@ -781,9 +796,18 @@ pub(crate) struct Peer {
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
     egress: Option<PooledBuf>,
+    /// A level, and the value it must reach before this peer sends a byte;
+    /// see [`Self::fence`]. Left up once reached, which holds nothing back.
+    fence: Option<(Rc<Level>, u64)>,
 }
 
 impl Peer {
+    /// The budget the frames of every connection's open write are charged
+    /// to, capped at [`Limits::write_span_cap`].
+    pub(crate) fn write_spans(&self) -> &Rc<Budget> {
+        &self.reactor.conns.spans
+    }
+
     /// See [`FrameSink::admit_full_frames`].
     pub(crate) fn admit_full_frames(&self) {
         self.conn.q.borrow_mut().admit_full_frames();
@@ -808,6 +832,12 @@ impl Peer {
         }
         self.flush_egress().await.ok()?;
         self.recv().await
+    }
+
+    /// Whether [`Self::next_request`] would answer without parking: a request,
+    /// or the end of them, is queued.
+    pub(crate) fn request_queued(&self) -> bool {
+        self.conn.is_readable()
     }
 
     /// What `waited` resolves to, or `None` once [`Self::next_request`] would
@@ -883,6 +913,23 @@ impl Peer {
         Ok(())
     }
 
+    /// Send nothing until `level` reaches `at`: what is corked now and
+    /// everything written after it waits, whichever send carries it. A fence
+    /// already up is raised to `at` if `at` is higher; it must be on the same
+    /// level.
+    pub(crate) fn fence(&mut self, level: &Rc<Level>, at: u64) {
+        if level.get() >= at {
+            return;
+        }
+        match &mut self.fence {
+            Some((up, v)) => {
+                debug_assert!(Rc::ptr_eq(up, level), "one level fences a peer");
+                *v = (*v).max(at);
+            }
+            None => self.fence = Some((Rc::clone(level), at)),
+        }
+    }
+
     fn live(&self) -> Result<(), PeerGone> {
         if self.conn.is_gone() { Err(PeerGone) } else { Ok(()) }
     }
@@ -921,10 +968,16 @@ impl Peer {
     /// [`SEAL_TURN_BYTES`] a turn otherwise. Every turn but the last is sent
     /// under [`SendBody::holding`], so no send waits on the client holding a
     /// W2M slot whose ring was given back; the last is sent with `body`
-    /// dropped.
+    /// dropped. Waits out the [`fence`](Self::fence) first.
     async fn send_raw(&self, mut body: SendBody) -> Result<(), PeerGone> {
         #[cfg(test)]
         SENDS.update(|n| n + 1);
+        if let Some((level, at)) = &self.fence
+            && level.get() < *at
+        {
+            body.holding(std::future::poll_fn(|cx| level.poll_reached(*at, cx)))
+                .await;
+        }
         let conn = &self.conn;
         let Some(session) = &conn.session else {
             return self.reactor.send_owned(conn, body).await;

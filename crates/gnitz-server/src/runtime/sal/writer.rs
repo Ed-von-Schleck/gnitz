@@ -6,6 +6,7 @@ use gnitz_foundation::gnitz_debug;
 use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use super::durable::Durable;
@@ -20,7 +21,7 @@ use super::tail::CommittedTail;
 use crate::catalog::SysFamily;
 use crate::runtime::park::{WorkerParks, WorkerSet};
 use crate::runtime::reactor::Reactor;
-use crate::runtime::sync::{AsyncRwLock, Parked, WriteGuard};
+use crate::runtime::sync::{AsyncRwLock, Level, Parked, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Stage;
 use gnitz_store::relation::PkRule;
@@ -429,6 +430,14 @@ impl SalWriter {
     pub(crate) async fn durable_through(&self, lsn: u64) {
         debug_assert!(lsn <= self.watermark(), "LSN {lsn} is not published");
         self.durable.through(lsn).await
+    }
+
+    /// The LSN every group published at or below is durable through, as a
+    /// level a connection can hold its sends on. Waiting on it asks for no
+    /// fdatasync: only an LSN [`Self::want_durable`] was called with, or one
+    /// below it, is sure to be reached.
+    pub(crate) fn durable_level(&self) -> &Rc<Level> {
+        self.durable.level()
     }
 
     /// Whether the fdatasync in flight makes every published group durable.

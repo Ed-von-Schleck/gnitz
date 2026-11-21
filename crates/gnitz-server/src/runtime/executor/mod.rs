@@ -35,7 +35,7 @@ use self::committer::{CommitRequests, Committer};
 use self::ddl::{allocate_ids, handle_ddl_txn, reserve_serial_range};
 use self::delta::{Feeds, Subscriptions, handle_delta_poll};
 use self::snapshot::HeldSnapshots;
-use self::write::{Writes, handle_push, handle_push_txn};
+use self::write::{OpenWrite, Writes};
 use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::listen::ClientListener;
@@ -185,7 +185,11 @@ async fn connection_loop(mut peer: Peer, shared: Rc<Shared>, served: Option<Rc<S
 
 /// One message is handled to completion before the next is received, so
 /// replies leave in request order, which is how a client pairs each with its
-/// request. A sync's answer is no reply, and leaves between two.
+/// request. A sync's answer is no reply, and leaves between two. A push is
+/// handled once it is laid out; its ACK, and every byte behind it, waits for
+/// the fdatasync that covers it. A write spanning several frames is one
+/// request, answered after its last frame; any other frame among its frames
+/// closes the connection.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
 async fn serve_connection(peer: &mut Peer, shared: &Rc<Shared>, served: Option<Rc<Served>>) {
@@ -212,7 +216,9 @@ async fn serve_connection(peer: &mut Peer, shared: &Rc<Shared>, served: Option<R
             }
         }
         let Some(buf) = peer.next_request().await else { break };
-        handle_message(peer, &mut subs, &mut snapshots, buf, shared).await;
+        if !handle_message(peer, &mut subs, &mut snapshots, buf, shared).await {
+            break;
+        }
         // Behind the reply, where a pushed train splits none. A client that
         // is gone is found out by the next request.
         let _ = subs.ship(peer).await;
@@ -294,47 +300,98 @@ async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>, mut s
 // Message dispatch
 // ---------------------------------------------------------------------------
 
+/// Handle one request: a frame, or a write's every frame, which
+/// [`receive_write`] takes. `false` once the connection is to be closed: a
+/// frame that is not the write's broke its frames off, which leaves no answer
+/// the client could pair.
 async fn handle_message(
     peer: &mut Peer,
     subs: &mut Subscriptions,
     snapshots: &mut HeldSnapshots,
     buf: RecvBuf,
     shared: &Shared,
-) {
+) -> bool {
     // One control-header parse for the whole request.
     let ctrl = match gnitz_wire::peek_control_block(buf.as_slice()) {
         Ok(c) => c,
         Err(e) => {
             cork_fault(peer, 0, &decode_fault(e));
-            return;
+            return true;
         }
     };
     let target_id = ctrl.hdr.target_id;
-    if let Err(f) = dispatch_request(peer, subs, snapshots, buf, ctrl, shared).await {
+    let answered = match ctrl.client_verb() {
+        Ok(verb @ (ClientVerb::Push | ClientVerb::PushTxn)) => {
+            let Some(frames) = receive_write(peer, verb, buf, ctrl).await else {
+                cork_fault(peer, target_id, &OpenWrite::broken_off());
+                return false;
+            };
+            let followed = peer.request_queued();
+            let lsn = match frames {
+                Ok(frames) => write::handle_write(shared, verb, frames, followed).await,
+                Err(why) => Err(why),
+            };
+            lsn.map(|lsn| {
+                // The write is laid out, not yet durable: `peer` sends nothing
+                // more until the fdatasync the committer asked for covers it,
+                // and reads and runs the requests behind it meanwhile, so one
+                // fdatasync answers a pipelined run.
+                peer.fence(shared.dispatcher.sal().durable_level(), lsn);
+                cork_ack(peer, target_id, lsn)
+            })
+        }
+        Ok(verb) => dispatch_request(peer, subs, snapshots, verb, buf, ctrl, shared).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(f) = answered {
         cork_fault(peer, target_id, &f);
     }
+    true
 }
 
-/// Run the verb `ctrl` names and end its reply. An arm that yields a value is
-/// answered with the request's ACK carrying it; an arm that returns has written
-/// its last frame itself, a fault confined to one position of its reply
-/// included. An `Err` is answered by [`handle_message`] with one fault frame,
-/// which fails the whole request at the client.
+/// The frames of the `verb` write `buf` heads: `buf` alone, or, where it sets
+/// `continuation`, it and each frame after it up to the first that does not,
+/// held as [`OpenWrite`] holds them. `None` once a frame of another verb, or
+/// one that does not decode, broke them off, or the client is gone.
+async fn receive_write(
+    peer: &mut Peer,
+    verb: ClientVerb,
+    mut buf: RecvBuf,
+    mut ctrl: gnitz_wire::DecodedControl,
+) -> Option<Result<write::WriteFrames, WireFault>> {
+    if !ctrl.hdr.flags.continuation {
+        return Some(Ok(smallvec::smallvec![(buf, ctrl)]));
+    }
+    let mut write = OpenWrite::new();
+    while write.take(buf, ctrl, peer.write_spans()) {
+        buf = peer.next_request().await?;
+        ctrl = (gnitz_wire::peek_control_block(buf.as_slice()).ok()).filter(|c| c.hdr.flags.verb == Some(verb))?;
+    }
+    Some(write.finish())
+}
+
+/// Run `verb`, a request [`handle_message`] does not run itself, and end its
+/// reply. An arm that yields a value is answered with the request's ACK
+/// carrying it; an arm that returns has written its last frame itself, a fault
+/// confined to one position of its reply included. An `Err` is answered by
+/// [`handle_message`] with one fault frame, which fails the whole request at
+/// the client.
 async fn dispatch_request(
     peer: &mut Peer,
     subs: &mut Subscriptions,
     snapshots: &mut HeldSnapshots,
+    verb: ClientVerb,
     buf: RecvBuf,
     ctrl: gnitz_wire::DecodedControl,
     shared: &Shared,
 ) -> Result<(), WireFault> {
     let data = buf.as_slice();
     let target_id = ctrl.hdr.target_id;
-    let ack = match ctrl.client_verb()? {
+    let ack = match verb {
+        ClientVerb::Push | ClientVerb::PushTxn => unreachable!("handle_message runs a write"),
         // The multi-item frames name no single relation in `target_id`; each
         // decodes its items from the frame's body.
         ClientVerb::DdlTxn => handle_ddl_txn(shared, data, ctrl.body).await?,
-        ClientVerb::PushTxn => handle_push_txn(shared, buf, ctrl).await?,
         ClientVerb::ScanMulti => {
             let scans = gnitz_wire::multi_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
             return read::handle_scan(shared, peer, &scans).await;
@@ -348,8 +405,6 @@ async fn dispatch_request(
         ClientVerb::AllocIds => allocate_ids(shared, ctrl.hdr.arg0).await?,
 
         ClientVerb::Resolve => return read::handle_resolve(shared, peer, &data[ctrl.blob.clone()]).await,
-
-        ClientVerb::Push => handle_push(shared, buf, ctrl).await?,
 
         ClientVerb::SyncPushed => {
             // Refused or not, it is answered as a sync is: out of the order of replies.

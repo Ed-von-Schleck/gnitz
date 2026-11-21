@@ -1,7 +1,7 @@
 use super::*;
 
 /// One `feed` over `src`: the payload, borrowed where it was handed out in place.
-fn feed_one<'s>(d: &mut Deframer, src: &mut &'s [u8]) -> Option<Cow<'s, [u8]>> {
+fn feed_one<'s>(d: &mut Deframer, src: &mut &'s [u8]) -> Option<FrameBytes<'s>> {
     d.feed(src, |_| Ok::<_, FrameLenError>(()))
         .expect("no refusal")
         .map(|(b, ())| b)
@@ -28,8 +28,8 @@ fn a_pipelined_run_split_anywhere_yields_each_frame_once() {
         for (i, half) in [&wire[..split], &wire[split..]].into_iter().enumerate() {
             let mut src = half;
             while let Some(p) = feed_one(&mut d, &mut src) {
-                borrowed.push(matches!(p, Cow::Borrowed(_)));
-                got.push(p.into_owned());
+                borrowed.push(matches!(p, FrameBytes::Borrowed(_)));
+                got.push(p.to_vec());
             }
             assert!(src.is_empty(), "split={split}: each half is consumed whole");
             if i == 0 {
@@ -112,7 +112,7 @@ impl Feeder {
         // SAFETY: `n` bytes were just written at the head of the window.
         let mut src = unsafe { self.deframer.landed(&self.carry, n) };
         while let Some(p) = feed_one(&mut self.deframer, &mut src) {
-            self.frames.push(p.into_owned());
+            self.frames.push(p.to_vec());
         }
         self.take_window();
         n

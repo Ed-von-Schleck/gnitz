@@ -7,7 +7,7 @@
 //! process that records ([`crate::recording`]) records every frame it queues to
 //! send or receives after its HELLO.
 
-use std::borrow::Cow;
+use gnitz_wire::FrameBytes;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
@@ -369,7 +369,7 @@ impl ClientTransport {
     /// True when the read filled its window, so more may be waiting.
     pub fn read(
         &mut self,
-        mut on_frame: impl FnMut(Cow<'_, [u8]>) -> Result<(), ProtocolError>,
+        mut on_frame: impl FnMut(FrameBytes<'_>) -> Result<(), ProtocolError>,
     ) -> Result<bool, ProtocolError> {
         let ClientTransport { inner, deframer, window, torn, tap, .. } = self;
         if *torn {
@@ -420,7 +420,8 @@ impl ClientTransport {
 // ── Framing: the outbound queue ──────────────────────────────────────────────
 
 /// Capacity the outbound buffer keeps once everything in it is written; a
-/// larger allocation is released.
+/// larger allocation goes back to [`gnitz_wire::frame_buf`]'s pool, which the
+/// encoders reserve a large frame from.
 const OUT_RETAIN_BYTES: usize = 1 << 20;
 
 /// The outbound queue: the queued frames back to back, each behind its length
@@ -462,12 +463,13 @@ impl OutBuf {
         }
     }
 
-    /// Empty the buffer, releasing an allocation past `OUT_RETAIN_BYTES`.
+    /// Empty the buffer, giving an allocation past `OUT_RETAIN_BYTES` back to
+    /// the frame-buffer pool.
     fn settle(&mut self) {
         self.buf.clear();
         self.off = 0;
         if self.buf.capacity() > OUT_RETAIN_BYTES {
-            self.buf = Vec::new();
+            gnitz_wire::frame_buf::recycle(std::mem::take(&mut self.buf));
         }
     }
 }

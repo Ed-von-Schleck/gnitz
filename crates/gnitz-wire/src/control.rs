@@ -6,7 +6,8 @@
 //! [`WireFault`]), the relation a request names ([`Target`]), two per-verb
 //! arguments, and the `flags` word ([`WireFlags`]): the request verb
 //! ([`ClientVerb`]), a push's conflict mode, the lane a server frame answers
-//! on, and the continuation bits of a reply train.
+//! on, and the continuation bits of a reply train and of a write spanning
+//! several request frames.
 
 use std::ops::Range;
 
@@ -153,13 +154,14 @@ impl ControlHeader {
     }
 
     /// Refuses a header no client writes: a status other than `Ok`, or a flag
-    /// only the engine sets.
-    pub(crate) fn check_client_authored(&self) -> Result<(), &'static str> {
+    /// only the engine sets. `continuation` is refused unless `spans`: the
+    /// header heads a frame of a write that may span several.
+    pub(crate) fn check_client_authored(&self, spans: bool) -> Result<(), &'static str> {
         let WireFlags { continuation, scan_last, lane, .. } = self.flags;
         if self.status != WireStatus::Ok {
             return Err("a request carries a status");
         }
-        if continuation || scan_last || lane != WireLane::Reply {
+        if continuation && !spans || scan_last || lane != WireLane::Reply {
             return Err("a request sets a flag only a reply carries");
         }
         Ok(())
@@ -197,8 +199,8 @@ impl DecodedControl {
     pub fn client_verb(&self) -> Result<ClientVerb, &'static str> {
         let hdr = &self.hdr;
         let verb = hdr.flags.verb.ok_or("a request names no verb")?;
-        hdr.check_client_authored()?;
         let shape = VerbShape::of(verb);
+        hdr.check_client_authored(shape.spans)?;
         match shape.items {
             None => {
                 shape.sections.check(self)?;
@@ -279,7 +281,7 @@ pub(crate) fn frame_size(blob: &[u8], data: Option<&[&[u8]]>) -> usize {
 /// Append one frame — header, blob, optional data block over a canonical region
 /// list — to `out`.
 pub fn append_frame(out: &mut Vec<u8>, hdr: &ControlHeader, blob: &[u8], data: Option<&[&[u8]]>) {
-    out.reserve(frame_size(blob, data));
+    crate::frame_buf::reserve(out, frame_size(blob, data));
     let at = out.len();
     out.resize(at + CTRL_HEADER_SIZE + blob.len(), 0);
     encode_frame_head(&mut out[at..], hdr, blob, data.is_some());
@@ -359,6 +361,13 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
 
 wire_enum! {
     /// The verb a client request frame names.
+    ///
+    /// A `PUSH` or a `PUSH_TXN` may span several frames: every frame but the
+    /// last sets [`WireFlags::continuation`], each is a whole frame of its
+    /// verb, and they arrive back to back, no other request between them. The
+    /// write is their families in frame order, committed as one SAL zone and
+    /// answered once, after its last frame; the frames of a `PUSH` name one
+    /// relation, token and conflict mode.
     pub enum ClientVerb: u8 {
         /// A data push under the descriptor token `arg1`, ACKed with its LSN in
         /// `arg0`. Its blob is the shape record of its rows. An empty batch is
@@ -474,6 +483,9 @@ pub(crate) struct VerbShape {
     pub(crate) sections: Sections,
     /// `None` for a single-item verb.
     pub(crate) items: Option<Items>,
+    /// Whether one request of the verb may span several frames, each but the
+    /// last setting `continuation` on its head.
+    pub(crate) spans: bool,
 }
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
@@ -508,6 +520,7 @@ impl VerbShape {
         VerbShape {
             sections: Sections { blob, data, conflict_mode },
             items,
+            spans: matches!(verb, ClientVerb::Push | ClientVerb::PushTxn),
         }
     }
 }
@@ -522,8 +535,9 @@ impl VerbShape {
 /// Bit 16 says a data block follows the blob; the frame codec sets and reads it,
 /// so `pack` leaves it clear and `unpack` ignores it.
 ///
-/// A request sets `verb` and, on a push, `conflict_mode`; the other fields are
-/// a reply's, and [`DecodedControl::client_verb`] refuses a request setting one.
+/// A request sets `verb`, on a push `conflict_mode`, and on a write spanning
+/// several frames `continuation`; the other fields are a reply's, and
+/// [`DecodedControl::client_verb`] refuses a request setting one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireFlags {
     /// Bits 0-7: a request's verb; `0`, which no verb is, on a reply.
@@ -531,7 +545,8 @@ pub struct WireFlags {
     /// Bits 8-15: a push's conflict mode.
     pub conflict_mode: WireConflictMode,
     /// Bit 17: more frames of this reply follow. Set on every per-worker reply
-    /// frame, absent on the master's terminal frame.
+    /// frame, absent on the master's terminal frame. On the head of a `PUSH` or
+    /// `PUSH_TXN` request: more frames of this write follow.
     pub continuation: bool,
     /// Bit 18: a worker's last frame of a train.
     pub scan_last: bool,

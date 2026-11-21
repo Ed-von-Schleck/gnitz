@@ -57,7 +57,7 @@ pub struct FrameItem<'a> {
 /// bytes exactly, so appending them never reallocates.
 fn multi_frame(out: &mut Vec<u8>, verb: ClientVerb, arg0: u64, body: usize, items: impl FnOnce(&mut Vec<u8>)) {
     let at = out.len();
-    out.reserve(CTRL_HEADER_SIZE + body);
+    crate::frame_buf::reserve(out, CTRL_HEADER_SIZE + body);
     append_frame(out, &ControlHeader::naming(verb, Target::from(0), arg0), &[], None);
     items(out);
     debug_assert_eq!(out.len() - at, CTRL_HEADER_SIZE + body, "{verb:?} frame missized");
@@ -107,7 +107,8 @@ pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Resul
     };
     let item = |rest: &[u8]| -> Result<DecodedControl, String> {
         let ctrl = peek_control_block(rest)?;
-        ctrl.hdr.check_client_authored()?;
+        // `continuation` is the frame's, on its prologue.
+        ctrl.hdr.check_client_authored(false)?;
         if ctrl.hdr.flags.verb != Some(verb) {
             return Err(format!("an item names verb {:?}", ctrl.hdr.flags.verb));
         }

@@ -2,12 +2,11 @@
 //! builders, and its WAL-block decode.
 
 use gnitz_zset::schema::pk_keys;
-use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
 use gnitz_expr::SchemaDescriptor;
-use gnitz_wire::{PkKeys, Regions};
+use gnitz_wire::{FrameBuf, FrameBytes, PkKeys, Regions};
 use gnitz_zset::repr::{Batch, BatchBuilder, CertifiedBlock, DirectWriter, MemBatch};
 
 use crate::{ProtocolError, Schema};
@@ -31,7 +30,7 @@ enum Rows {
     /// Boxed, so a move copies a pointer, not the batch's inline schema descriptor.
     Owned(Box<Batch>),
     /// A WAL block of `frame`, certified under the batch's schema.
-    Block { frame: Vec<u8>, block: CertifiedBlock },
+    Block { frame: FrameBuf, block: CertifiedBlock },
 }
 
 impl ZSetBatch {
@@ -296,7 +295,7 @@ fn wal_error(e: &str) -> ProtocolError {
 /// handed the frame over whole, borrowed from its read window otherwise.
 #[derive(Debug)]
 pub(crate) struct FrameBlock<'a> {
-    pub(crate) frame: Cow<'a, [u8]>,
+    pub(crate) frame: FrameBytes<'a>,
     pub(crate) block: Range<usize>,
 }
 
@@ -332,14 +331,14 @@ pub(crate) fn decode_wal_blocks(
     };
     let certify = |data: &[u8], range| CertifiedBlock::certify(data, range, schema.layout()).map_err(wal_error);
     let (frame, block) = match lone.frame {
-        Cow::Owned(frame) => {
+        FrameBytes::Owned(frame) => {
             let block = certify(&frame, lone.block)?;
             (frame, block)
         }
-        Cow::Borrowed(frame) => {
+        FrameBytes::Borrowed(frame) => {
             let bytes = &frame[lone.block];
             let block = certify(bytes, 0..bytes.len())?;
-            (bytes.to_vec(), block)
+            (FrameBuf::from(bytes.to_vec()), block)
         }
     };
     Ok(ZSetBatch {

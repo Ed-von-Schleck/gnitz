@@ -100,7 +100,7 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
         got.is_ok()
     };
     for &verb in ClientVerb::ALL {
-        let VerbShape { sections, items } = VerbShape::of(verb);
+        let VerbShape { sections, items, .. } = VerbShape::of(verb);
         if items.is_some() {
             assert!(accepts(verb, 0, b"", false, b"items"), "{verb:?} items");
             assert!(!accepts(verb, 0, b"blob", false, b"items"), "{verb:?} with a blob");
@@ -128,7 +128,8 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
     assert!(peek_control_block(&buf).unwrap().client_verb().is_err());
 }
 
-/// A client frame carries no status and no reply flag, and sets a conflict mode
+/// A client frame carries no status and no reply flag but `continuation` on a
+/// write's frame, and sets a conflict mode
 /// only where its verb's shape reads one, never on a multi-item prologue; a multi-item prologue sets no argument but a `DELTA_POLL`'s
 /// `arg0`.
 #[test]
@@ -153,8 +154,13 @@ fn client_verb_refuses_a_header_word_the_verb_does_not_carry() {
             ..Default::default()
         };
         assert_eq!(verdict(hdr), Ok(verb), "{verb:?}");
+        let more = verdict(ControlHeader {
+            flags: WireFlags { continuation: true, ..hdr.flags },
+            ..hdr
+        });
+        let spans = matches!(verb, ClientVerb::Push | ClientVerb::PushTxn);
+        assert_eq!(more.is_ok(), spans, "{verb:?} continuation: {more:?}");
         let flagged = [
-            WireFlags { continuation: true, ..hdr.flags },
             WireFlags { scan_last: true, ..hdr.flags },
             WireFlags { lane: WireLane::SyncAnswer, ..hdr.flags },
         ];

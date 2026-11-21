@@ -19,9 +19,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::family::TxnFamily;
-use super::write::{admit_push, admit_push_txn};
+use super::write::{OpenWrite, WriteFrames, admit_write};
 use super::*;
 use crate::catalog::{PUBLIC_SCHEMA_ID, SysFamily, ZoneError};
+use crate::runtime::reactor::Budget;
 use crate::test_support::{left_join_circuit, left_join_cols, sys_batch, table_blocks, view_blocks, view_tab_row};
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, SEEDS_ENV, Seed, Seeds};
@@ -57,7 +58,7 @@ fn play(sent: &[Frame]) {
     let path = dir.path().to_str().unwrap();
     let mut session = Session::open(path);
     for frame in sent {
-        session.request(&frame.bytes);
+        session.receive(frame.conn, &frame.bytes);
     }
     session.cat.close();
     CatalogEngine::open(path, 1)
@@ -75,6 +76,12 @@ struct Session {
     /// The snapshots pinned, by id, and the last id handed out.
     snapshots: HashMap<u64, Snapshot>,
     last_snapshot: u64,
+    /// Per connection, the write whose frames have arrived but not its last:
+    /// its verb, and its frames, charged to `spans`.
+    open: HashMap<u32, (ClientVerb, OpenWrite)>,
+    spans: Rc<Budget>,
+    /// The connections a broken-off write closed.
+    closed: HashSet<u32>,
 }
 
 impl Session {
@@ -85,43 +92,51 @@ impl Session {
             filled: HashSet::new(),
             snapshots: HashMap::new(),
             last_snapshot: 0,
+            open: HashMap::new(),
+            spans: Budget::new(usize::MAX),
+            closed: HashSet::new(),
         }
     }
 
-    /// Run the request `frame`; a refusal is an answer, and changes nothing.
+    /// Run the request `frame`, sent on connection 0.
     fn request(&mut self, frame: &[u8]) {
-        let Ok(ctrl) = gnitz_wire::peek_control_block(frame) else {
+        self.receive(0, frame)
+    }
+
+    /// Run the request `frame`, sent on connection `conn`, or take it as a
+    /// frame of the write open there; a refusal is an answer, and changes
+    /// nothing.
+    fn receive(&mut self, conn: u32, frame: &[u8]) {
+        if self.closed.contains(&conn) {
             return;
-        };
+        }
+        let ctrl = gnitz_wire::peek_control_block(frame);
+        if let Some((verb, mut write)) = self.open.remove(&conn) {
+            // A frame of another verb, or one that does not decode, breaks the
+            // write off and closes the connection.
+            let Some(ctrl) = ctrl.ok().filter(|c| c.hdr.flags.verb == Some(verb)) else {
+                self.closed.insert(conn);
+                return;
+            };
+            if write.take(RecvBuf::detached(frame), ctrl, &self.spans) {
+                self.open.insert(conn, (verb, write));
+            } else if let Ok(frames) = write.finish() {
+                self.write(verb, frames);
+            }
+            return;
+        }
+        let Ok(ctrl) = ctrl else { return };
         let Ok(verb) = ctrl.client_verb() else { return };
         let body = &frame[ctrl.body.clone()];
         let buf = RecvBuf::detached(frame);
         match verb {
             ClientVerb::DdlTxn => self.ddl(frame, ctrl.body.clone()),
-            ClientVerb::Push => {
-                let Ok(Some(push)) = admit_push(&self.cat, buf.as_slice(), ctrl, Access::Write) else {
-                    return;
-                };
-                let family = push.family(&Rc::new(buf));
-                let stream = self
-                    .cat
-                    .registry
-                    .relation(family.tid)
-                    .is_some_and(|r| r.kind() == RelationKind::Stream);
-                if stream || self.inserts(family.tid, &family.rows.view()) {
-                    self.ingest(vec![family]);
-                }
+            ClientVerb::Push | ClientVerb::PushTxn if ctrl.hdr.flags.continuation => {
+                let mut write = OpenWrite::new();
+                write.take(buf, ctrl, &self.spans);
+                self.open.insert(conn, (verb, write));
             }
-            ClientVerb::PushTxn => {
-                let Ok(items) = admit_push_txn(&self.cat, buf.as_slice(), ctrl.body.clone()) else {
-                    return;
-                };
-                let buf = Rc::new(buf);
-                let families: Vec<TxnFamily> = items.into_iter().map(|(_, push)| push.family(&buf)).collect();
-                if families.iter().all(|f| self.inserts(f.tid, &f.rows.view())) {
-                    self.ingest(families);
-                }
-            }
+            ClientVerb::Push | ClientVerb::PushTxn => self.write(verb, smallvec::smallvec![(buf, ctrl)]),
             ClientVerb::ScanMulti => {
                 for s in decode_scan_multi(body).unwrap_or_default() {
                     self.scan(s);
@@ -196,14 +211,14 @@ impl Session {
         }
     }
 
-    /// Whether `batch` is an INSERT into table `tid` as it stands: every weight
-    /// one, every key once, and none held already.
-    fn inserts(&self, tid: u64, batch: &MemBatch<'_>) -> bool {
-        if (0..batch.len()).any(|i| batch.get_weight(i) != 1) {
+    /// Whether `batches` are together an INSERT into table `tid` as it
+    /// stands: every weight one, every key once, and none held already.
+    fn inserts(&self, tid: u64, batches: &[MemBatch<'_>]) -> bool {
+        if batches.iter().any(|b| (0..b.len()).any(|i| b.get_weight(i) != 1)) {
             return false;
         }
-        let stride = batch.schema().pk_stride();
-        let mut keys: Vec<&[u8]> = batch.pk().chunks(stride).collect();
+        let stride = batches[0].schema().pk_stride();
+        let mut keys: Vec<&[u8]> = batches.iter().flat_map(|b| b.pk().chunks(stride)).collect();
         keys.sort_unstable();
         if keys.windows(2).any(|w| w[0] == w[1]) {
             return false;
@@ -212,6 +227,27 @@ impl Session {
             .registry
             .probe(tid, Probe::Pk, PkKeys::from_sorted(stride, keys.concat()))
             .is_ok_and(|held| held.is_empty())
+    }
+
+    /// Land the `verb` write of `frames` when the master would admit it: a
+    /// stream's rows as they come, and each table's rows across the write as
+    /// one INSERT.
+    fn write(&mut self, verb: ClientVerb, frames: WriteFrames) {
+        let Ok((families, _)) = admit_write(&self.cat, verb, frames) else {
+            return;
+        };
+        let mut tables: Vec<(u64, Vec<MemBatch<'_>>)> = Vec::new();
+        for f in &families {
+            let stream = (self.cat.registry.relation(f.tid)).is_some_and(|r| r.kind() == RelationKind::Stream);
+            match tables.iter_mut().find(|(tid, _)| *tid == f.tid) {
+                _ if stream => {}
+                Some((_, rows)) => rows.push(f.rows.view()),
+                None => tables.push((f.tid, vec![f.rows.view()])),
+            }
+        }
+        if tables.iter().all(|(tid, rows)| self.inserts(*tid, rows)) {
+            self.ingest(families);
+        }
     }
 
     /// Answer the scan `s` as a worker does.
@@ -293,7 +329,9 @@ fn eight_rows(session: &Session, tid: u64) -> Batch {
     let mut rows = BatchBuilder::new(&schema);
     for id in 0..8u64 {
         rows.begin_row(id as u128, 1);
-        [id % 3, id].into_iter().for_each(|c| rows.put_u64(c));
+        for c in [id % 3, id] {
+            rows.put_u64(c);
+        }
         rows.end_row();
     }
     rows.finish()
@@ -355,6 +393,7 @@ fn a_push_txn_reads_each_family_where_it_lies() {
         .collect();
     let mut frame = Vec::new();
     encode_items(&mut frame, ClientVerb::PushTxn, &items);
+    drop(items);
     session.request(&frame);
     assert_eq!(session.filled.len(), 2, "both families were admitted");
     assert_eq!(crate::test_support::net_weight(&session.cat, base + 2), 22);

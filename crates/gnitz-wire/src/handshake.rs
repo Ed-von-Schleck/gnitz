@@ -9,7 +9,7 @@ use crate::SYS_SCHEMA_DIGEST;
 
 /// The epoch of every client↔engine layout; the epoch-pin tests fail until it
 /// moves with one.
-const WIRE_EPOCH: u32 = 40;
+const WIRE_EPOCH: u32 = 41;
 
 /// The wire version: the HELLO's, a frame recording's, and part of the format
 /// word on the server's log. [`SYS_SCHEMA_DIGEST`] folds in, so a system-family

@@ -765,6 +765,7 @@ dependencies = [
  "libc",
  "rcgen",
  "rustls",
+ "smallvec",
  "tempfile",
  "webpki-roots",
 ]
