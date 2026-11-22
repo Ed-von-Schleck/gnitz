@@ -7,16 +7,6 @@ use gnitz_store::relation::RelationKind;
 const UNSUPPORTED: &str =
     "capacity-bounded view: only a filter/projection over one relation or over an inner equi-join is supported";
 
-/// Walk back from `from` through nodes that hand a subset of their input's
-/// rows on, each on its own worker with the PK region intact, to the first
-/// node that does not.
-fn row_local_origin(circuit: &Circuit, mut from: NodeId) -> NodeId {
-    while matches!(circuit.op(from), OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_))) {
-        from = circuit.inputs(from)[0];
-    }
-    from
-}
-
 /// A bounded view's per-key replay: the register it seeds, the integral the
 /// seed is gathered from, and the clamp the gathered weights are read through,
 /// resolved against the plan the emitter produced. The seed is
@@ -33,10 +23,17 @@ pub(super) fn derive_hydration(
     if circuit.ops().any(|(_, op)| op.exchanges()) {
         return Err(UNSUPPORTED.into());
     }
-    let origin = row_local_origin(circuit, circuit.out());
+    // Walk back from the output through nodes that hand a subset of their
+    // input's rows on, each on its own worker with the PK region intact, to the
+    // first node that does not.
+    let mut origin = circuit.out();
+    while matches!(circuit.op(origin), OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_))) {
+        origin = circuit.inputs(origin)[0];
+    }
     let (in_reg, seed, clamp) = match circuit.op(origin) {
         OpNode::ScanDelta { source, .. } => {
-            if meta.source(*source).kind() == RelationKind::Stream {
+            let source_meta = &meta.sources[source];
+            if source_meta.relation.kind() == RelationKind::Stream {
                 return Err(
                     "capacity-bounded view: a filter/projection over a stream has no stored rows to recompute from"
                         .into(),
@@ -44,7 +41,7 @@ pub(super) fn derive_hydration(
             }
             // The view's rows would sit where the route puts them, and the
             // source's where its store does.
-            if meta.states_route(*source) {
+            if source_meta.route.is_some() {
                 return Err(UNSUPPORTED.into());
             }
             (regs[origin], Integral::Relation(*source), None)

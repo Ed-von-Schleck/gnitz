@@ -222,6 +222,33 @@ impl MapPlan {
         self.moves.copies()
     }
 
+    /// The output columns holding the bytes input column `c` of `in_schema`
+    /// packs at `ty`: each copy of `c` at its own type, the PK column it
+    /// keeps its place in, and each key slot packing it at `ty`.
+    pub fn holders(&self, in_schema: &SchemaDescriptor, c: u32, ty: TypeCode) -> Vec<u32> {
+        let (src, out) = (in_schema.locate(c as usize), &self.output_schema);
+        let own = in_schema.columns()[c as usize].type_code;
+        let mut cols: Vec<u32> = (self.copies().iter())
+            .filter(|cc| cc.src == src)
+            .map(|cc| out.payload_col_idx(cc.slot))
+            .filter(|&at| out.columns()[at].type_code == own)
+            .map(|at| at as u32)
+            .collect();
+        match &self.pk_source {
+            PkSource::Inherit => cols.extend(
+                in_schema
+                    .pk_cols()
+                    .iter()
+                    .position(|&p| p == c)
+                    .map(|j| out.pk_cols()[j]),
+            ),
+            // A key column of the slot's type holds the bytes the slot packs.
+            PkSource::Pack { packer, .. } => cols.extend(packer.packing(src, ty).map(|i| out.pk_cols()[i])),
+            PkSource::HashRow(_) => {}
+        }
+        cols
+    }
+
     /// True iff this map copies its input's PK region verbatim, and so keeps
     /// every row under its own key.
     pub fn inherits_pk(&self) -> bool {

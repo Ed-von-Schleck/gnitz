@@ -78,6 +78,12 @@ impl ProgramBuilder {
         self.push(in_reg, self.schema_of(in_reg), Op::Round(plan))
     }
 
+    /// Push this worker's share of `in_reg` under `plan`: every worker holds
+    /// the rows whole, and keeps those `plan` routes to it.
+    pub(in crate::query) fn share(&mut self, in_reg: DeltaReg, plan: Rc<ScatterPlan>) -> DeltaReg {
+        self.push(in_reg, self.schema_of(in_reg), Op::Share(plan))
+    }
+
     /// Accumulate `reg` into `trace` after every instruction of each epoch: a
     /// join's integrand. A reduce's own output trace and a clamp's own history
     /// are named by their operator, and [`Self::push`] integrates them.

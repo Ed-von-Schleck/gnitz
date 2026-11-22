@@ -352,6 +352,14 @@ impl KeyPacker {
         &self.cols[..self.n_cols as usize]
     }
 
+    /// The output PK columns, by position, packing `loc` at `ty`.
+    pub(super) fn packing(&self, loc: ColumnLocator, ty: TypeCode) -> impl Iterator<Item = usize> {
+        let behind = usize::from(self.has_bitmap);
+        (self.cols().iter().enumerate())
+            .filter(move |(_, k)| k.loc == loc && k.out.type_code == ty)
+            .map(move |(i, _)| behind + i)
+    }
+
     /// The bytes of one packed key.
     #[inline(always)]
     pub(crate) fn out_stride(&self) -> usize {
