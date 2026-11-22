@@ -16,7 +16,7 @@ use crate::runs::MappedShard;
 use gnitz_wire::{Heap, RowSource};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::ColPtr;
-use gnitz_zset::repr::{ColumnarSource, DecodedColumns, gather_rows, with_picks};
+use gnitz_zset::repr::{ColumnarSource, DecodedColumns, gather_into, with_picks};
 use gnitz_zset::schema::SchemaDescriptor;
 use smallvec::SmallVec;
 
@@ -80,13 +80,20 @@ impl StoredRow {
     /// `rows`, in order, as one batch of `schema` at `weight`, writing the
     /// payload columns `skip` names as zeroes (see
     /// [`ReadCursor::skip_payload`](crate::runs::ReadCursor::skip_payload)),
-    /// copied a column at a time by [`gather_rows`].
+    /// copied a column at a time by [`gather_into`].
     pub fn gather(
         schema: &SchemaDescriptor,
         rows: impl IntoIterator<Item = StoredRow>,
         weight: i64,
         skip: u64,
     ) -> Batch {
+        let mut out = Batch::empty_with_schema(schema);
+        Self::gather_onto(&mut out, rows, weight, skip);
+        out
+    }
+
+    /// [`Self::gather`] onto `batch`'s tail.
+    pub fn gather_onto(batch: &mut Batch, rows: impl IntoIterator<Item = StoredRow>, weight: i64, skip: u64) {
         let mut sources: SmallVec<[Run; 4]> = SmallVec::new();
         with_picks(|picks| {
             for StoredRow { run, row } in rows {
@@ -100,7 +107,12 @@ impl StoredRow {
                 };
                 picks.push((src as u32, row as u32, weight));
             }
-            gather_rows(&sources, schema, picks, skip)
+            if !picks.is_empty() {
+                batch.write_rows(picks.len(), |w| {
+                    let schema = w.schema;
+                    gather_into(&sources, schema, picks, skip, w)
+                });
+            }
         })
     }
 }

@@ -785,32 +785,6 @@ fn runs_where_zip_matches_a_per_position_scan_across_word_boundaries() {
     }
 }
 
-/// One row at a time through `append_source_rows`, each reserving its long
-/// strings: every string reads back as its source, and the heap's capacity
-/// doubles rather than growing by each reserve.
-#[test]
-fn append_source_rows_one_row_at_a_time_grows_the_heap_geometrically() {
-    const N: usize = 1000;
-    let src = make_batch_bytes(
-        &make_schema_pk_u64_payload_string(),
-        &(0..N as u64)
-            .map(|i| (i, 1, format!("long string number {i:>8}")))
-            .collect::<Vec<_>>(),
-    );
-    let mut dst = Batch::empty_with_schema(src.schema());
-    let mut caps = std::collections::BTreeSet::new();
-    for row in 0..N {
-        dst.append_source_rows(std::iter::once((&src, row)), 1, 0);
-        caps.insert(dst.blob.capacity());
-    }
-    assert_eq!(read_strings(&dst), read_strings(&src));
-    assert!(
-        caps.len() <= 2 * N.ilog2() as usize,
-        "{} distinct capacities",
-        caps.len()
-    );
-}
-
 /// A heap that outgrows its buffer moves into a pooled one of at least twice
 /// its capacity, holding exactly its old bytes, and the outgrown buffer goes
 /// back to the pool; a reserve the capacity covers moves nothing.

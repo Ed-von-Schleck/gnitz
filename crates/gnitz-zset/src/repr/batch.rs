@@ -847,33 +847,6 @@ impl Batch {
         self.push_ranges(src, ranges, &mut cache);
     }
 
-    /// Copy each of `rows`, a source and a row of it, onto this batch's tail at
-    /// `weight`, each payload column `skip` names, as payload bits, as a zero that
-    /// is not NULL.
-    pub fn append_source_rows<'s, S: RowSource + 's>(
-        &mut self,
-        rows: impl ExactSizeIterator<Item = (&'s S, usize)> + Clone,
-        weight: i64,
-        skip: u64,
-    ) {
-        if rows.len() == 0 {
-            return;
-        }
-        self.reserve_rows(rows.len());
-        let mask = self.schema.string_payload_slots() & !skip;
-        if mask != 0 {
-            self.reserve_blob(
-                rows.clone()
-                    .map(|(src, row)| string_heap::row_long_bytes(src, mask, row))
-                    .sum(),
-            );
-        }
-        let mut cache = BlobCache::for_rows(&self.schema, rows.len());
-        for (src, row) in rows {
-            self.append_row_skipping(weight, src, row, skip, Some(&mut cache));
-        }
-    }
-
     /// Append row `row` of `src` at `weight`: its key, then its columns at `locs`
     /// as this batch's payload columns, in order, a NULL one as a NULL.
     pub fn append_projected_row<S: RowSource>(&mut self, locs: &[ColumnLocator], src: &S, row: usize, weight: i64) {
@@ -1022,33 +995,16 @@ impl Batch {
 
     /// Append `source[row]` at `weight`.
     pub fn append_row_from_source<S: RowSource>(&mut self, weight: i64, source: &S, row: usize) {
-        self.append_row_skipping(weight, source, row, 0, None);
-    }
-
-    /// [`Self::append_row_from_source`], each payload column `skip` names as a
-    /// zero that is not NULL; a `blob_cache` dedups repeated long-string spans.
-    fn append_row_skipping<S: RowSource>(
-        &mut self,
-        weight: i64,
-        source: &S,
-        row: usize,
-        skip: u64,
-        mut blob_cache: Option<&mut BlobCache>,
-    ) {
         debug_assert_ne!(
             weight, 0,
             "append_row_from_source: zero-weight row (filter before copying)"
         );
-        self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row) & !skip);
+        self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row));
         let src_heap = source.heap();
         for pi in 0..self.schema.num_payload_cols() {
             let col = self.schema.columns()[self.schema.payload_col_idx(pi)];
-            if skip >> pi & 1 == 1 {
-                self.extend_col(pi, &[0; 16][..col.size()]);
-                continue;
-            }
             let cell = source.get_col_ptr(row, pi, col.size());
-            self.append_payload_cell(pi, col.type_code, cell, src_heap, blob_cache.as_deref_mut());
+            self.append_payload_cell(pi, col.type_code, cell, src_heap);
         }
         self.commit_row();
     }
@@ -1056,16 +1012,9 @@ impl Batch {
     /// Append `cell` into output slot `out_pi`, relocating a STRING/BLOB struct
     /// into `self.blob` out of `src_heap`.
     #[inline(always)]
-    fn append_payload_cell(
-        &mut self,
-        out_pi: usize,
-        type_code: TypeCode,
-        cell: &[u8],
-        src_heap: Heap<'_>,
-        blob_cache: Option<&mut BlobCache>,
-    ) {
+    fn append_payload_cell(&mut self, out_pi: usize, type_code: TypeCode, cell: &[u8], src_heap: Heap<'_>) {
         if type_code.is_german_string() {
-            let dest = relocated_cell(cell.first_chunk().unwrap(), src_heap, &mut self.blob, blob_cache);
+            let dest = relocated_cell(cell.first_chunk().unwrap(), src_heap, &mut self.blob, None);
             self.extend_col(out_pi, &dest);
         } else {
             self.extend_col(out_pi, cell);
@@ -1088,7 +1037,7 @@ impl Batch {
                         continue;
                     }
                     let cell = src.get_col_ptr(row, slot as usize, size as usize);
-                    self.append_payload_cell(out_pi, type_code, cell, src.heap(), None);
+                    self.append_payload_cell(out_pi, type_code, cell, src.heap());
                 }
             }
         }

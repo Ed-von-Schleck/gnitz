@@ -115,15 +115,15 @@ pub(super) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
     }
 
     if ordered {
-        return sum_in_order(batch, dropped, &stored);
+        return sum_in_order(batch, dropped, stored);
     }
     if dropped.is_empty() {
-        batch.append_source_rows(stored.iter().map(StoredRow::source), -1, 0);
+        StoredRow::gather_onto(&mut batch, stored, -1, 0);
         return batch;
     }
     let kept = complement(dropped, n);
     let mut effective = Batch::from_ranges(&batch, &kept, stored.len());
-    effective.append_source_rows(stored.iter().map(StoredRow::source), -1, 0);
+    StoredRow::gather_onto(&mut effective, stored, -1, 0);
     effective
 }
 
@@ -131,7 +131,7 @@ pub(super) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
 /// `dropped`, one per key at `+1`, and the stored rows they retract, one per
 /// key at `-1`. Each is consolidated, so their sum is a merge, which cancels an
 /// update that rewrites a row unchanged.
-fn sum_in_order(mut batch: Batch, dropped: Vec<usize>, stored: &[StoredRow]) -> Batch {
+fn sum_in_order(mut batch: Batch, dropped: Vec<usize>, stored: Vec<StoredRow>) -> Batch {
     let n = batch.len();
     if dropped.len() == n && !stored.is_empty() {
         return retraction(batch.schema(), stored);
@@ -149,9 +149,8 @@ fn sum_in_order(mut batch: Batch, dropped: Vec<usize>, stored: &[StoredRow]) -> 
 }
 
 /// `stored`, rows of distinct keys in PK order, each at weight `-1`.
-fn retraction(schema: &SchemaDescriptor, stored: &[StoredRow]) -> Batch {
-    let mut retracted = Batch::with_capacity(schema, stored.len());
-    retracted.append_source_rows(stored.iter().map(StoredRow::source), -1, 0);
+fn retraction(schema: &SchemaDescriptor, stored: Vec<StoredRow>) -> Batch {
+    let mut retracted = StoredRow::gather(schema, stored, -1, 0);
     retracted.certify_consolidated();
     retracted
 }
