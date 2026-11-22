@@ -39,7 +39,7 @@ fn options_of(with: &str) -> Result<ViewProps, GnitzSqlError> {
     let Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v {with} AS SELECT 1")) else {
         panic!("not a CREATE VIEW");
     };
-    decode_view_options(&cv.options)
+    parse_view_options(&cv.options)
 }
 
 #[test]
@@ -95,11 +95,7 @@ fn with_options_spell_every_budget_a_with_clause_reads_back() {
     ] {
         for compress in [false, true] {
             let props = ViewProps { budget, compress };
-            let entries = view_with_options(&props);
-            let with = match entries.is_empty() {
-                true => String::new(),
-                false => format!("WITH ({})", entries.join(", ")),
-            };
+            let with = with_clause(&RelProps::View(props));
             assert_eq!(options_of(&with).unwrap(), props, "{with}");
         }
     }
@@ -107,7 +103,7 @@ fn with_options_spell_every_budget_a_with_clause_reads_back() {
         budget: ViewBudget::Bounded { capacity_bytes: kb(1536) },
         compress: false,
     };
-    assert_eq!(view_with_options(&props), ["capacity = '1536 B'"]);
+    assert_eq!(with_options(&RelProps::View(props)), ["capacity = '1536 B'"]);
 }
 
 fn table_options_of(with: &str) -> CreateTableOptions {
@@ -156,11 +152,7 @@ fn with_options_spell_every_table_property_a_with_clause_reads_back() {
                     },
                     compress,
                 };
-                let entries = table_with_options(&props);
-                let with = match entries.is_empty() {
-                    true => String::new(),
-                    false => format!("WITH ({})", entries.join(", ")),
-                };
+                let with = with_clause(&RelProps::Table(props));
                 assert_eq!(parse_table_options(&table_options_of(&with)).unwrap(), props, "{with}");
             }
         }

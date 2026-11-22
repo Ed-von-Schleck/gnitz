@@ -1,69 +1,68 @@
-//! The clause guards DDL statements share: the column options and PRIMARY KEY /
-//! UNIQUE / FOREIGN KEY constraint fields that CREATE TABLE, CREATE INDEX and
-//! ALTER TABLE each meet. They keep the guard contract `crate::validate` states.
+//! The clause guards DDL statements share: the column options, the PRIMARY KEY
+//! / UNIQUE / FOREIGN KEY constraints and the index column lists that CREATE
+//! TABLE, CREATE INDEX and ALTER TABLE each meet. They keep the guard contract
+//! `crate::validate` states.
 
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
+use crate::rules::canonical_user_name;
 use crate::types::declared_type;
 use gnitz_wire::{ColumnDef, FkAction};
+use sqlparser::ast::{Expr, IndexColumn, OrderByExpr, OrderByOptions, TableConstraint};
 
-/// A FOREIGN KEY's `ON DELETE` action, rejecting every field gnitz does not
-/// implement. Column-level and table-level FKs both read through here.
-pub(super) fn fk_on_delete(
-    fk: &sqlparser::ast::ForeignKeyConstraint,
+/// A key constraint, read: every field gnitz does not implement rejected, the
+/// column lists still names. Either spelling reads to it — a column option over
+/// its own column, a table constraint over the list it names.
+pub(super) enum KeyConstraint<'a> {
+    PrimaryKey(Vec<&'a str>),
+    /// With its `CONSTRAINT <name>`, canonical, which names the created index.
+    Unique(Vec<&'a str>, Option<String>),
+    ForeignKey {
+        child: &'a str,
+        parent: &'a sqlparser::ast::ObjectName,
+        /// The parent column named; `None` defaults to the parent's lone PK
+        /// column.
+        referred: Option<&'a str>,
+        on_delete: FkAction,
+    },
+}
+
+/// Read a table constraint. Exhaustive over `TableConstraint`: CHECK, inline
+/// INDEX, FULLTEXT/SPATIAL and the `{PRIMARY KEY,UNIQUE} USING INDEX`
+/// promotions (no pre-existing index at CREATE TABLE) are rejected.
+pub(super) fn read_table_constraint<'a>(
+    constraint: &'a TableConstraint,
     context: &str,
-) -> Result<FkAction, GnitzSqlError> {
-    let sqlparser::ast::ForeignKeyConstraint {
-        // Consumed by `resolve_fk_target`.
-        columns: _,
-        foreign_table: _,
-        referred_columns: _,
-        // Inert metadata: gnitz has no FK constraint/index naming surface.
-        name: _,
-        index_name: _,
-        on_delete,
-        // Rejected: unimplemented semantics.
-        on_update,
-        match_kind,
-        characteristics,
-    } = fk;
-    reject_if(on_update.is_some(), context, "FOREIGN KEY ON UPDATE action")?;
-    reject_if(match_kind.is_some(), context, "FOREIGN KEY MATCH")?;
-    reject_constraint_characteristics(characteristics, context)?;
-    use sqlparser::ast::ReferentialAction as A;
-    match on_delete {
-        // Both name the check a write's fold is held to.
-        None | Some(A::NoAction | A::Restrict) => Ok(FkAction::Restrict),
-        Some(A::Cascade) => Ok(FkAction::Cascade),
-        Some(A::SetNull | A::SetDefault) => Err(unsupported_clause(
-            context,
-            "FOREIGN KEY ON DELETE SET NULL / SET DEFAULT",
-        )),
+) -> Result<KeyConstraint<'a>, GnitzSqlError> {
+    match constraint {
+        TableConstraint::PrimaryKey(pk) => read_pk(pk, None, context),
+        TableConstraint::Unique(u) => {
+            let (cols, name) = read_unique(u, None, None, context)?;
+            Ok(KeyConstraint::Unique(cols, name))
+        }
+        TableConstraint::ForeignKey(fk) => read_fk(fk, None, context),
+        TableConstraint::Check(_) => Err(unsupported_clause(context, "CHECK constraint")),
+        TableConstraint::Index(_) => Err(unsupported_clause(context, "INDEX in table definition")),
+        TableConstraint::FulltextOrSpatial(_) => Err(unsupported_clause(context, "FULLTEXT/SPATIAL index")),
+        TableConstraint::PrimaryKeyUsingIndex(_) => Err(unsupported_clause(context, "PRIMARY KEY USING INDEX")),
+        TableConstraint::UniqueUsingIndex(_) => Err(unsupported_clause(context, "UNIQUE USING INDEX")),
+        TableConstraint::Exclude(_) => Err(unsupported_clause(context, "EXCLUDE constraint")),
     }
 }
 
-/// Constraint characteristics (`DEFERRABLE …`) are semantics gnitz does not
-/// implement; every constraint kind that can carry them rejects them here.
-fn reject_constraint_characteristics(
-    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
-    context: &str,
-) -> Result<(), GnitzSqlError> {
-    reject_if(
-        characteristics.is_some(),
-        context,
-        "constraint characteristics (DEFERRABLE …)",
-    )
-}
+/// Constraint characteristics are semantics gnitz does not implement; every
+/// constraint kind that can carry them rejects them.
+const CHARACTERISTICS: &str = "constraint characteristics (DEFERRABLE …)";
 
-/// Reject every PRIMARY KEY constraint field beyond the column list and the
-/// inert names. `index_type` follows CREATE INDEX's rule: the BTree default is
-/// accepted (it names gnitz's real ordered index), anything else is rejected.
-pub(super) fn reject_unhonored_pk_fields(
-    pk: &sqlparser::ast::PrimaryKeyConstraint,
+/// A PRIMARY KEY over `own` column, or over its own list where `own` is `None`.
+/// `index_type` follows CREATE INDEX's rule: the BTree default is accepted (it
+/// names gnitz's real ordered index), anything else is rejected.
+fn read_pk<'a>(
+    pk: &'a sqlparser::ast::PrimaryKeyConstraint,
+    own: Option<&'a str>,
     context: &str,
-) -> Result<(), GnitzSqlError> {
+) -> Result<KeyConstraint<'a>, GnitzSqlError> {
     let sqlparser::ast::PrimaryKeyConstraint {
-        // Consumed by `collect_declarations`.
-        columns: _,
+        columns,
         // Inert metadata: gnitz has no PK constraint/index naming surface.
         name: _,
         index_name: _,
@@ -74,22 +73,27 @@ pub(super) fn reject_unhonored_pk_fields(
         include,
     } = pk;
     reject_index_type_and_options(index_type, index_options, include, context)?;
-    reject_constraint_characteristics(characteristics, context)
+    reject_if(characteristics.is_some(), context, CHARACTERISTICS)?;
+    let cols = match own {
+        Some(c) => vec![c],
+        None => index_column_names(columns, "PRIMARY KEY")?,
+    };
+    Ok(KeyConstraint::PrimaryKey(cols))
 }
 
-/// Reject every UNIQUE constraint field beyond the column list and the
-/// constraint name (which names the created index). `NULLS [NOT] DISTINCT`
-/// is rejected like CREATE INDEX rejects it — gnitz defines no NULL-conflict
-/// semantics to honor.
-pub(super) fn reject_unhonored_unique_fields(
-    u: &sqlparser::ast::UniqueConstraint,
+/// A UNIQUE's column names and canonical name: over `own` column, or over its own list where `own` is `None`. A
+/// column-level one's `CONSTRAINT <name>` arrives as `option_name`. `NULLS [NOT]
+/// DISTINCT` is rejected like CREATE INDEX rejects it — gnitz defines no
+/// NULL-conflict semantics to honor.
+pub(super) fn read_unique<'a>(
+    u: &'a sqlparser::ast::UniqueConstraint,
+    option_name: Option<&sqlparser::ast::Ident>,
+    own: Option<&'a str>,
     context: &str,
-) -> Result<(), GnitzSqlError> {
+) -> Result<(Vec<&'a str>, Option<String>), GnitzSqlError> {
     let sqlparser::ast::UniqueConstraint {
-        // Consumed by `collect_declarations` on both spellings (the name becomes
-        // the index name); a column-level one arrives as `ColumnOptionDef.name`.
-        name: _,
-        columns: _,
+        name,
+        columns,
         // Inert keyword phrasing (`UNIQUE KEY` vs `UNIQUE INDEX`).
         index_type_display: _,
         // Rejected: a separate index name would be undroppable (DROP INDEX
@@ -113,13 +117,117 @@ pub(super) fn reject_unhonored_unique_fields(
         "NULLS [NOT] DISTINCT",
     )?;
     reject_index_type_and_options(index_type, index_options, include, context)?;
-    reject_constraint_characteristics(characteristics, context)
+    reject_if(characteristics.is_some(), context, CHARACTERISTICS)?;
+    let cols = match own {
+        Some(c) => vec![c],
+        None => index_column_names(columns, "UNIQUE")?,
+    };
+    let name = option_name.or(name.as_ref());
+    Ok((cols, name.map(|n| canonical_user_name(&n.value)).transpose()?))
+}
+
+/// A FOREIGN KEY from `own` column, or from its own single-column list where
+/// `own` is `None`.
+fn read_fk<'a>(
+    fk: &'a sqlparser::ast::ForeignKeyConstraint,
+    own: Option<&'a str>,
+    context: &str,
+) -> Result<KeyConstraint<'a>, GnitzSqlError> {
+    let sqlparser::ast::ForeignKeyConstraint {
+        columns,
+        foreign_table,
+        referred_columns,
+        // Inert metadata: gnitz has no FK constraint/index naming surface.
+        name: _,
+        index_name: _,
+        on_delete,
+        // Rejected: unimplemented semantics.
+        on_update,
+        match_kind,
+        characteristics,
+    } = fk;
+    reject_if(on_update.is_some(), context, "FOREIGN KEY ON UPDATE action")?;
+    reject_if(match_kind.is_some(), context, "FOREIGN KEY MATCH")?;
+    reject_if(characteristics.is_some(), context, CHARACTERISTICS)?;
+    use sqlparser::ast::ReferentialAction as A;
+    let on_delete = match on_delete {
+        // Both name the check a write's fold is held to.
+        None | Some(A::NoAction | A::Restrict) => FkAction::Restrict,
+        Some(A::Cascade) => FkAction::Cascade,
+        Some(A::SetNull | A::SetDefault) => {
+            return Err(unsupported_clause(
+                context,
+                "FOREIGN KEY ON DELETE SET NULL / SET DEFAULT",
+            ));
+        }
+    };
+    let child = match (own, columns.as_slice()) {
+        (Some(c), _) => c,
+        (None, [c]) => c.value.as_str(),
+        (None, _) => return Err(unsupported_clause(context, "a multi-column FOREIGN KEY")),
+    };
+    let referred = match referred_columns.as_slice() {
+        [] => None,
+        [c] => Some(c.value.as_str()),
+        _ => return Err(unsupported_clause(context, "a multi-column REFERENCES list")),
+    };
+    Ok(KeyConstraint::ForeignKey {
+        child,
+        parent: foreign_table,
+        referred,
+        on_delete,
+    })
+}
+
+/// A strictly simple identifier expression's name, or the shared
+/// "column must be a simple identifier" rejection. Backs [`index_column_names`]
+/// and the CLUSTER BY column list (a `Vec<Expr>` in sqlparser).
+pub(super) fn simple_ident_expr<'a>(e: &'a Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
+    match e {
+        Expr::Identifier(id) => Ok(&id.value),
+        _ => Err(GnitzSqlError::rejected(format!(
+            "{context}: column must be a simple identifier"
+        ))),
+    }
+}
+
+/// The bare column names of an index column list — a PRIMARY KEY or UNIQUE
+/// constraint's, or CREATE INDEX's — each of which gnitz requires to be a simple
+/// identifier. Any expression, operator class, or ordering qualifier is rejected
+/// — gnitz indexes are ordered ascending by key bytes and carry no per-column
+/// ordering.
+pub(super) fn index_column_names<'a>(columns: &'a [IndexColumn], context: &str) -> Result<Vec<&'a str>, GnitzSqlError> {
+    columns
+        .iter()
+        .map(|c| {
+            let IndexColumn {
+                column:
+                    OrderByExpr {
+                        expr,
+                        options: OrderByOptions { sort, nulls_first },
+                        with_fill,
+                    },
+                operator_class,
+            } = c;
+            reject_if(
+                operator_class.is_some(),
+                context,
+                "an operator class on an index column",
+            )?;
+            reject_if(
+                sort.is_some() || nulls_first.is_some() || with_fill.is_some(),
+                context,
+                "per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL)",
+            )?;
+            simple_ident_expr(expr, context)
+        })
+        .collect()
 }
 
 /// The index-shape tail every index-creating surface shares: accept only the
 /// BTree default `USING` (it names gnitz's real ordered index), no index
 /// options and no INCLUDE columns. CREATE INDEX, PRIMARY KEY and UNIQUE all
-/// read it; PRIMARY KEY and UNIQUE add [`reject_constraint_characteristics`].
+/// read it.
 pub(super) fn reject_index_type_and_options(
     index_type: &Option<sqlparser::ast::IndexType>,
     index_options: &[sqlparser::ast::IndexOption],
@@ -137,30 +245,18 @@ pub(super) fn reject_index_type_and_options(
     reject_if(!include.is_empty(), context, "INCLUDE (covering columns)")
 }
 
-/// A constraint one column option declares on its own column.
-pub(super) enum ColumnConstraint<'a> {
-    PrimaryKey,
-    /// The option's `CONSTRAINT <name>`, which names the created index.
-    Unique(Option<&'a sqlparser::ast::Ident>),
-    ForeignKey {
-        fk: &'a sqlparser::ast::ForeignKeyConstraint,
-        on_delete: FkAction,
-    },
-}
-
 /// One column definition, read: the column, whether it was spelled SERIAL, and
-/// every constraint its options declare, in the order written; the caller
+/// every constraint its options declare, read, in the order written; the caller
 /// decides which it honours.
 pub(super) struct ColumnDecl<'a> {
     pub(super) def: ColumnDef,
     pub(super) serial: bool,
-    pub(super) constraints: Vec<ColumnConstraint<'a>>,
+    pub(super) constraints: Vec<KeyConstraint<'a>>,
 }
 
 /// Read `col`, rejecting every column option no site honours; pure metadata
-/// (COMMENT/OPTIONS/POLICY/TAGS) is accepted. A constraint option is descended
-/// into, so a field gnitz does not implement (an `ON UPDATE` action, DEFERRABLE,
-/// NULLS NOT DISTINCT, …) is rejected with it. A SERIAL column is its signed
+/// (COMMENT/OPTIONS/POLICY/TAGS) is accepted, and each constraint option read
+/// as [`KeyConstraint`]. A SERIAL column is its signed
 /// integer, NOT NULL. `context` names the site in a rejection.
 pub(super) fn read_column<'a>(
     col: &'a sqlparser::ast::ColumnDef,
@@ -168,6 +264,7 @@ pub(super) fn read_column<'a>(
 ) -> Result<ColumnDecl<'a>, GnitzSqlError> {
     use sqlparser::ast::ColumnOption as O;
     let sqlparser::ast::ColumnDef { name, data_type, options } = col;
+    let own = Some(name.value.as_str());
     // `Some(true)` once NOT NULL is written, `Some(false)` once NULL is.
     let mut not_null: Option<bool> = None;
     let conflicting = || {
@@ -190,17 +287,11 @@ pub(super) fn read_column<'a>(
                 not_null = Some(written);
             }
             O::Unique(u) => {
-                reject_unhonored_unique_fields(u, context)?;
-                constraints.push(ColumnConstraint::Unique(constraint_name.as_ref()));
+                let (cols, name) = read_unique(u, constraint_name.as_ref(), own, context)?;
+                constraints.push(KeyConstraint::Unique(cols, name));
             }
-            O::PrimaryKey(pk) => {
-                reject_unhonored_pk_fields(pk, context)?;
-                constraints.push(ColumnConstraint::PrimaryKey);
-            }
-            O::ForeignKey(fk) => {
-                let on_delete = fk_on_delete(fk, context)?;
-                constraints.push(ColumnConstraint::ForeignKey { fk, on_delete });
-            }
+            O::PrimaryKey(pk) => constraints.push(read_pk(pk, own, context)?),
+            O::ForeignKey(fk) => constraints.push(read_fk(fk, own, context)?),
             O::Comment(_) | O::Options(_) | O::Policy(_) | O::Tags(_) => {} // inert metadata
             O::Default(_) => return Err(unsupported_clause(context, "DEFAULT")),
             O::Check(_) => return Err(unsupported_clause(context, "CHECK")),

@@ -2,7 +2,7 @@
 //! the body (`hir::bind_and_lower`) into a view bundle carrying the definition it
 //! records, and commit it atomically.
 
-use super::options::decode_view_options;
+use super::options::parse_view_options;
 use super::view_def::{RelationRef, ViewDefinition};
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, missing_relation, reject_if};
@@ -72,7 +72,7 @@ pub(crate) fn plan_create_view(
 ) -> Result<Option<ViewBundle>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let view_name = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
-    let props = decode_view_options(&cv.options)?;
+    let props = parse_view_options(&cv.options)?;
 
     // Each clause tests the name alone; a plain create leaves a taken name to
     // the engine's refusal.

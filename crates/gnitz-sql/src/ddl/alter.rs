@@ -5,8 +5,8 @@
 //! columns, to decide IF [NOT] EXISTS and the class gate. Whether the change is
 //! admissible is the engine precheck's.
 
-use super::guard::{ColumnConstraint, read_column, reject_unhonored_unique_fields};
-use super::table::{index_cols, index_column_names};
+use super::guard::{KeyConstraint, read_column, read_unique};
+use super::table::index_cols;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, missing_relation, reject_if, unsupported_clause};
 use crate::names::extract_object_name;
@@ -190,9 +190,9 @@ fn parse<'a>(
                 return Err(unsupported_clause(
                     CTX,
                     match constraint {
-                        ColumnConstraint::PrimaryKey => "PRIMARY KEY (a new column cannot join the primary key)",
-                        ColumnConstraint::Unique(_) => "UNIQUE (add the column, then CREATE UNIQUE INDEX)",
-                        ColumnConstraint::ForeignKey { .. } => {
+                        KeyConstraint::PrimaryKey(_) => "PRIMARY KEY (a new column cannot join the primary key)",
+                        KeyConstraint::Unique(..) => "UNIQUE (add the column, then CREATE UNIQUE INDEX)",
+                        KeyConstraint::ForeignKey { .. } => {
                             "REFERENCES (a foreign key is declared only at CREATE TABLE)"
                         }
                     },
@@ -263,16 +263,9 @@ fn parse<'a>(
                     "ADD CONSTRAINT: only UNIQUE constraints are supported",
                 ));
             };
-            // Same field rejections as an inline CREATE TABLE … UNIQUE.
-            reject_unhonored_unique_fields(u, "ADD CONSTRAINT")?;
             // The CONSTRAINT name becomes the index's; `None` auto-generates one.
-            Ok((
-                CTX,
-                Action::AddUnique {
-                    columns: index_column_names(&u.columns, "ADD CONSTRAINT")?,
-                    explicit_name: u.name.as_ref().map(|n| canonical_user_name(&n.value)).transpose()?,
-                },
-            ))
+            let (columns, explicit_name) = read_unique(u, None, None, CTX)?;
+            Ok((CTX, Action::AddUnique { columns, explicit_name }))
         }
         AlterTableOperation::DropConstraint { if_exists, name, drop_behavior } => {
             const CTX: &str = "ALTER TABLE DROP CONSTRAINT";

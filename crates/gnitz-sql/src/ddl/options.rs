@@ -17,11 +17,41 @@ pub fn with_option_names() -> impl Iterator<Item = &'static str> {
 }
 
 /// The `WITH (…)` entries that declare `props`, as a `CREATE` writes them; the
-/// defaults are omitted.
+/// defaults are omitted. [`parse_table_options`]' and [`parse_view_options`]'
+/// inverse.
 pub fn with_options(props: &RelProps) -> Vec<String> {
-    match props {
-        RelProps::Table(t) => table_with_options(t),
-        RelProps::View(v) => view_with_options(v),
+    let flag = |on: bool| on.then(|| "true".to_string());
+    let size = |bytes: Option<u64>| bytes.map(|b| format!("'{}'", size_text(b)));
+    let (keys, values) = match *props {
+        RelProps::Table(t) => (
+            TABLE_OPTIONS,
+            [
+                flag(t.distribution == TableDistribution::Replicated),
+                flag(t.stream),
+                flag(t.compress),
+            ],
+        ),
+        RelProps::View(ViewProps { budget, compress }) => (
+            VIEW_OPTIONS,
+            [
+                size(budget.capacity_bytes()),
+                size(budget.delta_bytes()),
+                flag(compress),
+            ],
+        ),
+    };
+    keys.into_iter()
+        .zip(values)
+        .filter_map(|(key, value)| Some(format!("{key} = {}", value?)))
+        .collect()
+}
+
+/// ` WITH (…)` declaring `props`, or nothing where every option is the default.
+pub(super) fn with_clause(props: &RelProps) -> String {
+    let options = with_options(props);
+    match options.is_empty() {
+        true => String::new(),
+        false => format!(" WITH ({})", options.join(", ")),
     }
 }
 
@@ -101,21 +131,6 @@ pub(super) fn parse_table_options(table_options: &CreateTableOptions) -> Result<
     })
 }
 
-/// The `WITH (…)` entries that declare `props`, as a `CREATE TABLE` writes
-/// them; the defaults are omitted. [`parse_table_options`]'s inverse.
-fn table_with_options(props: &TableProps) -> Vec<String> {
-    let replicated = props.distribution == TableDistribution::Replicated;
-    [
-        ("replicated", replicated),
-        ("stream", props.stream),
-        ("compress", props.compress),
-    ]
-    .into_iter()
-    .filter(|&(_, on)| on)
-    .map(|(key, _)| format!("{key} = true"))
-    .collect()
-}
-
 /// The `CREATE VIEW … WITH (…)` keys.
 const VIEW_OPTIONS: [&str; 3] = ["capacity", "delta", "compress"];
 
@@ -124,7 +139,7 @@ const VIEW_OPTIONS: [&str; 3] = ["capacity", "delta", "compress"];
 const SIZE_UNITS: [(&str, u64); 4] = [("B", 1), ("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
 
 /// Decode the `WITH (...)` clause of a `CREATE VIEW`.
-pub(super) fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzSqlError> {
+pub(super) fn parse_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzSqlError> {
     let [capacity, delta, compress] = kv_options(options, "CREATE VIEW", VIEW_OPTIONS)?;
     let budget = ViewBudget::from_budgets(
         capacity.map(|v| size_option("capacity", v)).transpose()?,
@@ -135,23 +150,6 @@ pub(super) fn decode_view_options(options: &CreateTableOptions) -> Result<ViewPr
         budget,
         compress: bool_option("compress", compress)?,
     })
-}
-
-/// The `WITH (…)` entries that declare `props`, as a `CREATE VIEW` writes them;
-/// the defaults are omitted. [`decode_view_options`]'s inverse.
-fn view_with_options(props: &ViewProps) -> Vec<String> {
-    let ViewProps { budget, compress } = *props;
-    let mut out = Vec::new();
-    if let Some(bytes) = budget.capacity_bytes() {
-        out.push(format!("capacity = '{}'", size_text(bytes)));
-    }
-    if let Some(bytes) = budget.delta_bytes() {
-        out.push(format!("delta = '{}'", size_text(bytes)));
-    }
-    if compress {
-        out.push("compress = true".to_string());
-    }
-    out
 }
 
 /// `bytes` in the largest of [`SIZE_UNITS`] that divides it: [`parse_size`]'s

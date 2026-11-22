@@ -4,8 +4,8 @@
 use crate::SqlResult;
 use crate::catalog::Catalog;
 use crate::dml::ReadPlan;
-use crate::error::GnitzSqlError;
-use crate::error::reject_if;
+use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
+use crate::names::extract_global_name;
 use crate::source::StatementText;
 use crate::{ddl, dml};
 use gnitz_core::{GnitzClient, RelDescriptor, RelName};
@@ -325,7 +325,11 @@ pub(crate) async fn execute_statement(
             reject_if(options.is_some(), CTX, "OPTIONS")?;
             reject_if(default_collate_spec.is_some(), CTX, "DEFAULT COLLATE")?;
             reject_if(clone.is_some(), CTX, "CLONE")?;
-            ddl::execute_create_schema(client, name, *if_not_exists).await?;
+            let sqlparser::ast::SchemaName::Simple(name) = name else {
+                return Err(unsupported_clause(CTX, "AUTHORIZATION"));
+            };
+            let name = extract_global_name(name, "schema", CTX)?;
+            client.create_schema(&name, *if_not_exists).await?;
             Ok(SqlResult::Ddl { tag: "CREATE SCHEMA" })
         }
         Statement::CreateView(cv) => {

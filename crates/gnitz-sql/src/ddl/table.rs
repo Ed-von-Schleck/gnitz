@@ -1,31 +1,30 @@
-//! DDL: CREATE TABLE (with FK resolution, UNIQUE, CLUSTER BY, REPLICATED), DROP,
-//! and CREATE INDEX.
+//! DDL: CREATE TABLE (with FK resolution, UNIQUE, CLUSTER BY, REPLICATED),
+//! DROP, and CREATE INDEX.
 
 use super::guard::{
-    ColumnConstraint, ColumnDecl, fk_on_delete, read_column, reject_index_type_and_options, reject_unhonored_pk_fields,
-    reject_unhonored_unique_fields,
+    ColumnDecl, KeyConstraint, index_column_names, read_column, read_table_constraint, reject_index_type_and_options,
+    simple_ident_expr,
 };
 use super::options::parse_table_options;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::names::{extract_global_name, extract_object_name};
-use crate::rules::{ClassWant, canonical_user_name, reject_duplicate_names, require_class, require_column};
+use crate::rules::{ClassWant, reject_duplicate_names, require_class, require_column};
 use gnitz_core::{ClientError, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
-use sqlparser::ast::{
-    Expr, ForeignKeyConstraint, IndexColumn, ObjectType, OrderByExpr, OrderByOptions, TableConstraint,
-    WrappedCollection,
-};
+use sqlparser::ast::{ObjectType, WrappedCollection};
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 
-/// The column list of an index over `key`, or why no index can be built on it.
-fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
-    let rejected = |rule: gnitz_wire::KeyListRefusal| {
-        let named = rule.named(PkListRole::ColumnList, |c| cols.get(c as usize).map(|d| &*d.name));
-        GnitzSqlError::rejected(format!("{role}: {named}"))
-    };
-    gnitz_wire::validate_index_key(key, cols.len(), src_pk_count, |c| cols[c as usize].ty.tc).map_err(rejected)
+/// The column list of an index on `key` of `schema`, or why no index can be
+/// built on it.
+fn index_key(schema: &Schema, key: &[u32], role: &str) -> Result<PkColList, GnitzSqlError> {
+    let cols = schema.columns();
+    gnitz_wire::validate_index_key(key, cols.len(), schema.pk_cols().len(), |c| cols[c as usize].ty.tc).map_err(
+        |rule| {
+            let named = rule.named(PkListRole::ColumnList, |c| cols.get(c as usize).map(|d| &*d.name));
+            GnitzSqlError::rejected(format!("{role}: {named}"))
+        },
+    )
 }
 
 /// The FK child-type rule: a child adopts the referenced type, so its type must
@@ -40,16 +39,6 @@ fn check_fk_type_compat(fk_col_type: ColType, parent_col_type: ColType) -> Resul
         )));
     }
     Ok(())
-}
-
-/// One `REFERENCES` site: the child column and the target the clause named.
-/// Both spellings — the column option and the table-level constraint — collapse
-/// to this before either is resolved.
-struct FkSite<'a> {
-    col_idx: usize,
-    foreign_table: &'a sqlparser::ast::ObjectName,
-    referred_columns: &'a [sqlparser::ast::Ident],
-    on_delete: FkAction,
 }
 
 /// Resolve a PRIMARY KEY / UNIQUE / CREATE INDEX / CLUSTER BY column list against `cols`, in
@@ -67,259 +56,121 @@ fn resolve_index_columns(names: &[&str], cols: &[ColumnDef], ctx: &str) -> Resul
     Ok(indices)
 }
 
-/// Resolve a `REFERENCES` clause's column list to the parent column it names.
-/// `pk_single` is the parent's lone PK column when its PK is single-column — an
-/// omitted column list defaults to it, and is undefined otherwise.
-fn resolve_referred_column(
-    referred_columns: &[sqlparser::ast::Ident],
-    ref_table: &RelName,
-    cols: &[ColumnDef],
-    pk_single: Option<usize>,
-) -> Result<usize, GnitzSqlError> {
-    if referred_columns.len() > 1 {
-        return Err(GnitzSqlError::rejected(
-            "multi-column FOREIGN KEY references are not supported",
-        ));
-    }
-    match referred_columns.first() {
-        Some(ident) => {
-            require_column(cols, &ident.value).map_err(|e| e.in_clause(&format!("FOREIGN KEY REFERENCES {ref_table}")))
-        }
-        None => pk_single.ok_or_else(|| {
-            GnitzSqlError::rejected(format!(
-                "FK against '{ref_table}' must name the referenced column (its primary key is not a single column)",
-            ))
-        }),
-    }
+/// One `REFERENCES` site, qualified but not yet resolved.
+struct FkSite {
+    /// The child column.
+    child: usize,
+    parent: RelName,
+    /// The parent column the clause names; `None` defaults to the parent's lone
+    /// PK column.
+    referred: Option<String>,
+    on_delete: FkAction,
 }
 
-/// Resolve the REFERENCES clause of `site` to its target and the parent column's
-/// type, which the child column adopts once checked compatible. A
-/// self-reference (`ref_table` is the table being created) resolves against the
-/// in-flight `cols` and `pk`, the table not being in the catalog yet; any other
-/// against the registered relation. The engine holds the target to a base
-/// table's lone PK or a column with a single-column UNIQUE index.
-fn resolve_fk_target(
-    cat: &dyn Catalog,
-    site: &FkSite<'_>,
-    ref_table: &RelName,
-    self_ref: bool,
-    cols: &[ColumnDef],
-    pk: &[u32],
-) -> Result<(FkRef, ColType), GnitzSqlError> {
-    let probed;
-    let (parent_cols, pk_single, parent) = match self_ref {
-        true => (cols, (pk.len() == 1).then(|| pk[0] as usize), None),
-        false => {
-            probed = cat.probe_relation(ref_table)?;
-            (
-                probed.schema.columns(),
-                probed.schema.layout().lone_pk_col(),
-                Some(probed.tid),
-            )
-        }
-    };
-    let col = resolve_referred_column(site.referred_columns, ref_table, parent_cols, pk_single)?;
-    let parent_ty = parent_cols[col].ty;
-    check_fk_type_compat(cols[site.col_idx].ty, parent_ty)?;
-    let (col, on_delete) = (col as u32, site.on_delete);
-    let table_id = parent.unwrap_or(gnitz_core::pending_id(0));
-    let target = FkRef { table_id, col, on_delete };
-    Ok((target, parent_ty))
-}
-
-/// A strictly simple identifier expression's name, or the shared
-/// "column must be a simple identifier" rejection. Backs [`index_column_names`]
-/// and the CLUSTER BY column list (a `Vec<Expr>` in sqlparser).
-fn simple_ident_expr<'a>(e: &'a Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
-    match e {
-        Expr::Identifier(id) => Ok(&id.value),
-        _ => Err(GnitzSqlError::rejected(format!(
-            "{context}: column must be a simple identifier"
-        ))),
-    }
-}
-
-/// The bare column names of an index column list — a PRIMARY KEY or UNIQUE
-/// constraint's, or CREATE INDEX's — each of which gnitz requires to be a simple
-/// identifier. Any expression, operator class, or ordering qualifier is rejected
-/// — gnitz indexes are ordered ascending by key bytes and carry no per-column
-/// ordering. Needs no catalog, so every surface reads its list here first.
-pub(super) fn index_column_names<'a>(columns: &'a [IndexColumn], context: &str) -> Result<Vec<&'a str>, GnitzSqlError> {
-    columns
-        .iter()
-        .map(|c| {
-            let IndexColumn {
-                column:
-                    OrderByExpr {
-                        expr,
-                        options: OrderByOptions { sort, nulls_first },
-                        with_fill,
-                    },
-                operator_class,
-            } = c;
-            reject_if(
-                operator_class.is_some(),
-                context,
-                "an operator class on an index column",
-            )?;
-            reject_if(
-                sort.is_some() || nulls_first.is_some() || with_fill.is_some(),
-                context,
-                "per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL)",
-            )?;
-            simple_ident_expr(expr, context)
-        })
-        .collect()
-}
-
-/// One UNIQUE constraint as written: the column list — one element for a
-/// column-level `UNIQUE`, the whole ordered list for a table-level one — and the
+/// One UNIQUE constraint as written: its ordered column list and the
 /// `CONSTRAINT <name>` it carried, canonical.
 struct UniqueDecl {
     cols: Vec<u32>,
     name: Option<String>,
 }
 
-/// Record a UNIQUE constraint, holding it to the rule CREATE INDEX holds an
-/// unnamed index to: an unnamed one may not repeat a column set another
-/// declares. `a INT UNIQUE UNIQUE` is one constraint written twice; two written
-/// names on one column list are two indexes, as two CREATE INDEX statements make.
-/// No two may share a written name.
-fn push_unique(
-    unique: &mut Vec<UniqueDecl>,
-    cols: Vec<u32>,
-    col_names: &[&str],
-    name: Option<&sqlparser::ast::Ident>,
-) -> Result<(), GnitzSqlError> {
-    if unique
-        .iter()
-        .any(|u| u.cols == cols && (u.name.is_none() || name.is_none()))
-    {
-        return Err(GnitzSqlError::rejected(format!(
-            "duplicate UNIQUE constraint on column(s) ({})",
-            col_names.join(", ")
-        )));
-    }
-    let name = name.map(|n| canonical_user_name(&n.value)).transpose()?;
-    if let Some(name) = &name
-        && unique.iter().any(|u| u.name.as_ref() == Some(name))
-    {
-        return Err(GnitzSqlError::rejected(format!("duplicate constraint name '{name}'")));
-    }
-    unique.push(UniqueDecl { cols, name });
-    Ok(())
-}
-
-/// Everything `CREATE TABLE`'s own text declares.
-struct Declared<'a> {
+/// Everything `CREATE TABLE`'s own text declares. Built from the statement and
+/// the session's schema alone, so it is complete before any catalog read: a
+/// column name is a column of the in-flight list or it is rejected, and a
+/// `REFERENCES` target is only qualified.
+#[derive(Default)]
+struct Declared {
     cols: Vec<ColumnDef>,
+    /// Empty where no PRIMARY KEY is written: a written one names a column.
     pk: Vec<u32>,
     /// The columns declared SERIAL.
     serial: Vec<u32>,
-    fk_sites: Vec<FkSite<'a>>,
+    fks: Vec<FkSite>,
     unique: Vec<UniqueDecl>,
 }
 
-/// Read `create` into a [`Declared`]. Takes neither a catalog nor a schema name,
-/// so nothing here can resolve to a relation: a name is a column of the in-flight
-/// list, or it is rejected — and so it runs before any catalog read.
-fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared<'_>, GnitzSqlError> {
-    let mut cols: Vec<ColumnDef> = Vec::with_capacity(create.columns.len());
-    let mut inline_pk: Vec<u32> = Vec::new();
-    let mut fk_sites: Vec<FkSite<'_>> = Vec::new();
-    let mut unique: Vec<UniqueDecl> = Vec::new();
-    let mut serial: Vec<u32> = Vec::new();
-
-    // The column defs and every site a column option declares.
-    for (i, col) in create.columns.iter().enumerate() {
-        let ColumnDecl { def, serial: is_serial, constraints } = read_column(col, "column definition")?;
-        cols.push(def);
-        if is_serial {
-            serial.push(i as u32);
-        }
-        for constraint in constraints {
-            match constraint {
-                ColumnConstraint::PrimaryKey => inline_pk.push(i as u32),
-                ColumnConstraint::ForeignKey { fk, on_delete } => fk_sites.push(FkSite {
-                    col_idx: i,
-                    foreign_table: &fk.foreign_table,
-                    referred_columns: &fk.referred_columns,
-                    on_delete,
-                }),
-                ColumnConstraint::Unique(name) => {
-                    push_unique(&mut unique, vec![i as u32], &[col.name.value.as_str()], name)?
-                }
-            }
-        }
-    }
-    if inline_pk.len() > 1 {
-        return Err(GnitzSqlError::rejected("Multiple PRIMARY KEYs defined"));
-    }
-
-    // The same three kinds again, table-level and in declaration order, with the
-    // columns named rather than positional. Exhaustive over `TableConstraint`: a
-    // consumed variant is descended into (`reject_unhonored_{pk,unique}_fields`,
-    // `fk_on_delete`) so an unimplemented field inside it (ON UPDATE, DEFERRABLE,
-    // NULLS [NOT] DISTINCT, …) is rejected rather than dropped; CHECK, inline
-    // INDEX, FULLTEXT/SPATIAL and the `{PRIMARY KEY,UNIQUE} USING INDEX`
-    // promotions (no pre-existing index at CREATE TABLE) are rejected.
-    const CTX: &str = "table constraint";
-    let mut table_pk: Option<Vec<u32>> = None;
-    for constraint in &create.constraints {
-        match constraint {
-            TableConstraint::PrimaryKey(pk) => {
-                reject_unhonored_pk_fields(pk, CTX)?;
+impl Declared {
+    /// Declare `c` over the in-flight columns. Each kind holds one rule whichever
+    /// spelling it is written in.
+    fn constrain(&mut self, c: KeyConstraint<'_>, schema_name: &str) -> Result<(), GnitzSqlError> {
+        match c {
+            KeyConstraint::PrimaryKey(names) => {
                 // Resolved before the conflict is reported, so an unknown column
                 // name is named rather than eclipsed by it.
-                let names = index_column_names(&pk.columns, "PRIMARY KEY")?;
-                let resolved = resolve_index_columns(&names, &cols, "PRIMARY KEY")?;
-                if table_pk.is_some() || !inline_pk.is_empty() {
+                let key = resolve_index_columns(&names, &self.cols, "PRIMARY KEY")?;
+                if !self.pk.is_empty() {
                     return Err(GnitzSqlError::rejected("Multiple PRIMARY KEYs defined"));
                 }
-                table_pk = Some(resolved);
-            }
-            TableConstraint::ForeignKey(fk) => {
-                let on_delete = fk_on_delete(fk, CTX)?;
-                let ForeignKeyConstraint {
-                    columns, foreign_table, referred_columns, ..
-                } = fk;
-                if columns.len() != 1 {
-                    return Err(GnitzSqlError::rejected(
-                        "multi-column FOREIGN KEY constraints are not supported",
-                    ));
+                // The null bitmap excludes the PK region, so a nullable PK has no
+                // place to carry the null: PRIMARY KEY implies NOT NULL, coerced
+                // rather than rejected.
+                for &c in &key {
+                    self.cols[c as usize].is_nullable = false;
                 }
-                let local_col_name = &columns[0].value;
-                let col_idx = require_column(&cols, local_col_name).map_err(|e| e.in_clause("FOREIGN KEY"))?;
-                fk_sites.push(FkSite {
-                    col_idx,
-                    foreign_table,
-                    referred_columns,
+                self.pk = key;
+            }
+            // The rule CREATE INDEX holds an unnamed index to: an unnamed UNIQUE
+            // may not repeat a column set another declares. `a INT UNIQUE UNIQUE`
+            // is one constraint written twice; two written names on one column
+            // list are two indexes, as two CREATE INDEX statements make. No two
+            // may share a written name.
+            KeyConstraint::Unique(names, name) => {
+                let cols = resolve_index_columns(&names, &self.cols, "UNIQUE")?;
+                if self
+                    .unique
+                    .iter()
+                    .any(|d| d.cols == cols && (d.name.is_none() || name.is_none()))
+                {
+                    return Err(GnitzSqlError::rejected(format!(
+                        "duplicate UNIQUE constraint on column(s) ({})",
+                        names.join(", ")
+                    )));
+                }
+                if let Some(name) = &name
+                    && self.unique.iter().any(|d| d.name.as_ref() == Some(name))
+                {
+                    return Err(GnitzSqlError::rejected(format!("duplicate constraint name '{name}'")));
+                }
+                self.unique.push(UniqueDecl { cols, name });
+            }
+            KeyConstraint::ForeignKey { child, parent, referred, on_delete } => {
+                let child = require_column(&self.cols, child).map_err(|e| e.in_clause("FOREIGN KEY"))?;
+                if self.fks.iter().any(|s| s.child == child) {
+                    return Err(GnitzSqlError::rejected(format!(
+                        "column '{}' carries more than one FOREIGN KEY",
+                        self.cols[child].name
+                    )));
+                }
+                self.fks.push(FkSite {
+                    child,
+                    parent: extract_object_name(parent, schema_name, "REFERENCES")?,
+                    referred: referred.map(str::to_owned),
                     on_delete,
                 });
             }
-            TableConstraint::Unique(u) => {
-                reject_unhonored_unique_fields(u, CTX)?;
-                let col_names = index_column_names(&u.columns, "UNIQUE")?;
-                let col_indices = resolve_index_columns(&col_names, &cols, "UNIQUE")?;
-                push_unique(&mut unique, col_indices, &col_names, u.name.as_ref())?;
-            }
-            TableConstraint::Check(_) => return Err(unsupported_clause(CTX, "CHECK constraint")),
-            TableConstraint::Index(_) => return Err(unsupported_clause(CTX, "INDEX in table definition")),
-            TableConstraint::FulltextOrSpatial(_) => return Err(unsupported_clause(CTX, "FULLTEXT/SPATIAL index")),
-            TableConstraint::PrimaryKeyUsingIndex(_) => return Err(unsupported_clause(CTX, "PRIMARY KEY USING INDEX")),
-            TableConstraint::UniqueUsingIndex(_) => return Err(unsupported_clause(CTX, "UNIQUE USING INDEX")),
-            TableConstraint::Exclude(_) => return Err(unsupported_clause(CTX, "EXCLUDE constraint")),
+        }
+        Ok(())
+    }
+}
+
+/// Read `create`'s columns and constraints into a [`Declared`]: every column
+/// option, then every table constraint, each in declaration order.
+fn collect_declarations(create: &sqlparser::ast::CreateTable, schema_name: &str) -> Result<Declared, GnitzSqlError> {
+    let mut d = Declared::default();
+    for (i, col) in create.columns.iter().enumerate() {
+        let ColumnDecl { def, serial, constraints } = read_column(col, "column definition")?;
+        d.cols.push(def);
+        if serial {
+            d.serial.push(i as u32);
+        }
+        for c in constraints {
+            d.constrain(c, schema_name)?;
         }
     }
-
-    Ok(Declared {
-        cols,
-        pk: table_pk.unwrap_or(inline_pk),
-        serial,
-        fk_sites,
-        unique,
-    })
+    for constraint in &create.constraints {
+        d.constrain(read_table_constraint(constraint, "table constraint")?, schema_name)?;
+    }
+    Ok(d)
 }
 
 /// Reject every `CREATE TABLE` clause the planner does not consume.
@@ -458,17 +309,11 @@ pub(crate) fn plan_create_table(
     // ambiguous *reference*, when it is the definition that is wrong.
     reject_duplicate_names(create.columns.iter().map(|c| c.name.value.as_str()), "table definition")?;
 
-    let Declared {
-        mut cols,
-        pk: pk_indices,
-        serial,
-        fk_sites,
-        unique,
-    } = collect_declarations(create)?;
+    let Declared { mut cols, pk, serial, mut fks, unique } = collect_declarations(create, schema_name)?;
 
     // The generated id has no compound form: a column spelled SERIAL is the table's
     // whole primary key.
-    if let Some(&c) = serial.iter().find(|&&c| pk_indices != [c]) {
+    if let Some(&c) = serial.iter().find(|&&c| pk != [c]) {
         return Err(GnitzSqlError::rejected(format!(
             "SERIAL column '{}' must be the table's only SERIAL column and its single-column PRIMARY KEY",
             cols[c as usize].name
@@ -498,13 +343,13 @@ pub(crate) fn plan_create_table(
             .map(|e| simple_ident_expr(e, "CLUSTER BY"))
             .collect::<Result<Vec<_>, _>>()?;
         let cluster_indices = resolve_index_columns(&names, &cols, "CLUSTER BY")?;
-        let prefix_len = dist_prefix_len(&cols, &pk_indices, &cluster_indices)?;
+        let prefix_len = dist_prefix_len(&cols, &pk, &cluster_indices)?;
         props.distribution = props
             .distribution
             .cluster_by(prefix_len)
             .map_err(GnitzSqlError::rejected)?;
     }
-    props.validate(pk_indices.len()).map_err(GnitzSqlError::rejected)?;
+    props.validate(pk.len()).map_err(GnitzSqlError::rejected)?;
 
     // `IF NOT EXISTS` tests the NAME, not the definition — no dialect compares the
     // two — so any relation standing under it ends the statement, whatever its
@@ -514,47 +359,64 @@ pub(crate) fn plan_create_table(
         return Ok(None);
     }
 
-    // A self-FK resolves against the whole PK, and each resolve REWRITES its child
-    // column's type to the parent's — so this runs after collection, not inside it.
-    // The self-references go last: one adopts the PK column's type, which a
-    // cross-table FK on that column rewrites.
-    let mut sites: Vec<(RelName, &FkSite<'_>)> = fk_sites
-        .iter()
+    // Each FK REWRITES its child column's type to the parent's, so the
+    // self-references go last: one adopts the PK column's type, which a
+    // cross-table FK on that column rewrites. A self-reference resolves against
+    // the in-flight columns and the whole PK, the table not being in the catalog
+    // yet; any other against the registered relation. The engine holds the target
+    // to a base table's lone PK or a column with a single-column UNIQUE index.
+    fks.sort_by_key(|site| site.parent == table_name);
+    let fks = fks
+        .into_iter()
         .map(|site| {
-            Ok((
-                extract_object_name(site.foreign_table, schema_name, "REFERENCES")?,
-                site,
-            ))
+            let probed;
+            let (parent_cols, parent_pk, table_id) = match site.parent == table_name {
+                true => (
+                    &cols[..],
+                    match pk[..] {
+                        [c] => Some(c as usize),
+                        _ => None,
+                    },
+                    gnitz_core::pending_id(0),
+                ),
+                false => {
+                    probed = cat.probe_relation(&site.parent)?;
+                    (
+                        probed.schema.columns(),
+                        probed.schema.layout().lone_pk_col(),
+                        probed.tid,
+                    )
+                }
+            };
+            let col = match &site.referred {
+                Some(name) => require_column(parent_cols, name)
+                    .map_err(|e| e.in_clause(&format!("FOREIGN KEY REFERENCES {}", site.parent)))?,
+                None => parent_pk.ok_or_else(|| {
+                    GnitzSqlError::rejected(format!(
+                        "FK against '{}' must name the referenced column (its primary key is not a single column)",
+                        site.parent
+                    ))
+                })?,
+            };
+            let parent_ty = parent_cols[col].ty;
+            check_fk_type_compat(cols[site.child].ty, parent_ty)?;
+            cols[site.child].ty = parent_ty;
+            let fk = FkRef {
+                table_id,
+                col: col as u32,
+                on_delete: site.on_delete,
+            };
+            Ok((site.child, fk))
         })
-        .collect::<Result<_, GnitzSqlError>>()?;
-    sites.sort_by_key(|(ref_table, _)| *ref_table == table_name);
-    let mut fks = BTreeMap::new();
-    for (ref_table, site) in sites {
-        let Entry::Vacant(slot) = fks.entry(site.col_idx) else {
-            return Err(GnitzSqlError::rejected(format!(
-                "column '{}' carries more than one FOREIGN KEY",
-                cols[site.col_idx].name
-            )));
-        };
-        let self_ref = ref_table == table_name;
-        let (fk, parent_pk_type) = resolve_fk_target(cat, site, &ref_table, self_ref, &cols, &pk_indices)?;
-        slot.insert(fk);
-        cols[site.col_idx].ty = parent_pk_type;
-    }
+        .collect::<Result<BTreeMap<_, _>, GnitzSqlError>>()?;
 
-    // The null bitmap excludes the PK region, so a nullable PK has no place to
-    // carry the null: PRIMARY KEY implies NOT NULL, coerced rather than rejected.
-    for &i in &pk_indices {
-        cols[i as usize].is_nullable = false;
-    }
-
-    let schema = Schema::from_parts(cols, &pk_indices).map_err(GnitzSqlError::rejected)?;
+    let schema = Schema::from_parts(cols, &pk).map_err(GnitzSqlError::rejected)?;
     // Keyed after FK resolution: an index key's admissibility reads the adopted
     // column types.
     let unique_indexes = unique
         .into_iter()
         .map(|u| {
-            let cols = index_key(schema.columns(), &u.cols, pk_indices.len(), "UNIQUE")?;
+            let cols = index_key(&schema, &u.cols, "UNIQUE")?;
             Ok(InlineUniqueIndex { cols, name: u.name })
         })
         .collect::<Result<_, GnitzSqlError>>()?;
@@ -704,7 +566,7 @@ pub(crate) async fn execute_create_index(
 /// and `ALTER TABLE … ADD CONSTRAINT UNIQUE` (which `ctx` names) ask for it.
 pub(super) fn index_cols(schema: &Schema, columns: &[&str], ctx: &str) -> Result<PkColList, GnitzSqlError> {
     let col_indices = resolve_index_columns(columns, schema.columns(), ctx)?;
-    index_key(schema.columns(), &col_indices, schema.pk_cols().len(), ctx)
+    index_key(schema, &col_indices, ctx)
 }
 
 #[cfg(test)]

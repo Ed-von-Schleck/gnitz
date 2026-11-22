@@ -637,8 +637,8 @@ fn a_repeated_column_name_is_rejected_before_it_is_resolved() {
     );
 }
 
-/// Two constraint names folding to one canonical name would write two IDX_TAB
-/// rows the catalog cannot both reach.
+/// Two constraint names folding to one canonical name collide; the statement's
+/// text decides that, so the planner rejects it.
 #[test]
 fn two_written_constraint_names_may_not_fold_together() {
     let cat = catalog(vec![]);
@@ -684,6 +684,19 @@ fn if_not_exists_plans_a_skip_but_a_bad_with_key_still_errors() {
         (
             "CREATE TABLE IF NOT EXISTS tv (id BIGINT, a SERIAL, PRIMARY KEY (id))",
             "SERIAL",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, a BIGINT REFERENCES p(x, y))",
+            "multi-column",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, a BIGINT REFERENCES p(id), \
+             FOREIGN KEY (a) REFERENCES q(id))",
+            "more than one FOREIGN KEY",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY, a BIGINT REFERENCES x.y.z(id))",
+            "too many name parts",
         ),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);

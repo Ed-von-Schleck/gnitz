@@ -6,7 +6,7 @@
 use gnitz_core::{Catalog, CatalogRelation, RelProps};
 use gnitz_wire::{FkAction, TableDistribution};
 
-use super::options::with_options;
+use super::options::with_clause;
 use super::view_def::ViewDefinition;
 use crate::names::{column_text, relation_text};
 use crate::types::serial_type_name;
@@ -19,15 +19,6 @@ pub fn create_schema_statement(name: &str) -> String {
 /// `rel`'s name as a statement names it: schema-qualified.
 pub fn qualified_name(rel: &CatalogRelation) -> String {
     format!("{}.{}", relation_text(&rel.schema), relation_text(&rel.name))
-}
-
-/// ` WITH (…)` declaring `props`, or nothing where every option is the default.
-fn with_clause(props: &RelProps) -> String {
-    let options = with_options(props);
-    match options.is_empty() {
-        true => String::new(),
-        false => format!(" WITH ({})", options.join(", ")),
-    }
 }
 
 /// The `CREATE TABLE` that declares base table or stream `rel`: its visible
