@@ -149,7 +149,11 @@ fn a_reduce_reads_one_distinct_set_and_shares_its_columns() {
         let RelExpr::Project { input, .. } = rel.as_ref() else {
             panic!("{sql}: no projection")
         };
-        let RelExpr::Reduce { input, aggs, .. } = crate::hir::split_filter(input).1.as_ref() else {
+        let input = match input.as_ref() {
+            RelExpr::Filter { input, .. } => input,
+            _ => input,
+        };
+        let RelExpr::Reduce { input, aggs, .. } = input.as_ref() else {
             panic!("{sql}: no reduce")
         };
         let set = match input.as_ref() {

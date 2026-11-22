@@ -2,8 +2,8 @@
 //! the layout-free logical IR: [`Frame`] substitutes each `ColId` leaf with a
 //! `ColRef(position)` against a node's column layout, and
 //! [`physicalize_projection`] physicalizes a projection: each slot a resolved
-//! expression, a bare `ColRef` being a copy, under the PK-front convention, whose
-//! single home is `place_pk_front`.
+//! expression, a bare `ColRef` being a copy, with the source PK pinned to the
+//! leading slots — the one place the PK-front convention is applied.
 
 use super::{AggCol, ColId, HirCol, HirExpr, OrderCol, ProjEntry};
 use crate::agg::group_pk_def;
@@ -91,6 +91,25 @@ impl Frame {
         })
     }
 
+    /// The group list to send a reduce, top-N or window grouped by `ids`' slots:
+    /// SQL's GROUP BY is a set, so a slot named twice is sent once and a
+    /// permutation of leading PK columns is sent in PK order.
+    pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
+        let mut group: Vec<u32> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let slot = self.slot(*id)? as u32;
+            if !group.contains(&slot) {
+                group.push(slot);
+            }
+        }
+        if let Some(lead) = self.schema.pk_cols().get(..group.len())
+            && lead.iter().all(|p| group.contains(p))
+        {
+            group = lead.to_vec();
+        }
+        Ok(group)
+    }
+
     /// A group-keyed operator's output frame over this one: the reduce output
     /// layout of `group` and `row`, then `tail`.
     pub(crate) fn keyed_by(
@@ -121,23 +140,6 @@ impl Frame {
                 })
             })
             .collect()
-    }
-
-    /// The group list to send a reduce, top-N or window grouped by `ids`' slots: SQL's
-    /// GROUP BY is a set, so a slot named twice is sent once and a permutation of
-    /// leading PK columns is sent in PK order.
-    pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
-        let mut group: Vec<u32> = Vec::with_capacity(ids.len());
-        for slot in self.slots(ids.iter().copied())? {
-            if !group.contains(&(slot as u32)) {
-                group.push(slot as u32);
-            }
-        }
-        let lead = self.schema.pk_cols().get(..group.len());
-        Ok(match lead {
-            Some(lead) if lead.iter().all(|p| group.contains(p)) => lead.to_vec(),
-            _ => group,
-        })
     }
 
     /// `expr` with every `ColId` leaf substituted by `ColRef(its slot)`.
@@ -210,27 +212,57 @@ impl Frame {
     }
 
     /// This frame under the identities of `items`, a projection that moves no data,
-    /// or `None` unless each item is a bare column and none reads a column twice. A
-    /// slot no item reads loses its identity. A hidden item keeps its slot's
-    /// definition, hidden, as [`place_pk_front`] gives a hidden key slot.
-    pub(crate) fn relabeled(&self, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
+    /// or `None` unless each item is a bare column, none reads a column twice, and
+    /// `how` admits the slots no item names. A slot no item reads loses its
+    /// identity. A hidden item keeps its slot's definition, hidden, as
+    /// [`physicalize_projection`] gives a hidden key slot.
+    pub(crate) fn relabeled(&self, items: &[ProjEntry], how: Relabel) -> Result<Option<Frame>, GnitzSqlError> {
+        if how == Relabel::Never {
+            return Ok(None);
+        }
+        let src = self.schema.columns();
+        let is_pk = |s: usize| self.schema.layout().is_pk_col(s);
         let mut layout = vec![None; self.layout.len()];
         let mut columns: Option<Vec<ColumnDef>> = None;
+        // The payload slots the visible items name, in item order.
+        let mut payload = Vec::new();
         for it in items {
-            let Some(src) = it.expr.as_col() else {
+            let Some(id) = it.expr.as_col() else {
                 return Ok(None);
             };
-            let slot = self.slot(src)?;
-            if layout[slot].is_some() {
+            let slot = self.slot(id)?;
+            if layout[slot].replace(it.out.id).is_some() {
                 return Ok(None);
             }
-            layout[slot] = Some(it.out.id);
             let def = match it.out.def.is_hidden {
-                true => self.schema.columns()[slot].clone().hidden(),
-                false => it.out.def.clone(),
+                true => src[slot].clone().hidden(),
+                false => {
+                    if !is_pk(slot) {
+                        payload.push(slot);
+                    }
+                    it.out.def.clone()
+                }
             };
-            if self.schema.columns()[slot] != def {
-                columns.get_or_insert_with(|| self.schema.columns().to_vec())[slot] = def;
+            if src[slot] != def {
+                columns.get_or_insert_with(|| src.to_vec())[slot] = def;
+            }
+        }
+        if how != Relabel::Slots {
+            if !payload.is_sorted() {
+                return Ok(None);
+            }
+            for s in (0..layout.len()).filter(|&s| layout[s].is_none()) {
+                let drops = match how {
+                    Relabel::Whole => !is_pk(s),
+                    Relabel::WholeCarryingHidden => !is_pk(s) && !src[s].is_hidden,
+                    _ => false,
+                };
+                if drops {
+                    return Ok(None);
+                }
+                if !src[s].is_hidden {
+                    columns.get_or_insert_with(|| src.to_vec())[s].is_hidden = true;
+                }
             }
         }
         let schema = match columns {
@@ -242,52 +274,27 @@ impl Frame {
         };
         Ok(Some(Frame { layout, schema }))
     }
+}
 
-    /// [`Self::relabeled`] as stored under `items`' written order, or `None` where
-    /// [`Self::schema_in_order`] would move a column: the visible items must name
-    /// payload columns in payload order. Every slot no item names is hidden.
-    pub(crate) fn relabeled_in_order(&self, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
-        let Some(Frame { layout, schema }) = self.relabeled(items)? else {
-            return Ok(None);
-        };
-        let payload = (items.iter())
-            .filter(|it| !it.out.def.is_hidden)
-            .filter_map(|it| it.expr.as_col())
-            .map(|c| self.slot(c))
-            .collect::<Result<Vec<_>, _>>()?;
-        if !payload.iter().filter(|&&s| !schema.layout().is_pk_col(s)).is_sorted() {
-            return Ok(None);
-        }
-        let unnamed = |s: &usize| layout[*s].is_none() && !schema.columns()[*s].is_hidden;
-        if !(0..layout.len()).any(|s| unnamed(&s)) {
-            return Ok(Some(Frame { layout, schema }));
-        }
-        let mut columns = schema.columns().to_vec();
-        for s in (0..layout.len()).filter(unnamed) {
-            columns[s].is_hidden = true;
-        }
-        let schema = Schema::from_parts(columns, schema.pk_cols())
-            .map_err(|e| GnitzSqlError::Internal(format!("relabeled schema: {e}")))?;
-        Ok(Some(Frame { layout, schema: Arc::new(schema) }))
-    }
-
-    /// [`Self::relabeled_in_order`] where it keeps every payload column of this
-    /// frame: each payload slot no item names must already be hidden, and there must
-    /// be none unless `carry_hidden`.
-    pub(crate) fn relabeled_whole(
-        &self,
-        items: &[ProjEntry],
-        carry_hidden: bool,
-    ) -> Result<Option<Frame>, GnitzSqlError> {
-        let Some(out) = self.relabeled_in_order(items)? else {
-            return Ok(None);
-        };
-        let columns = self.schema.columns();
-        let drops = (0..out.layout.len()).any(|s| {
-            out.layout[s].is_none() && !self.schema.layout().is_pk_col(s) && !(carry_hidden && columns[s].is_hidden)
-        });
-        Ok((!drops).then_some(out))
-    }
+/// Which slots a [`Frame::relabeled`] may leave unnamed — what a consumer needs of
+/// a projection it reads without one being emitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relabel {
+    /// Any slot: a consumer reading only a slot per column (a reduce, a set
+    /// operation's leaves, a join's inputs).
+    Slots,
+    /// Any slot, hidden, so the frame stores the items in their written order: the
+    /// visible items must name payload columns in payload order, as
+    /// [`Frame::schema_in_order`] moves none (a reduce's output the view stores).
+    InOrder,
+    /// As `InOrder`, but no payload slot may go unnamed (a view's output).
+    Whole,
+    /// As `Whole`, but an already-hidden payload slot may go unnamed (a read of a
+    /// view, whose hidden columns are its operators' state).
+    WholeCarryingHidden,
+    /// None: the projection is emitted (a top-N's or window's input, which carries
+    /// every column key first).
+    Never,
 }
 
 /// A projection's slots over `input`, in output order — each entry resolved and
@@ -305,7 +312,22 @@ pub(crate) fn physicalize_projection(
             Ok((input.resolve(&e.expr)?, Some(e.out.id), e.out.def.clone()))
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-    place_pk_front(&mut slots, &input.schema);
+    // Pin the source PK to slots `0..k` in PK-list order: each PK column's first
+    // pass-through moves there, and one nothing passes through is prepended hidden.
+    // A hidden key slot carries the source's definition of its column.
+    let source = &input.schema;
+    for (target, &pk) in source.pk_cols().iter().enumerate() {
+        let pk = pk as usize;
+        let key_def = || source.columns()[pk].clone().hidden();
+        let slot = match slots.iter().position(|(item, ..)| item.as_col() == Some(pk)) {
+            Some(pos) => {
+                let (item, id, def) = slots.remove(pos);
+                (item, id, if def.is_hidden { key_def() } else { def })
+            }
+            None => (BExpr::ColRef(pk), None, key_def()),
+        };
+        slots.insert(target, slot);
+    }
     // Each input column copied in place under its own definition: the output schema
     // is the input's.
     let columns = input.schema.columns();
@@ -335,28 +357,6 @@ pub(crate) fn projection_map(items: &[ProjEntry], input: &Frame) -> Result<(Opti
         false => Some(compute_map(payload_program(&items, &out.schema, input)?, &out.schema)),
     };
     Ok((map, out))
-}
-
-/// Pin the source PK to slots `0..k` in PK-list order: each PK column's first
-/// pass-through moves there, and
-/// one nothing passes through is prepended hidden. A hidden key slot carries the
-/// source's definition of its column.
-fn place_pk_front(slots: &mut Vec<(BoundExpr, Option<ColId>, ColumnDef)>, source: &Schema) {
-    for (target, &pk) in source.pk_cols().iter().enumerate() {
-        let pk = pk as usize;
-        let slot = match slots.iter().position(|(item, ..)| item.as_col() == Some(pk)) {
-            Some(pos) => {
-                let (item, id, def) = slots.remove(pos);
-                let def = match def.is_hidden {
-                    true => source.columns()[pk].clone().hidden(),
-                    false => def,
-                };
-                (item, id, def)
-            }
-            None => (BExpr::ColRef(pk), None, source.columns()[pk].clone().hidden()),
-        };
-        slots.insert(target, slot);
-    }
 }
 
 #[cfg(test)]

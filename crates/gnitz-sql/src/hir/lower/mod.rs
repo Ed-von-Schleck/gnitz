@@ -17,13 +17,13 @@ mod reduce;
 mod setop;
 mod spine;
 
-use super::physical::Frame;
+use super::physical::{Frame, Relabel};
 use super::{ColSet, HirCol, ProjEntry, RelExpr, col_by_id};
 use crate::error::GnitzSqlError;
 use gnitz_core::{PlannedView, RelDescriptor, pending_id};
 use gnitz_wire::Circuit;
 use rustc_hash::{FxHashMap, FxHashSet};
-use spine::{Head, Level, Top};
+use spine::{Head, Level};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -170,29 +170,31 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
     let peeled = spine::peel(chain, rel, &live);
     let core = peeled.bottom;
     // The bottom node is this body's own where it is under no shared subtree.
-    let (mut pieces, top) = match (peeled.cut.0 == 0, core.as_ref()) {
+    // A reduce read only through renames stays the circuit's output, whose store
+    // holds its history, so its rows are not copied into a second one: the
+    // columns no level names are stored hidden beside the others.
+    let top = match core.as_ref() {
+        RelExpr::Reduce { .. } if peeled.levels.iter().all(|(l, _)| matches!(l, Level::Project(_))) => Relabel::InOrder,
+        _ => Relabel::Whole,
+    };
+    let mut pieces = match (peeled.cut.0 == 0, core.as_ref()) {
         (true, RelExpr::Join { left, right, kind, on }) => {
             return join::lower_join_view(chain, peeled, [left, right], *kind, on);
         }
-        // A reduce read only through renames stays the circuit's output, whose store
-        // holds its history, so its rows are not copied into a second one: the
-        // columns no level names are stored hidden beside the others.
         (true, RelExpr::Reduce { input, group_cols, aggs, kind }) => {
-            let renames = peeled.levels.iter().all(|(l, _)| matches!(l, Level::Project(_)));
-            let pieces = reduce::lower_reduce(chain, input, group_cols, aggs, *kind)?;
-            (pieces, if renames { Top::Store } else { Top::Output })
+            reduce::lower_reduce(chain, input, group_cols, aggs, *kind)?
         }
         (true, RelExpr::Ordered { input, partition, order, op }) => {
-            (reduce::lower_ordered(chain, input, partition, order, op)?, Top::Output)
+            reduce::lower_ordered(chain, input, partition, order, op)?
         }
-        (true, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => (setop::lower_setop(chain, core)?, Top::Output),
+        (true, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => setop::lower_setop(chain, core)?,
         // A linear body: the levels over its one source. The circuit carries no
         // exchange: a filter or map neither re-keys nor redistributes its source.
         _ => {
             let spine = peeled.open(chain)?;
             let pk_repeats = spine.seg.pk_repeats;
             let mut circuit = Circuit::default();
-            let (_, out) = spine.emit(&mut circuit, Top::Output, None)?;
+            let (_, out) = spine.emit(&mut circuit, Relabel::Whole, None)?;
             return Ok(EmitPieces { circuit, out, pk_repeats });
         }
     };

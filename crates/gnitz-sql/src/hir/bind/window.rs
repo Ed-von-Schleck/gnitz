@@ -42,7 +42,7 @@
 //! specification). An ordered specification also reads the rows of the
 //! partition before the changed one, and keeps one index entry per row of `W`.
 
-use super::super::{ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr};
+use super::super::{ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, OrderCol, OrderedOp, ProjEntry, RelExpr};
 use super::{BindCx, ItemLeaf, bind_projection, place_order_keys};
 use crate::agg::{AggArg, AggFunc, agg_func_from_name};
 use crate::ast_util::{CallSurface, PlainCall, classify_agg_shape, single_part_ident, unknown_function};
@@ -124,7 +124,21 @@ pub(super) fn bind_select_list<L: ItemLeaf>(
     }
     let Windows { w, mut calls } = win;
     for call in &mut calls {
-        call.order = effective_order(call, key.as_deref());
+        // The call's order as its plan keys on it: the written keys — a
+        // ROW_NUMBER's extended by the input's unique key, which makes the order
+        // total over a set — less any key the partition or an earlier key fixes.
+        let tiebreak = (key.as_deref())
+            .filter(|_| call.func == WinFunc::RowNumber)
+            .into_iter()
+            .flatten()
+            .map(|&col| OrderCol { col, desc: false, nulls_first: false });
+        let mut order: Vec<OrderCol> = Vec::new();
+        for k in call.order.iter().copied().chain(tiebreak) {
+            if !call.partition.contains(&k.col) && !order.iter().any(|o| o.col == k.col) {
+                order.push(k);
+            }
+        }
+        call.order = order;
         for &p in &call.partition {
             if call.order.is_empty() && def_of(&w, p).is_nullable {
                 return Err(GnitzSqlError::rejected(
@@ -176,7 +190,7 @@ pub(super) fn bind_select_list<L: ItemLeaf>(
         rows = running_values(ids, rows, spec, &mut values)?;
     }
     if let Some((call, slots)) = cut {
-        rows = RelExpr::top_n(rows, call.partition, call.order, slots)?;
+        rows = RelExpr::ordered(rows, call.partition, call.order, OrderedOp::TopN(slots))?;
     }
     // Every unordered specification's `γ_P(W)`, joined onto the rows. One with no
     // partition key is a keyless (cross) join against the one global row.
@@ -538,24 +552,6 @@ fn frame_is_whole(frame: Option<&WindowFrame>) -> Result<bool, GnitzSqlError> {
 
 // ── Desugar ─────────────────────────────────────────────────────────────────────
 
-/// A call's order as its plan keys on it: the written keys — a ROW_NUMBER's
-/// extended by `key`, the input's unique key, which makes the order total over a
-/// set — less any key the partition or an earlier key already fixes.
-fn effective_order(call: &Call, key: Option<&[ColId]>) -> Vec<OrderCol> {
-    let tiebreak = key
-        .filter(|_| call.func == WinFunc::RowNumber)
-        .into_iter()
-        .flatten()
-        .map(|&col| OrderCol { col, desc: false, nulls_first: false });
-    let mut order: Vec<OrderCol> = Vec::new();
-    for k in call.order.iter().copied().chain(tiebreak) {
-        if !call.partition.contains(&k.col) && !order.iter().any(|o| o.col == k.col) {
-            order.push(k);
-        }
-    }
-    order
-}
-
 /// The weight slots a QUALIFY conjunct `rn <= n`, `rn < n` or `rn = n` over placeholder `rn` keeps of each
 /// partition, the literal on either side; `None` for any other predicate, or a
 /// bound keeping no slot.
@@ -655,7 +651,12 @@ fn running_values(
         };
         values.insert(c.out.id, value);
     }
-    RelExpr::window(rows, partition, order, HirAgg::physical(&aggs), rank, dense_rank)
+    let op = OrderedOp::Window {
+        aggs: HirAgg::physical(&aggs),
+        rank,
+        dense_rank,
+    };
+    RelExpr::ordered(rows, partition, order, op)
 }
 
 /// An unordered specification's `γ_P(W)` and its key columns in partition order,

@@ -4,9 +4,9 @@
 //! stored a second time beside an ordered operator's index. The reduce layout they
 //! and the ad-hoc fold share is `Frame::group_aggs` and `Frame::keyed_by`.
 
-use super::super::physical::{self, Slot};
+use super::super::physical::{self, Relabel, Slot};
 use super::super::{AggCol, ColId, ColSet, HirCol, OrderCol, OrderedOp, ProjEntry, RelExpr, reduce_reads};
-use super::spine::{Top, peel};
+use super::spine::peel;
 use super::{EmitPieces, ViewChain};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
@@ -28,7 +28,9 @@ pub(super) fn lower_reduce(
     // The spine's output is what the reduce groups and aggregates over, so the
     // group/argument positions, the strategy and the reduce-output layout all
     // resolve against it.
-    let (mut node, mut frame) = peel(chain, input, &live).open(chain)?.emit(&mut cb, Top::Slots, None)?;
+    let (mut node, mut frame) = peel(chain, input, &live)
+        .open(chain)?
+        .emit(&mut cb, Relabel::Slots, None)?;
     // The exchange ahead of the reduce carries only the PK and the columns the
     // reduce reads. A projection is linear and every aggregate reads only `live`,
     // so the reduce's output is the same. An ungrouped reduce pre-aggregates ahead
@@ -48,7 +50,6 @@ pub(super) fn lower_reduce(
         node = map.map_or(node, |map| cb.map_expr(node, map));
         frame = pruned;
     }
-
     let mut agg = frame.group_aggs(group_cols, aggs)?;
     let mut cols: Vec<Slot> = aggs.iter().map(|c| c.col.slot()).collect();
     // The engine reads group existence off a COUNT(*); a hidden one if no
@@ -75,7 +76,7 @@ pub(super) fn lower_ordered(
     let mut cb = Circuit::default();
     let (node, frame) = peel(chain, input, &live)
         .open(chain)?
-        .emit(&mut cb, Top::KeyFirst, None)?;
+        .emit(&mut cb, Relabel::Never, None)?;
     let npk = frame.schema.pk_cols().len();
     debug_assert!(
         frame.schema.pk_cols().iter().copied().eq(0..npk as u32),

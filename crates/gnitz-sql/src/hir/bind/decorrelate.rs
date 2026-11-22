@@ -2,7 +2,7 @@
 //! Bind reads each subquery through its column ([`SubqueryRef::id`]); its join
 //! produces that column.
 
-use super::super::{ColId, ExistsKind, HirExpr, JoinType, ProjEntry, RelExpr, split_filter};
+use super::super::{ColId, ExistsKind, HirExpr, JoinType, ProjEntry, RelExpr};
 use super::subquery::{SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
@@ -18,7 +18,10 @@ pub(super) fn decorrelate(
     if subs.is_empty() {
         return Ok(RelExpr::project(source, items));
     }
-    let (preds, input) = split_filter(&source);
+    let (preds, input): (&[HirExpr], _) = match source.as_ref() {
+        RelExpr::Filter { input, preds } => (preds, input),
+        _ => (&[], &source),
+    };
     let mut joins = Joins {
         pending: subs.iter().collect(),
         cur: Rc::clone(input),
@@ -27,7 +30,10 @@ pub(super) fn decorrelate(
     for pred in preds {
         // A bare WHERE conjunct reading an EXISTS/IN is a Semi/Anti join, and
         // leaves the filter.
-        let (bare, negated) = peel_not(pred);
+        let (mut bare, mut negated) = (pred, false);
+        while let BExpr::Not(inner) = bare {
+            (bare, negated) = (inner, !negated);
+        }
         if let Some(s) = bare
             .as_col()
             .and_then(|id| joins.find(id))
@@ -80,9 +86,27 @@ impl<'s> Joins<'s> {
         self.pending.iter().copied().find(|s| s.id == id)
     }
 
-    /// Join `s` in as `kind` on its correlation.
+    /// Join `s` in as `kind` on its correlation. An IN over a nullable operand is
+    /// three-valued; only a top-level conjunct — a semi-join, where WHERE reads NULL
+    /// as false — computes it exactly.
     fn join(&mut self, s: &SubqueryRef, kind: JoinType) -> Result<(), GnitzSqlError> {
-        reject_nullable_in(kind, s)?;
+        let refusal = match (s.kind, kind) {
+            (SubqueryKind::Exists { nullable: true }, JoinType::Exists(ExistsKind::Anti)) => Some(
+                "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
+                 NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
+                 use NOT EXISTS with an explicit equality instead",
+            ),
+            (SubqueryKind::Exists { nullable: true }, JoinType::Exists(ExistsKind::Mark(_))) => Some(
+                "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
+                 the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
+                 from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \
+                 NOT EXISTS with an explicit equality",
+            ),
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            return Err(GnitzSqlError::rejected(refusal));
+        }
         self.cur = RelExpr::join(Rc::clone(&self.cur), Rc::clone(&s.rel), kind, s.correlation.clone())?;
         self.pending.retain(|p| p.id != s.id);
         Ok(())
@@ -102,16 +126,6 @@ impl<'s> Joins<'s> {
     }
 }
 
-/// `e` under every `NOT` wrapping it, and whether their count is odd.
-fn peel_not(mut e: &HirExpr) -> (&HirExpr, bool) {
-    let mut negated = false;
-    while let BExpr::Not(inner) = e {
-        e = inner;
-        negated = !negated;
-    }
-    (e, negated)
-}
-
 /// `e` reading each of `counts` — a COUNT joined as LEFT, which null-fills an
 /// outer row its reduce has no group for — as 0 where it is NULL.
 fn zero_absent_counts(e: HirExpr, counts: &[ColId]) -> HirExpr {
@@ -125,26 +139,4 @@ fn zero_absent_counts(e: HirExpr, counts: &[ColId]) -> HirExpr {
             false => col,
         }
     })
-}
-
-/// An IN over a nullable operand is three-valued; only a top-level conjunct — a
-/// semi-join, where WHERE reads NULL as false — computes it exactly.
-fn reject_nullable_in(kind: JoinType, s: &SubqueryRef) -> Result<(), GnitzSqlError> {
-    if !matches!(s.kind, SubqueryKind::Exists { nullable: true }) {
-        return Ok(());
-    }
-    match kind {
-        JoinType::Exists(ExistsKind::Anti) => Err(GnitzSqlError::rejected(
-            "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
-             NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
-             use NOT EXISTS with an explicit equality instead",
-        )),
-        JoinType::Exists(ExistsKind::Mark(_)) => Err(GnitzSqlError::rejected(
-            "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
-             the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
-             from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \
-             NOT EXISTS with an explicit equality",
-        )),
-        _ => Ok(()),
-    }
 }

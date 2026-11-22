@@ -5,7 +5,7 @@
 //! else pruned to what its one reader reads. The same levels over a combine are
 //! emitted over its node.
 
-use super::super::physical::{self, Frame};
+use super::super::physical::{self, Frame, Relabel};
 use super::super::{ColId, ColSet, HirExpr, ProjEntry, RelExpr};
 use super::{SegInput, ViewChain};
 use crate::access::candidates;
@@ -136,20 +136,6 @@ pub(super) fn peel<'a>(chain: &ViewChain, rel: &'a Rc<RelExpr>, live: &ColSet) -
     Peeled { levels, bottom, read, cut }
 }
 
-/// What the consumer needs of the outermost projection: its exact columns under
-/// any numbering (a view's output), its exact columns key first (a top-N or window
-/// carrying every input column), only a slot per column it reads (a reduce, a set
-/// operation's leaves, a join's inputs), or its columns in their written order
-/// beside whatever else the node below holds (a reduce's output the view stores).
-/// Every inner projection is read as a slot per column.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Top {
-    Output,
-    KeyFirst,
-    Slots,
-    Store,
-}
-
 /// Where the levels' rows start.
 pub(super) enum Head {
     /// The source `tid`, its delta co-located by `scatter` ahead of the circuit —
@@ -166,28 +152,23 @@ pub(super) enum Head {
 }
 
 impl Spine<'_> {
-    /// The slot of the opened source each of `ids` is a verbatim copy of, or `None`
-    /// where one is computed. A bare column reference copies its column verbatim,
-    /// whether [`emit_levels`] relabels it or emits it; anything else ends that
-    /// column's chain.
-    pub(super) fn source_slots(&self, ids: impl IntoIterator<Item = ColId>) -> Option<Vec<u32>> {
-        (ids.into_iter())
-            .map(|mut id| {
-                for (level, _) in &self.levels {
-                    if let Level::Project(items) = level {
-                        id = items.iter().find(|it| it.out.id == id)?.expr.as_col()?;
-                    }
-                }
-                Some(self.seg.frame.slot(id).ok()? as u32)
-            })
-            .collect()
+    /// The slot of the opened source `id` is a verbatim copy of, or `None` where it
+    /// is computed. A bare column reference copies its column verbatim, whether
+    /// [`emit_levels`] relabels it or emits it; anything else ends the chain.
+    pub(super) fn source_slot(&self, mut id: ColId) -> Option<u32> {
+        for (level, _) in &self.levels {
+            if let Level::Project(items) = level {
+                id = items.iter().find(|it| it.out.id == id)?.expr.as_col()?;
+            }
+        }
+        Some(self.seg.frame.slot(id).ok()? as u32)
     }
 
     /// Emit the source, co-located by `scatter`, and the levels into `cb`.
     pub(super) fn emit(
         self,
         cb: &mut Circuit,
-        top: Top,
+        top: Relabel,
         scatter: Option<Vec<ReindexSlot>>,
     ) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels } = self;
@@ -197,15 +178,13 @@ impl Spine<'_> {
 }
 
 /// Emit `levels`, innermost first, over `head`, whose rows `frame` addresses. A
-/// rename-only projection relabels the frame instead of emitting a node, except
-/// the outermost one under `Top::KeyFirst`, under `Top::Output` one that would move
-/// or drop a payload column, and under `Top::Store` one that would move a column.
-/// The WHERE levels between two emitted nodes are one filter: a relabel moves no
-/// slot.
+/// rename-only projection relabels the frame instead of emitting a node: the
+/// outermost one as `top` admits, every inner one as a slot per column. The WHERE
+/// levels between two emitted nodes are one filter: a relabel moves no slot.
 pub(super) fn emit_levels(
     cb: &mut Circuit,
     levels: &[(Level<'_>, ColSet)],
-    top: Top,
+    top: Relabel,
     mut frame: Frame,
     mut head: Head,
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
@@ -223,13 +202,8 @@ pub(super) fn emit_levels(
             true => Cow::Borrowed(items),
             false => items.iter().filter(|it| read.contains(it.out.id)).cloned().collect(),
         };
-        let relabeled = match (outermost == Some(i)).then_some(top) {
-            None | Some(Top::Slots) => frame.relabeled(&items)?,
-            Some(Top::Store) => frame.relabeled_in_order(&items)?,
-            Some(Top::Output) => frame.relabeled_whole(&items, false)?,
-            Some(Top::KeyFirst) => None,
-        };
-        if let Some(relabeled) = relabeled {
+        let how = if outermost == Some(i) { top } else { Relabel::Slots };
+        if let Some(relabeled) = frame.relabeled(&items, how)? {
             frame = relabeled;
             continue;
         }

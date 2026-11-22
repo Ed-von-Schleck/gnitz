@@ -1,9 +1,9 @@
 //! The set-operation and DISTINCT shell: each leaf, opened through the spine, is
 //! keyed by its element's identity and combined by weight arithmetic.
 
-use super::super::physical::{self, Frame};
+use super::super::physical::{self, Frame, Relabel};
 use super::super::{HirCol, ProjEntry, RelExpr, SetOpKind};
-use super::spine::{Top, peel};
+use super::spine::peel;
 use super::{EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{Circuit, ColumnDef, NARROW_PK_MAX_BYTES, NodeId, NullKeys, ReadBound, ReindexSlot, TypeCode};
@@ -39,7 +39,7 @@ pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<Em
     combine(&mut Circuit::default(), rel, false, &mut |dry, side| {
         let cols = side.cols().into_owned();
         let spine = peel(chain, side, &cols.iter().map(|c| c.id).collect()).open(chain)?;
-        let (node, frame) = spine.emit(&mut cb, Top::Slots, None)?;
+        let (node, frame) = spine.emit(&mut cb, Relabel::Slots, None)?;
         leaves.push(Leaf { cols, node, frame });
         Ok(dry.input_delta(0, ReadBound::None))
     })?;

@@ -23,8 +23,8 @@ mod window;
 pub(crate) use window::ranking_names;
 
 use super::{
-    ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind, col_by_id, hircol_of,
-    schema_cols,
+    ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, OrderedOp, ProjEntry, RelExpr, SetOpKind, col_by_id,
+    hircol_of, schema_cols,
 };
 use crate::ast_util::{
     body_is_grouped, col_ref_parts, is_agg_call, peel_nested, select_is_distinct, single_part_ident,
@@ -361,7 +361,7 @@ pub(super) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExp
         }
     };
     match slots {
-        Some(slots) => RelExpr::top_n(rel, Vec::new(), order, slots),
+        Some(slots) => RelExpr::ordered(rel, Vec::new(), order, OrderedOp::TopN(slots)),
         None => Ok(rel),
     }
 }
@@ -507,8 +507,8 @@ pub(super) fn bind_select(
 
     // WHERE, then the projection in whichever shape the body carries. DISTINCT
     // outranks a grouped shape, and either sits above a join, which lowering
-    // cuts. The projection is bound in SELECT order (`place_pk_front` is
-    // physical, applied at lowering).
+    // cuts. The projection is bound in SELECT order (the PK-front
+    // placement is physical, applied at lowering).
     let ctx = &format!("{stmt} projection");
     if let Some(where_expr) = &select.selection {
         let leaf = ScopeLeaf { scope: &scope, sub };

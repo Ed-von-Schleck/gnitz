@@ -95,7 +95,7 @@ fn join_keep_rules() {
             .map(|&(side, slot)| col(side, slot))
             .chain(matches!(kind, Exists(Mark(_))).then_some(mark))
             .collect();
-        let got = join_keep(&refs, &class, kind, out_key(plan, kind), &frames).unwrap();
+        let got = join_keep(&refs, &class, kind, out_key(plan, kind), frames.each_ref()).unwrap();
         let got = got.each_ref().map(Vec::as_slice);
         assert_eq!(got, want, "{shape:?} {kind:?} reads={reads:?}");
     }

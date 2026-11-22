@@ -3,7 +3,7 @@
 //! the relation — a CTE reference is one — compose by substitution into the tree
 //! the flat query binds to, which the rows reply or the fold then lower.
 
-use super::physical::{self, Frame};
+use super::physical::{self, Frame, Relabel};
 use super::{AggCol, BoundRef, ColId, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, hircol_of, reduce_reads};
 use crate::error::{GnitzSqlError, derivation};
 use crate::ir::{BExpr, BoundExpr};
@@ -265,7 +265,7 @@ pub(crate) fn lower_read(
             // The pre-map over the source, under the spine's rule: one copying distinct
             // source columns relabels the source, which the reduce then reads in place;
             // anything else is a map.
-            let (map, reduce_in) = match src.relabeled(&pre)? {
+            let (map, reduce_in) = match src.relabeled(&pre, Relabel::Slots)? {
                 Some(relabeled) => (None, relabeled),
                 None => physical::projection_map(&pre, &src)?,
             };
@@ -352,7 +352,11 @@ pub(crate) fn reply_rows(
     // A reply moving no column ships the relation's regions as they are, a view's
     // hidden columns carried along hidden instead of the others being copied out
     // from beside them.
-    let (proj, out, program) = match src.relabeled_whole(&items, rides_hidden)? {
+    let how = match rides_hidden {
+        true => Relabel::WholeCarryingHidden,
+        false => Relabel::Whole,
+    };
+    let (proj, out, program) = match src.relabeled(&items, how)? {
         Some(out) => ((0..out.layout.len()).map(BoundExpr::ColRef).collect(), out, None),
         None => {
             let (proj, out) = physical::physicalize_projection(&items, &src)?;

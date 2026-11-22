@@ -186,20 +186,6 @@ struct GroupedLeaf<'a> {
     state: RefCell<Grouping>,
 }
 
-impl GroupedLeaf<'_> {
-    /// The group-key column an expression names, if it names one. Binding through
-    /// the **body's own leaf** is what makes one rule serve both spellings: a bare
-    /// reference binds to its own column, a written key to the pre-map column
-    /// holding it, and `l.v` in a join resolves the way the body resolves it.
-    fn group_key(&self, e: &Expr) -> Option<ColId> {
-        let bound = bind_structural(e, self.leaf).ok()?;
-        self.state
-            .borrow()
-            .find(&bound)
-            .filter(|id| self.group_cols.contains(id))
-    }
-}
-
 impl ItemLeaf for GroupedLeaf<'_> {
     /// `None` for a pre-map or aggregate column, which the body's scope does not hold.
     fn source_name(&self, id: ColId) -> Option<Arc<str>> {
@@ -231,12 +217,18 @@ impl LeafTyping<ColId> for GroupedLeaf<'_> {
 impl LeafBinder<ColId> for GroupedLeaf<'_> {
     /// A written GROUP BY key, wherever it appears: `(a + b) * 2` binds over
     /// `GROUP BY a + b`. With no computed key there is nothing to match, and
-    /// `bind_column` answers the bare names on its own.
+    /// `bind_column` answers the bare names on its own. Binding through the
+    /// **body's own leaf** is what makes one rule serve both spellings: a bare
+    /// reference binds to its own column, a written key to the pre-map column
+    /// holding it, and `l.v` in a join resolves the way the body resolves it.
     fn bind_node(&self, e: &Expr) -> Option<HirExpr> {
         if !self.computed_keys {
             return None;
         }
-        Some(BExpr::ColRef(self.group_key(e)?))
+        let bound = bind_structural(e, self.leaf).ok()?;
+        (self.state.borrow().find(&bound))
+            .filter(|id| self.group_cols.contains(id))
+            .map(BExpr::ColRef)
     }
 
     /// A group key binds to its column; a name the body resolves but the

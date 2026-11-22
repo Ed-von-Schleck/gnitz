@@ -496,11 +496,26 @@ impl HirAgg {
     /// aggregate as a CASE on it. A float SUM or AVG over a row of +inf is +inf,
     /// over one of -inf is -inf, and over both, or over a NaN, is NaN.
     pub(crate) fn finalize(&self) -> HirExpr {
-        let value = self.finite_value();
+        let col = |c: &AggCol| BExpr::ColRef(c.col.id);
+        let value = match &self.companion {
+            None => col(&self.out),
+            // The cast makes the division a float one; dividing by a zero count is NULL.
+            Some(count) if self.func == AggFunc::Avg => {
+                let value = BExpr::Cast {
+                    expr: Box::new(col(&self.out)),
+                    to: ColType::of(TypeCode::F64),
+                };
+                BExpr::bin(value, BinOp::Div, col(count))
+            }
+            Some(count) => BExpr::Case {
+                branches: vec![(BExpr::bin(col(count), BinOp::Ne, BExpr::LitInt(0)), col(&self.out))],
+                else_: Box::new(BExpr::LitNull),
+            },
+        };
         let Some([pos, neg]) = &self.infs else {
             return value;
         };
-        let some = |c: &AggCol| BExpr::bin(BExpr::ColRef(c.col.id), BinOp::Ne, BExpr::LitInt(0));
+        let some = |c: &AggCol| BExpr::bin(col(c), BinOp::Ne, BExpr::LitInt(0));
         let float = |v: f64| BExpr::LitFloat { v: F64Bits(v), dec: None };
         BExpr::Case {
             branches: vec![
@@ -510,38 +525,6 @@ impl HirAgg {
             ],
             else_: Box::new(value),
         }
-    }
-
-    /// [`Self::finalize`] over the finite values alone.
-    fn finite_value(&self) -> HirExpr {
-        let value = BExpr::ColRef(self.out.col.id);
-        let Some(count) = &self.companion else {
-            return value;
-        };
-        let cnt = BExpr::ColRef(count.col.id);
-        if self.func == AggFunc::Avg {
-            // The cast makes the division a float one; dividing by a zero count is NULL.
-            let value = BExpr::Cast {
-                expr: Box::new(value),
-                to: ColType::of(TypeCode::F64),
-            };
-            BExpr::bin(value, BinOp::Div, cnt)
-        } else {
-            let present = BExpr::bin(cnt, BinOp::Ne, BExpr::LitInt(0));
-            BExpr::Case {
-                branches: vec![(present, value)],
-                else_: Box::new(BExpr::LitNull),
-            }
-        }
-    }
-}
-
-/// Split an optional `Filter` off a node, returning its conjuncts (empty when
-/// absent) and the source below it, as the `Rc` decorrelation builds on.
-pub(crate) fn split_filter(input: &Rc<RelExpr>) -> (&[HirExpr], &Rc<RelExpr>) {
-    match input.as_ref() {
-        RelExpr::Filter { input, preds } => (preds, input),
-        _ => (&[], input),
     }
 }
 
@@ -659,7 +642,7 @@ impl JoinClass {
     }
 
     /// The key pairs, one per key slot: the eq pairs, then the range's.
-    fn keys(&self) -> impl Iterator<Item = &KeyPair> {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &KeyPair> {
         self.eq.iter().chain(self.range.as_ref().map(|(p, _)| p))
     }
 
@@ -672,11 +655,6 @@ impl JoinClass {
     /// and so what a cut input must keep however narrow the demand above it is.
     pub(crate) fn key_cols(&self, side: usize) -> impl Iterator<Item = ColId> {
         self.keys().map(move |p| p.cols[side])
-    }
-
-    /// Each key slot's common type, in [`Self::key_cols`] order.
-    pub(crate) fn key_types(&self) -> impl Iterator<Item = ColType> {
-        self.keys().map(|p| p.ty)
     }
 
     /// The physical join these keys call for.
@@ -710,19 +688,6 @@ impl JoinClass {
     }
 }
 
-/// Reject a float among `keys`, columns of `input`, as a hashed key of clause `role`.
-fn reject_float_group(input: &RelExpr, keys: &[ColId], role: &str) -> Result<(), GnitzSqlError> {
-    let cols = input.cols();
-    crate::rules::reject_float_keys(keys.iter().map(|&k| &hircol_of(&cols, k).def), role)
-}
-
-/// `key`, a set of `from`'s columns, as the columns at the same positions of `to`.
-fn rename_key(key: Vec<ColId>, from: &[HirCol], to: &[HirCol]) -> Option<Vec<ColId>> {
-    key.iter()
-        .map(|k| from.iter().position(|c| c.id == *k).map(|p| to[p].id))
-        .collect()
-}
-
 /// The type a set-op column pair shares: its own where the two agree, else one a
 /// column copy widens both into. `None` where there is neither.
 fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
@@ -752,7 +717,7 @@ impl RelExpr {
     }
 
     /// A projection: its output columns are the `ProjEntry.out`s (SELECT order —
-    /// `place_pk_front` is physical, applied at lowering, not here).
+    /// the PK-front placement is physical, applied at lowering, not here).
     pub(crate) fn project(input: Rc<RelExpr>, items: Vec<ProjEntry>) -> Rc<RelExpr> {
         Rc::new(RelExpr::Project { input, items })
     }
@@ -766,7 +731,8 @@ impl RelExpr {
         kind: ReduceKind,
         role: &str,
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        reject_float_group(&input, &group_cols, role)?;
+        let cols = input.cols();
+        crate::rules::reject_float_keys(group_cols.iter().map(|&k| &hircol_of(&cols, k).def), role)?;
         Ok(Rc::new(RelExpr::Reduce { input, group_cols, aggs, kind }))
     }
 
@@ -781,42 +747,26 @@ impl RelExpr {
         Ok(Rc::new(RelExpr::Distinct { input }))
     }
 
-    /// A top-N over `input`. `slots.keep ≥ 1`, and every key names an input column.
-    /// A partition is a window's PARTITION BY.
-    pub(crate) fn top_n(
+    /// `op` over each `partition` value of `input` kept in `order`. Every key names
+    /// an input column; a top-N keeps at least one slot, and a window has an order
+    /// and a value.
+    pub(crate) fn ordered(
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
         order: Vec<OrderCol>,
-        slots: WeightSlots,
+        op: OrderedOp,
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        debug_assert!(slots.keep >= 1, "a top-N selects at least one slot");
-        reject_float_group(&input, &partition, "window PARTITION BY")?;
-        Ok(Rc::new(RelExpr::Ordered {
-            input,
-            partition,
-            order,
-            op: OrderedOp::TopN(slots),
-        }))
-    }
-
-    /// The running values of `input` over `partition` in `order`. Every key
-    /// names an input column, `order` is not empty, and there is a value.
-    pub(crate) fn window(
-        input: Rc<RelExpr>,
-        partition: Vec<ColId>,
-        order: Vec<OrderCol>,
-        aggs: Vec<AggCol>,
-        rank: Option<HirCol>,
-        dense_rank: Option<HirCol>,
-    ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        debug_assert!(!order.is_empty() && (!aggs.is_empty() || rank.is_some() || dense_rank.is_some()));
-        reject_float_group(&input, &partition, "window PARTITION BY")?;
-        Ok(Rc::new(RelExpr::Ordered {
-            input,
-            partition,
-            order,
-            op: OrderedOp::Window { aggs, rank, dense_rank },
-        }))
+        debug_assert!(match &op {
+            OrderedOp::TopN(slots) => slots.keep >= 1,
+            OrderedOp::Window { aggs, rank, dense_rank } =>
+                !order.is_empty() && (!aggs.is_empty() || rank.is_some() || dense_rank.is_some()),
+        });
+        let cols = input.cols();
+        crate::rules::reject_float_keys(
+            partition.iter().map(|&k| &hircol_of(&cols, k).def),
+            "window PARTITION BY",
+        )?;
+        Ok(Rc::new(RelExpr::Ordered { input, partition, order, op }))
     }
 
     /// A fresh read of `input` under `defs`, one per input column in order, each
@@ -855,7 +805,12 @@ impl RelExpr {
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             // positive_part(A − B) ≤ A and min(A, B) ≤ A, B; a widened key stays a key.
             RelExpr::SetOp { op, left, right, out } => {
-                let kept = |side: &RelExpr| rename_key(side.unique_key()?, &side.cols(), out);
+                // A side's key as the columns at the same positions of `out`.
+                let kept = |side: &RelExpr| {
+                    let cols = side.cols();
+                    let at = |k: &ColId| cols.iter().position(|c| c.id == *k).map(|p| out[p].id);
+                    side.unique_key()?.iter().map(at).collect()
+                };
                 match op {
                     SetOpKind::Union => None,
                     SetOpKind::Except => kept(left),
