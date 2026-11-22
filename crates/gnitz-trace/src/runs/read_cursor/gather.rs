@@ -12,7 +12,6 @@ use std::ops::ControlFlow;
 use super::{ReadCursor, SkeletonKeys, hydrate_skeletons};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::{gather_rows, with_picks};
-use gnitz_zset::schema::SchemaDescriptor;
 
 pub struct PkSetGather {
     cursor: ReadCursor,
@@ -45,11 +44,6 @@ impl PkSetGather {
     /// [`ReadCursor::skip_payload`] on the cursor the keys are gathered from.
     pub fn skip_payload(&mut self, skip: u64) {
         self.cursor.skip_payload(skip);
-    }
-
-    /// The schema of the rows the keys are gathered from.
-    pub fn schema(&self) -> &SchemaDescriptor {
-        &self.cursor.schema
     }
 
     fn remaining_keys(&self) -> usize {

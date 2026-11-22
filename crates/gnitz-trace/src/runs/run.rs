@@ -16,7 +16,9 @@ use crate::runs::MappedShard;
 use gnitz_wire::{Heap, RowSource};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::ColPtr;
-use gnitz_zset::repr::{ColumnarSource, DecodedColumns};
+use gnitz_zset::repr::{ColumnarSource, DecodedColumns, gather_rows, with_picks};
+use gnitz_zset::schema::SchemaDescriptor;
+use smallvec::SmallVec;
 
 #[derive(Clone)]
 pub enum Run {
@@ -42,6 +44,15 @@ impl Run {
             Run::Shard(s) => s.seek(key, hint),
         }
     }
+
+    /// The address of the backing, equal for two `Run`s exactly when they
+    /// share one.
+    fn backing(&self) -> *const () {
+        match self {
+            Run::Mem(b) => Rc::as_ptr(b).cast(),
+            Run::Shard(s) => Rc::as_ptr(s).cast(),
+        }
+    }
 }
 
 /// One located row, pinned to the run that holds it. Keeps its backing alive via
@@ -64,6 +75,33 @@ impl StoredRow {
     #[inline]
     pub fn source(&self) -> (&impl RowSource, usize) {
         (&self.run, self.row)
+    }
+
+    /// `rows`, in order, as one batch of `schema` at `weight`, writing the
+    /// payload columns `skip` names as zeroes (see
+    /// [`ReadCursor::skip_payload`](crate::runs::ReadCursor::skip_payload)),
+    /// copied a column at a time by [`gather_rows`].
+    pub fn gather(
+        schema: &SchemaDescriptor,
+        rows: impl IntoIterator<Item = StoredRow>,
+        weight: i64,
+        skip: u64,
+    ) -> Batch {
+        let mut sources: SmallVec<[Run; 4]> = SmallVec::new();
+        with_picks(|picks| {
+            for StoredRow { run, row } in rows {
+                // Rows of one read come from few runs, often the same one in a row.
+                let src = match sources.iter().rposition(|s| s.backing() == run.backing()) {
+                    Some(i) => i,
+                    None => {
+                        sources.push(run);
+                        sources.len() - 1
+                    }
+                };
+                picks.push((src as u32, row as u32, weight));
+            }
+            gather_rows(&sources, schema, picks, skip)
+        })
     }
 }
 

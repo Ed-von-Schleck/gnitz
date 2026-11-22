@@ -1,5 +1,4 @@
 use super::*;
-use crate::read::source::Source;
 use crate::relation::{IndexClaim, Landing, PkRule, RelationKind};
 use crate::test_support::{
     RelationFixture, TID, batch_rows, col_range, img, make_batch, make_schema_u64_i64, pk_only_schema,
