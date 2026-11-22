@@ -13,10 +13,7 @@ fn col(tc: TypeCode, name: &str, nullable: bool) -> RecordCol<'_> {
 /// Every column `record` holds, and its PK indices.
 fn decode_cols(record: &[u8]) -> Result<(Vec<RecordCol<'_>>, PkIndices), String> {
     let mut cols = Vec::new();
-    let pk = decode(record, |c| {
-        cols.push(c);
-        Ok(())
-    })?;
+    let pk = decode(record, |c| cols.push(c))?;
     Ok((cols, pk))
 }
 

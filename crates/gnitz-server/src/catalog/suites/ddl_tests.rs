@@ -672,7 +672,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 // ---------------------------------------------------------------------------
 
 /// A registration naming both `capacity` and `delta` is refused by the engine,
-/// below the SQL layer (`ViewBudget::from_row`).
+/// below the SQL layer (`ViewTabRow::parts`).
 #[test]
 fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     let (_dir, mut engine) = empty_catalog(1);

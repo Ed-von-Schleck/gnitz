@@ -189,18 +189,6 @@ pub struct DecodedControl {
 }
 
 impl DecodedControl {
-    /// The control of a frame peeked at `at` in a larger buffer, its ranges
-    /// moved onto that buffer.
-    pub(crate) fn placed_at(self, at: usize) -> Self {
-        let shift = |r: Range<usize>| r.start + at..r.end + at;
-        DecodedControl {
-            hdr: self.hdr,
-            blob: shift(self.blob),
-            body: shift(self.body),
-            data: self.data.map(shift),
-        }
-    }
-
     /// The verb a client frame names, refusing a header no client writes and
     /// a section or prologue word that verb does not carry. A multi-item
     /// frame's items are checked as they are decoded.
@@ -332,25 +320,33 @@ pub fn encode_frame_head(out: &mut [u8], hdr: &ControlHeader, blob: &[u8], has_d
 /// Decode the control header at the front of the whole frame `data`, and locate
 /// the blocks behind it.
 pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
+    let mut r = Reader::new(data);
+    let mut ctrl = read_control(&mut r)?;
+    ctrl.body = r.pos()..data.len();
+    Ok(ctrl)
+}
+
+/// Decode the control header at `r`'s position and the blocks behind it, its
+/// ranges indexing `r`'s buffer, and leave `r` past them. `body` is the empty
+/// range there.
+pub(crate) fn read_control(r: &mut Reader<'_>) -> Result<DecodedControl, String> {
     // A header cut short is refused before any word is read, so a field map of
     // it holds no field.
-    if data.len() < CTRL_HEADER_SIZE {
+    if r.remaining() < CTRL_HEADER_SIZE {
         return Err("control header truncated".into());
     }
-    let mut r = Reader::new(data);
     // The header's words in layout order, each read whole: none can run short.
     let whole = "a whole header";
     let (word, target_id) = (r.u64().expect(whole), r.u64().expect(whole));
     let (arg0, arg1) = (r.u64().expect(whole), r.u64().expect(whole));
     let status = r.u32().expect(whole);
-    debug_assert_eq!(r.pos(), CTRL_HEADER_SIZE - 4);
     let blob_len = r.bytes32().map_err(|_| "control blob runs past the frame")?.len();
-    let blob = CTRL_HEADER_SIZE..CTRL_HEADER_SIZE + blob_len;
+    let blob = r.pos() - blob_len..r.pos();
     let status = WireStatus::from_wire(status).ok_or("control header names no status")?;
     let flags = WireFlags::unpack(word)?;
     let data_block = if word & FLAG_HAS_DATA != 0 {
         let at = r.pos();
-        r.take(crate::wal::block_slice(&data[at..])?.len())?;
+        r.take(crate::wal::block_slice(r.rest())?.len())?;
         Some(at..r.pos())
     } else {
         None
@@ -358,7 +354,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
     Ok(DecodedControl {
         hdr: ControlHeader { status, flags, target_id, arg0, arg1 },
         blob,
-        body: r.pos()..data.len(),
+        body: r.pos()..r.pos(),
         data: data_block,
     })
 }

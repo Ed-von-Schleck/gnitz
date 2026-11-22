@@ -127,7 +127,11 @@ impl ReadSpec {
     /// The blob of a SCAN_MULTI item.
     pub fn encode(&self) -> Vec<u8> {
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
-        let mut w = Writer::with_capacity(64 + self.predicate.len() + self.bound.key_bytes() + map);
+        let keys = match &self.bound {
+            ReadBound::PkSet(k) => k.as_bytes().len(),
+            ReadBound::None | ReadBound::Range(_) => 0,
+        };
+        let mut w = Writer::with_capacity(64 + self.predicate.len() + keys + map);
 
         w.put(&self.bound).bytes32(&self.predicate).put(&self.sink.map);
 
@@ -169,18 +173,13 @@ impl ReadSpec {
     }
 }
 
-/// The one `PkSet` layout: stride, key count, then the keys.
-fn write_pk_set(w: &mut Writer, stride: usize, keys: &[u8]) {
-    write_pk_set_head(w, stride, keys.len() / stride);
-    w.raw(keys);
-}
-
-/// [`write_pk_set`]'s stride and key count, which the keys follow.
+/// The head of the one `PkSet` layout: the stride and the key count, which the
+/// keys follow.
 fn write_pk_set_head(w: &mut Writer, stride: usize, count: usize) {
     w.u8(stride as u8).u32(count as u32);
 }
 
-/// [`write_pk_set`]'s inverse: the stride and the keys, not checked for order.
+/// A `PkSet` layout's stride and keys, not checked for order.
 fn read_pk_set<'a>(r: &mut Reader<'a>) -> Result<(usize, &'a [u8]), String> {
     let stride = r.u8()? as usize;
     if !(1..=MAX_PK_BYTES).contains(&stride) {
@@ -197,14 +196,6 @@ impl ReadBound {
         match self {
             ReadBound::Range(r) => Some(r),
             ReadBound::None | ReadBound::PkSet(_) => None,
-        }
-    }
-
-    /// The bytes of the keys a `PkSet` carries; `0` for any other bound.
-    fn key_bytes(&self) -> usize {
-        match self {
-            ReadBound::PkSet(k) => k.as_bytes().len(),
-            _ => 0,
         }
     }
 }
@@ -257,7 +248,8 @@ impl Wire for ReadBound {
 /// The stride, the count, then the keys; [`peek_bound`] reads the same layout.
 impl Wire for PkKeys {
     fn write(&self, w: &mut Writer) {
-        write_pk_set(w, self.stride(), self.as_bytes());
+        write_pk_set_head(w, self.stride(), self.len());
+        w.raw(self.as_bytes());
     }
 
     /// Keys out of order are an `Err`.

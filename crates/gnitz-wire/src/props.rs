@@ -109,16 +109,6 @@ impl ViewBudget {
         }
     }
 
-    /// Decode the `(capacity, delta)` `VIEW_TAB` words, where `0` is absent.
-    pub(crate) fn from_row(capacity: u64, delta: u64) -> Result<ViewBudget, String> {
-        Self::from_budgets(NonZeroU64::new(capacity), NonZeroU64::new(delta))
-    }
-
-    /// The `(capacity, delta)` `VIEW_TAB` words.
-    pub(crate) fn row_words(self) -> (u64, u64) {
-        (self.capacity_bytes().unwrap_or(0), self.delta_bytes().unwrap_or(0))
-    }
-
     pub fn capacity_bytes(self) -> Option<u64> {
         match self {
             ViewBudget::Bounded { capacity_bytes } => Some(capacity_bytes.get()),

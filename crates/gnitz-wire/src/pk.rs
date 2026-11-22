@@ -201,39 +201,40 @@ impl PkKeys {
     /// Keys of `stride` already concatenated in strictly ascending order. A
     /// list past the inline capacity keeps `bytes`' heap buffer as its storage.
     pub fn from_sorted(stride: usize, bytes: impl Into<PkBytes>) -> Self {
-        let bytes = bytes.into();
-        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
-        debug_assert!(strictly_ascending(&bytes, stride), "PkKeys: keys do not ascend");
-        Self::new(stride, bytes)
+        Self::new(stride, bytes.into())
     }
 
     /// Keys of `stride` concatenated in ascending order, adjacent repeats
     /// dropped. A list of at most `MAX_PK_BYTES` never touches the heap.
     pub fn from_ascending(stride: usize, bytes: &[u8]) -> Self {
-        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
         let mut out = PkBytes::with_capacity(bytes.len());
-        for key in bytes.chunks_exact(stride) {
+        // Not `chunks_exact`: a partial key is kept, for `new` to refuse.
+        for key in bytes.chunks(stride) {
             if out.len() < stride || out[out.len() - stride..] != *key {
                 out.extend_from_slice(key);
             }
         }
-        debug_assert!(strictly_ascending(&out, stride), "PkKeys: keys do not ascend");
         Self::new(stride, out)
     }
 
     /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
     /// strictly ascend. `stride` is in range and `bytes` a whole number of keys.
     pub(crate) fn checked(stride: usize, bytes: &[u8]) -> Result<Self, String> {
-        debug_assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
         if !strictly_ascending(bytes, stride) {
             return Err("keys are not strictly ascending".to_string());
         }
-        Ok(Self::new(stride, SmallVec::from_slice(bytes)))
+        // `new` would re-run the order check just made.
+        Ok(PkKeys {
+            stride: stride as u8,
+            bytes: SmallVec::from_slice(bytes),
+        })
     }
 
+    /// Keys of `stride`, trusted to ascend: checked only in debug builds.
     fn new(stride: usize, bytes: PkBytes) -> Self {
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
+        debug_assert!(strictly_ascending(&bytes, stride), "PkKeys: keys do not ascend");
         PkKeys { stride: stride as u8, bytes }
     }
 
@@ -280,7 +281,7 @@ impl PkKeys {
 }
 
 /// Whether `bytes`, read as keys of `stride`, strictly ascend.
-pub(crate) fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
+fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
     bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
 }
 

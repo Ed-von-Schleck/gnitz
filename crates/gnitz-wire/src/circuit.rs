@@ -522,13 +522,6 @@ impl Circuit {
             .expect("a builder wires a well-formed operator on its arity to earlier nodes")
     }
 
-    /// The node scanning `source`, if any.
-    fn scan_of(&self, source: u64) -> Option<NodeId> {
-        self.nodes
-            .iter()
-            .position(|n| matches!(n.op, OpNode::ScanDelta { source: s, .. } if s == source))
-    }
-
     /// A source's delta input. `bound` narrows only the source's backfill scan,
     /// never the rows the view holds, so the caller still emits the full `Filter`.
     pub fn input_delta(&mut self, source: u64, bound: crate::ReadBound) -> NodeId {
@@ -548,11 +541,12 @@ impl Circuit {
         bound: crate::ReadBound,
         scatter: Option<Vec<ReindexSlot>>,
     ) -> Result<NodeId, String> {
-        let Some(nid) = self.scan_of(source) else {
+        let scan = self.nodes.iter_mut().enumerate().find_map(|(nid, n)| match &mut n.op {
+            OpNode::ScanDelta { source: s, bound: held, scatter: stated } if *s == source => Some((nid, held, stated)),
+            _ => None,
+        });
+        let Some((nid, held, stated)) = scan else {
             return Ok(self.add(OpNode::ScanDelta { source, bound, scatter }, &[]));
-        };
-        let OpNode::ScanDelta { bound: held, scatter: stated, .. } = &mut self.nodes[nid].op else {
-            unreachable!("scan_of answers a ScanDelta node")
         };
         if let Some(key) = scatter {
             if stated.as_ref().is_some_and(|s| *s != key) {

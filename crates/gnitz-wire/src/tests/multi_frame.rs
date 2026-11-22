@@ -1,6 +1,6 @@
 use super::*;
-use crate::WireFlags;
 use crate::{CTRL_HEADER_SIZE, WireConflictMode, WireLane, WireStatus};
+use crate::{WireFlags, peek_control_block};
 
 /// [`decode_items`] of a whole item list.
 fn items(body: &[u8], verb: ClientVerb) -> Result<Vec<DecodedControl>, String> {

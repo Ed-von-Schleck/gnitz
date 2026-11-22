@@ -62,14 +62,6 @@ struct Pending<A> {
     admitted: A,
 }
 
-impl<A> Pending<A> {
-    /// The room past the bytes arrived, up to the payload's end.
-    fn tail(&mut self) -> &mut [MaybeUninit<u8>] {
-        let rest = self.len - self.buf.len();
-        &mut self.buf.spare_capacity_mut()[..rest]
-    }
-}
-
 /// One whole payload, and what `admit` answered for it. Borrowed where it lay
 /// whole in the bytes fed.
 pub type Frame<'s, A> = (FrameBytes<'s>, A);
@@ -140,11 +132,14 @@ impl<A> Deframer<A> {
         }
     }
 
-    /// Where the next read lands: the payload in progress when at least a
-    /// carry of it is still to come, else `carry`.
+    /// Where the next read lands: the room past the payload's bytes arrived,
+    /// when at least a carry of it is still to come, else `carry`.
     pub fn window<'a>(&'a mut self, carry: &'a mut [MaybeUninit<u8>]) -> &'a mut [MaybeUninit<u8>] {
         let min = carry.len();
-        let tail = self.pending.as_mut().map(Pending::tail);
+        let tail = self.pending.as_mut().map(|p| {
+            let rest = p.len - p.buf.len();
+            &mut p.buf.spare_capacity_mut()[..rest]
+        });
         match tail.filter(|t| t.len() >= min) {
             Some(tail) => {
                 self.lent = Some(Lent::Payload);

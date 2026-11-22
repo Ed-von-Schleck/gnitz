@@ -105,46 +105,40 @@ impl Iterator for BitIter {
 /// computes them need not collect them first; the bits of the last one at or
 /// past `n` are ignored.
 pub fn set_bit_runs(words: impl IntoIterator<Item = u64>, n: usize, out: &mut Vec<(usize, usize)>) {
+    // The start of a run that reached the top of the previous word: it continues
+    // into this one only while the low bit is still set.
     let mut open: Option<usize> = None;
     let mut base = 0;
     for word in words {
         debug_assert!(base < n, "set_bit_runs: one bit per row");
         // Only the last word has bits at or past `n`; every other mask is all ones.
-        scan_bit_runs(&mut open, base, word & low_bits_mask(n - base), out);
+        let word = word & low_bits_mask(n - base);
+        if word & 1 == 0
+            && let Some(s) = open.take()
+        {
+            out.push((s, base));
+        }
+        // Unscanned bits stay in place, so no shift below reaches 64.
+        let mut rest = word;
+        while rest != 0 {
+            let start_bit = rest.trailing_zeros() as usize;
+            // Filling in below the run's start is what makes `trailing_ones`
+            // measure the run rather than the gap under it.
+            let end_bit = (rest | ((1u64 << start_bit) - 1)).trailing_ones() as usize;
+            let start = open.take().unwrap_or(base + start_bit);
+            if end_bit == 64 {
+                open = Some(start); // reaches the top; the next word may continue it
+                break;
+            }
+            out.push((start, base + end_bit));
+            rest &= !((1u64 << end_bit) - 1);
+        }
         base += 64;
     }
     debug_assert!(base >= n, "set_bit_runs: one bit per row");
     // A run still open reached the top of the last word, which is `n`.
     if let Some(s) = open {
         out.push((s, n));
-    }
-}
-
-/// Append the runs of `word`, the 64 positions from `base`, that end inside it.
-/// `open` is the start of a run that reached the top of the previous word: it
-/// continues into this one only while the low bit is still set, and is left set
-/// when this word's run reaches its top.
-#[inline(always)]
-fn scan_bit_runs(open: &mut Option<usize>, base: usize, word: u64, out: &mut Vec<(usize, usize)>) {
-    if word & 1 == 0
-        && let Some(s) = open.take()
-    {
-        out.push((s, base));
-    }
-    // Unscanned bits stay in place, so no shift below reaches 64.
-    let mut rest = word;
-    while rest != 0 {
-        let start_bit = rest.trailing_zeros() as usize;
-        // Filling in below the run's start is what makes `trailing_ones`
-        // measure the run rather than the gap under it.
-        let end_bit = (rest | ((1u64 << start_bit) - 1)).trailing_ones() as usize;
-        let start = open.take().unwrap_or(base + start_bit);
-        if end_bit == 64 {
-            *open = Some(start); // reaches the top; the next word may continue it
-            break;
-        }
-        out.push((start, base + end_bit));
-        rest &= !((1u64 << end_bit) - 1);
     }
 }
 

@@ -136,8 +136,7 @@ impl Schema {
                 ty: c.ty,
                 is_nullable: c.nullable,
                 is_hidden: c.hidden,
-            });
-            Ok(())
+            })
         })?;
         Schema::from_parts(columns, pk.as_slice())
     }

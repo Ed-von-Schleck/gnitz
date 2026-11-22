@@ -26,11 +26,11 @@
 //! `DELTA_POLL` item and terminal carry, and the held-ids blob ([`encode_held`])
 //! of a `SYNC_PUSHED` request, a single-item verb.
 
-use crate::control::{Section, VerbShape, frame_size};
+use crate::control::{Section, VerbShape, frame_size, read_control};
 use crate::region::Regions;
 use crate::{
     CTRL_HEADER_SIZE, ClientVerb, ControlHeader, DecodedControl, Reader, SysFamily, Target, WireConflictMode, Writer,
-    append_frame, peek_control_block,
+    append_frame,
 };
 use std::fmt;
 use std::num::NonZeroU64;
@@ -104,8 +104,8 @@ pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Resul
     let Some(items) = shape.items else {
         return Err(format!("{verb:?} is not a multi-item verb"));
     };
-    let item = |rest: &[u8]| -> Result<DecodedControl, String> {
-        let ctrl = peek_control_block(rest)?;
+    let item = |r: &mut Reader<'_>| -> Result<DecodedControl, String> {
+        let ctrl = read_control(r)?;
         // `continuation` is the frame's, on its prologue.
         ctrl.hdr.check_client_authored(false)?;
         if ctrl.hdr.flags.verb != Some(verb) {
@@ -117,17 +117,14 @@ pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Resul
     if body.is_empty() {
         return Err(format!("{verb:?}: empty item list"));
     }
-    let mut at = body.start;
+    let mut r = Reader::new(&frame[..body.end]);
+    r.take(body.start)?;
     let mut out = Vec::new();
-    while at < body.end {
+    while r.remaining() > 0 {
         if out.len() == items.cap {
             return Err(format!("{verb:?}: too many items (max {})", items.cap));
         }
-        let mut ctrl =
-            (item(&frame[at..body.end]).map_err(|e| format!("{verb:?} item {}: {e}", out.len())))?.placed_at(at);
-        at = ctrl.body.start;
-        ctrl.body = at..at;
-        out.push(ctrl);
+        out.push(item(&mut r).map_err(|e| format!("{verb:?} item {}: {e}", out.len()))?);
     }
     Ok(out)
 }

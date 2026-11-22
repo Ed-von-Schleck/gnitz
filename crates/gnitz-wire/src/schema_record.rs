@@ -20,7 +20,7 @@
 
 use smallvec::SmallVec;
 
-use crate::codec::{Reader, Writer, decode_all};
+use crate::codec::{Writer, decode_all};
 use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 
 /// One column as the record carries it. `name` borrows the record's own bytes on
@@ -54,21 +54,6 @@ const _: () = assert!(
     "a PK index this wide must be refused"
 );
 
-/// One column, read forward.
-fn take_col<'a>(r: &mut Reader<'a>) -> Result<RecordCol<'a>, String> {
-    let code = r.u8()?;
-    let flags = r.flags(DEFINED_FLAGS)?;
-    let scale = r.u8()?;
-    let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("invalid column type {code}/{scale}"))?;
-    let name = r.str32()?;
-    Ok(RecordCol {
-        ty,
-        nullable: flags & NULLABLE != 0,
-        hidden: flags & HIDDEN != 0,
-        name,
-    })
-}
-
 /// The record for `cols` keyed by `pk_cols`, in declared PK-tuple order. `cols`
 /// is walked twice: a clone sizes the record, the original writes it.
 pub fn encode<'a>(cols: impl Iterator<Item = RecordCol<'a>> + Clone, pk_cols: &[u32]) -> Vec<u8> {
@@ -98,17 +83,27 @@ type PkIndices = SmallVec<[u32; MAX_PK_COLUMNS]>;
 /// Decode and validate `buf`, handing each column to `on_col` in physical order
 /// once the column count is known to lie within [`MAX_COLUMNS`]; returns the PK
 /// column indices.
-pub fn decode<'a>(
-    buf: &'a [u8],
-    mut on_col: impl FnMut(RecordCol<'a>) -> Result<(), String>,
-) -> Result<PkIndices, String> {
+pub fn decode<'a>(buf: &'a [u8], mut on_col: impl FnMut(RecordCol<'a>)) -> Result<PkIndices, String> {
     decode_all(buf, "schema record", |r| {
         let mut pk = PkIndices::new();
         r.items("pk columns", MAX_PK_COLUMNS, |r| {
             pk.push(r.u8()?.into());
             Ok(())
         })?;
-        if r.items("columns", MAX_COLUMNS, |r| on_col(take_col(r)?))?.is_empty() {
+        let cols = r.items("columns", MAX_COLUMNS, |r| {
+            let code = r.u8()?;
+            let flags = r.flags(DEFINED_FLAGS)?;
+            let scale = r.u8()?;
+            let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("invalid column type {code}/{scale}"))?;
+            on_col(RecordCol {
+                ty,
+                nullable: flags & NULLABLE != 0,
+                hidden: flags & HIDDEN != 0,
+                name: r.str32()?,
+            });
+            Ok(())
+        })?;
+        if cols.is_empty() {
             return Err("a record holds at least one column".into());
         }
         Ok(pk)
@@ -120,16 +115,13 @@ pub fn decode<'a>(
 /// words a mismatch: column count, PK list, a column's type (scale included) or
 /// nullability, or else a name or hidden flag no shape record carries.
 pub fn check_shape(got: &[u8], want: &[u8]) -> Result<(), String> {
-    debug_assert!(decode(want, |_| Ok(())).is_ok(), "`want` is a well-formed record");
+    debug_assert!(decode(want, |_| {}).is_ok(), "`want` is a well-formed record");
     if got == want {
         return Ok(());
     }
     fn layout(record: &[u8]) -> Result<(Vec<(ColType, bool)>, PkIndices), String> {
         let mut cols = Vec::new();
-        let pk = decode(record, |c| {
-            cols.push((c.ty, c.nullable));
-            Ok(())
-        })?;
+        let pk = decode(record, |c| cols.push((c.ty, c.nullable)))?;
         Ok((cols, pk))
     }
     let (want_cols, want_pk) = layout(want)?;

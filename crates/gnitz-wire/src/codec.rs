@@ -249,26 +249,20 @@ impl<'a> Reader<'a> {
         T::read(self)
     }
 
-    /// [`Writer::count`]'s inverse, refusing a length past `cap` before anything is
-    /// sized off it.
-    fn count(&mut self, what: &str, cap: usize) -> Result<usize, String> {
-        debug_assert!(cap <= MAX_LIST_LEN, "a saturated count must stay refusable");
-        let n = self.u16()? as usize;
-        if n > cap {
-            return Err(format!("{what}: {n} entries exceeds cap {cap}"));
-        }
-        Ok(n)
-    }
-
     /// A counted list of at most `cap` items, each read by `item`: the inverse of
-    /// a [`Writer::count`] and that many items.
+    /// a [`Writer::count`] and that many items. A count past `cap` is refused
+    /// before anything is sized off it.
     pub fn items<T>(
         &mut self,
         what: &str,
         cap: usize,
         mut item: impl FnMut(&mut Self) -> Result<T, String>,
     ) -> Result<Vec<T>, String> {
-        let n = self.count(what, cap)?;
+        debug_assert!(cap <= MAX_LIST_LEN, "a saturated count must stay refusable");
+        let n = self.u16()? as usize;
+        if n > cap {
+            return Err(format!("{what}: {n} entries exceeds cap {cap}"));
+        }
         #[cfg(feature = "field-map")]
         let (count, mut spans) = (self.off - 2, Vec::with_capacity(n));
         // Sized once: a fallible `collect` has no lower size hint.
@@ -299,17 +293,15 @@ impl<'a> Reader<'a> {
         self.buf.len() - self.off
     }
 
-    /// Reject leftover bytes: they mean the sender and this decoder disagree
-    /// about the layout, which is what a format's version field exists to catch.
-    fn expect_consumed(&self) -> Result<(), String> {
-        match self.remaining() {
-            0 => Ok(()),
-            n => Err(format!("{n} trailing bytes")),
-        }
+    /// The bytes not yet consumed, left unconsumed.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.buf[self.off..]
     }
 }
 
 /// Decode all of `buf` with `f`, labelling any error with the format name `ctx`.
+/// Leftover bytes are refused: they mean the sender and this decoder disagree
+/// about the layout, which is what a format's version field exists to catch.
 pub fn decode_all<'a, T>(
     buf: &'a [u8],
     ctx: &str,
@@ -317,7 +309,10 @@ pub fn decode_all<'a, T>(
 ) -> Result<T, String> {
     let mut r = Reader::new(buf);
     f(&mut r)
-        .and_then(|v| r.expect_consumed().map(|()| v))
+        .and_then(|v| match r.remaining() {
+            0 => Ok(v),
+            n => Err(format!("{n} trailing bytes")),
+        })
         .map_err(|e| format!("{ctx}: {e}"))
 }
 

@@ -377,7 +377,6 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         gnitz_wire::schema_record::decode(engine.shape_target(tid).unwrap().1, |c| {
             assert!(c.name.is_empty(), "a push group's record carries no name");
             n += 1;
-            Ok(())
         })
         .unwrap();
         n

@@ -188,7 +188,6 @@ impl PkSortKey<'_> for [u128; 2] {
 
 /// Sort and dedup `keys`, each exactly `stride` bytes.
 pub fn pk_keys<'a>(stride: usize, keys: impl IntoIterator<Item = &'a [u8]>) -> PkKeys {
-    assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
     let keys = keys
         .into_iter()
         .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"));

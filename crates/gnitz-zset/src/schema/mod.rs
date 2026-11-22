@@ -31,10 +31,7 @@ pub use sort_key::{pk_keys, pk_keys_of_images};
 /// nothing engine-side reads a name, a hidden flag or a scale.
 pub fn decode_schema_record(data: &[u8]) -> Result<SchemaDescriptor, String> {
     let mut cols: SmallVec<[SchemaColumn; MAX_COLUMNS]> = SmallVec::new();
-    let pk = gnitz_wire::schema_record::decode(data, |c| {
-        cols.push(SchemaColumn::new(c.ty.tc, c.nullable));
-        Ok(())
-    })?;
+    let pk = gnitz_wire::schema_record::decode(data, |c| cols.push(SchemaColumn::new(c.ty.tc, c.nullable)))?;
     Ok(SchemaDescriptor::try_new(&cols, pk.as_slice())?)
 }
 

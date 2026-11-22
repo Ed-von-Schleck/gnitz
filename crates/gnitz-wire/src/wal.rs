@@ -41,21 +41,16 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
     total
 }
 
-/// The row count of the canonical region list `regions`, read off its weight
-/// region.
-fn region_rows(regions: &[&[u8]]) -> usize {
-    let w = regions[crate::REG_WEIGHT].len();
-    debug_assert_eq!(w % FIXED_REGION_BYTES, 0, "a weight region holds whole i64s");
-    w / FIXED_REGION_BYTES
-}
-
 /// The header of the block framing the canonical region list `regions`, and
 /// that block's total size.
 fn head(regions: &[&[u8]], heap_dead: usize) -> ([u8; WAL_HEADER_SIZE], usize) {
     let (heap, fixed) = regions.split_last().expect("a region list ends with its heap");
+    let weights = regions[crate::REG_WEIGHT].len();
+    debug_assert_eq!(weights % FIXED_REGION_BYTES, 0, "a weight region holds whole i64s");
+    let rows = weights / FIXED_REGION_BYTES;
     let mut head = [0u8; WAL_HEADER_SIZE];
     let fixed_len = fixed.iter().map(|r| r.len()).sum();
-    let total = write_head(&mut head, region_rows(regions), fixed_len, heap.len(), heap_dead);
+    let total = write_head(&mut head, rows, fixed_len, heap.len(), heap_dead);
     (head, total)
 }
 

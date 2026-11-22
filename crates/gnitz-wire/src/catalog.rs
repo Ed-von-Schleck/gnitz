@@ -1,9 +1,10 @@
 //! The system catalog: the system families — their registry, and per family the
-//! row, payload slots, writer and reader one `sys_row!` declaration yields, so
+//! row, payload slots, writer and reader one `sys_families!` entry yields, so
 //! the client's rows and the engine's are laid out and read back by the same
 //! list — the stored-shape digest, [`EXPR_BLOB_VERSION`] and
 //! [`VIEW_DEF_VERSION`], the system and user id ranges, and [`bool_word`].
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::{
@@ -63,8 +64,9 @@ impl WireSysFamily {
 
 /// Declare the system families from one list in apply order: per family its
 /// [`SysFamily`] variant, the [`WireSysFamily`] [`SysFamily::def`] returns, what
-/// a row is called in a message, and the row the field list yields through
-/// `sys_row!`.
+/// a row is called in a message, and the row the field list yields: the struct
+/// holding the cells a row stores, its payload-slot enum, and the writer and the
+/// reader, which decodes every typed cell.
 macro_rules! sys_families {
     (
         $(#[$meta:meta])*
@@ -99,7 +101,7 @@ macro_rules! sys_families {
                             name: $name,
                             cols: &[
                                 $(WireSysCol { name: stringify!($k), type_code: TypeCode::U64 },)+
-                                $(WireSysCol { name: stringify!($p), type_code: sys_row!(@tc $tc) },)+
+                                $(WireSysCol { name: stringify!($p), type_code: sys_col!(@tc $tc) },)+
                             ],
                             pk_cols: SYS_KEY_COLS.split_at([$(stringify!($k)),+].len()).0,
                         };
@@ -126,64 +128,52 @@ macro_rules! sys_families {
             }
         }
 
-        $(sys_row! {
+        $(
             $(#[$rmeta])*
-            $Variant, $Row $(<$lt>)?, $Slot -> $E,
-            key { $($k),+ }
-            payload { $($(#[$pmeta])* $p: $tc),+ }
-        })+
+            #[derive(Clone, Debug, PartialEq, Eq)]
+            pub struct $Row $(<$lt>)? {
+                $(pub $k: u64,)+
+                $($(#[$pmeta])* pub $p: sys_col!(@ty $tc),)+
+            }
+
+            impl $(<$lt>)? SysRow for $Row $(<$lt>)? {
+                const FAMILY: SysFamily = SysFamily::$Variant;
+                fn write(&self, sink: &mut (impl SysRowSink + ?Sized), weight: i64) {
+                    sink.begin_row(&[$(self.$k as u128),+], weight);
+                    $(sys_col!(@put sink, self.$p, $tc);)+
+                    sink.end_row();
+                }
+            }
+
+            #[doc = concat!("Payload slots of [`", stringify!($Row), "`], in column order.")]
+            #[allow(non_camel_case_types)]
+            #[derive(Clone, Copy, Debug)]
+            pub enum $Slot {
+                $($(#[$pmeta])* $p,)+
+            }
+
+            impl $(<$lt>)? $Row $(<$lt>)? {
+                /// The row [`SysRow::write`] wrote, read back from `row` of `src`.
+                pub fn read<S: RowSource>(src: &$($lt)? S, row: usize) -> Result<Self, $E> {
+                    let mut key = src
+                        .get_pk_bytes(row)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|w| u64::from_be_bytes(*w));
+                    Ok($Row {
+                        $($k: key.next().expect("a system key is one u64 word per key column"),)+
+                        $($p: sys_col!(@get src, row, $Slot::$p as usize, $p, $tc),)+
+                    })
+                }
+            }
+        )+
     };
 }
 
-/// One system family's row: the struct holding the cells a row stores, its
-/// payload-slot enum, and the writer and the reader, which decodes every typed
-/// cell.
-macro_rules! sys_row {
-    (
-        $(#[$meta:meta])*
-        $Variant:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
-        key { $($k:ident),+ $(,)? }
-        payload { $($(#[$pmeta:meta])* $p:ident: $tc:ident),+ $(,)? }
-    ) => {
-        $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        pub struct $Row $(<$lt>)? {
-            $(pub $k: u64,)+
-            $($(#[$pmeta])* pub $p: sys_row!(@ty $tc),)+
-        }
-
-        impl $(<$lt>)? SysRow for $Row $(<$lt>)? {
-            const FAMILY: SysFamily = SysFamily::$Variant;
-            fn write(&self, sink: &mut (impl SysRowSink + ?Sized), weight: i64) {
-                sink.begin_row(&[$(self.$k as u128),+], weight);
-                $(sys_row!(@put sink, self.$p, $tc);)+
-                sink.end_row();
-            }
-        }
-
-        #[doc = concat!("Payload slots of [`", stringify!($Row), "`], in column order.")]
-        #[allow(non_camel_case_types)]
-        #[derive(Clone, Copy, Debug)]
-        pub enum $Slot {
-            $($(#[$pmeta])* $p,)+
-        }
-
-        impl $(<$lt>)? $Row $(<$lt>)? {
-            /// The row [`SysRow::write`] wrote, read back from `row` of `src`.
-            pub fn read<S: RowSource>(src: &$($lt)? S, row: usize) -> Result<Self, $E> {
-                let mut key = src
-                    .get_pk_bytes(row)
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|w| u64::from_be_bytes(*w));
-                Ok($Row {
-                    $($k: key.next().expect("a system key is one u64 word per key column"),)+
-                    $($p: sys_row!(@get src, row, $Slot::$p as usize, $p, $tc),)+
-                })
-            }
-        }
-    };
+/// One system column kind's Rust type (`@ty`), wire type (`@tc`), and how a
+/// row writes it (`@put`) and reads it back (`@get`).
+macro_rules! sys_col {
     // `Bool`, `Key` and `Cols` are stored as `U64` words: a boolean, and a
     // [`PkColList::pack`] read as a primary key or as an index's column list.
     (@tc String) => { TypeCode::String };
@@ -570,14 +560,14 @@ impl<'a> ViewTabRow<'a> {
         definition: impl Into<std::borrow::Cow<'a, [u8]>>,
     ) -> Self {
         debug_assert_ne!(parts.owner, Some(0), "owner 0 is a user view's word");
-        let (capacity_bytes, delta_bytes) = parts.props.budget.row_words();
+        let budget = parts.props.budget;
         ViewTabRow {
             view_id,
             schema_id,
             name: name.into(),
             pk_col_idx,
-            capacity_bytes,
-            delta_bytes,
+            capacity_bytes: budget.capacity_bytes().unwrap_or(0),
+            delta_bytes: budget.delta_bytes().unwrap_or(0),
             owner_view_id: parts.owner.unwrap_or(0),
             pk_repeats: parts.pk_repeats,
             compress: parts.props.compress,
@@ -588,7 +578,8 @@ impl<'a> ViewTabRow<'a> {
     /// The row's words beyond its name and key, decoded and held to the rule that
     /// a chain segment, which the planner mints, carries no `WITH` option.
     pub fn parts(&self) -> Result<ViewParts, String> {
-        let budget = ViewBudget::from_row(self.capacity_bytes, self.delta_bytes)?;
+        // A budget word of `0` is absent.
+        let budget = ViewBudget::from_budgets(NonZeroU64::new(self.capacity_bytes), NonZeroU64::new(self.delta_bytes))?;
         let props = ViewProps { budget, compress: self.compress };
         let owner = (self.owner_view_id != 0).then_some(self.owner_view_id);
         if owner.is_some() && props != ViewProps::default() {

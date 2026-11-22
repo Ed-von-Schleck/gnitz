@@ -89,7 +89,7 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
     let pk: Vec<u32> = (0..n as u32).collect();
     let block = gnitz_wire::schema_record::encode((0..n).map(|_| key.record_col()), &pk);
     assert!(
-        gnitz_wire::schema_record::decode(&block, |_| Ok(())).is_ok(),
+        gnitz_wire::schema_record::decode(&block, |_| {}).is_ok(),
         "the codec admits it"
     );
     assert!(Schema::from_record(&block).is_err());
