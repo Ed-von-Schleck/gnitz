@@ -173,28 +173,22 @@ fn debug_assert_words(lanes: &[&[i64]], words: usize) {
 /// Bit `i` of `out` set iff `P` holds of lane `i` of `a` and `b`.
 pub(crate) fn pred_bits<P: LanePred>(level: Level, a: &[i64], b: &[i64], out: &mut [u64]) {
     debug_assert_words(&[a, b], out.len());
-    dispatch!(level, simd => pred_bits_at::<_, P>(simd, a, b, out));
-}
-
-#[inline(always)]
-fn pred_bits_at<S: Simd, P: LanePred>(simd: S, a: &[i64], b: &[i64], out: &mut [u64]) {
-    for ((w, a), b) in out.iter_mut().zip(a.as_chunks::<64>().0).zip(b.as_chunks::<64>().0) {
-        *w = P::FLIP ^ mask_word(|at| P::vector(simd, lanes(simd, a, at), lanes(simd, b, at)));
-    }
+    dispatch!(level, simd => {
+        for ((w, a), b) in out.iter_mut().zip(a.as_chunks::<64>().0).zip(b.as_chunks::<64>().0) {
+            *w = P::FLIP ^ mask_word(|at| P::vector(simd, lanes(simd, a, at), lanes(simd, b, at)));
+        }
+    });
 }
 
 /// Bit `i` of `out` set iff lane `i` of `src` is non-zero.
 pub(crate) fn truthy_bits(level: Level, src: &[i64], out: &mut [u64]) {
     debug_assert_words(&[src], out.len());
-    dispatch!(level, simd => truthy_bits_at(simd, src, out));
-}
-
-#[inline(always)]
-fn truthy_bits_at<S: Simd>(simd: S, src: &[i64], out: &mut [u64]) {
-    let zero = i64x8::splat(simd, 0);
-    for (w, src) in out.iter_mut().zip(src.as_chunks::<64>().0) {
-        *w = !mask_word(|at| lanes(simd, src, at).simd_eq(zero));
-    }
+    dispatch!(level, simd => {
+        let zero = i64x8::splat(simd, 0);
+        for (w, src) in out.iter_mut().zip(src.as_chunks::<64>().0) {
+            *w = !mask_word(|at| lanes(simd, src, at).simd_eq(zero));
+        }
+    });
 }
 
 /// Bit `i` of `out` set iff lane `i` of `a` is one of `set`.
@@ -238,7 +232,17 @@ fn or_member_bits<S: Simd, const N: usize>(simd: S, a: &[i64], set: &[i64; N], o
 pub fn null_bits(level: Level, rows: &[u8], cols: u64, out: &mut [u64]) {
     debug_assert_eq!(out.len(), (rows.len() / 8).div_ceil(64), "one bit per row");
     let (blocks, tail) = rows.as_chunks::<{ 64 * 8 }>();
-    dispatch!(level, simd => null_bits_at(simd, blocks, cols, out));
+    dispatch!(level, simd => {
+        let (cols, zero) = (u64x8::splat(simd, cols), u64x8::splat(simd, 0));
+        for (w, block) in out.iter_mut().zip(blocks) {
+            *w = !mask_word(|at| {
+                // `gnitz-wire` builds for little-endian hosts alone, so a row's
+                // eight bytes are its word.
+                let rows: u64x8<_> = u8x64::from_slice(simd, &block[at * 8..at * 8 + 64]).bitcast();
+                (rows & cols).simd_eq(zero)
+            });
+        }
+    });
     if let Some(w) = out.get_mut(blocks.len()) {
         let mut word = 0u64;
         for (j, row) in tail.as_chunks::<8>().0.iter().enumerate() {
@@ -248,54 +252,35 @@ pub fn null_bits(level: Level, rows: &[u8], cols: u64, out: &mut [u64]) {
     }
 }
 
-#[inline(always)]
-fn null_bits_at<S: Simd>(simd: S, blocks: &[[u8; 64 * 8]], cols: u64, out: &mut [u64]) {
-    let (cols, zero) = (u64x8::splat(simd, cols), u64x8::splat(simd, 0));
-    for (w, block) in out.iter_mut().zip(blocks) {
-        *w = !mask_word(|at| {
-            // `gnitz-wire` builds for little-endian hosts alone, so a row's
-            // eight bytes are its word.
-            let rows: u64x8<S> = u8x64::from_slice(simd, &block[at * 8..at * 8 + 64]).bitcast();
-            (rows & cols).simd_eq(zero)
-        });
-    }
-}
-
 /// `d[i] = if bit i of take_a { a[i] } else { b[i] }`.
 pub(crate) fn blend(level: Level, take_a: &[u64], a: &[i64], b: &[i64], d: &mut [i64]) {
     debug_assert_words(&[a, b, d], take_a.len());
-    dispatch!(level, simd => blend_at(simd, take_a, a, b, d));
-}
-
-#[inline(always)]
-fn blend_at<S: Simd>(simd: S, take_a: &[u64], a: &[i64], b: &[i64], d: &mut [i64]) {
-    let words = a.as_chunks::<64>().0.iter().zip(b.as_chunks::<64>().0);
-    for ((&take, (a, b)), d) in take_a.iter().zip(words).zip(d.as_chunks_mut::<64>().0) {
-        for at in (0..64).step_by(8) {
-            mask64x8::from_bitmask(simd, take >> at)
-                .select(lanes(simd, a, at), lanes(simd, b, at))
-                .store_slice(&mut d[at..at + 8]);
+    dispatch!(level, simd => {
+        let words = a.as_chunks::<64>().0.iter().zip(b.as_chunks::<64>().0);
+        for ((&take, (a, b)), d) in take_a.iter().zip(words).zip(d.as_chunks_mut::<64>().0) {
+            for at in (0..64).step_by(8) {
+                mask64x8::from_bitmask(simd, take >> at)
+                    .select(lanes(simd, a, at), lanes(simd, b, at))
+                    .store_slice(&mut d[at..at + 8]);
+            }
         }
-    }
+    });
 }
 
 /// `d[i] = bit i of bits`, as 0 or 1.
 pub(crate) fn bit_lanes(level: Level, bits: &[u64], d: &mut [i64]) {
     debug_assert_words(&[d], bits.len());
-    dispatch!(level, simd => bit_lanes_at(simd, bits, d));
-}
-
-#[inline(always)]
-fn bit_lanes_at<S: Simd>(simd: S, bits: &[u64], d: &mut [i64]) {
-    let one = u64x8::splat(simd, 1);
-    let lane = u64x8::from_fn(simd, |i| i as u64);
-    for (&word, d) in bits.iter().zip(d.as_chunks_mut::<64>().0) {
-        let word = u64x8::splat(simd, word);
-        for at in (0..64).step_by(8) {
-            let v: i64x8<S> = ((word >> (lane + u64x8::splat(simd, at as u64))) & one).bitcast();
-            v.store_slice(&mut d[at..at + 8]);
+    dispatch!(level, simd => {
+        let one = u64x8::splat(simd, 1);
+        let lane = u64x8::from_fn(simd, |i| i as u64);
+        for (&word, d) in bits.iter().zip(d.as_chunks_mut::<64>().0) {
+            let word = u64x8::splat(simd, word);
+            for at in (0..64).step_by(8) {
+                let v: i64x8<_> = ((word >> (lane + u64x8::splat(simd, at as u64))) & one).bitcast();
+                v.store_slice(&mut d[at..at + 8]);
+            }
         }
-    }
+    });
 }
 
 #[cfg(test)]

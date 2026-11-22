@@ -83,7 +83,7 @@ impl EmitStore {
 impl LogicalProgram {
     /// A pure projection: `copies[i] = src_col` copies logical input column
     /// `src_col` into output payload slot `i`. The source type is derived in
-    /// `map_sinks` from the schema. The instruction-free shape a map consumer
+    /// [`Self::resolve_map`] from the schema. The instruction-free shape a map consumer
     /// turns into verbatim column moves and nothing else.
     pub fn copy_cols(copies: &[u32]) -> Self {
         let sinks = copies.iter().map(|&src_col| Sink::Col(src_col)).collect();
@@ -91,27 +91,15 @@ impl LogicalProgram {
     }
 
     /// A map from `in_schema` to `out_schema`, covering every output payload slot
-    /// exactly once: the computed columns, and the copied ones in slot order for
-    /// the caller to run.
+    /// exactly once: the computed columns as emits in slot order, and the copied
+    /// ones as [`ColCopy`]s in slot order for the caller to run. Sink `i` writes
+    /// slot `i`, so covering every declared payload slot is a count.
     pub fn resolve_map(
         &self,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
     ) -> Result<(MapEval, Vec<ColCopy>), ExprValidateErr> {
         let prog = self.resolve_program(in_schema, ReadAs::Value)?;
-        let (copies, emits) = self.map_sinks(in_schema, out_schema)?;
-        Ok((MapEval { ev: Evaluator::new(prog), emits }, copies))
-    }
-
-    /// Hold this map's sinks to its two schemas and say where each output slot
-    /// comes from: the copied ones as [`ColCopy`]s, the computed ones as emits in slot
-    /// order. Sink `i` writes slot `i`, so covering every declared payload slot
-    /// is a count.
-    fn map_sinks(
-        &self,
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Result<(Vec<ColCopy>, Vec<Emit>), ExprValidateErr> {
         use ExprValidateErr as E;
         let num_payload_cols = out_schema.num_payload_cols();
         if self.sinks().len() != num_payload_cols {
@@ -149,7 +137,7 @@ impl LogicalProgram {
                 }
             }
         }
-        Ok((copies, emits))
+        Ok((MapEval { ev: Evaluator::new(prog), emits }, copies))
     }
 }
 
