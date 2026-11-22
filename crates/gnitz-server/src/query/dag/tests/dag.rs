@@ -2,12 +2,35 @@ use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
     RowKey, certified, chunked, col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick,
-    reindexed_on_col1, scan_all, table_engine_with, try_register_identity_view, try_register_view,
-    two_term_join_circuit, u64_i64_cols, zset_of,
+    register_identity_view, reindexed_on_col1, scan_all, table_engine, table_engine_with, try_register_identity_view,
+    try_register_view, two_term_join_circuit, u64_i64_cols, zset_of,
 };
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{Circuit, JoinKind, TypeCode};
+use gnitz_wire::{Circuit, JoinKind, ReadBound, TypeCode};
 use std::collections::HashMap;
+
+/// A union view over `sources`, each scanned in that order, named `name`.
+pub(super) fn union_view(engine: &mut CatalogEngine, sources: &[u64], name: &str) -> u64 {
+    let mut circuit = Circuit::default();
+    let scans: Vec<_> = sources
+        .iter()
+        .map(|&s| circuit.input_delta(s, ReadBound::None))
+        .collect();
+    scans[1..].iter().fold(scans[0], |acc, &scan| circuit.union(acc, scan));
+    try_register_view(engine, circuit, name, &u64_i64_cols(), 0, 0).unwrap()
+}
+
+/// A fresh catalog holding base table `public.t` and one more per name in
+/// `more`, each `(id U64 PK, v I64)`.
+pub(super) fn engine_with_tables<const N: usize>(more: [&str; N]) -> (tempfile::TempDir, CatalogEngine, u64, [u64; N]) {
+    let (dir, mut engine, t) = table_engine(1, &u64_i64_cols());
+    let ids = more.map(|m| {
+        engine
+            .create_table(&format!("public.{m}"), &u64_i64_cols(), &[0])
+            .unwrap()
+    });
+    (dir, engine, t, ids)
+}
 
 /// `view`'s rows recomputed for the U64 keys `ids`, as a Z-set.
 fn hydrate(engine: &mut CatalogEngine, view: u64, ids: &[u64]) -> HashMap<RowKey, i64> {
@@ -105,4 +128,71 @@ fn a_clamp_history_seed_is_read_through_the_clamp() {
     assert_eq!(held.len(), 2, "k=10 and k=20, once each");
     assert!(held.values().all(|&w| w == 1), "each match once, through the clamp");
     assert_eq!(hydrate(&mut engine, view, &[10, 20]), held);
+}
+
+/// A view registered again under a dropped id takes the roots of its new plan.
+#[test]
+fn a_views_roots_are_dropped_and_recomputed_with_its_view() {
+    let (_dir, mut engine, t1, [t2]) = engine_with_tables(["t2"]);
+    let cols = u64_i64_cols();
+    let v1 = register_identity_view(&mut engine, t1, "v1", &cols);
+    let v2 = register_identity_view(&mut engine, v1, "v2", &cols);
+    assert_eq!(engine.dag.roots_of(v2), [t1]);
+    engine.dag.forget(v2);
+    assert!(engine.dag.roots_of(v2).is_empty());
+    assert_eq!(engine.dag.roots_of(v1), [t1]);
+
+    let circuit = crate::test_support::identity_circuit(t2, ReadBound::None);
+    let registry = &engine.registry;
+    let schema = crate::test_support::make_schema_u64_i64();
+    engine
+        .dag
+        .register_view(registry, v2, &schema, false, v2, &circuit)
+        .unwrap();
+    assert_eq!(engine.dag.roots_of(v2), [t2]);
+}
+
+/// A view links to each source once however many times its builder named it, in
+/// scan order. Forgetting a view drops its edges and its pending rebuild, leaves a
+/// sibling over the same source linked, keeps no emptied entry, and is a no-op
+/// when repeated or for an id never linked.
+#[test]
+fn forgetting_a_view_drops_only_what_it_linked() {
+    let (_dir, mut engine, t1, [t2]) = engine_with_tables(["t2"]);
+    let v = union_view(&mut engine, &[t2, t1, t2], "v");
+    let sibling = register_identity_view(&mut engine, t1, "sibling", &u64_i64_cols());
+    let dag = &mut engine.dag;
+    assert_eq!(dag.sources_of(v).collect::<Vec<_>>(), [t2, t1]);
+    assert_eq!(dag.dependents_of(t1), [v, sibling]);
+    assert_eq!(dag.dependents_of(t2), [v]);
+
+    for _ in 0..2 {
+        dag.forget(v);
+        dag.forget(u64::MAX);
+        assert!(dag.sources_of(v).next().is_none());
+        assert_eq!(dag.dependents_of(t1), [sibling]);
+        assert_eq!(dag.sources_of(sibling).collect::<Vec<_>>(), [t1]);
+        assert!(!dag.forward.contains_key(&t2));
+    }
+    dag.forget(sibling);
+    assert!(dag.forward.is_empty());
+}
+
+/// A view scans only relations older than it: ticks and backfills take ascending
+/// id order as dependency order. The refusal links nothing.
+#[test]
+fn a_view_scanning_a_relation_not_older_than_it_is_refused() {
+    use crate::test_support::{identity_circuit, make_schema_u64_i64};
+    use gnitz_store::relation::StoreConfig;
+    let registry = RelationRegistry::new("", Slot::SOLO, StoreConfig::default());
+    let mut dag = DagEngine::default();
+    for source in [5, 6] {
+        let circuit = identity_circuit(source, gnitz_wire::ReadBound::None);
+        let refused = dag.register_view(&registry, 5, &make_schema_u64_i64(), false, 5, &circuit);
+        assert_eq!(
+            refused.map(drop),
+            Err(format!("scans relation {source}, which is not older than it"))
+        );
+    }
+    assert!(dag.sources_of(5).next().is_none() && !dag.is_scanned(5));
 }

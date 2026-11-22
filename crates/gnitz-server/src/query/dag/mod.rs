@@ -1,27 +1,29 @@
 //! DagEngine: every registered view's compiled plan, the operator state of the
-//! views this process runs, and the decision of the boot verdict on which views
-//! rebuild rather than resume. Epoch execution lives in `exec`, per-key
-//! hydration in `hydrate`, the dependency graph and the tick schedules in `meta`.
+//! views this process runs, the dependency graph between them, the decision of
+//! the boot verdict on which views rebuild rather than resume, and per-key
+//! hydration of a bounded view. Epoch execution lives in `exec`, the tick
+//! schedules in `schedule`.
 
 use std::borrow::Cow;
 use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::hash_map::Entry;
 
 use crate::query::compiler::{self, CompileOutput};
 use crate::query::vm;
 use gnitz_store::relation::{CircuitState, RelationKind, RelationRegistry, StateLayout};
+use gnitz_wire::PkKeys;
 use gnitz_zset::algebra::{self, Placement, ScatterPlan, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod exec;
-mod hydrate;
-mod meta;
+mod schedule;
 
 pub(crate) use exec::{backfill, tick};
 
-use meta::{DepMap, Step};
+use schedule::Step;
 
 /// One view's rows of an exchange round: lent, or given to the round, which
 /// frees them once they are sent.
@@ -61,6 +63,9 @@ struct RegisteredView {
     state: Option<CircuitState>,
     /// The user view whose chain holds this view: its owner, or itself.
     chain: u64,
+    /// A chain segment whose store no reduce of its own reads back: its output
+    /// reaches its readers in the run that emits it, and it lands none.
+    passes_through: bool,
     /// Every relation that is no view one or more `view → sources` edges from this
     /// view, sorted and each once: the relations whose ticks reach it. Fixed from
     /// registration to drop, since a source registers before and drops after it.
@@ -69,7 +74,12 @@ struct RegisteredView {
 
 #[derive(Default)]
 pub(crate) struct DagEngine {
-    dep: DepMap,
+    /// source id → the views that scan it, in registration order: the source →
+    /// dependents half of the view-dependency graph, whose other half is each
+    /// view's plan. An entry exists only while it holds an id.
+    forward: FxHashMap<u64, Vec<u64>>,
+    /// source id → [`Self::tick_schedule`] of it, each kept until an edge moves.
+    tick_steps: FxHashMap<u64, Rc<[Step]>>,
     /// Every registered view, from its registration to its drop.
     views: FxHashMap<u64, RegisteredView>,
     /// The running tick's state; between ticks empty, kept for its capacity.
@@ -102,8 +112,10 @@ impl DagEngine {
             code.source_ids()
                 .all(|s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view()))
         );
+        self.tick_steps.clear();
         let mut roots = Vec::new();
         for source in code.source_ids() {
+            self.forward.entry(source).or_default().push(view_id);
             match self.views.get(&source) {
                 Some(view) => roots.extend_from_slice(&view.roots),
                 None => roots.push(source),
@@ -111,10 +123,18 @@ impl DagEngine {
         }
         roots.sort_unstable();
         roots.dedup();
-        self.dep.link(view_id, code.source_ids());
+        let passes_through = chain != view_id && !code.vm.reads_view_store();
         let roots = roots.into_boxed_slice();
-        self.views
-            .insert(view_id, RegisteredView { code, state: None, chain, roots });
+        self.views.insert(
+            view_id,
+            RegisteredView {
+                code,
+                state: None,
+                chain,
+                passes_through,
+                roots,
+            },
+        );
         Ok((placement, traces))
     }
 
@@ -125,24 +145,66 @@ impl DagEngine {
             .ok_or_else(|| format!("view {view_id} is not registered"))
     }
 
-    /// Whether view `id` is a chain segment whose store no reduce of its own
-    /// reads back.
-    fn passes_through(&self, id: u64) -> bool {
-        self.views
-            .get(&id)
-            .is_some_and(|v| v.chain != id && !v.code.vm.reads_view_store())
-    }
-
     /// The user view whose chain holds view `id`: its owner, or `id` itself.
     pub(crate) fn chain_of(&self, id: u64) -> u64 {
         self.views.get(&id).map_or(id, |v| v.chain)
     }
 
+    /// The views that scan `id` directly. Empty when none do.
+    pub(crate) fn dependents_of(&self, id: u64) -> &[u64] {
+        self.forward.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether any view scans `id`.
+    pub(crate) fn is_scanned(&self, id: u64) -> bool {
+        !self.dependents_of(id).is_empty()
+    }
+
+    /// The relations `view_id` scans directly, each once, in its plan's scan order.
+    /// Empty when it is no registered view.
+    pub(crate) fn sources_of(&self, view_id: u64) -> impl Iterator<Item = u64> {
+        self.views.get(&view_id).into_iter().flat_map(|v| v.code.source_ids())
+    }
+
+    /// Every relation that is no view and reaches `view` through the relations it
+    /// scans — the relations whose ticks reach it — sorted. Empty for an id that
+    /// is no registered view.
+    pub(crate) fn roots_of(&self, view: u64) -> &[u64] {
+        self.views.get(&view).map_or(&[], |v| &v.roots)
+    }
+
     /// Drop everything this layer holds for relation `id`.
     pub(crate) fn forget(&mut self, id: u64) {
-        if let Some(view) = self.views.remove(&id) {
-            self.dep.unlink(id, view.code.source_ids());
+        let Some(view) = self.views.remove(&id) else {
+            return;
+        };
+        self.tick_steps.clear();
+        for source in view.code.source_ids() {
+            if let Entry::Occupied(mut views) = self.forward.entry(source) {
+                views.get_mut().retain(|&v| v != id);
+                if views.get().is_empty() {
+                    views.remove();
+                }
+            }
         }
+    }
+
+    /// Every row of `view_id` at `keys`, each held by the view's store as a
+    /// skeleton row, recomputed by replaying the view's own program over a
+    /// key-restricted seed: the hydrate closure of [`RelationRegistry::scan_spec`].
+    pub(crate) fn hydrate_keys(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: u64,
+        keys: PkKeys,
+    ) -> Result<Batch, String> {
+        let view = self.registered(view_id)?;
+        let replay = view
+            .code
+            .hydration
+            .ok_or_else(|| format!("view {view_id} holds skeleton rows but was compiled unbounded"))?;
+        let (vm, mut stores) = view.opened(registry, view_id, usize::MAX)?;
+        vm::replay_keys(vm, &mut stores, &replay, keys)
     }
 
     // ── The boot verdict ────────────────────────────────────────────────
@@ -286,3 +348,7 @@ impl RegisteredView {
         Ok((vm, vm::Stores { own, registry, unfed }))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/dag.rs"]
+mod tests;

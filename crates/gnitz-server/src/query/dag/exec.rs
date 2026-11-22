@@ -3,7 +3,6 @@
 
 use super::*;
 use std::collections::VecDeque;
-use std::collections::hash_map::Entry;
 
 use gnitz_store::relation::{Landing, PkRule};
 
@@ -67,14 +66,6 @@ impl Default for Pass {
 }
 
 impl Pass {
-    /// The round a run's outputs are captured as.
-    fn round(self) -> Option<u64> {
-        match self {
-            Pass::Tick { round } => Some(round),
-            Pass::Fill { .. } => None,
-        }
-    }
-
     /// How many of `view`'s sources, in scan order, it has been fed: every
     /// later one reads empty.
     fn fed(self, view: u64) -> usize {
@@ -89,14 +80,9 @@ impl Pass {
 }
 
 /// The round a step of the running tick stands at.
-#[expect(clippy::large_enum_variant, reason = "held once per round, and boxing allocates")]
 enum Stage {
-    /// Its relay round, which sends `rows` under `plan`.
-    Relay {
-        rows: Batch,
-        plan: Rc<ScatterPlan>,
-        fold: bool,
-    },
+    /// Its relay round, which sends what the round's slot holds under this plan.
+    Relay(Rc<ScatterPlan>),
     /// A round of its epoch.
     Epoch(vm::Epoch),
 }
@@ -127,9 +113,11 @@ pub(super) struct TickRun {
     /// The batch each producer of the run has emitted, keyed by producer. A
     /// producer with no entry produced nothing.
     outputs: FxHashMap<u64, Batch>,
-    /// What each relay round gathered, indexed by [`meta::RelaySlot`], from
-    /// the round's run to its last reader; `None` while its round is out.
-    relays: Vec<Option<Batch>>,
+    /// Each relay round's rows, indexed by [`schedule::RelaySlot`]: what it sends
+    /// from its start until it is sent, then nothing until it gathers, then
+    /// what it gathered until its last reader. A round is out while the step
+    /// that runs it stands at it.
+    relays: Vec<Batch>,
     /// The steps standing at a round, each by its index in the schedule, in
     /// schedule order: the order their lanes go out. A step run on from a
     /// gathered round that stands again goes behind the rest of its wave.
@@ -139,71 +127,40 @@ pub(super) struct TickRun {
 }
 
 impl TickRun {
-    /// Whether step `i` can start: a relay round another step runs for it has
-    /// gathered, and no step at a round is of its view or of its producer.
+    /// Whether step `i` can start: no step at a round is of its view or of its
+    /// producer, or runs the relay round it reads.
     fn ready(&self, i: usize) -> bool {
-        // A relay round is out only while the step that runs it stands.
         if self.standing.is_empty() {
             return true;
         }
         let step = &self.schedule[i];
-        if step
-            .relay
-            .is_some_and(|slot| self.relays.get(slot.at).is_some_and(Option::is_none))
-        {
-            return false;
-        }
-        !self.standing.iter().any(|&(at, _)| {
-            let held = self.schedule[at].view;
-            held == step.view || held == step.producer
+        let relay = step.relay.map(|slot| slot.at);
+        !self.standing.iter().any(|(j, stage)| {
+            let held = &self.schedule[*j];
+            held.view == step.view
+                || held.view == step.producer
+                || matches!(stage, Stage::Relay(_)) && held.relay.map(|slot| slot.at) == relay
         })
     }
 
-    /// Start step `i`: run it to its first round, or its end.
+    /// Start step `i`, to its first round or its end, over its delta: what its
+    /// relay round gathered, or its producer's output, lent where a later step
+    /// reads it too. The first step to reach a relay round stands at the round
+    /// instead, and starts again once it has gathered.
     fn start(&mut self, host: &mut impl DriveHost, i: usize) -> Result<(), String> {
         let Step { view, producer, last, relay } = self.schedule[i];
-        // A relayed step reads its round's rows: the round's first reader runs it.
-        if let Some(slot) = relay.filter(|slot| slot.first) {
-            debug_assert_eq!(slot.at, self.relays.len(), "rounds start in slot order");
-            let code = &host.parts().0.views[&view].code;
-            let scan = code.scan(producer);
-            let plan = Rc::clone(&scan.relay.as_ref().expect("a relayed scan has a relay").plan);
-            // The round runs on every worker, whatever this one holds: it sends
-            // the producer's output, taken where no later step reads it.
-            let rows = match self.outputs.get_mut(&producer) {
-                None => Batch::empty_with_schema(code.vm.schema_of(scan.seed)),
-                Some(input) => {
-                    // Every worker sends its rows, and decodes theirs, under the
-                    // seed's label.
-                    code.vm.label(scan.seed, input);
-                    // Every worker gathers every row of a broadcast: one fold at
-                    // the sender serves them all.
-                    if slot.fold && plan.is_broadcast() {
-                        input.consolidate_in_place();
-                    }
-                    if last { input.take() } else { input.clone() }
-                }
-            };
-            self.relays.push(None);
-            let fold = slot.fold;
-            self.standing.push_back((i, Stage::Relay { rows, plan, fold }));
-            return Ok(());
-        }
-        self.start_epoch(host, i)
-    }
-
-    /// Start step `i`'s epoch over its delta: what its relay round gathered, or
-    /// its producer's output, lent where a later step reads it too.
-    fn start_epoch(&mut self, host: &mut impl DriveHost, i: usize) -> Result<(), String> {
-        let Step { view, producer, last, relay } = self.schedule[i];
         let fed = self.pass.fed(view);
-        let (input, take) = match relay {
-            Some(slot) => (self.relays[slot.at].as_mut(), slot.last),
-            None => (self.outputs.get_mut(&producer), last),
-        };
         let (dag, registry) = host.parts();
         // A view's run reaches it only from a source its circuit scans.
         let registered = dag.registered(view)?;
+        let (input, take) = match relay {
+            None => (self.outputs.get_mut(&producer), last),
+            Some(slot) if slot.at == self.relays.len() => {
+                self.start_relay(&registered.code, i, slot);
+                return Ok(());
+            }
+            Some(slot) => (Some(&mut self.relays[slot.at]), slot.last),
+        };
         let reg = registered.code.scan(producer).seed;
         let seed = input.filter(|input| !input.is_empty());
         // An empty delta still runs its round, on every worker, whatever this one
@@ -213,6 +170,17 @@ impl TickRun {
         }
         let (vm, mut stores) = registered.opened(registry, view, fed)?;
         let ran = vm::start(vm, &mut stores, reg, seed, take)?;
+        self.ran(host, i, ran)
+    }
+
+    /// Run step `i`'s `epoch` on from the round it stood at, over what the round
+    /// gathered.
+    fn resume(&mut self, host: &mut impl DriveHost, i: usize, epoch: vm::Epoch, rows: Batch) -> Result<(), String> {
+        let view = self.schedule[i].view;
+        // The exchange held the host: the plan and its stores are looked up again.
+        let (dag, registry) = host.parts();
+        let (vm, mut stores) = dag.registered(view)?.opened(registry, view, self.pass.fed(view))?;
+        let ran = vm::resume(vm, &mut stores, epoch, rows)?;
         self.ran(host, i, ran)
     }
 
@@ -227,6 +195,32 @@ impl TickRun {
         }
     }
 
+    /// Stand step `i`, the first reader of relay round `slot`, at the round,
+    /// which runs on every worker, whatever this one holds: it sends the
+    /// producer's output, taken where no later step reads it. `code`: the
+    /// step's view's plan.
+    fn start_relay(&mut self, code: &CompileOutput, i: usize, slot: schedule::RelaySlot) {
+        let Step { producer, last, .. } = self.schedule[i];
+        let scan = code.scan(producer);
+        let plan = Rc::clone(&scan.relay.as_ref().expect("a relayed scan has a relay").plan);
+        let rows = match self.outputs.get_mut(&producer) {
+            None => Batch::empty_with_schema(code.vm.schema_of(scan.seed)),
+            Some(input) => {
+                // Every worker sends its rows, and decodes theirs, under the
+                // seed's label.
+                code.vm.label(scan.seed, input);
+                // Every worker gathers every row of a broadcast: one fold at
+                // the sender serves them all.
+                if slot.fold && plan.is_broadcast() {
+                    input.consolidate_in_place();
+                }
+                if last { input.take() } else { input.clone() }
+            }
+        };
+        self.relays.push(rows);
+        self.standing.push_back((i, Stage::Relay(plan)));
+    }
+
     /// Ingest `out`, `view`'s output, unless the view passes it through, and hold
     /// it for its readers where a view scans it: each is a later step of the run.
     fn land(&mut self, host: &mut impl DriveHost, view: u64, out: Batch) -> Result<(), String> {
@@ -235,15 +229,14 @@ impl TickRun {
         }
         let (dag, registry) = host.parts();
         let needed = dag.is_scanned(view);
-        let echo = match dag.passes_through(view) {
+        let round = match self.pass {
+            Pass::Tick { round } => Some(round),
+            Pass::Fill { .. } => None,
+        };
+        let echo = match dag.views[&view].passes_through {
             // Its delta reaches its readers in this run.
             true => needed.then_some(out),
-            false => registry.land(
-                view,
-                out,
-                Landing::Cut { round: self.pass.round(), echo: needed },
-                PkRule::Enforce,
-            )?,
+            false => registry.land(view, out, Landing::Cut { round, echo: needed }, PkRule::Enforce)?,
         };
         if let Some(out) = echo {
             match self.outputs.entry(view) {
@@ -296,19 +289,18 @@ impl TickRun {
                 debug_assert_eq!(next, self.schedule.len(), "a step waits on no round");
                 return Ok(drained);
             }
-            let schedule = &self.schedule;
+            let (schedule, relays) = (&self.schedule, &mut self.relays);
             let lanes = self.standing.iter_mut().map(|(i, stage)| {
+                let step = &schedule[*i];
                 let (batch, plan, fold) = match stage {
                     // A relay's rows are its round's to free once sent.
-                    Stage::Relay { rows, plan, fold } => (Cow::Owned(rows.take()), &**plan, *fold),
+                    Stage::Relay(plan) => {
+                        let slot = step.relay.expect("a relay step");
+                        (Cow::Owned(relays[slot.at].take()), &**plan, slot.fold)
+                    }
                     Stage::Epoch(epoch) => epoch.round(),
                 };
-                Lane {
-                    view: schedule[*i].view,
-                    batch,
-                    plan,
-                    fold,
-                }
+                Lane { view: step.view, batch, plan, fold }
             });
             drained = host.exchange(lanes, drained, &mut self.gathered);
             let mut gathered = std::mem::take(&mut self.gathered);
@@ -316,20 +308,12 @@ impl TickRun {
             for rows in gathered.drain(..) {
                 let (i, stage) = self.standing.pop_front().expect("a lane per round");
                 match stage {
-                    Stage::Relay { .. } => {
+                    Stage::Relay(_) => {
                         let slot = self.schedule[i].relay.expect("a relay step");
-                        self.relays[slot.at] = Some(rows);
-                        self.start_epoch(host, i)?;
+                        self.relays[slot.at] = rows;
+                        self.start(host, i)?;
                     }
-                    Stage::Epoch(epoch) => {
-                        // The exchange held the host: the plan and its stores are
-                        // looked up again.
-                        let view = self.schedule[i].view;
-                        let (dag, registry) = host.parts();
-                        let (vm, mut stores) = dag.registered(view)?.opened(registry, view, self.pass.fed(view))?;
-                        let ran = vm::resume(vm, &mut stores, epoch, rows)?;
-                        self.ran(host, i, ran)?;
-                    }
+                    Stage::Epoch(epoch) => self.resume(host, i, epoch, rows)?,
                 }
             }
             self.gathered = gathered;
@@ -397,7 +381,7 @@ impl TickRun {
             }
             let (dag, registry) = host.parts();
             debug_assert!(
-                !dag.passes_through(source),
+                !dag.views.get(&source).is_some_and(|v| v.passes_through),
                 "a passthrough view holds no rows: it is backfilled with its readers"
             );
             let relation = registry.relation_or_err(source)?;
