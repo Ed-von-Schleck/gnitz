@@ -20,4 +20,4 @@ pub use shard::{
     Codebook, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError, guard_slot, write_shard,
 };
 
-pub(crate) use read_cursor::{CursorRow, GroupProbe};
+pub(crate) use read_cursor::GroupProbe;

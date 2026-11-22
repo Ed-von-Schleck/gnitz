@@ -335,7 +335,8 @@ impl RunMerge {
         drive::<_, _, SPANS>(tree, schema, sources, *order, cursors, payload, emit);
     }
 
-    /// Move every head whose row `lags` to where `gallop` lands it, stepping
+    /// Move every head whose row `lags` to where `gallop` lands it, both handed
+    /// `schema`, stepping
     /// the tournament once per gallop. Only the champion can lag — it is the
     /// least head — so the loop gallops it alone, and leaves the tournament as
     /// a [`Self::rebuild`] at the new heads would. `lags` must hold of a
@@ -346,18 +347,18 @@ impl RunMerge {
         schema: &SchemaDescriptor,
         sources: &[S],
         payload: P,
-        lags: impl Fn(&S, usize) -> bool,
-        mut gallop: impl FnMut(&S, &Range<usize>) -> usize,
+        lags: impl Fn(&SchemaDescriptor, &S, usize) -> bool,
+        mut gallop: impl FnMut(&SchemaDescriptor, &S, &Range<usize>) -> usize,
     ) {
         let (tree, order, cursors) = (&mut self.tree, self.order, &mut self.cursors[..]);
         let less = merge_less(schema, sources, order, payload);
         while let Some(Player { source_idx: src, row, .. }) = tree.peek() {
             let (src, row) = (src as usize, row as usize);
             // The champion is the least head, so once it no longer lags neither does any.
-            if !lags(&sources[src], row) {
+            if !lags(schema, &sources[src], row) {
                 break;
             }
-            cursors[src].start = gallop(&sources[src], &cursors[src]);
+            cursors[src].start = gallop(schema, &sources[src], &cursors[src]);
             tree.step_top(order.head(sources, src, &cursors[src]), &less);
         }
     }

@@ -46,32 +46,6 @@ impl PkSetGather {
         self.cursor.skip_payload(skip);
     }
 
-    fn remaining_keys(&self) -> usize {
-        self.keys.len() - self.next
-    }
-
-    /// Call `f` on every row of each remaining key's group, in ascending
-    /// (PK, payload) order, until it has run `max_rows` times; returns how often it ran.
-    /// The budget is tested before each key and each group is visited whole, so the count
-    /// can overshoot to `max_rows - 1 + |largest group|`. `0` means the list is exhausted.
-    fn for_each_live_row(&mut self, max_rows: usize, mut f: impl FnMut(&ReadCursor)) -> usize {
-        assert!(max_rows > 0, "for_each_live_row: max_rows must be positive");
-        let mut visited = 0;
-        for key in self.keys.iter().skip(self.next) {
-            if visited >= max_rows {
-                break;
-            }
-            self.next += 1;
-            if self.cursor.seek_pk_group_ascending(key) {
-                self.cursor.for_each_pk_group_row(key, |c| {
-                    visited += 1;
-                    f(c);
-                });
-            }
-        }
-        visited
-    }
-
     /// Call `f` on the positive-weight rows of each remaining key's group, in
     /// key order, and on at most `total` rows in all.
     pub fn for_each_positive_capped(&mut self, total: usize, mut f: impl FnMut(&ReadCursor)) {
@@ -83,35 +57,53 @@ impl PkSetGather {
             if !self.cursor.seek_pk_group_ascending(key) {
                 continue;
             }
-            self.cursor.walk_positive_with_prefix_until(key, |c| {
-                f(c);
-                room -= 1;
-                match room {
-                    0 => ControlFlow::Break(()),
-                    _ => ControlFlow::Continue(()),
-                }
-            });
+            self.cursor.walk_until(
+                |pk| pk.starts_with(key),
+                |c| {
+                    if c.current_weight() <= 0 {
+                        return ControlFlow::Continue(());
+                    }
+                    f(c);
+                    room -= 1;
+                    match room {
+                        0 => ControlFlow::Break(()),
+                        _ => ControlFlow::Continue(()),
+                    }
+                },
+            );
         }
         self.next = self.keys.len();
     }
 
-    /// The next chunk with skeleton rows split out, as [`ReadCursor::drain_live_chunk`].
+    /// The next chunk with skeleton rows split out, as
+    /// [`ReadCursor::drain_live_chunk`]: every row of each remaining key's
+    /// group, in ascending (PK, payload) order, until `max_rows` are visited.
+    /// The budget is tested before each key and each group is visited whole,
+    /// so a chunk can overshoot to `max_rows - 1 + |largest group|`; `None`
+    /// once no key is left.
     pub(super) fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
-        if self.remaining_keys() == 0 {
+        assert!(max_rows > 0, "drain_live_chunk: max_rows must be positive");
+        let remaining = self.keys.len() - self.next;
+        if remaining == 0 {
             return None;
         }
-        let split = self.cursor.merge.coarsens();
         with_picks(|picks| {
-            picks.reserve(self.remaining_keys().min(max_rows));
-            let visited = self.for_each_live_row(max_rows, |c| {
-                if split && c.current_is_skeleton() {
-                    skeletons.push(c.current_pk_bytes(), c.current_weight());
-                } else {
-                    picks.push(c.current_pick());
+            picks.reserve(remaining.min(max_rows));
+            for key in self.keys.iter().skip(self.next) {
+                if picks.len() >= max_rows {
+                    break;
                 }
-            });
-            (visited != 0).then(|| {
+                self.next += 1;
+                if self.cursor.seek_pk_group_ascending(key) {
+                    self.cursor
+                        .for_each_pk_group_row(key, |c| picks.push(c.current_position()));
+                }
+            }
+            (!picks.is_empty()).then(|| {
                 let c = &self.cursor;
+                if c.merge.coarsens() {
+                    skeletons.split_from(&c.sources, picks);
+                }
                 let mut out = gather_rows(&c.sources, &c.schema, picks, c.skip_payload);
                 out.certify_consolidated();
                 out
@@ -135,7 +127,7 @@ impl PkSetGather {
     }
 
     /// The next non-empty chunk of source rows, or `None` once the key list is
-    /// exhausted; `max_rows` as [`Self::for_each_live_row`].
+    /// exhausted; `max_rows` as [`Self::drain_live_chunk`] reads it.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s))
     }

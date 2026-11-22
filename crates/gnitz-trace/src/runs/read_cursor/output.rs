@@ -6,7 +6,7 @@ use std::rc::Rc;
 use super::super::run::Run;
 use super::{ReadCursor, SkeletonKeys, hydrate_skeletons};
 use gnitz_expr::RowFilter;
-use gnitz_wire::{PkKeys, RowSource};
+use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::{ColumnarSource, Pick, UnifiedSet, span_of, span_pick, with_picks, with_spans};
 use gnitz_zset::schema::with_payload_cmp;
@@ -14,12 +14,11 @@ use gnitz_zset::schema::with_payload_cmp;
 impl ReadCursor {
     /// Copy the current row into `batch` at `weight`, clearing its consolidated claim.
     pub fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
-        debug_assert!(self.valid, "copy_current_row_into on an invalid cursor");
+        let (src, row) = self.row_at(self.current_position());
         debug_assert!(
-            !self.current_is_skeleton(),
+            !src.is_skeleton(),
             "a skeleton row has no payload to copy; hydrate its key"
         );
-        let (src, row) = self.row_at(self.current);
         batch.append_row_from_source(weight, src, row);
     }
 
@@ -67,18 +66,16 @@ impl ReadCursor {
         filter: &mut RowFilter,
     ) -> Option<(Batch, bool)> {
         assert!(max_rows > 0, "drain_live_chunk: max_rows must be positive");
-        if !self.valid {
-            return None;
-        }
+        let (src, row, _) = self.current?;
         if let Some(i) = self.mode {
             let decided = matches!(self.sources[i], Run::Mem(_));
-            return Some((self.drain_single(i, max_rows, skeletons, filter), decided));
+            return Some((self.drain_single(i, row as usize, max_rows, skeletons, filter), decided));
         }
         // Per source, the rows this drain can emit: its current row on to where the drive stops.
         let mut windows = std::mem::take(&mut self.drain_windows);
         windows.clear();
         windows.extend(self.merge.cursors().iter().map(|s| s.start..s.start));
-        windows[self.current.src as usize].start = self.current.row as usize;
+        windows[src as usize].start = row as usize;
         let mut decided = true;
         let mut batch = with_picks(|picks| {
             let spans = self.drain_sorted_into(max_rows, picks);
@@ -91,23 +88,7 @@ impl ReadCursor {
                 .zip(&windows)
                 .any(|(src, w)| matches!(src, Run::Shard(_)) && !w.is_empty());
             if self.merge.coarsens() {
-                let sources = &self.sources;
-                picks.retain(|&pick| match span_of(pick) {
-                    Some((s, rows)) => match &sources[s] {
-                        Run::Shard(shard) if shard.is_skeleton() => {
-                            skeletons.extend(shard, rows);
-                            false
-                        }
-                        _ => true,
-                    },
-                    None => {
-                        let (src, (_, r, w)) = (&sources[pick.0 as usize], pick);
-                        if src.is_skeleton() {
-                            skeletons.push(src.get_pk_bytes(r as usize), w);
-                        }
-                        !src.is_skeleton()
-                    }
-                });
+                skeletons.split_from(&self.sources, picks);
             }
             if !filter.keeps_all() {
                 retain_kept(&self.sources, &windows, picks, filter, spans);
@@ -129,7 +110,7 @@ impl ReadCursor {
     /// Every remaining row in merge order, consolidated.
     pub fn materialize(mut self) -> Rc<Batch> {
         if let [Run::Mem(rc)] = &self.sources[..] {
-            let whole = self.valid && self.current.row == 0 && self.merge.cursors()[0].end == rc.len();
+            let whole = self.current.is_some_and(|(_, row, _)| row == 0) && self.merge.cursors()[0].end == rc.len();
             if whole {
                 return Rc::clone(rc);
             }
@@ -139,18 +120,17 @@ impl ReadCursor {
             .unwrap_or_else(|| Rc::new(Batch::empty_with_schema(&self.schema)))
     }
 
-    /// Up to `max_rows` rows of `i`, the one live source, as one slice copy; of an
-    /// in-memory run, only the rows `filter` keeps.
+    /// Up to `max_rows` rows of `i`, the one live source, from `start`, the
+    /// current row, as one slice copy; of an in-memory run, only the rows
+    /// `filter` keeps.
     fn drain_single(
         &mut self,
         i: usize,
+        start: usize,
         max_rows: usize,
         skeletons: &mut SkeletonKeys,
         filter: &mut RowFilter,
     ) -> Batch {
-        // The walk's `start` is already past the committed row, so the slice
-        // starts at `current.row`.
-        let start = self.current.row as usize;
         let row_count = (self.merge.cursors()[i].end - start).min(max_rows);
         let batch = match &self.sources[i] {
             Run::Shard(shard) if shard.is_skeleton() => {
@@ -184,7 +164,7 @@ impl ReadCursor {
     fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<Pick>) -> bool {
         out.clear();
         out.reserve(max_rows.min(self.estimated_length()));
-        out.push(self.current_pick());
+        out.push(self.current_position());
         with_spans!(self.merge.dominated(), |SPANS| {
             with_payload_cmp!(self.schema, |payload| {
                 let mut first_undrained = None;
@@ -192,7 +172,8 @@ impl ReadCursor {
                 let mut extra = 0usize;
                 // Whether a span was cut at `max_rows`, its rest left unconsumed.
                 let mut cut = false;
-                self.drive::<_, SPANS>(payload, |src, row, w| {
+                let ReadCursor { merge, schema, sources, .. } = &mut *self;
+                merge.drive::<_, _, SPANS>(schema, sources, payload, |src, row, w| {
                     let pick = (src as u32, row as u32, w);
                     if SPANS && let Some((src, rows)) = span_of(pick) {
                         let take = rows.len().min(max_rows - out.len() - extra);
@@ -207,7 +188,7 @@ impl ReadCursor {
                         };
                     }
                     if out.len() + extra == max_rows {
-                        first_undrained = Some((src, row, w));
+                        first_undrained = Some(pick);
                         ControlFlow::Break(0)
                     } else {
                         out.push(pick);
@@ -217,7 +198,7 @@ impl ReadCursor {
                 match cut {
                     // The cut span's next row is the cursor's next group.
                     true => self.advance_merge_with(payload),
-                    false => self.commit_emitted(first_undrained),
+                    false => self.current = first_undrained,
                 }
             });
             SPANS

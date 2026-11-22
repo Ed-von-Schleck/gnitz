@@ -262,9 +262,11 @@ impl IndexWalk {
         let span = self.idx.schema().pk_stride() - self.stride;
         self.pks.clear();
         let mut taken = 0;
-        while taken < max_rows && self.idx.is_valid() {
+        while taken < max_rows
+            && let Some(pk) = self.idx.current_pk()
+        {
             debug_assert!(self.idx.current_weight() > 0, "an index entry at a non-positive weight");
-            self.pks.extend_from_slice(&self.idx.current_pk_bytes()[span..]);
+            self.pks.extend_from_slice(&pk[span..]);
             self.idx.advance();
             taken += 1;
         }

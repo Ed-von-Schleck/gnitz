@@ -8,10 +8,10 @@ use crate::test_support::{
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::{PkKeys, TypeCode};
+use gnitz_zset::repr::ColumnarSource;
 use gnitz_zset::repr::{Batch, BatchBuilder, MAX_POOLED_BYTES, gather_rows, with_picks};
 use gnitz_zset::schema::SchemaColumn;
 use proptest::prelude::*;
-use std::ops::ControlFlow;
 use std::rc::Rc;
 
 /// A cursor over `batches` and `shards`, one run each.
@@ -107,7 +107,7 @@ proptest! {
         let mut walked = Vec::new();
         while c.is_valid() {
             prop_assert!(c.estimated_length() >= want.len() - walked.len());
-            prop_assert!(!c.current_is_skeleton());
+            prop_assert!(!c.row_at(c.current_position()).0.is_skeleton());
             walked.push(current(&c));
             c.advance();
         }
@@ -164,10 +164,14 @@ proptest! {
                 let mut positive = Vec::new();
                 let mut c = open();
                 prop_assert_eq!(c.seek_positive_with_prefix(&k[..n]), !want.is_empty());
-                c.walk_positive_with_prefix_until(&k[..n], |c| {
-                    positive.push(current(c));
-                    ControlFlow::Continue(())
-                });
+                c.for_each_row_while(
+                    |p| p.starts_with(&k[..n]),
+                    |c| {
+                        if c.current_weight() > 0 {
+                            positive.push(current(c));
+                        }
+                    },
+                );
                 prop_assert_eq!(&positive, &want);
             }
         }
@@ -411,7 +415,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
             groups.push((
                 gnitz_wire::widen_pk_be(c.current_pk_bytes()),
                 c.current_weight(),
-                c.current_is_skeleton(),
+                c.row_at(c.current_position()).0.is_skeleton(),
             ));
             c.advance();
         }

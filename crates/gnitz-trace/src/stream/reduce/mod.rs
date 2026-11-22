@@ -15,7 +15,7 @@ mod tests;
 
 use std::cmp::Ordering;
 
-use crate::runs::{CursorRow, GroupProbe, ReadCursor};
+use crate::runs::{GroupProbe, ReadCursor};
 use crate::stream::OpenAt;
 use gnitz_expr::ColCopy;
 use gnitz_wire::AggDescriptor;
@@ -24,7 +24,7 @@ use gnitz_wire::{MAX_PK_BYTES, PkBuf, RowSource};
 use gnitz_zset::algebra::{
     Agg, AggValues, ColMoves, FoldGroups, GroupOrdinals, GroupPrefix, GroupScratch, OutPk, ReduceShape, ground_pk,
 };
-use gnitz_zset::repr::{Batch, DirectWriter, MemBatch, vec_bytes};
+use gnitz_zset::repr::{Batch, DirectWriter, MemBatch, Pick, vec_bytes};
 use gnitz_zset::schema::SchemaDescriptor;
 use value_index::ValueIndex;
 
@@ -81,7 +81,7 @@ struct EmitScratch {
     /// reduce without one.
     probes: Vec<Probe>,
     /// The stored rows of the groups that have one, in output order.
-    stored: Vec<CursorRow>,
+    stored: Vec<Pick>,
     /// Per stored row, its group.
     stored_groups: Vec<u32>,
     /// The output rows, as rows of the stored and fresh rows they copy.
@@ -608,7 +608,8 @@ impl GroupEmit<'_, '_, '_> {
                 self.emit_fresh(&mut out, out_pk.bytes(), g);
             }
             if let Some(at) = at {
-                self.probe.copy_row_into(at, &mut out, -1);
+                let (rows, row) = self.probe.row_at(at);
+                out.append_row_from_source(-1, rows, row);
             }
             if new == Some(Ordering::Greater) {
                 self.emit_fresh(&mut out, out_pk.bytes(), g);

@@ -10,9 +10,9 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use crate::runs::{CursorRow, ReadCursor, Run};
+use crate::runs::{ReadCursor, Run};
 use gnitz_zset::repr::{
-    Batch, copy_runs, pk_group_end, prorated_blob_cap, relocated_cell, row_long_bytes, runs_where,
+    Batch, Pick, copy_runs, pk_group_end, prorated_blob_cap, relocated_cell, row_long_bytes, runs_where,
     should_relocate_blob, stride, stride_dispatch, with_scratch,
 };
 use gnitz_zset::schema::{DerivedSchema, SchemaDescriptor, band, compare_pk_ordering, group_floor, key_above};
@@ -261,13 +261,12 @@ impl RangeProbe {
 // ---------------------------------------------------------------------------
 
 /// One emission of a walk: the delta run `[rs, re)` against one trace row, by
-/// its cursor handle.
+/// its cursor handle at the trace weight the pairing multiplies by.
 #[derive(Clone, Copy)]
 struct Pairing {
     rs: u32,
     re: u32,
-    at: CursorRow,
-    w_trace: i64,
+    at: Pick,
 }
 
 impl Pairing {
@@ -314,9 +313,10 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
     with_scratch(&PAIRS, |pairs| {
         let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
             debug_assert!(rs < re, "every walk emits a non-empty delta run");
+            let (src, row, w) = c.current_position();
             let w_trace = match plan.trace_cap {
-                Some(cap) => c.current_weight().clamp(0, cap),
-                None => c.current_weight(),
+                Some(cap) => w.clamp(0, cap),
+                None => w,
             };
             // Dropping a pairing keeps the rest in walk order.
             if w_trace == 0 {
@@ -325,8 +325,7 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
             pairs.push(Pairing {
                 rs: rs as u32,
                 re: re as u32,
-                at: c.current_position(),
-                w_trace,
+                at: (src, row, w_trace),
             });
         };
         match plan.walk {
@@ -445,7 +444,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
             let mut dst = weights.as_chunks_mut::<8>().0.iter_mut();
             for p in pairs {
                 for (w_delta, w_out) in src[p.delta_rows()].iter().zip(&mut dst) {
-                    let w = i64::from_le_bytes(*w_delta).wrapping_mul(p.w_trace);
+                    let w = i64::from_le_bytes(*w_delta).wrapping_mul(p.at.2);
                     any_ghost |= w == 0;
                     *w_out = w.to_le_bytes();
                 }
@@ -614,8 +613,8 @@ fn equi_merge_walk(delta: &Batch, cursor: &mut ReadCursor, mut emit: impl FnMut(
             let j = pk_group_end(delta, i, k); // delta group
             cursor.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
-        } else if cursor.is_valid() {
-            i = delta.seek(&cursor.current_pk_bytes()[..k], Some(i)); // skip delta
+        } else if let Some(pk) = cursor.current_pk() {
+            i = delta.seek(&pk[..k], Some(i)); // skip delta
         } else {
             break;
         }
@@ -673,13 +672,13 @@ fn range_merge_walk(
         );
         // Group spans ascend, so once the trace runs out inside one span no later
         // group can match either.
-        if !cursor.is_valid() {
+        let Some(pk) = cursor.current_pk() else {
             return;
-        }
+        };
         // The cursor sits past the span, so its equality prefix names the next
         // group the trace can match: the delta groups below it are skipped by
         // seeking to that group's zero-padded floor.
-        let trace_group = &cursor.current_pk_bytes()[..eq_size];
+        let trace_group = &pk[..eq_size];
         lo = hi;
         if hi < delta.len() && compare_pk_ordering(&delta.get_pk_bytes(hi)[..eq_size], trace_group).is_lt() {
             lo = delta.seek(group_floor(trace_group, stride).pk_bytes(), Some(hi));

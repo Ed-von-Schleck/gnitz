@@ -4,10 +4,9 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use super::{CursorRow, ReadCursor, Run};
+use super::{ReadCursor, Run};
 use gnitz_wire::RowSource;
-use gnitz_zset::repr::Batch;
-use gnitz_zset::repr::{gather_into, with_picks};
+use gnitz_zset::repr::{Batch, Pick, gather_into};
 use gnitz_zset::schema::compare_pk_ordering;
 
 /// A [`ReadCursor`] over a store of one row per PK, its runs newest first as
@@ -17,7 +16,7 @@ pub(crate) struct GroupProbe<'c> {
     cursor: &'c mut ReadCursor,
     /// The row the cursor stood on when the probe began, until a key reaches
     /// its PK: the cursor's walk is already past it, and every row below it.
-    pending: Option<CursorRow>,
+    pending: Option<Pick>,
 }
 
 impl ReadCursor {
@@ -28,9 +27,8 @@ impl ReadCursor {
     pub(crate) fn group_probe(&mut self) -> GroupProbe<'_> {
         // A skeleton run folds a PK group regardless of payload; a probe folds by element.
         debug_assert!(!self.merge.coarsens(), "group probe over a skeleton store");
-        // An invalid cursor's runs are spent: every key finds none.
-        let pending = self.valid.then_some(self.current);
-        self.valid = false;
+        // An exhausted cursor's runs are spent: every key finds none.
+        let pending = self.current.take();
         GroupProbe { cursor: self, pending }
     }
 }
@@ -38,33 +36,23 @@ impl ReadCursor {
 impl GroupProbe<'_> {
     /// The source and row of a handle [`Self::find`] returned.
     #[inline(always)]
-    pub(crate) fn row_at(&self, at: CursorRow) -> (&Run, usize) {
+    pub(crate) fn row_at(&self, at: Pick) -> (&Run, usize) {
         self.cursor.row_at(at)
     }
 
     /// Append to `batch`, of the cursor's layout, the rows of handles
-    /// [`Self::find`] returned, in the order given, at weight +1.
-    pub(crate) fn gather_into(&self, rows: &[CursorRow], batch: &mut Batch) {
+    /// [`Self::find`] returned, in the order given, at their weight +1.
+    pub(crate) fn gather_into(&self, rows: &[Pick], batch: &mut Batch) {
         let ReadCursor { sources, schema, .. } = &*self.cursor;
         debug_assert!(batch.schema().same_region_types(schema));
-        with_picks(|picks| {
-            picks.extend(rows.iter().map(|at| at.pick(1)));
-            batch.write_rows(picks.len(), |w| gather_into(sources, schema, picks, 0, w));
-        });
+        batch.write_rows(rows.len(), |w| gather_into(sources, schema, rows, 0, w));
     }
 
-    /// Copy the row of a handle [`Self::find`] returned into `batch` at `weight`.
-    #[inline]
-    pub(crate) fn copy_row_into(&self, at: CursorRow, batch: &mut Batch, weight: i64) {
-        let (src, row) = self.row_at(at);
-        batch.append_row_from_source(weight, src, row);
-    }
-
-    /// The first live row of PK `key`, in (PK, payload) order, or `None` for a
-    /// PK with none — where [`ReadCursor::seek_pk_group_ascending`] would land.
+    /// The first live row of PK `key`, in (PK, payload) order, at weight +1,
+    /// or `None` for a PK with none — where [`ReadCursor::seek_pk_group_ascending`] would land.
     /// Keys must strictly ascend across calls.
     #[inline(always)]
-    pub(crate) fn find(&mut self, key: &[u8]) -> Option<CursorRow> {
+    pub(crate) fn find(&mut self, key: &[u8]) -> Option<Pick> {
         if let Some(at) = self.pending {
             let (src, row) = self.cursor.row_at(at);
             match vs_key(src, row, key) {
@@ -108,8 +96,7 @@ impl GroupProbe<'_> {
         let live = newest_decides(&sources[newest], &mut states[newest], newest, key);
         #[cfg(debug_assertions)]
         assert_eq!(
-            folded,
-            live.map(|at| (at.src, at.row)),
+            folded, live,
             "the newest run holding a PK answers what folding every run does",
         );
         live
@@ -126,7 +113,7 @@ impl GroupProbe<'_> {
 /// one it started from: one row at +1 and one at -1 at most. A positive row is
 /// the live one, and a retraction alone means the stretch deleted the PK.
 #[inline(always)]
-fn newest_decides(run: &Run, state: &mut Range<usize>, i: usize, key: &[u8]) -> Option<CursorRow> {
+fn newest_decides(run: &Run, state: &mut Range<usize>, i: usize, key: &[u8]) -> Option<Pick> {
     let mut row = state.start;
     if run.get_weight(row) < 0 {
         row += 1;
@@ -138,7 +125,7 @@ fn newest_decides(run: &Run, state: &mut Range<usize>, i: usize, key: &[u8]) -> 
     debug_assert!(run.get_weight(row) > 0, "a run holds one row of a PK at either sign");
     // The row is the PK's, below every later key.
     state.start = row + 1;
-    Some(CursorRow { src: i as u32, row: row as u32 })
+    Some((i as u32, row as u32, 1))
 }
 
 /// The fold every probe's answer is checked against in debug builds.
@@ -146,7 +133,7 @@ fn newest_decides(run: &Run, state: &mut Range<usize>, i: usize, key: &[u8]) -> 
 mod tripwire {
     use smallvec::SmallVec;
 
-    use super::{CursorRow, Range, Run, vs_key};
+    use super::{Pick, Range, Run, vs_key};
     use gnitz_zset::schema::{PayloadOrder, SchemaDescriptor, with_payload_cmp};
 
     /// [`fold_pk`]'s answer at PK `key` over every run, each galloped to the PK
@@ -156,19 +143,18 @@ mod tripwire {
         states: &[Range<usize>],
         schema: &SchemaDescriptor,
         key: &[u8],
-    ) -> Option<(u32, u32)> {
+    ) -> Option<Pick> {
         let mut states = states.to_vec();
         for (src, st) in sources.iter().zip(states.iter_mut()) {
             if st.start < st.end && vs_key(src, st.start, key).is_lt() {
                 st.start = src.seek(key, Some(st.start)).min(st.end);
             }
         }
-        let at = with_payload_cmp!(schema, |p| fold_pk(sources, &mut states, schema, key, p));
-        at.map(|at| (at.src, at.row))
+        with_payload_cmp!(schema, |p| fold_pk(sources, &mut states, schema, key, p))
     }
 
-    /// The first element, in payload order, of PK `key`, among those whose weights
-    /// summed across the runs are not zero, each run positioned at or above the
+    /// The first element, in payload order, of PK `key`, at its weight summed
+    /// across the runs, among those whose sum is not zero, each run positioned at or above the
     /// PK; each run's position moves past the PK.
     fn fold_pk<P: PayloadOrder>(
         sources: &[Run],
@@ -176,28 +162,27 @@ mod tripwire {
         schema: &SchemaDescriptor,
         key: &[u8],
         payload: P,
-    ) -> Option<CursorRow> {
-        let cmp = |a: CursorRow, b: CursorRow| {
-            let (sa, sb) = (&sources[a.src as usize], &sources[b.src as usize]);
-            payload.compare(schema, sa, a.row as usize, sb, b.row as usize)
+    ) -> Option<Pick> {
+        let cmp = |a: Pick, b: Pick| {
+            let (sa, sb) = (&sources[a.0 as usize], &sources[b.0 as usize]);
+            payload.compare(schema, sa, a.1 as usize, sb, b.1 as usize)
         };
-        // Every element of the PK with its summed weight.
-        let mut elements: SmallVec<[(CursorRow, i64); 8]> = SmallVec::new();
+        // Every element of the PK, its weight summed in `.2`.
+        let mut elements: SmallVec<[Pick; 8]> = SmallVec::new();
         for (src, (run, state)) in sources.iter().zip(states.iter_mut()).enumerate() {
             let src = src as u32;
             let mut row = state.start;
             while row < state.end && vs_key(run, row, key).is_eq() {
-                let at = CursorRow { src, row: row as u32 };
-                let w = run.get_weight(row);
-                match elements.iter_mut().find(|(e, _)| cmp(*e, at).is_eq()) {
-                    Some((_, sum)) => *sum += w,
-                    None => elements.push((at, w)),
+                let at = (src, row as u32, run.get_weight(row));
+                match elements.iter_mut().find(|e| cmp(**e, at).is_eq()) {
+                    Some(e) => e.2 += at.2,
+                    None => elements.push(at),
                 }
                 row += 1;
             }
             state.start = row;
         }
-        let mut live = elements.iter().filter(|&&(_, w)| w != 0).map(|&(e, _)| e);
+        let mut live = elements.iter().copied().filter(|e| e.2 != 0);
         let first = live.next()?;
         Some(live.fold(first, |m, e| if cmp(e, m).is_lt() { e } else { m }))
     }

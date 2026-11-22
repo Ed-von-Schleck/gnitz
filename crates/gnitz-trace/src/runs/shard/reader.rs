@@ -493,20 +493,6 @@ impl MappedShard {
         }
     }
 
-    /// The leading `size` bytes of row `row`'s cell of `p`, payload column `pi`.
-    #[inline]
-    fn packed_cell<'a>(&'a self, p: &'a PackedRegion, pi: usize, row: usize, size: usize) -> &'a [u8] {
-        let decode = |first, out: &mut [u8]| self.decode_packed(p, pi, first, out);
-        p.blocks.cell(row, size, (self.header.row_count, p.width), decode)
-    }
-
-    /// Row `row`'s key of `key`, `stride` bytes.
-    #[inline]
-    fn packed_key<'a>(&'a self, key: &'a PackedKey, row: usize, stride: usize) -> &'a [u8] {
-        let decode = |first, out: &mut [u8]| key.image.decode(first, out);
-        key.blocks.cell(row, stride, (self.header.row_count, stride), decode)
-    }
-
     /// How many blocks of a packed key per-row reads have decoded.
     #[cfg(test)]
     fn decoded_key_blocks(&self) -> usize {
@@ -746,7 +732,10 @@ impl RowSource for MappedShard {
         match &self.pk {
             // SAFETY: the region holds a key for every row of the shard.
             KeyRegion::Mapped(cp) => unsafe { cp.row(row, stride) },
-            KeyRegion::Packed(key) => self.packed_key(key, row, stride),
+            KeyRegion::Packed(key) => {
+                let decode = |first, out: &mut [u8]| key.image.decode(first, out);
+                key.blocks.cell(row, stride, (self.header.row_count, stride), decode)
+            }
         }
     }
 
@@ -762,7 +751,10 @@ impl RowSource for MappedShard {
         match &self.col_regions[payload_col] {
             // SAFETY: the region holds a cell for every row of the shard.
             PayloadRegion::Mapped(cp) => unsafe { cp.row(row, col_size) },
-            PayloadRegion::Packed(p) => self.packed_cell(p, payload_col, row, col_size),
+            PayloadRegion::Packed(p) => {
+                let decode = |first, out: &mut [u8]| self.decode_packed(p, payload_col, first, out);
+                p.blocks.cell(row, col_size, (self.header.row_count, p.width), decode)
+            }
             PayloadRegion::Dict(d) => &d.cell(row)[..col_size],
         }
     }

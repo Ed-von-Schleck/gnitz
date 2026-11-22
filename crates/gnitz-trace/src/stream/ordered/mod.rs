@@ -21,12 +21,12 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::runs::{CursorRow, ReadCursor, Run};
+use crate::runs::{ReadCursor, Run};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
 use gnitz_wire::{OrderKey, WeightSlots};
 use gnitz_zset::algebra::{GroupOutKey, GroupPrefix};
-use gnitz_zset::repr::{Batch, MemBatch, pk_group_end};
+use gnitz_zset::repr::{Batch, MemBatch, Pick, pk_group_end};
 use gnitz_zset::schema::{DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor, compare_pk_ordering};
 
 use gnitz_expr::{ColCopy, ColumnLocator};
@@ -140,11 +140,11 @@ pub struct OrderedEpoch {
     pub index_entries: Batch,
 }
 
-/// A row of the group a [`Walk`] is in: a stored one, by its cursor handle, or
-/// one of the epoch's entries.
+/// A row of the group a [`Walk`] is in: a stored one, by its cursor handle at
+/// its weight before the epoch, or one of the epoch's entries.
 #[derive(Clone, Copy)]
 enum At {
-    Stored(CursorRow),
+    Stored(Pick),
     Entry(u32),
 }
 
@@ -202,7 +202,7 @@ impl Walk<'_> {
     fn peek(&self) -> Option<Element> {
         let ord = match (self.history.is_valid(), self.pending()) {
             // No entry bounds the stored rows, so the group's own key does.
-            (stored, false) => match stored && self.history.current_pk_bytes().starts_with(self.group) {
+            (_, false) => match self.history.current_pk().is_some_and(|pk| pk.starts_with(self.group)) {
                 true => Ordering::Less,
                 false => return None,
             },
@@ -216,10 +216,10 @@ impl Walk<'_> {
         };
         let (stored, entry) = (ord.is_le(), ord.is_ge());
         let (at, old) = match stored {
-            true => (
-                At::Stored(self.history.current_position()),
-                self.history.current_weight(),
-            ),
+            true => {
+                let p = self.history.current_position();
+                (At::Stored(p), p.2)
+            }
             false => (At::Entry(self.next as u32), 0),
         };
         let new = old.wrapping_add(if entry { self.entries.get_weight(self.next) } else { 0 });
@@ -268,10 +268,9 @@ impl Walk<'_> {
         if !self.index.cmp_keys(src, row, self.entries, self.next).is_lt() {
             return None;
         }
-        let at = At::Stored(self.history.current_position());
-        let weight = self.history.current_weight();
+        let p = self.history.current_position();
         self.history.advance();
-        Some((at, weight))
+        Some((At::Stored(p), p.2))
     }
 
     /// Pass over the stored rows whose PK is below the next entry's, handing
@@ -283,11 +282,12 @@ impl Walk<'_> {
     fn skip_stored_below_entry_pk(&mut self, mut fold: impl FnMut(&Run, Range<usize>, Option<i64>)) {
         debug_assert!(self.pending());
         let key = self.entries.get_pk_bytes(self.next);
-        if !self.history.is_valid() || compare_pk_ordering(self.history.current_pk_bytes(), key).is_ge() {
+        if !(self.history.current_pk()).is_some_and(|pk| compare_pk_ordering(pk, key).is_lt()) {
             return;
         }
-        let (src, row) = self.history.row_at(self.history.current_position());
-        fold(src, row..row + 1, Some(self.history.current_weight()));
+        let p = self.history.current_position();
+        let (src, row) = self.history.row_at(p);
+        fold(src, row..row + 1, Some(p.2));
         self.history.skip_below(key, |src, rows| fold(src, rows, None));
     }
 

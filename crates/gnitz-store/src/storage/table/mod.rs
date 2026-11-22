@@ -314,9 +314,10 @@ impl Table {
             None => from_runs(runs, schema),
         };
         if !judged {
-            let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.is_valid() {
-                true => PkBuf::from_bytes(cursor.current_pk_bytes()),
-                false => PkBuf::max(schema.pk_stride()),
+            let first_live = (cursor.passed_more_than_a_seek()).then(|| {
+                cursor
+                    .current_pk()
+                    .map_or_else(|| PkBuf::max(schema.pk_stride()), PkBuf::from_bytes)
             });
             // Kept at or under every row above the cut, so it holds at both cuts.
             let at = match (first_live, self.pending_least()) {
