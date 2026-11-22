@@ -19,6 +19,12 @@ impl Vm {
     pub(in crate::query) fn ops(&self) -> impl Iterator<Item = &Op> {
         self.instructions.iter().map(|i| &i.op)
     }
+
+    /// A replay seeding `reg`, from whatever store: refused where `reg`'s
+    /// delta reaches a stateful operator.
+    fn replayable(&self, reg: DeltaReg) -> Result<Replay, String> {
+        self.replay(reg, Integral::Relation(VIEW_ID), None, 0)
+    }
 }
 
 impl Replay {
@@ -110,9 +116,8 @@ impl TestVm {
             unfed: &self.unfed,
         };
         let out = f(&mut self.vm, &mut stores).unwrap();
-        assert_eq!(self.vm.batches.len(), self.vm.regs.len(), "a run left no registers");
         assert!(
-            self.vm.batches.iter().all(Batch::is_empty),
+            self.vm.spare.iter().all(Batch::is_empty),
             "a run left a register holding rows"
         );
         out
@@ -531,7 +536,6 @@ fn a_run_after_an_epoch_dropped_at_its_round_starts_from_empty_registers() {
     let ran = start(&mut vm.vm, &mut stores, r0, Some(&mut seed), true).unwrap();
     assert!(matches!(ran, Ran::Round(_)));
     drop(ran);
-    assert!(vm.vm.batches.is_empty(), "the dropped epoch held the registers");
 
     let mut seed = Batch::empty_with_schema(&schema);
     let got = vm.epoch_with(r0, &mut seed, true, |_, _| {

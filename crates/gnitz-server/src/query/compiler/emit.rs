@@ -9,7 +9,7 @@
 
 use super::routing::{Dist, node_dist, pk_prefix_routed};
 use super::*;
-use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
+use crate::query::vm::{ClampHistory, HistoryStep, HistoryTerm, Op, ProgramBuilder};
 use gnitz_trace::stream::{JoinPlan, OrderedPlan, ReducePlan};
 use gnitz_zset::algebra::null_extend_output_schema;
 
@@ -158,7 +158,7 @@ impl<'a> EmitCtx<'a> {
     /// The base table whose store is already the integral of `of`, the register
     /// its scan reads, and `of`'s re-key of that register.
     fn source_rekey(&self, of: NodeId) -> Option<(&'a Relation, DeltaReg, &MapPlan)> {
-        let (_, Op::Map(rekey), entry) = self.prog.writer(self.regs[of])? else {
+        let (Op::Map(rekey), entry) = self.prog.writer(self.regs[of])? else {
             return None;
         };
         let relation = self.integral_store(self.scanned_at(entry)?)?;
@@ -179,8 +179,8 @@ impl<'a> EmitCtx<'a> {
         let mut operands = vec![(reg, false)];
         while let Some((reg, negated)) = operands.pop() {
             match self.prog.writer(reg) {
-                Some((_, Op::Union { in_b }, in_a)) => operands.extend([(in_a, negated), (*in_b, negated)]),
-                Some((_, Op::Negate, input)) => operands.push((input, !negated)),
+                Some((Op::Union { in_b }, in_a)) => operands.extend([(in_a, negated), (*in_b, negated)]),
+                Some((Op::Negate, input)) => operands.push((input, !negated)),
                 _ => terms.push(self.history_term(reg, negated)?),
             }
         }
@@ -195,10 +195,10 @@ impl<'a> EmitCtx<'a> {
             if let Some(scanned) = self.scanned_at(reg) {
                 break scanned;
             }
-            let (pc, op, input) = self.prog.writer(reg)?;
+            let (op, input) = self.prog.writer(reg)?;
             match op {
-                Op::Filter(_) => steps.push(pc),
-                Op::Map(plan) if plan.inherits_pk() => steps.push(pc),
+                Op::Filter(pred) => steps.push(HistoryStep::Filter(pred.clone())),
+                Op::Map(plan) if plan.inherits_pk() => steps.push(HistoryStep::Map(plan.clone())),
                 // A share keeps or drops whole elements.
                 Op::Share(_) => {}
                 _ => return None,
@@ -430,7 +430,6 @@ fn emit_join_term(
                 // A clamp's output integral is its history clamped, both integrated
                 // in one pass, so the join reads the history through the clamp.
                 Some((
-                    _,
                     &Op::WeightClamp {
                         hist: ClampHistory::Own(hist),
                         kind: clamp,

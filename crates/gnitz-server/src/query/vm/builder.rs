@@ -31,34 +31,38 @@ impl ProgramBuilder {
 
     /// Push `op` over `in_reg`, writing a fresh register of `out_schema`.
     pub(in crate::query) fn push(&mut self, in_reg: DeltaReg, out_schema: SchemaDescriptor, op: Op) -> DeltaReg {
-        let out_reg = self.seed(out_schema);
+        let out_reg = DeltaReg(self.schemas.len());
         let instr = Instr { in_reg, out_reg, op };
         let mut reach: Vec<DeltaReg> = Vec::new();
-        for seed in instr.reads().into_iter().flatten().flat_map(|r| &self.reach[r.at()]) {
+        for seed in instr.reads().into_iter().flatten().flat_map(|r| &self.reach[r.0]) {
             if !reach.contains(seed) {
                 reach.push(*seed);
             }
         }
-        self.reach[out_reg.at()] = reach;
+        // The integral an operator keeps of its own output or input.
+        match &instr.op {
+            Op::Reduce { out_trace: Integral::Own(trace), .. } => self.integrate(out_reg, *trace),
+            Op::WeightClamp { hist: ClampHistory::Own(hist), .. } => self.integrate(in_reg, *hist),
+            _ => {}
+        }
+        self.schemas.push(out_schema);
+        self.reach.push(reach);
         self.instructions.push(instr);
         out_reg
     }
 
-    /// The instruction writing `reg`, with its position and its first operand;
-    /// `None` for a seeded register. Instructions are in out-register order:
-    /// [`Self::push`] gives each a fresh register above every earlier one.
-    pub(in crate::query) fn writer(&self, reg: DeltaReg) -> Option<(usize, &Op, DeltaReg)> {
-        let pc = self
-            .instructions
-            .binary_search_by_key(&reg.at(), |i| i.out_reg.at())
-            .ok()?;
+    /// The operator writing `reg`, with its first operand; `None` for a seeded
+    /// register. Instructions are in out-register order: [`Self::push`] gives
+    /// each a fresh register above every earlier one.
+    pub(in crate::query) fn writer(&self, reg: DeltaReg) -> Option<(&Op, DeltaReg)> {
+        let pc = self.instructions.binary_search_by_key(&reg.0, |i| i.out_reg.0).ok()?;
         let instr = &self.instructions[pc];
-        Some((pc, &instr.op, instr.in_reg))
+        Some((&instr.op, instr.in_reg))
     }
 
     /// Some seeded register's delta reaches both `a` and `b`.
     pub(in crate::query) fn share_a_seed(&self, a: DeltaReg, b: DeltaReg) -> bool {
-        self.reach[a.at()].iter().any(|seed| self.reach[b.at()].contains(seed))
+        self.reach[a.0].iter().any(|seed| self.reach[b.0].contains(seed))
     }
 
     /// Push the sum of `a` and `b`, under the schema both widen to.
@@ -76,7 +80,7 @@ impl ProgramBuilder {
 
     /// Accumulate `reg` into `trace` after every instruction of each epoch: a
     /// join's integrand. A reduce's own output trace and a clamp's own history
-    /// are named by their operator, and [`Self::finish`] integrates them.
+    /// are named by their operator, and [`Self::push`] integrates them.
     pub(in crate::query) fn integrate(&mut self, reg: DeltaReg, trace: StateIdx) {
         self.integrates.push((reg, trace));
     }
@@ -88,7 +92,7 @@ impl ProgramBuilder {
 
     /// The schema register `reg` is labelled with.
     pub(in crate::query) fn schema_of(&self, reg: DeltaReg) -> SchemaDescriptor {
-        self.schemas[reg.at()]
+        self.schemas[reg.0]
     }
 
     /// The runnable plan, whose epoch output is extracted from `out_reg`, and
@@ -96,58 +100,68 @@ impl ProgramBuilder {
     pub(in crate::query) fn finish(self, out_reg: DeltaReg) -> (Vm, StateLayout) {
         let ProgramBuilder {
             instructions,
-            mut integrates,
+            integrates,
             schemas,
-            reach,
             layout,
+            ..
         } = self;
-        for instr in &instructions {
-            match &instr.op {
-                Op::Reduce { out_trace: Integral::Own(trace), .. } => integrates.push((instr.out_reg, *trace)),
-                Op::WeightClamp { hist: ClampHistory::Own(hist), .. } => integrates.push((instr.in_reg, *hist)),
-                _ => {}
-            }
-        }
-
-        // The rounds each seed's delta reaches, by instruction.
-        let mut rounds = vec![Vec::new(); schemas.len()];
-        for (pc, instr) in instructions.iter().enumerate() {
-            if let Op::Round(_) = instr.op {
-                for seed in &reach[instr.in_reg.at()] {
-                    rounds[seed.at()].push(pc);
+        let n = instructions.len();
+        // Forward from `reg`: an instruction is on its run iff it reads a
+        // register the run has reached.
+        let run = |reg: usize| -> Box<[usize]> {
+            let mut reached = vec![false; schemas.len()];
+            reached[reg] = true;
+            let mut run = Vec::new();
+            for (pc, instr) in instructions.iter().enumerate() {
+                if instr.reads().into_iter().flatten().any(|r| reached[r.0]) {
+                    reached[instr.out_reg.0] = true;
+                    run.push(pc);
                 }
             }
-        }
-        // Over the emitted instructions, which already name the register an
-        // elided node's readers read.
-        let mut regs: Vec<Reg> = schemas
-            .into_iter()
-            .zip(rounds)
-            .map(|(schema, rounds)| Reg {
-                schema,
+            let integrated = integrates.iter().enumerate().filter(|(_, (r, _))| reached[r.0]);
+            run.extend(integrated.map(|(i, _)| n + i));
+            run.into()
+        };
+        let mut regs: Vec<Reg> = (0..schemas.len())
+            .map(|reg| Reg {
+                schema: schemas[reg],
                 fold: false,
-                last_read: LastRead::Nobody,
-                rounds: rounds.into_boxed_slice(),
+                last_read: 0,
+                run: run(reg),
             })
             .collect();
-        // Forward, so a later reader replaces an earlier one.
+        // Forward, so a later reader replaces an earlier one. Over the emitted
+        // instructions, which already name the register an elided node's
+        // readers read.
         for (pc, instr) in instructions.iter().enumerate() {
             for reg in instr.reads().into_iter().flatten() {
-                regs[reg.at()].last_read = LastRead::Instr(pc);
+                regs[reg.0].last_read = pc;
             }
-            regs[instr.in_reg.at()].fold |= facts(&instr.op).consolidates_in;
+            // Whether the operator reads its input at net weights.
+            regs[instr.in_reg.0].fold |= match &instr.op {
+                Op::WeightClamp { .. } | Op::JoinDT { .. } => true,
+                Op::Reduce { plan, .. } => !plan.is_exact_linear(),
+                Op::Filter(_)
+                | Op::Map(_)
+                | Op::Negate
+                | Op::Union { .. }
+                | Op::Share(_)
+                | Op::Round(_)
+                | Op::NullExtend { .. }
+                | Op::Ordered { .. } => false,
+            };
         }
         for (i, &(reg, _)) in integrates.iter().enumerate() {
-            regs[reg.at()].last_read = LastRead::Integrate(i);
+            regs[reg.0].last_read = n + i;
         }
         // After the scan, not before: the output register can itself be an operand.
-        regs[out_reg.at()].last_read = LastRead::Nobody;
+        regs[out_reg.0].last_read = usize::MAX;
 
         let vm = Vm {
-            batches: registers(&regs),
             instructions: instructions.into_boxed_slice(),
             integrates: integrates.into_boxed_slice(),
             regs: regs.into_boxed_slice(),
+            spare: Box::default(),
             out_reg,
         };
         (vm, layout)
