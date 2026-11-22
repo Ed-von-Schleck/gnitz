@@ -55,23 +55,6 @@ pub(crate) fn runs_where_zip<A, B>(a: &[A], b: &[B], keep: impl Fn(&A, &B) -> bo
     runs
 }
 
-/// Copy `count` rows of every region from an arena of `src_cap` rows onto one
-/// of `dst_cap` rows, both laid out under `schema`. Arenas of one capacity
-/// hold every region at the same place, so they copy as one run.
-fn copy_regions(schema: &SchemaDescriptor, src: &[u8], src_cap: usize, dst: &mut [u8], dst_cap: usize, count: usize) {
-    if src_cap == dst_cap {
-        let last = schema.num_fixed_regions() - 1;
-        let used = schema.region_start(last, src_cap) + count * schema.region_stride(last);
-        dst[..used].copy_from_slice(&src[..used]);
-        return;
-    }
-    for r in 0..schema.num_fixed_regions() {
-        let len = count * schema.region_stride(r);
-        let (s, d) = (schema.region_start(r, src_cap), schema.region_start(r, dst_cap));
-        dst[d..d + len].copy_from_slice(&src[s..s + len]);
-    }
-}
-
 /// A fresh arena of `cap` rows under `schema` holding the `count` rows of
 /// `src`, an arena of `src_cap` rows; the rows past `count` are uninitialized.
 /// `exact` sizes the buffer as [`PooledBuf::uninit_exact`] does, else as
@@ -85,16 +68,28 @@ fn arena_copy(
     exact: bool,
 ) -> PooledBuf {
     let len = cap * schema.row_width();
-    // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
-    let mut data = unsafe {
+    // SAFETY: the copies below write the `count` rows a `Batch` reads.
+    let mut dst = unsafe {
         if exact {
             PooledBuf::uninit_exact(len)
         } else {
             PooledBuf::uninit(len)
         }
     };
-    copy_regions(schema, src, src_cap, &mut data, cap, count);
-    data
+    if src_cap == cap {
+        // Arenas of one capacity hold every region at the same place, so they
+        // copy as one run.
+        let last = schema.num_fixed_regions() - 1;
+        let used = schema.region_start(last, cap) + count * schema.region_stride(last);
+        dst[..used].copy_from_slice(&src[..used]);
+        return dst;
+    }
+    for r in 0..schema.num_fixed_regions() {
+        let len = count * schema.region_stride(r);
+        let (s, d) = (schema.region_start(r, src_cap), schema.region_start(r, cap));
+        dst[d..d + len].copy_from_slice(&src[s..s + len]);
+    }
+    dst
 }
 
 /// Which row of a batch before [`Batch::consolidate_recording`] each row after
@@ -556,7 +551,7 @@ impl Batch {
             None,
         );
         let out = fill(&mut w);
-        if w.strings_touched() {
+        if w.strings_touched {
             self.dead_heap = self.blob.len();
         }
         out
@@ -960,13 +955,6 @@ impl Batch {
         out
     }
 
-    /// No rows and no string heap, so `clear` has nothing to do and `clone`
-    /// builds an empty batch.
-    #[inline]
-    fn holds_nothing(&self) -> bool {
-        self.count == 0 && self.blob.is_empty()
-    }
-
     /// Reset to empty and return both buffers to the pool, in place. Leaves what
     /// [`Self::empty_with_schema`] would build, without `take`'s two moves of the
     /// whole struct — and returns immediately when the batch is already free, which is
@@ -985,7 +973,7 @@ impl Batch {
 
     /// Reset to empty without freeing buffer allocations.
     pub fn clear(&mut self) {
-        if self.holds_nothing() {
+        if self.count == 0 && self.blob.is_empty() {
             return;
         }
         // The data buffer stays allocated, at its capacity.
@@ -1129,20 +1117,11 @@ impl Batch {
     /// [`Self::consolidate_in_place`] of a batch without the claim.
     #[inline(never)]
     fn consolidate_unclaimed(&mut self) {
-        if self.stands_consolidated() {
+        if merge::in_consolidated_order(self) {
             self.certify_consolidated();
             return;
         }
-        *self = self.folded();
-    }
-
-    /// The rows sorted and weight-folded into a fresh batch, through the
-    /// thread's pooled picks.
-    fn folded(&self) -> Batch {
-        with_picks(|picks| {
-            picks.reserve(self.count);
-            Self::consolidated_from(self, picks)
-        })
+        *self = with_picks(|picks| self.consolidated_from(picks));
     }
 
     /// Consolidate this batch: rows that stand in consolidated order are
@@ -1153,8 +1132,8 @@ impl Batch {
             self.certify_consolidated();
             return RowOrigins::Unmoved;
         }
-        let mut survivors = Vec::with_capacity(self.count);
-        *self = Self::consolidated_from(self, &mut survivors);
+        let mut survivors = Vec::new();
+        *self = self.consolidated_from(&mut survivors);
         RowOrigins::Moved(survivors)
     }
 
@@ -1162,7 +1141,7 @@ impl Batch {
     /// counterpart of [`Self::into_consolidated`].
     pub fn to_consolidated(&self) -> Batch {
         if !self.stands_consolidated() {
-            return self.folded();
+            return with_picks(|picks| self.consolidated_from(picks));
         }
         let mut copy = self.clone();
         if !copy.consolidated {
@@ -1178,17 +1157,17 @@ impl Batch {
         self.is_consolidated() || merge::in_consolidated_order(self)
     }
 
-    /// Sort and weight-fold `batch` into a fresh certified batch, handing back in
-    /// `survivors`, which must be empty, what [`merge::consolidate_groups`]
-    /// found: per output row, the `batch` row it is.
+    /// The rows sorted and weight-folded into a fresh certified batch, handing
+    /// back in `survivors`, which must be empty, what
+    /// [`merge::consolidate_groups`] found: per output row, the row it is.
     #[inline(always)]
-    fn consolidated_from(batch: &Batch, survivors: &mut Vec<Pick>) -> Batch {
-        let schema = &batch.schema;
-        let mb = batch.as_mem_batch();
+    fn consolidated_from(&self, survivors: &mut Vec<Pick>) -> Batch {
+        let mb = self.as_mem_batch();
         debug_assert!(survivors.is_empty());
+        survivors.reserve(self.count);
         // Folded first, so the arena is sized to the survivors.
         merge::consolidate_groups(&mb, survivors);
-        let mut result = super::scatter::materialize_carrying(std::slice::from_ref(&mb), schema, survivors);
+        let mut result = super::scatter::materialize_carrying(std::slice::from_ref(&mb), &self.schema, survivors);
         result.certify_consolidated();
         result
     }
@@ -1264,7 +1243,7 @@ impl Clone for Batch {
     /// rows, keeping the consolidated claim.
     fn clone(&self) -> Self {
         // Rebuilt rather than copied through two pooled arenas holding zero bytes.
-        if self.holds_nothing() {
+        if self.count == 0 && self.blob.is_empty() {
             return Self::empty_with_schema(&self.schema);
         }
         let mut b = self.as_mem_batch().to_batch();

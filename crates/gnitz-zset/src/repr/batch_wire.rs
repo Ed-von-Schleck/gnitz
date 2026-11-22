@@ -222,17 +222,15 @@ impl<'a> MemBatch<'a> {
     /// relocate under span dedup are charged — each span once — and those heap
     /// bytes. `slots` names the German-string payload slots.
     fn deduped_fit(&self, rows: Rows<'_>, slots: u64, budget: usize) -> (usize, usize) {
+        let (blob, slope) = (self.blob(), self.schema().row_width());
         let mut seen = BlobCache::for_rows(self.schema, rows.len());
-        let costs = (0..rows.len()).map(|i| self.row_heap_cost(rows.at(i), slots, &mut seen));
-        self.fit_rows(costs, budget)
-    }
-
-    /// How many rows, from the front, fit `budget`, each taking its fixed width
-    /// and the heap bytes `costs` charges it, and those heap bytes.
-    fn fit_rows(&self, costs: impl Iterator<Item = usize>, budget: usize) -> (usize, usize) {
-        let slope = self.schema().row_width();
         let (mut fit, mut heap) = (0usize, 0usize);
-        for cost in costs {
+        for i in 0..rows.len() {
+            let row = rows.at(i);
+            let cost: usize = gnitz_wire::BitIter(slots)
+                .filter_map(|pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), blob.len()))
+                .map(|span| charge_span(&blob[span], &mut seen))
+                .sum();
             // The first row goes in whatever it costs; a frame carries whole rows.
             if fit > 0 && wal::WAL_HEADER_SIZE + (fit + 1) * slope + heap + cost > budget {
                 break;
@@ -291,18 +289,6 @@ impl<'a> MemBatch<'a> {
             }
         }
         (fit, heap, plain > hi.saturating_sub(lo))
-    }
-
-    /// Heap bytes row `row` adds to a chunk: the spans its long cells in the
-    /// string slots `slots` name, each charged once, `seen` holding the chunk's
-    /// spans so far.
-    #[inline]
-    fn row_heap_cost(&self, row: usize, slots: u64, seen: &mut BlobCache) -> usize {
-        let blob = self.blob();
-        gnitz_wire::BitIter(slots)
-            .filter_map(|pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), blob.len()))
-            .map(|span| charge_span(&blob[span], seen))
-            .sum()
     }
 
     /// The rows `rows` names, in order, as one WAL block at the front of `out`,

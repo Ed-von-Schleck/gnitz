@@ -6,7 +6,7 @@
 use gnitz_expr::{ColCopy, ColumnLocator};
 
 use super::int_cell;
-use crate::repr::{Batch, DirectWriter, MemBatch, relocated_cell};
+use crate::repr::{Batch, DirectWriter, MemBatch, StringDest};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{FixedInt, Heap, RowSource, TypeCode, zip_cells};
 
@@ -234,20 +234,15 @@ fn gather_column(src: &MemBatch, c: &ColCopy, rows: impl Iterator<Item = usize>,
         return;
     };
     let col = src.col_data(slot as usize);
-    if type_code.is_german_string() {
-        let cells = col.as_chunks::<16>().0;
-        let (dst, heap, mut cache) = out.string_col_mut(c.slot);
-        for (cell, row) in dst.as_chunks_mut::<16>().0.iter_mut().zip(rows) {
-            *cell = relocated_cell(&cells[row], src.heap(), heap, cache.as_deref_mut());
+    gnitz_wire::by_cell_width!(size as usize, |T| {
+        const N: usize = size_of::<T>();
+        let cells = col.as_chunks::<N>().0;
+        for (cell, row) in out.col_mut(c.slot).as_chunks_mut::<N>().0.iter_mut().zip(rows) {
+            *cell = cells[row];
         }
-    } else {
-        gnitz_wire::by_cell_width!(size as usize, |T| {
-            const N: usize = size_of::<T>();
-            let cells = col.as_chunks::<N>().0;
-            for (cell, row) in out.col_mut(c.slot).as_chunks_mut::<N>().0.iter_mut().zip(rows) {
-                *cell = cells[row];
-            }
-        })
+    });
+    if type_code.is_german_string() {
+        out.rebase_string_col(c.slot, src.heap(), StringDest::Placed(None));
     }
 }
 

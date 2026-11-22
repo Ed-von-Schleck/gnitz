@@ -137,7 +137,7 @@ pub fn relocate_german_string_with(cell: &[u8; 16], src_blob: &[u8], place: impl
 /// `cell`, re-homed from `heap`: a short cell with its pad zeroed, a long one
 /// pointing at the offset `place` returns for its value; a long cell `heap` does
 /// not hold becomes the empty string, as [`german_string_bytes`] reads it.
-#[inline]
+#[inline(always)]
 pub fn relocate_german_value_with(
     cell: &[u8; 16],
     heap: Heap<'_>,

@@ -319,17 +319,9 @@ fn relocate_value(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, ca
 /// Where `content`, a span of a plain source heap, sits in `dst_blob`:
 /// appended, or where `cache` already put it.
 fn place_span(content: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) -> usize {
-    let at = dst_blob.len();
-    match cache {
-        Some(cache) => *cache.map().entry(blob_span_key(content)).or_insert_with(|| {
-            dst_blob.extend_from_slice(content);
-            at
-        }),
-        None => {
-            dst_blob.extend_from_slice(content);
-            at
-        }
-    }
+    place(blob_span_key(content), dst_blob, cache, |dst| {
+        dst.extend_from_slice(content)
+    })
 }
 
 /// [`place_span`] of a value of any heap into `dst_blob`: decoded into a plain
@@ -340,14 +332,26 @@ fn place_value(
     book: Option<&dyn HeapCoder>,
     cache: Option<&mut BlobCache>,
 ) -> usize {
+    place(value.key(), dst_blob, cache, |dst| append_value(value, dst, book))
+}
+
+/// Where the source value `key` names sits in `dst_blob`: appended there by
+/// `append`, or where `cache` already put it.
+#[inline(always)]
+fn place(
+    key: SpanKey,
+    dst_blob: &mut Vec<u8>,
+    cache: Option<&mut BlobCache>,
+    append: impl FnOnce(&mut Vec<u8>),
+) -> usize {
     let at = dst_blob.len();
     match cache {
-        Some(cache) => *cache.map().entry(value.key()).or_insert_with(|| {
-            append_value(value, dst_blob, book);
+        Some(cache) => *cache.map().entry(key).or_insert_with(|| {
+            append(dst_blob);
             at
         }),
         None => {
-            append_value(value, dst_blob, book);
+            append(dst_blob);
             at
         }
     }

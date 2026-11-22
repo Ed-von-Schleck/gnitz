@@ -27,9 +27,9 @@ pub struct DirectWriter<'a> {
     /// each get a copy.
     blob_cache: Option<&'a mut BlobCache>,
     pub schema: &'a SchemaDescriptor,
-    /// Some German-string cell or the heap was handed out to write: a rewrite may have
-    /// left a long value unreferenced.
-    strings_touched: bool,
+    /// Some German-string cell was handed out to write, or the heap beside more
+    /// than one column: a rewrite may have left a long value unreferenced.
+    pub(super) strings_touched: bool,
 }
 
 impl<'a> DirectWriter<'a> {
@@ -57,12 +57,6 @@ impl<'a> DirectWriter<'a> {
             schema,
             strings_touched: false,
         }
-    }
-
-    /// Whether a German-string cell or the heap was handed out to write.
-    #[inline(always)]
-    pub(super) fn strings_touched(&self) -> bool {
-        self.strings_touched
     }
 
     /// Rows this writer fills.
@@ -194,7 +188,8 @@ impl<'a> DirectWriter<'a> {
 impl gnitz_expr::MapTarget for DirectWriter<'_> {
     #[inline(always)]
     fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
-        self.strings_touched = true;
+        // Only a string slot's write reaches the heap.
+        self.strings_touched |= gnitz_wire::null_word_get(self.schema.string_payload_slots(), pi);
         let (cells, nulls) = (self.span(REG_PAYLOAD_START + pi), self.span(REG_NULL_BMP));
         // The null words lie below every payload column.
         let (lo, hi) = self.data.split_at_mut(cells.start);

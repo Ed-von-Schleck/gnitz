@@ -98,8 +98,9 @@ pub fn with_picks<R>(f: impl FnOnce(&mut Vec<Pick>) -> R) -> R {
 
 /// Instantiate `$f` at the const width matching the region stride `$w`, which
 /// is also passed on. The literal width keeps the per-row copy a load/store
-/// instead of a `memcpy` call. `N = 0` is the runtime arm, which a compound PK
-/// stride (U64+U32 = 12) reaches; a target reads its width through [`stride`].
+/// instead of a `memcpy` call; 12 and 24 are the common compound PK strides
+/// (U64+U32, three U64). `N = 0` is the runtime arm, which any other compound
+/// PK stride reaches; a target reads its width through [`stride`].
 #[macro_export]
 #[doc(hidden)]
 macro_rules! stride_dispatch {
@@ -110,7 +111,9 @@ macro_rules! stride_dispatch {
             2 => $f::<2>($($arg,)* w),
             4 => $f::<4>($($arg,)* w),
             8 => $f::<8>($($arg,)* w),
+            12 => $f::<12>($($arg,)* w),
             16 => $f::<16>($($arg,)* w),
+            24 => $f::<24>($($arg,)* w),
             _ => $f::<0>($($arg,)* w),
         }
     }};
@@ -233,63 +236,33 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], heap_at: Option<us
         );
     }
 
-    stride_dispatch!(writer.schema.pk_stride(), scatter_pk_wt_nbm, batch, indices, writer);
-
     let schema = writer.schema;
-    for (pi, col) in schema.payload_columns() {
-        let src_col = batch.col_data(pi);
-        let german = col.type_code.is_german_string();
-        if german && heap_at.is_none() {
-            let src = src_col.as_chunks::<16>().0;
-            let (cells, blob, mut cache) = writer.string_col_mut(pi);
-            for (cell, &idx) in cells.as_chunks_mut::<16>().0.iter_mut().zip(indices) {
-                *cell = relocated_cell(&src[idx as usize], Heap::Plain(batch.blob), blob, cache.as_deref_mut());
-            }
-            continue;
-        }
-        let dst = writer.col_mut(pi);
-        gnitz_wire::by_cell_width!(col.size(), |T| gather_col::<{ size_of::<T>() }>(src_col, dst, indices));
-        if let Some(base) = heap_at.filter(|_| german) {
-            gnitz_wire::shift_german_string_heaps(dst, base);
-        }
+    for r in 0..schema.num_fixed_regions() {
+        stride_dispatch!(
+            schema.region_stride(r),
+            gather_col,
+            batch.region(r),
+            writer.region_mut(r),
+            indices
+        );
+    }
+    for pi in gnitz_wire::BitIter(schema.string_payload_slots()) {
+        writer.rebase_string_col(pi, Heap::Plain(batch.blob), heap_at.into());
     }
 }
 
+/// The `width`-byte cell of every row `indices` names, copied onto `dst` back
+/// to back; `indices` lie inside `src`, as [`scatter_copy`] checks.
 #[inline(always)]
-fn scatter_pk_wt_nbm<const PKS: usize>(
-    batch: &MemBatch<'_>,
-    indices: &[u32],
-    writer: &mut DirectWriter<'_>,
-    width: usize,
-) {
-    const FB: usize = FIXED_REGION_BYTES;
-    let pks = stride::<PKS>(width);
-    let pk_src = batch.pk();
-    let wt_src = batch.weight();
-    let nb_src = batch.null_bmp();
-    let (pk_dst, wt_dst, nb_dst) = writer.fixed_mut();
-    assert!(pk_dst.len() == indices.len() * pks && wt_dst.len() == indices.len() * FB);
+fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32], width: usize) {
+    let w = stride::<N>(width);
+    assert_eq!(dst.len(), indices.len() * w);
     for (out, &idx) in indices.iter().enumerate() {
         let i = idx as usize;
-        debug_assert!((i + 1) * pks <= pk_src.len());
-        debug_assert!((i + 1) * FB <= wt_src.len());
-        debug_assert!((i + 1) * FB <= nb_src.len());
+        debug_assert!((i + 1) * w <= src.len());
+        // SAFETY: `i` is a row of `src`, `out` a row of `dst`, by the asserts.
         unsafe {
-            std::ptr::copy_nonoverlapping(pk_src.as_ptr().add(i * pks), pk_dst.as_mut_ptr().add(out * pks), pks);
-            std::ptr::copy_nonoverlapping(wt_src.as_ptr().add(i * FB), wt_dst.as_mut_ptr().add(out * FB), FB);
-            std::ptr::copy_nonoverlapping(nb_src.as_ptr().add(i * FB), nb_dst.as_mut_ptr().add(out * FB), FB);
-        }
-    }
-}
-
-#[inline(always)]
-fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
-    assert_eq!(dst.len(), indices.len() * N);
-    for (out, &idx) in indices.iter().enumerate() {
-        let i = idx as usize;
-        debug_assert!((i + 1) * N <= src.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(i * N), dst.as_mut_ptr().add(out * N), N);
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(i * w), dst.as_mut_ptr().add(out * w), w);
         }
     }
 }
