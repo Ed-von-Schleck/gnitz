@@ -38,7 +38,6 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
     let [user, all] = std::array::from_fn(|i| (instructions[i] - empty[i]) as f64 / PASSES as f64);
     assert_eq!(parks.get(), PASSES, "{label}: a pass that woke nothing");
     println!("reactor_pass_bench {label:<12} {user:>7.1} user, {all:>8.1} user+kernel instr/pass");
-    r.tasks.borrow_mut().clear(); // the task holds the reactor
 }
 
 /// What one pass of the loop costs in instructions, by what its one task parked
@@ -55,26 +54,24 @@ fn reactor_pass_bench() {
     arm("task", make_reactor(), async || yield_once().await, || ());
 
     let r = make_reactor();
-    let r2 = r.clone();
     arm(
         "op",
         r,
         async move || {
-            black_box(nop(&r2).await);
+            black_box(nop(r).await);
         },
         || (),
     );
 
     let r = make_reactor();
-    let r2 = r.clone();
     let send = async move || {
-        let op = select2(nop(&r2), r2.sleep(Limits::TEST.client_send_timeout)).await;
+        let op = select2(nop(r), r.sleep(Limits::TEST.client_send_timeout)).await;
         assert!(matches!(op, Either::A(_)));
     };
     arm("op+deadline", r, send, || ());
 
     let r = make_reactor();
-    let (peer, partner) = Peer::over_socketpair(&r);
+    let (peer, partner) = Peer::over_socketpair(r);
     let frame = gnitz_wire::framed(b"x");
     let recv = async move || drop(black_box(peer.recv().await.expect("a frame")));
     arm("recv", r, recv, || (&partner).write_all(&frame).expect("write"));
@@ -83,10 +80,10 @@ fn reactor_pass_bench() {
         let (r, mut writers) = reactor_with_rings(nw);
         // The position the task waits on, 0 before its first wait.
         let awaited = Rc::new(Cell::new(0));
-        let (r2, next) = (r.clone(), Rc::clone(&awaited));
+        let next = Rc::clone(&awaited);
         let acks = async move || {
             next.update(|v| v + 1);
-            r2.applied_through(next.get()).await;
+            r.applied_through(next.get()).await;
         };
         arm(&format!("acks nw={nw}"), r, acks, || {
             writers.iter_mut().for_each(|w| w.applied(awaited.get()));

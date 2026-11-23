@@ -4,10 +4,10 @@
 //! goes again behind a checkpoint or fails — over a dispatcher no worker is
 //! launched for. What a worker does with the groups is covered end to end.
 
+use super::super::tests::workerless_committer;
 use super::super::tick::fresh_read_lock;
 use super::*;
 use crate::catalog::CatalogEngine;
-use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::reactor::test_support::poll_until;
 use crate::runtime::sal::Routed;
 use crate::runtime::test_support::{try_poll_once, within};
@@ -16,7 +16,6 @@ use crate::test_support::{
     certified, col_def, make_batch, make_batch_bytes, make_schema_u64_i64, register_identity_view, u64_i64_cols,
 };
 use gnitz_wire::{TableDistribution, TableProps, TypeCode, WireConflictMode, WireStatus};
-use std::time::Duration;
 
 fn batch_of(rows: usize) -> Batch {
     make_batch(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
@@ -198,17 +197,6 @@ fn a_push_merges_behind_the_last_write_to_its_table() {
     assert!(s.last_unit.is_empty());
 }
 
-/// The committer serving `engine` with no worker launched: every round's ACKs
-/// are in at its write. Neither the tick loop nor the feeds' pump is running;
-/// the pump's requests are returned to stay open.
-fn workerless_committer(engine: CatalogEngine) -> (Rc<Shared>, impl Sized) {
-    let (dispatcher, _) = test_dispatcher(0, engine);
-    let reactor = dispatcher.reactor().clone();
-    let (shared, requests, asks) = Shared::new(dispatcher, Duration::ZERO, None);
-    reactor.spawn(run(requests, Rc::clone(&shared)));
-    (shared, asks)
-}
-
 /// Replicated tables of a U64 key and a string, so the one payload holds a
 /// table's rows whatever the width.
 fn string_tables<const N: usize>(engine: &mut CatalogEngine, names: [&str; N]) -> [u64; N] {
@@ -254,7 +242,7 @@ fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
             shared.dispatcher.credit(&laid_out, t, 1);
         });
 
-        let mut read = std::pin::pin!(fresh_read_lock(&shared, [v], reactor.now()));
+        let mut read = std::pin::pin!(fresh_read_lock(shared, [v], reactor.now()));
         assert!(try_poll_once(read.as_mut()).is_none(), "the read waits on a drain");
         reactor.block_on(shared.committer.close());
         assert!(shared.dispatcher.all_ticked([v]));
@@ -275,7 +263,7 @@ fn a_closed_committer_refuses_a_write_and_a_backup() {
             .block_on(disp.checkpoint_ephemeral(&disp.alone()))
             .unwrap();
         let write = || {
-            let rows = FamilyRows::Built(sized_row(&shared, tid, None));
+            let rows = FamilyRows::Built(sized_row(shared, tid, None));
             let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
             Box::pin(shared.committer.write(families, HeldTables::default(), false))
         };
@@ -315,7 +303,7 @@ fn a_write_past_the_threshold_is_checkpointed_unasked() {
             .block_on(disp.checkpoint_ephemeral(&disp.alone()))
             .unwrap();
 
-        let rows = FamilyRows::Built(sized_row(&shared, tid, Some(sal.push_room())));
+        let rows = FamilyRows::Built(sized_row(shared, tid, Some(sal.push_room())));
         let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
         disp.reactor()
             .block_on(shared.committer.write(families, HeldTables::default(), false))
@@ -356,7 +344,7 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
             let families = (families.iter())
                 .map(|&(family, footprint)| {
                     // Sized as a row of `tid`: the tables share one schema.
-                    let rows = FamilyRows::Built(sized_row(&shared, tid, footprint));
+                    let rows = FamilyRows::Built(sized_row(shared, tid, footprint));
                     TxnFamily::new(family, WireConflictMode::Update, rows)
                 })
                 .collect();
@@ -442,7 +430,7 @@ fn a_refused_merged_run_goes_again_as_its_writes() {
         // strings differ, so the merged batch holds both.
         let large = room / 4 * 3;
         let mut pushes = [large, large + 8].map(|footprint| {
-            let rows = FamilyRows::Built(sized_row(&shared, tid, Some(footprint)));
+            let rows = FamilyRows::Built(sized_row(shared, tid, Some(footprint)));
             let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
             Box::pin(shared.committer.write(families, HeldTables::default(), false))
         });

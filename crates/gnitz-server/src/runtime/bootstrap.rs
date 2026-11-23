@@ -429,12 +429,12 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // a wait of the recovery, or every request a worker answers, waiting
     // forever. `workers` drops at the return, which kills them: after the final
     // checkpoint, a death, or a failed boot.
-    let mut death = std::pin::pin!(workers.death(&reactor));
+    let mut death = std::pin::pin!(workers.death(reactor));
     let recovered = async {
         let pushed = tail.pushed().clone();
-        let sal = SalWriter::boot(tail, parks, &reactor).await;
+        let sal = SalWriter::boot(tail, parks, reactor).await;
         inject_recovery_panic("reset");
-        let dispatcher = MasterDispatcher::new(catalog, sal, reactor.clone());
+        let dispatcher = MasterDispatcher::new(catalog, sal, reactor);
         master_post_fork_recovery(&dispatcher, pushed).await?;
         Ok::<_, String>(dispatcher)
     };

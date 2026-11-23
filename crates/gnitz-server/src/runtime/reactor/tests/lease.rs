@@ -7,7 +7,7 @@ use crate::runtime::frame::WireMsg;
 use crate::runtime::w2m::fixtures::id;
 
 /// A lease on `r` of one read per set of `reads`, each written to its set.
-fn lease_of(r: &Reactor, reads: &[WorkerSet]) -> TrainLease {
+fn lease_of(r: Reactor, reads: &[WorkerSet]) -> TrainLease {
     let mut lease = r.lease_train();
     for &set in reads {
         lease.add(set, "ScanSpec");
@@ -122,7 +122,7 @@ fn a_passing_frame_is_copied_out_unless_its_reader_waits_on_its_worker() {
     r.drain_all_w2m();
     assert_eq!(r.w2m.release_cursor(1), r.w2m.write_cursor(1), "no reader: copied out");
 
-    let other = lease_of(&r, &[WorkerSet::ALL]);
+    let other = lease_of(r, &[WorkerSet::ALL]);
     writers[1].send_msg(other.id(), &last);
     r.drain_all_w2m();
     assert!(
@@ -288,14 +288,14 @@ fn a_reused_queue_box_holds_only_its_own_leases_frames() {
         pks
     };
 
-    let mut read = lease_of(&r, &[WorkerSet::one(1)]);
+    let mut read = lease_of(r, &[WorkerSet::one(1)]);
     writers[1].send_train_frame(read.id(), true, Some(&rows(1)));
     r.drain_all_w2m();
     assert_eq!(read_all(&mut read), [1]);
     drop(read);
     assert_eq!(r.routes.borrow().spare.len(), 1, "the box is kept");
 
-    let unread = lease_of(&r, &[WorkerSet::one(0).with(2)]);
+    let unread = lease_of(r, &[WorkerSet::one(0).with(2)]);
     assert!(r.routes.borrow().spare.is_empty(), "the kept box is taken");
     for w in [0, 2] {
         writers[w].send_train_frame(unread.id(), false, Some(&rows(2)));
@@ -311,7 +311,7 @@ fn a_reused_queue_box_holds_only_its_own_leases_frames() {
         );
     }
 
-    let mut next = lease_of(&r, &[WorkerSet::ALL]);
+    let mut next = lease_of(r, &[WorkerSet::ALL]);
     assert!(r.routes.borrow().spare.is_empty(), "the kept box is taken");
     for (w, writer) in writers.iter_mut().enumerate() {
         writer.send_train_frame(next.id(), true, (w == 2).then(|| rows(3)).as_ref());
@@ -341,7 +341,7 @@ fn a_leases_trains_split_at_their_terminals() {
     };
 
     let (first, second) = (WorkerSet::one(0).with(1), WorkerSet::one(1).with(2));
-    let mut lease = lease_of(&r, &[first, second]);
+    let mut lease = lease_of(r, &[first, second]);
     let id = lease.id();
     // Worker 1 answers both reads, and has sent the second's train before
     // worker 0 has sent anything of the first's.
@@ -371,7 +371,7 @@ fn a_given_up_trains_remainder_is_read_off_before_the_next() {
     let (r, mut writers) = reactor_with_rings(2);
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = |pk: u64| crate::test_support::certified(crate::test_support::make_batch(&schema, &[(pk, 1, 0)]));
-    let mut lease = lease_of(&r, &[WorkerSet::ALL, WorkerSet::ALL]);
+    let mut lease = lease_of(r, &[WorkerSet::ALL, WorkerSet::ALL]);
     let id = lease.id();
 
     let fault = gnitz_wire::WireFault::from("no such store");
@@ -418,7 +418,7 @@ fn a_hold_ends_when_the_read_being_taken_waits_on_its_worker() {
     let (r, mut writers) = reactor_with_rings(1);
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::certified(crate::test_support::make_batch(&schema, &[(7, 1, 0)]));
-    let mut lease = lease_of(&r, &[WorkerSet::ALL, WorkerSet::ALL]);
+    let mut lease = lease_of(r, &[WorkerSet::ALL, WorkerSet::ALL]);
     let id = lease.id();
     // All of the first read's train, and the start of the second's.
     writers[0].send_train_frame(id, true, Some(&rows));
@@ -447,7 +447,7 @@ fn a_hold_ends_when_the_read_being_taken_waits_on_its_worker() {
 #[should_panic(expected = "worker 1 answered a read it was not sent")]
 fn a_frame_from_a_worker_the_lease_never_wrote_to_is_reported() {
     let (r, mut writers) = reactor_with_rings(2);
-    let lease = lease_of(&r, &[WorkerSet::one(0)]);
+    let lease = lease_of(r, &[WorkerSet::one(0)]);
     writers[1].send_train_frame(lease.id(), true, None);
     r.drain_all_w2m();
     drop(lease);

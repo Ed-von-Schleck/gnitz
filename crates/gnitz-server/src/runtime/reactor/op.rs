@@ -138,11 +138,11 @@ impl Reactor {
     /// its awaiter, which yields the CQE `res` and `carry`. Not submitted.
     ///
     /// # Safety
-    /// As [`ReactorShared::push`]; what `carry` holds counts as valid until the CQE.
+    /// As [`Self::push`]; what `carry` holds counts as valid until the CQE.
     /// `sqe` posts exactly one CQE: [`Ops::complete`] finds an op's slot by its
     /// low bits alone, so a second CQE would complete the slot's next op early
     /// and free that op's carry while its SQE still reads it.
-    pub(super) unsafe fn push_op<C: 'static>(&self, sqe: io_uring::squeue::Entry, carry: C) -> Op<C> {
+    pub(super) unsafe fn push_op<C: 'static>(self, sqe: io_uring::squeue::Entry, carry: C) -> Op<C> {
         let slot = self.ops.slots.borrow_mut().insert(OpSlot::Waiting(None)) as u64;
         debug_assert!(slot <= OP_SLOT_MASK, "{slot} ops in flight");
         let pushed = self.ops.pushed.get() + 1;
@@ -151,7 +151,7 @@ impl Reactor {
         // SAFETY: forwarded to the caller.
         unsafe { self.push(sqe, user_data) };
         Op {
-            reactor: self.clone(),
+            reactor: self,
             user_data,
             carry: Some(carry),
         }
@@ -160,7 +160,7 @@ impl Reactor {
     /// An fdatasync of `fd`, submitted at its first poll rather than with the
     /// pass's own submit, so it runs while the rest of the pass does. Yields
     /// the CQE `res`: 0, or a negative errno.
-    pub(crate) async fn fsync(&self, fd: BorrowedFd<'static>) -> i32 {
+    pub(crate) async fn fsync(self, fd: BorrowedFd<'static>) -> i32 {
         let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
             .flags(types::FsyncFlags::DATASYNC)
             .build();
@@ -173,7 +173,7 @@ impl Reactor {
     /// Resolves once child `pid` has exited, leaving it a zombie (`WNOWAIT`) for
     /// a later wait to reap. Yields how it ended, or the negative errno of a
     /// failed wait.
-    pub(crate) async fn child_exit(&self, pid: libc::pid_t) -> Result<libc::siginfo_t, i32> {
+    pub(crate) async fn child_exit(self, pid: libc::pid_t) -> Result<libc::siginfo_t, i32> {
         // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
         let info: Box<libc::siginfo_t> = Box::new(unsafe { std::mem::zeroed() });
         let sqe = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, libc::WEXITED | libc::WNOWAIT)
@@ -187,7 +187,7 @@ impl Reactor {
 
     /// Read up to `buf.len()` bytes of `fd` into `buf`. Yields the CQE `res`,
     /// the bytes read or a negative errno, and `buf`.
-    pub(crate) async fn read(&self, fd: BorrowedFd<'static>, mut buf: Box<[u8]>) -> (i32, Box<[u8]>) {
+    pub(crate) async fn read(self, fd: BorrowedFd<'static>, mut buf: Box<[u8]>) -> (i32, Box<[u8]>) {
         let sqe = opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
             .offset(u64::MAX)
             .build();

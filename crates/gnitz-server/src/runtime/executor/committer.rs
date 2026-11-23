@@ -17,7 +17,6 @@ use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use std::cell::Cell;
-use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
 /// capped at this plus one whole request — and one request is itself bounded
@@ -151,13 +150,13 @@ struct CommitScratch {
 /// The committer task loop. Never returns. With no request queued it runs a
 /// checkpoint as soon as the SAL wants one: a workload with no writes sends it
 /// nothing, yet its reads still write SAL groups.
-pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Shared>) {
+pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: &'static Shared) {
     let mut s = CommitScratch::default();
     loop {
         let first = match select2(rx.recv(), shared.dispatcher.sal().checkpoint_due()).await {
             Either::A(req) => req,
             Either::B(()) => {
-                run_checkpoint_sequence(&shared).await;
+                run_checkpoint_sequence(shared).await;
                 continue;
             }
         };
@@ -179,7 +178,7 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
 
         // Before this batch's groups: the checkpoint makes room for them.
         if shared.dispatcher.sal().needs_checkpoint() {
-            run_checkpoint_sequence(&shared).await;
+            run_checkpoint_sequence(shared).await;
         }
 
         // A write the SAL refused for want of room goes again behind a
@@ -190,9 +189,9 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         // floor fails, so a pass with no such group commits or fails a unit.
         let mut merge = true;
         while !s.writes.is_empty() {
-            commit_writes(&shared, &mut s, merge).await;
+            commit_writes(shared, &mut s, merge).await;
             if !s.writes.is_empty() {
-                run_checkpoint_sequence(&shared).await;
+                run_checkpoint_sequence(shared).await;
                 merge = false;
             }
         }
@@ -200,12 +199,12 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         match end {
             None => {}
             Some(BatchEnd::Checkpoint(done)) => {
-                run_checkpoint_sequence(&shared).await;
+                run_checkpoint_sequence(shared).await;
                 done.send(());
             }
             Some(BatchEnd::Backup { dir, done }) => {
-                run_checkpoint_sequence(&shared).await;
-                done.send(super::backup::copy_published(&shared, &dir).await);
+                run_checkpoint_sequence(shared).await;
+                done.send(super::backup::copy_published(shared, &dir).await);
             }
             Some(BatchEnd::Settle(done)) => done.send(()),
         }

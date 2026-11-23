@@ -17,7 +17,7 @@ fn fanout_coalesced_egress_bench() {
         for frame_len in [CAP / 32, CAP / 8, CAP / 2, CAP, 2 * CAP] {
             let total = w * frame_len;
             let r = make_reactor();
-            let (mut peer, receiver) = Peer::over_socketpair(&r);
+            let (mut peer, receiver) = Peer::over_socketpair(r);
             // The reader keeps the socket buffers from ever stalling a send, so
             // the timed region is kernel-op cost, not backpressure.
             let expect = 2 * ROUNDS * total;
@@ -100,7 +100,7 @@ fn pushed_train_band_bench() {
             let mut peers = Vec::new();
             let mut drains = Vec::new();
             for _ in 0..n {
-                let (peer, receiver) = Peer::over_socketpair(&r);
+                let (peer, receiver) = Peer::over_socketpair(r);
                 peers.push(peer);
                 drains.push(spawn_drain(receiver, per_peer));
             }

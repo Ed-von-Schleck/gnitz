@@ -26,11 +26,11 @@ fn panic_in_spawned_task_propagates_not_swallowed() {
 fn a_task_spawns_during_its_own_poll() {
     let r = make_reactor();
     let ran = Rc::new(Cell::new(0));
-    let (r2, ran2) = (r.clone(), Rc::clone(&ran));
+    let ran2 = Rc::clone(&ran);
     r.spawn(async move {
         for _ in 0..64 {
             let ran = Rc::clone(&ran2);
-            r2.spawn(async move { ran.update(|v| v + 1) });
+            r.spawn(async move { ran.update(|v| v + 1) });
         }
     });
     r.block_until_idle();
@@ -158,7 +158,6 @@ fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
             r.timers.earliest() > Some(start + Duration::from_secs(60)),
             "only the hour-long deadline is left"
         );
-        r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
     });
 }
 
@@ -183,33 +182,13 @@ fn a_self_waking_task_does_not_starve_the_pass() {
 #[test]
 fn block_on_submits_the_pass_that_completed_it() {
     let r = make_reactor();
-    let mut op = r.block_on(std::future::poll_fn(|_| Poll::Ready(nop(&r))));
+    let mut op = r.block_on(std::future::poll_fn(|_| Poll::Ready(nop(r))));
     r.dispatch_cqes();
     assert_eq!(
         try_poll_once(&mut op),
         Some((0, ())),
         "block_on returned with its last pass's SQE unsubmitted"
     );
-}
-
-/// A thread holds one live reactor at a time: its wakes land in the one
-/// thread-local run queue. A refused reactor leaves the live one's claim
-/// standing, so the next is refused too.
-#[test]
-fn a_second_live_reactor_on_one_thread_panics() {
-    let _first = make_reactor();
-    for _ in 0..2 {
-        let refused = std::panic::catch_unwind(make_reactor).err().expect("a second reactor");
-        let why = refused.downcast_ref::<&str>().expect("a panic message");
-        assert!(why.contains("second reactor"), "{why}");
-    }
-}
-
-/// The thread's claim ends with its reactor, so a later one may take it.
-#[test]
-fn a_dropped_reactor_frees_its_thread() {
-    drop(make_reactor());
-    drop(make_reactor());
 }
 
 /// More ops than the SQ holds, queued at once: the push that finds the SQ full
@@ -220,7 +199,7 @@ fn a_dropped_reactor_frees_its_thread() {
 fn a_pass_past_the_sq_and_the_drain_batch_loses_no_completion() {
     let r = make_reactor();
     let n = SQ_ENTRIES + SQ_ENTRIES / 2;
-    let ops: Vec<_> = (0..n).map(|_| nop(&r)).collect();
+    let ops: Vec<_> = (0..n).map(|_| nop(r)).collect();
     r.tick();
     r.run_ready();
     assert!(ops.into_iter().all(|op| try_poll_once(op) == Some((0, ()))));

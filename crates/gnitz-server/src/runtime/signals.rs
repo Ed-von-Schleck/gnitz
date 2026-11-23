@@ -71,7 +71,7 @@ impl Signals {
     }
 
     /// The next signal read off the signalfd.
-    pub(super) async fn next(&mut self, reactor: &Reactor) -> libc::c_int {
+    pub(super) async fn next(&mut self, reactor: Reactor) -> libc::c_int {
         let (rc, buf) = reactor.read(self.fd.as_fd(), std::mem::take(&mut self.buf)).await;
         self.buf = buf;
         let buf = &self.buf;

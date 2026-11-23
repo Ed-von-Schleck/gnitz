@@ -38,17 +38,17 @@ fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
 #[test]
 fn a_reused_slot_gives_its_next_op_another_id() {
     let r = make_reactor();
-    let first = nop(&r);
+    let first = nop(r);
     let (id, slot) = (first.user_data, first.slot());
     r.block_on(first);
-    let second = nop(&r);
+    let second = nop(r);
     assert_eq!(second.slot(), slot, "the freed slot is reused");
     assert_ne!(second.user_data, id);
     r.block_on(second);
 }
 
 /// Submit what is queued, then dispatch every CQE that arrived.
-fn complete_queued(r: &Reactor) {
+fn complete_queued(r: Reactor) {
     r.submit();
     r.run_ready();
 }
@@ -58,11 +58,11 @@ fn complete_queued(r: &Reactor) {
 #[test]
 fn an_op_dropped_before_its_cqe_is_freed_by_the_cqe() {
     let r = make_reactor();
-    drop(nop(&r));
+    drop(nop(r));
     assert_eq!(r.ops.len(), 1, "the slot outlives its dropped awaiter");
-    complete_queued(&r);
+    complete_queued(r);
     assert_eq!(r.ops.len(), 0, "the CQE freed the abandoned slot");
-    assert_eq!(r.block_on(nop(&r)).0, 0);
+    assert_eq!(r.block_on(nop(r)).0, 0);
     assert_eq!(r.ops.len(), 0);
 }
 
@@ -71,13 +71,13 @@ fn an_op_dropped_before_its_cqe_is_freed_by_the_cqe() {
 #[test]
 fn an_op_dropped_after_its_cqe_frees_its_slot() {
     let r = make_reactor();
-    let mut op = nop(&r);
+    let mut op = nop(r);
     assert!(try_poll_once(&mut op).is_none());
-    complete_queued(&r);
+    complete_queued(r);
     assert_eq!(r.ops.len(), 1, "the CQE leaves the result in the slot");
     drop(op);
     assert_eq!(r.ops.len(), 0, "the drop freed the completed slot");
-    assert_eq!(r.block_on(nop(&r)).0, 0);
+    assert_eq!(r.block_on(nop(r)).0, 0);
     assert_eq!(r.ops.len(), 0);
 }
 
@@ -90,7 +90,7 @@ fn read_takes_a_blocked_signal_off_a_signalfd() {
         // Masks the signals on this thread alone, which the signal is sent to,
         // so no other thread can take it.
         let mut signals = Signals::open();
-        let mut next = std::pin::pin!(signals.next(&r));
+        let mut next = std::pin::pin!(signals.next(r));
         assert!(try_poll_once(next.as_mut()).is_none(), "no signal yet");
         assert_eq!(unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGHUP) }, 0);
         assert_eq!(r.block_on(next), libc::SIGHUP);

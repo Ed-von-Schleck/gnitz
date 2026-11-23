@@ -493,7 +493,7 @@ impl Armed {
     /// a plain socket, so a large payload lands in place, else into the carry.
     /// The entry's `key` rides the udata id, so the completion routes back to
     /// it. Not flushed (see the module header).
-    fn arm(&mut self, key: usize, reactor: &Reactor) {
+    fn arm(&mut self, key: usize, reactor: Reactor) {
         let fd = self.conn.fd();
         let w = match self.conn.session {
             None => self.deframer.window(&mut self.carry),
@@ -504,8 +504,7 @@ impl Armed {
         // progress, which nothing touches until [`Self::ingest`]. Only this
         // recv's CQE removes or refills entry `key`, which holds them and the
         // connection (so `fd`); nothing cancels a recv by its user_data, so the
-        // key needs no generation. The reactor's drop cancels the recv ahead of
-        // dropping the entry.
+        // key needs no generation.
         unsafe { reactor.push(sqe, udata(KIND_RECV, key as u64)) };
     }
 
@@ -548,7 +547,7 @@ impl Reactor {
     ///
     /// Not cancel-safe: a future dropped mid-accept leaves an op whose later
     /// result is a raw fd nothing owns.
-    pub(crate) async fn accept(&self, listener: BorrowedFd<'static>) -> Accepted {
+    pub(crate) async fn accept(self, listener: BorrowedFd<'static>) -> Accepted {
         loop {
             let sqe = opcode::Accept::new(
                 types::Fd(listener.as_raw_fd()),
@@ -572,7 +571,7 @@ impl Reactor {
 
     /// `fd`, holding one slot under the connection cap; `None`, closing `fd`, at
     /// the cap.
-    pub(super) fn admit(&self, fd: OwnedFd) -> Option<Accepted> {
+    pub(super) fn admit(self, fd: OwnedFd) -> Option<Accepted> {
         let Some(slot) = self.conns.slots.charge(1) else {
             gnitz_warn!(
                 "connection cap {} reached; closing fd={}",
@@ -587,7 +586,7 @@ impl Reactor {
     /// A connection over `accepted`, charging frames to the inbound budget, its
     /// first recv armed, under `session` if it has one; the reactor holds it
     /// until the recv side ends.
-    pub(crate) fn connect(&self, accepted: Accepted, session: Option<Rc<dyn Session>>) -> Peer {
+    pub(crate) fn connect(self, accepted: Accepted, session: Option<Rc<dyn Session>>) -> Peer {
         let carry = Box::new_uninit_slice(match session {
             None => CARRY_BYTES,
             Some(_) => CIPHER_WINDOW_BYTES,
@@ -609,14 +608,14 @@ impl Reactor {
             })
             .arm(key, self);
         Peer {
-            reactor: self.clone(),
+            reactor: self,
             conn,
             egress: None,
             fence: None,
         }
     }
 
-    pub(super) fn handle_recv_cqe(&self, key: usize, res: i32) {
+    pub(super) fn handle_recv_cqe(self, key: usize, res: i32) {
         let mut recvs = self.conns.recvs.borrow_mut();
         let armed = recvs.get_mut(key).expect("a recv's entry lives until its CQE");
         let end = match res {
@@ -664,7 +663,7 @@ impl Reactor {
     /// its share, and let go of every paused one that is gone, whose bytes no
     /// recv will read. Run ahead of every submit, so a pass that took frames
     /// re-arms before the loop sleeps.
-    pub(super) fn resume_recvs(&self) {
+    pub(super) fn resume_recvs(self) {
         if self.conns.paused.borrow().is_empty() {
             return;
         }
@@ -694,7 +693,7 @@ impl Reactor {
     /// A W2M slot is sent from its ring until the ring is given back while a
     /// send waits on the client: that send is cancelled, the slot copied out,
     /// and the rest sent from the copy.
-    async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
+    async fn send_owned(self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
         if conn.end.get() == End::Shut {
             return Err(PeerGone);
         }
@@ -778,7 +777,7 @@ pub(crate) struct Peer {
     egress: Option<PooledBuf>,
     /// A level, and the value it must reach before this peer sends a byte;
     /// see [`Self::fence`]. Left up once reached, which holds nothing back.
-    fence: Option<(Rc<Level>, u64)>,
+    fence: Option<(&'static Level, u64)>,
 }
 
 impl Peer {
@@ -897,16 +896,16 @@ impl Peer {
     /// everything written after it waits, whichever send carries it. A fence
     /// already up is raised to `at` if `at` is higher; it must be on the same
     /// level.
-    pub(crate) fn fence(&mut self, level: &Rc<Level>, at: u64) {
+    pub(crate) fn fence(&mut self, level: &'static Level, at: u64) {
         if level.get() >= at {
             return;
         }
         match &mut self.fence {
             Some((up, v)) => {
-                debug_assert!(Rc::ptr_eq(up, level), "one level fences a peer");
+                debug_assert!(std::ptr::eq(*up, level), "one level fences a peer");
                 *v = (*v).max(at);
             }
-            None => self.fence = Some((Rc::clone(level), at)),
+            None => self.fence = Some((level, at)),
         }
     }
 

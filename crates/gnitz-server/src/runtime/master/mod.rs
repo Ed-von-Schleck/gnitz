@@ -83,8 +83,8 @@ impl MasterDispatcher {
     }
 
     /// The master's event loop.
-    pub(crate) fn reactor(&self) -> &Reactor {
-        &self.reactor
+    pub(crate) fn reactor(&self) -> Reactor {
+        self.reactor
     }
 
     /// The scan-shaped requests `build` writes under one SAL hold: the one

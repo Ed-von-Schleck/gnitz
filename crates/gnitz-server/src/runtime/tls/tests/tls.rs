@@ -282,7 +282,7 @@ fn tls_over_socketpair() -> (Reactor, Peer, UnixStream, String) {
 
 /// Tick until the client end reads EOF, returning every byte before it; `None`
 /// if the EOF never comes.
-fn read_until_eof(r: &Reactor, fd: &UnixStream) -> Option<Vec<u8>> {
+fn read_until_eof(r: Reactor, fd: &UnixStream) -> Option<Vec<u8>> {
     let mut seen = Vec::new();
     let eof = poll_until(r, || {
         while let Some(bytes) = read_nonblocking(fd, 4096) {

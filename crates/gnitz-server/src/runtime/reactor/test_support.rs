@@ -43,13 +43,13 @@ impl Reactor {
     /// Tick until no task is left. Bounded as [`poll_until`] is: the tests that
     /// use this guard against lost wakes and lock deadlocks, which an unbounded
     /// loop would turn into a wedged test run rather than a failure.
-    pub(crate) fn block_until_idle(&self) {
+    pub(crate) fn block_until_idle(self) {
         let idle = poll_until(self, || self.tasks.borrow().is_empty());
         assert!(idle, "reactor never reached idle: lost wake or deadlock");
     }
 
     /// One pass of the loop `block_on` runs, never sleeping.
-    pub(crate) fn tick(&self) {
+    pub(crate) fn tick(self) {
         self.run_ready();
         self.submit_or_sleep(false);
     }
@@ -82,14 +82,14 @@ pub(crate) fn train_of(lease: &mut TrainLease) -> Train<'_> {
 }
 
 /// A one-shot op the kernel completes at its submit.
-pub(super) fn nop(r: &Reactor) -> Op<()> {
+pub(super) fn nop(r: Reactor) -> Op<()> {
     // SAFETY: the SQE names no memory.
     unsafe { r.push_op(opcode::Nop::new().build(), ()) }
 }
 
 /// One end of a fresh socketpair admitted under the connection cap, and the
 /// other end.
-pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
+pub(crate) fn accepted_pair(r: Reactor) -> (Accepted, UnixStream) {
     let (local, partner) = UnixStream::pair().expect("socketpair");
     (r.admit(OwnedFd::from(local)).expect("under the cap"), partner)
 }
@@ -97,7 +97,7 @@ pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
 impl Peer {
     /// A plain connection over one end of an [`accepted_pair`], its recv armed,
     /// and the other end.
-    pub(crate) fn over_socketpair(r: &Reactor) -> (Peer, UnixStream) {
+    pub(crate) fn over_socketpair(r: Reactor) -> (Peer, UnixStream) {
         let (accepted, partner) = accepted_pair(r);
         (r.connect(accepted, None), partner)
     }
@@ -105,7 +105,7 @@ impl Peer {
 
 /// Drive the reactor in non-blocking ticks until `cond` holds after one, for at
 /// most ten seconds; `false` if it never does.
-pub(crate) fn poll_until(r: &Reactor, mut cond: impl FnMut() -> bool) -> bool {
+pub(crate) fn poll_until(r: Reactor, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
     while Instant::now() < deadline {
         r.tick();

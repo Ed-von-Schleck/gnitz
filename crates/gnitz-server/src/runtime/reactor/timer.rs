@@ -56,21 +56,21 @@ struct TimerFuture {
 
 impl Reactor {
     /// Future that completes once `at` has passed.
-    pub(crate) fn sleep_until(&self, at: Instant) -> impl Future<Output = ()> + use<> {
+    pub(crate) fn sleep_until(self, at: Instant) -> impl Future<Output = ()> + use<> {
         let id = self.timers.next_id.get();
         self.timers.next_id.set(id + 1);
-        TimerFuture { deadline: at, id, reactor: self.clone() }
+        TimerFuture { deadline: at, id, reactor: self }
     }
 
     /// Future that completes once `d` has passed since this pass began.
-    pub(crate) fn sleep(&self, d: Duration) -> impl Future<Output = ()> + use<> {
+    pub(crate) fn sleep(self, d: Duration) -> impl Future<Output = ()> + use<> {
         self.sleep_until(self.now() + d)
     }
 
     /// The clock this pass read: every timer is polled against it, so a deadline
     /// taken from it that has passed is ready at its first poll. Outside a pass
     /// it is the last pass's (or `Reactor::new`'s).
-    pub(crate) fn now(&self) -> Instant {
+    pub(crate) fn now(self) -> Instant {
         self.timers.now.get()
     }
 }

@@ -3,7 +3,6 @@
 //! otherwise miss a commit no tick has taken yet.
 
 use gnitz_foundation::gnitz_warn;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::{CatalogLock, Shared, park_until};
@@ -25,7 +24,7 @@ const TICK_HOLD_MAX_POLLS: u32 = 10_000;
 /// loop's last tick where that is sooner. `patient_gap`
 /// (`GNITZ_PATIENT_TICK_GAP_MS`) paces the loop: a held sync is re-issued the
 /// moment it is answered, so unpaced it would tick per commit.
-pub(super) async fn tick_loop(shared: Rc<Shared>, patient_gap: Duration) {
+pub(super) async fn tick_loop(shared: &'static Shared, patient_gap: Duration) {
     let reactor = shared.dispatcher.reactor();
     let mut rx = shared.dispatcher.tick_requests();
     let mut patient_from = reactor.now();
@@ -48,7 +47,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, patient_gap: Duration) {
             Err(e) => gnitz_warn!("tick error: {}", e),
             Ok(Some(wait)) => {
                 if TICK_HOLD_FOR_DDL.take_once() {
-                    park_until(&shared, TICK_HOLD_MAX_POLLS, "tick hold", || ticking.contended()).await;
+                    park_until(shared, TICK_HOLD_MAX_POLLS, "tick hold", || ticking.contended()).await;
                 }
                 wait.await;
             }

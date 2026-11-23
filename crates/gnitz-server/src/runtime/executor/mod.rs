@@ -68,7 +68,8 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
 /// The tag of the catalog lock: a guard of it orders a task against DDL.
 enum CatalogLock {}
 
-/// Shared executor state held by every task.
+/// Shared executor state held by every task. Never freed, as the tasks that
+/// hold it never end.
 ///
 /// Lock order: the catalog, then a table lock, then the apply lock, then the
 /// SAL writer.
@@ -96,11 +97,11 @@ impl Shared {
         dispatcher: MasterDispatcher,
         hello_timeout: Duration,
         backup_dir: Option<String>,
-    ) -> (Rc<Shared>, CommitRequests, chan::Receiver<oneshot::Sender<()>>) {
+    ) -> (&'static Shared, CommitRequests, chan::Receiver<oneshot::Sender<()>>) {
         let boot_seed = dispatcher.sal().watermark();
         let (committer, committer_rx) = Committer::new();
         let (feeds, asks) = Feeds::new();
-        let shared = Rc::new(Shared {
+        let shared = Box::leak(Box::new(Shared {
             dispatcher,
             committer,
             catalog_rwlock: AsyncRwLock::default(),
@@ -109,7 +110,7 @@ impl Shared {
             hello_timeout,
             last_snapshot: Cell::new(0),
             backup_dir,
-        });
+        }));
         (shared, committer_rx, asks)
     }
 
@@ -133,7 +134,7 @@ impl Shared {
 
 /// Serve `listeners` until a shutdown signal, having run the final checkpoint.
 pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<String>, listeners: Vec<ClientListener>) {
-    let reactor = dispatcher.reactor().clone();
+    let reactor = dispatcher.reactor();
     let hello_timeout = Duration::from_millis(gnitz_foundation::env::env_num(
         "GNITZ_HELLO_TIMEOUT_MS",
         (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
@@ -147,37 +148,36 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
 
     let tls = listeners.iter().find_map(|l| l.tls.clone());
-    let syncs = Rc::clone(&shared);
-    reactor.spawn(async move { syncs.dispatcher.sal().run_syncs(syncs.dispatcher.reactor()).await });
-    reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
+    reactor.spawn(shared.dispatcher.sal().run_syncs(reactor));
+    reactor.spawn(committer::run(committer_rx, shared));
     for listener in listeners {
-        reactor.spawn(accept_loop(Rc::clone(&shared), listener));
+        reactor.spawn(accept_loop(shared, listener));
     }
-    reactor.spawn(tick::tick_loop(Rc::clone(&shared), patient_gap));
-    reactor.spawn(delta::pump(Rc::clone(&shared), asks));
+    reactor.spawn(tick::tick_loop(shared, patient_gap));
+    reactor.spawn(delta::pump(shared, asks));
 
-    serve_until_signalled(&shared, tls.as_deref(), signals).await
+    serve_until_signalled(shared, tls.as_deref(), signals).await
 }
 
 // ---------------------------------------------------------------------------
 // Accept loop
 // ---------------------------------------------------------------------------
 
-async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
+async fn accept_loop(shared: &'static Shared, listener: ClientListener) {
     let ClientListener { fd, tls } = listener;
     // Leaked: the loop never ends, and its accept SQEs name the fd throughout.
     let fd: &'static OwnedFd = Box::leak(Box::new(fd));
-    let reactor = shared.dispatcher.reactor().clone();
+    let reactor = shared.dispatcher.reactor();
     loop {
         let accepted = reactor.accept(fd.as_fd()).await;
         let served = tls.as_ref().map(|t| t.current());
         let peer = reactor.connect(accepted, served.as_ref().map(|s| s.session()));
-        reactor.spawn(connection_loop(peer, Rc::clone(&shared), served));
+        reactor.spawn(connection_loop(peer, shared, served));
     }
 }
 
-async fn connection_loop(mut peer: Peer, shared: Rc<Shared>, served: Option<Rc<Served>>) {
-    serve_connection(&mut peer, &shared, served).await;
+async fn connection_loop(mut peer: Peer, shared: &'static Shared, served: Option<Rc<Served>>) {
+    serve_connection(&mut peer, shared, served).await;
     // The one exit: ship what is corked, a refusal included, then retire the fd.
     let _ = peer.flush_egress().await;
     peer.close().await;
@@ -192,7 +192,7 @@ async fn connection_loop(mut peer: Peer, shared: Rc<Shared>, served: Option<Rc<S
 /// closes the connection.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
-async fn serve_connection(peer: &mut Peer, shared: &Rc<Shared>, served: Option<Rc<Served>>) {
+async fn serve_connection(peer: &mut Peer, shared: &'static Shared, served: Option<Rc<Served>>) {
     let deadline = shared.dispatcher.reactor().sleep(shared.hello_timeout);
     match select2(handshake(peer, served), deadline).await {
         Either::A(true) => peer.admit_full_frames(),
@@ -308,7 +308,7 @@ async fn handle_message(
     subs: &mut Subscriptions,
     snapshots: &mut HeldSnapshots,
     buf: RecvBuf,
-    shared: &Shared,
+    shared: &'static Shared,
 ) -> bool {
     // One control-header parse for the whole request.
     let ctrl = match gnitz_wire::peek_control_block(buf.as_slice()) {

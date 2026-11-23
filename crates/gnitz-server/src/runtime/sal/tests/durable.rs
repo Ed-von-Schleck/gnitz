@@ -72,8 +72,7 @@ fn an_lsn_published_under_an_fdatasync_in_flight_waits_for_the_next() {
         covered
     };
     let reactor = make_reactor();
-    let driver = reactor.clone();
-    reactor.spawn(async move { durable.run(&driver, file, published_at_submit).await });
+    reactor.spawn(async move { durable.run(reactor, file, published_at_submit).await });
 
     reactor.block_on(async {
         let mut first = Box::pin(durable.through(5));

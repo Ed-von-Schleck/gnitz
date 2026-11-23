@@ -85,31 +85,26 @@ pub(crate) struct ReactorShared {
     applied: Level,
     conns: conn::Conns,
     w2m: W2mReceiver,
-    _thread: runloop::ThreadClaim,
 }
 
-/// The ring stops before the memory its SQEs name is freed: this runs ahead of
-/// every field's own drop.
-impl Drop for ReactorShared {
-    fn drop(&mut self) {
-        self.cancel_all();
-    }
-}
-
-/// A handle on the master's one event loop; clones share it.
-#[derive(Clone)]
-pub(crate) struct Reactor(Rc<ReactorShared>);
+/// A handle on the master's one event loop. The loop is never freed, so the
+/// kernel never touches freed memory an SQE names.
+#[derive(Clone, Copy)]
+pub(crate) struct Reactor(&'static ReactorShared);
 
 impl std::ops::Deref for Reactor {
     type Target = ReactorShared;
     fn deref(&self) -> &ReactorShared {
-        &self.0
+        self.0
     }
 }
 
 impl Reactor {
+    /// A new event loop on this thread. The reactors of a thread share its run
+    /// queue, so one is driven at a time: driving one while another has a task
+    /// waiting takes that task's wakes.
     pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
-        Ok(Reactor(Rc::new(ReactorShared {
+        Ok(Reactor(Box::leak(Box::new(ReactorShared {
             ring: RefCell::new(IoUring::new(uring::SQ_ENTRIES)?),
             tasks: RefCell::new(Slab::new()),
             parked: Cell::new(false),
@@ -119,7 +114,6 @@ impl Reactor {
             applied: Level::default(),
             conns: conn::Conns::new(limits),
             w2m,
-            _thread: runloop::ThreadClaim::take(),
-        })))
+        }))))
     }
 }

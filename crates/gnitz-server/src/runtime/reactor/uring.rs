@@ -1,5 +1,5 @@
 //! The reactor's ring: the host check, and every `io_uring_enter` the reactor
-//! makes — queueing and submitting SQEs, the loop's wait, and the drop's cancel.
+//! makes — queueing and submitting SQEs, and the loop's wait.
 
 use std::time::Instant;
 
@@ -7,9 +7,9 @@ use gnitz_foundation::gnitz_warn;
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
-use super::ReactorShared;
+use super::Reactor;
 
-/// The ring's SQ entries. This sets submit batching, not depth: [`ReactorShared::push`]
+/// The ring's SQ entries. This sets submit batching, not depth: [`Reactor::push`]
 /// flushes a full SQ.
 pub(super) const SQ_ENTRIES: u32 = 256;
 
@@ -69,14 +69,13 @@ pub(crate) fn check_host() -> Result<(), String> {
     ))
 }
 
-impl ReactorShared {
+impl Reactor {
     /// Queue `sqe` under `user_data`, first submitting the pending batch if the SQ
     /// is full.
     ///
     /// # Safety
-    /// Every buffer and fd `sqe` names stays valid until its CQE, or until
-    /// [`Self::cancel_all`], after which nothing is pushed or submitted.
-    pub(super) unsafe fn push(&self, sqe: squeue::Entry, user_data: u64) {
+    /// Every buffer and fd `sqe` names stays valid until its CQE.
+    pub(super) unsafe fn push(self, sqe: squeue::Entry, user_data: u64) {
         let mut ring = self.ring.borrow_mut();
         if ring.submission().is_full() {
             entered(ring.submit());
@@ -89,7 +88,7 @@ impl ReactorShared {
 
     /// Submit pending SQEs without waiting. No syscall when the SQ is empty and no
     /// completion overflowed.
-    pub(super) fn submit(&self) {
+    pub(super) fn submit(self) {
         let mut ring = self.ring.borrow_mut();
         let sq = ring.submission();
         if sq.is_empty() && !sq.cq_overflow() {
@@ -100,7 +99,7 @@ impl ReactorShared {
     }
 
     /// Submit pending SQEs and wait for one CQE, or until `until` passes.
-    pub(super) fn wait(&self, until: Option<Instant>) {
+    pub(super) fn wait(self, until: Option<Instant>) {
         let ring = self.ring.borrow();
         entered(match until {
             None => ring.submitter().submit_and_wait(1),
@@ -110,19 +109,6 @@ impl ReactorShared {
                     .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
             }
         });
-    }
-
-    /// Cancel every submitted op, after which the kernel touches nothing their
-    /// SQEs name. The ring's last use: an SQE still queued is never submitted.
-    /// An op already running in the kernel's worker pool (an fsync) runs on,
-    /// and names no memory.
-    pub(super) fn cancel_all(&self) {
-        // NotFound when nothing is in flight.
-        let _ = self
-            .ring
-            .borrow()
-            .submitter()
-            .register_sync_cancel(None, types::CancelBuilder::any());
     }
 }
 

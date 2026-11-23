@@ -6,7 +6,6 @@ use gnitz_foundation::gnitz_debug;
 use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use super::durable::Durable;
@@ -159,7 +158,7 @@ impl SalWriter {
     /// worker publishes it behind its boot recovery, which flushes the rows it
     /// replayed from the tail to its stores: until then the tail is those rows'
     /// only durable copy, which the rewind gives up.
-    pub(crate) async fn boot(tail: CommittedTail, parks: WorkerParks, reactor: &Reactor) -> Self {
+    pub(crate) async fn boot(tail: CommittedTail, parks: WorkerParks, reactor: Reactor) -> Self {
         reactor.applied_through(epoch_word(tail.live_epoch, 0)).await;
         Self::rewound(tail.log, parks, tail.live_epoch)
     }
@@ -464,7 +463,7 @@ impl SalWriter {
     /// level a connection can hold its sends on. Waiting on it asks for no
     /// fdatasync: only an LSN [`Self::want_durable`] was called with, or one
     /// below it, is sure to be reached.
-    pub(crate) fn durable_level(&self) -> &Rc<Level> {
+    pub(crate) fn durable_level(&self) -> &Level {
         self.durable.level()
     }
 
@@ -476,7 +475,7 @@ impl SalWriter {
     /// Run the fdatasyncs [`Self::durable_through`] waits for, each covering
     /// every group published before it is submitted. Publishing needs the
     /// writer lock, this does not. Never returns.
-    pub(crate) async fn run_syncs(&self, reactor: &Reactor) {
+    pub(crate) async fn run_syncs(&self, reactor: Reactor) {
         self.durable.run(reactor, self.log.file, || self.watermark()).await
     }
 }

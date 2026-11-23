@@ -10,7 +10,7 @@ use crate::runtime::reactor::test_support::make_reactor;
 fn queued_trains_are_shipped_whole_behind_the_reply() {
     const LARGE: usize = 1 << 20;
     let r = make_reactor();
-    let (mut peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(r);
     let subs = Subscriptions::default();
     let id = |id| SubId::new(id).unwrap();
     subs.out.send(7, id(1), Rc::new(vec![0x11; 100]));
@@ -52,7 +52,7 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
 #[test]
 fn a_second_ship_sends_only_the_trains_queued_since() {
     let r = make_reactor();
-    let (mut peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(r);
     let subs = Subscriptions::default();
     let id = |id| SubId::new(id).unwrap();
     subs.out.send(7, id(1), Rc::new(vec![0x11; 10]));

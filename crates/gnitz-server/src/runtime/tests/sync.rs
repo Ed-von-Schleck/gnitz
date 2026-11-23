@@ -160,7 +160,7 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
 
     cancel_tx.send(());
     assert!(
-        poll_until(&r, || done.get()),
+        poll_until(r, || done.get()),
         "C must unblock when the last write waiter (B) is cancelled"
     );
     release_tx.send(());
@@ -177,8 +177,8 @@ fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
     const MAX_TASKS: u32 = 5;
 
     // One reactor for every mix: each drains to an empty task slab before the
-    // next starts, and a fresh io_uring per mix exhausts RLIMIT_MEMLOCK long
-    // before the enumeration ends.
+    // next starts, and a reactor is never freed, so one per mix would leak a
+    // ring for each of the enumeration's mixes.
     let r = make_reactor();
 
     for len in 2..=MAX_TASKS {

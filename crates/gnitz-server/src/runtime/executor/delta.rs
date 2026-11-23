@@ -470,7 +470,7 @@ impl Subscriptions {
 
     /// The [`sync_wait`] of the oldest unanswered sync, begun if none is
     /// under way.
-    pub(super) fn sync_wait(&mut self, shared: &Rc<Shared>) -> Option<&mut SyncWait> {
+    pub(super) fn sync_wait(&mut self, shared: &'static Shared) -> Option<&mut SyncWait> {
         if self.wait.is_none() {
             let Asked { held, syncs } = &mut self.asked;
             let deadline = match syncs.len() {
@@ -480,8 +480,8 @@ impl Subscriptions {
                 _ => syncs[0].clone().map(|_| shared.dispatcher.reactor().now()),
             };
             held.retain(|(sub, _)| sub.after_tick.get().is_some());
-            let (shared, out, held) = (Rc::clone(shared), Rc::clone(&self.out), held.clone());
-            self.wait = Some(Box::pin(async move { sync_wait(&shared, &out, deadline?, held).await }));
+            let (out, held) = (Rc::clone(&self.out), held.clone());
+            self.wait = Some(Box::pin(async move { sync_wait(shared, &out, deadline?, held).await }));
         }
         self.wait.as_mut()
     }
@@ -631,7 +631,7 @@ async fn sync_wait(
 /// Read the feeds the syncs on `asks` ask for. A pass answers the syncs
 /// waiting when it starts: one read per distinct cursor behind among a feed's
 /// subscribers, each subscriber queued its train.
-pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::Sender<()>>) {
+pub(super) async fn pump(shared: &'static Shared, mut asks: chan::Receiver<oneshot::Sender<()>>) {
     let feeds = &shared.feeds;
     let disp = &shared.dispatcher;
     // Scratch kept across passes; each pass leaves every one empty.
@@ -650,7 +650,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
         // Each distinct cursor that is behind, of the feeds still readable.
         let mut first_lock = Some(shared.catalog_rwlock.read().await);
         for feed in asked.drain(..) {
-            if let Err(fault) = feed_readable(&shared, &feed) {
+            if let Err(fault) = feed_readable(shared, &feed) {
                 feeds.end(&feed, &fault);
                 continue;
             }
@@ -669,7 +669,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
                 None => shared.catalog_rwlock.read().await,
             };
             for (feed, cursor) in slice {
-                match feed_readable(&shared, feed) {
+                match feed_readable(shared, feed) {
                     Ok(_) => reads.push((Rc::clone(feed), *cursor)),
                     Err(fault) => feeds.end(feed, &fault),
                 }
@@ -683,7 +683,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
             .await;
             drop(catalog);
             for (feed, cursor) in reads.drain(..) {
-                queue_train(&shared, &feed, cursor, cut.next().await).await;
+                queue_train(shared, &feed, cursor, cut.next().await).await;
             }
         }
         behind.clear();

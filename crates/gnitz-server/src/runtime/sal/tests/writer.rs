@@ -477,8 +477,7 @@ fn durable_through_waits_for_an_fdatasync_or_a_rewind() {
     let mut waiting = Box::pin(log.durable_through(first));
     assert!(try_poll_once(&mut waiting).is_none(), "published, not yet durable");
     let reactor = make_reactor();
-    let driver = reactor.clone();
-    reactor.spawn(async move { log.run_syncs(&driver).await });
+    reactor.spawn(async move { log.run_syncs(reactor).await });
     reactor.block_on(waiting);
     assert!(
         !log.syncing_all(),
@@ -508,8 +507,7 @@ fn an_fdatasync_in_flight_covers_everything_until_a_zone_commits_under_it() {
         scope.commit().expect("the zone was open")
     };
     let reactor = make_reactor();
-    let driver = reactor.clone();
-    reactor.spawn(async move { log.run_syncs(&driver).await });
+    reactor.spawn(async move { log.run_syncs(reactor).await });
 
     reactor.block_on(async {
         let first = zone(1);

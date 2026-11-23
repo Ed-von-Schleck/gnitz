@@ -38,9 +38,9 @@ fn death_names_the_dead_worker_without_reaping_it() {
     within(move || {
         let reactor = make_reactor();
         let workers = Workers::new(vec![live, dead]);
-        assert_eq!(reactor.block_on(workers.death(&reactor)), (1, WorkerEnd::Exited(3)));
+        assert_eq!(reactor.block_on(workers.death(reactor)), (1, WorkerEnd::Exited(3)));
         assert_eq!(
-            reactor.block_on(workers.death(&reactor)),
+            reactor.block_on(workers.death(reactor)),
             (1, WorkerEnd::Exited(3)),
             "and again"
         );
@@ -60,7 +60,7 @@ fn death_names_the_signal_that_killed_a_worker() {
     unsafe { libc::kill(killed.get(), libc::SIGKILL) };
     within(move || {
         let reactor = make_reactor();
-        let (w, end) = reactor.block_on(workers.death(&reactor));
+        let (w, end) = reactor.block_on(workers.death(reactor));
         assert_eq!((w, end), (1, WorkerEnd::Killed(libc::SIGKILL)));
         assert_eq!(end.to_string(), "was killed by signal 9 (SIGKILL)");
     });

@@ -64,7 +64,7 @@ impl Reactor {
     /// Route every unread slot of every worker's ring, raise the applied level
     /// when a worker has moved its position, and give back each ring whose
     /// worker named a shortage of room.
-    pub(super) fn drain_all_w2m(&self) {
+    pub(super) fn drain_all_w2m(self) {
         if let Some(at) = self.w2m.lowest_applied_if_moved() {
             self.applied.raise(at);
         }
@@ -85,7 +85,7 @@ impl Reactor {
     /// frame of it a lease holds queued out of the ring, holding each such
     /// lease's trains on `w`.
     #[cold]
-    fn give_back(&self, w: usize) {
+    fn give_back(self, w: usize) {
         for (&id, t) in self.routes.borrow_mut().trains.iter_mut() {
             let queue = &mut t.queues[w];
             if !queue.iter().any(W2mSlot::in_ring) {
@@ -109,7 +109,7 @@ impl Reactor {
     /// may be far from taking it: it is copied out here unless that reader waits on
     /// its worker, which takes it now. Any other slot queued when its ring runs
     /// short of room is copied out by [`Self::give_back`].
-    fn route(&self, mut slot: W2mSlot) {
+    fn route(self, mut slot: W2mSlot) {
         let w = slot.worker as usize;
         let mut routes = self.routes.borrow_mut();
         // No lease takes it: it drops here undecoded, releasing its ring space.
@@ -128,13 +128,13 @@ impl Reactor {
 
     /// A wait for every launched worker to apply the log through `at`: the
     /// position a group every worker runs ends at. See [`AckWait`].
-    pub(crate) fn applied_through(&self, at: u64) -> AckWait {
-        AckWait { reactor: self.clone(), at }
+    pub(crate) fn applied_through(self, at: u64) -> AckWait {
+        AckWait { reactor: self, at }
     }
 
     /// One request id, routed from no worker until a read is written under it.
     /// See [`TrainLease`].
-    pub(crate) fn lease_train(&self) -> TrainLease {
+    pub(crate) fn lease_train(self) -> TrainLease {
         let nw = self.w2m.num_workers();
         let id = {
             let mut routes = self.routes.borrow_mut();
@@ -159,7 +159,7 @@ impl Reactor {
             id
         };
         TrainLease {
-            reactor: self.clone(),
+            reactor: self,
             id,
             reads: SmallVec::new(),
             taken: 0,

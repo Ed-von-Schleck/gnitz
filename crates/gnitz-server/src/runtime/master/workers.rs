@@ -67,7 +67,7 @@ impl Workers {
 
     /// Resolves with the rank of the first worker to exit and how it ended,
     /// leaving it unreaped.
-    pub(crate) async fn death(&self, reactor: &Reactor) -> (usize, WorkerEnd) {
+    pub(crate) async fn death(&self, reactor: Reactor) -> (usize, WorkerEnd) {
         let mut exits: Vec<_> = self
             .0
             .iter()

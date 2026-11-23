@@ -15,7 +15,7 @@ const ROOT: usize = 0;
 
 impl Reactor {
     /// Spawn a task that runs detached.
-    pub(crate) fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
+    pub(crate) fn spawn(self, fut: impl Future<Output = ()> + 'static) {
         let slot = self.tasks.borrow_mut().insert(Some(Box::pin(fut)));
         RUN_QUEUE.with(|q| q.borrow_mut().push(slot + 1));
     }
@@ -23,7 +23,7 @@ impl Reactor {
     /// Drive `fut` to completion beside the spawned tasks, and return its output.
     /// The one driver of the loop, called outside any task. `fut` is polled in
     /// place under the [`ROOT`] key, after the tasks of each pass that woke it.
-    pub(crate) fn block_on<F: Future>(&self, fut: F) -> F::Output {
+    pub(crate) fn block_on<F: Future>(self, fut: F) -> F::Output {
         let out = {
             let mut fut = std::pin::pin!(fut);
             let waker = make_waker(ROOT);
@@ -50,7 +50,7 @@ impl Reactor {
     /// pass. A task spawned by them runs next pass too, unless a stale wake left
     /// its reused key queued, when it runs later in this one. True when [`ROOT`]
     /// was among those queued.
-    pub(super) fn run_ready(&self) -> bool {
+    pub(super) fn run_ready(self) -> bool {
         self.dispatch_cqes();
         self.drain_all_w2m();
         self.timers.fire();
@@ -71,7 +71,7 @@ impl Reactor {
     /// deadline has passed or the drain run before arming woke a task. The park
     /// is armed only on a pass that sleeps: the publish that takes an arm spends
     /// a cross-process `FUTEX_WAKE`.
-    pub(super) fn submit_or_sleep(&self, block: bool) {
+    pub(super) fn submit_or_sleep(self, block: bool) {
         self.resume_recvs();
         let until = self.timers.earliest();
         let sleep = block
@@ -88,7 +88,7 @@ impl Reactor {
 
     /// Arm the W2M park for a sleep. False, arming nothing, when the drain run
     /// first woke a task.
-    fn arm_park(&self) -> bool {
+    fn arm_park(self) -> bool {
         loop {
             self.drain_all_w2m();
             if !run_queue_is_empty() {
@@ -114,7 +114,7 @@ impl Reactor {
     /// from the poll cannot take its key; no borrow of `tasks` spans the poll. A
     /// completed task frees its slot, and drops at the end of the function, after
     /// the borrow, since its drop may re-enter the reactor.
-    fn poll_task(&self, key: usize) {
+    fn poll_task(self, key: usize) {
         let slot = key - 1;
         let Some(mut task) = self.tasks.borrow_mut().get_mut(slot).and_then(Option::take) else {
             return;
@@ -131,7 +131,7 @@ impl Reactor {
     }
 
     /// Drain all CQEs pending in the ring, each to what its kind names.
-    fn dispatch_cqes(&self) {
+    fn dispatch_cqes(self) {
         let mut buf = [const { MaybeUninit::<cqueue::Entry>::uninit() }; 64];
         loop {
             // The slice borrows `buf`, not the ring, so dispatch can re-borrow it.
@@ -209,47 +209,16 @@ impl RunQueue {
     fn len(&self) -> usize {
         self.queue.len()
     }
-
-    fn clear(&mut self) {
-        self.queue.clear();
-        self.queued.clear();
-    }
 }
 
 thread_local! {
-    /// The run queue of the reactor on this thread, for the waker vtable to reach
-    /// without per-wake `Rc` traffic. A wake with no reactor live lands here
-    /// harmlessly; the next [`ThreadClaim`] clears what a dropped reactor left.
+    /// The run queue of the reactor driven on this thread, which the waker
+    /// vtable reaches with no reactor handle.
     static RUN_QUEUE: RefCell<RunQueue> = const { RefCell::new(RunQueue::new()) };
-    /// A reactor is live on this thread.
-    static REACTOR_LIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn run_queue_is_empty() -> bool {
     RUN_QUEUE.with(|q| q.borrow().len() == 0)
-}
-
-/// A reactor's claim on its thread's run queue, held for the reactor's life.
-pub(super) struct ThreadClaim(());
-
-impl ThreadClaim {
-    /// Claim this thread for a new reactor, starting it on an empty run queue.
-    /// A refused claim panics with no `ThreadClaim` built, so the live
-    /// reactor's stands.
-    pub(super) fn take() -> Self {
-        assert!(
-            !REACTOR_LIVE.replace(true),
-            "a second reactor on this thread would orphan the first's wakes"
-        );
-        RUN_QUEUE.with(|q| q.borrow_mut().clear());
-        ThreadClaim(())
-    }
-}
-
-impl Drop for ThreadClaim {
-    fn drop(&mut self) {
-        REACTOR_LIVE.set(false);
-    }
 }
 
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
