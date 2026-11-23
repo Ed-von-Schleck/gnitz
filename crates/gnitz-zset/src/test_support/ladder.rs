@@ -4,9 +4,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The crate-root names any file may use: the roots themselves and the test
-/// scaffolding beside the rungs. A `#[macro_export]` macro is a crate-root name
-/// too, wherever it is defined, so the crate's own may be named as well.
+/// The entries of `src/` that are not rungs: the crate roots and the test
+/// scaffolding. A file may name the scaffolding; a `#[macro_export]` macro is a
+/// crate-root name wherever it is defined, so a rung's own may be named too.
 const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 
 /// Assert that every rung under `src_root` names only the rungs beneath it.
@@ -19,57 +19,61 @@ const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 /// than an exported macro and a grouped `crate::{…}` import are refused along
 /// with a higher rung. It does not see `super::`-relative reaches, so it is a
 /// regression guard and not a proof.
-pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
+pub fn assert_ladder(src_root: impl AsRef<Path>, ladder: &[&[&str]]) {
+    let src_root = src_root.as_ref();
+    let rungs = ladder.concat();
     for p in entries(src_root) {
         let name = p.file_stem().unwrap().to_str().unwrap();
         assert!(
-            ladder.concat().contains(&name) || UNLADDERED.contains(&name),
+            rungs.contains(&name) || UNLADDERED.contains(&name),
             "{name} is a module root the ladder does not place",
         );
     }
-    let macros = exported_macros(src_root);
+    let macros: Vec<String> = rungs
+        .iter()
+        .flat_map(|rung| rs_files(src_root.join(rung)))
+        .flat_map(exported_macros)
+        .collect();
     let macros: Vec<&str> = macros.iter().map(String::as_str).collect();
-    for (tier, rungs) in ladder.iter().enumerate() {
-        for rung in *rungs {
+    for (tier, tier_rungs) in ladder.iter().enumerate() {
+        for rung in *tier_rungs {
             let allowed = [&[*rung], &ladder[..tier].concat()[..], &UNLADDERED[..], &macros[..]].concat();
-            assert_rungs_name_only(src_root, &[rung], "crate", &allowed);
+            assert_names_only(src_root.join(rung), "crate", &allowed);
         }
     }
 }
 
-/// Assert that every path into crate `krate` from a file of `rungs` leads with
-/// one of `allowed`: the modules of a crate beneath that these rungs may reach.
+/// Assert that every path into crate `krate` from a file under `dir` leads with
+/// one of `allowed`: the modules of a crate beneath that `dir` may reach.
 ///
 /// It reads paths as [`assert_ladder`] does: a grouped `krate::{…}` import is
 /// refused and a module renamed on import is checked under its own name, but a
 /// reach through an alias of `krate` itself goes unseen.
-pub fn assert_rungs_name_only(src_root: &Path, rungs: &[&str], krate: &str, allowed: &[&str]) {
-    for rung in rungs {
-        for f in rung_files(src_root, rung) {
-            let src = fs::read_to_string(&f).unwrap();
-            for named in heads(&src, krate) {
-                assert!(
-                    allowed.contains(&named),
-                    "{}: {rung}/ names {krate}::{named}, which is not beneath it",
-                    f.display(),
-                );
-            }
+pub fn assert_names_only(dir: impl AsRef<Path>, krate: &str, allowed: &[&str]) {
+    for f in rs_files(dir) {
+        let src = fs::read_to_string(&f).unwrap();
+        for named in heads(&src, krate) {
+            assert!(
+                allowed.contains(&named),
+                "{}: names {krate}::{named}, which is not beneath it",
+                f.display(),
+            );
         }
     }
 }
 
-/// Every `.rs` file of a rung, its directory walked recursively.
+/// Every `.rs` file under `dir`, walked recursively.
 ///
-/// `tests/` and `benches/` directories are skipped: a unit test or benchmark of a
-/// rung may name a higher one to build its fixture, which is not the dependency
-/// the ladder is about.
-pub fn rung_files(src_root: &Path, rung: &str) -> Vec<PathBuf> {
+/// `tests/`, `benches/` and `fuzz/` directories are skipped: a unit test,
+/// benchmark or fuzz target may name a higher rung to build its fixture, which
+/// is not the dependency the ladder is about.
+pub fn rs_files(dir: impl AsRef<Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut dirs = vec![src_root.join(rung)];
+    let mut dirs = vec![dir.as_ref().to_path_buf()];
     while let Some(dir) = dirs.pop() {
         for p in entries(&dir) {
             if p.is_dir() {
-                if !p.ends_with("tests") && !p.ends_with("benches") {
+                if !["tests", "benches", "fuzz"].iter().any(|d| p.ends_with(d)) {
                     dirs.push(p);
                 }
             } else if p.extension().is_some_and(|x| x == "rs") {
@@ -80,31 +84,20 @@ pub fn rung_files(src_root: &Path, rung: &str) -> Vec<PathBuf> {
     out
 }
 
-/// The names of the `#[macro_export]` macros defined anywhere under `src_root`.
-fn exported_macros(src_root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut dirs = vec![src_root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        for p in entries(&dir) {
-            if p.is_dir() {
-                dirs.push(p);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                let src = fs::read_to_string(&p).unwrap();
-                for (at, _) in src.match_indices("#[macro_export]") {
-                    let rest = &src[at..];
-                    let Some(def) = rest.find("macro_rules! ") else {
-                        continue;
-                    };
-                    let name = &rest[def + "macro_rules! ".len()..];
-                    let name = &name[..name
-                        .find(|c: char| c != '_' && !c.is_alphanumeric())
-                        .unwrap_or(name.len())];
-                    out.push(name.to_string());
-                }
-            }
-        }
-    }
-    out
+/// The names of the `#[macro_export]` macros defined in the file at `path`.
+fn exported_macros(path: PathBuf) -> Vec<String> {
+    const RULES: &str = "macro_rules! ";
+    let src = fs::read_to_string(path).unwrap();
+    src.match_indices("#[macro_export]")
+        .filter_map(|(at, _)| {
+            let rest = &src[at..];
+            let name = &rest[rest.find(RULES)? + RULES.len()..];
+            let name = &name[..name
+                .find(|c: char| c != '_' && !c.is_alphanumeric())
+                .unwrap_or(name.len())];
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// The name each `root::` path in `src` leads with; `""` for a grouped
