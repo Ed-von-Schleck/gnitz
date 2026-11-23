@@ -41,25 +41,20 @@ pub(crate) fn raw(name: &str) -> Option<String> {
     }
 }
 
-/// `raw`, `name`'s value, as `rule` reads it.
+/// `raw`, `name`'s value, as `rule` reads it; `None` when unset.
 ///
 /// # Panics
 ///
 /// On a value `rule` rejects, naming the variable, the value and `what` it
 /// should have been.
-pub(crate) fn parsed<T>(name: &str, raw: &str, rule: impl Fn(&str) -> Option<T>, what: &str) -> T {
-    rule(raw).unwrap_or_else(|| panic!("{name}={raw:?} is not {what}"))
-}
-
-/// `name`'s override: `default` when unset, else [`parsed`].
-fn read<T>(name: &str, raw: Option<&str>, default: T, rule: impl Fn(&str) -> Option<T>, what: &str) -> T {
-    raw.map_or(default, |raw| parsed(name, raw, rule, what))
+pub(crate) fn parse<T>(name: &str, raw: Option<&str>, rule: impl FnOnce(&str) -> Option<T>, what: &str) -> Option<T> {
+    raw.map(|raw| rule(raw).unwrap_or_else(|| panic!("{name}={raw:?} is not {what}")))
 }
 
 /// A positive-integer env override; unset reads as `default`, and a zero or
 /// unparseable value panics.
 pub fn env_num<T: std::str::FromStr + Default + PartialOrd>(name: &str, default: T) -> T {
-    read(name, raw(name).as_deref(), default, positive, POSITIVE)
+    parse(name, raw(name).as_deref(), positive, POSITIVE).unwrap_or(default)
 }
 
 /// An integer env override within `range`; unset reads as `default`, and a
@@ -69,19 +64,19 @@ where
     T: std::str::FromStr + PartialOrd,
     R: std::ops::RangeBounds<T> + std::fmt::Debug,
 {
-    read(
+    parse(
         name,
         raw(name).as_deref(),
-        default,
         |v| v.parse().ok().filter(|n| range.contains(n)),
         &format!("an integer in {range:?}"),
     )
+    .unwrap_or(default)
 }
 
 /// A boolean env override under [`flag`]'s rule; unset reads as `default`, and
 /// a value the rule does not read panics.
 pub fn env_flag(name: &str, default: bool) -> bool {
-    read(name, raw(name).as_deref(), default, flag, BOOLEAN)
+    parse(name, raw(name).as_deref(), flag, BOOLEAN).unwrap_or(default)
 }
 
 /// A path env override, `None` when unset; an empty value, which names no

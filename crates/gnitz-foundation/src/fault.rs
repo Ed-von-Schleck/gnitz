@@ -17,7 +17,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::env::{BOOLEAN, POSITIVE, flag, parsed, positive, raw};
+use crate::env::{BOOLEAN, POSITIVE, flag, parse, positive, raw};
 
 /// Whether this build keeps its seams. Decided in *this* crate's compilation
 /// unit, so a per-package `debug-assertions` override on `gnitz-foundation`
@@ -45,14 +45,10 @@ impl<T: Copy> Var<T> {
     }
 }
 
-/// `raw`, `name`'s value, as `rule` reads it: `None` when unset or off.
-///
-/// # Panics
-///
-/// On a value neither off nor read by `rule`, which should have been `what`.
-fn arm<T>(name: &str, raw: Option<&str>, rule: impl Fn(&str) -> Option<T>, what: &str) -> Option<T> {
-    let v = raw.filter(|v| flag(v) != Some(false))?;
-    Some(parsed(name, v, rule, what))
+/// As [`parse`], except that a value `env`'s flag rule reads as off counts as
+/// unset.
+fn arm<T>(name: &str, raw: Option<&str>, rule: impl FnOnce(&str) -> Option<T>, what: &str) -> Option<T> {
+    parse(name, raw.filter(|v| flag(v) != Some(false)), rule, what)
 }
 
 /// A seam that is on or off.

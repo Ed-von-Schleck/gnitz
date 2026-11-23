@@ -29,17 +29,17 @@ fn an_unset_variable_reads_as_its_default() {
     assert_eq!(env_num_in("GNITZ_TEST_ENV_UNSET", 7u64, 1..=10), 7);
     assert!(env_flag("GNITZ_TEST_ENV_UNSET", true));
     assert_eq!(env_path("GNITZ_TEST_ENV_UNSET"), None);
-    assert_eq!(read("GNITZ_X", None, 7u64, positive, ""), 7);
+    assert_eq!(parse("GNITZ_X", None, positive::<u64>, ""), None);
 }
 
 #[test]
 fn a_set_variable_overrides_its_default() {
-    assert_eq!(read("GNITZ_X", Some("4096"), 1u64, positive, ""), 4096);
-    assert!(!read("GNITZ_X", Some("no"), true, flag, ""));
+    assert_eq!(parse("GNITZ_X", Some("4096"), positive::<u64>, ""), Some(4096));
+    assert_eq!(parse("GNITZ_X", Some("no"), flag, ""), Some(false));
 }
 
 #[test]
 #[should_panic(expected = "GNITZ_X=\"134217728x\" is not a positive integer")]
 fn a_value_its_rule_rejects_panics() {
-    read("GNITZ_X", Some("134217728x"), 1u64, positive, "a positive integer");
+    parse("GNITZ_X", Some("134217728x"), positive::<u64>, "a positive integer");
 }

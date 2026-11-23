@@ -93,7 +93,11 @@ impl LocalServer {
             data_dir,
             log: log_path,
         };
-        server.await_ready()?;
+        let ready = |log: &str| log.contains(READY_LINE).then_some(());
+        if let Err(why) = await_log(&mut server.child, &server.log, 0, BOOT_TIMEOUT, LOG_TAIL_LINES, ready) {
+            let _ = server.stop();
+            return Err(format!("{SERVER} failed before it served: {why}"));
+        }
         Ok(server)
     }
 
@@ -115,27 +119,20 @@ impl LocalServer {
     /// Stop the server and remove the scratch directory; a no-op once stopped.
     /// `Err` reports a server that had already exited by itself after it
     /// served, quoting its log, which goes with the scratch directory.
+    ///
+    /// A running server is SIGTERMed and reaped, and its process group,
+    /// workers included, SIGKILLed should it not exit within [`STOP_TIMEOUT`].
     pub fn stop(&mut self) -> Result<(), String> {
-        if self.scratch.is_none() {
+        // Dropped on return, so the directory outlives the server.
+        let Some(_scratch) = self.scratch.take() else {
             return Ok(());
-        }
-        let report = match self.child.try_wait() {
-            Ok(Some(status)) => Err(format!(
+        };
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Err(format!(
                 "{SERVER} exited ({status}) while it served:\n{}",
                 log_tail(&self.log, LOG_TAIL_LINES)
-            )),
-            _ => {
-                self.terminate();
-                Ok(())
-            }
-        };
-        self.scratch = None;
-        report
-    }
-
-    /// SIGTERM the server and reap it, SIGKILLing its process group, workers
-    /// included, should it not exit within [`STOP_TIMEOUT`].
-    fn terminate(&mut self) {
+            ));
+        }
         let pid = self.child.id() as libc::pid_t;
         // SAFETY: `kill` takes no pointer; `pid` is this child's, not yet reaped.
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -146,20 +143,11 @@ impl LocalServer {
                 // the group's until every member is gone.
                 unsafe { libc::killpg(pid, libc::SIGKILL) };
                 let _ = self.child.wait();
-                return;
+                break;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-    }
-
-    fn await_ready(&mut self) -> Result<(), String> {
-        let Err(why) = await_log(&mut self.child, &self.log, 0, BOOT_TIMEOUT, LOG_TAIL_LINES, |log| {
-            log.contains(READY_LINE).then_some(())
-        }) else {
-            return Ok(());
-        };
-        let _ = self.stop();
-        Err(format!("{SERVER} failed before it served: {why}"))
+        Ok(())
     }
 }
 
