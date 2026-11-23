@@ -225,7 +225,7 @@ impl Session {
         }
         self.cat
             .registry
-            .probe(tid, Probe::Pk, PkKeys::from_sorted(stride, keys.concat()))
+            .probe(tid, Probe::Pk { read: 0 }, PkKeys::from_sorted(stride, keys.concat()))
             .is_ok_and(|held| held.is_empty())
     }
 

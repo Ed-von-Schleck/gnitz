@@ -82,7 +82,7 @@ pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
 
 /// A PK probe of `tid` at `keys`.
 pub(super) fn probe(tid: u64, keys: &[u8]) -> Read<'_> {
-    Read::HasPk { tid, probe: Probe::Pk, keys }
+    Read::HasPk { tid, probe: Probe::Pk { read: 0 }, keys }
 }
 
 /// Serve every group on the SAL as an exchange wait whose round is still out

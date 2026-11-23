@@ -145,8 +145,7 @@ impl Read<'_> {
         match *self {
             Read::HasPk { tid, probe, keys } => (
                 match probe {
-                    Probe::Pk => head(K::HasPk, tid, 0, 0),
-                    Probe::PkColumn(col) => head(K::HasPkColumn, tid, col.into(), 0),
+                    Probe::Pk { read } => head(K::HasPk, tid, read, 0),
                     Probe::Index(cols, cap) => head(K::HasPkIndex, tid, cap.get(), cols.pack()),
                 },
                 keys,
@@ -195,13 +194,10 @@ impl<'r> SalRequest<'r> {
                 tids: gnitz_wire::le_scalars(blob)?.into(),
             }
             .into(),
-            SalMessageKind::HasPk | SalMessageKind::HasPkColumn | SalMessageKind::HasPkIndex => {
+            SalMessageKind::HasPk | SalMessageKind::HasPkIndex => {
                 let refused = || format!("no probe is carried as ({}, {:#x})", arg0, arg1);
                 let probe = match (kind, arg0, arg1) {
-                    (SalMessageKind::HasPk, 0, 0) => Probe::Pk,
-                    (SalMessageKind::HasPkColumn, col, 0) => {
-                        Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)
-                    }
+                    (SalMessageKind::HasPk, read, 0) => Probe::Pk { read },
                     (SalMessageKind::HasPkIndex, cap, cols) => {
                         let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
                         Probe::Index(PkColList::unpack_as(cols, PkListRole::ColumnList)?, cap)

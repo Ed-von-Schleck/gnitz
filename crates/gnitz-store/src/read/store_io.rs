@@ -20,11 +20,9 @@ use std::num::NonZeroU64;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Probe {
     /// The relation's own PK store, where every key nets 0 or 1: each key a
-    /// live row carries, echoed.
-    Pk,
-    /// The relation's own PK store, where every key nets 0 or 1: each key a
-    /// live row carries, with that row's column.
-    PkColumn(u32),
+    /// live row carries, with that row's payload columns `read` names, as
+    /// payload bits, in slot order.
+    Pk { read: u64 },
     /// The secondary index on this exact column list: its entries under the
     /// keys' spans, in [`KeySpec::index_schema`](gnitz_zset::algebra::KeySpec::index_schema),
     /// in key order, up to `cap` in all.
@@ -42,9 +40,8 @@ impl RelationRegistry {
         let relation = self.relation_or_err(id)?;
         let keyed_as = |stride| check_stride("probe", id, keys.stride(), stride);
         let out_schema = relation.probe_reply_schema(probe)?;
-        let cols: &[u32] = match &probe {
-            Probe::Pk => &[],
-            Probe::PkColumn(col) => std::slice::from_ref(col),
+        let cols = match probe {
+            Probe::Pk { read } => read_cols(&relation.schema(), read),
             Probe::Index(cols, cap) => {
                 let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.
@@ -65,7 +62,7 @@ impl RelationRegistry {
         if !relation.kind().nets_unit_per_key() {
             return Err(format!("probe: PK probe of relation {id}, whose keys may net above 1"));
         }
-        Ok(project_unique(table, &keys, cols, &out_schema))
+        Ok(project_unique(table, &keys, &cols, &out_schema))
     }
 }
 
@@ -74,8 +71,11 @@ impl Relation {
     pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
         let schema = self.schema();
         match probe {
-            Probe::Pk => project_schema(&schema, &[]),
-            Probe::PkColumn(col) => project_schema(&schema, &[col]),
+            Probe::Pk { read } if read & !schema.payload_slots() != 0 => Err(format!(
+                "probe: payload bits {read:#x} past a {}-column schema",
+                schema.num_columns()
+            )),
+            Probe::Pk { read } => project_schema(&schema, &read_cols(&schema, read)),
             Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.key_spec().index_schema(&schema)),
         }
     }
@@ -324,6 +324,14 @@ impl UniqueGather<'_> {
 /// `table`, probed from it, whose every key nets 0 or 1, at weight 1 and
 /// in `out_schema`, the [`project_schema`] layout of `cols`: the PK, then the
 /// payload columns `cols` names. The probe reads the rows `Cut::Now` reads.
+/// The columns of the payload slots `read` names, in slot order.
+fn read_cols(schema: &SchemaDescriptor, read: u64) -> Vec<u32> {
+    (0..schema.num_payload_cols())
+        .filter(|&pi| read >> pi & 1 != 0)
+        .map(|pi| schema.payload_col_idx(pi) as u32)
+        .collect()
+}
+
 fn project_unique(table: &Table, keys: &PkKeys, cols: &[u32], out_schema: &SchemaDescriptor) -> Batch {
     let schema = table.schema();
     let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();

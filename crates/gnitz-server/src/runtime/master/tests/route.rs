@@ -319,7 +319,7 @@ fn a_probe_routes_by_the_store_it_reads() {
     let index = Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::MAX);
 
     let replicated = registry(schema, Placement::Replicated);
-    for own in [Probe::Pk, Probe::PkColumn(1)] {
+    for own in [Probe::Pk { read: 0 }, Probe::Pk { read: 1 }] {
         let (set, per_worker) = route_read(&probe(own), &replicated, NW);
         assert_eq!(set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
         assert!(per_worker.is_some(), "{own:?}: each worker is sent its own keys");
@@ -328,7 +328,7 @@ fn a_probe_routes_by_the_store_it_reads() {
     let r = route_read(
         &Read::HasPk {
             tid: 16,
-            probe: Probe::Pk,
+            probe: Probe::Pk { read: 0 },
             keys: &one[..],
         },
         &replicated,

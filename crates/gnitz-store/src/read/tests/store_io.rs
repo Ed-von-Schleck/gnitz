@@ -425,8 +425,11 @@ fn a_pk_probe_answers_each_key_a_live_row_carries() {
     r.ingest(TID, make_batch(&make_schema_u64_i64(), &[(5, -1, 50)]))
         .unwrap();
     let keys = pk_keys_of_images(8, [2, 5, 7, 300]);
-    assert_eq!(keyed(&r.probe(TID, Probe::Pk, keys.clone()).unwrap()), [(2, 1), (7, 1)]);
-    let column = r.probe(TID, Probe::PkColumn(1), keys).unwrap();
+    assert_eq!(
+        keyed(&r.probe(TID, Probe::Pk { read: 0 }, keys.clone()).unwrap()),
+        [(2, 1), (7, 1)]
+    );
+    let column = r.probe(TID, Probe::Pk { read: 1 }, keys).unwrap();
     assert_eq!(batch_rows(&column), rows([2, 7]));
 }
 
@@ -435,7 +438,7 @@ fn a_pk_probe_answers_each_key_a_live_row_carries() {
 #[test]
 fn a_pk_or_column_probe_of_a_view_is_refused() {
     let r = fixture(RelationKind::View(ViewBudget::Plain), x10);
-    for probe in [Probe::Pk, Probe::PkColumn(1)] {
+    for probe in [Probe::Pk { read: 0 }, Probe::Pk { read: 1 }] {
         let err = r.probe(TID, probe, pk_keys_of_images(8, [2])).map(drop).unwrap_err();
         assert!(err.contains("may net above 1"), "{probe:?}: {err}");
     }
@@ -494,8 +497,8 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
         (r.probe(999_999, index(&[1]), span()).map(drop), "not registered"),
         (r.probe(TID, index(&[0, 1]), span()).map(drop), "no index"),
         (r.probe(TID, index(&[1]), entry()).map(drop), "stride"),
-        (r.probe(TID, Probe::Pk, entry()).map(drop), "stride"),
-        (r.probe(TID, Probe::PkColumn(1), entry()).map(drop), "stride"),
+        (r.probe(TID, Probe::Pk { read: 0 }, entry()).map(drop), "stride"),
+        (r.probe(TID, Probe::Pk { read: 1 }, entry()).map(drop), "stride"),
     ];
     for (i, (got, why)) in refusals.into_iter().enumerate() {
         let err = got.expect_err(why);
@@ -508,7 +511,7 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
 #[test]
 fn a_read_of_a_stream_is_refused() {
     let r = relation_fixture(RelationKind::Stream, make_schema_u64_i64(), &[], []);
-    for probe in [Probe::Pk, Probe::PkColumn(1)] {
+    for probe in [Probe::Pk { read: 0 }, Probe::Pk { read: 1 }] {
         let err = r.probe(TID, probe, pk_keys_of_images(8, [2])).map(drop).unwrap_err();
         assert!(err.contains("is a stream"), "{probe:?}: {err}");
     }

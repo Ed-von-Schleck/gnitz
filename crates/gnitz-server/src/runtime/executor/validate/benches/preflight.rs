@@ -90,8 +90,9 @@ fn preflight_probe_bench() {
 
 /// What the master spends on an upsert into a table whose payload column a
 /// child's FK references, in instructions per row, by phase: the bundle's fold,
-/// the PK-column probe planned over every key, and that probe's replies folded
-/// in, each key answered as committed. The replies are synthetic: one frame per
+/// the PK probe reading that column planned over every key with the column's
+/// delta, and that probe's replies folded in, each key answered as committed
+/// and its value retired. The replies are synthetic: one frame per
 /// worker, each holding the keys `key % 4` sends it, ascending.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -109,7 +110,7 @@ fn preflight_sink_bench() {
         .registry
         .relation(parent)
         .unwrap()
-        .probe_reply_schema(Probe::PkColumn(1))
+        .probe_reply_schema(Probe::Pk { read: 1 })
         .unwrap();
 
     let counter = Counter::instructions();
@@ -137,19 +138,25 @@ fn preflight_sink_bench() {
         let (disp, _) = test_dispatcher(4, engine);
         let run = || {
             let (b, fold) = counter.measure(|| TxnBundle::new(&disp.cat(), &families).unwrap());
-            let mut b = std::hint::black_box(b);
+            let b = std::hint::black_box(b);
             let mut checks: Vec<Check<Rule>> = Vec::new();
-            let ((), plan) = counter.measure(|| plan_pk_checks(&disp.cat(), &b, &mut checks).unwrap());
-            let [Check { plan: Rule::Gather { old, .. }, .. }] = &mut checks[..] else {
-                panic!("one PK-column probe");
+            let (mut deltas, plan) = counter.measure(|| {
+                plan_pk_checks(&disp.cat(), &b, &mut checks).unwrap();
+                parent_deltas(&disp.cat(), &b)
+            });
+            let [Check { plan: Rule::Pk { refs }, .. }] = &checks[..] else {
+                panic!("one PK probe");
             };
             let ((), sink) = counter.measure(|| {
-                let t = b.table_mut(parent);
                 for f in &frames {
-                    fold_pk_reply(&disp, t, &f.as_mem_batch(), &reply, Some(old)).unwrap();
+                    fold_pk_reply(&disp, b.table(parent), &f.as_mem_batch(), refs, &mut deltas).unwrap();
                 }
             });
-            assert_eq!(old.len() as u64, rows, "every key's before-image");
+            assert_eq!(
+                deltas[&(parent, 1)].retired.len() as u64,
+                rows,
+                "every key's before-image"
+            );
             [fold, plan, sink]
         };
         run(); // first allocations

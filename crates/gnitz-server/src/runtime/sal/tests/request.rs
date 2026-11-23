@@ -29,13 +29,13 @@ fn every_request() -> Vec<SalRequest<'static>> {
         .into(),
         Read::HasPk {
             tid: 19,
-            probe: Probe::Pk,
+            probe: Probe::Pk { read: 0 },
             keys: &[38, 39],
         }
         .into(),
         Read::HasPk {
             tid: 20,
-            probe: Probe::PkColumn(21),
+            probe: Probe::Pk { read: 21 },
             keys: &[40],
         }
         .into(),
@@ -126,10 +126,8 @@ fn a_push_rule_no_group_writes_is_refused() {
 fn a_probe_no_kind_writes_is_refused() {
     let index = PkColList::from_slice(&[2, 5]).pack();
     for (kind, arg0, arg1) in [
-        (SalMessageKind::HasPk, 5, 0),
         (SalMessageKind::HasPk, 0, index),
-        (SalMessageKind::HasPkColumn, 1 << 32, 0),
-        (SalMessageKind::HasPkColumn, 4, index),
+        (SalMessageKind::HasPk, 5, 1),
         (SalMessageKind::HasPkIndex, 0, index),
         (SalMessageKind::HasPkIndex, 9, 0),
         (SalMessageKind::HasPkIndex, 9, 7),
