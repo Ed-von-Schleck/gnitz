@@ -56,12 +56,6 @@ impl RelationEntry {
             token: Cell::new(None),
         }
     }
-
-    /// Re-encode both records for a relation keyed `pk` over the columns `defs`.
-    pub(in crate::catalog) fn set_records(&mut self, pk: &[u32], defs: &[CatalogColumn]) {
-        self.record = encode_record(pk, defs);
-        self.shape_record = encode_shape_record(pk, defs);
-    }
 }
 
 impl CatalogEngine {
@@ -131,10 +125,9 @@ impl CatalogEngine {
         if token == 0 {
             return Ok(());
         }
-        let current = match self.caches.relations.get(&tid).map(|e| e.token.get()) {
-            Some(Some(t)) => Some(t.get()),
-            Some(None) => self.resolve_answer(tid).map(|(_, t)| t),
-            None => None,
+        let current = match self.caches.relations.get(&tid).and_then(|e| e.token.get()) {
+            Some(t) => Some(t.get()),
+            None => self.resolve_answer(tid).map(|(_, t)| t),
         };
         if current == Some(token) {
             return Ok(());

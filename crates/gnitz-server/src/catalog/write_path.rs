@@ -181,7 +181,7 @@ impl CatalogEngine {
                 // same groups in the same order.
                 let scanned = self.dag.is_scanned(family.id());
                 zone.push(ZoneGroup { family, batch, scanned });
-                let applied = &zone[zone.len() - 1].batch;
+                let applied = &zone.last().expect("pushed above").batch;
                 self.apply_family(family, applied, Landing::CUT)?;
             }
         }

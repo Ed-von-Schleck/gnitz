@@ -31,13 +31,16 @@ mod relations;
 mod sequences;
 mod sys_reads;
 mod sys_tables;
-mod view_state;
 mod write_path;
 
 #[cfg(test)]
 mod suites;
 
-use gnitz_store::relation::RelationRegistry;
+use std::rc::Rc;
+
+use gnitz_store::relation::{RelationRegistry, Residency};
+use gnitz_wire::ReadSpec;
+use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 
 use crate::query::DagEngine;
@@ -89,4 +92,31 @@ pub(crate) struct CatalogEngine {
 pub(crate) struct BootVerdict {
     pub(crate) resume_at: u64,
     pub(crate) rebuild: FxHashSet<u64>,
+}
+
+impl CatalogEngine {
+    /// [`RelationRegistry::scan_spec`], hydrating.
+    pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<Rc<Batch>, String> {
+        let (registry, dag) = (&self.registry, &mut self.dag);
+        registry.scan_spec(
+            target_id,
+            spec,
+            reply_layout,
+            Some(&mut |k| dag.hydrate_keys(registry, target_id, k)),
+        )
+    }
+
+    /// Open this process's stores: a relation's rederived state resumes at the
+    /// boot verdict's generation unless the verdict rebuilds it.
+    pub(crate) fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, String> {
+        let boot = &self.boot;
+        self.registry.open_stores(rank, residency, |id| {
+            (!boot.rebuild.contains(&id)).then_some(boot.resume_at)
+        })
+    }
+
+    /// The ephemeral checkpoint round at `generation`.
+    pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
+        self.dag.checkpoint_ephemeral(&mut self.registry, generation)
+    }
 }

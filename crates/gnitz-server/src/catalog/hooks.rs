@@ -193,11 +193,12 @@ impl CatalogEngine {
             if rebuilt != cur {
                 self.registry.swap_schema(owner, rebuilt)?;
             }
-            self.caches
+            let entry = self
+                .caches
                 .relations
                 .get_mut(&owner)
-                .expect("every registered relation has an entry")
-                .set_records(rebuilt.pk_cols(), &defs);
+                .expect("every registered relation has an entry");
+            *entry = RelationEntry::new(rebuilt.pk_cols(), &defs, std::mem::take(&mut entry.fks));
         }
         Ok(())
     }

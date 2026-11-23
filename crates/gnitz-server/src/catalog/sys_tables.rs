@@ -133,21 +133,17 @@ impl PkSignature {
 /// any row order. Zero-weight rows are skipped.
 pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
-    let mut by_pk: FxHashMap<(u64, Option<u64>), usize> = FxHashMap::default();
+    let mut by_pk: FxHashMap<&[u8], usize> = FxHashMap::default();
     for i in 0..batch.len() {
         let w = batch.get_weight(i);
         if w == 0 {
             continue;
         }
         let key = batch.get_pk_bytes(i);
-        let (leading, member) = (
-            gnitz_wire::sys_leading_id(key),
-            (key.len() > 8).then(|| gnitz_wire::sys_leading_id(&key[8..])),
-        );
-        let slot = *by_pk.entry((leading, member)).or_insert_with(|| {
+        let slot = *by_pk.entry(key).or_insert_with(|| {
             sigs.push(PkSignature {
-                leading,
-                member,
+                leading: gnitz_wire::sys_leading_id(key),
+                member: (key.len() > 8).then(|| gnitz_wire::sys_leading_id(&key[8..])),
                 row: i,
                 neg: None,
                 pos: None,
@@ -244,14 +240,6 @@ pub(crate) struct Block {
 }
 
 impl Block {
-    /// The ids of the rows the block creates.
-    pub(in crate::catalog) fn creates(&self) -> impl Iterator<Item = u64> {
-        self.sigs
-            .iter()
-            .filter(|s| s.shape() == PkShape::Create)
-            .map(|s| s.leading)
-    }
-
     /// The leading ids of the rows the block leaves live: its creates and pairs.
     pub(in crate::catalog) fn live_ids(&self) -> impl Iterator<Item = u64> + Clone {
         self.sigs.iter().filter(|s| s.pos.is_some()).map(|s| s.leading)
@@ -295,7 +283,8 @@ impl DdlBundle {
 
     /// The ids of the rows the bundle's `family` block creates.
     pub(in crate::catalog) fn creates(&self, family: SysFamily) -> impl Iterator<Item = u64> {
-        self.get(family).into_iter().flat_map(Block::creates)
+        let sigs = self.get(family).map_or(&[][..], |b| &b.sigs);
+        sigs.iter().filter(|s| s.shape() == PkShape::Create).map(|s| s.leading)
     }
 
     /// The distinct `(owner, cols)` of every unique index the bundle's IDX_TAB

@@ -220,28 +220,30 @@ impl CatalogEngine {
             // The `-1` must content-equal the live row — you may only retract the
             // element that exists — and `live + Σ batch` must land in `{0, 1}`: the
             // sys stores run no `enforce_unique_pk`, so nothing else stops a
-            // duplicate live head or a persistent negative ghost.
-            let live = store.unique_live_row_at(batch.get_pk_bytes(sig.row));
-            if let Some(nj) = sig.neg {
-                let Some(sr) = live.as_ref() else {
+            // duplicate live head or a persistent negative ghost. `check_batch_shape`
+            // admitted at most one row of each sign, so the net leaves `{0, 1}`
+            // only where a `+1` meets a live row with no `-1`.
+            match (store.unique_live_row_at(batch.get_pk_bytes(sig.row)), sig.neg) {
+                (None, Some(_)) => {
                     return Err(format!(
                         "catalog changed concurrently: retracting a {noun} that no longer exists"
                     ));
-                };
-                let (src, ri) = sr.source();
-                if payload_differs(family.schema(), 0, src, ri, batch, nj) {
+                }
+                (Some(live), Some(nj)) => {
+                    let (src, ri) = live.source();
+                    if payload_differs(family.schema(), 0, src, ri, batch, nj) {
+                        return Err(format!(
+                            "catalog changed concurrently: the retracted {noun} differs from the current one"
+                        ));
+                    }
+                }
+                (Some(_), None) => {
                     return Err(format!(
-                        "catalog changed concurrently: the retracted {noun} differs from the current one"
+                        "system-catalog write would leave {} at net weight 2 (expected 0 or 1)",
+                        sig.label(family)
                     ));
                 }
-            }
-            // `check_batch_shape` admitted at most one row of each sign, each of weight ±1.
-            let net = i64::from(live.is_some()) + sig.pos.is_some() as i64 - sig.neg.is_some() as i64;
-            if !(0..=1).contains(&net) {
-                return Err(format!(
-                    "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
-                    sig.label(family)
-                ));
+                (None, None) => {}
             }
         }
         let dropped = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Drop).map(|s| s.leading));
