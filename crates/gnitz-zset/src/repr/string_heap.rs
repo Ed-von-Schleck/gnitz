@@ -142,15 +142,6 @@ pub(super) fn carry_dead_rows(
     carry_dead(src, slots, &runs)
 }
 
-/// A bitset of `count` rows with each of `rows` set.
-pub(super) fn named_rows(count: usize, rows: impl Iterator<Item = usize>) -> Vec<u64> {
-    let mut named = vec![0u64; count.div_ceil(64)];
-    for row in rows {
-        named[row / 64] |= 1 << (row % 64);
-    }
-    named
-}
-
 /// The rows of `0..count` outside the ascending, disjoint ranges `kept`, as
 /// ranges; some may be empty.
 fn gaps(kept: &[(usize, usize)], count: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
@@ -470,24 +461,21 @@ pub(super) fn walk_heap_spans(mb: &MemBatch<'_>, mut accept: impl FnMut(&[u8; 16
             if !accept(cell, col.type_code) {
                 return None;
             }
-            if let Some(span) = gnitz_wire::german_string_heap(cell, heap) {
-                mark_bits(&mut live, span);
+            let Some(span) = gnitz_wire::german_string_heap(cell, heap) else {
+                continue;
+            };
+            // Each word the span covers gets the span's bits in it.
+            let (mut at, end) = (span.start, span.end);
+            while at < end {
+                let (word, bit) = (at / 64, at % 64);
+                let n = (64 - bit).min(end - at);
+                live[word] |= gnitz_wire::low_bits_mask(n) << bit;
+                at += n;
             }
         }
     }
     let marked: usize = live.iter().map(|w| w.count_ones() as usize).sum();
     Some(heap - marked)
-}
-
-/// Set bits `span` of the bitset `bits`.
-fn mark_bits(bits: &mut [u64], span: std::ops::Range<usize>) {
-    let (mut at, end) = (span.start, span.end);
-    while at < end {
-        let (word, bit) = (at / 64, at % 64);
-        let n = (64 - bit).min(end - at);
-        bits[word] |= gnitz_wire::low_bits_mask(n) << bit;
-        at += n;
-    }
 }
 
 #[cfg(test)]

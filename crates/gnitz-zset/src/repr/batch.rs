@@ -734,19 +734,9 @@ impl Batch {
 
     // ── Copies ──────────────────────────────────────────────────────────
 
-    /// The rows `indices` names, in that order, any of them any number of times,
-    /// at their own weights; none may be weight 0. This batch's heap is carried
-    /// whole where that beats relocating the named rows' long strings.
+    /// [`MemBatch::indexed_rows`] of this batch.
     pub fn indexed_rows(&self, indices: &[u32]) -> Self {
-        self.indexed_rows_then(indices, |_| {})
-    }
-
-    /// [`Self::indexed_rows`], then the writer of those rows handed to `then`,
-    /// to overwrite cells. A row named twice shares its strings' heap bytes, and
-    /// nothing charges a long value `then` overwrites dead: it may overwrite a
-    /// string cell only where another copy still references the old value.
-    pub fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Self {
-        self.as_mem_batch().indexed_rows_then(indices, then)
+        self.as_mem_batch().indexed_rows(indices)
     }
 
     /// [`Self::indexed_rows`] of a strictly ascending `indices`, inheriting this
@@ -1295,15 +1285,25 @@ impl<'a> MemBatch<'a> {
         b
     }
 
-    /// [`Batch::indexed_rows`] of these rows.
+    /// The rows `indices` names, in that order, any of them any number of times,
+    /// at their own weights; none may be weight 0. This batch's heap is carried
+    /// whole where that beats relocating the named rows' long strings.
     pub fn indexed_rows(&self, indices: &[u32]) -> Batch {
         self.indexed_rows_then(indices, |_| {})
     }
 
-    /// [`Batch::indexed_rows_then`] of these rows.
+    /// [`Self::indexed_rows`], then the writer of those rows
+    /// handed to `then`, to overwrite cells. A row named twice shares its
+    /// strings' heap bytes, and nothing charges a long value `then` overwrites
+    /// dead: it may overwrite a string cell only where another copy still
+    /// references the old value.
     pub fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Batch {
         let dead = string_heap::carry_dead_rows(self, indices.len(), false, || {
-            string_heap::named_rows(self.count, indices.iter().map(|&row| row as usize))
+            let mut named = vec![0u64; self.count.div_ceil(64)];
+            for &row in indices {
+                named[row as usize / 64] |= 1 << (row % 64);
+            }
+            named
         });
         let carried = dead.map(|dead| (self.blob, 0, dead));
         let blob_cap = match carried {

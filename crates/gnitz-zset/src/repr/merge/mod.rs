@@ -898,10 +898,28 @@ where
 /// group to `out` — [`run_merge`]'s single-source counterpart, in the shape
 /// [`super::scatter::materialize_carrying`] copies out.
 pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<Pick>) {
-    if batch.count == 0 {
+    let (n, stride) = (batch.count, batch.pk_stride());
+    if n == 0 {
         return;
     }
-    with_payload_cmp!(batch.schema, |p| consolidate_groups_inner(batch, out, p))
+    // The entries sorted by PK alone — a batch whose PKs already stand in order
+    // sorts in one pass — and each run of a PK sorted by its payload as
+    // [`fold_runs`] folds it.
+    if (17..=PACKED_MAX_STRIDE).contains(&stride) {
+        let mut entries: Vec<PackedEntry> = (0..n as u32)
+            .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))
+            .collect();
+        radix_sort_by_key(&mut entries, |&e| e);
+        with_payload_cmp!(batch.schema, |p| fold_runs(&mut entries, batch, p, out))
+    } else {
+        pk_width_dispatch!(stride, |K| {
+            let mut entries: Vec<(K, u32)> = (0..n as u32)
+                .map(|i| (K::from_opk(batch.get_pk_bytes(i as usize)), i))
+                .collect();
+            radix_sort_by_key(&mut entries, |e| e.0);
+            with_payload_cmp!(batch.schema, |p| fold_runs(&mut entries, batch, p, out))
+        })
+    }
 }
 
 /// Whether `batch`'s rows already stand as [`consolidate_groups`] would leave
@@ -951,20 +969,14 @@ trait ArgEntry: Copy {
 /// A `(sort key, row-index)` pair. Keeps the key co-located with its index so the
 /// comparator reads from the element being positioned rather than chasing a
 /// separate key array.
-#[derive(Copy, Clone, Default)]
-struct SortEntry<K> {
-    key: K,
-    idx: u32,
-}
-
-impl<K: Copy + Eq> ArgEntry for SortEntry<K> {
+impl<K: Copy + Eq> ArgEntry for (K, u32) {
     #[inline(always)]
     fn idx(self) -> usize {
-        self.idx as usize
+        self.1 as usize
     }
     #[inline(always)]
     fn same_pk(self, other: Self) -> bool {
-        self.key == other.key
+        self.0 == other.0
     }
 }
 
@@ -1020,31 +1032,6 @@ impl ArgEntry for PackedEntry {
     fn same_pk(self, other: Self) -> bool {
         self.0[0] == other.0[0] && (self.0[1] ^ other.0[1]) >> 32 == 0
     }
-}
-
-/// The argsort half of [`consolidate_groups`]: the entries sorted by PK alone —
-/// a batch whose PKs already stand in order sorts in one pass — and each run of
-/// a PK sorted by its payload as [`fold_runs`] folds it.
-#[inline]
-fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pick>, payload: P) {
-    let (n, stride) = (batch.count, batch.pk_stride());
-    if (17..=PACKED_MAX_STRIDE).contains(&stride) {
-        let mut entries: Vec<PackedEntry> = (0..n as u32)
-            .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))
-            .collect();
-        radix_sort_by_key(&mut entries, |&e| e);
-        return fold_runs(&mut entries, batch, payload, out);
-    }
-    pk_width_dispatch!(stride, |K| {
-        let mut entries: Vec<SortEntry<K>> = (0..n as u32)
-            .map(|i| SortEntry {
-                key: K::from_opk(batch.get_pk_bytes(i as usize)),
-                idx: i,
-            })
-            .collect();
-        radix_sort_by_key(&mut entries, |e| e.key);
-        fold_runs(&mut entries, batch, payload, out);
-    })
 }
 
 /// The fold half of [`consolidate_groups`]: over entries sorted by PK, sort each

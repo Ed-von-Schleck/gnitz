@@ -405,115 +405,44 @@ impl Batch {
     }
 }
 
-/// Every BOOLEAN cell of `mb`, key or payload, is 0 or 1: a third byte would
-/// be a second encoding of true, which keys and compares apart from the first.
-fn boolean_cells_ok(mb: &MemBatch<'_>) -> bool {
-    // Branch-free over a column: a conforming batch is the one worth being fast on.
-    fn le1<'a>(cells: impl Iterator<Item = &'a u8>) -> bool {
-        cells.fold(0, |a, &b| a | b) <= 1
-    }
-    (0..mb.schema.num_columns()).all(|ci| match mb.schema.locate(ci) {
-        ColumnLocator::Payload { slot, type_code: TypeCode::Bool, .. } => le1(mb.col_data(slot as usize).iter()),
-        ColumnLocator::Pk { byte_off, type_code: TypeCode::Bool, .. } => {
-            le1(mb.pk().iter().skip(byte_off as usize).step_by(mb.pk_stride()))
-        }
-        _ => true,
-    })
-}
-
-/// Every German-string cell of `mb` is in canonical form against its own heap,
-/// and every STRING cell's content is UTF-8. Answers the heap's exact count of
-/// bytes no cell references.
-fn validate_string_cells(mb: &MemBatch<'_>) -> Result<usize, &'static str> {
-    // Non-ASCII STRING contents, each closed by an ASCII byte so no character
-    // runs from one into the next.
-    let mut text = Vec::new();
-    let dead = walk_heap_spans(mb, |cell, tc| {
-        if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
-            return false;
-        }
-        if tc == TypeCode::String && !gnitz_wire::german_string_short_ascii(cell) {
-            let c = gnitz_wire::german_string_content(cell, mb.blob);
-            if !c.is_ascii() {
-                text.extend_from_slice(c);
-                text.push(0);
-            }
-        }
-        true
-    })
-    .ok_or("data WAL German string is not in canonical form")?;
-    simdutf8::basic::from_utf8(&text).map_err(|_| "a TEXT cell is not UTF-8")?;
-    Ok(dead)
-}
-
-/// The first `(row, payload slot)` whose little-endian `u64` null word in
-/// `null_bmp` sets a bit outside the `nullable` slots, past the last payload
-/// slot included.
-fn first_not_null_violation(nullable: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
-    let not_null = !nullable;
-    let words = null_bmp.as_chunks::<8>().0;
-    // A conforming batch takes only this branch-free pass.
-    if not_null == 0 || words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & not_null == 0 {
-        return None;
-    }
-    words.iter().enumerate().find_map(|(row, w)| {
-        let bad = u64::from_le_bytes(*w) & not_null;
-        (bad != 0).then(|| (row, bad.trailing_zeros() as usize))
-    })
-}
-
-/// The first `(row, payload slot)` whose null bit in `null_bmp`, among the
-/// `nullable` slots, sits over a non-zero cell: NULL encodes as a zeroed cell.
-/// `col(slot)` is that slot's region and its cell width.
-fn first_valued_null<'a>(
-    nullable: u64,
-    null_bmp: &[u8],
-    col: impl Fn(usize) -> (&'a [u8], usize),
-) -> Option<(usize, usize)> {
-    let words = null_bmp.as_chunks::<8>().0;
-    // A batch holding no NULL takes only this branch-free pass.
-    let present = words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & nullable;
-    let mut first: Option<(usize, usize)> = None;
-    // One pass per slot that holds a NULL anywhere.
-    for slot in gnitz_wire::BitIter(present) {
-        let (cells, width) = col(slot);
-        let row = gnitz_wire::by_cell_width!(width, |T| valued_null_row::<{ size_of::<T>() }>(words, cells, slot));
-        if let Some(row) = row.filter(|&r| first.is_none_or(|(f, _)| r < f)) {
-            first = Some((row, slot));
-        }
-    }
-    first
-}
-
-/// The first row whose null word sets bit `slot` over a non-zero `W`-byte cell.
-fn valued_null_row<const W: usize>(words: &[[u8; 8]], cells: &[u8], slot: usize) -> Option<usize> {
-    let cells = cells.as_chunks::<W>().0;
-    let valued = |(w, c): (&[u8; 8], &[u8; W])| (u64::from_le_bytes(*w) >> slot) & 1 != 0 && *c != [0u8; W];
-    // A conforming column takes only this pass, which has no early exit to branch on.
-    if !words.iter().zip(cells).fold(false, |any, wc| any | valued(wc)) {
-        return None;
-    }
-    words.iter().zip(cells).position(valued)
-}
-
 impl<'a> MemBatch<'a> {
     /// The first breach of this batch's null rule, and its `(row, payload slot)`: a null
     /// bit on a NOT NULL column, or a NULL cell that is not zeroed — a key reader
     /// packs or routes a cell whatever its null bit says, so a second encoding
     /// would key a row and its retraction apart.
     pub fn null_breach(&self) -> Option<(&'static str, (usize, usize))> {
-        let schema = self.schema;
-        if let Some(at) = first_not_null_violation(schema.nullable_payload_slots(), self.null_bmp()) {
-            return Some(("a null bit on a NOT NULL column", at));
+        let nullable = self.schema.nullable_payload_slots();
+        // A conforming batch takes only this branch-free pass, which also names
+        // the slots holding a NULL anywhere; a bit past the last payload slot is
+        // a bit on no nullable column.
+        let set = self.null_words().fold(0, |a, w| a | w);
+        if set & !nullable != 0 {
+            let at = self.null_words().enumerate().find_map(|(row, w)| {
+                let bad = w & !nullable;
+                (bad != 0).then(|| (row, bad.trailing_zeros() as usize))
+            });
+            return Some(("a null bit on a NOT NULL column", at.expect("a word sets the bit")));
         }
-        let col = |pi| {
-            (
-                self.col_data(pi),
-                schema.region_stride(gnitz_wire::REG_PAYLOAD_START + pi),
-            )
-        };
-        first_valued_null(schema.nullable_payload_slots(), self.null_bmp(), col)
-            .map(|at| ("a non-zero cell under a NULL", at))
+        // One pass per slot holding a NULL: its first row whose bit sits over a
+        // non-zero cell.
+        let mut first: Option<(usize, usize)> = None;
+        for slot in gnitz_wire::BitIter(set) {
+            let width = self.schema.region_stride(gnitz_wire::REG_PAYLOAD_START + slot);
+            let row = gnitz_wire::by_cell_width!(width, |T| {
+                const W: usize = size_of::<T>();
+                let cells = self.col_data(slot).as_chunks::<W>().0;
+                let valued = |(w, c): (u64, &[u8; W])| gnitz_wire::null_word_get(w, slot) && *c != [0; W];
+                // A conforming column takes only this pass, which has no early exit to branch on.
+                match self.null_words().zip(cells).fold(false, |any, wc| any | valued(wc)) {
+                    true => self.null_words().zip(cells).position(valued),
+                    false => None,
+                }
+            });
+            if let Some(row) = row.filter(|&r| first.is_none_or(|(f, _)| r < f)) {
+                first = Some((row, slot));
+            }
+        }
+        first.map(|at| ("a non-zero cell under a NULL", at))
     }
 
     /// The rows of the WAL block `data` under `schema`: its fixed bytes are an
@@ -547,11 +476,49 @@ impl<'a> MemBatch<'a> {
     /// is not trusted: the heap is measured.
     pub fn of_foreign_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
         let mut mb = MemBatch::of_wal_block(data, schema)?;
-        mb.dead_heap = validate_string_cells(&mb)?;
+        // Every German-string cell in canonical form against its own heap, and
+        // every STRING cell's content UTF-8: the non-ASCII contents are gathered,
+        // each closed by an ASCII byte so no character runs from one into the next.
+        let mut text = Vec::new();
+        mb.dead_heap = walk_heap_spans(&mb, |cell, tc| {
+            if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
+                return false;
+            }
+            if tc == TypeCode::String && !gnitz_wire::german_string_short_ascii(cell) {
+                let c = gnitz_wire::german_string_content(cell, mb.blob);
+                if !c.is_ascii() {
+                    text.extend_from_slice(c);
+                    text.push(0);
+                }
+            }
+            true
+        })
+        .ok_or("data WAL German string is not in canonical form")?;
+        simdutf8::basic::from_utf8(&text).map_err(|_| "a TEXT cell is not UTF-8")?;
         if let Some((breach, _)) = mb.null_breach() {
             return Err(breach);
         }
-        if !boolean_cells_ok(&mb) {
+        // Every BOOLEAN cell, key or payload, is 0 or 1: a third byte would be a
+        // second encoding of true, which keys and compares apart from the first.
+        // Branch-free over a column: a conforming batch is the one worth being fast on.
+        let or = |a: u8, &b: &u8| a | b;
+        let is_bool = |&ci: &usize| schema.columns()[ci].type_code == TypeCode::Bool;
+        let bad_bool = (0..schema.num_columns()).filter(is_bool).any(|ci| {
+            let any = match schema.locate(ci) {
+                ColumnLocator::Payload { slot, type_code: TypeCode::Bool, .. } => {
+                    mb.col_data(slot as usize).iter().fold(0, or)
+                }
+                ColumnLocator::Pk { byte_off, type_code: TypeCode::Bool, .. } => mb
+                    .pk()
+                    .iter()
+                    .skip(byte_off as usize)
+                    .step_by(mb.pk_stride())
+                    .fold(0, or),
+                _ => 0,
+            };
+            any > 1
+        });
+        if bad_bool {
             return Err("a BOOLEAN cell is neither 0 nor 1");
         }
         Ok(mb)

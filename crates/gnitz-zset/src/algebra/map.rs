@@ -7,7 +7,7 @@
 
 use gnitz_expr::{ColCopy, ColumnLocator, ExprValidateErr, LogicalProgram, MapEval};
 
-use super::copy::{ColMoves, RowWindow, copy_window, rebase_copied_strings};
+use super::copy::{ColMoves, copy_window, rebase_copied_strings};
 use super::key_pack::{FoldCols, IDENTITY_CHUNK, KeyPacker, locate_key_col, pk_run};
 use crate::repr::{Batch, DirectWriter, MemBatch, copy_runs};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -86,23 +86,6 @@ fn stamp_hash_row_pks(output: &mut DirectWriter<'_>, fold: &FoldCols) {
     }
 }
 
-/// Output schema of a HashRow Map: a U128 PK, then each projected column at its
-/// slot type and its source nullability. Typed at the slot, the promotion is
-/// what the copy kernel screens.
-fn hashrow_output_schema(
-    in_schema: &SchemaDescriptor,
-    cols: &[gnitz_wire::ReindexSlot],
-) -> Result<SchemaDescriptor, String> {
-    let mut b = DerivedSchema::new();
-    b.push_pk(SchemaColumn::new(TypeCode::U128, false));
-    for &(c, t) in cols {
-        // A key column: a float is refused, as for a reindex key.
-        let (src, _) = locate_key_col(in_schema, c, "hash-row map")?;
-        b.push(SchemaColumn::new(t, src.nullable));
-    }
-    b.finish().map_err(|e| format!("hash-row map: output {e}"))
-}
-
 impl MapPlan {
     /// The plan for a circuit's MAP node: one derivation of its `(output schema,
     /// map program, PK source)` triple, and the trust boundary each kind's
@@ -126,7 +109,17 @@ impl MapPlan {
             }
 
             gnitz_wire::MapKind::HashRow { cols } => {
-                let out_schema = hashrow_output_schema(in_schema, cols)?;
+                // A U128 PK, then each projected column at its slot type and its
+                // source nullability. Typed at the slot, the promotion is what
+                // the copy kernel screens.
+                let mut b = DerivedSchema::new();
+                b.push_pk(SchemaColumn::new(TypeCode::U128, false));
+                for &(c, t) in cols {
+                    // A key column: a float is refused, as for a reindex key.
+                    let (src, _) = locate_key_col(in_schema, c, "hash-row map")?;
+                    b.push(SchemaColumn::new(t, src.nullable));
+                }
+                let out_schema = b.finish().map_err(|e| format!("hash-row map: output {e}"))?;
                 let proj: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
                 let fold = FoldCols::new(out_schema.payload_locators());
                 (out_schema, LogicalProgram::copy_cols(&proj), PkSource::HashRow(fold))
@@ -338,11 +331,11 @@ impl MapPlan {
             copy_runs::<8>(src.weight(), out.weight_mut(), ranges, 8);
             let mut dst = 0;
             for &(start, end) in ranges {
-                let w = RowWindow { src: start, dst, n: end - start };
+                let n = end - start;
                 // The window's null words first: an emit sets its NULL bits on them.
-                copy_window(src, out, &self.moves, w);
-                self.ev.write_computed(&mb, start, w.n, out, dst);
-                dst += w.n;
+                copy_window(src, out, &self.moves, start, dst, n);
+                self.ev.write_computed(&mb, start, n, out, dst);
+                dst += n;
             }
             rebase_copied_strings(&self.moves, out, src.blob(), heap_at);
             if let PkSource::HashRow(fold) = &self.pk_source {

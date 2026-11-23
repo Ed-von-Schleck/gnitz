@@ -696,7 +696,7 @@ impl GroupEmit<'_, '_, '_> {
         }
         let EmitScratch { vals, out_rows, fresh, derived, .. } = &*self.s;
         rows.write_rows(fresh.len(), |w| heads.write_fresh(vals, w, fresh));
-        rows.indexed_rows_then(out_rows, |w| {
+        rows.as_mem_batch().indexed_rows_then(out_rows, |w| {
             // Every row copies at its own weight: a stored row at −1, a fresh
             // row at +1. A new row copied off a stored row is set to +1.
             let weights = w.weight_mut().as_chunks_mut::<8>().0;

@@ -793,18 +793,8 @@ impl<'a> UnifiedSet<'a> {
 /// where that beats relocating the cells of the rows `rows` keeps of it.
 /// No row of a source may be picked twice.
 pub fn materialize_carrying(sources: &[MemBatch<'_>], schema: &SchemaDescriptor, rows: &[Pick]) -> Batch {
-    UnifiedSet::with_whole(sources, schema, |set| carry_and_write(set, sources, schema, rows))
-}
-
-/// [`materialize_carrying`]'s body over the set built for it.
-fn carry_and_write(
-    set: &mut UnifiedSet<'_>,
-    sources: &[MemBatch<'_>],
-    schema: &SchemaDescriptor,
-    rows: &[Pick],
-) -> Batch {
     if schema.string_payload_slots() == 0 {
-        return set.materialize(rows, None);
+        return UnifiedSet::with_whole(sources, schema, |set| set.materialize(rows, None));
     }
     let mut kept: SmallVec<[usize; 4]> = smallvec![0; sources.len()];
     // Counted through one slice, so the loop does not re-resolve inline storage per row.
@@ -818,6 +808,7 @@ fn carry_and_write(
     // Each source's picked rows as a bitset, set in one pass over the picks
     // on the first source that needs them.
     let mut named: Option<SmallVec<[Vec<u64>; 4]>> = None;
+    let mut carries: SmallVec<[Carry; 4]> = SmallVec::with_capacity(sources.len());
     for (si, s) in sources.iter().enumerate() {
         let named_here = || {
             let named = named.get_or_insert_with(|| {
@@ -830,20 +821,24 @@ fn carry_and_write(
             });
             std::mem::take(&mut named[si])
         };
-        match carry_dead_rows(s, kept[si], true, named_here) {
-            Some(d) => {
-                set.strings[si].1 = Some((heap_end, d));
-                heap_end += s.blob.len();
-            }
+        let carry = carry_dead_rows(s, kept[si], true, named_here).map(|d| (heap_end, d));
+        match carry {
+            Some(_) => heap_end += s.blob.len(),
             None => {
                 relocated_blob += s.blob.len();
                 relocated_rows += s.count;
                 relocated_out += kept[si];
             }
         }
+        carries.push(carry);
     }
     let blob_cap = heap_end + prorated_blob_cap(relocated_blob, relocated_rows, relocated_out);
-    set.write(rows, Some(blob_cap), None)
+    UnifiedSet::with_whole(sources, schema, |set| {
+        for (string, carry) in set.strings.iter_mut().zip(carries) {
+            string.1 = carry;
+        }
+        set.write(rows, Some(blob_cap), None)
+    })
 }
 
 // ===========================================================================

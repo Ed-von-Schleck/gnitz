@@ -499,25 +499,47 @@ fn foreign_decode_utf8_spans_split_across_cells() {
     assert!(!accepts(&[(&long(b"", &[0xFF]), &[0xFF; 20])]));
 }
 
-#[test]
-fn first_not_null_violation_names_the_first_row_and_its_lowest_offending_slot() {
-    let words: [u64; 4] = [0b0001, 0b0000, 0b1100, 0b0100];
-    let bmp = gnitz_wire::as_le_bytes(&words);
-    assert_eq!(first_not_null_violation(!0, bmp), None);
-    assert_eq!(first_not_null_violation(!0b0010, bmp), None);
-    assert_eq!(first_not_null_violation(!0b0110, bmp), Some((2, 2)));
-    assert_eq!(first_not_null_violation(!0b1001, bmp), Some((0, 0)));
-    assert_eq!(first_not_null_violation(0, &[]), None);
+/// Three rows of two I64 payload columns, `nullable` as given, holding `cols`
+/// under the null words `words`, written as they are.
+fn raw_two_col_batch(nullable: [bool; 2], cols: [[u64; 3]; 2], words: [u64; 3]) -> Batch {
+    let schema = u64_pk_schema(&nullable.map(|n| SchemaColumn::new(TypeCode::I64, n)));
+    Batch::write_new(&schema, 3, 0, |w| {
+        let (pk, weights, nulls) = w.fixed_mut();
+        pk.fill(0);
+        weights.copy_from_slice(gnitz_wire::as_le_bytes(&[1u64; 3]));
+        nulls.copy_from_slice(gnitz_wire::as_le_bytes(&words));
+        for (pi, col) in cols.iter().enumerate() {
+            w.col_mut(pi).copy_from_slice(gnitz_wire::as_le_bytes(col));
+        }
+    })
 }
 
 #[test]
-fn first_valued_null_names_the_first_null_bit_over_a_non_zero_cell() {
-    // Two 8-byte payload slots over three rows; only slot 1 is nullable.
-    let cols: [[u64; 3]; 2] = [[7, 0, 9], [0, 5, 0]];
-    let col = |slot: usize| (gnitz_wire::as_le_bytes(&cols[slot]), 8);
-    let bmp = |words: [u64; 3]| gnitz_wire::as_le_bytes(&words).to_vec();
-    assert_eq!(first_valued_null(0b10, &bmp([0b10, 0, 0b10]), col), None);
-    assert_eq!(first_valued_null(0b10, &bmp([0b10, 0b10, 0b10]), col), Some((1, 1)));
-    // A bit outside `nullable` is not this check's to judge.
-    assert_eq!(first_valued_null(0b10, &bmp([0b01, 0, 0]), col), None);
+fn null_breach_names_the_first_row_and_its_lowest_null_bit_on_a_not_null_column() {
+    let breach = |nullable, words| {
+        raw_two_col_batch(nullable, [[0; 3]; 2], words)
+            .as_mem_batch()
+            .null_breach()
+    };
+    let not_null = "a null bit on a NOT NULL column";
+    assert_eq!(breach([true, true], [0b01, 0, 0b11]), None);
+    assert_eq!(breach([true, false], [0b01, 0, 0b11]), Some((not_null, (2, 1))));
+    assert_eq!(breach([false, true], [0b10, 0b11, 0b01]), Some((not_null, (1, 0))));
+    // A bit past the last payload slot sits on no nullable column.
+    assert_eq!(breach([true, true], [0, 0b100, 0]), Some((not_null, (1, 2))));
+}
+
+#[test]
+fn null_breach_names_the_first_null_bit_over_a_non_zero_cell() {
+    let cols = [[7, 0, 9], [0, 5, 0]];
+    let breach = |words| {
+        raw_two_col_batch([false, true], cols, words)
+            .as_mem_batch()
+            .null_breach()
+    };
+    assert_eq!(breach([0b10, 0, 0b10]), None);
+    assert_eq!(
+        breach([0b10, 0b10, 0b10]),
+        Some(("a non-zero cell under a NULL", (1, 1)))
+    );
 }

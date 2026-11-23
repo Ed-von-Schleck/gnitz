@@ -10,15 +10,6 @@ use crate::repr::{Batch, DirectWriter, MemBatch, StringDest};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{FixedInt, Heap, RowSource, TypeCode, zip_cells};
 
-/// One copy step's row window: source rows `[src, src + n)` onto destination rows
-/// `[dst, dst + n)`.
-#[derive(Clone, Copy)]
-pub(super) struct RowWindow {
-    pub(super) src: usize,
-    pub(super) dst: usize,
-    pub(super) n: usize,
-}
-
 /// Columns copied verbatim from an input row into an output row, with the null
 /// bits and German-string slots that follow from them.
 #[derive(Clone)]
@@ -168,7 +159,7 @@ impl ColMoves {
 /// and each German-string column rebased onto the heap
 /// [`crate::repr::Batch::carry_heap`] left at `heap_at`.
 pub fn copy_columns(src: &MemBatch, out: &mut DirectWriter<'_>, moves: &ColMoves, n: usize, heap_at: Option<usize>) {
-    copy_window(src, out, moves, RowWindow { src: 0, dst: 0, n });
+    copy_window(src, out, moves, 0, 0, n);
     rebase_copied_strings(moves, out, src.blob(), heap_at);
 }
 
@@ -246,13 +237,21 @@ fn gather_column(src: &MemBatch, c: &ColCopy, rows: impl Iterator<Item = usize>,
     }
 }
 
-/// Copy `moves` of `in_batch` onto `output` over `w`: each row's whole null word,
+/// Copy `moves` of `in_batch`'s rows `[src_start, src_start + n)` onto
+/// `output`'s rows `[dst_base, dst_base + n)`: each row's whole null word,
 /// holding the copied columns' bits and no other, then each copied cell, a
 /// German-string cell verbatim: the caller rebases those columns.
-pub(super) fn copy_window(in_batch: &MemBatch, output: &mut DirectWriter<'_>, moves: &ColMoves, w: RowWindow) {
-    moves.write_null_rows(in_batch.null_bmp(), w.src, output.null_bmp_mut(), w.dst, w.n);
+pub(super) fn copy_window(
+    in_batch: &MemBatch,
+    output: &mut DirectWriter<'_>,
+    moves: &ColMoves,
+    src_start: usize,
+    dst_base: usize,
+    n: usize,
+) {
+    moves.write_null_rows(in_batch.null_bmp(), src_start, output.null_bmp_mut(), dst_base, n);
     for c in moves.copies() {
-        copy_column(in_batch, output, c, w);
+        copy_column(in_batch, output, c, src_start, dst_base, n);
     }
 }
 
@@ -285,9 +284,10 @@ fn copy_column(
         slot: dst_payload,
         width: dw,
     }: &ColCopy,
-    w: RowWindow,
+    src_start: usize,
+    dst_base: usize,
+    n: usize,
 ) {
-    let RowWindow { src: src_start, dst: dst_base, n } = w;
     let dst = &mut output.col_mut(dst_payload)[dst_base * dw..(dst_base + n) * dw];
     match src_loc {
         ColumnLocator::Pk { byte_off, size, type_code } => {
