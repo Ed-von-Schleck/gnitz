@@ -1,13 +1,12 @@
 //! The replies that are not rows, as Python objects: the result classes of a
-//! poll and a sync, `execute_sql`'s statement dicts, and the converters a verb
-//! hands its driver to turn what the client yields into its Python value.
+//! poll and a sync, and `execute_sql`'s statement dicts.
 
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 
-use gnitz_core::{PollOutcome, PollResult, Pushed, ScanReply, Synced};
+use gnitz_core::{PollOutcome, PollResult, Pushed, Synced};
 use gnitz_sql::SqlResult;
 use gnitz_wire::multi_frame::DeltaCursor;
 
@@ -30,7 +29,7 @@ pub struct PyPollResult {
 }
 
 impl PyPollResult {
-    fn new(py: Python<'_>, o: PollOutcome) -> PyPollResult {
+    pub(crate) fn new(py: Python<'_>, o: PollOutcome) -> PyPollResult {
         PyPollResult {
             view_id: o.view_id,
             reseeded: o.result.reseeded(),
@@ -66,7 +65,7 @@ pub struct PySynced {
 }
 
 impl PySynced {
-    fn new(py: Python<'_>, synced: Synced) -> PyResult<PySynced> {
+    pub(crate) fn new(py: Python<'_>, synced: Synced) -> PyResult<PySynced> {
         let pushed = synced.pushed.into_iter().map(|p| PyPushed::new(py, p));
         let mirrored = synced.mirrored.into_iter().map(|o| PyPollResult::new(py, o));
         Ok(PySynced {
@@ -131,7 +130,7 @@ fn py_repr<'py>(py: Python<'py>, v: impl IntoPyObject<'py>) -> PyResult<String> 
 
 /// `execute_sql`'s result: one dict per statement, keyed as `gnitz._types`'
 /// TypedDicts are.
-pub(crate) fn sql_results(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyAny>> {
+pub(crate) fn sql_results(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Vec<Py<PyDict>>> {
     let dicts = results.into_iter().map(|r| {
         let (kind, field) = match r {
             SqlResult::Ddl { .. } => ("Ddl", None),
@@ -146,44 +145,8 @@ pub(crate) fn sql_results(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<P
         if let Some((key, v)) = field {
             d.set_item(PyString::intern(py, key), v)?;
         }
-        Ok(d)
+        Ok(d.unbind())
     });
-    dicts.collect::<PyResult<Vec<_>>>()?.into_py_any(py)
-}
 
-// ---------------------------------------------------------------------------
-// Converters: what a verb's driver calls, GIL held, on what the client yields.
-// ---------------------------------------------------------------------------
-
-/// The value itself.
-pub(crate) fn value<T>(py: Python<'_>, v: T) -> PyResult<Py<PyAny>>
-where
-    T: for<'py> IntoPyObject<'py>,
-{
-    v.into_py_any(py)
-}
-
-/// `None`, whatever the client yielded.
-pub(crate) fn none<T>(py: Python<'_>, _: T) -> PyResult<Py<PyAny>> {
-    Ok(py.None())
-}
-
-/// A read's rows.
-pub(crate) fn scanned(py: Python<'_>, reply: ScanReply) -> PyResult<Py<PyAny>> {
-    Ok(scan_result(py, reply)?.into_any())
-}
-
-/// What one view's poll did.
-pub(crate) fn polled(py: Python<'_>, outcome: PollOutcome) -> PyResult<Py<PyAny>> {
-    value(py, PyPollResult::new(py, outcome))
-}
-
-/// What one sync brought.
-pub(crate) fn synced(py: Python<'_>, synced: Synced) -> PyResult<Py<PyAny>> {
-    value(py, PySynced::new(py, synced)?)
-}
-
-/// A delta read's rows, and the cursor past them.
-pub(crate) fn delta(py: Python<'_>, (reply, cursor): (ScanReply, DeltaCursor)) -> PyResult<Py<PyAny>> {
-    (scan_result(py, reply)?, cursor.pair()).into_py_any(py)
+    dicts.collect()
 }

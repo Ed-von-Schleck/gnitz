@@ -272,12 +272,6 @@ impl PyRow {
 /// The years a `datetime.date` holds.
 const PY_YEARS: std::ops::RangeInclusive<i64> = 1..=9999;
 
-/// `decimal.Decimal`, imported once.
-fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
-    static DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-    DECIMAL.import(py, "decimal", "Decimal")
-}
-
 /// The cell at `loc` in `row`, PK or payload.
 fn cell_to_py(
     py: Python<'_>,
@@ -333,9 +327,13 @@ fn cell_to_py(
                 micros.into_py_any(py)?
             }
         }
-        TypeCode::Decimal => py_decimal(py)?
-            .call1((write_decimal(int(), ty.scale, &mut [0; VALUE_TEXT_MAX]),))?
-            .unbind(),
+        TypeCode::Decimal => {
+            static DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+            let decimal = DECIMAL.import(py, "decimal", "Decimal")?;
+            decimal
+                .call1((write_decimal(int(), ty.scale, &mut [0; VALUE_TEXT_MAX]),))?
+                .unbind()
+        }
         // CPython validates the UTF-8 and raises `UnicodeDecodeError`.
         TypeCode::String => PyString::from_bytes(py, &loc.content(batch, row))?.into_any().unbind(),
         TypeCode::Blob => PyBytes::new(py, &loc.content(batch, row)).into_any().unbind(),

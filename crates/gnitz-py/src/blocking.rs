@@ -11,13 +11,6 @@ use gnitz_sql::GnitzSqlError;
 use crate::client::{Mode, PyClient, resolve_target};
 use crate::{client_err, sql_err};
 
-/// A connection whose waits check for Ctrl-C.
-fn connect(py: Python<'_>, target: &str) -> PyResult<GnitzClient> {
-    let host = BlockingHost::with_hook(|| Python::attach(|py| py.check_signals()).map_err(Into::into));
-    py.detach(|| block_on(GnitzClient::connect_with(target, Box::new(host))))
-        .map_err(client_err)
-}
-
 /// Run `f` on the client with the GIL released.
 pub(crate) fn call<T: Send, E: Into<GnitzSqlError> + Send>(
     client: &mut GnitzClient,
@@ -40,7 +33,12 @@ impl PyGnitzClient {
     #[new]
     #[pyo3(signature = (target = None, schema = "public"))]
     fn new(py: Python<'_>, target: Option<String>, schema: &str) -> PyResult<PyClassInitializer<Self>> {
-        let client = connect(py, &resolve_target(target)?)?;
+        let target = resolve_target(target)?;
+        // Its waits check for Ctrl-C.
+        let host = BlockingHost::with_hook(|| Python::attach(|py| py.check_signals()).map_err(Into::into));
+        let client = py
+            .detach(|| block_on(GnitzClient::connect_with(&target, Box::new(host))))
+            .map_err(client_err)?;
         Ok(PyClient::init(Mode::Blocking(Mutex::new(Some(Box::new(client)))), schema).add_subclass(PyGnitzClient))
     }
 

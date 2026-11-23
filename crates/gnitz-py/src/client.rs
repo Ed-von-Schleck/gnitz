@@ -23,7 +23,7 @@ use gnitz_wire::{KeyRange, PkColList, PkListRole, ReadBound, ReadSpec, WireConfl
 use crate::aio::{LoopCore, LoopHandle};
 use crate::blocking;
 use crate::read::scan_result;
-use crate::reply::{delta, none, polled, scanned, sql_results, synced, value};
+use crate::reply::{PyPollResult, PySynced, sql_results};
 use crate::schema::PySchema;
 use crate::write::{PyZSetBatch, py_key_image, py_pk_keys};
 use crate::{client_err, lock};
@@ -106,11 +106,12 @@ impl PyClient {
     }
 
     /// Run one verb: `op` on the client, and `convert` on what it yields.
-    fn run<T, O, C>(slf: &Bound<'_, Self>, op: O, convert: C) -> PyResult<Py<PyAny>>
+    fn run<T, R, O, C>(slf: &Bound<'_, Self>, op: O, convert: C) -> PyResult<Py<PyAny>>
     where
         T: Send + 'static,
+        R: for<'py> IntoPyObject<'py>,
         O: VerbOp<T>,
-        C: Convert<T>,
+        C: FnOnce(Python<'_>, T) -> PyResult<R> + Send + 'static,
     {
         match &slf.get().mode {
             Mode::Blocking(_) => {
@@ -120,26 +121,26 @@ impl PyClient {
                         Ok::<_, GnitzSqlError>(c.wait(sent).await?)
                     })
                 })?;
-                convert(slf.py(), reply)
+                convert(slf.py(), reply)?.into_py_any(slf.py())
             }
             Mode::Loop(handle) => handle.get().submit(slf.py(), op, convert),
         }
     }
 
-    /// Answer out of the client's memory. A blocking client does so in place,
-    /// GIL held; one on an event loop is reached in its turn, like any call.
-    fn peek<T, R, C>(slf: &Bound<'_, Self>, read: R, convert: C) -> PyResult<Py<PyAny>>
+    /// Answer `read` out of the client's memory. A blocking client does so in
+    /// place, GIL held; one on an event loop is reached in its turn, like any
+    /// call.
+    fn peek<T>(slf: &Bound<'_, Self>, read: impl FnOnce(&mut GnitzClient) -> T + Send + 'static) -> PyResult<Py<PyAny>>
     where
-        T: Send + 'static,
-        R: FnOnce(&mut GnitzClient) -> T + Send + 'static,
-        C: Convert<T>,
+        T: for<'py> IntoPyObject<'py> + Send + 'static,
     {
         match &slf.get().mode {
-            Mode::Blocking(_) => slf.get().blocking(|c| convert(slf.py(), read(c))),
-            Mode::Loop(_) => Self::run(slf, whole!(|c| read(c)), convert),
+            Mode::Blocking(_) => slf.get().blocking(|c| read(c).into_py_any(slf.py())),
+            Mode::Loop(_) => Self::run(slf, whole!(|c| read(c)), value),
         }
     }
 
+    /// The schema a relation named without one is in.
     fn schema_name(slf: &Bound<'_, Self>) -> Arc<str> {
         Arc::clone(&lock(&slf.get().schema))
     }
@@ -157,8 +158,18 @@ impl PyClient {
     /// The rows `spec` selects of relation `tid` in `schema`'s layout, off this
     /// client's local copy if it mirrors one.
     fn read(slf: &Bound<'_, Self>, tid: u64, schema: PySchema, spec: ReadSpec) -> PyResult<Py<PyAny>> {
-        Self::run(slf, single!(|c| c.scan_spec(tid, spec, &schema.rust)), scanned)
+        Self::run(slf, single!(|c| c.scan_spec(tid, spec, &schema.rust)), scan_result)
     }
+}
+
+/// A verb's answer as itself.
+fn value<T>(_: Python<'_>, v: T) -> PyResult<T> {
+    Ok(v)
+}
+
+/// `None`, whatever the verb answered.
+pub(crate) fn none<T>(py: Python<'_>, _: T) -> PyResult<Py<PyAny>> {
+    Ok(py.None())
 }
 
 /// A delta read's `cursor` and `spec` arguments: `(tag, tick)` or none, and
@@ -177,12 +188,6 @@ fn delta_args(cursor: Option<(u64, u64)>, spec: Option<Vec<u8>>) -> PyResult<(Op
     ))
 }
 
-/// A sync's `wait`, given in seconds.
-fn sync_wait(seconds: f64) -> PyResult<Duration> {
-    Duration::try_from_secs_f64(seconds)
-        .map_err(|_| PyValueError::new_err(format!("wait must be a non-negative number of seconds, not {seconds}")))
-}
-
 #[pymethods]
 impl PyClient {
     #[getter]
@@ -199,7 +204,7 @@ impl PyClient {
     /// mirrored read does not move. Answers on a poisoned store.
     #[getter]
     fn requests_sent(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, |c| c.requests_sent(), value)
+        Self::peek(slf, |c| c.requests_sent())
     }
 
     // ----- DDL -----
@@ -268,8 +273,8 @@ impl PyClient {
     /// resolve_table(table_name) -> (tid: int, schema: Schema)
     fn resolve_table(slf: &Bound<'_, Self>, table_name: String) -> PyResult<Py<PyAny>> {
         let table = Self::relation(slf, &table_name)?;
-        Self::run(slf, whole!(|c| c.resolve_relation(&table).await?), |py, rel| {
-            value(py, (rel.tid, PySchema { rust: Arc::clone(&rel.schema) }))
+        Self::run(slf, whole!(|c| c.resolve_relation(&table).await?), |_, rel| {
+            Ok((rel.tid, PySchema { rust: Arc::clone(&rel.schema) }))
         })
     }
 
@@ -296,8 +301,10 @@ impl PyClient {
                 c.scan_many(&scans)
             }),
             |py, replies| {
-                let results = replies.into_iter().map(|reply| scan_result(py, reply));
-                value(py, results.collect::<PyResult<Vec<_>>>()?)
+                replies
+                    .into_iter()
+                    .map(|reply| scan_result(py, reply))
+                    .collect::<PyResult<Vec<_>>>()
             },
         )
     }
@@ -372,7 +379,13 @@ impl PyClient {
         Self::run(
             slf,
             whole!(|c| gnitz_sql::plan_subscription(c, &sn, &sql).await?),
-            |py, s| (s.upstream.tid, PySchema { rust: s.schema }, PyBytes::new(py, &s.spec)).into_py_any(py),
+            |py, s| {
+                Ok((
+                    s.upstream.tid,
+                    PySchema { rust: s.schema },
+                    PyBytes::new(py, &s.spec).unbind(),
+                ))
+            },
         )
     }
 
@@ -398,7 +411,7 @@ impl PyClient {
         Self::run(
             slf,
             single!(|c| c.delta_read(view_id, cursor, &schema.rust, &spec)),
-            delta,
+            |py, (reply, cursor)| Ok((scan_result(py, reply)?, cursor.pair())),
         )
     }
 
@@ -418,7 +431,7 @@ impl PyClient {
         Self::run(
             slf,
             whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec).await?),
-            |py, (id, rows, cursor)| (id.get(), scan_result(py, rows)?, cursor.pair()).into_py_any(py),
+            |py, (id, rows, cursor)| Ok((id.get(), scan_result(py, rows)?, cursor.pair())),
         )
     }
 
@@ -446,10 +459,11 @@ impl PyClient {
     /// `KeyboardInterrupt`.
     #[pyo3(signature = (wait = 0.0))]
     fn sync(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
-        let wait = sync_wait(wait)?;
+        let wait = Duration::try_from_secs_f64(wait)
+            .map_err(|_| PyValueError::new_err(format!("wait must be a non-negative number of seconds, not {wait}")))?;
         match &slf.get().mode {
             Mode::Loop(handle) => handle.get().sync(slf.py(), wait),
-            Mode::Blocking(_) => Self::run(slf, whole!(|c| c.sync(wait).await?), synced),
+            Mode::Blocking(_) => Self::run(slf, whole!(|c| c.sync(wait).await?), PySynced::new),
         }
     }
 
@@ -481,7 +495,9 @@ impl PyClient {
     /// now.
     fn mirror_view(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
         let view = Self::relation(slf, &name)?;
-        Self::run(slf, whole!(|c| c.mirror_view(&view).await?), polled)
+        Self::run(slf, whole!(|c| c.mirror_view(&view).await?), |py, o| {
+            Ok(PyPollResult::new(py, o))
+        })
     }
 
     /// mirror_subscription(alias, sql) -> PollResult
@@ -501,7 +517,7 @@ impl PyClient {
         Self::run(
             slf,
             whole!(|c| gnitz_sql::mirror_subscription(c, &sn, &alias, &sql).await?),
-            polled,
+            |py, o| Ok(PyPollResult::new(py, o)),
         )
     }
 
@@ -530,7 +546,7 @@ impl PyClient {
     /// Every registration this client holds, valid copy or not — wider than the
     /// views `cursor` answers for by the ones a poll has yet to seed.
     fn mirrored_ids(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, |c| c.mirrored_ids(), value)
+        Self::peek(slf, |c| c.mirrored_ids())
     }
 
     /// cursor(view_id) -> (tag, tick) | None
@@ -539,14 +555,14 @@ impl PyClient {
     /// valid copy. A discarded copy is told by `PollResult.reseeded`, never by
     /// its cursor.
     fn cursor(slf: &Bound<'_, Self>, view_id: u64) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, move |c| c.cursor_of(view_id).map(DeltaCursor::pair), value)
+        Self::peek(slf, move |c| c.cursor_of(view_id).map(DeltaCursor::pair))
     }
 
     /// Whether this client's store is poisoned. Answers on a poisoned store —
     /// diagnosing one is what it is for.
     #[getter]
     fn mirror_poisoned(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, |c| c.mirror_poisoned(), value)
+        Self::peek(slf, |c| c.mirror_poisoned())
     }
 
     /// reconnect(target)
@@ -591,15 +607,12 @@ impl PyTxn {
     /// Ends the transaction and lets the block's exception through.
     fn __exit__(&self, py: Python<'_>, exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> PyResult<bool> {
         let clean = exc_type.is_none(py);
-        let ended = self
-            .client
-            .get()
-            .blocking(|client| Ok(blocking::call(client, py, async |c| end_txn(c, clean).await)));
-        match ended {
-            Ok(ended) => ended?,
-            // The block's own exception outranks a client it left unusable.
-            Err(_) if !clean => {}
-            Err(e) => return Err(e),
+        match self.client.get().blocking_slot()?.as_deref_mut() {
+            Some(client) => blocking::call(client, py, async |c| end_txn(c, clean).await)?,
+            // The block's own exception outranks a client it closed, whose
+            // transaction closed with it.
+            None if !clean => {}
+            None => return Err(client_err(ClientError::Closed)),
         }
         Ok(false)
     }
@@ -609,7 +622,7 @@ impl PyTxn {
         self.client
             .get()
             .on_loop()?
-            .submit(py, whole!(|c| c.txn_begin()?), move |_, ()| Ok(entered.into_any()))
+            .submit(py, whole!(|c| c.txn_begin()?), move |_, ()| Ok(entered))
     }
 
     /// As `__exit__`, awaited.
@@ -625,9 +638,9 @@ impl PyTxn {
         // The block's own exception outranks a client it closed, whose
         // transaction closed with it.
         if !clean && core.closing() {
-            return core.settled(py, false.into_py_any(py)?);
+            return core.settled(py, false);
         }
-        core.submit(py, whole!(|c| end_txn(c, clean).await?), |py, ()| value(py, false))
+        core.submit(py, whole!(|c| end_txn(c, clean).await?), |_, ()| Ok(false))
     }
 }
 
@@ -652,8 +665,3 @@ impl<T, F> VerbOp<T> for F where
     F: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static
 {
 }
-
-/// What turns a verb's answer into its Python value.
-pub(crate) trait Convert<T>: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static {}
-
-impl<T, F> Convert<T> for F where F: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static {}

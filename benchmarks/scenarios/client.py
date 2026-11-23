@@ -30,11 +30,12 @@ def _pk_and(tc, **kw):
     return Schema([ColumnDef("pk", TypeCode.I64), ColumnDef("x", tc, **kw)], [0])
 
 
-def _dicts(ncols, weight=None):
+def _dicts(ncols, weight=None, every=1):
+    """`N` rows of `ncols` columns; every `every`-th row carries `weight`."""
     names = [sys.intern(f"c{c}") for c in range(ncols)]
     rows = [dict.fromkeys(names, i) for i in range(N)]
     if weight is not None:
-        for r in rows:
+        for r in rows[::every]:
             r["_weight"] = weight
     return rows
 
@@ -136,8 +137,8 @@ class Codec(Scenario):
             b = ZSetBatch(schema)
             case(f"append_{name}", lambda: _append_typed(b, x))
         for ncols in (3, 10):
-            for label, weight in (("", None), ("_weighted", 2)):
-                rows, b = _dicts(ncols, weight), ZSetBatch(_i64(ncols))
+            for label, weight, every in (("", None, 1), ("_weighted", 2, 1), ("_mixed", -1, 2)):
+                rows, b = _dicts(ncols, weight, every), ZSetBatch(_i64(ncols))
                 case(f"extend_{ncols}{label}", lambda: b.extend(rows))
         for ncols in (1, 3, 16):
             result = ZSetBatch(_i64(ncols)).extend(_dicts(ncols)).rows()

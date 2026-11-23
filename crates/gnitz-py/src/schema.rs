@@ -80,25 +80,6 @@ impl PyColumnDef {
     }
 }
 
-impl PyColumnDef {
-    fn from_rust(py: Python<'_>, c: &ColumnDef) -> Self {
-        PyColumnDef {
-            name: PyString::intern(py, &c.name).unbind(),
-            ty: c.ty,
-            is_nullable: c.is_nullable,
-            is_hidden: c.is_hidden,
-        }
-    }
-
-    fn to_rust(&self, py: Python<'_>) -> PyResult<ColumnDef> {
-        let name = self.name.bind(py).to_cow()?;
-        Ok(ColumnDef {
-            is_hidden: self.is_hidden,
-            ..ColumnDef::new(&*name, self.ty, self.is_nullable)
-        })
-    }
-}
-
 /// A validated Rust `Schema`, and nothing else: `columns` is derived from it on
 /// access, so there is no second representation that could drift.
 ///
@@ -114,7 +95,17 @@ pub struct PySchema {
 impl PySchema {
     #[new]
     pub fn new(py: Python<'_>, columns: Vec<PyRef<'_, PyColumnDef>>, pk_indices: Vec<u32>) -> PyResult<Self> {
-        let cols = columns.iter().map(|c| c.to_rust(py)).collect::<PyResult<_>>()?;
+        let cols = columns
+            .iter()
+            .map(|c| {
+                Ok(ColumnDef {
+                    name: (&*c.name.bind(py).to_cow()?).into(),
+                    ty: c.ty,
+                    is_nullable: c.is_nullable,
+                    is_hidden: c.is_hidden,
+                })
+            })
+            .collect::<PyResult<_>>()?;
         let rust = Schema::from_parts(cols, &pk_indices).map_err(PyValueError::new_err)?;
         Ok(PySchema { rust: Arc::new(rust) })
     }
@@ -124,7 +115,12 @@ impl PySchema {
         self.rust
             .columns()
             .iter()
-            .map(|c| PyColumnDef::from_rust(py, c))
+            .map(|c| PyColumnDef {
+                name: PyString::intern(py, &c.name).unbind(),
+                ty: c.ty,
+                is_nullable: c.is_nullable,
+                is_hidden: c.is_hidden,
+            })
             .collect()
     }
 

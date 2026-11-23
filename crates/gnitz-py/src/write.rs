@@ -72,8 +72,10 @@ struct RowWriter {
     /// not the row weight: the schema is the authority on what a name means, and
     /// `extend`'s own `_weight` parameter still sets the weight for such a batch.
     weight_is_column: bool,
-    /// The plan the last row was written through — see [`KwPlan`].
-    plan: Option<KwPlan>,
+    /// The plans of the last two call shapes, the last row's first — see
+    /// [`KwPlan`]. Two, so rows alternating with and without [`WEIGHT_KW`]
+    /// resolve neither again.
+    plans: [Option<KwPlan>; 2],
 }
 
 impl PyZSetBatch {
@@ -110,24 +112,10 @@ fn write_column_value(cell: &mut [u8], blob: &mut Vec<u8>, ty: ColType, val: &Bo
     Ok(())
 }
 
-/// A PK column had no value supplied.
-#[cold]
-fn missing_pk_err(schema: &Schema, ci: usize) -> PyErr {
-    pyo3::exceptions::PyValueError::new_err(format!("missing PK column {:?}", schema.columns()[ci].name))
-}
-
 /// `None` reached a NOT NULL column — every PK column is one.
 #[cold]
 fn not_nullable_err(name: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!("Non-nullable column {name:?} cannot be None"))
-}
-
-/// The `TypeError` for a supplied name that matches no column.
-#[cold]
-fn unexpected_name_err(name: &str) -> PyErr {
-    pyo3::exceptions::PyTypeError::new_err(format!(
-        "ZSetBatch got an unexpected column name '{name}' (the row weight is spelled '{WEIGHT_KW}')"
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,35 +192,32 @@ fn plan_hits(py: Python<'_>, plan: &KwPlan, names: &[Bound<'_, PyAny>], tuple: O
         })
 }
 
-/// First position in `names` holding `col`.
-fn kw_position(names: &[&Bound<'_, PyString>], col: &str) -> Option<usize> {
-    names.iter().position(|n| n.to_str().is_ok_and(|s| s == col))
-}
-
 /// Resolve a name tuple into a write plan. Cold: once per call shape.
 fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, PyTuple>) -> PyResult<KwPlan> {
-    let mut names: Vec<&Bound<'_, PyString>> = Vec::with_capacity(kwnames.len());
-    for item in kwnames.as_slice() {
-        names.push(
-            item.cast::<PyString>()
-                .map_err(|_| pyo3::exceptions::PyTypeError::new_err("column names must be strings"))?,
-        );
-    }
+    let names = kwnames
+        .as_slice()
+        .iter()
+        .map(|item| match item.cast::<PyString>() {
+            Ok(s) => s.to_str(),
+            Err(_) => Err(pyo3::exceptions::PyTypeError::new_err("column names must be strings")),
+        })
+        .collect::<PyResult<Vec<&str>>>()?;
+    // First position holding `col`.
+    let position = |col: &str| names.iter().position(|&n| n == col);
 
     let mut consumed = vec![false; names.len()];
-    let weight = if weight_is_column {
-        None
-    } else {
-        kw_position(&names, WEIGHT_KW)
-    };
+    let weight = if weight_is_column { None } else { position(WEIGHT_KW) };
     if let Some(i) = weight {
         consumed[i] = true;
     }
     let mut pks = Vec::with_capacity(schema.pk_cols().len());
     for &ci in schema.pk_cols() {
         let ci = ci as usize;
-        let Some(i) = kw_position(&names, &schema.columns()[ci].name) else {
-            return Err(missing_pk_err(schema, ci));
+        let Some(i) = position(&schema.columns()[ci].name) else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "missing PK column {:?}",
+                schema.columns()[ci].name
+            )));
         };
         consumed[i] = true;
         pks.push(PkPlan { pos: i, ci, ty: schema.columns()[ci].ty });
@@ -241,7 +226,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
     for (_, ci, col) in schema.payload_columns() {
         let src = if col.is_hidden {
             PayloadSrc::Filler
-        } else if let Some(i) = kw_position(&names, &col.name) {
+        } else if let Some(i) = position(&col.name) {
             consumed[i] = true;
             PayloadSrc::Arg(i)
         } else {
@@ -255,7 +240,10 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
         });
     }
     if let Some(i) = consumed.iter().position(|c| !c) {
-        return Err(unexpected_name_err(names[i].to_str()?));
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "ZSetBatch got an unexpected column name '{}' (the row weight is spelled '{WEIGHT_KW}')",
+            names[i]
+        )));
     }
 
     Ok(KwPlan {
@@ -285,17 +273,19 @@ impl RowWriter {
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let RowWriter { schema, weight_is_column, plan } = self;
-        let plan = match plan {
-            Some(p) if plan_hits(py, p, names, tuple) => p,
-            slot => {
+        let RowWriter { schema, weight_is_column, plans } = self;
+        let hits = |p: &Option<KwPlan>| p.as_ref().is_some_and(|p| plan_hits(py, p, names, tuple));
+        if !hits(&plans[0]) {
+            if !hits(&plans[1]) {
                 let t = match tuple {
                     Some(t) => t.clone(),
                     None => PyTuple::new(py, names)?,
                 };
-                slot.insert(build_kw_plan(schema, *weight_is_column, &t)?)
+                plans[1] = Some(build_kw_plan(schema, *weight_is_column, &t)?);
             }
-        };
+            plans.swap(0, 1);
+        }
+        let plan = plans[0].as_ref().expect("resolved above");
         let weight = match plan.weight {
             Some(pos) => arg(pos)
                 .extract::<i64>()
@@ -336,51 +326,6 @@ impl RowWriter {
         }
         Ok(())
     }
-
-    /// Split one row dict into the column `names` and `args` the row is written
-    /// from, and the weight it is written at. [`WEIGHT_KW`] is taken out here
-    /// rather than probed for: the walk visits every key anyway, and keeping it
-    /// out of `names` lets a batch mixing inserts with retractions run on one
-    /// plan. A *column* of that name takes it back — the schema is the authority.
-    fn capture_row<'py>(
-        &self,
-        dict: &Bound<'py, PyDict>,
-        names: &mut Vec<Bound<'py, PyAny>>,
-        args: &mut Vec<Bound<'py, PyAny>>,
-        default_weight: i64,
-    ) -> PyResult<i64> {
-        names.clear();
-        args.clear();
-        let mut supplied = None;
-        // A key the cached plan names at this position needs no text compare.
-        let planned = self
-            .plan
-            .as_ref()
-            .map_or(&[][..], |p| p.kwnames.bind(dict.py()).as_slice());
-        for (key, val) in dict.iter() {
-            let known = planned.get(names.len()).is_some_and(|n| n.is(&key));
-            if !known && !self.weight_is_column && is_weight_key(&key) {
-                supplied = Some(val);
-                continue;
-            }
-            names.push(key);
-            args.push(val);
-        }
-        // After the walk, not inside it: an `extract` runs Python, and a dict
-        // mutated mid-iteration raises.
-        match supplied {
-            None => Ok(default_weight),
-            Some(w) => w
-                .extract::<i64>()
-                .map_err(|e| argument_extraction_error(dict.py(), WEIGHT_KW, e)),
-        }
-    }
-}
-
-/// Does this dict key spell [`WEIGHT_KW`]?
-fn is_weight_key(key: &Bound<'_, PyAny>) -> bool {
-    key.cast::<PyString>()
-        .is_ok_and(|s| s.to_str().is_ok_and(|t| t == WEIGHT_KW))
 }
 
 /// `ZSetBatch.append(**columns)` — the raw `METH_FASTCALL | METH_KEYWORDS` slot.
@@ -474,7 +419,11 @@ impl PyZSetBatch {
         let weight_is_column = schema.visible_columns().any(|(_, c)| &*c.name == WEIGHT_KW);
         PyZSetBatch {
             batch: Arc::new(ZSetBatch::new(&schema)),
-            writer: RowWriter { schema, weight_is_column, plan: None },
+            writer: RowWriter {
+                schema,
+                weight_is_column,
+                plans: [None, None],
+            },
         }
     }
 
@@ -482,9 +431,10 @@ impl PyZSetBatch {
     /// Python→Rust crossing); returns the batch so calls chain. A per-row
     /// `_weight` key overrides the batch-wide `_weight`.
     ///
-    /// Rows sharing a key sequence share one resolved write plan, so spell an
-    /// absent nullable column as an explicit `None` rather than omitting its
-    /// key: a varying key set is one plan resolution per change.
+    /// Rows sharing a key sequence share one resolved write plan, and the last
+    /// two sequences are kept, so spell an absent nullable column as an
+    /// explicit `None` rather than omitting its key: a key set varying past
+    /// two is one plan resolution per change.
     #[pyo3(signature = (rows, _weight = 1))]
     pub fn extend<'py>(slf: Bound<'py, Self>, rows: Bound<'_, PyAny>, _weight: i64) -> PyResult<Bound<'py, Self>> {
         let py = slf.py();
@@ -504,8 +454,13 @@ impl PyZSetBatch {
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;
                 let dict: &Bound<'_, PyDict> = row_item.cast()?;
-                let weight = w.capture_row(dict, &mut names, &mut args, _weight)?;
-                w.write_row(py, batch, &names, None, |pos| args[pos].as_borrowed(), weight)?;
+                names.clear();
+                args.clear();
+                for (key, val) in dict.iter() {
+                    names.push(key);
+                    args.push(val);
+                }
+                w.write_row(py, batch, &names, None, |pos| args[pos].as_borrowed(), _weight)?;
             }
             Ok(())
         })?;
