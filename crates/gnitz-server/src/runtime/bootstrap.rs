@@ -202,7 +202,7 @@ fn run_worker_child(
     master_pid: i32,
     catalog: &mut CatalogEngine,
     tail: &CommittedTail,
-    (mut w2m_writer, mut mesh): (W2mWriter, Mesh),
+    (mut w2m_writer, mesh): (W2mWriter, Mesh),
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
     let w = slot.rank as usize;
@@ -232,15 +232,10 @@ fn run_worker_child(
     }
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
-    // Pinned, this worker has a core of its own to spin on.
-    if pinning.is_some() {
-        mesh.spin_before_park();
-    }
-
     let sal_reader = tail.reader(slot.rank);
     // The boot ACK: the recovery above has flushed what it replayed.
     w2m_writer.applied(sal_reader.position());
-    WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
+    WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh, pinning.is_some()).run()
 }
 
 /// The master's half of recovery before any worker exists: the catalog opened

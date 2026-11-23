@@ -25,7 +25,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::query::Lane;
-use crate::runtime::park::{Park, WorkerParks, WorkerSet};
+use crate::runtime::park::{WorkerParks, WorkerSet};
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
 use gnitz_zset::algebra::ScatterPlan;
@@ -51,11 +51,6 @@ const _: () = assert!(
     size_of::<Head>() + size_of::<LaneHead>() + MAX_WORKERS * size_of::<Span>() <= BLOCKS_AT,
     "an outbox's first page holds its head and a lane's"
 );
-
-/// How many `spin_loop` polls a worker on a core of its own spends waiting for a
-/// part before it parks. A peer's arrival in a small tick usually lands within tens of
-/// microseconds, sooner than a futex sleep and wake turn around.
-const SPINS_BEFORE_PARK: u32 = 1000;
 
 /// Resident bytes an outbox keeps past its latest part; a part that ends
 /// further below the outbox's high-water mark returns the pages beyond it.
@@ -97,7 +92,6 @@ pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result
             parks,
             routed: Vec::new(),
             resident: [0; 2],
-            spins: 0,
         })
         .collect())
 }
@@ -152,9 +146,6 @@ pub(crate) struct Mesh {
     routed: Vec<Vec<u32>>,
     /// How far into each of this worker's outboxes pages may be resident.
     resident: [usize; 2],
-    /// How many polls [`Self::spin_for_part`] spends; zero until
-    /// [`Self::spin_before_park`].
-    spins: u32,
 }
 
 /// One exchange round, from [`Mesh::open`] to the [`Mesh::step`] that closes it:
@@ -200,12 +191,6 @@ struct Cursor {
 impl Mesh {
     fn nw(&self) -> usize {
         self.parks.len()
-    }
-
-    /// This worker's park: where it sleeps for an exchange part, and for a SAL
-    /// group too, since its peers' arrivals and the master's wakes land on it.
-    pub(crate) fn park(&self) -> &'static Park {
-        self.parks.park(self.rank)
     }
 
     fn arrivals(&self) -> &AtomicU64 {
@@ -404,21 +389,9 @@ impl Mesh {
         self.resident[p] = self.resident[p].max(end);
     }
 
-    /// Poll for the current part before parking for it. Only for a worker on a
-    /// core of its own: on a shared one the spin holds off the peer it waits for.
-    pub(crate) fn spin_before_park(&mut self) {
-        self.spins = SPINS_BEFORE_PARK;
-    }
-
-    /// Poll until the current part completes or `woken` holds, for at most the
-    /// spin budget.
-    pub(crate) fn spin_for_part(&self, mut woken: impl FnMut() -> bool) {
-        for _ in 0..self.spins {
-            if self.complete() || woken() {
-                return;
-            }
-            std::hint::spin_loop();
-        }
+    /// A [`Round`] is open: this worker is inside an exchange wait.
+    pub(crate) fn in_round(&self) -> bool {
+        self.in_round
     }
 
     /// Every worker has published the current part.

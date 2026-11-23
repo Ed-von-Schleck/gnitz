@@ -40,7 +40,7 @@ pub(super) fn worker_over(
         .unwrap()
         .pop()
         .unwrap();
-    let wp = WorkerProcess::new(catalog, sal.reader(0), writers.pop().unwrap(), mesh);
+    let wp = WorkerProcess::new(catalog, sal.reader(0), writers.pop().unwrap(), mesh, false);
     (wp, sal, receiver)
 }
 
@@ -86,9 +86,15 @@ pub(super) fn probe(tid: u64, keys: &[u8]) -> Read<'_> {
 }
 
 /// Serve every group on the SAL as an exchange wait whose round is still out
-/// does.
+/// does: a turn inside a round of a two-worker mesh whose peer never arrives.
 fn drain_in_wait(wp: &mut WorkerProcess) {
-    wp.drain_sal(true);
+    let parks = crate::runtime::park::WorkerParks::create(2).unwrap();
+    let mesh = crate::runtime::mesh::create(1 << 16, parks).unwrap().swap_remove(0);
+    let own = std::mem::replace(&mut wp.mesh, mesh);
+    let (empty, plan) = (make_batch(&make_schema_u64_i64(), &[]), ScatterPlan::broadcast());
+    let _round = wp.mesh.open_one(9, Cow::Borrowed(&empty), &plan, false, false);
+    wp.turn();
+    wp.mesh = own;
 }
 
 // -- dispatch ---------------------------------------------------------------
@@ -182,7 +188,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
         tids: vec![500, 501].into(),
     };
     let at = sal.excl().apply(tick).expect("group fits");
-    wp.drain_sal(false);
+    wp.turn();
 
     for tid in [500, 501] {
         assert!(wp.catalog.registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
@@ -238,7 +244,7 @@ fn a_parked_view_read_answers_ahead_of_the_read_behind_it_on_its_lease() {
     assert!(frames(&rx).is_empty(), "nothing of the lease passes its parked read");
 
     wp.replies
-        .answer_parked(|read| answer(wp.catalog, &mut wp.snapshots, read));
+        .applied(0, |read| answer(wp.catalog, &mut wp.snapshots, read));
     assert_eq!(owed(&wp.replies), [("train", 1)]);
     drain(&mut wp.replies);
     let out = frames(&rx);
@@ -351,7 +357,7 @@ fn a_train_advances_with_every_request() {
         // Control-only and unanswered: nothing of its own reaches the ring.
         sal.excl().push(tid, &[], Routed::Same(None)).expect("group fits");
     }
-    wp.drain_sal(false);
+    wp.turn();
     assert_eq!(reqs(&frames(&rx)), [11; GROUPS + 1]);
     assert_eq!(owed(&wp.replies), [("train", 11)], "ten frames, six sent");
 }
@@ -427,7 +433,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
 
     let spans = Read::KeySpans { tid, cols, claim: true };
     ask(&mut sal.excl(), spans, 1).expect("group fits");
-    wp.drain_sal(false);
+    wp.turn();
     drain(&mut wp.replies);
     assert!(indexed(&wp));
     let span_schema = pk_only_schema(&[TypeCode::I64]);
@@ -439,7 +445,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
     );
 
     ask(&mut sal.excl(), Read::ReleasePreflight, 2).expect("group fits");
-    wp.drain_sal(false);
+    wp.turn();
     assert!(!indexed(&wp));
     assert_eq!(reqs(&frames(&rx)), [2]);
 }
@@ -480,7 +486,7 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     sal.excl()
         .push(t2, &record, Routed::Same(row.wire_whole()))
         .expect("group fits");
-    wp.drain_sal(false);
+    wp.turn();
     drain(&mut wp.replies);
 
     let out = frames(&rx);

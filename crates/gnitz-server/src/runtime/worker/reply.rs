@@ -37,6 +37,16 @@ impl Owed {
             Owed::Parked(route, _) | Owed::Train(Train { route, .. }) => route.request_id,
         }
     }
+
+    /// `answer` owed as the reply to `route`, none of it sent.
+    fn train(route: ReplyRoute, answer: Result<Rows, WireFault>) -> Self {
+        Owed::Train(Train {
+            route,
+            answer,
+            next_row: 0,
+            refused_at: None,
+        })
+    }
 }
 
 /// A reply, and how far into it its frames have come.
@@ -80,16 +90,6 @@ impl From<Batch> for Rows {
 }
 
 impl Train {
-    /// `answer` as the reply to `route`, none of it sent.
-    fn new(route: ReplyRoute, answer: Result<Rows, WireFault>) -> Self {
-        Train {
-            route,
-            answer,
-            next_row: 0,
-            refused_at: None,
-        }
-    }
-
     /// Send the next frame, if the ring has room for it now: `Ok(last)`, `last`
     /// once it was the last; `Err` refused, with the release cursor the ring
     /// weighed. A row too wide for any frame, or for the ring, turns the train
@@ -150,20 +150,7 @@ impl Replies {
         Replies { w2m, owed: VecDeque::new() }
     }
 
-    /// Nothing is owed.
-    #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        self.owed.is_empty()
-    }
-
-    /// Publish that this worker has applied the log through `at`: in the
-    /// ring's header, which no owed reply holds up.
-    #[inline]
-    pub(super) fn applied(&mut self, at: u64) {
-        self.w2m.applied(at);
-    }
-
-    /// Owe `route` the answer of `read`, once [`Self::answer_parked`] asks for it.
+    /// Owe `route` the answer of `read`, once [`Self::applied`] asks for it.
     pub(super) fn park(&mut self, route: ReplyRoute, read: &Read<'_>) {
         self.owed.push_back(Owed::Parked(route, read.keep()));
     }
@@ -184,12 +171,15 @@ impl Replies {
             }
             self.refused(id);
         }
-        self.owed.push_back(Owed::Train(Train::new(route, answer)));
+        self.owed.push_back(Owed::train(route, answer));
     }
 
-    /// Answer every parked read where it stands in the queue, by `answer`: the
-    /// queue is owed again in its order, each parked read as its reply.
-    pub(super) fn answer_parked(&mut self, mut answer: impl FnMut(&Read<'_>) -> Result<Rows, WireFault>) {
+    /// This worker has applied the log through `at`: publish it in the ring's
+    /// header, which no owed reply holds up, then answer every parked read by
+    /// `answer`, off the state the drive left, where it stands in the queue —
+    /// the queue is owed again in its order, each parked read as its reply.
+    pub(super) fn applied(&mut self, at: u64, mut answer: impl FnMut(&Read<'_>) -> Result<Rows, WireFault>) {
+        self.w2m.applied(at);
         if !self.owed.iter().any(|owed| matches!(owed, Owed::Parked(..))) {
             return;
         }
@@ -233,30 +223,21 @@ impl Replies {
         }
     }
 
-    /// Wait on this worker's park while `idle` and no owed reply can leave
-    /// before the master releases room or ends a hold: either wakes the park
-    /// too. Returns at once when a reply can leave now.
-    pub(super) fn wait_for_master(&self, idle: impl FnOnce() -> bool) {
-        if self.waits_on_master() {
-            self.w2m.park_for_master(|| idle() && self.waits_on_master());
-        }
-    }
-
-    /// An owed reply can leave now, without the master releasing room or
-    /// ending a hold.
-    #[inline]
-    pub(super) fn can_leave(&self) -> bool {
-        !self.owed.is_empty() && !self.waits_on_master()
+    /// Wait on this worker's park — the one its SAL groups and exchange parts
+    /// wake — while `idle` and no owed reply can leave. While replies are owed,
+    /// the master's release of room or end of a hold wakes it too.
+    pub(super) fn wait(&self, idle: impl FnOnce() -> bool) {
+        self.w2m
+            .park(!self.owed.is_empty(), || idle() && self.waits_on_master());
     }
 
     /// No owed reply can leave before the master releases room or ends a hold:
-    /// none is sendable, or the ring refused the first sendable one's next frame
-    /// at the release cursor as it stands.
-    fn waits_on_master(&self) -> bool {
-        let release = self.w2m.release_cursor();
+    /// none is sendable, as when nothing is owed, or the ring refused the first
+    /// sendable one's next frame at the release cursor as it stands.
+    pub(super) fn waits_on_master(&self) -> bool {
         self.sendable()
             .next()
-            .is_none_or(|i| matches!(&self.owed[i], Owed::Train(t) if t.refused_at == Some(release)))
+            .is_none_or(|i| matches!(&self.owed[i], Owed::Train(t) if t.refused_at == Some(self.w2m.release_cursor())))
     }
 
     /// The entries a frame may go for now, in queue order: the first of each

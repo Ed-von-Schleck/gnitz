@@ -21,7 +21,7 @@ const CHUNK_ROWS: usize = 1024;
 /// One arm: a table `prepare` dresses and `held` rows are then ingested into,
 /// `requests` groups on the SAL, each written by `request` from the table's id, its schema
 /// record and the group's request id, answering the position an apply's ACK
-/// reaches and 0 for any other group, and `drain_sal` until nothing is owed.
+/// reaches and 0 for any other group, and `turn` until nothing is owed.
 /// The worker must answer in `frames_owed` frames, no frame a fault, ACK the
 /// last apply written, and leave the table at net weight `holds`.
 fn arm(
@@ -47,7 +47,7 @@ fn arm(
     }
     let ((), instructions) = Counter::instructions().measure(|| {
         loop {
-            wp.drain_sal(false);
+            wp.turn();
             if wp.replies.is_empty() {
                 break;
             }

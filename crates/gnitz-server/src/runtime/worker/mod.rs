@@ -6,30 +6,34 @@
 //! the mesh.
 //!
 //! This file reads the SAL and runs what it asks: a read is answered off the
-//! catalog, rows are ingested, a round is run and ACKed. `reply` owns the ring
-//! and what the worker owes on it; `exchange` is the wait a drive's round spends
-//! on its peers, while it serves the SAL and sends owed replies.
+//! catalog, rows are ingested, a round is run and ACKed, and a drive's exchange
+//! round is waited out while the SAL is served and owed replies sent. `reply`
+//! owns the ring and what the worker owes on it.
 
-mod exchange;
 mod reply;
 
 use crate::catalog::CatalogEngine;
+use crate::query::{DagEngine, DriveHost, Lane};
 use crate::runtime::mesh::Mesh;
 use crate::runtime::sal::{Apply, Inbound, Ingest, Read, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use gnitz_foundation::fault::Switch;
 use gnitz_foundation::gnitz_debug;
-use gnitz_store::relation::{IndexClaim, Snapshot};
+use gnitz_store::relation::{IndexClaim, RelationRegistry, Snapshot};
 use gnitz_wire::{PkKeys, WireFault};
 use gnitz_zset::repr::Batch;
 use reply::{Replies, Rows};
 use rustc_hash::FxHashMap;
 
+/// How many `spin_loop` polls a worker on a core of its own spends waiting for an
+/// exchange part before it parks. A peer's arrival in a small tick usually lands
+/// within tens of microseconds, sooner than a futex sleep and wake turn around.
+const SPINS_BEFORE_PARK: u32 = 1000;
+
 pub(super) struct WorkerProcess<'c> {
     catalog: &'c mut CatalogEngine,
     sal_reader: SalReader,
-    /// Where this worker trades its exchange rounds with its peers, and parks
-    /// for a SAL group or an exchange part.
+    /// Where this worker trades its exchange rounds with its peers.
     mesh: Mesh,
     replies: Replies,
     /// The snapshots this worker holds pinned, by id.
@@ -38,17 +42,23 @@ pub(super) struct WorkerProcess<'c> {
     /// seals its source as it starts, and a seal takes every row pending: a push
     /// written behind the group must not be applied ahead of one.
     seals_ahead: bool,
+    /// How many polls an exchange wait spends on its part before it parks: zero
+    /// unless this worker has a core of its own, where a spin holds off no peer.
+    spins: u32,
 }
 
 /// `GNITZ_INJECT_KEY_SPANS_ERROR`: fail every `KeySpans` request, after its claim.
 static KEY_SPANS_ERROR: Switch = Switch::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
+    /// `pinned`: this worker runs on a core of its own, so an exchange wait
+    /// spins before it parks.
     pub(super) fn new(
         catalog: &'c mut CatalogEngine,
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
         mesh: Mesh,
+        pinned: bool,
     ) -> Self {
         WorkerProcess {
             catalog,
@@ -57,6 +67,7 @@ impl<'c> WorkerProcess<'c> {
             replies: Replies::new(w2m_writer),
             snapshots: FxHashMap::default(),
             seals_ahead: false,
+            spins: if pinned { SPINS_BEFORE_PARK } else { 0 },
         }
     }
 
@@ -64,25 +75,16 @@ impl<'c> WorkerProcess<'c> {
     /// the loop.
     pub(super) fn run(&mut self) -> ! {
         loop {
-            self.wait(|| !self.sal_reader.is_empty());
-            self.drain_sal(false);
+            self.turn();
         }
     }
 
-    /// Park this worker until `woken`, unless an owed reply can leave now.
-    /// While every owed reply waits on the master, for room the ring refused or
-    /// the end of a hold, the master's release or end of a hold wakes the park
-    /// too.
-    fn wait(&self, woken: impl Fn() -> bool) {
-        if self.replies.is_empty() {
-            self.mesh.park().park(|| !woken());
-        } else {
-            self.replies.wait_for_master(|| !woken());
-        }
-    }
-
-    /// Serve the SAL's pending groups and send owed reply frames, neither
-    /// waiting for the other to run dry. `in_drive`: inside an exchange wait.
+    /// Wait for work, then do it: serve the SAL's pending groups and send owed
+    /// reply frames, neither waiting for the other to run dry. Inside an
+    /// exchange wait, the open round's completion is work too.
+    ///
+    /// The wait parks this worker until there is work, unless an owed reply
+    /// can leave now; an exchange wait polls first, for the spin budget.
     ///
     /// - At the top level: one frame ahead of the first group, and one after
     ///   each group served.
@@ -95,25 +97,38 @@ impl<'c> WorkerProcess<'c> {
     ///   reads on the SAL moving through a long drive, whose rounds may each be
     ///   complete when its wait begins (with one worker, always). The next
     ///   wait, or the top level, serves what the SAL still holds, in order.
-    fn drain_sal(&mut self, in_drive: bool) {
+    fn turn(&mut self) {
         let serves = !self.seals_ahead;
-        let open = |wp: &Self| !in_drive || !wp.mesh.complete();
-        if open(self) {
+        let spins = if self.mesh.in_round() { self.spins } else { 0 };
+        let part_ready = |wp: &Self| wp.mesh.in_round() && wp.mesh.complete();
+        let woken = || serves && !self.sal_reader.is_empty() || part_ready(self);
+        if self.replies.waits_on_master()
+            && !woken()
+            && !(0..spins).any(|_| {
+                std::hint::spin_loop();
+                woken()
+            })
+        {
+            self.replies.wait(|| !woken());
+        }
+        if !part_ready(self) {
             self.replies.emit_frame();
         }
-        while serves && self.serve_next(in_drive) && open(self) {
+        while serves && self.serve_next() && !part_ready(self) {
             self.replies.emit_frame();
         }
     }
 
     /// Read the next SAL group this worker acts on and run it: the one place
     /// the drain decodes a group, and the one place a request's outcome
-    /// is chosen — a read's failure is a fault frame to its asker, a state
-    /// change's a fail-stop. `in_drive`: the group arrives inside an exchange
-    /// wait of a `Tick` or `Backfill`.
+    /// is chosen — a read's failure is a fault frame to its asker; a state
+    /// change every worker makes that fails has diverged this worker from the
+    /// log, and fail-stops it for a restart. With a round open, the group
+    /// arrives inside an exchange wait of a `Tick` or `Backfill`.
     ///
     /// `false` when the SAL holds no group for this worker.
-    fn serve_next(&mut self, in_drive: bool) -> bool {
+    fn serve_next(&mut self) -> bool {
+        let in_drive = self.mesh.in_round();
         let cat = &mut *self.catalog;
         let Some(inbound) = self
             .sal_reader
@@ -139,7 +154,6 @@ impl<'c> WorkerProcess<'c> {
                     let answer = answer(cat, &mut self.snapshots, &read);
                     self.replies.reply(route, answer);
                 }
-                true
             }
             // The views and the DAG are a drive's own while it runs: of the
             // requests that touch them the master pipelines only reads, which
@@ -151,66 +165,68 @@ impl<'c> WorkerProcess<'c> {
                     gnitz_fatal_abort!("{ingest:?} inside an exchange wait — diverged from the master");
                 }
                 // A group without a data block carries an empty delta.
-                if let Some(rows) = rows
-                    && let Err(e) = self.ingest(ingest, rows)
-                {
+                let Some(rows) = rows else { return true };
+                let n = rows.len();
+                let taken = match ingest {
+                    Ingest::DdlSync { family } => cat.ddl_sync(family, *rows),
+                    Ingest::Push { tid, rule } => cat.ingest_unticked(tid, *rows, rule),
+                };
+                if let Err(e) = taken {
                     gnitz_fatal_abort!("worker: {ingest:?} failed: {e} — aborting for restart");
                 }
-                true
+                gnitz_debug!("{ingest:?} rows={n}");
             }
             Inbound::Apply { apply } => {
                 if in_drive {
                     gnitz_fatal_abort!("{apply:?} inside an exchange wait — diverged from the master");
                 }
-                if let Err(e) = self.apply(&apply) {
+                let ran = match apply {
+                    Apply::Flush => self.catalog.registry.checkpoint_base(),
+                    Apply::FlushEph { generation } => self.catalog.flush_ephemeral_round(generation),
+                    Apply::Tick { first_round, ref tids } => (0..tids.len()).try_for_each(|i| {
+                        self.seals_ahead = i + 1 < tids.len();
+                        crate::query::tick(self, tids[i], first_round + i as u64)
+                    }),
+                    Apply::Backfill { ref views } => crate::query::backfill(self, views),
+                };
+                if let Err(e) = ran {
                     gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
                 }
-                // The ACK: every apply at or below the drain's position has run.
-                self.replies.applied(self.sal_reader.position());
-                // Before the next group: a parked read answers from the state its
-                // drive left.
-                self.replies
-                    .answer_parked(|read| answer(self.catalog, &mut self.snapshots, read));
-                true
+                self.replies.applied(self.sal_reader.position(), |read| {
+                    answer(self.catalog, &mut self.snapshots, read)
+                });
             }
         }
+        true
+    }
+}
+
+impl DriveHost for WorkerProcess<'_> {
+    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
+        let cat = &mut *self.catalog;
+        (&mut cat.dag, &mut cat.registry)
     }
 
-    /// Take a group's rows. The SAL holds them and every worker they reach
-    /// takes them: a worker that cannot has diverged from the log, and only a
-    /// restart brings it back.
-    fn ingest(&mut self, ingest: Ingest, rows: Box<Batch>) -> Result<(), String> {
-        match ingest {
-            Ingest::DdlSync { family } => {
-                self.catalog.ddl_sync(family, *rows)?;
-                gnitz_debug!("ddl_sync tid={}", family.id());
-            }
-            Ingest::Push { tid, rule } => {
-                let row_count = rows.len();
-                self.catalog.ingest_unticked(tid, *rows, rule)?;
-                gnitz_debug!("push tid={} rows={}", tid, row_count);
-            }
-        }
-        Ok(())
-    }
-
-    /// Run a round every worker runs: one that cannot has diverged from the
-    /// log, and only a restart brings it back.
-    fn apply(&mut self, apply: &Apply<'_>) -> Result<(), String> {
-        match *apply {
-            Apply::Flush => self.catalog.registry.checkpoint_base(),
-            Apply::FlushEph { generation } => self.catalog.flush_ephemeral_round(generation),
-            Apply::Tick { first_round, ref tids } => {
-                for (i, &source) in tids.iter().enumerate() {
-                    self.seals_ahead = i + 1 < tids.len();
-                    crate::query::tick(self, source, first_round + i as u64)?;
+    /// Publish `lanes` as this worker's rounds — one, or as few as hold them —
+    /// and wait out every part of each, serving the SAL and sending owed reply
+    /// frames meanwhile.
+    fn exchange<'b>(
+        &mut self,
+        mut lanes: impl ExactSizeIterator<Item = Lane<'b>>,
+        drained: bool,
+        gathered: &mut Vec<Batch>,
+    ) -> bool {
+        let (max, mut all) = (self.mesh.max_lanes(), true);
+        while lanes.len() > 0 {
+            let mut round = self.mesh.open(lanes.by_ref().take(max), drained);
+            all &= loop {
+                self.turn();
+                if let Some(drained) = self.mesh.step(&mut round, gathered) {
+                    break drained;
                 }
-                Ok(())
-            }
-            Apply::Backfill { ref views } => {
-                crate::query::backfill(self, views).map_err(|e| format!("backfill of views {views:?}: {e}"))
-            }
+            };
         }
+        all
     }
 }
 

@@ -21,6 +21,11 @@ fn queue_over(ring_bytes: usize) -> (Replies, W2mReceiver) {
 }
 
 impl Replies {
+    /// Nothing is owed.
+    pub(in crate::runtime::worker) fn is_empty(&self) -> bool {
+        self.owed.is_empty()
+    }
+
     /// Cut this queue's trains into frames of `budget` bytes.
     pub(in crate::runtime::worker) fn set_frame_budget(&mut self, budget: usize) {
         self.w2m.set_frame_budget(budget);
@@ -28,7 +33,7 @@ impl Replies {
 
     /// Owe `answer` at the back of the queue, sending none of it.
     fn reply_owed(&mut self, route: ReplyRoute, answer: Result<Rows, WireFault>) {
-        self.owed.push_back(Owed::Train(Train::new(route, answer)));
+        self.owed.push_back(Owed::train(route, answer));
     }
 }
 

@@ -407,7 +407,7 @@ pub struct W2mWriter {
     wc: RingCursor,
     /// The master's park, which a publish takes.
     master: &'static Park,
-    /// This worker's park, which [`Self::park_for_master`] sleeps on.
+    /// This worker's park, which [`Self::park`] sleeps on.
     park: &'static Park,
     /// The leases this worker sends nothing more for.
     holds: &'static HoldTable,
@@ -576,12 +576,14 @@ impl W2mWriter {
     }
 
     /// Wait on this worker's park, the one its SAL groups and exchange parts
-    /// wake, while `still_waiting`: for the master's next release or end of a
-    /// hold. The release arm goes ahead of the park's own arm and re-test: a
-    /// release or end of a hold behind it wakes the park, and one ahead of it
-    /// is what the re-test sees.
-    pub fn park_for_master(&self, still_waiting: impl FnOnce() -> bool) {
-        self.wc.header().release.arm();
+    /// wake, while `still_waiting`. `for_master`: the master's next release or
+    /// end of a hold wakes it too. The release arm goes ahead of the park's own
+    /// arm and re-test: a release or end of a hold behind it wakes the park, and
+    /// one ahead of it is what the re-test sees.
+    pub fn park(&self, for_master: bool, still_waiting: impl FnOnce() -> bool) {
+        if for_master {
+            self.wc.header().release.arm();
+        }
         self.park.park(still_waiting);
     }
 }
