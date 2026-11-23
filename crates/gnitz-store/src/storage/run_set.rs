@@ -37,12 +37,11 @@ const RUN_FILTER_MIN_ROWS: usize = 64;
 /// misses' share of a filter's savings repays.
 const RUN_FILTER_ROWS_PER_MISS: usize = 8;
 
-fn pk_min(run: &Batch) -> &[u8] {
-    run.get_pk_bytes(0)
-}
-
-fn pk_max(run: &Batch) -> &[u8] {
-    run.get_pk_bytes(run.len() - 1)
+/// Whether `run`, a non-empty sorted run, can hold a key of the inclusive
+/// `[lo, hi]`.
+#[inline(always)]
+fn meets(run: &Batch, lo: &[u8], hi: &[u8]) -> bool {
+    pk_ranges_overlap(run.get_pk_bytes(0), run.get_pk_bytes(run.len() - 1), lo, hi)
 }
 
 pub(super) struct RunSet {
@@ -124,7 +123,7 @@ impl RunSet {
             .iter()
             .rev()
             .map(|run| &run.batch)
-            .filter(move |run| bound.is_none_or(|(lo, hi)| pk_ranges_overlap(pk_min(run), pk_max(run), lo, hi)))
+            .filter(move |run| bound.is_none_or(|(lo, hi)| meets(run, lo, hi)))
     }
 
     fn batches(&self) -> impl Iterator<Item = &Rc<Batch>> {
@@ -319,9 +318,7 @@ impl HeldRun {
     #[inline(always)]
     fn probe(&self, key: &[u8], fingerprint: u64) -> Option<Range<usize>> {
         let run = &*self.batch;
-        if !pk_ranges_overlap(pk_min(run), pk_max(run), key, key)
-            || self.filter.get().is_some_and(|f| !f.may_contain(fingerprint))
-        {
+        if !meets(run, key, key) || self.filter.get().is_some_and(|f| !f.may_contain(fingerprint)) {
             return None;
         }
         let rows = run.pk_rows(key);

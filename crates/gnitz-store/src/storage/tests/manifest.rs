@@ -128,8 +128,7 @@ fn published(dir: &str, count: usize) -> Manifest {
     for e in &m.shards.entries {
         fs::write(shard_path(dir, e.seq), e.seq.to_le_bytes()).unwrap();
     }
-    stage(dir, &m).unwrap();
-    commit(dir).unwrap();
+    fs::write(manifest_path(dir), encode(&m)).unwrap();
     m
 }
 

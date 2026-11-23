@@ -1,9 +1,9 @@
-use super::super::*;
 use super::tests::fresh;
 use super::tests::spread;
 use super::tests::stride_schema;
 use super::tests::trailing_gk;
 use super::tests::trailing_key_batch;
+use super::*;
 use crate::storage::Cut;
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_foundation::rng::Rng;

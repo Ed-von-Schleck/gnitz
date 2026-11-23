@@ -33,7 +33,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::Cut;
-use super::manifest::RecoverySource;
+use super::manifest::{FlushWork, RecoverySource, StoreDir};
 use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
 use gnitz_trace::runs::StorageError;
@@ -64,6 +64,8 @@ pub(crate) const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
 struct LiveFloor {
     /// `None` where unknown, or where it skips too few rows to repay a seek.
     at: Option<PkBuf>,
+    /// Cleared by every ingest and fold: a fold leaves the floor valid, but can
+    /// cancel the rows it skips.
     judged: bool,
 }
 
@@ -92,9 +94,18 @@ pub(crate) struct Table {
     live_floor: Cell<LiveFloor>,
 }
 
-mod flush;
-
-pub(crate) use flush::flush_barrier;
+/// Durably publish every table in `tables`, each manifest carrying
+/// `checkpoint_mark`.
+pub(crate) fn flush_barrier<'a>(
+    tables: impl IntoIterator<Item = &'a mut Table>,
+    checkpoint_mark: u64,
+) -> Result<(), StorageError> {
+    let mut work = Vec::new();
+    for t in tables {
+        work.extend(t.flush_prepare(checkpoint_mark)?);
+    }
+    StoreDir::publish(work)
+}
 
 impl Table {
     /// Open a table at `dir`. `recovery_source` decides what this does with
@@ -242,7 +253,7 @@ impl Table {
             }
         };
         // The cut now reads every ingest.
-        self.rejudge_live_floor();
+        self.live_floor.get_mut().judged = false;
         self.upkeep(delta.as_ref().map_or(0, |delta| delta.total_bytes()))?;
         // Copied only while a heap tier still holds the run.
         Ok(delta.map(Rc::unwrap_or_clone).filter(|delta| !delta.is_empty()))
@@ -259,6 +270,40 @@ impl Table {
             return Ok(());
         }
         self.shard_index.upkeep(ingested)
+    }
+
+    /// Fold the memtable into the RAM tier, spilling the tier to an unsynced L0
+    /// shard unless its net state leaves it room. `cached_full_scan` survives
+    /// it: the row set does not move.
+    pub(crate) fn fold_to_ram(&mut self) -> Result<(), StorageError> {
+        let schema = self.shard_index.schema;
+        self.live_floor.get_mut().judged = false;
+        self.memtable.drain_into(&mut self.ram_tier, &schema);
+        if self.held_in_ram || !self.ram_tier.is_full() {
+            return Ok(());
+        }
+        // The fold's cancellation can bring the tier back under its ceiling. A
+        // tier it leaves crowded is over the ceiling again within the little
+        // room it has left, and every such crossing folds the whole tier.
+        self.ram_tier.fold(&schema);
+        if !self.ram_tier.is_crowded() {
+            return Ok(());
+        }
+        self.ram_tier.spill(&schema, |run| self.shard_index.append_l0_run(run))
+    }
+
+    /// Fold memtable and RAM tier into one L0 shard, and the pending rows into
+    /// one above the cut, which no compaction folds below it; then
+    /// [stage](ShardIndex::stage) the manifest naming them.
+    fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork<'_>>, StorageError> {
+        debug_assert!(!self.held_in_ram, "a barrier over a store held in RAM only");
+        self.fold_to_ram()?;
+        let schema = self.shard_index.schema;
+        self.ram_tier
+            .spill(&schema, |run| self.shard_index.append_l0_run(run))?;
+        self.pending
+            .spill(&schema, |run| self.shard_index.append_pending_run(run))?;
+        self.shard_index.stage(checkpoint_mark)
     }
 
     /// Fold the memtable into the RAM tier, then every fold the disk tier owes,
@@ -320,27 +365,16 @@ impl Table {
                     .map_or_else(|| PkBuf::max(schema.pk_stride()), PkBuf::from_bytes)
             });
             // Kept at or under every row above the cut, so it holds at both cuts.
-            let at = match (first_live, self.pending_least()) {
+            let pending_least = (self.pending.runs_overlapping(None).map(|run| run.get_pk_bytes(0)))
+                .chain(self.shard_index.pending_least())
+                .min();
+            let at = match (first_live, pending_least) {
                 (Some(f), Some(p)) if p < f.pk_bytes() => Some(PkBuf::from_bytes(p)),
                 (f, _) => f,
             };
             self.live_floor.set(LiveFloor { at, judged: true });
         }
         cursor
-    }
-
-    /// The least key a row above the cut holds.
-    fn pending_least(&self) -> Option<&[u8]> {
-        self.pending
-            .runs_overlapping(None)
-            .map(|run| run.get_pk_bytes(0))
-            .chain(self.shard_index.pending_least())
-            .min()
-    }
-
-    /// A fold leaves the floor valid, but can cancel the rows it skips.
-    fn rejudge_live_floor(&mut self) {
-        self.live_floor.get_mut().judged = false;
     }
 
     /// `rows`, a non-empty run, enter the store.

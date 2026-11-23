@@ -1,5 +1,4 @@
-use super::super::*;
-use super::Fold;
+use super::*;
 use crate::storage::Cut;
 use crate::storage::manifest::{self, StoreDir};
 use crate::test_support::{
@@ -321,7 +320,7 @@ fn a_spill_of_retractions_folds_into_the_rows_it_cancels() {
     idx.drain().unwrap();
     assert_eq!(idx.level_shape(), (0, [1, 0]));
     let guard = &idx.levels[L1].guards[0];
-    assert_eq!((guard.entries.len(), guard.rows()), (1, 700));
+    assert_eq!((guard.entries.len(), guard.entries[0].shard.row_count()), (1, 700));
     assert_weighs(&idx, 0, (0..300).map(gk));
     assert_all_found(&idx, 300..1000);
 }

@@ -152,17 +152,6 @@ fn absent_ok(r: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Remove the staging file and every shard `live` does not hold from `dir`.
-fn remove_stale_files(dir: &str, live: impl Fn(u64) -> bool) -> io::Result<()> {
-    absent_ok(fs::remove_file(staging_path(dir)))?;
-    for seq in shard_seqs(dir)? {
-        if !live(seq) {
-            absent_ok(fs::remove_file(shard_path(dir, seq)))?;
-        }
-    }
-    Ok(())
-}
-
 /// Every file in `dir` named as a shard, with the level `dir`'s intact manifest
 /// places it at — `None` for one the manifest does not name.
 pub(crate) fn shard_files(dir: &str) -> Result<Vec<(String, Option<u64>)>, StorageError> {
@@ -195,22 +184,6 @@ pub(crate) fn read_intact(dir: &str) -> Result<Option<Manifest>, StorageError> {
 /// The intact manifest in `dir` iff it carries `generation`.
 pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, StorageError> {
     Ok(read_intact(dir)?.filter(|m| m.checkpoint_mark == generation))
-}
-
-/// Write `m` to `dir`'s [`staging_path`], for [`commit`] to publish.
-fn stage(dir: &str, m: &Manifest) -> Result<(), StorageError> {
-    fs::write(staging_path(dir), encode(m))?;
-    Ok(())
-}
-
-/// Rename the manifest staged at [`staging_path`] onto `dir`'s manifest path.
-///
-/// The new shards' directory entries are synced only after the rename, so a
-/// crash in between relies on the filesystem ordering its metadata (ext4,
-/// xfs), which POSIX does not promise.
-fn commit(dir: &str) -> Result<(), StorageError> {
-    fs::rename(staging_path(dir), manifest_path(dir))?;
-    Ok(())
 }
 
 /// The directories a sync of the store directory `dir` makes durable: its own,
@@ -292,7 +265,9 @@ pub(crate) fn link_stores(pairs: &[(String, String)]) -> Result<(), StorageError
     // Every copied shard and staged manifest, before any rename.
     sync.sync_paths(copies, FsyncFlags::DATASYNC)?;
     for dst in stores {
-        commit(dst)?;
+        // The shards' directory entries are synced only after the rename, as
+        // in `StoreDir::publish`, under the same metadata-ordering reliance.
+        fs::rename(staging_path(dst), manifest_path(dst))?;
     }
     sync.sync_paths(&dirs, FsyncFlags::empty())
 }
@@ -402,8 +377,12 @@ impl StoreDir {
                 m
             }
         };
+        // Unlink the staging file and every shard the loaded manifest does not name.
         let live: HashSet<u64> = loaded.iter().flat_map(|m| &m.shards.entries).map(|e| e.seq).collect();
-        remove_stale_files(path, |seq| live.contains(&seq))?;
+        absent_ok(fs::remove_file(staging_path(path)))?;
+        for seq in shard_seqs(path)?.into_iter().filter(|seq| !live.contains(seq)) {
+            absent_ok(fs::remove_file(shard_path(path, seq)))?;
+        }
         let seq = live.into_iter().max().unwrap_or(0);
         Ok(StoreDir {
             path: path.to_string(),
@@ -473,18 +452,14 @@ impl StoreDir {
         seq <= self.published_through
     }
 
-    /// Unlink the shard drawn at `seq`, best-effort.
-    fn unlink_shard(&self, seq: u64) {
-        let _ = fs::remove_file(self.shard_path(seq));
-    }
-
     /// Drop the shard drawn at `seq`: unlinked now if no published manifest
     /// names it, else once a manifest that does not is durable.
     pub(super) fn retire(&mut self, seq: u64) {
         if self.published(seq) {
             self.retired.push(seq);
         } else {
-            self.unlink_shard(seq);
+            // Best-effort: the next open unlinks a shard no manifest names.
+            let _ = fs::remove_file(self.shard_path(seq));
         }
     }
 
@@ -515,7 +490,7 @@ impl StoreDir {
                 // Until the barrier records otherwise: a failed publish may have
                 // renamed it.
                 self.in_place = InPlace::Unknown;
-                stage(&self.path, &m)?;
+                fs::write(staging_path(&self.path), encode(&m))?;
                 true
             }
         };
@@ -542,8 +517,11 @@ impl StoreDir {
         )?;
         for w in &mut work {
             if w.rename {
-                // The rename publishes every shard the manifest names.
-                commit(&w.dir.path)?;
+                // The rename publishes every shard the manifest names. Their
+                // directory entries are synced only after it, so a crash in
+                // between relies on the filesystem ordering its metadata (ext4,
+                // xfs), which POSIX does not promise.
+                fs::rename(staging_path(&w.dir.path), manifest_path(&w.dir.path))?;
                 w.dir.published_through = w.dir.seq;
             }
         }
@@ -555,7 +533,7 @@ impl StoreDir {
         for FlushWork { dir, manifest, .. } in work {
             dir.in_place = InPlace::Durable(manifest);
             for seq in std::mem::take(&mut dir.retired) {
-                dir.unlink_shard(seq);
+                let _ = fs::remove_file(dir.shard_path(seq));
             }
         }
         Ok(())
