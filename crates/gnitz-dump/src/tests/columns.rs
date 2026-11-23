@@ -1,5 +1,5 @@
 use super::*;
-use parquet::column::writer::ColumnWriter;
+use gnitz_wire::{ColType, ColumnDef};
 use parquet::data_type::FixedLenByteArray;
 
 /// One column of every type, every other one nullable and NULL in odd rows,
@@ -58,30 +58,28 @@ fn every_type_reads_back_bit_for_bit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.parquet");
     let batch = rows(&schema);
-    let mut w = TableWriter::create(&path, &schema).unwrap();
+    let mut w = create(&path, &schema).unwrap();
     // Two row groups, one empty batch between them.
-    w.write(&batch).unwrap();
-    w.write(&ZSetBatch::new(&schema)).unwrap();
-    w.write(&batch).unwrap();
-    assert_eq!(w.finish().unwrap(), 12);
+    write(&mut w, &batch).unwrap();
+    write(&mut w, &ZSetBatch::new(&schema)).unwrap();
+    write(&mut w, &batch).unwrap();
+    assert_eq!(finish(w).unwrap(), 12);
 
-    let mut r = TableReader::open(&path, &schema).unwrap();
-    let mut groups = 0;
-    while let Some(back) = r.next_group().unwrap() {
-        assert_eq!(back, batch);
-        groups += 1;
+    let groups: Vec<ZSetBatch> = open(&path, &schema).unwrap().map(Result::unwrap).collect();
+    assert_eq!(groups.len(), 2);
+    for group in groups {
+        assert_eq!(group, batch);
     }
-    assert_eq!(groups, 2);
 }
 
 #[test]
 fn a_row_not_at_weight_one_is_refused() {
     let schema = every_type();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = TableWriter::create(&dir.path().join("t.parquet"), &schema).unwrap();
+    let mut w = create(&dir.path().join("t.parquet"), &schema).unwrap();
     let mut batch = rows(&schema);
     batch.rewrite(|d| d.weight_mut()[16..24].copy_from_slice(&2i64.to_le_bytes()));
-    let err = w.write(&batch).unwrap_err();
+    let err = write(&mut w, &batch).unwrap_err();
     assert!(err.0.contains("weight 2"), "{err}");
 }
 
@@ -111,9 +109,9 @@ fn a_file_of_other_columns_is_refused() {
     .enumerate()
     {
         let path = dir.path().join(format!("{i}.parquet"));
-        TableWriter::create(&path, &table(&written)).unwrap().finish().unwrap();
-        TableReader::open(&path, &table(&written)).unwrap();
-        let err = TableReader::open(&path, &table(&opened)).err().unwrap();
+        finish(create(&path, &table(&written)).unwrap()).unwrap();
+        assert_eq!(open(&path, &table(&written)).unwrap().count(), 0);
+        let err = open(&path, &table(&opened)).err().unwrap();
         assert!(err.0.contains("its columns are not the table's"), "{i}: {err}");
     }
 }
@@ -123,7 +121,7 @@ fn the_file_names_each_columns_gnitz_type() {
     let schema = every_type();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.parquet");
-    TableWriter::create(&path, &schema).unwrap().finish().unwrap();
+    finish(create(&path, &schema).unwrap()).unwrap();
     let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
     let kv = reader.metadata().file_metadata().key_value_metadata().unwrap();
     let types = kv
@@ -181,11 +179,7 @@ fn a_cell_its_column_cannot_hold_is_refused() {
             .unwrap(),
         );
         let path = dir.path().join(format!("{i}.parquet"));
-        let (root, types, _) = file_layout(&schema).unwrap();
-        let props = WriterProperties::builder()
-            .set_key_value_metadata(Some(vec![KeyValue::new(COLUMNS_KEY.to_string(), types)]))
-            .build();
-        let mut w = SerializedFileWriter::new(File::create(&path).unwrap(), Arc::new(root), Arc::new(props)).unwrap();
+        let mut w = create(&path, &schema).unwrap();
         let mut group = w.next_row_group().unwrap();
         while let Some(mut col) = group.next_column().unwrap() {
             match col.untyped() {
@@ -201,8 +195,8 @@ fn a_cell_its_column_cannot_hold_is_refused() {
             col.close().unwrap();
         }
         group.close().unwrap();
-        w.close().unwrap();
-        let err = TableReader::open(&path, &schema).unwrap().next_group().unwrap_err();
+        finish(w).unwrap();
+        let err = open(&path, &schema).unwrap().next().unwrap().unwrap_err();
         assert!(err.0.contains(refusal), "{i}: {err}");
     }
 }

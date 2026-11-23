@@ -1,5 +1,6 @@
 use super::*;
 use gnitz_foundation::rng::mix;
+use gnitz_wire::{ColType, ColumnDef};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 /// Rows a bench table holds.
@@ -78,19 +79,17 @@ fn columns_bench() {
         let batches = groups(&schema, fill);
         let path = dir.path().join(format!("{name}.parquet"));
         let (_, write) = counter.measure(|| {
-            let mut w = TableWriter::create(&path, &schema).unwrap();
+            let mut w = create(&path, &schema).unwrap();
             for b in &batches {
-                w.write(std::hint::black_box(b)).unwrap();
+                write(&mut w, std::hint::black_box(b)).unwrap();
             }
-            w.finish().unwrap()
+            finish(w).unwrap()
         });
         let (read_rows, read) = counter.measure(|| {
-            let mut r = TableReader::open(&path, &schema).unwrap();
-            let mut n = 0;
-            while let Some(b) = r.next_group().unwrap() {
-                n += std::hint::black_box(b).len();
-            }
-            n
+            open(&path, &schema)
+                .unwrap()
+                .map(|group| std::hint::black_box(group.unwrap()).len())
+                .sum::<usize>()
         });
         assert_eq!(read_rows, ROWS);
         let bytes = std::fs::metadata(&path).unwrap().len();
