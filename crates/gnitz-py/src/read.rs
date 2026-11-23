@@ -64,7 +64,7 @@ impl RowType {
         }
         static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
         let key = {
-            let mut guard = crate::lock(&CACHE);
+            let mut guard = gnitz_foundation::sync::lock(&CACHE);
             let Cache { types, key } = &mut *guard;
             key.clear();
             // Length-prefixed, so no two column lists share a key.
@@ -83,7 +83,11 @@ impl RowType {
         let names: Vec<(&str, bool)> = columns.map(|c| (&*c.name, c.is_hidden)).collect();
         let built = Self::build(py, &names)?;
         Ok(RowType(
-            crate::lock(&CACHE).types.entry(key).or_insert(built).clone_ref(py),
+            gnitz_foundation::sync::lock(&CACHE)
+                .types
+                .entry(key)
+                .or_insert(built)
+                .clone_ref(py),
         ))
     }
 

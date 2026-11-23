@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{session_pair, wide_rows, wide_schema};
+use crate::write_frames::SpanningWrite;
 use std::hint::black_box;
 
 /// Instructions to encode a push request of four nullable columns into a buffer
@@ -17,16 +18,18 @@ fn push_encode_bench() {
             let mut e = 0;
             let mut out = Vec::new();
             for _ in 0..iters {
-                let push = || Request::Push {
+                let family = || PushFamily {
                     target,
-                    batch: &batch,
+                    batch: Arc::clone(&batch),
                     mode: WireConflictMode::Update,
+                    basis: 0,
                 };
                 out.clear();
                 e += counter
                     .measure(|| {
-                        let (verb, families) = push().write_families().expect("a write");
-                        let write = SpanningWrite::cut(verb, families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
+                        let families = smallvec::smallvec![family()];
+                        let write =
+                            SpanningWrite::cut(ClientVerb::Push, families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
                         write.encode(0, black_box(&mut out))
                     })
                     .1;
@@ -52,7 +55,7 @@ fn submit_write_bench() {
     submit_write("1-row push", |s| {
         drop(s.submit(Request::Push {
             target: Target { tid: 7, token: 1 },
-            batch: &batch,
+            batch: Arc::clone(&batch),
             mode: WireConflictMode::Update,
         }))
     });
@@ -91,7 +94,7 @@ fn spanning_write_bench() {
     let batch = Arc::new(wide_rows(&schema, ROWS, 4));
     for ceiling in [64 << 10, 1 << 20] {
         let (mut s, peer) = session_pair();
-        s.set_write_frame_bytes(ceiling);
+        s.transport.set_write_frame_bytes(ceiling);
         let drain = std::thread::spawn(move || {
             let mut n = 0usize;
             loop {
@@ -106,7 +109,7 @@ fn spanning_write_bench() {
         let ((), instr) = counter.measure(|| {
             drop(s.submit(Request::Push {
                 target: Target { tid: 7, token: 1 },
-                batch: &batch,
+                batch: Arc::clone(&batch),
                 mode: WireConflictMode::Update,
             }));
             peak = peak.max(s.transport.queued_bytes());

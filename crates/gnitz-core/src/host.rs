@@ -7,7 +7,9 @@ use std::future::{Future, poll_fn};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
+
+use gnitz_foundation::sync::lock;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -281,30 +283,17 @@ enum Awaited<T> {
     Watched(Waker),
 }
 
-struct Cell<T>(Mutex<Awaited<T>>);
-
-impl<T> Cell<T> {
-    fn new(awaited: Awaited<T>) -> Arc<Self> {
-        Arc::new(Cell(Mutex::new(awaited)))
-    }
-
-    /// A panic under this lock leaves what it guards whole.
-    fn lock(&self) -> MutexGuard<'_, Awaited<T>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
 /// A reply on its way, borrowing nothing. One to a request arrives as the
 /// session is stepped: [`GnitzClient::wait`](crate::GnitzClient::wait) steps
 /// until it has, and awaiting it directly leaves the stepping to someone else.
-pub struct Sent<T>(Arc<Cell<T>>);
+pub struct Sent<T>(Arc<Mutex<Awaited<T>>>);
 
 /// The writer of a [`Sent`]. Dropped unfulfilled, the reply is `Closed`.
-pub struct Promise<T>(Option<Arc<Cell<T>>>);
+pub struct Promise<T>(Option<Arc<Mutex<Awaited<T>>>>);
 
 /// A reply yet to arrive, and its writer.
 pub fn promise<T>() -> (Promise<T>, Sent<T>) {
-    let cell = Cell::new(Awaited::Outstanding);
+    let cell = Arc::new(Mutex::new(Awaited::Outstanding));
     (Promise(Some(Arc::clone(&cell))), Sent(cell))
 }
 
@@ -314,7 +303,7 @@ impl<T> Promise<T> {
         let Some(cell) = self.0.take() else {
             return;
         };
-        let mut slot = cell.lock();
+        let mut slot = lock(&cell);
         match std::mem::take(&mut *slot) {
             Awaited::Routed(route) => {
                 drop(slot);
@@ -340,12 +329,12 @@ impl<T> Drop for Promise<T> {
 impl<T> Sent<T> {
     /// A reply that needed no request.
     pub fn ready(value: Result<T, ClientError>) -> Self {
-        Sent(Cell::new(Awaited::Arrived(value)))
+        Sent(Arc::new(Mutex::new(Awaited::Arrived(value))))
     }
 
     /// The reply, if it has arrived. It is handed out once.
     pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
-        let mut slot = self.0.lock();
+        let mut slot = lock(&self.0);
         match std::mem::take(&mut *slot) {
             Awaited::Arrived(reply) => Some(reply),
             other => {
@@ -358,7 +347,7 @@ impl<T> Sent<T> {
     /// Hand the reply to `route` — now if it has arrived, else from wherever
     /// it does: for a request's, inside the step that reads it.
     pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static) {
-        let mut slot = self.0.lock();
+        let mut slot = lock(&self.0);
         match std::mem::take(&mut *slot) {
             Awaited::Arrived(reply) => {
                 drop(slot);
@@ -373,7 +362,7 @@ impl<T> Future for Sent<T> {
     type Output = Result<T, ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut slot = self.0.lock();
+        let mut slot = lock(&self.0);
         match std::mem::take(&mut *slot) {
             Awaited::Arrived(reply) => Poll::Ready(reply),
             _ => {

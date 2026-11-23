@@ -144,7 +144,7 @@ fn a_failed_wait_ends_the_session() {
     let (s, _peer) = session_pair();
     let mut c = GnitzClient::over(s, Box::new(FailingHost)).unwrap();
     for _ in 0..2 {
-        let lost = block_on(c.alloc_ids(1));
+        let lost = block_on(c.ack(Request::AllocIds(1)));
         assert!(
             matches!(&lost, Err(ClientError::ConnectionLost(ProtocolError::IoError(e))) if e.to_string() == "no reactor"),
             "{lost:?}"
@@ -185,7 +185,7 @@ fn detached_requests_are_answered_by_one_wait() {
     assert_eq!(second.try_take().unwrap().unwrap(), 1);
 
     // A verb awaited whole is the same round trip, undetached.
-    assert_eq!(block_on(c.alloc_ids(1)).unwrap(), 3);
+    assert_eq!(block_on(c.ack(Request::AllocIds(1))).unwrap(), 3);
     drop(c);
     peer.join().unwrap();
 }
@@ -225,7 +225,7 @@ fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
         Box::pin(async move {
             let mut ids = Vec::new();
             for _ in 0..3 {
-                ids.push(c.alloc_ids(1).await.unwrap());
+                ids.push(c.ack(Request::AllocIds(1)).await.unwrap());
             }
             *out.lock().unwrap() = Some(ids);
         })
@@ -300,7 +300,7 @@ fn an_offloaded_job_is_the_hosts_to_run() {
 fn block_on_refuses_a_host_that_pends() {
     let (s, _peer) = session_pair();
     let mut c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
-    let _ = block_on(c.alloc_ids(1));
+    let _ = block_on(c.ack(Request::AllocIds(1)));
 }
 
 /// A host that fails ends the session as that failure: the replies it owed

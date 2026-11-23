@@ -70,7 +70,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
 
     // ?ca=<minted cert>: full verification against the minted self-signed cert.
     let mut pinned = GnitzClient::connect(&srv.tls_target()).expect("ca-pinned connect");
-    block_on(pinned.alloc_ids(1)).unwrap();
+    block_on(pinned.ack(Request::AllocIds(1))).unwrap();
 
     // Default webpki roots must REJECT the self-signed minted cert.
     let err = GnitzClient::connect(&format!("tls://{}", srv.tls_endpoint()))
@@ -126,7 +126,7 @@ fn ipv6_loopback_connect_and_ca_verify() {
     assert!(target.starts_with("tls://[::1]:"), "v6 endpoint expected, got {target}");
     // Full verification against the minted cert's ::1 IP SAN.
     let mut client = GnitzClient::connect(&target).expect("ca-pinned tls over [::1]");
-    block_on(client.alloc_ids(1)).unwrap();
+    block_on(client.ack(Request::AllocIds(1))).unwrap();
 }
 
 /// A required-mTLS server admits the leaf its own client CA signed, and neither
@@ -285,7 +285,7 @@ fn first_frame_deadline_reaps_silent_connections() {
 
     // A client that sends its HELLO at once is unaffected.
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("a normal client must connect");
-    block_on(client.alloc_ids(1)).unwrap();
+    block_on(client.ack(Request::AllocIds(1))).unwrap();
 }
 
 #[test]
@@ -360,7 +360,7 @@ fn a_restart_fails_the_old_connection_fast_and_admits_a_new_one() {
             assert!(matches!(err, ClientError::ConnectionLost(_)), "{target}: {err:?}");
         }
         assert!(t0.elapsed() < Duration::from_secs(5), "{target}: {:?}", t0.elapsed());
-        block_on(GnitzClient::connect(target).unwrap().alloc_ids(1)).unwrap();
+        block_on(GnitzClient::connect(target).unwrap().ack(Request::AllocIds(1))).unwrap();
     }
 }
 

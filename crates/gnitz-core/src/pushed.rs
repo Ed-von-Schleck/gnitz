@@ -3,7 +3,7 @@
 //! advances every mirrored view.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::Schema;
@@ -13,6 +13,7 @@ use crate::connection::{Held, ScanReply, draw_subs, park, untaken};
 use crate::error::ClientError;
 use crate::host::Sent;
 use crate::mirror::PollOutcome;
+use gnitz_foundation::sync::lock;
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::{DeltaCursor, SubId};
 
@@ -103,10 +104,6 @@ struct Reader {
     held: Held,
 }
 
-fn lock(received: &Mutex<Received>) -> MutexGuard<'_, Received> {
-    received.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// What one sync brought a client.
 #[must_use]
 pub struct Synced {
@@ -175,19 +172,18 @@ impl GnitzClient {
     /// until the answer arrives: a request made meanwhile is answered while the
     /// server holds the sync, and leaves it held.
     pub fn begin_sync(&mut self, wait: Duration) -> Sent<()> {
-        let (wait, readers) = {
+        let (wait, mut held) = {
             let mut received = lock(&self.received);
+            let reseeded = std::mem::take(&mut received.reseeded);
             if let Some(m) = self.mirror.as_deref_mut() {
-                m.owe_reseeds(&received.reseeded);
+                m.owe_reseeds(&reseeded);
             }
-            received.reseeded.clear();
             let untaken = received.readers.values().any(|r| untaken(&r.held));
             let held = received.readers.iter().filter(|(_, r)| r.held.is_ok());
             let held: Vec<SubId> = held.map(|(&id, _)| id).collect();
             (if untaken { Duration::ZERO } else { wait }, held)
         };
         let (wait, mirrored) = self.mirror_hold(wait);
-        let mut held = readers;
         held.extend(mirrored);
         self.session.submit_sync(&held, wait)
     }

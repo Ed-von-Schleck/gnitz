@@ -31,8 +31,8 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let mut s = Session::connect(srv.sock_path()).unwrap();
     let (a, b) = (
-        block_on(client.alloc_ids(1)).unwrap(),
-        block_on(client.alloc_ids(1)).unwrap(),
+        block_on(client.ack(Request::AllocIds(1))).unwrap(),
+        block_on(client.ack(Request::AllocIds(1))).unwrap(),
     );
     let err = refusal(
         &mut s,

@@ -14,6 +14,7 @@
 //!   - `local_server` — a `gnitz-server` this process runs for its own use: the
 //!     shell's session server and Python's `gnitz.local_server`
 //!   - `rng`        — the deterministic PRNG of tests and benchmarks, and `u64` bijections
+//!   - `sync`       — the locking idioms `std` lacks
 //!
 //! The server is Linux-only; a client is not. What a client links of this crate
 //! builds on any Unix: `perf`, and the `posix_io` and `process` items only the
@@ -33,3 +34,4 @@ pub mod perf;
 pub mod posix_io;
 pub mod process;
 pub mod rng;
+pub mod sync;

@@ -26,7 +26,8 @@ use gnitz_core::{BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job
 
 use crate::client::{Mode, PyClient, VerbOp, none, resolve_target, whole};
 use crate::reply::PySynced;
-use crate::{client_err, lock, sql_err};
+use crate::{client_err, sql_err};
+use gnitz_foundation::sync::lock;
 
 /// Resolve one loop future; a cancelled one's refusal is dropped.
 fn settle(py: Python<'_>, future: &Py<PyAny>, value: PyResult<Py<PyAny>>) {

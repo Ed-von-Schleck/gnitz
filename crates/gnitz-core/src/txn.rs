@@ -14,8 +14,9 @@ use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode,
 use gnitz_zset::repr::{MemBatch, Pick, gather_rows};
 
 use crate::client::GnitzClient;
-use crate::connection::{PushFamily, RelDescriptor, Request, ScanReply};
+use crate::connection::{RelDescriptor, Request, ScanReply};
 use crate::error::ClientError;
+use crate::write_frames::PushFamily;
 use crate::{Schema, ZSetBatch};
 
 /// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink

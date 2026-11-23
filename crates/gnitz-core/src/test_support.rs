@@ -276,11 +276,12 @@ pub(crate) fn hold_subscription(s: &mut Session, peer: &Peer, id: SubId, schema:
     assert_eq!((rows.batch.len(), at), (0, DeltaCursor::from_pair(1, tick).unwrap()));
 }
 
-/// One frame payload, without the 4-byte length prefix, as
-/// `append_payload` writes it.
+/// One frame payload, without the 4-byte length prefix. An empty batch ships
+/// no data block, and still ships the blob.
 pub(crate) fn encode_frame(hdr: ControlHeader, blob: &[u8], data: Option<&ZSetBatch>) -> Vec<u8> {
     let mut out = Vec::new();
-    crate::connection::append_payload(&mut out, hdr, blob, data);
+    let regions = data.filter(|b| !b.is_empty()).map(|b| b.regions());
+    gnitz_wire::append_frame(&mut out, &hdr, blob, regions.as_deref());
     out
 }
 

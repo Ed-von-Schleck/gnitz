@@ -22,11 +22,12 @@ use gnitz_wire::{KeyRange, PkColList, PkListRole, ReadBound, ReadSpec, WireConfl
 
 use crate::aio::{LoopCore, LoopHandle};
 use crate::blocking;
+use crate::client_err;
 use crate::read::scan_result;
 use crate::reply::{PyPollResult, PySynced, sql_results};
 use crate::schema::PySchema;
 use crate::write::{PyZSetBatch, py_key_image, py_pk_keys};
-use crate::{client_err, lock};
+use gnitz_foundation::sync::lock;
 
 /// How a client waits, which is the whole difference between its two classes.
 pub(crate) enum Mode {

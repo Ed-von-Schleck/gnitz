@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::poll_fn;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::client::GnitzClient;
@@ -41,6 +41,7 @@ use crate::ddl::DdlBundle;
 use crate::error::ClientError;
 use crate::host::{BoxFut, Host, Pending, Sent, offload};
 use crate::{RelName, Schema, ZSetBatch};
+use gnitz_foundation::sync::lock;
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::{DeltaCursor, DeltaPollItem, SubId};
 use gnitz_wire::{RelClass, WireStatus};
@@ -225,11 +226,6 @@ fn alias_id(name: &RelName) -> u64 {
 }
 
 impl MirroredView {
-    /// Whether `other` reads the same rows of the same view.
-    fn reads_what(&self, other: &MirroredView) -> bool {
-        self.upstream.tid == other.upstream.tid && self.spec == other.spec
-    }
-
     /// A delta read brought this copy up to date and left it subscribed as
     /// `id`: from here it answers reads.
     fn subscribed(&mut self, id: SubId) {
@@ -252,7 +248,7 @@ struct Store(Arc<Mutex<dyn MirrorStore>>);
 impl Store {
     /// The store, poisoned or not, for a lookup made in place.
     fn get(&self) -> MutexGuard<'_, dyn MirrorStore + 'static> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.0)
     }
 
     /// Refused once a call panicked under the lock — the store's poison, and so
@@ -324,17 +320,6 @@ impl MirrorState {
             v.confirmed = false;
             v.link = Link::Due;
         }
-    }
-
-    /// One failed entry for each view, its copy answering at no round: the
-    /// store is poisoned.
-    fn poisoned(&self) -> Vec<PollOutcome> {
-        let failed = |&view_id: &u64| PollOutcome {
-            view_id,
-            cursor: None,
-            result: PollResult::Failed(ClientError::MirrorPoisoned),
-        };
-        self.views.keys().map(failed).collect()
     }
 
     /// Owe each view of `view_ids` still registered its
@@ -452,7 +437,10 @@ impl GnitzClient {
             .await??;
         let views = &mut self.mirror_state()?.views;
         let held = views.get(&tid);
-        entry.confirmed = held.is_some_and(|held| held.confirmed && held.reads_what(&entry));
+        // A registration that reads the same rows of the same view keeps its
+        // copy's standing.
+        let same = |held: &MirroredView| held.upstream.tid == entry.upstream.tid && held.spec == entry.spec;
+        entry.confirmed = held.is_some_and(|held| held.confirmed && same(held));
         entry.owed_reseed |= held.is_some_and(|held| held.owed_reseed);
         // One registration per name, and one at an id; a subscription outlives
         // only a rename, which carries it.
@@ -487,7 +475,8 @@ impl GnitzClient {
     }
 
     /// Bring every view of `tids` up to date and subscribed, each by a delta
-    /// read and then the recovery its refusal names. Returns how each view's
+    /// read and then the recovery its refusal names: a registration derived
+    /// again, or a copy read whole. Returns how each view's
     /// last sync went, under the id it ended up mirrored at.
     async fn settle(
         &mut self,
@@ -515,7 +504,14 @@ impl GnitzClient {
                         continue;
                     }
                     Err(e) if attempt == SETTLE_ATTEMPTS => Err(e),
-                    Err(e) => self.recover(tid, e, &mut expired).await,
+                    // The registration no longer resolves as it was derived.
+                    Err(e) if e.status() == Some(WireStatus::StaleCatalog) => self.rebind(tid).await,
+                    // The cursor does not continue: the view is read whole.
+                    Err(e) if e.status() == Some(WireStatus::DeltaExpired) => {
+                        expired.push(tid);
+                        Ok(tid)
+                    }
+                    Err(e) => Err(e),
                 };
                 match recovered {
                     Ok(now) if pending.contains(&now) => {}
@@ -531,22 +527,6 @@ impl GnitzClient {
             }
         }
         Ok(done)
-    }
-
-    /// Take the recovery `failure` names for `tid`'s sync, and return the id to
-    /// sync next; a failure that names none is handed back. A view to read
-    /// whole joins `expired`.
-    async fn recover(&mut self, tid: u64, failure: ClientError, expired: &mut Vec<u64>) -> Result<u64, ClientError> {
-        match failure.status() {
-            // The registration no longer resolves as it was derived.
-            Some(WireStatus::StaleCatalog) => self.rebind(tid).await,
-            // The cursor does not continue.
-            Some(WireStatus::DeltaExpired) => {
-                expired.push(tid);
-                Ok(tid)
-            }
-            _ => Err(failure),
-        }
     }
 
     /// One delta read of each view of `tids`, which keeps each one it brings
@@ -879,7 +859,13 @@ impl GnitzClient {
             return Ok(Vec::new());
         };
         if m.store.refusal().is_err() {
-            return Ok(m.poisoned());
+            // Each view's copy answers at no round.
+            let failed = |&view_id: &u64| PollOutcome {
+                view_id,
+                cursor: None,
+                result: PollResult::Failed(ClientError::MirrorPoisoned),
+            };
+            return Ok(m.views.keys().map(failed).collect());
         }
         let mut done = self.advance_pushed(synced).await?;
         let views = &self.mirror_state()?.views;

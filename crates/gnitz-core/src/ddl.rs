@@ -30,11 +30,6 @@ fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Option<(usize, u64)> {
     })
 }
 
-/// The id of the live schema `schema_name` (already canonical) in `schemas`.
-fn live_schema_id(schemas: &ZSetBatch, schema_name: &str) -> Option<u64> {
-    schema_row(schemas, schema_name).map(|(_, id)| id)
-}
-
 /// The catalog name of an unnamed index on `cols` of `table`, whose columns are
 /// `columns`: `{schema}__{table}__idx_{col1}_{col2}…`, lowercased with every
 /// non-identifier byte made `_`, suffixed `_{n}` (n ≥ 2) where `taken` holds it.
@@ -150,15 +145,6 @@ impl DdlBundle {
     /// none.
     fn batch(&mut self, family: SysFamily) -> &mut ZSetBatch {
         self.0[family.index()].get_or_insert_with(|| ZSetBatch::new(sys_schema(family)))
-    }
-
-    /// A bundle of `families`' rows, one batch per family.
-    fn of(families: impl IntoIterator<Item = (SysFamily, ZSetBatch)>) -> Self {
-        let mut b = DdlBundle::default();
-        for (family, rows) in families {
-            b.0[family.index()] = Some(rows);
-        }
-        b
     }
 
     /// Each family written, with its rows.
@@ -347,7 +333,10 @@ impl GnitzClient {
         is_unique: bool,
     ) -> Result<u64, ClientError> {
         let (index_name, index_id) = match name {
-            Some(name) => (gnitz_wire::canonical_identifier(name)?, self.alloc_ids(1).await?),
+            Some(name) => (
+                gnitz_wire::canonical_identifier(name)?,
+                self.ack(Request::AllocIds(1)).await?,
+            ),
             None => {
                 let ([indexes], index_id) = self.cut_and_ids([SysFamily::Index], 1).await?;
                 let live = idx_rows(&indexes)?;
@@ -401,9 +390,7 @@ impl GnitzClient {
         if_exists: bool,
         matches: impl Fn(&IdxTabRow) -> bool,
     ) -> Result<(), ClientError> {
-        let [scanned] = self
-            .sys_cut([SysFamily::Index], &ReadSpec::all_rows(ReadBound::None))
-            .await?;
+        let [scanned] = self.sys_cut([SysFamily::Index], ReadBound::None).await?;
         let rows = idx_rows(&scanned)?;
         let mut b = DdlBundle::default();
         let mut retracted = Vec::new();
@@ -424,8 +411,7 @@ impl GnitzClient {
 
     /// The whole catalog, read at one cut.
     pub async fn catalog(&mut self) -> Result<Catalog, ClientError> {
-        let all = ReadSpec::all_rows(ReadBound::None);
-        let families = self.sys_cut(CATALOG_FAMILIES, &all).await?;
+        let families = self.sys_cut(CATALOG_FAMILIES, ReadBound::None).await?;
         Ok(Catalog::decode(&families)?)
     }
 
@@ -457,12 +443,12 @@ impl GnitzClient {
         let name = gnitz_wire::canonical_identifier(name)?;
         let schema_id = if if_not_exists {
             let ([schemas], fresh) = self.cut_and_ids([SysFamily::Schema], 1).await?;
-            if live_schema_id(&schemas, &name).is_some() {
+            if schema_row(&schemas, &name).is_some() {
                 return Ok(());
             }
             fresh
         } else {
-            self.alloc_ids(1).await?
+            self.ack(Request::AllocIds(1)).await?
         };
         let mut b = DdlBundle::default();
         b.put(&SchemaTabRow { schema_id, name: name.as_str().into() }, 1);
@@ -475,9 +461,8 @@ impl GnitzClient {
     /// is dropped; without, the engine refuses a schema still holding a
     /// relation. A missing schema is not found, or skipped under `if_exists`.
     pub async fn drop_schema(&mut self, names: &[&str], cascade: bool, if_exists: bool) -> Result<(), ClientError> {
-        let all = ReadSpec::all_rows(ReadBound::None);
         let [schemas, views, tables] = self
-            .sys_cut([SysFamily::Schema, SysFamily::View, SysFamily::Table], &all)
+            .sys_cut([SysFamily::Schema, SysFamily::View, SysFamily::Table], ReadBound::None)
             .await?;
         let mut dropped = Vec::new();
         for name in names {
@@ -539,7 +524,7 @@ impl GnitzClient {
             let ([schemas], new_tid) = self.cut_and_ids([SysFamily::Schema], n).await?;
             (schemas, HashSet::new(), new_tid)
         };
-        let schema_id = live_schema_id(&schemas, table.schema()).ok_or_else(|| not_found("schema", table.schema()))?;
+        let (_, schema_id) = schema_row(&schemas, table.schema()).ok_or_else(|| not_found("schema", table.schema()))?;
         let index_names = inline_index_names(table, schema.columns(), unique_indexes, live)?;
 
         let mut b = DdlBundle::default();
@@ -582,14 +567,14 @@ impl GnitzClient {
                 // Where `bundle` stands if it is the chain under `vid`: one
                 // allocation holds a chain, the user-named view last.
                 let base = vid.saturating_sub(n_segments);
-                let members = ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
+                let members = ReadBound::Range(KeyRange::new(
                     PkColList::from_slice(&[0]),
                     &[],
                     base as u128,
                     vid as u128,
-                )));
+                ));
                 let families = [SysFamily::View, SysFamily::Column, SysFamily::Circuit];
-                let [views, columns, circuits] = self.sys_cut(families, &members).await?;
+                let [views, columns, circuits] = self.sys_cut(families, members).await?;
                 let rows = views.view();
                 let i = rows
                     .live_rows()
@@ -610,16 +595,19 @@ impl GnitzClient {
                 // is the same view, and keeps the standing definition.
                 let mut want = DdlBundle::default();
                 bundle.put_rows(&mut want, &row.definition, schema_id, base);
-                let standing = DdlBundle::of(families.into_iter().zip([views, columns, circuits]));
+                let mut standing = DdlBundle::default();
+                for (family, rows) in families.into_iter().zip([views, columns, circuits]) {
+                    standing.0[family.index()] = Some(rows);
+                }
                 if want.same_rows(&standing) {
                     return Ok(vid);
                 }
-                (schema_id, self.alloc_ids(n_views).await?)
+                (schema_id, self.ack(Request::AllocIds(n_views)).await?)
             }
             None => {
                 let ([schemas], base) = self.cut_and_ids([SysFamily::Schema], n_views).await?;
-                let schema_id =
-                    live_schema_id(&schemas, view.schema()).ok_or_else(|| not_found("schema", view.schema()))?;
+                let (_, schema_id) =
+                    schema_row(&schemas, view.schema()).ok_or_else(|| not_found("schema", view.schema()))?;
                 (schema_id, base)
             }
         };
@@ -656,9 +644,8 @@ impl GnitzClient {
         if names.is_empty() || self.txn.is_some() {
             return self.commit_ddl(DdlBundle::default()).await;
         }
-        let all = ReadSpec::all_rows(ReadBound::None);
         let [schemas, tables, views] = self
-            .sys_cut([SysFamily::Schema, SysFamily::Table, SysFamily::View], &all)
+            .sys_cut([SysFamily::Schema, SysFamily::Table, SysFamily::View], ReadBound::None)
             .await?;
         let mut b = DdlBundle::default();
         for (k, name) in names.iter().enumerate() {
@@ -667,7 +654,7 @@ impl GnitzClient {
             if names[..k].contains(name) {
                 continue;
             }
-            let Some(sid) = live_schema_id(&schemas, name.schema()) else {
+            let Some((_, sid)) = schema_row(&schemas, name.schema()) else {
                 if if_exists {
                     continue;
                 }
@@ -757,9 +744,10 @@ impl GnitzClient {
         self.commit_ddl(b).await
     }
 
-    /// Push a `(-1, +1)` rewrite pair on the live `family` row keyed `key`: the
-    /// stored row at `-1`, verbatim, and at `+1` the row `edit` puts, read from
-    /// row `i` of `rows`.
+    /// Push a `(-1, +1)` rewrite pair on the live `family` row keyed `key` —
+    /// its PK columns' native values in PK-list order — or `missing()` where
+    /// there is none: the stored row at `-1`, verbatim, and at `+1` the row
+    /// `edit` puts, read from row `i` of `rows`.
     async fn rewrite_sys_row(
         &mut self,
         family: SysFamily,
@@ -767,7 +755,11 @@ impl GnitzClient {
         missing: impl FnOnce() -> ClientError,
         edit: impl FnOnce(&MemBatch<'_>, usize, &mut DdlBundle) -> Result<(), String>,
     ) -> Result<(), ClientError> {
-        let (scanned, i) = self.seek_sys_row(family, key, missing).await?;
+        // One master-local keyed read: `PkSet` is exact, so a live row in the
+        // reply is that key's.
+        let keys = sys_schema(family).pk_keys([key]);
+        let [scanned] = self.sys_cut([family], ReadBound::PkSet(keys)).await?;
+        let i = scanned.view().live_rows().next().ok_or_else(missing)?;
         let mut b = DdlBundle::default();
         b.retract(family, &scanned, i);
         edit(&scanned.view(), i, &mut b)
@@ -786,40 +778,22 @@ impl GnitzClient {
         n: u64,
     ) -> Result<([ZSetBatch; N], u64), ClientError> {
         let ids = self.session.submit(Request::AllocIds(n));
-        let cut = self.sys_cut(families, &ReadSpec::all_rows(ReadBound::None)).await?;
+        let cut = self.sys_cut(families, ReadBound::None).await?;
         Ok((cut, self.wait(ids).await?))
     }
 
-    /// `families`' rows under `spec`, with no DDL between them.
+    /// `families`' rows within `bound`, with no DDL between them.
     async fn sys_cut<const N: usize>(
         &mut self,
         families: [SysFamily; N],
-        spec: &ReadSpec,
+        bound: ReadBound,
     ) -> Result<[ZSetBatch; N], ClientError> {
-        let scans = families.map(|family| (Target::from(family), spec, sys_schema(family)));
+        let spec = ReadSpec::all_rows(bound);
+        let scans = families.map(|family| (Target::from(family), &spec, sys_schema(family)));
         let mut replies = self.scan_many(&scans).await?.into_iter();
         Ok(std::array::from_fn(|_| {
             replies.next().expect("one reply per scan").batch
         }))
-    }
-
-    /// The live `family` row keyed `key` — its PK columns' native values in
-    /// PK-list order — by one master-local keyed read: the
-    /// reply batch and the row's index in it, for a caller to copy the stored row
-    /// out of. `PkSet` is exact, so a live row in the reply is that key's; none is
-    /// `missing()`.
-    async fn seek_sys_row(
-        &mut self,
-        family: SysFamily,
-        key: &[u128],
-        missing: impl FnOnce() -> ClientError,
-    ) -> Result<(ZSetBatch, usize), ClientError> {
-        let keys = sys_schema(family).pk_keys([key]);
-        let [batch] = self
-            .sys_cut([family], &ReadSpec::all_rows(ReadBound::PkSet(keys)))
-            .await?;
-        let i = batch.view().live_rows().next().ok_or_else(missing)?;
-        Ok((batch, i))
     }
 }
 

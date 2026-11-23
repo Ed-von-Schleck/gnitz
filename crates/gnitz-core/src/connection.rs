@@ -14,11 +14,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
-use crate::batch::{FrameBlock, decode_wal_blocks};
+use crate::batch::{FrameBlock, decode_wal_blocks, wal_error};
 use crate::error::ClientError;
 use crate::host::{Host, Promise, Sent, promise};
 use crate::transport::Interest;
-use crate::write_frames::{SpanningWrite, WriteFamily};
+use crate::write_frames::PushFamily;
 use crate::{ClientTransport, ProtocolError, Schema, ZSetBatch};
 use gnitz_wire::Target;
 use gnitz_wire::multi_frame::{self, DeltaCursor, SubId, kept_as};
@@ -26,7 +26,6 @@ use gnitz_wire::{
     CONNECT_TIMEOUT, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob, RelIndex,
     ServerLane, SysFamily, WireConflictMode, append_frame, peek_control_block,
 };
-use smallvec::SmallVec;
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
 /// on the memory a driver that never waits can pin, not a throughput knob.
@@ -99,8 +98,9 @@ fn own_block(frame: &mut FrameBytes<'_>, block: std::ops::Range<usize>) -> RawBl
 
 // ── The request vocabulary ───────────────────────────────────────────────────
 
-/// A request answered by one value — an LSN, or the base id of a run. It
-/// borrows its inputs; the borrow ends at [`Session::submit`].
+/// A request answered by one value — an LSN, or the base id of a run. What it
+/// borrows, the borrow ends at [`Session::submit`]; a push owns its batch,
+/// which a write spanning several frames holds until its last is encoded.
 pub(crate) enum Request<'a> {
     /// A run of this many catalog object ids.
     AllocIds(u64),
@@ -116,7 +116,7 @@ pub(crate) enum Request<'a> {
     /// copied, by a write spanning several frames until its last is encoded.
     Push {
         target: Target,
-        batch: &'a Arc<ZSetBatch>,
+        batch: Arc<ZSetBatch>,
         mode: WireConflictMode,
     },
     /// SNAPSHOT_OPEN; the ACK names the snapshot.
@@ -125,104 +125,6 @@ pub(crate) enum Request<'a> {
     SnapshotClose(u64),
     /// BACKUP into the backup directory's entry of this name.
     Backup(&'a str),
-}
-
-impl<'a> Request<'a> {
-    /// The relation its ACK names.
-    fn acked_tid(&self) -> u64 {
-        match *self {
-            Request::AllocSerial { table, .. } | Request::Push { target: table, .. } => table.tid,
-            Request::AllocIds(_)
-            | Request::DdlTxn(_)
-            | Request::PushTxn(_)
-            | Request::SnapshotOpen
-            | Request::SnapshotClose(_)
-            | Request::Backup(_) => 0,
-        }
-    }
-
-    /// A write's families, as frames carry them: a PUSH's one, a PUSH_TXN's
-    /// every one; `None` for a request that writes no user rows.
-    fn write_families(&self) -> Option<(ClientVerb, SmallVec<[WriteFamily; 1]>)> {
-        match *self {
-            Request::Push { target, batch, mode } => {
-                let family = WriteFamily {
-                    hdr: ControlHeader::item(ClientVerb::Push, target, 0, mode),
-                    batch: Arc::clone(batch),
-                };
-                Some((ClientVerb::Push, smallvec::smallvec![family]))
-            }
-            Request::PushTxn(families) => {
-                let families = (families.iter()).map(|f| WriteFamily {
-                    hdr: f.head(),
-                    batch: Arc::clone(&f.batch),
-                });
-                Some((ClientVerb::PushTxn, families.collect()))
-            }
-            _ => None,
-        }
-    }
-
-    /// Append the frame payload of a request that writes no user rows to
-    /// `out`; a write goes as [`SpanningWrite`] encodes it.
-    fn append(self, out: &mut Vec<u8>) {
-        // A control-only request: its verb, the relation it names, `arg0`, and its blob.
-        let (verb, target, arg0, blob): (ClientVerb, Target, u64, &[u8]) = match self {
-            Request::AllocIds(n) => (ClientVerb::AllocIds, Target::from(0), n, &[]),
-            Request::AllocSerial { table, count } => (ClientVerb::AllocSerialRange, table, count, &[]),
-            Request::SnapshotOpen => (ClientVerb::SnapshotOpen, Target::from(0), 0, &[]),
-            Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, Target::from(0), id, &[]),
-            Request::Backup(name) => (ClientVerb::Backup, Target::from(0), 0, name.as_bytes()),
-            Request::DdlTxn(families) => {
-                let blocks = families.iter().map(|(family, b)| (*family, b.regions()));
-                return multi_frame::encode_ddl_txn(out, blocks);
-            }
-            Request::PushTxn(_) | Request::Push { .. } => unreachable!("a write goes as SpanningWrite encodes it"),
-        };
-        append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None)
-    }
-}
-
-/// Append one frame payload, without the 4-byte length prefix, to `out`. An
-/// empty batch ships no data block, and still ships the blob.
-pub(crate) fn append_payload(out: &mut Vec<u8>, hdr: ControlHeader, blob: &[u8], data: Option<&ZSetBatch>) {
-    append_frame(
-        out,
-        &hdr,
-        blob,
-        data.filter(|b| !b.is_empty()).map(|b| b.regions()).as_deref(),
-    );
-}
-
-/// The refusal of a request frame of `total` bytes, past the ceiling.
-fn oversize(total: usize) -> ClientError {
-    ClientError::from(format!(
-        "request frame is {total} bytes, exceeding the {}-byte server ingress cap; split the request",
-        gnitz_wire::MAX_FRAME_PAYLOAD
-    ))
-}
-
-/// One family of a user-table push transaction: a maximal run of same-mode
-/// writes into `target`.
-pub(crate) struct PushFamily {
-    /// The relation, under the descriptor token of the first of the family's
-    /// batches built from a descriptor; `0` while none was.
-    pub(crate) target: Target,
-    /// May still be shared with the caller that pushed it, so it is never
-    /// written in place.
-    pub(crate) batch: Arc<ZSetBatch>,
-    pub(crate) mode: WireConflictMode,
-    /// The commit fails if `target` was written after `basis`, the oldest
-    /// watermark among the reads this family's writes were built from; `BLIND`
-    /// when none was.
-    pub(crate) basis: u64,
-}
-
-impl PushFamily {
-    /// The item header its chunks carry.
-    fn head(&self) -> ControlHeader {
-        ControlHeader::item(ClientVerb::PushTxn, self.target, self.basis, self.mode)
-    }
 }
 
 /// One request in flight, or a pushed train: how its reply decodes, the reply
@@ -313,7 +215,7 @@ impl Train {
         more: bool,
     ) -> Result<(), ProtocolError> {
         self.rows += gnitz_wire::wal::parse_block(&frame[block.clone()], self.schema.layout().row_width())
-            .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?
+            .map_err(wal_error)?
             .rows;
         if more {
             self.held.push(own_block(frame, block));
@@ -326,15 +228,7 @@ impl Train {
     fn finish(&mut self, last: Option<FrameBlock<'_>>) -> Result<ZSetBatch, ProtocolError> {
         decode_wal_blocks(std::mem::take(&mut self.held), last, &self.schema)
     }
-
-    fn reply(&mut self, last: Option<FrameBlock<'_>>, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
-        Ok(ScanReply { batch: self.finish(last)?, lsn })
-    }
 }
-
-/// How one view's train ends: the cursor its terminal carries, or the fault
-/// that ended its position.
-pub(crate) type PollEnd = Result<DeltaCursor, ClientError>;
 
 /// Where the trains of delta polls and pushed trains go.
 #[derive(Default)]
@@ -376,25 +270,25 @@ pub(crate) fn park(held: &mut Held, taken: Held) {
 }
 
 impl Polls {
-    /// The delta poll's item kept as `id` ended with `end`: its train is held
-    /// at the cursor, or the item ended. An id no longer read is left as it is.
-    fn poll_end(&mut self, id: SubId, end: PollEnd) {
-        match self.reading.remove(&id) {
-            Some(blocks) => self.hold(id, blocks, end),
-            // A cursor is what the server keeps a subscription from, held here or not.
-            None => self.server_holds |= end.is_ok(),
+    /// The delta poll's item kept as `id` ended with `end` — the cursor its
+    /// terminal carries, or the fault that ended its position: its train is
+    /// held at the cursor, or the item ended. An id no longer read is left as it is.
+    fn poll_end(&mut self, id: SubId, end: Result<DeltaCursor, ClientError>) {
+        // A cursor is what the server keeps a subscription from, held here or not.
+        self.server_holds |= end.is_ok();
+        if let Some(blocks) = self.reading.remove(&id) {
+            self.subs.insert(id, end.map(|cursor| (blocks, cursor)));
         }
     }
 
-    /// Hold `id` with `blocks` read for it, at the cursor `end` names, or
-    /// ended.
-    fn hold(&mut self, id: SubId, blocks: Vec<RawBlock>, end: PollEnd) {
-        self.server_holds |= end.is_ok();
-        self.subs.insert(id, end.map(|cursor| (blocks, cursor)));
+    /// A delta read left `id` subscribed at `cursor`, holding nothing past it.
+    fn kept(&mut self, id: SubId, cursor: DeltaCursor) {
+        self.server_holds = true;
+        self.subs.insert(id, Ok((Vec::new(), cursor)));
     }
 
     /// A train pushed for `sub` ended with `end`, after `train`.
-    fn holder_end(&mut self, sub: SubId, train: Vec<RawBlock>, end: PollEnd) {
+    fn holder_end(&mut self, sub: SubId, train: Vec<RawBlock>, end: Result<DeltaCursor, ClientError>) {
         self.server_holds |= end.is_ok();
         if let Some(held) = self.subs.get_mut(&sub) {
             park(held, end.map(|cursor| (train, cursor)));
@@ -488,10 +382,6 @@ pub(crate) struct Session {
     /// The last flush left bytes the socket would not take, so the next one
     /// waits for it to be writable.
     refused: bool,
-    /// The payload bytes past which a write is cut into several frames
-    /// (`GNITZ_WRITE_FRAME_BYTES`, at most and by default
-    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`]).
-    write_frame_bytes: usize,
 }
 
 /// The connection's socket, for a [`Host`] to register.
@@ -520,18 +410,7 @@ impl Session {
             ended: None,
             unread: false,
             refused: false,
-            write_frame_bytes: gnitz_foundation::env::env_num_in(
-                "GNITZ_WRITE_FRAME_BYTES",
-                gnitz_wire::MAX_FRAME_PAYLOAD,
-                1..=gnitz_wire::MAX_FRAME_PAYLOAD,
-            ),
         }
-    }
-
-    /// Cut writes into frames of at most `bytes`.
-    #[cfg(test)]
-    pub(crate) fn set_write_frame_bytes(&mut self, bytes: usize) {
-        self.write_frame_bytes = bytes;
     }
 
     /// Requests submitted since this session connected — one per `submit`,
@@ -546,37 +425,50 @@ impl Session {
     /// or past the frame ceiling — is answered with the refusal, as every
     /// submit's is; the server certifies a pushed batch's shape record, and
     /// every row's NULL bits and cells, against the relation's own schema.
-    ///
-    /// A write goes as [`SpanningWrite`] cuts it at [`Self::write_frame_bytes`]:
-    /// past it as several frames, which the server commits as one write.
+    /// A write goes as [`ClientTransport::write`] cuts it.
     pub(crate) fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
         let (to, sent) = promise();
-        let mut slot = Slot::Ack { tid: req.acked_tid(), to };
-        let Some((verb, families)) = req.write_families() else {
-            self.enqueue(|out| req.append(out), slot);
-            return sent;
+        // A control-only request: its verb, the relation it names, `arg0`, and its blob.
+        let none = Target::from(0);
+        let (verb, target, arg0, blob): (ClientVerb, Target, u64, &[u8]) = match req {
+            Request::AllocIds(n) => (ClientVerb::AllocIds, none, n, &[]),
+            Request::AllocSerial { table, count } => (ClientVerb::AllocSerialRange, table, count, &[]),
+            Request::SnapshotOpen => (ClientVerb::SnapshotOpen, none, 0, &[]),
+            Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, none, id, &[]),
+            Request::Backup(name) => (ClientVerb::Backup, none, 0, name.as_bytes()),
+            Request::DdlTxn(families) => {
+                let blocks = families.iter().map(|(family, b)| (*family, b.regions()));
+                self.enqueue(Slot::Ack { tid: 0, to }, |t| {
+                    t.frame(|out| multi_frame::encode_ddl_txn(out, blocks))
+                });
+                return sent;
+            }
+            Request::Push { target, batch, mode } => {
+                let family = PushFamily { target, batch, mode, basis: 0 };
+                self.enqueue(Slot::Ack { tid: target.tid, to }, |t| {
+                    t.write(ClientVerb::Push, smallvec::smallvec![family])
+                });
+                return sent;
+            }
+            Request::PushTxn(families) => {
+                let families = families.iter().cloned().collect();
+                self.enqueue(Slot::Ack { tid: 0, to }, |t| t.write(ClientVerb::PushTxn, families));
+                return sent;
+            }
         };
-        let ceiling = self.write_frame_bytes;
-        let queued = self.admit_with(|t| {
-            t.write(SpanningWrite::cut(verb, families, ceiling).map_err(oversize)?);
-            Ok(())
-        });
-        match queued {
-            Ok(()) => self.inbox.pending.push_back(slot),
-            Err(why) => slot.fail(why, &mut self.inbox.polls),
-        }
+        self.enqueue(
+            Slot::Ack { tid: target.tid, to },
+            control_frame(verb, target, arg0, blob),
+        );
         sent
     }
 
     /// RESOLVE — describe the relation named by the canonical
     /// `"schema_name.relation_name"`; `None` when there is none.
     pub(crate) fn submit_resolve(&mut self, qname: &str) -> Sent<Option<Arc<RelDescriptor>>> {
-        let hdr = ControlHeader::naming(ClientVerb::Resolve, Target::from(0), 0);
         let (to, sent) = promise();
-        self.enqueue(
-            |out| append_payload(out, hdr, qname.as_bytes(), None),
-            Slot::Resolve { to },
-        );
+        let frame = control_frame(ClientVerb::Resolve, Target::from(0), 0, qname.as_bytes());
+        self.enqueue(Slot::Resolve { to }, frame);
         sent
     }
 
@@ -588,13 +480,17 @@ impl Session {
         reply_schema: &Arc<Schema>,
     ) -> Sent<ScanReply> {
         let spec = spec.encode();
-        let item = scan_item(target, reply_schema, &spec);
+        let item = multi_frame::ScanItem {
+            target,
+            reply_layout: reply_schema.layout().layout_digest(),
+            spec: &spec,
+        };
         let (to, sent) = promise();
         let slot = Slot::Rows {
             train: Train::new(target.tid, reply_schema),
             to: RowsTo::Scan(to),
         };
-        self.enqueue(|out| multi_frame::encode_scan_multi(out, &[item]), slot);
+        self.enqueue(slot, |t| t.frame(|out| multi_frame::encode_scan_multi(out, &[item])));
         sent
     }
 
@@ -609,19 +505,21 @@ impl Session {
         limit: u64,
         reply_schema: &Arc<Schema>,
     ) -> Sent<SnapshotPage> {
-        let hdr = ControlHeader::naming(ClientVerb::SnapshotPage, Target::from(tid), snapshot);
         let request = gnitz_wire::snapshot::PageRequest {
             layout: reply_schema.layout().layout_digest(),
             limit,
             after: after.to_vec(),
-        };
+        }
+        .encode();
         let (to, sent) = promise();
         let slot = Slot::Rows {
             train: Train::new(tid, reply_schema),
             to: RowsTo::Page { worker_ends: Vec::new(), to },
         };
-        let request = request.encode();
-        self.enqueue(|out| append_payload(out, hdr, &request, None), slot);
+        self.enqueue(
+            slot,
+            control_frame(ClientVerb::SnapshotPage, Target::from(tid), snapshot, &request),
+        );
         sent
     }
 
@@ -635,7 +533,11 @@ impl Session {
         let items: Vec<multi_frame::ScanItem> = scans
             .iter()
             .zip(&specs)
-            .map(|(&(target, _, schema), spec)| scan_item(target, schema, spec))
+            .map(|(&(target, _, schema), spec)| multi_frame::ScanItem {
+                target,
+                reply_layout: schema.layout().layout_digest(),
+                spec,
+            })
             .collect();
         let mut next: Vec<Train> = (scans.iter().rev())
             .map(|&(target, _, schema)| Train::new(target.tid, schema))
@@ -652,7 +554,7 @@ impl Session {
                 to,
             },
         };
-        self.enqueue(|out| multi_frame::encode_scan_multi(out, &items), slot);
+        self.enqueue(slot, |t| t.frame(|out| multi_frame::encode_scan_multi(out, &items)));
         sent
     }
 
@@ -679,7 +581,9 @@ impl Session {
             reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
-        self.enqueue(|out| multi_frame::encode_delta_poll(out, &[item], keep), slot);
+        self.enqueue(slot, |t| {
+            t.frame(|out| multi_frame::encode_delta_poll(out, &[item], keep))
+        });
         sent
     }
 
@@ -699,10 +603,9 @@ impl Session {
         } else {
             u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
         };
-        let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms);
         let named = multi_frame::encode_held(polls.subs.keys().copied());
         let (mut to, sent) = promise();
-        match self.admit(|out| append_payload(out, hdr, &named, None)) {
+        match self.admit(control_frame(ClientVerb::SyncPushed, Target::from(0), wait_ms, &named)) {
             Ok(()) => {
                 self.inbox.syncing.push_back(to);
                 self.inbox.polls.server_holds = !self.inbox.polls.subs.is_empty();
@@ -761,39 +664,44 @@ impl Session {
             at: 0,
             first,
         };
-        self.enqueue(|out| multi_frame::encode_delta_poll(out, views, Some(first)), slot);
+        self.enqueue(slot, |t| {
+            t.frame(|out| multi_frame::encode_delta_poll(out, views, Some(first)))
+        });
     }
 
-    /// Queue the frame `encode` appends, whose reply `slot` reads. A request
-    /// this session refuses is answered with the refusal.
-    fn enqueue(&mut self, encode: impl FnOnce(&mut Vec<u8>), mut slot: Slot) {
-        match self.admit(encode) {
+    /// Queue one request — the frames `queue` puts on the transport — and the
+    /// `slot` its reply is read into. A request this session refuses is
+    /// answered with the refusal.
+    fn enqueue(&mut self, mut slot: Slot, queue: impl FnOnce(&mut ClientTransport) -> Result<(), usize>) {
+        match self.admit(queue) {
             Ok(()) => self.inbox.pending.push_back(slot),
             Err(why) => slot.fail(why, &mut self.inbox.polls),
         }
     }
 
-    /// Queue the frame `encode` appends on the transport, or the refusal this
-    /// session answers it with.
-    fn admit(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), ClientError> {
-        // A frame past the ceiling is refused here rather than by the server's
-        // ingress cap, which would drop the connection.
-        self.admit_with(|t| t.frame(encode).map_err(oversize))
-    }
-
     /// Queue one request's frames, which `queue` puts on the transport, or the
-    /// refusal this session answers it with.
-    fn admit_with(
-        &mut self,
-        queue: impl FnOnce(&mut ClientTransport) -> Result<(), ClientError>,
-    ) -> Result<(), ClientError> {
+    /// refusal this session answers it with: the session ended, a cap reached,
+    /// or a frame past the ceiling, refused with its size by `queue` — refused
+    /// here rather than by the server's ingress cap, which would drop the
+    /// connection.
+    fn admit(&mut self, queue: impl FnOnce(&mut ClientTransport) -> Result<(), usize>) -> Result<(), ClientError> {
         if let Some(why) = &self.ended {
             return Err(why.clone());
         }
-        if let Some(why) = self.cap_refusal() {
-            return Err(why);
+        if self.at_capacity() {
+            return Err(ClientError::from(if self.inbox.in_flight() >= MAX_IN_FLIGHT {
+                format!("connection has {MAX_IN_FLIGHT} requests in flight")
+            } else {
+                let queued = self.transport.queued_bytes();
+                format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
+            }));
         }
-        queue(&mut self.transport)?;
+        queue(&mut self.transport).map_err(|total| {
+            ClientError::from(format!(
+                "request frame is {total} bytes, exceeding the {}-byte server ingress cap; split the request",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            ))
+        })?;
         self.submitted += 1;
         Ok(())
     }
@@ -900,21 +808,6 @@ impl Session {
     /// bit, so gating on it loses no wakeup.
     pub(crate) fn at_capacity(&self) -> bool {
         self.inbox.in_flight() >= MAX_IN_FLIGHT || self.transport.queued_bytes() >= MAX_QUEUED_BYTES
-    }
-
-    /// The refusal [`Self::submit`] answers at a reached cap, if one is.
-    fn cap_refusal(&self) -> Option<ClientError> {
-        if !self.at_capacity() {
-            return None;
-        }
-        Some(ClientError::from(if self.inbox.in_flight() >= MAX_IN_FLIGHT {
-            format!("connection has {MAX_IN_FLIGHT} requests in flight")
-        } else {
-            format!(
-                "connection has {} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap",
-                self.transport.queued_bytes()
-            )
-        }))
     }
 
     /// `READ` while any request is unanswered; `WRITE` while bytes remain queued
@@ -1034,10 +927,11 @@ impl Slot {
                 // The frame is taken out of `buf`, so a frame the transport handed over whole
                 // becomes the batch.
                 let last = (ctrl.data.clone()).map(|block| FrameBlock { frame: std::mem::take(&mut buf), block });
+                let batch = train.finish(last)?;
                 match to {
-                    RowsTo::Scan(to) => to.fulfil(Ok(train.reply(last, Some(ctrl.hdr.arg0))?)),
+                    RowsTo::Scan(to) => to.fulfil(Ok(ScanReply { batch, lsn: Some(ctrl.hdr.arg0) })),
                     RowsTo::Scans { next, replies, to } => {
-                        replies.push(train.reply(last, Some(ctrl.hdr.arg0))?);
+                        replies.push(ScanReply { batch, lsn: Some(ctrl.hdr.arg0) });
                         if let Some(following) = next.pop() {
                             *train = following;
                             return Ok(false);
@@ -1045,7 +939,6 @@ impl Slot {
                         to.fulfil(Ok(std::mem::take(replies)))
                     }
                     RowsTo::Page { worker_ends, to } => {
-                        let batch = train.finish(last)?;
                         // The next page's rows are shared over the stores this one
                         // names, so a page naming none is no reply to a page request.
                         if worker_ends.is_empty() {
@@ -1056,11 +949,10 @@ impl Slot {
                     }
                     RowsTo::Delta { to, keep } => {
                         let cursor = cursor()?;
-                        let reply = train.reply(last, None)?;
                         if let Some(id) = *keep {
-                            polls.hold(id, Vec::new(), Ok(cursor));
+                            polls.kept(id, cursor);
                         }
-                        to.fulfil(Ok((reply, cursor)))
+                        to.fulfil(Ok((ScanReply { batch, lsn: None }, cursor)))
                     }
                 }
             }
@@ -1098,13 +990,15 @@ impl Slot {
     }
 }
 
-/// One SCAN_MULTI item: `target` read under `spec`, replied in `schema`'s layout.
-fn scan_item<'a>(target: Target, schema: &Schema, spec: &'a [u8]) -> multi_frame::ScanItem<'a> {
-    multi_frame::ScanItem {
-        target,
-        reply_layout: schema.layout().layout_digest(),
-        spec,
-    }
+/// The frame of a request that is its control block alone: `verb` naming
+/// `target`, with `arg0` and `blob`.
+fn control_frame(
+    verb: ClientVerb,
+    target: Target,
+    arg0: u64,
+    blob: &[u8],
+) -> impl FnOnce(&mut ClientTransport) -> Result<(), usize> + '_ {
+    move |t| t.frame(|out| append_frame(out, &ControlHeader::naming(verb, target, arg0), blob, None))
 }
 
 /// A reply frame naming a relation the head slot's position does not expect.

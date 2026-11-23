@@ -6,7 +6,8 @@
 //! that family.
 
 use gnitz_wire::{
-    CTRL_HEADER_SIZE, ClientVerb, ControlHeader, MAX_FRAME_PAYLOAD, Target, append_frame, encode_frame_head,
+    CTRL_HEADER_SIZE, ClientVerb, ControlHeader, MAX_FRAME_PAYLOAD, Target, WireConflictMode, append_frame,
+    encode_frame_head,
 };
 use gnitz_zset::repr::WireCut;
 use smallvec::SmallVec;
@@ -14,12 +15,22 @@ use std::sync::Arc;
 
 use crate::ZSetBatch;
 
-/// One family of a write: the item header each of its chunks carries, and its
-/// rows, whose schema's shape record each chunk carries too.
+/// One family of a write: a `PUSH`'s rows, or a maximal run of same-mode
+/// writes into `target` within a `PUSH_TXN`. Each of its chunks carries the
+/// item header these name, and its schema's shape record.
 #[derive(Clone)]
-pub(crate) struct WriteFamily {
-    pub(crate) hdr: ControlHeader,
+pub(crate) struct PushFamily {
+    /// The relation, under the descriptor token of the first of the family's
+    /// batches built from a descriptor; `0` while none was.
+    pub(crate) target: Target,
+    /// May still be shared with the caller that pushed it, so it is never
+    /// written in place.
     pub(crate) batch: Arc<ZSetBatch>,
+    pub(crate) mode: WireConflictMode,
+    /// A `PUSH_TXN` fails if `target` was written after `basis`, the oldest
+    /// watermark among the reads this family's writes were built from; `BLIND`
+    /// when none was. A `PUSH` carries `0`.
+    pub(crate) basis: u64,
 }
 
 /// One family's rows within a frame: a chunk of them, or `None` for a family
@@ -37,7 +48,7 @@ struct Chunk {
 /// at a time as a socket takes them.
 pub(crate) struct SpanningWrite {
     verb: ClientVerb,
-    families: SmallVec<[WriteFamily; 1]>,
+    families: SmallVec<[PushFamily; 1]>,
     /// Every frame's chunks, in send order.
     chunks: SmallVec<[Chunk; 1]>,
     /// Each frame, in send order: where its chunks end in `chunks`, and its
@@ -49,7 +60,7 @@ impl SpanningWrite {
     /// Cut `families` into frames of at most `ceiling` bytes, filling each
     /// before the next opens; `Err` with a frame's size where one row's
     /// frame is past [`MAX_FRAME_PAYLOAD`].
-    pub(crate) fn cut(verb: ClientVerb, families: SmallVec<[WriteFamily; 1]>, ceiling: usize) -> Result<Self, usize> {
+    pub(crate) fn cut(verb: ClientVerb, families: SmallVec<[PushFamily; 1]>, ceiling: usize) -> Result<Self, usize> {
         debug_assert!(matches!(verb, ClientVerb::Push | ClientVerb::PushTxn));
         debug_assert!(
             verb == ClientVerb::PushTxn || families.len() == 1,
@@ -137,7 +148,7 @@ impl SpanningWrite {
         for chunk in &self.chunks[first..end] {
             let f = &self.families[chunk.family];
             let (blob, view) = (f.batch.schema().shape_record(), f.batch.view());
-            let mut hdr = f.hdr;
+            let mut hdr = ControlHeader::item(self.verb, f.target, f.basis, f.mode);
             hdr.flags.continuation = more && !txn;
             let Some(rows) = chunk.rows.map(|cut| view.wire_cut(cut)) else {
                 append_frame(out, &hdr, blob, txn.then(|| view.regions()).as_deref());

@@ -190,12 +190,6 @@ impl GnitzClient {
 
     // ── Catalog and SERIAL ids ─────────────────────────────────────────────
 
-    /// Allocate `n` contiguous catalog object ids (schemas, relations or
-    /// indexes) and return the first.
-    pub(crate) async fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
-        self.ack(Request::AllocIds(n)).await
-    }
-
     /// Reserve `count` contiguous SERIAL ids for `table` and return the first,
     /// so an INSERT that knows its row count pays one round trip rather than
     /// `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
@@ -244,7 +238,7 @@ impl GnitzClient {
             let buffered = txn.push(target, batch, mode, BLIND);
             return self.wait(Sent::ready(buffered.map(|()| 0)));
         }
-        self.ack(Request::Push { target, batch: &batch, mode })
+        self.ack(Request::Push { target, batch, mode })
     }
 
     /// Run a parameterized bounded read on the server, replied in

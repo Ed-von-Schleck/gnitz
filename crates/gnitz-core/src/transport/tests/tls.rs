@@ -6,6 +6,7 @@ use crate::transport::poll_fd;
 use crate::{ClientError, Interest};
 use gnitz_wire::{CONNECT_TIMEOUT, framed};
 use std::io::ErrorKind;
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::sync::mpsc;
 use std::time::Duration;

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::ClientTransport;
-use crate::connection::PushFamily;
 use crate::transport::poll_fd;
+use crate::write_frames::PushFamily;
 use gnitz_wire::multi_frame::BLIND;
 use gnitz_wire::{ClientVerb, ControlHeader, Target, WireStatus, append_frame, peek_control_block};
 
@@ -23,9 +23,10 @@ fn spanning_session(srv: &ServerHandle) -> (GnitzClient, Session, u64, Arc<Schem
         &mut client,
         schema_of(&[("pk", TypeCode::I64), ("a", TypeCode::I64), ("b", TypeCode::I64)]),
     );
-    let mut s = Session::connect(srv.sock_path()).unwrap();
-    s.set_write_frame_bytes(FRAME_BYTES);
-    (client, s, tid, schema)
+    let until = Instant::now() + gnitz_wire::CONNECT_TIMEOUT;
+    let mut t = ClientTransport::connect(srv.sock_path(), until).unwrap();
+    t.set_write_frame_bytes(FRAME_BYTES);
+    (client, Session::over(t), tid, schema)
 }
 
 /// The answer to `req`, submitted on `s`.
@@ -34,8 +35,12 @@ fn answer(s: &mut Session, req: Request<'_>) -> Result<u64, ClientError> {
     drive(s, sent).0
 }
 
-fn push(tid: u64, batch: &Arc<ZSetBatch>, mode: WireConflictMode) -> Request<'_> {
-    Request::Push { target: tid.into(), batch, mode }
+fn push(tid: u64, batch: &Arc<ZSetBatch>, mode: WireConflictMode) -> Request<'static> {
+    Request::Push {
+        target: tid.into(),
+        batch: Arc::clone(batch),
+        mode,
+    }
 }
 
 /// A push of many frames commits whole; one whose key in its first frame is

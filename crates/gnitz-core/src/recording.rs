@@ -114,7 +114,7 @@ impl Tap {
             std::process::id()
         );
         let path = dir.join(name);
-        let mut recordings = RECORDINGS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut recordings = gnitz_foundation::sync::lock(&RECORDINGS);
         let recording = recordings.entry(path).or_insert_with_key(|path| {
             std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{RECORD_ENV}: create {}: {e}", dir.display()));
             let mut file =
@@ -137,7 +137,7 @@ impl Tap {
     pub(crate) fn note(&self, dir: Direction, frame: &[u8]) {
         let mut w = Writer::with_capacity(1 + 4 + 4 + frame.len());
         Recorded { conn: self.conn, dir, frame }.write(&mut w);
-        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        let mut file = gnitz_foundation::sync::lock(&self.file);
         file.write_all(&w.into_vec())
             .unwrap_or_else(|e| panic!("{RECORD_ENV}: a frame could not be recorded: {e}"));
     }

@@ -6,8 +6,6 @@
 //! and `read` encode and decode values; `reply` turns the other replies into
 //! Python objects; `schema` describes columns.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
-
 use pyo3::prelude::*;
 
 use gnitz_core::ClientError;
@@ -104,11 +102,6 @@ pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
         gnitz_sql::GnitzSqlError::Client(inner) => client_err(inner),
         internal @ gnitz_sql::GnitzSqlError::Internal(_) => gnitz_err(internal),
     }
-}
-
-/// A lock that guards plain state: a panic under it leaves that state whole.
-pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`, which

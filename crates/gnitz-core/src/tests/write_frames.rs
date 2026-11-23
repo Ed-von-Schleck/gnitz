@@ -29,15 +29,17 @@ fn string_rows(first: u64, n: u64) -> ZSetBatch {
     b
 }
 
-fn family(verb: ClientVerb, tid: u64, mode: WireConflictMode, basis: u64, batch: &ZSetBatch) -> WriteFamily {
-    WriteFamily {
-        hdr: ControlHeader::item(verb, Target { tid, token: tid + 100 }, basis, mode),
+fn family(tid: u64, mode: WireConflictMode, basis: u64, batch: &ZSetBatch) -> PushFamily {
+    PushFamily {
+        target: Target { tid, token: tid + 100 },
         batch: Arc::new(batch.clone()),
+        mode,
+        basis,
     }
 }
 
 /// `families`, cut as a write of `verb` at `ceiling`.
-fn cut(verb: ClientVerb, families: &[WriteFamily], ceiling: usize) -> Result<SpanningWrite, usize> {
+fn cut(verb: ClientVerb, families: &[PushFamily], ceiling: usize) -> Result<SpanningWrite, usize> {
     SpanningWrite::cut(verb, families.iter().cloned().collect(), ceiling)
 }
 
@@ -71,7 +73,7 @@ fn a_push_is_cut_into_whole_push_frames_at_row_boundaries() {
         kv_rows(&(0..1000).map(|pk| (pk, pk as i64, 1)).collect::<Vec<_>>()),
         string_rows(0, 300),
     ] {
-        let fams = [family(ClientVerb::Push, 7, WireConflictMode::Error, 0, &batch)];
+        let fams = [family(7, WireConflictMode::Error, 0, &batch)];
         let ceiling = 4096;
         let write = cut(ClientVerb::Push, &fams, ceiling).unwrap();
         let frames = encoded(&write);
@@ -103,10 +105,10 @@ fn a_push_txn_is_cut_into_whole_txn_frames_keeping_family_order() {
     let empty = ZSetBatch::new(&kv_schema(TypeCode::I64));
     let c = string_rows(10, 400);
     let fams = [
-        family(ClientVerb::PushTxn, 1, WireConflictMode::Update, 11, &a),
-        family(ClientVerb::PushTxn, 2, WireConflictMode::Error, 12, &b),
-        family(ClientVerb::PushTxn, 3, WireConflictMode::Update, 13, &empty),
-        family(ClientVerb::PushTxn, 2, WireConflictMode::Update, 14, &c),
+        family(1, WireConflictMode::Update, 11, &a),
+        family(2, WireConflictMode::Error, 12, &b),
+        family(3, WireConflictMode::Update, 13, &empty),
+        family(2, WireConflictMode::Update, 14, &c),
     ];
     let ceiling = 8192;
     let write = cut(ClientVerb::PushTxn, &fams, ceiling).unwrap();
@@ -122,8 +124,8 @@ fn a_push_txn_is_cut_into_whole_txn_frames_keeping_family_order() {
         for item in decode_items(f, ctrl.body.clone(), ClientVerb::PushTxn).unwrap() {
             let basis = item.hdr.arg0;
             let fam = &fams[(basis - 11) as usize];
-            assert_eq!(item.hdr.target(), fam.hdr.target());
-            assert_eq!(item.hdr.flags.conflict_mode, fam.hdr.flags.conflict_mode);
+            assert_eq!(item.hdr.target(), fam.target);
+            assert_eq!(item.hdr.flags.conflict_mode, fam.mode);
             let schema = [&a, &b, &empty, &c][(basis - 11) as usize].schema();
             let rows = rows_of(f, &item, schema);
             match got.last_mut() {
@@ -146,7 +148,7 @@ fn a_push_txn_is_cut_into_whole_txn_frames_keeping_family_order() {
 #[test]
 fn a_row_past_the_ceiling_goes_alone_unless_past_the_frame_cap() {
     let batch = string_rows(0, 3);
-    let fams = [family(ClientVerb::Push, 7, WireConflictMode::Update, 0, &batch)];
+    let fams = [family(7, WireConflictMode::Update, 0, &batch)];
     let write = cut(ClientVerb::Push, &fams, 1).unwrap();
     assert_eq!(write.frames(), 3, "a frame per row");
 
@@ -155,7 +157,7 @@ fn a_row_past_the_ceiling_goes_alone_unless_past_the_frame_cap() {
         .begin_row(1, 1)
         .put_string(&"x".repeat(MAX_FRAME_PAYLOAD))
         .put_int(1);
-    let fams = [family(ClientVerb::Push, 7, WireConflictMode::Update, 0, &wide)];
+    let fams = [family(7, WireConflictMode::Update, 0, &wide)];
     let refused = cut(ClientVerb::Push, &fams, 4096).err();
     assert!(refused.is_some_and(|size| size > MAX_FRAME_PAYLOAD), "{refused:?}");
 }
@@ -168,9 +170,9 @@ fn an_empty_family_fits_its_frame_at_every_ceiling() {
     let a = kv_rows(&(0..20).map(|pk| (pk, pk as i64, 1)).collect::<Vec<_>>());
     let empty = ZSetBatch::new(&kv_schema(TypeCode::I64));
     let fams = [
-        family(ClientVerb::PushTxn, 1, WireConflictMode::Update, 11, &a),
-        family(ClientVerb::PushTxn, 2, WireConflictMode::Update, 12, &empty),
-        family(ClientVerb::PushTxn, 1, WireConflictMode::Update, 13, &a),
+        family(1, WireConflictMode::Update, 11, &a),
+        family(2, WireConflictMode::Update, 12, &empty),
+        family(1, WireConflictMode::Update, 13, &a),
     ];
     for ceiling in 200..2000 {
         let write = cut(ClientVerb::PushTxn, &fams, ceiling).unwrap();
@@ -191,7 +193,7 @@ fn an_empty_family_fits_its_frame_at_every_ceiling() {
 #[test]
 fn an_empty_push_goes_without_a_data_block() {
     let empty = ZSetBatch::new(&kv_schema(TypeCode::I64));
-    let fams = [family(ClientVerb::Push, 7, WireConflictMode::Update, 0, &empty)];
+    let fams = [family(7, WireConflictMode::Update, 0, &empty)];
     let write = cut(ClientVerb::Push, &fams, 1).unwrap();
     let frames = encoded(&write);
     assert_eq!(frames.len(), 1);

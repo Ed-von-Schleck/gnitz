@@ -280,14 +280,8 @@ pub struct RowMark {
     heap: usize,
 }
 
-/// The rows of the WAL block `data` a server wrote, under `schema`, read in place and
-/// validated as the engine validates a block a peer wrote.
-fn checked_wal_block<'a>(data: &'a [u8], schema: &'a Schema) -> Result<MemBatch<'a>, ProtocolError> {
-    MemBatch::of_foreign_wal_block(data, schema.layout()).map_err(wal_error)
-}
-
 /// A WAL block's validation failure as a reply's decode error.
-fn wal_error(e: &str) -> ProtocolError {
+pub(crate) fn wal_error(e: &str) -> ProtocolError {
     ProtocolError::DecodeError(format!("WAL {e}"))
 }
 
@@ -320,8 +314,10 @@ pub(crate) fn decode_wal_blocks(
         (0, Some(last)) => last,
         (1, None) => held.pop().expect("one held block"),
         (_, last) => {
+            // Each block read in place, validated as the engine validates a block a
+            // peer wrote.
             let views = (held.iter().chain(last.as_ref()))
-                .map(|b| checked_wal_block(b.bytes(), schema))
+                .map(|b| MemBatch::of_foreign_wal_block(b.bytes(), schema.layout()).map_err(wal_error))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(ZSetBatch::of(
                 schema,

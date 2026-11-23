@@ -58,7 +58,7 @@ impl Held {
                 // Held across the exit, so a main that ends meanwhile waits on
                 // it in `drop` and the signal's status is the one the process
                 // exits with.
-                let mut server = held.lock().unwrap_or_else(|e| e.into_inner());
+                let mut server = gnitz_foundation::sync::lock(&held);
                 drop(server.take());
                 std::process::exit(128 + signal);
             }
@@ -74,7 +74,7 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        drop(self.server.lock().unwrap_or_else(|e| e.into_inner()).take());
+        drop(gnitz_foundation::sync::lock(&self.server).take());
     }
 }
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use gnitz_core::Job;
 
-use crate::lock;
+use gnitz_foundation::sync::lock;
 
 /// How long a thread waits for its next job before it ends.
 const IDLE: Duration = Duration::from_secs(10);

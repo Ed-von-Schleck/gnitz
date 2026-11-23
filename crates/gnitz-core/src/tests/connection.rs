@@ -193,7 +193,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     let oversize = Arc::new(oversize);
     let req = Request::Push {
         target: 4.into(),
-        batch: &oversize,
+        batch: Arc::clone(&oversize),
         mode: WireConflictMode::Update,
     };
     assert!(matches!(s.submit(req).try_take(), Some(Err(_))));
@@ -230,7 +230,7 @@ fn replies_completed_before_a_fatal_frame_are_delivered() {
     let mut a = s.submit(COMMIT);
     let push = Request::Push {
         target: 5.into(),
-        batch: &rows,
+        batch: Arc::clone(&rows),
         mode: WireConflictMode::Update,
     };
     let mut b = s.submit(push);
@@ -326,7 +326,7 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     let push = |s: &mut Session| {
         let push = Request::Push {
             target: 4.into(),
-            batch: &b,
+            batch: Arc::clone(&b),
             mode: WireConflictMode::Update,
         };
         s.submit(push).try_take()
@@ -1164,16 +1164,16 @@ fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
 #[test]
 fn a_write_past_the_ceiling_goes_as_several_frames_a_frame_at_a_time() {
     let (mut s, peer) = pair();
-    s.set_write_frame_bytes(1024);
+    s.transport.set_write_frame_bytes(1024);
     let rows = |base: u64| {
         Arc::new(kv_rows(
             &(base..base + 200).map(|pk| (pk, pk as i64, 1)).collect::<Vec<_>>(),
         ))
     };
     let (a, b, small) = (rows(0), rows(1000), Arc::new(batch_a(&[1, 2])));
-    let push = |batch| Request::Push {
+    let push = |batch: &Arc<ZSetBatch>| Request::Push {
         target: 4.into(),
-        batch,
+        batch: Arc::clone(batch),
         mode: WireConflictMode::Update,
     };
     let first = s.submit(push(&a));
@@ -1228,12 +1228,11 @@ fn a_write_past_the_ceiling_goes_as_several_frames_a_frame_at_a_time() {
 
 /// The one frame `req`, a write within the frame ceiling, goes as.
 fn one_frame(req: Request<'_>) -> Vec<u8> {
-    let (verb, families) = req.write_families().expect("a write");
-    let write = SpanningWrite::cut(verb, families, gnitz_wire::MAX_FRAME_PAYLOAD).unwrap();
-    assert_eq!(write.frames(), 1);
-    let mut out = Vec::new();
-    write.encode(0, &mut out);
-    out
+    let (mut s, peer) = pair();
+    drop(s.submit(req));
+    s.step(Interest::WRITE);
+    assert!(!s.transport.wants_write(), "one frame, written whole");
+    peer.recv()
 }
 
 /// A write within the ceiling is the one frame the wire's own encoders write
@@ -1254,16 +1253,14 @@ fn a_write_within_the_ceiling_is_the_wire_encoders_frame() {
         family(batch_b(&[3])),
     ];
     let (rows, empty) = (Arc::new(batch_b(&[1, 2, 3])), Arc::new(ZSetBatch::new(&schema)));
-    let push = |batch| Request::Push {
+    let push = |batch: &Arc<ZSetBatch>| Request::Push {
         target: 3.into(),
-        batch,
+        batch: Arc::clone(batch),
         mode: WireConflictMode::Update,
     };
-    let mut hdr = ControlHeader::naming(ClientVerb::Push, 3.into(), 0);
-    hdr.flags.conflict_mode = WireConflictMode::Update;
+    let hdr = ControlHeader::item(ClientVerb::Push, 3.into(), 0, WireConflictMode::Update);
     for batch in [&rows, &empty] {
-        let mut want = Vec::new();
-        append_payload(&mut want, hdr, schema.shape_record(), Some(&**batch));
+        let want = encode_frame(hdr, schema.shape_record(), Some(&**batch));
         assert_eq!(one_frame(push(batch)), want);
     }
     let items: Vec<_> = (families.iter())

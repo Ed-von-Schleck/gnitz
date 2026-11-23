@@ -4,6 +4,7 @@
 use super::*;
 use crate::BlockingHost;
 use crate::block_on;
+use crate::connection::Request;
 use crate::test_support::{
     Peer, client_pair, delta_frame, delta_terminal, encode_frame, interrupt_self_until, kv_rows, kv_schema,
     pushed_train, rel, reply_ctrl, reply_status, sync_answer, sync_header, sync_held,
@@ -586,7 +587,7 @@ fn a_read_abandoned_mid_train_applies_nothing() {
         id
     });
     // Behind the rest of the abandoned train and the pushed one.
-    assert_eq!(block_on(client.alloc_ids(1)).unwrap(), 4242);
+    assert_eq!(block_on(client.ack(Request::AllocIds(1))).unwrap(), 4242);
     let gone = client.session.take_pushed(abandoned).expect_err("dropped");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
     poll(&mut client);
@@ -1083,7 +1084,7 @@ fn a_train_behind_another_reply_waits_for_its_poll() {
         peer.expect_sync("the poll");
         peer.send(&sync_answer(None));
     });
-    assert_eq!(block_on(client.alloc_ids(1)).unwrap(), 4242);
+    assert_eq!(block_on(client.ack(Request::AllocIds(1))).unwrap(), 4242);
     assert!(log.take().is_empty(), "a copy moves only in a poll");
     poll(&mut client);
     h.join().unwrap();
@@ -1398,7 +1399,7 @@ fn a_sync_over_an_untaken_train_asks_for_no_hold() {
         peer.send(&sync_answer(None));
         hdr.arg0
     });
-    assert_eq!(block_on(client.alloc_ids(1)).unwrap(), 4242);
+    assert_eq!(block_on(client.ack(Request::AllocIds(1))).unwrap(), 4242);
     let synced = block_on(client.sync(Duration::from_secs(30))).unwrap();
     assert_eq!(synced.mirrored.len(), 2);
     assert_eq!(h.join().unwrap(), 0, "no hold in front of a train already here");
@@ -1430,7 +1431,7 @@ fn a_sync_at_the_in_flight_cap_waits_for_room() {
     let (mut client, peer, log, subs) = subscribed();
     let (sub, peer) = subscribe_reader(&mut client, peer);
     let detached: Vec<_> = (0..crate::connection::MAX_IN_FLIGHT)
-        .map(|_| client.ack(crate::connection::Request::AllocIds(1)).detach())
+        .map(|_| client.ack(Request::AllocIds(1)).detach())
         .collect();
     assert!(client.session.at_capacity());
     let h = std::thread::spawn(move || {

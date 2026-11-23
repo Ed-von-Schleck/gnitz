@@ -18,10 +18,11 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
-use gnitz_wire::{AuthStatus, Deframer, HelloError};
+use gnitz_wire::{AuthStatus, ClientVerb, Deframer, HelloError};
+use smallvec::SmallVec;
 
 use crate::recording::{Direction, Tap};
-use crate::write_frames::SpanningWrite;
+use crate::write_frames::{PushFamily, SpanningWrite};
 use crate::{ClientError, ProtocolError};
 
 mod tls;
@@ -45,6 +46,10 @@ pub struct ClientTransport {
     owed_bytes: usize,
     /// Where this connection records its frames, when its process records.
     tap: Option<Tap>,
+    /// The payload bytes past which a write is cut into several frames
+    /// (`GNITZ_WRITE_FRAME_BYTES`, at most and by default
+    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`]).
+    write_frame_bytes: usize,
 }
 
 /// Bytes one socket read can take, short of a read straight into a payload.
@@ -56,34 +61,6 @@ enum Inner {
 }
 
 impl Inner {
-    /// The non-blocking write core: hand `bytes` to the sink and report how
-    /// many of them it accepted. The Unix arm writes them as one `writev`
-    /// slice, so a syscall trace tells the transport's writes apart from a
-    /// `write` to stdout and a `sendto` to a self-pipe.
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<Option<usize>, ProtocolError> {
-        match self {
-            Inner::Unix(s) => write_nonblocking(|| (&*s).write_vectored(&[IoSlice::new(bytes)])),
-            Inner::Tls(t) => t.write_bytes(bytes),
-        }
-    }
-
-    /// Ciphertext rustls still holds for the socket. Always false on the Unix
-    /// arm, which has no second outbound source beneath the queue.
-    fn has_pending_ciphertext(&self) -> bool {
-        match self {
-            Inner::Unix(_) => false,
-            Inner::Tls(t) => t.conn.wants_write(),
-        }
-    }
-
-    /// Ship queued ciphertext without waiting; a no-op on the Unix arm.
-    fn ship_ciphertext(&mut self) -> Result<(), ProtocolError> {
-        match self {
-            Inner::Unix(_) => Ok(()),
-            Inner::Tls(t) => t.ship(),
-        }
-    }
-
     fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
             Inner::Unix(s) => s.as_fd(),
@@ -231,6 +208,11 @@ impl ClientTransport {
             owed: VecDeque::new(),
             owed_bytes: 0,
             tap: None,
+            write_frame_bytes: gnitz_foundation::env::env_num_in(
+                "GNITZ_WRITE_FRAME_BYTES",
+                gnitz_wire::MAX_FRAME_PAYLOAD,
+                1..=gnitz_wire::MAX_FRAME_PAYLOAD,
+            ),
         }
     }
 
@@ -345,10 +327,21 @@ impl ClientTransport {
         Ok(())
     }
 
-    /// Queue `write`'s frames behind everything already queued, each encoded
-    /// once what is ahead of it is written; its first at once when nothing
-    /// is owed ahead of it.
-    pub(crate) fn write(&mut self, write: SpanningWrite) {
+    /// Cut writes into frames of at most `bytes`.
+    #[cfg(test)]
+    pub(crate) fn set_write_frame_bytes(&mut self, bytes: usize) {
+        self.write_frame_bytes = bytes;
+    }
+
+    /// Queue a write of `verb` into `families` behind everything already
+    /// queued, as [`SpanningWrite`] cuts it at the write frame ceiling: past
+    /// it as several frames, which the server commits as one write, each
+    /// encoded once what is ahead of it is written — its first at once when
+    /// nothing is owed ahead of it. A frame past
+    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`] is refused with its length, and
+    /// nothing is queued.
+    pub(crate) fn write(&mut self, verb: ClientVerb, families: SmallVec<[PushFamily; 1]>) -> Result<(), usize> {
+        let write = SpanningWrite::cut(verb, families, self.write_frame_bytes)?;
         let mut next = 0;
         if self.owed.is_empty() {
             let first = self.queue.frame(self.tap.as_ref(), |out| write.encode(0, out));
@@ -358,6 +351,7 @@ impl ClientTransport {
         if next < write.frames() {
             self.owed.push_back(Owed::Write { write, next });
         }
+        Ok(())
     }
 
     /// Move what is owed next into the written queue; false when nothing is.
@@ -389,11 +383,26 @@ impl ClientTransport {
     /// left is reported by `wants_write`.
     pub fn flush(&mut self) -> Result<(), ProtocolError> {
         loop {
-            self.inner.ship_ciphertext()?;
-            if self.inner.has_pending_ciphertext() || (self.queue.is_empty() && !self.refill()) {
+            if let Inner::Tls(t) = &mut self.inner {
+                t.ship()?;
+                // rustls takes more plaintext only once its ciphertext is out.
+                if t.conn.wants_write() {
+                    return Ok(());
+                }
+            }
+            if self.queue.is_empty() && !self.refill() {
                 return Ok(());
             }
-            match self.inner.write_bytes(self.queue.pending())? {
+            let bytes = self.queue.pending();
+            // The Unix arm writes `bytes` as one `writev` slice, so a syscall
+            // trace tells the transport's writes apart from a `write` to stdout
+            // and a `sendto` to a self-pipe. On TLS, rustls takes a prefix of
+            // them, held as plaintext until the handshake completes.
+            let wrote = match &mut self.inner {
+                Inner::Unix(s) => write_nonblocking(|| (&*s).write_vectored(&[IoSlice::new(bytes)]))?,
+                Inner::Tls(t) => write_nonblocking(|| t.conn.writer().write(bytes))?,
+            };
+            match wrote {
                 Some(n) => self.queue.advance(n),
                 None => return Ok(()),
             }
@@ -406,11 +415,11 @@ impl ClientTransport {
         self.queue.pending().len() + self.owed_bytes
     }
 
-    /// Frames queued, or ciphertext pending: the `WRITE` half of a driver's
-    /// interest. On TLS the ciphertext can outlast the queue that emptied into
-    /// it.
+    /// Frames queued, or ciphertext rustls still holds for the socket: the
+    /// `WRITE` half of a driver's interest. On TLS the ciphertext can outlast
+    /// the queue that emptied into it.
     pub fn wants_write(&self) -> bool {
-        !self.queue.is_empty() || !self.owed.is_empty() || self.inner.has_pending_ciphertext()
+        !self.queue.is_empty() || !self.owed.is_empty() || matches!(&self.inner, Inner::Tls(t) if t.conn.wants_write())
     }
 
     /// Shut the socket down so the peer sees EOF, and drop every queued frame.

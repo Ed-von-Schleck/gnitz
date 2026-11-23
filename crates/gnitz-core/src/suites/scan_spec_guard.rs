@@ -37,5 +37,5 @@ fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {
 
     // The error frame is non-continuation, so the connection is still usable for
     // a full round trip.
-    block_on(client.alloc_ids(1)).unwrap();
+    block_on(client.ack(Request::AllocIds(1))).unwrap();
 }
