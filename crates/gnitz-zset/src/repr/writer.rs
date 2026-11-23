@@ -119,6 +119,18 @@ impl<'a> DirectWriter<'a> {
         self.region_mut(REG_NULL_BMP)
     }
 
+    /// Payload column `pi`'s null bit of each `(row, null)` of `rows`, set where
+    /// `null` and cleared elsewhere.
+    #[inline(always)]
+    pub fn set_null_bits(&mut self, pi: usize, rows: impl Iterator<Item = (usize, bool)>) {
+        let (byte, bit) = (pi / 8, 1u8 << (pi % 8));
+        let words = self.null_bmp_mut().as_chunks_mut::<8>().0;
+        for (row, null) in rows {
+            let b = &mut words[row][byte];
+            *b = (*b & !bit) | if null { bit } else { 0 };
+        }
+    }
+
     /// The PK, weight and null-word regions, each bounded to this writer's rows.
     #[inline]
     pub fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {

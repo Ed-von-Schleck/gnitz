@@ -12,7 +12,7 @@ use crate::rules::require_column;
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::ScalarEval;
-use gnitz_wire::{ColType, FixedInt, Heap, TypeCode, null_word_get, null_word_set};
+use gnitz_wire::{ColType, FixedInt, Heap, TypeCode, null_word_get};
 use gnitz_zset::repr::{StringDest, relocated_cell};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr};
 
@@ -221,7 +221,7 @@ pub(super) fn apply_set(
                         w.col_mut(pi).as_chunks_mut::<{ size_of::<T>() }>().0.fill(cell);
                     });
                 }
-                set_null_bits(w.null_bmp_mut(), pi, |_| *null);
+                w.set_null_bits(pi, (0..w.rows()).map(|r| (r, *null)));
             }),
             SetRhs::Copy { scope, src } => {
                 let b = scoped(*scope).view();
@@ -232,12 +232,12 @@ pub(super) fn apply_set(
                     if def.ty.tc.is_german_string() && matches!(scope, Scope::Excluded) {
                         w.rebase_string_col(pi, Heap::Plain(b.blob()), StringDest::Placed(None));
                     }
-                    set_null_bits(w.null_bmp_mut(), pi, |r| null_word_get(b.get_null_word(r), *src));
+                    w.set_null_bits(pi, (0..w.rows()).map(|r| (r, null_word_get(b.get_null_word(r), *src))));
                 });
             }
             SetRhs::Expr { scope, ev } => new.rewrite(|w| {
                 w.col_mut(pi).fill(0);
-                set_null_bits(w.null_bmp_mut(), pi, |_| false);
+                w.set_null_bits(pi, (0..w.rows()).map(|r| (r, false)));
                 ev.write_slot(&scoped(*scope).view(), w, pi, def.ty.tc).map_err(|v| {
                     GnitzSqlError::rejected(format!("column '{}': {} value out of range: {v}", def.name, def.ty))
                 })
@@ -256,15 +256,6 @@ pub(super) fn apply_set(
     }
     new.fill_weights(1);
     Ok(new)
-}
-
-/// Null bit `pi` of each row's word in `nulls` set to `null` of the row.
-fn set_null_bits(nulls: &mut [u8], pi: usize, null: impl Fn(usize) -> bool) {
-    for (r, word) in nulls.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-        let mut w = u64::from_le_bytes(*word);
-        null_word_set(&mut w, pi, null(r));
-        *word = w.to_le_bytes();
-    }
 }
 
 #[cfg(test)]

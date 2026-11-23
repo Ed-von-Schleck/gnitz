@@ -909,11 +909,7 @@ impl AggValues {
                     }
                 }
             }
-            set_null_bits(
-                w.null_bmp_mut(),
-                pi,
-                rows.clone().map(|(row, g)| (row, !self.has[at(g)])),
-            );
+            w.set_null_bits(pi, rows.clone().map(|(row, g)| (row, !self.has[at(g)])));
         }
     }
 
@@ -1038,18 +1034,6 @@ fn put_cells_at(col: &mut [u8], size: usize, values: impl Iterator<Item = (usize
             cells[row] = (v as T).to_le_bytes();
         }
     })
-}
-
-/// Payload column `pi`'s bit in the null word of each `(row, null)` of `rows`,
-/// set where `null` and cleared elsewhere.
-#[inline(always)]
-fn set_null_bits(null_bmp: &mut [u8], pi: usize, rows: impl Iterator<Item = (usize, bool)>) {
-    let (byte, bit) = (pi / 8, 1u8 << (pi % 8));
-    let words = null_bmp.as_chunks_mut::<8>().0;
-    for (row, null) in rows {
-        let b = &mut words[row][byte];
-        *b = (*b & !bit) | if null { bit } else { 0 };
-    }
 }
 
 /// [`fold_cells`] over `($vals, $mb, $src, $ranges, $groups)`, the source
