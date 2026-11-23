@@ -27,6 +27,10 @@ const PROBE_BYTES: usize = 16 << 10;
 /// table may code a batch before one trained on that batch replaces it.
 const DRIFT_SIXTEENTHS: usize = 1;
 
+/// The most a coded heap may take, in sixteenths of its values' plain bytes,
+/// for coding it to pay for decoding every value read.
+pub(super) const PAYING_SIXTEENTHS: usize = 12;
+
 /// One symbol table, as the encoder a writer codes values with and the table a
 /// reader decodes them through.
 pub struct Codebook {
@@ -70,6 +74,14 @@ impl Codebook {
         self.trained_sixteenths
     }
 
+    /// Whether the table codes its training values to a heap that pays for
+    /// decoding them: a writer codes under it only then. One that does not is
+    /// still worth holding, so a store whose values code no better is not
+    /// trained again on each run it writes.
+    pub fn pays(&self) -> bool {
+        self.trained_sixteenths <= PAYING_SIXTEENTHS
+    }
+
     /// What the table codes values spread evenly over `values`, about
     /// `PROBE_BYTES` of them, to, in sixteenths of their plain bytes.
     fn probe_sixteenths(&self, values: &[&[u8]]) -> usize {
@@ -83,10 +95,11 @@ impl Codebook {
         (16 * codes.len()).div_ceil(plain.max(1))
     }
 
-    /// The codebook a store holding `current` codes `batch`'s heap under:
-    /// `current` while it codes the batch's long values within
-    /// `DRIFT_SIXTEENTHS` of how it coded its own training values, else one
-    /// trained on them; `None` while they are too few to pay for a table.
+    /// The codebook a store holding `current` writes `batch`'s heap with:
+    /// `current`, unless the batch's long values drifted past
+    /// `DRIFT_SIXTEENTHS` from how it coded its training values, or `current`
+    /// does not [pay](Self::pays) yet codes them well enough to; then one
+    /// trained on them. `None` while they are too few to pay for a table.
     pub fn for_batch(current: Option<&Rc<Codebook>>, batch: &Batch) -> Option<Rc<Codebook>> {
         let blob = batch.blob();
         // Each long value once per cell naming it.
@@ -97,17 +110,17 @@ impl Codebook {
         if values.iter().map(|v| v.len()).sum::<usize>() < MIN_CODED_HEAP {
             return None;
         }
-        match current {
-            Some(book) if book.probe_sixteenths(&values) <= book.trained_sixteenths + DRIFT_SIXTEENTHS => {
-                Some(Rc::clone(book))
-            }
-            _ => {
-                // A table trained on `values`.
-                let mut book = Self::of_encoder(fsst::Compressor::train(&values), 0);
-                book.trained_sixteenths = book.probe_sixteenths(&values);
-                Some(Rc::new(book))
+        if let Some(book) = current {
+            let probe = book.probe_sixteenths(&values);
+            let drifted = probe > book.trained_sixteenths + DRIFT_SIXTEENTHS;
+            let would_pay = !book.pays() && probe <= PAYING_SIXTEENTHS;
+            if !drifted && !would_pay {
+                return Some(Rc::clone(book));
             }
         }
+        let mut book = Self::of_encoder(fsst::Compressor::train(&values), 0);
+        book.trained_sixteenths = book.probe_sixteenths(&values);
+        Some(Rc::new(book))
     }
 }
 

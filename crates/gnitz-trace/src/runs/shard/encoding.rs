@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use super::codebook::Codebook;
+use super::codebook::{Codebook, PAYING_SIXTEENTHS};
 use gnitz_expr::{Level, null_bits};
 use gnitz_wire::{
     CodedHeap, FixedInt, GERMAN_INLINE_OFF, Heap, HeapValue, MAX_PK_COLUMNS, MAX_SYMBOL_LEN, MAX_SYMBOLS,
@@ -1092,10 +1092,9 @@ impl<'a> HeapWriter<'a> {
     }
 
     /// Whether the heap is coded and its image, table included, holds more than
-    /// three quarters of the bytes its values take: a saving that small does
-    /// not pay for decoding every value read.
+    /// `PAYING_SIXTEENTHS` of the bytes its values take.
     pub(crate) fn coding_lost(&self) -> bool {
-        self.coded.is_some() && self.bytes.len() > self.plain_len / 4 * 3
+        self.coded.is_some() && 16 * self.bytes.len() > PAYING_SIXTEENTHS * self.plain_len
     }
 
     /// The heap's region: its encoding and image.

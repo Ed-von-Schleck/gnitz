@@ -570,6 +570,14 @@ pub fn prose(i: usize) -> String {
     s
 }
 
+/// Base64's alphabet: random characters of it code under no symbol table.
+pub const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `n` characters drawn uniformly from `alphabet`.
+pub fn random_chars(rng: &mut gnitz_foundation::rng::Rng, alphabet: &[u8], n: usize) -> String {
+    (0..n).map(|_| char::from(rng.pick(alphabet))).collect()
+}
+
 /// Strings that are prefixes of one another, one escaping `0x00`, and two that
 /// share more leading bytes than an index key's lead slot holds.
 pub(crate) const STRS: [&str; 10] = [

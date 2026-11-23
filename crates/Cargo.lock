@@ -974,6 +974,7 @@ name = "gnitz-zset-testkit"
 version = "0.1.8"
 dependencies = [
  "gnitz-expr",
+ "gnitz-foundation",
  "gnitz-wire",
  "gnitz-zset",
  "proptest",

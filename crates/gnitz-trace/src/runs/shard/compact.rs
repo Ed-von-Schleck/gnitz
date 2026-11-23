@@ -173,7 +173,7 @@ impl GuardMerge {
     }
 
     /// Merge the next destination's rows into one run; `None` when every row
-    /// cancelled. Long values are coded under `codebook` where given; those of
+    /// cancelled. Long values are coded under `codebook` where it pays; those of
     /// a shard of the same table keep their codes.
     ///
     /// Out of line: inlined into a caller, the payload comparator drops out of
@@ -185,8 +185,8 @@ impl GuardMerge {
             *start = w.end;
         }
         self.next += 1;
-        // A skeleton run holds no string.
-        let codebook = codebook.filter(|_| !self.skeleton);
+        // A skeleton run holds no string; a table that does not pay codes none.
+        let codebook = codebook.filter(|b| !self.skeleton && b.pays());
         let batch = match self.in_order(&windows) {
             Some(order) => self.concat(&windows, &order, codebook),
             None => self.merged(windows, codebook),

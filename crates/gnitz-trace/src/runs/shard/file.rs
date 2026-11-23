@@ -226,8 +226,8 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
 pub struct ShardWriteOpts<'a> {
     /// Write no PK filter.
     pub skip_pk_filter: bool,
-    /// Code the heap under this codebook where that pays (see
-    /// `HeapWriter::coding_lost`).
+    /// Code the heap under this codebook where it [pays](Codebook::pays) and
+    /// the coded heap does (see `HeapWriter::coding_lost`).
     pub codebook: Option<&'a Codebook>,
 }
 
@@ -289,7 +289,7 @@ pub(crate) fn write_shard_over(
             })
             .collect()
     };
-    let mut heap = opts.codebook.map_or_else(HeapWriter::plain, HeapWriter::coded);
+    let mut heap = (opts.codebook.filter(|b| b.pays())).map_or_else(HeapWriter::plain, HeapWriter::coded);
     let mut strings = pack_strings(&mut heap);
     if heap.coding_lost() {
         heap = HeapWriter::plain();

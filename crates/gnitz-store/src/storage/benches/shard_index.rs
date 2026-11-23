@@ -361,3 +361,90 @@ fn compaction_amplification_bench() {
         }
     }
 }
+
+/// A compressing store against a plain twin, over scattered spills of one long
+/// STRING value per row through every fold the upkeep owes: per value shape,
+/// the codebook it holds and how well that codes, the shards written coded,
+/// the bytes resident, and instructions per spilled row to spill and keep up.
+/// The last shape turns from values no table codes to ones a table codes well
+/// halfway through.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn compressed_upkeep_bench() {
+    use gnitz_foundation::perf::Counter;
+    use gnitz_wire::TypeCode;
+    use gnitz_zset::repr::BatchBuilder;
+    use gnitz_zset::schema::SchemaColumn;
+    use gnitz_zset_testkit::{BASE64, prose, random_chars, u64_pk_schema};
+    const RUN_ROWS: u64 = 8192;
+    const KEYSPACE: u64 = 200_000_000;
+    const RUNS: u64 = 200;
+    const HEX: &[u8] = b"0123456789abcdef";
+    // Label, and the value of key `k` in run `run`.
+    type Shape = (&'static str, fn(u64, u64, &mut Rng) -> String);
+    let shapes: [Shape; 6] = [
+        ("prose", |_, k, _| prose(k as usize)),
+        ("sha256 hex", |_, _, rng| random_chars(rng, HEX, 64)),
+        ("uuid text", |_, _, rng| {
+            let [a, b, c, d, e] = [8, 4, 4, 4, 12].map(|n| random_chars(rng, HEX, n));
+            format!("{a}-{b}-{c}-{d}-{e}")
+        }),
+        ("json with a token", |_, k, rng| {
+            format!(
+                r#"{{"user_id":{k},"session":"{}","active":true}}"#,
+                random_chars(rng, BASE64, 22)
+            )
+        }),
+        ("base64 token", |_, _, rng| random_chars(rng, BASE64, 43)),
+        ("base64, then prose", |run, k, rng| match run < RUNS / 2 {
+            true => random_chars(rng, BASE64, 43),
+            false => prose(k as usize),
+        }),
+    ];
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::String, false),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let counter = Counter::instructions();
+    for (label, value) in shapes {
+        for compress in [false, true] {
+            let dir = tmp.path().join(format!("{label}, {compress}"));
+            let recovery = RecoverySource::Rederive { resume_at: None };
+            let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, recovery, None, compress).unwrap();
+            let mut rng = Rng::new(0x5EED_1234);
+            let (mut spill, mut upkeep, mut rows) = (0, 0, 0);
+            for run in 0..RUNS {
+                let mut keys: Vec<u64> = (0..RUN_ROWS).map(|_| rng.gen_range(KEYSPACE)).collect();
+                keys.sort_unstable();
+                keys.dedup();
+                let mut b = BatchBuilder::new(&schema);
+                for k in keys {
+                    b.begin_row(k as u128, 1);
+                    b.put_int(k as u128);
+                    b.put_string(&value(run, k, &mut rng));
+                    b.end_row();
+                }
+                let batch = b.finish();
+                rows += batch.len();
+                spill += counter.measure(|| idx.append_l0_run(&batch).unwrap()).1;
+                upkeep += counter.measure(|| idx.maintain(u64::MAX).unwrap()).1;
+            }
+            let coded = idx.all_entries().filter(|e| e.shard.heap().plain().is_none()).count();
+            let book = (idx.codebook.as_ref()).map_or("none".to_string(), |b| {
+                format!("{}/16, pays {}", b.trained_sixteenths(), b.pays())
+            });
+            println!(
+                "compressed_upkeep_bench {label}, compress={compress}: codebook {book}, {coded} of {} shards coded, \
+                 {} B resident",
+                idx.shard_count(),
+                idx.resident_bytes(),
+            );
+            println!(
+                "  {:.1} instr/row to spill and {:.1} to keep up",
+                spill as f64 / rows as f64,
+                upkeep as f64 / rows as f64,
+            );
+        }
+    }
+}

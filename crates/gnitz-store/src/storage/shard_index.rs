@@ -286,9 +286,9 @@ pub(super) struct ShardIndex {
     /// `WITH (compress = true)`: the store codes its shards' heaps under a
     /// symbol table where that pays.
     compress: bool,
-    /// The table a compressing store codes under: the one its newest coded
-    /// shard was written under, until a spill its codes drift from trains
-    /// another.
+    /// The table a compressing store writes its runs with: at open, the one its
+    /// newest coded shard was written under; then the one
+    /// [`Codebook::for_batch`] picks for each plain run the store writes.
     codebook: Option<Rc<Codebook>>,
     /// What the in-place guard folds so far cancelled per retraction they read.
     cancel_yield: CancelYield,
@@ -522,8 +522,8 @@ impl ShardIndex {
 
     /// Write a shard named by a fresh seq through `write`, handed its path and
     /// the store's options, and open it; `newest` defaults to that seq. A
-    /// compressing store codes `plain`, rows whose heap holds their values
-    /// verbatim, under the codebook [`Codebook::for_batch`] picks for them, and
+    /// compressing store writes `plain`, rows whose heap holds their values
+    /// verbatim, with the codebook [`Codebook::for_batch`] picks for them, and
     /// adopts it as its own; none for a run too small to code.
     fn write_with(
         &mut self,
@@ -750,7 +750,7 @@ impl ShardIndex {
         let merged = run.merge.next(codebook.as_deref());
         // +1: a destination whose rows all cancelled still costs a step.
         let read = run.merge.bytes_merged() - before + 1;
-        // A run the merge left plain is coded under a codebook of its own.
+        // A run the merge left plain picks a codebook of its own.
         let written = merged.map(|merged| {
             self.write_with(merged.plain(), Some(run.fold.newest), |path, opts| {
                 merged.write_as_shard(path, opts)
