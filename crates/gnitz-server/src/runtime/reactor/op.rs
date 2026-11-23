@@ -13,6 +13,7 @@ use super::*;
 const OP_SLOT_MASK: u64 = 0xFFFF_FFFF;
 
 /// Every one-shot op in flight.
+#[derive(Default)]
 pub(super) struct Ops {
     /// Each op's slot, freed by the later of its CQE and its awaiter's end
     /// (taking the result, or being dropped), and then reused.
@@ -34,13 +35,6 @@ enum OpSlot {
 }
 
 impl Ops {
-    pub(super) fn new() -> Self {
-        Ops {
-            slots: RefCell::new(Slab::new()),
-            pushed: Cell::new(0),
-        }
-    }
-
     /// Slots held: ops in flight, and results no awaiter has taken.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
@@ -97,7 +91,7 @@ impl<C: 'static> Op<C> {
     pub(super) fn cancel(&self) {
         let sqe = opcode::AsyncCancel::new(self.user_data).build();
         // SAFETY: the SQE names no memory.
-        unsafe { self.reactor.ring.borrow_mut().push(sqe, udata(KIND_CANCEL, 0)) };
+        unsafe { self.reactor.push(sqe, udata(KIND_CANCEL, 0)) };
     }
 }
 
@@ -144,7 +138,7 @@ impl Reactor {
     /// its awaiter, which yields the CQE `res` and `carry`. Not submitted.
     ///
     /// # Safety
-    /// As [`IoUringRing::push`]; what `carry` holds counts as valid until the CQE.
+    /// As [`ReactorShared::push`]; what `carry` holds counts as valid until the CQE.
     /// `sqe` posts exactly one CQE: [`Ops::complete`] finds an op's slot by its
     /// low bits alone, so a second CQE would complete the slot's next op early
     /// and free that op's carry while its SQE still reads it.
@@ -155,7 +149,7 @@ impl Reactor {
         self.ops.pushed.set(pushed);
         let user_data = udata(KIND_OP, pushed << OP_SLOT_MASK.count_ones() | slot);
         // SAFETY: forwarded to the caller.
-        unsafe { self.ring.borrow_mut().push(sqe, user_data) };
+        unsafe { self.push(sqe, user_data) };
         Op {
             reactor: self.clone(),
             user_data,
@@ -172,7 +166,7 @@ impl Reactor {
             .build();
         // SAFETY: `fd` is open for the process's life; the SQE names no memory.
         let op = unsafe { self.push_op(sqe, ()) };
-        self.ring.borrow_mut().submit();
+        self.submit();
         op.await.0
     }
 

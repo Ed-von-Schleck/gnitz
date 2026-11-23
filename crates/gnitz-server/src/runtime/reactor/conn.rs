@@ -51,7 +51,18 @@ pub(crate) struct Limits {
 impl Limits {
     /// The server's, resolved from the environment.
     pub(crate) fn from_env() -> Limits {
-        let inbound_cap = resolve_inbound_cap();
+        // A quarter of the process memory budget within the bounds below, or a
+        // `GNITZ_INBOUND_MEM_BYTES` no lower than the floor. A fraction of the
+        // *actual* budget scales with the deployment where a flat constant would
+        // OOM a mid-size box yet never trip in a small container. The floor
+        // admits at least one max-size frame on even a tiny budget; the ceiling
+        // caps the default on a large box, where a quarter of RAM would be an
+        // excessive inbound reserve.
+        const INBOUND_CAP_FLOOR: usize = MAX_FRAME_PAYLOAD;
+        const INBOUND_CAP_CEIL: usize = 4 << 30;
+        let host = gnitz_foundation::host::available_memory_bytes();
+        let default = (host / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
+        let inbound_cap = gnitz_foundation::env::env_num_in("GNITZ_INBOUND_MEM_BYTES", default, INBOUND_CAP_FLOOR..);
         let max_conns = gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256);
         Limits {
             inbound_cap,
@@ -70,23 +81,6 @@ impl Limits {
             ),
         }
     }
-}
-
-/// Lower/upper bounds on the global inbound-memory cap (see
-/// [`resolve_inbound_cap`]). The floor guarantees even a tiny memory budget
-/// admits at least one max-size frame; the ceiling caps the default on a
-/// large box where a quarter of RAM would be an excessive inbound reserve.
-const INBOUND_CAP_FLOOR: usize = gnitz_wire::MAX_FRAME_PAYLOAD;
-const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
-
-/// The global inbound-memory ceiling, resolved once at startup: a quarter of the
-/// process memory budget within the bounds above, or a `GNITZ_INBOUND_MEM_BYTES`
-/// no lower than the floor. A fraction of the *actual* budget scales with the deployment where a
-/// flat constant would OOM a mid-size box yet never trip in a small container.
-fn resolve_inbound_cap() -> usize {
-    let host = gnitz_foundation::host::available_memory_bytes();
-    let default = (host / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
-    gnitz_foundation::env::env_num_in("GNITZ_INBOUND_MEM_BYTES", default, INBOUND_CAP_FLOOR..)
 }
 
 /// A capped running total. Each [`Charge`] counts toward it until dropped.
@@ -309,22 +303,8 @@ impl ClientConn {
         self.sock.fd.as_raw_fd()
     }
 
-    /// `shutdown(SHUT_RDWR)`: errors out a pending recv or send on the socket, which
-    /// `close` would not. Never closes the fd; a peer already gone is not an error.
-    fn shutdown(&self) {
-        // SAFETY: the connection's own fd, open while `self` lives; shutdown
-        // reads or writes no memory.
-        unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) };
-    }
-
     fn is_gone(&self) -> bool {
         self.end.get() != End::Open
-    }
-
-    /// The client closed its sending side. Frames already queued are still
-    /// delivered, and replies still go out.
-    fn end_recv(&self) {
-        self.q.borrow_mut().frames.close();
     }
 
     /// Finish the connection and discard the frames it queued. The socket stays
@@ -340,11 +320,14 @@ impl ClientConn {
     }
 
     /// [`Self::retire`], and shut the socket down now: the client is owed
-    /// nothing more.
+    /// nothing more. `shutdown(SHUT_RDWR)` errors out a pending recv or send on
+    /// the socket, which `close` would not; a peer already gone is not an error.
     fn fail(&self) {
         self.retire();
         self.end.set(End::Shut);
-        self.shutdown();
+        // SAFETY: the connection's own fd, open while `self` lives; shutdown
+        // reads or writes no memory.
+        unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) };
     }
 
     /// Next frame, or `None` once the recv side has ended and is drained. What
@@ -510,7 +493,7 @@ impl Armed {
     /// a plain socket, so a large payload lands in place, else into the carry.
     /// The entry's `key` rides the udata id, so the completion routes back to
     /// it. Not flushed (see the module header).
-    fn arm(&mut self, key: usize, ring: &mut IoUringRing) {
+    fn arm(&mut self, key: usize, reactor: &Reactor) {
         let fd = self.conn.fd();
         let w = match self.conn.session {
             None => self.deframer.window(&mut self.carry),
@@ -523,7 +506,7 @@ impl Armed {
         // connection (so `fd`); nothing cancels a recv by its user_data, so the
         // key needs no generation. The reactor's drop cancels the recv ahead of
         // dropping the entry.
-        unsafe { ring.push(sqe, udata(KIND_RECV, key as u64)) };
+        unsafe { reactor.push(sqe, udata(KIND_RECV, key as u64)) };
     }
 
     /// The recv [`Self::arm`] queued landed `n` bytes: queue the frames they
@@ -624,7 +607,7 @@ impl Reactor {
                 carry,
                 deframer: Deframer::default(),
             })
-            .arm(key, &mut self.ring.borrow_mut());
+            .arm(key, self);
         Peer {
             reactor: self.clone(),
             conn,
@@ -636,34 +619,31 @@ impl Reactor {
     pub(super) fn handle_recv_cqe(&self, key: usize, res: i32) {
         let mut recvs = self.conns.recvs.borrow_mut();
         let armed = recvs.get_mut(key).expect("a recv's entry lives until its CQE");
-        let end = if armed.conn.is_gone() {
+        let end = match res {
             // Retired while this recv was in flight: its bytes are discarded.
-            None
-        } else {
-            match res {
-                ..0 => Some(RecvEnd::Socket),
-                0 => Some(RecvEnd::PeerClosed),
-                n => {
-                    // SAFETY: this CQE completes the recv `arm` queued, and `n`
-                    // counts the bytes it wrote.
-                    let ingested = unsafe { armed.ingest(n as usize) };
-                    let over = armed.conn.q.borrow().over(self.conns.limits.conn_inbound_share);
-                    match ingested {
-                        // Not re-armed: the socket's bytes stay in the kernel, whose
-                        // flow control holds the client off.
-                        Ok(()) if over => return self.conns.paused.borrow_mut().push(key),
-                        Ok(()) => return armed.arm(key, &mut self.ring.borrow_mut()),
-                        Err(end) => Some(end),
-                    }
+            _ if armed.conn.is_gone() => None,
+            ..0 => Some(RecvEnd::Socket),
+            0 => Some(RecvEnd::PeerClosed),
+            // SAFETY: this CQE completes the recv `arm` queued, and `n` counts
+            // the bytes it wrote.
+            n => match unsafe { armed.ingest(n as usize) } {
+                Err(end) => Some(end),
+                // Not re-armed: the socket's bytes stay in the kernel, whose
+                // flow control holds the client off.
+                Ok(()) if armed.conn.q.borrow().over(self.conns.limits.conn_inbound_share) => {
+                    return self.conns.paused.borrow_mut().push(key);
                 }
-            }
+                Ok(()) => return armed.arm(key, self),
+            },
         };
         let armed = recvs.remove(key);
         let Some(end) = end else { return };
         let fd = armed.conn.fd();
         if let RecvEnd::PeerClosed = end {
             gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
-            return armed.conn.end_recv();
+            // The client closed its sending side. Frames already queued are
+            // still delivered, and replies still go out.
+            return armed.conn.q.borrow_mut().frames.close();
         }
         gnitz_warn!(
             "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
@@ -700,7 +680,7 @@ impl Reactor {
             if armed.conn.q.borrow().over(share) {
                 return true;
             }
-            armed.arm(key, &mut self.ring.borrow_mut());
+            armed.arm(key, self);
             false
         });
     }

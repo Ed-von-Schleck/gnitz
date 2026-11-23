@@ -79,11 +79,10 @@ impl Reactor {
             && until.is_none_or(|at| at > Instant::now())
             && (self.parked.get() || self.arm_park());
         if sleep {
-            // Measured after the arm, whose drain takes time of its own.
-            let timeout = until.map(|at| at.saturating_duration_since(Instant::now()));
-            self.ring.borrow_mut().wait(timeout);
+            // The timeout is measured after the arm, whose drain takes time of its own.
+            self.wait(until);
         } else {
-            self.ring.borrow_mut().submit();
+            self.submit();
         }
     }
 
@@ -103,7 +102,7 @@ impl Reactor {
                 let sqe = opcode::FutexWait::new(word.cast(), at as u64, mask, FUTEX2_SIZE_U32).build();
                 // SAFETY: the word is in a never-unmapped shared mapping, and the
                 // SQE names no other memory.
-                unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_PARK, 0)) };
+                unsafe { self.push(sqe, udata(KIND_PARK, 0)) };
                 self.parked.set(true);
                 return true;
             }
@@ -131,43 +130,41 @@ impl Reactor {
         }
     }
 
-    /// Drain all CQEs pending in the ring and route each through `dispatch_cqe`.
+    /// Drain all CQEs pending in the ring, each to what its kind names.
     fn dispatch_cqes(&self) {
         let mut buf = [const { MaybeUninit::<cqueue::Entry>::uninit() }; 64];
         loop {
-            // `fill`'s slice borrows `buf`, not the ring, so dispatch can re-borrow it.
-            let cqes = self.ring.borrow_mut().fill(&mut buf);
+            // The slice borrows `buf`, not the ring, so dispatch can re-borrow it.
+            let cqes: &[_] = self.ring.borrow_mut().completion().fill(&mut buf);
             for e in cqes {
-                self.dispatch_cqe(e.user_data(), e.result());
+                let (user_data, res) = (e.user_data(), e.result());
+                match user_data >> KIND_SHIFT {
+                    KIND_PARK => {
+                        // No drain here: the pass's own drain follows CQE dispatch.
+                        // The boot's `check_host` saw the opcode supported, so these
+                        // are a malformed wait, which no later pass repairs.
+                        if res == -libc::ENOSYS || res == -libc::EINVAL {
+                            gnitz_fatal_abort!(
+                                "reactor: IORING_OP_FUTEX_WAIT failed: {}",
+                                std::io::Error::from_raw_os_error(-res)
+                            );
+                        }
+                        // No disarm: a take clears the arm. A CQE with no take
+                        // behind it, such as a late wake from an earlier take,
+                        // leaves the arm set, and the next `arm` sets it again and
+                        // re-tests the rings.
+                        self.parked.set(false);
+                    }
+                    KIND_OP => self.ops.complete(user_data, res),
+                    KIND_RECV => self.handle_recv_cqe((user_data & ID_MASK) as usize, res),
+                    KIND_CANCEL => {}
+                    kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
+                }
             }
             // A short read proves the ring is empty.
             if cqes.len() < 64 {
                 break;
             }
-        }
-    }
-
-    fn dispatch_cqe(&self, user_data: u64, res: i32) {
-        match user_data >> KIND_SHIFT {
-            KIND_PARK => {
-                // No drain here: the pass's own drain follows CQE dispatch.
-                // The boot's `check_host` saw the opcode supported, so these are
-                // a malformed wait, which no later pass repairs.
-                if res == -libc::ENOSYS || res == -libc::EINVAL {
-                    gnitz_fatal_abort!(
-                        "reactor: IORING_OP_FUTEX_WAIT failed: {}",
-                        std::io::Error::from_raw_os_error(-res)
-                    );
-                }
-                // No disarm: a take clears the arm. A CQE with no take behind it,
-                // such as a late wake from an earlier take, leaves the arm set,
-                // and the next `arm` sets it again and re-tests the rings.
-                self.parked.set(false);
-            }
-            KIND_OP => self.ops.complete(user_data, res),
-            KIND_RECV => self.handle_recv_cqe((user_data & ID_MASK) as usize, res),
-            KIND_CANCEL => {}
-            kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
         }
     }
 }

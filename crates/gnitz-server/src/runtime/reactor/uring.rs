@@ -1,18 +1,17 @@
-//! The reactor's io_uring wrapper: queue, submit, wait, drain.
+//! The reactor's ring: the host check, and every `io_uring_enter` the reactor
+//! makes — queueing and submitting SQEs, the loop's wait, and the drop's cancel.
+
+use std::time::Instant;
 
 use gnitz_foundation::gnitz_warn;
-use std::mem::MaybeUninit;
-use std::time::Duration;
 
-use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
+use io_uring::{IoUring, Probe, opcode, squeue, types};
 
-/// The ring's SQ entries. This sets submit batching, not depth: [`IoUringRing::push`]
+use super::ReactorShared;
+
+/// The ring's SQ entries. This sets submit batching, not depth: [`ReactorShared::push`]
 /// flushes a full SQ.
 pub(super) const SQ_ENTRIES: u32 = 256;
-
-pub(super) struct IoUringRing {
-    ring: IoUring,
-}
 
 /// The one answer to an `io_uring_enter` result.
 fn entered(rc: std::io::Result<usize>) {
@@ -70,63 +69,58 @@ pub(crate) fn check_host() -> Result<(), String> {
     ))
 }
 
-impl IoUringRing {
-    pub(super) fn new() -> std::io::Result<Self> {
-        Ok(IoUringRing { ring: IoUring::new(SQ_ENTRIES)? })
-    }
-
+impl ReactorShared {
     /// Queue `sqe` under `user_data`, first submitting the pending batch if the SQ
     /// is full.
     ///
     /// # Safety
     /// Every buffer and fd `sqe` names stays valid until its CQE, or until
     /// [`Self::cancel_all`], after which nothing is pushed or submitted.
-    pub(super) unsafe fn push(&mut self, sqe: squeue::Entry, user_data: u64) {
-        if self.ring.submission().is_full() {
-            self.submit();
+    pub(super) unsafe fn push(&self, sqe: squeue::Entry, user_data: u64) {
+        let mut ring = self.ring.borrow_mut();
+        if ring.submission().is_full() {
+            entered(ring.submit());
         }
         // SAFETY: forwarded to the caller.
-        if unsafe { self.ring.submission().push(&sqe.user_data(user_data)) }.is_err() {
+        if unsafe { ring.submission().push(&sqe.user_data(user_data)) }.is_err() {
             gnitz_fatal_abort!("reactor: the SQ is full and the kernel refused its submit");
         }
     }
 
     /// Submit pending SQEs without waiting. No syscall when the SQ is empty and no
     /// completion overflowed.
-    pub(super) fn submit(&mut self) {
-        let sq = self.ring.submission();
+    pub(super) fn submit(&self) {
+        let mut ring = self.ring.borrow_mut();
+        let sq = ring.submission();
         if sq.is_empty() && !sq.cq_overflow() {
             return;
         }
         drop(sq);
-        entered(self.ring.submit());
+        entered(ring.submit());
     }
 
-    /// Submit pending SQEs and wait for one CQE, for at most `timeout`.
-    pub(super) fn wait(&mut self, timeout: Option<Duration>) {
-        entered(match timeout {
-            None => self.ring.submitter().submit_and_wait(1),
-            Some(d) => {
-                let ts = types::Timespec::from(d);
-                let args = types::SubmitArgs::new().timespec(&ts);
-                self.ring.submitter().submit_with_args(1, &args)
+    /// Submit pending SQEs and wait for one CQE, or until `until` passes.
+    pub(super) fn wait(&self, until: Option<Instant>) {
+        let ring = self.ring.borrow();
+        entered(match until {
+            None => ring.submitter().submit_and_wait(1),
+            Some(at) => {
+                let ts = types::Timespec::from(at.saturating_duration_since(Instant::now()));
+                ring.submitter()
+                    .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
             }
         });
-    }
-
-    /// Pop up to `buf.len()` completed CQEs. No syscall.
-    pub(super) fn fill<'a>(&mut self, buf: &'a mut [MaybeUninit<cqueue::Entry>]) -> &'a [cqueue::Entry] {
-        self.ring.completion().fill(buf)
     }
 
     /// Cancel every submitted op, after which the kernel touches nothing their
     /// SQEs name. The ring's last use: an SQE still queued is never submitted.
     /// An op already running in the kernel's worker pool (an fsync) runs on,
     /// and names no memory.
-    pub(super) fn cancel_all(&mut self) {
+    pub(super) fn cancel_all(&self) {
         // NotFound when nothing is in flight.
         let _ = self
             .ring
+            .borrow()
             .submitter()
             .register_sync_cancel(None, types::CancelBuilder::any());
     }

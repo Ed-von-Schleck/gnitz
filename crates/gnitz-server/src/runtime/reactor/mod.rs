@@ -10,7 +10,7 @@
 //! the W2M park, CQE dispatch), `op` (one-shot ops), `lease` (W2M ingest, the
 //! applied level it raises and the leases it routes to), `conn` (client
 //! connections, their limits, and the `Peer` a connection's task sends and
-//! receives through), `timer` (deadlines) and `uring` (the ring).
+//! receives through), `timer` (deadlines) and `uring` (the ring and its syscalls).
 //!
 //! The reactor reads the W2M rings (`w2m`, `park`) and shares the task
 //! primitives of `sync`; it names nothing that schedules work on it (`sal`,
@@ -24,10 +24,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 
-use io_uring::{opcode, types};
+use io_uring::{IoUring, opcode, types};
 use slab::Slab;
-
-use self::uring::IoUringRing;
 
 use crate::runtime::sync::Level;
 use crate::runtime::w2m::W2mReceiver;
@@ -73,7 +71,7 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 /// The state behind every [`Reactor`] handle.
 pub(crate) struct ReactorShared {
-    ring: RefCell<IoUringRing>,
+    ring: RefCell<IoUring>,
     /// Live tasks; a task's waker key is its slot plus one. A slot holds `None`
     /// while its task is polled, and is freed for reuse when it completes.
     tasks: RefCell<Slab<Option<Task>>>,
@@ -94,7 +92,7 @@ pub(crate) struct ReactorShared {
 /// every field's own drop.
 impl Drop for ReactorShared {
     fn drop(&mut self) {
-        self.ring.get_mut().cancel_all();
+        self.cancel_all();
     }
 }
 
@@ -112,10 +110,10 @@ impl std::ops::Deref for Reactor {
 impl Reactor {
     pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
         Ok(Reactor(Rc::new(ReactorShared {
-            ring: RefCell::new(IoUringRing::new()?),
+            ring: RefCell::new(IoUring::new(uring::SQ_ENTRIES)?),
             tasks: RefCell::new(Slab::new()),
             parked: Cell::new(false),
-            ops: op::Ops::new(),
+            ops: op::Ops::default(),
             timers: timer::Timers::new(),
             routes: RefCell::new(lease::Routes::new()),
             applied: Level::default(),

@@ -42,16 +42,6 @@ impl Routes {
             spare: Vec::new(),
         }
     }
-
-    /// A request id no live lease holds.
-    fn fresh_id(&mut self) -> RequestId {
-        let mut id = self.next_id;
-        while self.trains.contains_key(&id) {
-            id = id.next();
-        }
-        self.next_id = id.next();
-        id
-    }
 }
 
 /// The undecoded frames of one [`TrainLease`]; each pins its ring space until
@@ -152,7 +142,12 @@ impl Reactor {
                 .spare
                 .pop()
                 .unwrap_or_else(|| (0..nw).map(|_| VecDeque::new()).collect());
-            let id = routes.fresh_id();
+            // A request id no live lease holds.
+            let mut id = routes.next_id;
+            while routes.trains.contains_key(&id) {
+                id = id.next();
+            }
+            routes.next_id = id.next();
             routes.trains.insert(
                 id,
                 TrainRoute {
