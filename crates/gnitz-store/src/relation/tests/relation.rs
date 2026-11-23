@@ -234,7 +234,8 @@ fn an_index_leading_the_pk_reads_the_owners_rows() {
         assert!(ix.reads_owner_pk(), "{cols:?}");
         assert!(!Path::new(&dir(cols)).exists(), "{cols:?} keeps no store");
         let ix_schema = ix.key_spec().index_schema(&schema);
-        let want = index_entries(&rel.full_scan(), ix.key_spec(), &ix_schema);
+        // An owner row's entry is its PK.
+        let want = rel.full_scan();
         let k = ix.key_spec().key_size();
         let entries: Vec<&[u8]> = (0..want.len()).map(|i| want.get_pk_bytes(i)).collect();
 

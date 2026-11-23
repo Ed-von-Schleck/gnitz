@@ -85,13 +85,8 @@ impl RelationRegistry {
                 continue;
             }
             let key_spec = KeySpec::new(cols.as_slice(), &schema).map_err(|e| index_fault(owner.id(), cols, e))?;
-            let store = match schema.pk_cols().starts_with(cols.as_slice()) {
-                true => {
-                    // The span of a PK column is its OPK bytes, so the entry's span
-                    // is the owner PK's leading bytes.
-                    debug_assert_eq!(key_spec.key_size(), schema.pk_prefix_stride(cols.as_slice().len()));
-                    IndexStore::OwnerPk
-                }
+            let store = match key_spec.leads_pk() {
+                true => IndexStore::OwnerPk,
                 false => IndexStore::NotHeld,
             };
             declared.push(SecondaryIndex {

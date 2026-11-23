@@ -140,10 +140,16 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
         let span_schema = spec.span_schema();
         assert_eq!(span_schema, pk_only_schema(&types), "{s:?} {cols:?}");
         let span_cols: Vec<u32> = (0..cols.len() as u32).collect();
-        let src_pk = s.pk_columns().map(|c| c.type_code);
+        let src_pk: Vec<TypeCode> = s.pk_columns().map(|c| c.type_code).collect();
         let index = spec.index_schema(&s);
-        assert_eq!(index, pk_only_schema(&[types.clone(), src_pk.collect()].concat()));
-        assert_eq!(index.pk_stride(), spec.key_size() + s.pk_stride(), "{s:?} {cols:?}");
+        assert_eq!(spec.leads_pk(), s.pk_cols().starts_with(&cols), "{s:?} {cols:?}");
+        // A key leading the PK is the PK's leading bytes, so its entry is the PK alone.
+        let (entry_cols, span_size) = match spec.leads_pk() {
+            true => (src_pk, 0),
+            false => ([types.clone(), src_pk].concat(), spec.key_size()),
+        };
+        assert_eq!(index, pk_only_schema(&entry_cols), "{s:?} {cols:?}");
+        assert_eq!(index.pk_stride(), span_size + s.pk_stride(), "{s:?} {cols:?}");
 
         let key = |row: usize| -> Option<Vec<u128>> { cols.iter().map(|&c| natives[row][c as usize]).collect() };
         let mut spans: Vec<(Vec<u128>, Vec<u8>)> = Vec::new();

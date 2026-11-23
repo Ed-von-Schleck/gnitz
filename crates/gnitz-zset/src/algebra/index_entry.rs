@@ -15,6 +15,9 @@ pub struct KeySpec {
     /// The null bits of the span's payload columns: a row with any of them set
     /// is unindexed.
     null_mask: u64,
+    /// Whether the columns lead the owner's PK, so a row's span is its PK's
+    /// leading bytes and its entry is its PK alone.
+    leads_pk: bool,
 }
 
 impl KeySpec {
@@ -27,16 +30,30 @@ impl KeySpec {
         })
         .map_err(|rule| format!("Index: {}", rule.for_role(PkListRole::ColumnList)))?;
         let locs = cols.iter().map(|&c| owner.locate(c as usize));
-        Ok(KeySpec {
+        let spec = KeySpec {
             null_mask: locs.clone().fold(0, |mask, loc| mask | loc.null_bit()),
             packer: KeyPacker::of_span(locs),
-        })
+            leads_pk: owner.pk_cols().starts_with(cols),
+        };
+        // The span of a PK column is its OPK bytes.
+        debug_assert!(!spec.leads_pk || spec.key_size() == owner.pk_prefix_stride(cols.len()));
+        Ok(spec)
     }
 
-    /// The index schema this spec's entries land in: the key columns, then
-    /// `source`'s PK columns, all in the PK.
+    /// Whether the columns lead the owner's PK: an entry is then the owner's
+    /// PK, whose leading bytes are its span, and no store of entries is kept.
+    pub fn leads_pk(&self) -> bool {
+        self.leads_pk
+    }
+
+    /// The schema of this spec's entries, all in the PK: the key columns, then
+    /// `source`'s PK columns; only the latter where the key [leads
+    /// it](Self::leads_pk).
     pub fn index_schema(&self, source: &SchemaDescriptor) -> SchemaDescriptor {
-        let mut b = self.key_columns();
+        let mut b = match self.leads_pk {
+            true => DerivedSchema::new(),
+            false => self.key_columns(),
+        };
         b.push_pk_of(source);
         b.finish().expect("KeySpec::new bounds the index schema")
     }
@@ -71,11 +88,12 @@ impl KeySpec {
         Some(key)
     }
 
-    /// Split an index entry `[span ‖ source PK]` at `key_size()`; nothing is
+    /// Split an index entry into its span and its source PK; nothing is
     /// decoded.
     pub fn split_entry<'a>(&self, entry: &'a [u8]) -> (&'a [u8], &'a [u8]) {
-        debug_assert!(entry.len() > self.key_size(), "index entry shorter than its span");
-        entry.split_at(self.key_size())
+        debug_assert!(entry.len() >= self.key_size(), "index entry shorter than its span");
+        let (span, rest) = entry.split_at(self.key_size());
+        (span, if self.leads_pk { entry } else { rest })
     }
 }
 
@@ -99,8 +117,9 @@ pub fn extend_spans(out: &mut Vec<u8>, mb: &MemBatch<'_>, spec: &KeySpec) {
 }
 
 /// Each nonzero-weight row of `source` that `spec` indexes, as its index entry
-/// `[span ‖ source PK]` at that row's weight, in source order. A row NULL in an
-/// indexed column has no entry.
+/// `[span ‖ source PK]` at that row's weight, in source order, for a `spec`
+/// that does not [lead the PK](KeySpec::leads_pk). A row NULL in an indexed
+/// column has no entry.
 pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
     /// Copy each `runs` row's PK behind its entry's span: `W` bytes, or
     /// `src_stride` where `W = 0`.
@@ -123,6 +142,7 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
         }
     }
 
+    debug_assert!(!spec.leads_pk, "an entry that is its source PK is never written");
     let (idx_stride, key_size) = (idx_schema.pk_stride(), spec.key_size());
     let src_stride = source.schema().pk_stride();
     assert_eq!(idx_stride, key_size + src_stride, "index schema of another spec");

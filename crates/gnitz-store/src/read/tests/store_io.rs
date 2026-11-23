@@ -114,11 +114,8 @@ fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
         let relation = r.relation(TID).unwrap();
         let (mut read, unapplied) = relation.open_read(keys(), u64::MAX).unwrap();
         assert_eq!(unapplied, None);
-        let gather = match &read.0 {
-            Source::Keyed { gather, walk: None } => gather,
-            _ => panic!("{kind:?}: a key list is a listed gather"),
-        };
-        assert_eq!(matches!(gather, KeyGather::Unique(_)), probed, "{kind:?}");
+        assert!(read.walk.is_none(), "{kind:?}: a key list is a listed gather");
+        assert_eq!(matches!(read.source, Source::Unique(_)), probed, "{kind:?}");
         let mut sealed = relation.open_sealed(keys(), u64::MAX).unwrap();
         assert_eq!(drain_all(&mut read, 2), rows([2, 7]), "{kind:?}");
         assert_eq!(drain_all(&mut sealed, 2), rows([2, 7]), "{kind:?}");
@@ -587,16 +584,10 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
         _ => relation.open_read(range(), read).unwrap().0,
     };
     for label in ["index range", "unique pk set", "unique index range"] {
-        let shape = match open(label, u64::MAX).0 {
-            Source::Keyed {
-                gather: KeyGather::Merge(_),
-                walk: Some(_),
-            } => "index range",
-            Source::Keyed { gather: KeyGather::Unique(_), walk: None } => "unique pk set",
-            Source::Keyed {
-                gather: KeyGather::Unique(_),
-                walk: Some(_),
-            } => "unique index range",
+        let shape = match open(label, u64::MAX) {
+            SourceCursor { source: Source::Merge(_), walk: Some(_) } => "index range",
+            SourceCursor { source: Source::Unique(_), walk: None } => "unique pk set",
+            SourceCursor { source: Source::Unique(_), walk: Some(_) } => "unique index range",
             _ => "another source",
         };
         assert_eq!(shape, label);

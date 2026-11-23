@@ -96,7 +96,7 @@ enum Rule<'a> {
     /// [`Rule::Pk`] and the before-image of a referenced payload column at once:
     /// a reply row also records the value there, unless NULL.
     Gather { col: usize, old: FxHashMap<&'a [u8], u128> },
-    /// U-SEC on `cols`: `spec` splits a reply entry into `[span ‖ holder PK]`.
+    /// U-SEC on `cols`: `spec` splits a reply entry into its span and holder PK.
     Unique { cols: PkColList, spec: KeySpec },
     /// F1 on `edge`: each probed reference, flagged once a reply finds it
     /// committed. A reply's leading `span` bytes are the key it answers.
@@ -605,7 +605,7 @@ struct Cascaded {
 /// values that leave the parent.
 struct ReferencePlan {
     edge: FkEdge,
-    /// Splits a reply entry into `[span ‖ holder PK]`, and re-encodes a
+    /// Splits a reply entry into its span and holder PK, and re-encodes a
     /// surviving holder's own span for the exemption test.
     spec: KeySpec,
     /// The values' rows are deleted and `edge` cascades, so a referencing row is

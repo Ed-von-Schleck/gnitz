@@ -25,9 +25,9 @@ pub enum Probe {
     /// The relation's own PK store, where every key nets 0 or 1: each key a
     /// live row carries, with that row's column.
     PkColumn(u32),
-    /// The secondary index on this exact column list: the stored entries
-    /// under the keys' spans, `[span ‖ holder PK]`, in key order, up to `cap`
-    /// in all.
+    /// The secondary index on this exact column list: its entries under the
+    /// keys' spans, in [`KeySpec::index_schema`](gnitz_zset::algebra::KeySpec::index_schema),
+    /// in key order, up to `cap` in all.
     Index(PkColList, NonZeroU64),
 }
 
@@ -49,9 +49,13 @@ impl RelationRegistry {
                 let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.
                 keyed_as(index.key_spec().key_size())?;
+                let store = index.entry_store(relation);
+                let mut gather = store.gather(keys, Cut::Now);
+                // An entry is its row's key, so no payload column is read.
+                gather.skip_payload(store.schema().payload_slots());
                 let mut entries = Batch::empty_with_schema(&out_schema);
                 let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
-                index.for_each_entry(relation, keys, cap, |entry| entries.push_key_row(entry, 1));
+                gather.for_each_positive_capped(cap, |c| entries.push_key_row(c.current_pk_bytes(), 1));
                 return Ok(entries);
             }
         };
@@ -115,9 +119,12 @@ impl Relation {
             "a key probe reads the rows Cut::Now reads"
         );
         let (schema, table) = (self.schema(), self.table_or_err()?);
-        let full = |cursor| SourceCursor(Source::Full(cursor));
+        let whole = |cursor| SourceCursor {
+            source: Source::Cursor(cursor),
+            walk: None,
+        };
         let (keys, walk) = match bound {
-            ReadBound::None => return Ok((full(self.open_cursor(cut, read)), None)),
+            ReadBound::None => return Ok((whole(self.open_cursor(cut, read)), None)),
             ReadBound::PkSet(keys) => {
                 check_stride("open", self.id(), keys.stride(), schema.pk_stride())?;
                 (keys, None)
@@ -125,7 +132,7 @@ impl Relation {
             ReadBound::Range(r) if r.walks_pk(schema.pk_cols()) => {
                 let mut cursor = table.range_cursor(&r, cut);
                 cursor.skip_payload(self.unread(read));
-                return Ok((full(cursor), None));
+                return Ok((whole(cursor), None));
             }
             ReadBound::Range(r) => {
                 // An index holds a pending row's entry from its ingest on, so it is
@@ -133,10 +140,10 @@ impl Relation {
                 let index = self.index_on(r.cols().as_slice());
                 match index
                     .filter(|_| cut == Cut::Now || !table.has_pending())
-                    .map(|ic| ic.cursor_over(&r))
+                    .map(|ix| ix.entry_store(self).range_cursor(&r, Cut::Now))
                 {
                     // No entry in the range: no store cursor to open.
-                    Some(idx) if !idx.is_valid() => return Ok((full(empty_cursor(schema)), None)),
+                    Some(idx) if !idx.is_valid() => return Ok((whole(empty_cursor(schema)), None)),
                     Some(idx) if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO => {
                         let stride = schema.pk_stride();
                         let walk = IndexWalk { idx, stride, pks: Vec::new() };
@@ -145,14 +152,14 @@ impl Relation {
                     _ => {
                         // The reader applies the range, so it reads the range's columns.
                         let walked = schema.payload_bits(r.cols().as_slice().iter().copied());
-                        return Ok((full(self.open_cursor(cut, read | walked)), Some(r)));
+                        return Ok((whole(self.open_cursor(cut, read | walked)), Some(r)));
                     }
                 }
             }
         };
         // A key this worker holds no row for copies nothing.
-        let gather = match unique {
-            Some(table) => KeyGather::Unique(UniqueGather {
+        let source = match unique {
+            Some(table) => Source::Unique(UniqueGather {
                 table,
                 keys,
                 next: 0,
@@ -160,33 +167,36 @@ impl Relation {
             }),
             // The walk feeds the gather its keys a refill at a time, so its
             // cursor spans the whole store.
-            None if walk.is_some() => KeyGather::Merge(PkSetGather::over(self.open_cursor(cut, read), keys)),
-            None => KeyGather::Merge(self.gather(keys, cut, read)),
+            None if walk.is_some() => Source::Merge(PkSetGather::over(self.open_cursor(cut, read), keys)),
+            None => Source::Merge(self.gather(keys, cut, read)),
         };
-        Ok((SourceCursor(Source::Keyed { gather, walk }), None))
+        Ok((SourceCursor { source, walk }, None))
     }
 }
 
 /// A chunked source of `Batch`es: a whole cursor, or the rows of a key list.
-pub struct SourceCursor<'a>(Source<'a>);
+pub struct SourceCursor<'a> {
+    source: Source<'a>,
+    /// An index range's walk, feeding a key list's source its keys a refill at
+    /// a time. Boxed: it holds a cursor beside the source's.
+    walk: Option<Box<IndexWalk>>,
+}
 
-/// What backs a [`SourceCursor`].
-// An index walk holds a cursor beside the gather's, so it is boxed.
+/// What a [`SourceCursor`] drains.
+// One per read; boxing the merge gather would cost each one an allocation.
+#[allow(clippy::large_enum_variant)]
 enum Source<'a> {
-    Full(ReadCursor),
-    /// The rows of a key list, resolved by `gather`: listed whole (`pk IN (…)`)
-    /// with no `walk`, or fed a refill at a time by an index range's `walk`.
-    Keyed {
-        gather: KeyGather<'a>,
-        walk: Option<Box<IndexWalk>>,
-    },
+    Cursor(ReadCursor),
+    /// The rows of a strictly ascending key list, gathered off a cursor.
+    Merge(PkSetGather),
+    Unique(UniqueGather<'a>),
 }
 
 impl SourceCursor<'_> {
     /// Whether the source walks a secondary index.
     #[cfg(test)]
     pub(super) fn walks_index(&self) -> bool {
-        matches!(self.0, Source::Keyed { walk: Some(_), .. })
+        self.walk.is_some()
     }
 
     /// The next non-empty source chunk, or `None` once the source is exhausted.
@@ -213,82 +223,63 @@ impl SourceCursor<'_> {
         filter: &mut RowFilter,
         hydrate: &mut impl FnMut(PkKeys) -> Result<Batch, String>,
     ) -> Result<Option<(Batch, bool)>, String> {
-        let (gather, mut walk) = match &mut self.0 {
-            Source::Full(c) => return c.drain_hydrated(max_rows, filter, hydrate),
-            Source::Keyed { gather, walk } => (gather, walk.as_deref_mut()),
-        };
         loop {
-            let chunk = match gather {
-                KeyGather::Merge(g) => g.drain_hydrated(max_rows, hydrate)?,
+            let chunk = match &mut self.source {
+                Source::Cursor(c) => return c.drain_hydrated(max_rows, filter, hydrate),
+                Source::Merge(g) => g.drain_hydrated(max_rows, hydrate)?,
                 // A store of one row per key holds no skeleton rows.
-                KeyGather::Unique(g) => g.drain_chunk(max_rows),
+                Source::Unique(g) => g.drain_chunk(max_rows),
             };
             if let Some(chunk) = chunk {
                 // The gather returns every row under an entry's source PK, so a
                 // second one is an owner the walk cannot read exactly.
                 debug_assert!(
-                    walk.is_none() || (1..chunk.len()).all(|i| chunk.get_pk_bytes(i - 1) != chunk.get_pk_bytes(i)),
+                    self.walk.is_none() || (1..chunk.len()).all(|i| chunk.get_pk_bytes(i - 1) != chunk.get_pk_bytes(i)),
                     "index owner holds two rows under one PK"
                 );
                 return Ok(Some((chunk, false)));
             }
-            let Some(w) = walk.as_mut() else { return Ok(None) };
-            if !w.refill(gather, max_rows) {
+            let Some(refill) = self.walk.as_mut().and_then(|w| w.refill(max_rows)) else {
                 return Ok(None);
+            };
+            match &mut self.source {
+                Source::Merge(g) => g.reload(refill),
+                Source::Unique(g) => (g.keys, g.next) = (refill, 0),
+                Source::Cursor(_) => unreachable!("an index walk feeds a key list"),
             }
         }
     }
 }
 
 /// The walk of one secondary-index key range, feeding each entry's source PK
-/// to a [`KeyGather`] over the relation it indexes, over one snapshot of each.
-/// The gather returns every row under an entry's source PK, so the walk is
-/// exact only over rows unique on their PK: a source PK then has one live row
-/// and at most one live index entry.
+/// to a key list over the relation it indexes, over one snapshot of each.
+/// The key list's source returns every row under an entry's source PK, so the
+/// walk is exact only over rows unique on their PK: a source PK then has one
+/// live row and at most one live index entry.
 struct IndexWalk {
     /// Positioned on the index range and clamped at its end; an entry is a
     /// leading span followed by the source PK.
     idx: ReadCursor,
-    /// The source PK's width: the gather's `pk_stride`.
+    /// The source PK's width: the relation's `pk_stride`.
     stride: usize,
     /// A refill's source PKs in index order, flat at `stride`.
     pks: Vec<u8>,
 }
 
 impl IndexWalk {
-    /// Reload `gather` with the source PKs of the next `max_rows` index entries;
-    /// `false` once the index range is spent.
-    fn refill(&mut self, gather: &mut KeyGather<'_>, max_rows: usize) -> bool {
+    /// The source PKs of the next `max_rows` index entries, ascending; `None`
+    /// once the index range is spent.
+    fn refill(&mut self, max_rows: usize) -> Option<PkKeys> {
         let span = self.idx.schema().pk_stride() - self.stride;
         self.pks.clear();
-        let mut taken = 0;
-        while taken < max_rows
-            && let Some(pk) = self.idx.current_pk()
-        {
+        for _ in 0..max_rows {
+            let Some(pk) = self.idx.current_pk() else { break };
             debug_assert!(self.idx.current_weight() > 0, "an index entry at a non-positive weight");
             self.pks.extend_from_slice(&pk[span..]);
             self.idx.advance();
-            taken += 1;
         }
-        if taken == 0 {
-            return false;
-        }
-        let keys = pk_keys(self.stride, self.pks.chunks_exact(self.stride));
-        match gather {
-            KeyGather::Merge(g) => g.reload(keys),
-            KeyGather::Unique(g) => (g.keys, g.next) = (keys, 0),
-        }
-        true
+        (!self.pks.is_empty()).then(|| pk_keys(self.stride, self.pks.chunks_exact(self.stride)))
     }
-}
-
-/// The rows of a strictly ascending list of keys: gathered off a cursor, or
-/// probed key by key from a store whose every key nets 0 or 1.
-// One per keyed read; boxing the merge gather would cost each one an allocation.
-#[allow(clippy::large_enum_variant)]
-enum KeyGather<'a> {
-    Merge(PkSetGather),
-    Unique(UniqueGather<'a>),
 }
 
 /// Every live row of a strictly ascending list of whole keys of `table`, whose

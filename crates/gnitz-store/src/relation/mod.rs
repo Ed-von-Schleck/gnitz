@@ -57,9 +57,9 @@ pub enum IndexClaim {
 enum IndexStore {
     /// A store of its own, which this process holds.
     Own(Box<Table>),
-    /// The owner's rows: the index's columns lead the owner's PK, so an owner
-    /// row's entry `[span ‖ PK]` is its PK with the span's leading bytes
-    /// repeated, in the owner's PK order. No process keeps a store for it.
+    /// The owner's rows: the index's columns [lead the owner's
+    /// PK](KeySpec::leads_pk), so an owner row's entry is its PK. No process
+    /// keeps a store for it.
     OwnerPk,
     /// A store of its own, which this process does not hold because it holds no
     /// store of the owner's rows: the master's state.
@@ -123,44 +123,18 @@ impl SecondaryIndex {
         self.held().open_cursor(Cut::Now)
     }
 
-    /// A non-compacting cursor whose rows each lead their key with one entry's
-    /// span, in span order: this index's store, or `owner`'s.
-    pub(crate) fn span_cursor(&self, owner: &Relation) -> ReadCursor {
-        match self.store {
-            // A span is a prefix of the owner's PK, so no payload column is read.
-            IndexStore::OwnerPk => owner.open_cursor(Cut::Now, 0),
-            _ => self.cursor(),
-        }
-    }
-
-    /// Call `f` on each live entry `[span ‖ owner PK]` of `spans`, each this
-    /// index's leading key bytes, in span order and at most `cap` of them.
-    pub(crate) fn for_each_entry(&self, owner: &Relation, spans: PkKeys, cap: usize, mut f: impl FnMut(&[u8])) {
+    /// The store whose row keys are this process's entries of the index, in
+    /// entry order: its own, or `owner`'s where they [are its
+    /// PKs](Self::reads_owner_pk). Either holds one row per key, so a reader of
+    /// the entries alone may skip every payload column.
+    pub(crate) fn entry_store<'a>(&'a self, owner: &'a Relation) -> &'a Table {
         match self.store {
             IndexStore::OwnerPk => {
-                let key_size = self.key_spec.key_size();
-                let mut entry = Vec::with_capacity(key_size + owner.schema().pk_stride());
-                // A span is a prefix of the owner's PK, so no payload column is read.
-                owner.gather(spans, Cut::Now, 0).for_each_positive_capped(cap, |c| {
-                    let pk = c.current_pk_bytes();
-                    entry.clear();
-                    entry.extend_from_slice(&pk[..key_size]);
-                    entry.extend_from_slice(pk);
-                    f(&entry);
-                });
+                debug_assert!(!owner.pk_repeats(), "an indexed owner repeats its PK");
+                owner.table()
             }
-            _ => self
-                .held()
-                .gather(spans, Cut::Now)
-                .for_each_positive_capped(cap, |c| f(c.current_pk_bytes())),
+            _ => self.held(),
         }
-    }
-
-    /// A cursor positioned on the key band `r` walks over this index's own
-    /// store. An index that reads its owner's PK has none: a range on its
-    /// columns walks the owner's PK.
-    pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
-        self.held().range_cursor(r, Cut::Now)
     }
 
     /// This process's own store of the index, if it holds one.

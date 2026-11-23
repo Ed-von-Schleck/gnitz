@@ -1,7 +1,7 @@
 //! The sorted key spans of one relation's column list, read off the index on
 //! those columns, or off the relation's own PK where those columns lead it.
 
-use crate::relation::RelationRegistry;
+use crate::relation::{Cut, RelationRegistry};
 use gnitz_trace::runs::ReadCursor;
 use gnitz_zset::repr::Batch;
 
@@ -20,9 +20,13 @@ impl RelationRegistry {
     pub fn key_spans(&self, id: u64, cols: &[u32]) -> Result<KeySpans, String> {
         let relation = self.relation_or_err(id)?;
         let index = relation.index_or_err(cols)?;
+        let store = index.entry_store(relation);
+        let mut cursor = store.open_cursor(Cut::Now);
+        // A span leads its row's key, so no payload column is read.
+        cursor.skip_payload(store.schema().payload_slots());
         let mut spans = KeySpans {
             chunk_rows: self.config.scan_chunk_rows,
-            index: index.span_cursor(relation),
+            index: cursor,
             chunk: Batch::empty_with_schema(&index.key_spec().span_schema()),
         };
         spans.advance();
