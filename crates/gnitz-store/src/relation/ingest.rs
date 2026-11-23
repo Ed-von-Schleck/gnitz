@@ -1,7 +1,7 @@
 //! The write path: unique-PK enforcement, store + secondary-index application,
 //! delta capture, the seal, and the checkpoint rounds.
 
-use super::unique_pk::{PkRule, under_pk_rule};
+use super::unique_pk::{PkRule, admit_fresh, enforce_unique_pk};
 use super::{CircuitState, NOT_HELD, Relation, RelationKind, RelationRegistry};
 use crate::storage::Table;
 use gnitz_trace::runs::StorageError;
@@ -39,11 +39,6 @@ impl Landing {
 }
 
 impl Relation {
-    /// Whether rows sit above this relation's cut.
-    fn has_pending(&self) -> bool {
-        self.unsealed.is_some() || self.table.as_ref().is_some_and(Table::has_pending)
-    }
-
     /// See [`RelationRegistry::seal`].
     #[inline]
     fn seal(&mut self) -> Result<Option<Batch>, String> {
@@ -53,25 +48,43 @@ impl Relation {
             None => Ok(self.unsealed.take().filter(|delta| !delta.is_empty())),
         }
     }
+}
 
-    /// See [`RelationRegistry::land`].
-    fn apply(&mut self, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
+impl RelationRegistry {
+    // ── Ingestion ───────────────────────────────────────────────────────
+    //
+    // A batch moves by value into `land` alone: `ingest` is inlined into its
+    // caller, since out of line it would copy the batch once more.
+
+    /// [`Self::land`] at the cut, under [`PkRule::Enforce`].
+    #[inline(always)]
+    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        self.land(id, batch, Landing::CUT, PkRule::Enforce).map(drop)
+    }
+
+    /// Apply `batch` to `id`'s store and its index projections where `landing`
+    /// puts it, moving it in, consolidated, a base table's after `rule`; the
+    /// batch as applied comes back iff it asks for an echo and the batch holds
+    /// a row. Pending rows land above the cut: every reader sees them but one
+    /// at [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers
+    /// them, and a view is refused. A landing at the cut seals what the
+    /// relation left pending first. A stream holds no rows: it keeps a pending
+    /// batch as pushed, for the seal, and writes nothing at the cut.
+    pub fn land(&mut self, id: u64, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
+        let relation = self.relation_mut_or_err(id)?;
+        let kind = relation.kind();
         match landing {
-            Landing::Pending if self.kind().is_view() => {
-                return Err(format!(
-                    "relation {} is a view: its rows land only at the cut",
-                    self.id()
-                ));
+            Landing::Pending if kind.is_view() => {
+                return Err(format!("relation {id} is a view: its rows land only at the cut"));
             }
             // Rows left above the cut would stay there: nothing seals a
             // relation no view reads.
-            Landing::Cut { .. } if self.has_pending() => drop(self.seal()?),
-            _ => {}
+            Landing::Cut { .. } => drop(relation.seal()?),
+            Landing::Pending => {}
         }
-        let (id, kind) = (self.id(), self.kind());
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
-        let want = self.schema.num_payload_cols();
+        let want = relation.schema.num_payload_cols();
         let got = batch.schema().num_payload_cols();
         if got != want {
             return Err(format!(
@@ -81,18 +94,19 @@ impl Relation {
         // A stream's rows exist only as the deltas they produce.
         if kind == RelationKind::Stream {
             if let Landing::Pending = landing {
-                match &mut self.unsealed {
+                match &mut relation.unsealed {
                     Some(held) => held.append_batch(&batch),
                     held => *held = Some(batch),
                 }
             }
             return Ok(None);
         }
-        let Relation { table, feed, indexes, .. } = self;
+        let Relation { table, feed, indexes, .. } = relation;
         let table = table.as_mut().expect(NOT_HELD);
-        let mut effective = match kind.is_base_table() {
-            true => under_pk_rule(table, batch, rule),
-            false => batch,
+        let mut effective = match (kind.is_base_table(), rule) {
+            (true, PkRule::Enforce) => enforce_unique_pk(table, batch),
+            (true, PkRule::Fresh) => admit_fresh(table, batch),
+            (false, _) => batch,
         };
         // Folded once for every reader below — the indexes, the store, the delta
         // capture and the echo — which all read net weights. In place: a batch
@@ -135,32 +149,6 @@ impl Relation {
         }
         Ok(applied)
     }
-}
-
-impl RelationRegistry {
-    // ── Ingestion ───────────────────────────────────────────────────────
-    //
-    // Each verb is one lookup and one call, inlined into its caller: out of
-    // line, a batch moving through it by value is copied once more.
-
-    /// [`Self::land`] at the cut, under [`PkRule::Enforce`].
-    #[inline(always)]
-    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        self.land(id, batch, Landing::CUT, PkRule::Enforce).map(drop)
-    }
-
-    /// Apply `batch` to `id`'s store and its index projections where `landing`
-    /// puts it, moving it in, consolidated, a base table's after `rule`; the
-    /// batch as applied comes back iff it asks for an echo and the batch holds
-    /// a row. Pending rows land above the cut: every reader sees them but one
-    /// at [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers
-    /// them, and a view is refused. A landing at the cut seals what the
-    /// relation left pending first. A stream holds no rows: it keeps a pending
-    /// batch as pushed, for the seal, and writes nothing at the cut.
-    #[inline(always)]
-    pub fn land(&mut self, id: u64, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
-        self.relation_mut_or_err(id)?.apply(batch, landing, rule)
-    }
 
     /// Move `id`'s cut past every row ingested as pending since the last seal,
     /// and answer those rows: the relation's delta, consolidated for a table and
@@ -187,7 +175,7 @@ impl RelationRegistry {
     /// included: no manifest publish, no barrier, and nothing of the relation's
     /// indexes. Unregistered is an `Err`.
     pub fn settle(&mut self, id: u64) -> Result<(), String> {
-        let store = self.relation_mut_or_err(id)?.table_mut();
+        let store = self.relation_mut_or_err(id)?.table.as_mut().expect(NOT_HELD);
         store.settle().map_err(|e| format!("settle relation {id}: {e}"))
     }
 
@@ -203,7 +191,8 @@ impl RelationRegistry {
 
     /// The bytes `id`'s next published manifest carries beside its rows.
     pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), String> {
-        self.relation_mut_or_err(id)?.table_mut().set_caller_record(record);
+        let store = self.relation_mut_or_err(id)?.table.as_mut().expect(NOT_HELD);
+        store.set_caller_record(record);
         Ok(())
     }
 
@@ -234,7 +223,7 @@ impl RelationRegistry {
         generation: u64,
         resumes: impl Fn(u64) -> bool,
     ) -> Result<(), String> {
-        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(CircuitState::tables_mut).collect();
+        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|s| &mut s.tables).collect();
         let picked = self.relations.values_mut().filter(|e| resumes(e.id()));
         tables.extend(picked.flat_map(Relation::rebuilt_stores_mut));
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))

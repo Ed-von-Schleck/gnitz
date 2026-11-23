@@ -38,7 +38,7 @@ impl RelationRegistry {
             return Err(format!("relation {id} is already registered"));
         }
         debug_assert!(
-            traces.is_empty() || spec.kind.is_view(),
+            traces.children.is_empty() || spec.kind.is_view(),
             "only a view keeps operator traces"
         );
         let mut relation = Relation {

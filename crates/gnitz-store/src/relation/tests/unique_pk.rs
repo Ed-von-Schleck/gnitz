@@ -1,4 +1,4 @@
-use super::{PkRule, enforce_unique_pk, under_pk_rule};
+use super::{admit_fresh, enforce_unique_pk};
 use crate::storage::flush_barrier;
 use crate::test_support::{
     certified, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64,
@@ -242,8 +242,8 @@ fn rows_of(schema: &SchemaDescriptor, k: &[Vec<u8>], rows: &[Row]) -> Batch {
 fn fresh_rule_matches_enforce_on_fresh_keys() {
     let (_dir, pt, schema, k) = fresh_fixture();
     for rows in [&[(6, 1, 60), (4, 1, 40), (7, 1, 70)][..], &[(5, 1, 50)], &[]] {
-        let fresh = under_pk_rule(&pt, rows_of(&schema, &k, rows), PkRule::Fresh);
-        let enforced = under_pk_rule(&pt, rows_of(&schema, &k, rows), PkRule::Enforce);
+        let fresh = admit_fresh(&pt, rows_of(&schema, &k, rows));
+        let enforced = enforce_unique_pk(&pt, rows_of(&schema, &k, rows));
         assert_eq!(zset_of(&fresh, &schema), zset_of(&enforced, &schema), "{rows:?}");
         assert_eq!(fresh.len(), rows.len(), "{rows:?}");
     }
@@ -255,7 +255,7 @@ fn fresh_rule_matches_enforce_on_fresh_keys() {
 #[should_panic(expected = "admitted as fresh")]
 fn fresh_rule_refuses_a_held_key() {
     let (_dir, pt, schema, k) = fresh_fixture();
-    under_pk_rule(&pt, rows_of(&schema, &k, &[(5, 1, 50), (2, 1, 20)]), PkRule::Fresh);
+    admit_fresh(&pt, rows_of(&schema, &k, &[(5, 1, 50), (2, 1, 20)]));
 }
 
 /// A debug build refuses a batch admitted as fresh that repeats a key.
@@ -264,7 +264,7 @@ fn fresh_rule_refuses_a_held_key() {
 #[should_panic(expected = "admitted as fresh")]
 fn fresh_rule_refuses_a_repeated_key() {
     let (_dir, pt, schema, k) = fresh_fixture();
-    under_pk_rule(&pt, rows_of(&schema, &k, &[(5, 1, 50), (5, 1, 51)]), PkRule::Fresh);
+    admit_fresh(&pt, rows_of(&schema, &k, &[(5, 1, 50), (5, 1, 51)]));
 }
 
 /// A debug build refuses a batch admitted as fresh that weighs a row other than 1.
@@ -273,5 +273,5 @@ fn fresh_rule_refuses_a_repeated_key() {
 #[should_panic(expected = "admitted as fresh")]
 fn fresh_rule_refuses_a_weight_other_than_one() {
     let (_dir, pt, schema, k) = fresh_fixture();
-    under_pk_rule(&pt, rows_of(&schema, &k, &[(5, 2, 50)]), PkRule::Fresh);
+    admit_fresh(&pt, rows_of(&schema, &k, &[(5, 2, 50)]));
 }

@@ -96,16 +96,10 @@ impl SecondaryIndex {
         self.key_spec.leads_pk()
     }
 
-    /// This process's store of the index; panics when it holds none.
-    #[track_caller]
-    fn held(&self) -> &Table {
-        self.table.as_ref().expect(NOT_HELD)
-    }
-
     /// Non-compacting cursor over this index's own store, in the index schema;
     /// panics on an index that [reads its owner's PK](Self::reads_owner_pk).
     pub fn cursor(&self) -> ReadCursor {
-        self.held().open_cursor(Cut::Now)
+        self.table.as_ref().expect(NOT_HELD).open_cursor(Cut::Now)
     }
 
     /// The store whose row keys are this process's entries of the index, in
@@ -118,7 +112,7 @@ impl SecondaryIndex {
                 debug_assert!(!owner.pk_repeats(), "an indexed owner repeats its PK");
                 owner.table()
             }
-            false => self.held(),
+            false => self.table.as_ref().expect(NOT_HELD),
         }
     }
 
@@ -460,12 +454,6 @@ impl Relation {
     #[track_caller]
     pub(crate) fn table(&self) -> &Table {
         self.table.as_ref().expect(NOT_HELD)
-    }
-
-    /// [`Self::table`] as `&mut`.
-    #[track_caller]
-    fn table_mut(&mut self) -> &mut Table {
-        self.table.as_mut().expect(NOT_HELD)
     }
 
     /// [`Self::table`], `Err` when this process holds no store of the relation.

@@ -36,7 +36,11 @@ fn an_upsert_moves_the_index_entry() {
         let ix = registry.relation(TID).unwrap().index_on(&[1]).unwrap();
         assert_index_holds(ix, &row, format_args!("after {val}"));
         if val == 10 {
-            assert_eq!(ix.held().estimated_rows(), 1, "the identical upserts wrote nothing");
+            assert_eq!(
+                ix.table.as_ref().unwrap().estimated_rows(),
+                1,
+                "the identical upserts wrote nothing"
+            );
         }
     }
 }

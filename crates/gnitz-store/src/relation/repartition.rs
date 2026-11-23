@@ -75,7 +75,17 @@ pub(super) fn repartition_relation(
         // A crashed attempt's partial target would double every row it holds.
         remove_set(rel_dir, launched)?;
         if placement.is_replicated() {
-            link_targets(rel_dir, source, launched)?;
+            // Every child is a copy, so each target hard-links the replica
+            // owner's published files, which no publish rewrites in place.
+            let owner = ChildAddr {
+                kind: ChildKind::Rows,
+                slot: Slot::new(Placement::REPLICA_OWNER, source),
+            }
+            .dir(rel_dir);
+            let pairs: Vec<(String, String)> = cluster_children(ChildKind::Rows, launched)
+                .map(|target| (owner.clone(), target.dir(rel_dir)))
+                .collect();
+            link_stores(&pairs)?;
         } else {
             rewrite_targets(rel_dir, schema, placement, source, launched, config)?;
         }
@@ -88,20 +98,6 @@ pub(super) fn repartition_relation(
 fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
     let set: Vec<String> = cluster_children(ChildKind::Rows, of).map(|c| c.dir(rel_dir)).collect();
     retire_stores(&set)
-}
-
-/// Replicated relations: every child is a copy, so each target hard-links the
-/// replica owner's published files, which no publish rewrites in place.
-fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), StorageError> {
-    let source_dir = ChildAddr {
-        kind: ChildKind::Rows,
-        slot: Slot::new(Placement::REPLICA_OWNER, source),
-    }
-    .dir(rel_dir);
-    let pairs: Vec<(String, String)> = cluster_children(ChildKind::Rows, launched)
-        .map(|target| (source_dir.clone(), target.dir(rel_dir)))
-        .collect();
-    link_stores(&pairs)
 }
 
 /// Key-routed relations: scatter the merged source set to its owners, cutting

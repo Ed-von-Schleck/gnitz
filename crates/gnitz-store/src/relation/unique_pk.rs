@@ -3,7 +3,7 @@
 
 use std::collections::hash_map::Entry;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::storage::Table;
 
@@ -23,33 +23,20 @@ pub enum PkRule {
     Fresh,
 }
 
-/// The effective batch of `batch` under `rule`, against `store`.
-#[inline]
-pub(super) fn under_pk_rule(store: &Table, batch: Batch, rule: PkRule) -> Batch {
-    match rule {
-        PkRule::Enforce => enforce_unique_pk(store, batch),
-        PkRule::Fresh => admit_fresh(store, batch),
-    }
-}
-
 /// [`PkRule::Fresh`]'s effective batch: `batch` itself, under the store's schema.
-fn admit_fresh(store: &Table, mut batch: Batch) -> Batch {
+pub(super) fn admit_fresh(store: &Table, mut batch: Batch) -> Batch {
     batch.set_schema(store.schema());
     debug_assert!(
-        fresh_against(store, &batch),
+        {
+            let mut seen = FxHashSet::default();
+            (0..batch.len()).all(|row| {
+                let pk = batch.get_pk_bytes(row);
+                batch.get_weight(row) == 1 && seen.insert(pk) && store.unique_live_row_at(pk).is_none()
+            })
+        },
         "a batch admitted as fresh repeats a key, weighs a row other than 1, or meets a held key"
     );
     batch
-}
-
-/// Whether every row of `batch` weighs 1 under a key no other row of it and no
-/// live row of `store` holds.
-fn fresh_against(store: &Table, batch: &Batch) -> bool {
-    let mut seen = rustc_hash::FxHashSet::default();
-    (0..batch.len()).all(|row| {
-        let pk = batch.get_pk_bytes(row);
-        batch.get_weight(row) == 1 && seen.insert(pk) && store.unique_live_row_at(pk).is_none()
-    })
 }
 
 /// Enforce unique-PK semantics on an ingest batch: per PK, the batch's last

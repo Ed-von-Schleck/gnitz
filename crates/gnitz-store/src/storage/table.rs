@@ -241,6 +241,9 @@ impl Table {
     /// store's delta since the last seal. `None` when there is none. The row set
     /// a [`Cut::Now`] reader sees does not move.
     pub(crate) fn seal(&mut self) -> Result<Option<Batch>, StorageError> {
+        if !self.has_pending() {
+            return Ok(None);
+        }
         let schema = self.shard_index.schema;
         let run = self.pending.drain_into(&mut self.memtable, &schema);
         let shards = self.shard_index.seal_pending();

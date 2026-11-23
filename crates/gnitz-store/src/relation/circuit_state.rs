@@ -16,7 +16,7 @@ pub struct StateIdx(usize);
 /// The children one compiled circuit declares, in [`StateIdx`] order.
 #[derive(Default)]
 pub struct StateLayout {
-    children: Vec<(String, SchemaDescriptor)>,
+    pub(super) children: Vec<(String, SchemaDescriptor)>,
 }
 
 impl StateLayout {
@@ -41,17 +41,13 @@ impl StateLayout {
     pub(super) fn names(&self) -> impl Iterator<Item = &str> {
         self.children.iter().map(|(name, _)| name.as_str())
     }
-
-    /// Whether no child is declared.
-    pub(super) fn is_empty(&self) -> bool {
-        self.children.is_empty()
-    }
 }
 
 /// The rederived operator state of one compiled circuit: the stores its stateful
 /// operators read and write, addressed by [`StateIdx`].
 pub struct CircuitState {
-    tables: Vec<Table>,
+    /// Every child store, in [`StateIdx`] order.
+    pub(super) tables: Vec<Table>,
 }
 
 impl CircuitState {
@@ -86,10 +82,5 @@ impl CircuitState {
 
     pub fn ingest(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {
         self.tables[idx.0].ingest(batch)
-    }
-
-    /// Every child store, for the checkpoint round that publishes them.
-    pub(super) fn tables_mut(&mut self) -> impl Iterator<Item = &mut Table> {
-        self.tables.iter_mut()
     }
 }
