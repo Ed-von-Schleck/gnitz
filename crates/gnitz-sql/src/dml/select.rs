@@ -162,7 +162,12 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
     let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query)? {
         AdhocRead::Relation { desc, name, conjuncts, shape } => (desc, name, conjuncts, shape),
         AdhocRead::Constant(rows) => {
-            let row = plan_constant(rows)?;
+            // A FROM-less SELECT's one row, finished at plan time: `rows` over the
+            // global ground row. One row sorts to itself, so its order is dropped.
+            let mut map = ClientMap::over(rows)?;
+            let mut ground_row = ZSetBatch::with_capacity(map.src(), 1);
+            ground_row.builder().begin_row(gnitz_wire::global_group_key(), 1);
+            let row = map.apply(ground_row);
             return Ok(ReadPlan {
                 cut: ResultCut::new(Arc::clone(row.schema()), &[], slice)?,
                 case: ReadCase::Constant { row },
@@ -170,7 +175,11 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
         }
     };
     let (bound, predicate) = bound_and_predicate(&desc.schema, &conjuncts, &desc.indexes)?;
-    let in_pk_order = walks_in_pk_order(&bound, desc.schema.pk_cols());
+    // A worker walks every bound but a secondary index's in ascending PK order.
+    let in_pk_order = match &bound {
+        ReadBound::Range(r) => r.walks_pk(desc.schema.pk_cols()),
+        ReadBound::None | ReadBound::PkSet(_) => true,
+    };
     let read = |sink| SpecRead {
         name,
         desc: Arc::clone(&desc),
@@ -185,10 +194,9 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
                 having,
                 finalize,
             } = *pieces;
-            let (finalize, order) = ClientMap::over(finalize)?;
-            let cut = ResultCut::new(Arc::clone(finalize.out_schema()), &order, slice)?;
+            let cut = ResultCut::new(Arc::clone(&finalize.schema), &finalize.order, slice)?;
             // Compiled here rather than at finish, so every rejection is pre-dispatch.
-            let finish = FoldFinish::new(&agg.aggs, &having, finalize)?;
+            let finish = FoldFinish::new(&agg.aggs, &having, ClientMap::over(finalize)?)?;
             let sink = ReadSink { map: pre, kind: SinkKind::Fold(agg) };
             let case = ReadCase::Fold {
                 read: read(sink),
@@ -232,24 +240,6 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
         }
     };
     Ok(ReadPlan { case, cut })
-}
-
-/// Whether a worker reading under `bound` yields its rows in ascending PK order:
-/// every walk but a secondary index's.
-fn walks_in_pk_order(bound: &ReadBound, pk_cols: &[u32]) -> bool {
-    match bound {
-        ReadBound::None | ReadBound::PkSet(_) => true,
-        ReadBound::Range(r) => r.walks_pk(pk_cols),
-    }
-}
-
-/// A FROM-less SELECT's one row, finished at plan time: `rows` over the global ground
-/// row. One row sorts to itself, so its order is dropped.
-fn plan_constant(rows: RowsReply) -> Result<ZSetBatch, GnitzSqlError> {
-    let (mut map, _) = ClientMap::over(rows)?;
-    let mut ground_row = ZSetBatch::with_capacity(map.src(), 1);
-    ground_row.builder().begin_row(gnitz_wire::global_group_key(), 1);
-    Ok(map.apply(ground_row))
 }
 
 // ---------------------------------------------------------------------------

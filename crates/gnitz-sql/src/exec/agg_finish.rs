@@ -50,12 +50,6 @@ impl FoldFinish {
         self.finalize.src()
     }
 
-    /// The finalized result, keyed by the output key.
-    #[cfg(test)]
-    pub(crate) fn out_schema(&self) -> &Arc<Schema> {
-        self.finalize.out_schema()
-    }
-
     pub(crate) fn has_having(&self) -> bool {
         self.having.is_some()
     }

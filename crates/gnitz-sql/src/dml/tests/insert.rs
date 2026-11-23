@@ -69,7 +69,7 @@ fn insert(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
 /// The VALUES rows an INSERT plan writes.
 fn rows(plan: &WritePlan) -> &ZSetBatch {
     match &plan.write {
-        Write::Insert { rows, .. } | Write::Rmw { read: RmwRead::Values(rows), .. } => rows,
+        Write::Insert { rows, .. } | Write::Upsert { rows, .. } => rows,
         _ => panic!("not an INSERT plan"),
     }
 }
@@ -120,15 +120,12 @@ fn values_land_in_the_columns_the_list_names() {
             vec![(vec![Int(0), Null], 1), (vec![Int(0), Null], 1)],
         ),
         ("INSERT INTO st VALUES (1, 5)", vec![1], one(&[Int(5)])),
-        ("INSERT INTO sr VALUES ('x')", vec![], one(&[Str("x")])),
-        ("INSERT INTO sr (name) VALUES ('x')", vec![], one(&[Str("x")])),
+        // A SERIAL key is reserved at execute: planned, it is 0.
+        ("INSERT INTO sr VALUES ('x')", vec![0], one(&[Str("x")])),
+        ("INSERT INTO sr (name) VALUES ('x')", vec![0], one(&[Str("x")])),
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        match want_keys.is_empty() {
-            // A SERIAL key is reserved at execute: planned, it is zero bytes.
-            true => assert!(rows(&plan).view().pk().iter().all(|&b| b == 0), "`{sql}`"),
-            false => assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`"),
-        }
+        assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`");
         assert_eq!(rows_of(rows(&plan)), want_rows, "`{sql}`");
     }
 }
@@ -318,8 +315,9 @@ fn returning_a_relations_columns_replies_the_rows_written() {
         let Write::Insert { rows, returning: Some(mut map) } = plan.write else {
             panic!("RETURNING {list} has no map")
         };
-        assert_eq!(map.apply(rows.clone()), rows, "RETURNING {list}");
-        let schema = map.out_schema();
+        let out = map.apply(rows.clone());
+        assert_eq!(out, rows, "RETURNING {list}");
+        let schema = out.schema();
         let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
         assert_eq!(
             (got, schema.pk_cols()),
@@ -345,8 +343,9 @@ fn returning_names_the_reply_by_the_list() {
         let Write::Insert { rows, returning: Some(mut map) } = plan.write else {
             panic!("RETURNING {list} has no map")
         };
-        assert_eq!(map.apply(rows.clone()), rows, "RETURNING {list}");
-        let schema = map.out_schema();
+        let out = map.apply(rows.clone());
+        assert_eq!(out, rows, "RETURNING {list}");
+        let schema = out.schema();
         let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
         assert_eq!(
             (got, schema.pk_cols()),
@@ -397,7 +396,7 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
     for (sql, held, want_keys, want_rows) in cases {
         let WritePlan {
             target,
-            write: Write::Rmw { read: RmwRead::Values(rows), mut set },
+            write: Write::Upsert { rows, mut set },
         } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         else {
             panic!("`{sql}` has no ON CONFLICT");
@@ -421,7 +420,7 @@ fn on_conflict_refuses_a_reply_outside_the_read_keys() {
     ] {
         let WritePlan {
             target,
-            write: Write::Rmw { read: RmwRead::Values(rows), mut set },
+            write: Write::Upsert { rows, mut set },
         } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         else {
             panic!("`{sql}` has no ON CONFLICT");

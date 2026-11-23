@@ -9,7 +9,7 @@ use super::options::parse_table_options;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::names::{extract_global_name, extract_object_name};
-use crate::rules::{ClassWant, reject_duplicate_names, require_class, require_column};
+use crate::rules::{ClassWant, column_names, reject_duplicate_names, require_class, require_column};
 use gnitz_core::{ClientError, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
 use sqlparser::ast::{ObjectType, WrappedCollection};
@@ -325,10 +325,9 @@ pub(crate) fn plan_create_table(
     if props.stream
         && let Some(u) = unique.first()
     {
-        let names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
         return Err(GnitzSqlError::rejected(format!(
             "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
-            names.join(", ")
+            column_names(&cols, &u.cols)
         )));
     }
 

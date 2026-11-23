@@ -41,7 +41,7 @@ enum SetRhs {
 
 /// Which statement a SET list belongs to: what its error messages name, and
 /// whether a value may read the incoming row as `EXCLUDED.<col>`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(super) enum SetClause {
     Update,
     DoUpdate,
@@ -58,7 +58,8 @@ impl SetClause {
 
 /// Each target is one plain identifier naming a non-PK column not already
 /// assigned; each value is bound against `schema` under `alias`, the qualifier a
-/// written column reference must name.
+/// written column reference must name. Under `DoUpdate` a value may instead be
+/// the pseudo-qualified `EXCLUDED.<col>`, the incoming row's column.
 pub(super) fn bind_set_list(
     raw: &[Assignment],
     schema: &Schema,
@@ -84,39 +85,27 @@ pub(super) fn bind_set_list(
                 "multiple assignments to column '{name}' in {clause_name}"
             )));
         }
-        let rhs = bind_set_rhs(&a.value, ci, schema, alias, clause)?;
+        // An `EXCLUDED.<col>` goes through the same classifier as a bare RHS, so
+        // `SET int_col = EXCLUDED.str_col` is rejected here rather than per row.
+        let (expr, scope) = match (clause, excluded_col(&a.value)) {
+            (SetClause::DoUpdate, Some(col)) => {
+                let col_idx = require_column(schema.columns(), col).map_err(|e| e.in_clause("EXCLUDED"))?;
+                (BoundExpr::ColRef(col_idx), Scope::Excluded)
+            }
+            // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
+            // relation in scope); this says why, which its message cannot.
+            (SetClause::DoUpdate, None) if expr_any(&a.value, &|e| excluded_col(e).is_some()) => {
+                return Err(GnitzSqlError::rejected(
+                    "EXCLUDED column references inside compound expressions are not \
+                     supported; use a simple `col = EXCLUDED.col` assignment",
+                ));
+            }
+            _ => (bind_single_table(&a.value, schema, alias)?, Scope::Existing),
+        };
+        let rhs = classify_set_rhs(expr, scope, ci, schema)?;
         set.push(SetCol { ci, rhs });
     }
     Ok(set)
-}
-
-/// One SET right-hand side for column `target`. Under `DoUpdate` the incoming-row
-/// scope is the pseudo-qualifier `EXCLUDED.<col>`; a bare column name, as under
-/// `Update`, refers to the existing (stored) row.
-fn bind_set_rhs(
-    expr: &Expr,
-    target: usize,
-    schema: &Schema,
-    alias: &str,
-    clause: SetClause,
-) -> Result<SetRhs, GnitzSqlError> {
-    if clause == SetClause::DoUpdate {
-        if let Some(col_name) = excluded_col(expr) {
-            let col_idx = require_column(schema.columns(), col_name).map_err(|e| e.in_clause("EXCLUDED"))?;
-            // Through the same classifier as a bare RHS, so `SET int_col =
-            // EXCLUDED.str_col` is rejected here rather than per row.
-            return classify_set_rhs(BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
-        }
-        // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
-        // relation in scope); this says why, which its message cannot.
-        if expr_any(expr, &|e| excluded_col(e).is_some()) {
-            return Err(GnitzSqlError::rejected(
-                "EXCLUDED column references inside compound expressions are not \
-                 supported; use a simple `col = EXCLUDED.col` assignment",
-            ));
-        }
-    }
-    classify_set_rhs(bind_single_table(expr, schema, alias)?, Scope::Existing, target, schema)
 }
 
 /// The column an `EXCLUDED.<col>` reference names.

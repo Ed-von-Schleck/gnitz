@@ -7,8 +7,9 @@
 //! planned, and whether a read is served locally is read off the client's copy.
 
 use crate::SqlResult;
-use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
+use crate::dml::select::{ReadCase, ReadPlan};
 use crate::error::{GnitzSqlError, reject_if};
+use crate::rules::column_names;
 use std::sync::Arc;
 
 use gnitz_core::{GnitzClient, ScanReply, Schema, ZSetBatch};
@@ -52,13 +53,31 @@ pub(crate) fn explained_query(stmt: &Statement) -> Result<&Query, GnitzSqlError>
     ))
 }
 
-/// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
-/// `client` mirrors is described as the local read it is served as.
+/// Describe `plan` without running it: the EXPLAIN reply, a hidden 1-based line
+/// number as the PK (a schema needs one and STRING is not PK-eligible; it also
+/// fixes the row order) plus the visible `plan` column every presentation surface
+/// shows. A read of a relation `client` mirrors is described as the local read it
+/// is served as.
 pub(crate) fn execute_explain(client: &GnitzClient, plan: &ReadPlan) -> SqlResult {
     let local = plan
         .spec_read()
         .is_some_and(|read| client.cursor_of(read.desc.tid).is_some());
-    plan_rows(&explain_lines(plan, local))
+    let schema = Arc::new(
+        Schema::from_parts(
+            vec![
+                ColumnDef::new("_line", TypeCode::U64, false).hidden(),
+                ColumnDef::new("plan", TypeCode::String, false),
+            ],
+            &[0],
+        )
+        .expect("the EXPLAIN reply schema is a valid two-column schema"),
+    );
+    let mut batch = ZSetBatch::new(&schema);
+    let mut a = batch.builder();
+    for (i, line) in explain_lines(plan, local).iter().enumerate() {
+        a.begin_row(i as u128 + 1, 1).put_string(line);
+    }
+    SqlResult::Rows(ScanReply { batch, lsn: None })
 }
 
 /// The five lines EXPLAIN renders for `plan`: what is read, the access path,
@@ -66,7 +85,7 @@ pub(crate) fn execute_explain(client: &GnitzClient, plan: &ReadPlan) -> SqlResul
 /// `local`: the read is served off the client's copy, which executes the same
 /// `ReadSpec` the server would.
 pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
-    let order_limit = order_limit_line(plan, local);
+    let order_limit = format!("order/limit: {}", order_limit(plan, local));
     let (read, shape) = match &plan.case {
         ReadCase::Constant { .. } => {
             return vec![
@@ -88,14 +107,39 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
             (read, fold_line(agg, reduce_schema, finish.has_having(), *is_distinct))
         }
     };
+    // What is read. The view suffix is a real cost of the read: a server read of a
+    // view whose source closure has a committed-but-unticked write drains the
+    // pending ticks before serving. EXPLAIN cannot know staleness at plan time, so
+    // it names the condition, not a verdict. A local read drains nothing.
+    let (class, name) = (read.desc.class, &read.name);
+    let read_line = if local {
+        format!("read view {name} (local copy)")
+    } else if class.is_view() {
+        format!("read view {name} (drains pending ticks when stale)")
+    } else {
+        format!("read {} {name}", class.noun())
+    };
+    let schema = &read.desc.schema;
+    // The walk the bound names; a one-key `PkSet` is a point lookup.
+    let access = match &read.spec.bound {
+        ReadBound::None => "full scan".to_string(),
+        ReadBound::Range(r) if r.walks_pk(schema.pk_cols()) => "pk range walk".to_string(),
+        ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
+        // The keys ship deduplicated, so this is the distinct key count.
+        ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
+        ReadBound::Range(r) => format!(
+            "index range on ({})",
+            column_names(schema.columns(), r.cols().as_slice())
+        ),
+    };
     let predicate = match (read.spec.predicate.is_empty(), local) {
         (true, _) => "none",
         (false, true) => "local",
         (false, false) => "server-side",
     };
     vec![
-        read_line(read, local),
-        format!("access: {}", access_line(&read.spec.bound, &read.desc.schema)),
+        read_line,
+        format!("access: {access}"),
         format!("predicate: {predicate}"),
         shape,
         order_limit,
@@ -103,9 +147,9 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
 }
 
 /// Where the ORDER BY / LIMIT / OFFSET work happens.
-fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
+fn order_limit(plan: &ReadPlan, local: bool) -> String {
     if plan.answers_from_schema() {
-        return "order/limit: no request (LIMIT 0)".to_string();
+        return "no request (LIMIT 0)".to_string();
     }
     let mut facts = Vec::new();
     // The per-worker cut is OFFSET+LIMIT deep, because the client cuts the exact slice. A cut
@@ -127,49 +171,9 @@ fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
         facts.push("client slice".to_string());
     }
     if facts.is_empty() {
-        "order/limit: none".to_string()
+        "none".to_string()
     } else {
-        format!("order/limit: {}", facts.join(", "))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The line vocabulary
-// ---------------------------------------------------------------------------
-
-/// What is read. The view suffix is a real cost of the read: a server read of a
-/// view whose source closure has a committed-but-unticked write drains the
-/// pending ticks before serving. EXPLAIN cannot know staleness at plan time, so it
-/// names the condition, not a verdict. A local read drains nothing.
-fn read_line(read: &SpecRead, local: bool) -> String {
-    let class = read.desc.class;
-    if local {
-        format!("read view {} (local copy)", read.name)
-    } else if class.is_view() {
-        format!("read view {} (drains pending ticks when stale)", read.name)
-    } else {
-        format!("read {} {}", class.noun(), read.name)
-    }
-}
-
-/// The walk the bound names; a one-key `PkSet` is a point lookup.
-fn access_line(bound: &ReadBound, schema: &Schema) -> String {
-    match bound {
-        ReadBound::None => "full scan".to_string(),
-        ReadBound::Range(r) if r.walks_pk(schema.pk_cols()) => "pk range walk".to_string(),
-        ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
-        // The keys ship deduplicated, so this is the distinct key count.
-        ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
-        ReadBound::Range(r) => {
-            let cols = r
-                .cols()
-                .as_slice()
-                .iter()
-                .map(|&c| &*schema.columns()[c as usize].name)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("index range on ({cols})")
-        }
+        facts.join(", ")
     }
 }
 
@@ -207,13 +211,15 @@ fn fold_line(agg: &GroupAggs, reduce_schema: &Schema, has_having: bool, is_disti
     // groups and aggregates columns the source does not have, and the hidden
     // `_preN` the pre-map minted for the written expression is the only name one
     // of those has.
-    let cols = agg
-        .group_cols
-        .iter()
-        .map(|&c| &*reduce_schema.columns()[c as usize].name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ops = agg
+    let cols = column_names(reduce_schema.columns(), &agg.group_cols);
+    let mut line = if is_distinct {
+        format!("fold: distinct on ({cols})")
+    } else if agg.group_cols.is_empty() {
+        "fold: global aggregate".to_string()
+    } else {
+        format!("fold: group by ({cols})")
+    };
+    let ops: Vec<String> = agg
         .aggs
         .iter()
         .map(|s| {
@@ -229,50 +235,12 @@ fn fold_line(agg: &GroupAggs, reduce_schema: &Schema, has_having: bool, is_disti
             };
             format!("{op}({})", reduce_schema.columns()[s.col_idx as usize].name)
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut line = if is_distinct {
-        format!("fold: distinct on ({cols})")
-    } else if agg.group_cols.is_empty() && ops.is_empty() {
-        "fold: global aggregate".to_string()
-    } else if agg.group_cols.is_empty() {
-        format!("fold: global aggregate: {ops}")
-    } else if ops.is_empty() {
-        format!("fold: group by ({cols})")
-    } else {
-        format!("fold: group by ({cols}): {ops}")
-    };
+        .collect();
+    if !is_distinct && !ops.is_empty() {
+        line = format!("{line}: {}", ops.join(", "));
+    }
     if has_having {
         line.push_str("; HAVING applied client-side");
     }
     line
-}
-
-// ---------------------------------------------------------------------------
-// The result shape
-// ---------------------------------------------------------------------------
-
-/// The two-column EXPLAIN reply: a hidden 1-based line number as the PK (a schema
-/// needs one and STRING is not PK-eligible; it also fixes the row order) plus the
-/// visible `plan` column every presentation surface shows.
-fn plan_rows(lines: &[String]) -> SqlResult {
-    let schema = Arc::new(
-        Schema::from_parts(
-            vec![
-                ColumnDef::new("_line", TypeCode::U64, false).hidden(),
-                ColumnDef::new("plan", TypeCode::String, false),
-            ],
-            &[0],
-        )
-        .expect("the EXPLAIN reply schema is a valid two-column schema"),
-    );
-    let mut batch = ZSetBatch::new(&schema);
-    {
-        let mut a = batch.builder();
-        for (i, line) in lines.iter().enumerate() {
-            a.begin_row(i as u128 + 1, 1).put_string(line);
-        }
-    }
-    SqlResult::Rows(ScanReply { batch, lsn: None })
 }

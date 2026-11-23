@@ -51,7 +51,7 @@ pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     else {
         panic!("{sql}: not a fold");
     };
-    let (finalize, _) = ClientMap::over(pieces.finalize).unwrap();
+    let finalize = ClientMap::over(pieces.finalize).unwrap();
     FoldFinish::new(&pieces.agg.aggs, &pieces.having, finalize).unwrap()
 }
 
@@ -323,7 +323,7 @@ fn partials_finish_to_one_row_per_group() {
     for (sql, rel, partials, want) in cases {
         let mut f = plan(sql, rel);
         let got = f.finish(batch(f.partial_schema(), partials));
-        let want = batch(f.out_schema(), want);
+        let want = batch(got.schema(), want);
         assert_eq!(got.view().null_breach(), None);
         assert_eq!(got.view().pk(), want.view().pk(), "{sql}");
         assert_eq!(rows_of(&got), rows_of(&want), "{sql}");

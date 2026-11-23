@@ -23,18 +23,13 @@ pub(crate) struct ClientMap {
 }
 
 impl ClientMap {
-    /// `rows` as the client runs them over their source, and their ORDER BY over the
-    /// output.
-    pub(crate) fn over(rows: RowsReply) -> Result<(Self, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
-        let RowsReply { src, schema, program, order, .. } = rows;
-        Ok((ClientMap::new(program, src, schema)?, order))
+    /// `rows` as the client runs them over their source.
+    pub(crate) fn over(rows: RowsReply) -> Result<Self, GnitzSqlError> {
+        let RowsReply { src, schema, program, .. } = rows;
+        ClientMap::new(program, src, schema)
     }
 
-    pub(crate) fn new(
-        program: Option<LogicalProgram>,
-        src: Arc<Schema>,
-        out_schema: Arc<Schema>,
-    ) -> Result<Self, GnitzSqlError> {
+    fn new(program: Option<LogicalProgram>, src: Arc<Schema>, out_schema: Arc<Schema>) -> Result<Self, GnitzSqlError> {
         debug_assert!(
             src.layout().same_key_types(out_schema.layout()),
             "a client map keeps its source's key"
@@ -54,10 +49,6 @@ impl ClientMap {
     /// The schema of the batches the map reads.
     pub(crate) fn src(&self) -> &Arc<Schema> {
         &self.src
-    }
-
-    pub(crate) fn out_schema(&self) -> &Arc<Schema> {
-        &self.out_schema
     }
 
     /// The map over every row of `src`, each row keeping its PK and weight.

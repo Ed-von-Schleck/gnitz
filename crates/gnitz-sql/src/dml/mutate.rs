@@ -2,7 +2,7 @@
 //! (`crate::access::bound_and_predicate`), and UPDATE's SET list.
 
 use super::set::{SetClause, bind_set_list};
-use super::write::{RmwRead, Write, WritePlan};
+use super::write::{Write, WritePlan};
 use crate::access::bound_and_predicate;
 use crate::ast_util::single_plain_relation;
 use crate::bind::bind_single_table;
@@ -13,22 +13,10 @@ use crate::rules::{ClassWant, require_class};
 use sqlparser::ast::{Assignment, Delete, Expr, FromTable, TableWithJoins, Update};
 
 pub(super) fn plan_update(update: &Update, cat: &dyn Catalog) -> Result<WritePlan, GnitzSqlError> {
-    let (table, selection, assignments) = reject_unhonored_update_clauses(update)?;
-    plan_mutation(std::slice::from_ref(table), selection, Some(assignments), cat)
-}
-
-pub(super) fn plan_delete(del: &Delete, cat: &dyn Catalog) -> Result<WritePlan, GnitzSqlError> {
-    let (from, selection) = reject_unhonored_delete_clauses(del)?;
-    plan_mutation(from, selection, None, cat)
-}
-
-/// Reject every `UPDATE` clause `plan_mutation` does not consume, and hand back
-/// the table, WHERE and SET list it does. Each rejected clause would otherwise be
-/// dropped: a dropped `FROM` binds SET/WHERE against the wrong relations.
-fn reject_unhonored_update_clauses(
-    update: &Update,
-) -> Result<(&TableWithJoins, Option<&Expr>, &[Assignment]), GnitzSqlError> {
     const CTX: &str = "UPDATE";
+    // Every clause `plan_mutation` does not consume is rejected, as it would
+    // otherwise be dropped: a dropped `FROM` binds SET/WHERE against the wrong
+    // relations.
     let Update {
         // `table` whole: `plan_mutation` classifies its FROM shape, so a join
         // written there is rejected.
@@ -38,7 +26,6 @@ fn reject_unhonored_update_clauses(
         // Inert: the `UPDATE` token and advisory-only comment hints.
         update_token: _,
         optimizer_hints: _,
-        // Rejected: each is a clause `plan_mutation` does not implement.
         from,
         returning,
         output,
@@ -56,15 +43,14 @@ fn reject_unhonored_update_clauses(
     reject_if(limit.is_some(), CTX, "LIMIT")?;
     reject_if(on_cluster.is_some(), CTX, "ON CLUSTER")?;
     reject_if(settings.is_some(), CTX, "SETTINGS")?;
-    Ok((table, selection.as_ref(), assignments))
+    plan_mutation(std::slice::from_ref(table), selection.as_ref(), Some(assignments), cat)
 }
 
-/// Reject every `DELETE` clause `plan_mutation` does not consume, and hand back
-/// the FROM list and WHERE it does. Each rejected clause would otherwise be
-/// dropped: a dropped `LIMIT` deletes every matched row, a dropped `USING` binds
-/// WHERE against the wrong relations.
-fn reject_unhonored_delete_clauses(del: &Delete) -> Result<(&[TableWithJoins], Option<&Expr>), GnitzSqlError> {
+pub(super) fn plan_delete(del: &Delete, cat: &dyn Catalog) -> Result<WritePlan, GnitzSqlError> {
     const CTX: &str = "DELETE";
+    // Every clause `plan_mutation` does not consume is rejected, as it would
+    // otherwise be dropped: a dropped `LIMIT` deletes every matched row, a dropped
+    // `USING` binds WHERE against the wrong relations.
     let Delete {
         from,
         selection,
@@ -89,7 +75,7 @@ fn reject_unhonored_delete_clauses(del: &Delete) -> Result<(&[TableWithJoins], O
     reject_if(on_cluster.is_some(), CTX, "ON CLUSTER")?;
     reject_if(settings.is_some(), CTX, "SETTINGS")?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
-    Ok((from, selection.as_ref()))
+    plan_mutation(from, selection.as_ref(), None, cat)
 }
 
 fn plan_mutation(
@@ -124,13 +110,12 @@ fn plan_mutation(
         None => Vec::new(),
     };
     let (bound, predicate) = bound_and_predicate(schema, &conjuncts, &target.indexes)?;
-    let read = RmwRead::Where { bound, predicate };
-    Ok(WritePlan { target, write: Write::Rmw { read, set } })
+    let write = match set {
+        Some(set) => Write::Update { bound, predicate, set },
+        None => Write::Delete { bound, predicate },
+    };
+    Ok(WritePlan { target, write })
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "tests/mutate.rs"]

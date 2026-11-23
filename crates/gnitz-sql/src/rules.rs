@@ -173,6 +173,12 @@ pub(crate) fn require_column<'a>(
         .ok_or_else(|| GnitzSqlError::rejected(format!("column '{col_name}' not found")))
 }
 
+/// The names of `columns[cols]`, comma-separated.
+pub(crate) fn column_names(columns: &[ColumnDef], cols: &[u32]) -> String {
+    let names: Vec<&str> = cols.iter().map(|&c| &*columns[c as usize].name).collect();
+    names.join(", ")
+}
+
 /// The column of the one relation in scope, under `alias`, that a reference
 /// names: a written qualifier must name `alias`, and it disambiguates nothing
 /// more.

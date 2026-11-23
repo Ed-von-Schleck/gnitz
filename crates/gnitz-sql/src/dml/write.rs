@@ -13,7 +13,7 @@
 //! catalog, so a refused statement issues no request and consumes no SERIAL id;
 //! [`execute_write`] runs what was planned.
 
-use super::insert::{plan_insert, resolve_conflicts, serial_col, serial_keys};
+use super::insert::{plan_insert, resolve_conflicts, serial_keys};
 use super::mutate::{plan_delete, plan_update};
 use super::set::{SetCol, apply_set};
 use crate::SqlResult;
@@ -34,23 +34,24 @@ pub(crate) struct WritePlan {
 
 pub(super) enum Write {
     /// A plain INSERT: the VALUES rows at weight +1, and the RETURNING reply's
-    /// map over them. Into a SERIAL table the key region is empty until
+    /// map over them. Into a SERIAL table the key region is a placeholder until
     /// [`execute_write`] stamps it.
     Insert {
         rows: ZSetBatch,
         returning: Option<Box<ClientMap>>,
     },
-    /// A read-modify-write: the rows `read` holds, rewritten by the SET list or,
-    /// without one, retracted (a WHERE) or left alone (ON CONFLICT DO NOTHING).
-    Rmw { read: RmwRead, set: Option<Vec<SetCol>> },
-}
-
-pub(super) enum RmwRead {
-    /// UPDATE or DELETE.
-    Where { bound: ReadBound, predicate: Vec<u8> },
     /// INSERT … ON CONFLICT: the VALUES rows, one per key, each pushed where its
-    /// key is not held.
-    Values(ZSetBatch),
+    /// key is not held; a held key's row is rewritten by DO UPDATE's SET list or,
+    /// under DO NOTHING (`None`), left alone.
+    Upsert { rows: ZSetBatch, set: Option<Vec<SetCol>> },
+    /// The rows the WHERE reads, each rewritten by the SET list.
+    Update {
+        bound: ReadBound,
+        predicate: Vec<u8>,
+        set: Vec<SetCol>,
+    },
+    /// The keys the WHERE reads, retracted.
+    Delete { bound: ReadBound, predicate: Vec<u8> },
 }
 
 /// Plan an INSERT, UPDATE or DELETE.
@@ -67,8 +68,8 @@ pub(crate) fn plan_write(stmt: &Statement, cat: &dyn Catalog) -> Result<WritePla
 pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> Result<SqlResult, GnitzSqlError> {
     let WritePlan { target, mut write } = plan;
     let schema = &target.schema;
-    if serial_col(&target).is_some()
-        && let Write::Insert { rows, .. } | Write::Rmw { read: RmwRead::Values(rows), .. } = &mut write
+    if target.serial
+        && let Write::Insert { rows, .. } | Write::Upsert { rows, .. } = &mut write
     {
         // One reservation for the whole statement.
         let n = rows.len();
@@ -98,23 +99,28 @@ pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> 
             let batch = map.apply(Arc::unwrap_or_clone(rows));
             return Ok(SqlResult::Rows(ScanReply { batch, lsn: None }));
         }
-        Write::Rmw { read, mut set } => {
-            let (tag, bound, predicate, values) = match read {
-                RmwRead::Where { bound, predicate } => {
-                    (if set.is_some() { "UPDATE" } else { "DELETE" }, bound, predicate, None)
-                }
-                RmwRead::Values(rows) => ("INSERT", ReadBound::PkSet(rows.pk_keys()), Vec::new(), Some(rows)),
-            };
+        Write::Upsert { rows, mut set } => {
+            let bound = ReadBound::PkSet(rows.pk_keys());
             let count = client
-                .read_modify_write(&target, bound, predicate, set.is_none(), |held| {
-                    match (values, set.as_deref_mut()) {
-                        (Some(rows), set) => resolve_conflicts(rows, held, set),
-                        (None, Some(set)) => apply_set(set, held, None),
-                        (None, None) => Ok(ZSetBatch::key_rows(schema, held.view().pk(), -1)),
-                    }
+                .read_modify_write(&target, bound, Vec::new(), set.is_none(), |held| {
+                    resolve_conflicts(rows, held, set.as_deref_mut())
                 })
                 .await?;
-            (tag, count)
+            ("INSERT", count)
+        }
+        Write::Update { bound, predicate, mut set } => {
+            let count = client
+                .read_modify_write(&target, bound, predicate, false, |held| apply_set(&mut set, held, None))
+                .await?;
+            ("UPDATE", count)
+        }
+        Write::Delete { bound, predicate } => {
+            let count = client
+                .read_modify_write(&target, bound, predicate, true, |held| {
+                    Ok::<_, GnitzSqlError>(ZSetBatch::key_rows(schema, held.view().pk(), -1))
+                })
+                .await?;
+            ("DELETE", count)
         }
     };
     Ok(SqlResult::RowsAffected { tag, count })
