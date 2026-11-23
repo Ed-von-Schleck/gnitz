@@ -10,14 +10,14 @@ use super::request::Ingest;
 
 /// The committed part of the un-checkpointed tail.
 pub(crate) struct CommittedTail {
-    log: SalLog,
+    pub(super) log: SalLog,
     epoch: u32,
     /// The end of the last zone closed before the walk's first defect.
     end: u64,
     /// The relations the tail's Push groups target.
     pushed: BTreeSet<u64>,
-    /// The epoch this boot writes and drains at.
-    live_epoch: u32,
+    /// The epoch this boot writes and drains at: above the tail's.
+    pub(super) live_epoch: u32,
 }
 
 impl CommittedTail {
@@ -95,17 +95,7 @@ impl CommittedTail {
 
     /// Worker `rank`'s live drain of the log the tail was read from.
     pub(crate) fn reader(&self, rank: u32) -> SalReader {
-        SalReader::new(self.log, rank, self.live_epoch())
-    }
-
-    /// The log the tail was read from.
-    pub(super) fn log(&self) -> SalLog {
-        self.log
-    }
-
-    /// The epoch this boot writes and drains at: above the tail's.
-    pub(super) fn live_epoch(&self) -> u32 {
-        self.live_epoch
+        SalReader::new(self.log, rank, self.live_epoch)
     }
 
     /// Every zone member below the committed end, in log order, undecoded.

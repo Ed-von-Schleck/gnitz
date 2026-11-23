@@ -160,8 +160,8 @@ impl SalWriter {
     /// replayed from the tail to its stores: until then the tail is those rows'
     /// only durable copy, which the rewind gives up.
     pub(crate) async fn boot(tail: CommittedTail, parks: WorkerParks, reactor: &Reactor) -> Self {
-        reactor.applied_through(epoch_word(tail.live_epoch(), 0)).acks().await;
-        Self::rewound(tail.log(), parks, tail.live_epoch())
+        reactor.applied_through(epoch_word(tail.live_epoch, 0)).acks().await;
+        Self::rewound(tail.log, parks, tail.live_epoch)
     }
 
     /// A writer over `log` rewound to cursor 0 of `epoch`, its watermark below
@@ -345,6 +345,10 @@ impl SalWriter {
 
     /// Seal the header of the group laid out at `base` and store its prefix: the
     /// group is readable from here on.
+    ///
+    /// Apart from [`Self::publish_range`]: a lone group's writer knows its end,
+    /// and reading that end back from the header costs every group written
+    /// outside a zone.
     #[inline]
     fn publish(&self, base: u64) {
         // SAFETY: laid out by this writer and, its prefix word still zero,

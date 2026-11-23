@@ -19,20 +19,6 @@ pub(crate) enum Routed<'a> {
     Each(&'a [Option<WireRows<'a>>]),
 }
 
-impl Routed<'_> {
-    /// The workers these rows are for; every worker for the one payload all share.
-    fn holders(&self) -> WorkerSet {
-        match *self {
-            Self::Same(_) => WorkerSet::ALL,
-            Self::Each(each) => each
-                .iter()
-                .enumerate()
-                .filter_map(|(w, rows)| rows.map(|_| w))
-                .collect(),
-        }
-    }
-}
-
 /// What a group sends each worker.
 #[derive(Clone, Copy)]
 pub(super) enum Payloads<'a> {
@@ -88,17 +74,21 @@ impl<'a> Group<'a> {
     }
 
     /// A push of `rows` into `tid`, held to `rule`, whose shape record is
-    /// `record` and the group's blob: sent to the workers `rows` holds rows for,
-    /// answered by none.
+    /// `record` and the group's blob: sent to the workers `rows` holds rows for —
+    /// every worker for the one payload all share — answered by none.
     pub(super) fn push(tid: u64, rule: PkRule, record: &'a [u8], rows: Routed<'a>) -> Self {
+        let (data, to) = match rows {
+            Routed::Same(d) => (Payloads::Shared(d), WorkerSet::ALL),
+            Routed::Each(each) => (
+                Payloads::EachRows(each),
+                each.iter().enumerate().filter_map(|(w, r)| r.map(|_| w)).collect(),
+            ),
+        };
         Group {
             request: Ingest::Push { tid, rule }.encode(),
             blob: record,
-            data: match rows {
-                Routed::Same(d) => Payloads::Shared(d),
-                Routed::Each(each) => Payloads::EachRows(each),
-            },
-            to: rows.holders(),
+            data,
+            to,
             reply: None,
         }
     }

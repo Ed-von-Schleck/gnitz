@@ -78,7 +78,7 @@ fn a_fresh_file_anchors_epoch_0() {
     let view = *log.log();
     assert_eq!(view.anchor(), Ok(0));
     let tail = CommittedTail::read(view).unwrap();
-    assert_eq!((tail.live_epoch(), tail.groups().count()), (1, 0));
+    assert_eq!((tail.live_epoch, tail.groups().count()), (1, 0));
 }
 
 /// Any flipped bit of the anchor fails the boot.
@@ -149,7 +149,7 @@ fn the_next_epochs_anchor_over_the_old_ring_is_an_empty_tail() {
 
     log.anchor_mut().copy_from_slice(&anchor_word(2).to_ne_bytes());
     let tail = CommittedTail::read(*log.log()).expect("an empty tail");
-    assert_eq!((tail.live_epoch(), tail.groups().count()), (3, 0));
+    assert_eq!((tail.live_epoch, tail.groups().count()), (3, 0));
 }
 
 /// A checkpoint reset durably anchors the next epoch at cursor 0: the old
