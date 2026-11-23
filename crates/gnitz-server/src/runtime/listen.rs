@@ -4,7 +4,6 @@
 use gnitz_foundation::{gnitz_info, gnitz_note};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::runtime::tls::TlsListener;
@@ -23,9 +22,10 @@ const ADDRESS_RETRY: Duration = Duration::from_millis(5);
 
 /// A bound, listening socket, and what its connections are served under
 /// (`None`: the AF_UNIX socket, served in plaintext and asked for no token).
+/// The TLS listener is leaked: it lives as long as the process.
 pub(crate) struct ClientListener {
     pub fd: OwnedFd,
-    pub tls: Option<Rc<TlsListener>>,
+    pub tls: Option<&'static TlsListener>,
 }
 
 /// Remove an earlier boot's endpoint file. Called with the data-directory lock
@@ -61,7 +61,7 @@ pub(crate) fn bind_listeners(
         let path = format!("{data_dir}/{TLS_ENDPOINT_FILE}");
         std::fs::write(&path, format!("{bound}\n")).map_err(|e| format!("failed to publish {path}: {e}"))?;
         gnitz_note!("Listening on tls://{bound}: {}", tls.describe());
-        listeners.push(ClientListener { fd, tls: Some(Rc::new(tls)) });
+        listeners.push(ClientListener { fd, tls: Some(Box::leak(Box::new(tls))) });
     }
     Ok(listeners)
 }

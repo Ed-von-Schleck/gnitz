@@ -22,42 +22,6 @@ const TLS_MAX_FRAGMENT: usize = 16 * 1024;
 /// AEAD tag.
 const TLS_RECORD_OVERHEAD: usize = 5 + 1 + 16;
 
-/// Feed one socket chunk of ciphertext through rustls, handing the plaintext
-/// it yields to `plain`. A peer's close_notify ends the recv side once the
-/// plaintext ahead of it is handed over.
-fn ingest_cipher(
-    sess: &mut rustls::ServerConnection,
-    mut cipher: &[u8],
-    plain: &mut dyn FnMut(&[u8]) -> Result<(), RecvEnd>,
-) -> Result<(), RecvEnd> {
-    while !cipher.is_empty() {
-        // rustls takes nothing once a handshake message has outgrown its
-        // buffer, which no drain below frees.
-        if !matches!(sess.read_tls(&mut cipher), Ok(1..)) {
-            return Err(RecvEnd::Oversize);
-        }
-        sess.process_new_packets()
-            .map_err(|e| RecvEnd::Session(e.to_string()))?;
-        let mut reader = sess.reader();
-        loop {
-            let n = match reader.fill_buf() {
-                Ok([]) => return Err(RecvEnd::PeerClosed),
-                Ok(chunk) => {
-                    plain(chunk)?;
-                    chunk.len()
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => return Err(RecvEnd::Protocol),
-            };
-            reader.consume(n);
-        }
-    }
-    Ok(())
-}
-
-/// One TLS connection's codec.
-struct TlsSession(RefCell<rustls::ServerConnection>);
-
 impl Served {
     /// The session of a connection served under this.
     pub(crate) fn session(&self) -> Rc<dyn Session> {
@@ -65,21 +29,47 @@ impl Served {
             .expect("a session fails to build only on a max_fragment_size no `Served` sets");
         // The reactor bounds each seal, and every seal drains what it buffered.
         sess.set_buffer_limit(None);
-        Rc::new(TlsSession(RefCell::new(sess)))
+        Rc::new(RefCell::new(sess))
     }
 }
 
-impl Session for TlsSession {
-    fn ingest(&self, cipher: &[u8], plain: &mut dyn FnMut(&[u8]) -> Result<(), RecvEnd>) -> Result<(), RecvEnd> {
-        ingest_cipher(&mut self.0.borrow_mut(), cipher, plain)
+/// One TLS connection's codec.
+impl Session for RefCell<rustls::ServerConnection> {
+    /// A peer's close_notify ends the recv side once the plaintext ahead of it
+    /// is handed over.
+    fn ingest(&self, mut cipher: &[u8], plain: &mut dyn FnMut(&[u8]) -> Result<(), RecvEnd>) -> Result<(), RecvEnd> {
+        let mut sess = self.borrow_mut();
+        while !cipher.is_empty() {
+            // rustls takes nothing once a handshake message has outgrown its
+            // buffer, which no drain below frees.
+            if !matches!(sess.read_tls(&mut cipher), Ok(1..)) {
+                return Err(RecvEnd::Oversize);
+            }
+            sess.process_new_packets()
+                .map_err(|e| RecvEnd::Session(e.to_string()))?;
+            let mut reader = sess.reader();
+            loop {
+                let n = match reader.fill_buf() {
+                    Ok([]) => return Err(RecvEnd::PeerClosed),
+                    Ok(chunk) => {
+                        plain(chunk)?;
+                        chunk.len()
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => return Err(RecvEnd::Protocol),
+                };
+                reader.consume(n);
+            }
+        }
+        Ok(())
     }
 
     fn owes(&self) -> bool {
-        self.0.borrow().wants_write()
+        self.borrow().wants_write()
     }
 
     fn seal(&self, plain: &[u8]) -> PooledBuf {
-        let mut sess = self.0.borrow_mut();
+        let mut sess = self.borrow_mut();
         sess.writer()
             .write_all(plain)
             .expect("rustls takes every byte under no buffer limit");
@@ -92,7 +82,11 @@ impl Session for TlsSession {
     }
 
     fn close(&self) -> PooledBuf {
-        self.0.borrow_mut().send_close_notify();
+        self.borrow_mut().send_close_notify();
         self.seal(&[])
     }
 }
+
+#[cfg(test)]
+#[path = "tests/tls.rs"]
+mod tests;

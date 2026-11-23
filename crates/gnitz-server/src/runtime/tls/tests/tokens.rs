@@ -71,7 +71,7 @@ fn a_malformed_token_file_is_refused_naming_the_line() {
         (format!("bad/name {hex}\n"), "must be"),
         (format!("app1 {hex}\napp1 {other}\n"), "already held"),
         (
-            format!("app1 {hex}\napp2 {hex}\n"),
+            format!("app1 {hex}\napp2 {}\n", hex.to_uppercase()),
             "line 2: \"app2\" and \"app1\" hold the same digest",
         ),
     ] {

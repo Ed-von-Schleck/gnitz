@@ -9,12 +9,13 @@ use std::sync::Arc;
 
 use gnitz_foundation::posix_io::write_file_durable;
 use gnitz_wire::ALPN_GNITZ;
+use ring::digest::{SHA256, digest};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::danger::ClientCertVerifier;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 
-use super::tokens::{Tokens, sha256};
+use super::tokens::Tokens;
 
 /// The `--tls-*` and `--auth-tokens` flags.
 pub(crate) struct TlsArgs {
@@ -49,14 +50,7 @@ pub(crate) struct Served {
     pub(super) cfg: Arc<rustls::ServerConfig>,
     /// `None`: no token is asked for.
     pub(crate) tokens: Option<Tokens>,
-    identity: Arc<CertifiedKey>,
-}
-
-impl Served {
-    /// The served certificate's SHA-256, as `openssl x509 -fingerprint -sha256` prints it.
-    pub(super) fn fingerprint(&self) -> String {
-        sha256(&self.identity.cert[0]).map(|b| format!("{b:02X}")).join(":")
-    }
+    pub(super) identity: Arc<CertifiedKey>,
 }
 
 /// What the files the flags name hold, at one read of them.
@@ -108,8 +102,7 @@ impl TlsArgs {
             );
         }
         // Read now, so a file that does not load is refused as argv.
-        let files = self.read()?;
-        Ok(ResolvedTls { args: self, files })
+        Ok(ResolvedTls { files: self.read()?, args: self })
     }
 
     /// Read every file the flags name.
@@ -179,7 +172,8 @@ impl TlsListener {
         Ok(())
     }
 
-    /// One line for the log: the certificate served and what authenticates a client.
+    /// One line for the log: the certificate served, by its SHA-256 as `openssl
+    /// x509 -fingerprint -sha256` prints it, and what authenticates a client.
     pub(crate) fn describe(&self) -> String {
         let served = self.current();
         let auth = match (&served.tokens, self.args.client_ca.is_some()) {
@@ -188,9 +182,11 @@ impl TlsListener {
             (None, true) => "a client certificate".to_string(),
             (None, false) => "nothing".to_string(),
         };
+        let digest = digest(&SHA256, &served.identity.cert[0]);
+        let fingerprint: Vec<String> = digest.as_ref().iter().map(|b| format!("{b:02X}")).collect();
         format!(
             "certificate SHA-256 {}; a client is authenticated by {auth}",
-            served.fingerprint()
+            fingerprint.join(":")
         )
     }
 }

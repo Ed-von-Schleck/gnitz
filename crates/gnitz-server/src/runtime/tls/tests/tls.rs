@@ -107,20 +107,19 @@ fn a_minted_identity_is_served_and_kept() {
     assert_eq!((dev.cfg.send_tls13_tickets, dev.cfg.max_early_data_size), (0, 0));
     let (client, _) = handshake(&dev, &pem, "localhost").unwrap();
     assert_eq!(client.alpn_protocol(), Some(gnitz_wire::ALPN_GNITZ));
-    assert_eq!(dev.fingerprint().len(), 32 * 3 - 1, "{}", dev.fingerprint());
-
-    let again = open_in(TlsArgs::on(LOOPBACK), &dir).unwrap().current();
-    assert_eq!(again.fingerprint(), dev.fingerprint(), "a kept identity is served again");
+    let served = |listener: &TlsListener| listener.current().identity.cert[0].clone();
+    let again = open_in(TlsArgs::on(LOOPBACK), &dir).unwrap();
+    assert_eq!(served(&again), dev.identity.cert[0], "a kept identity is served again");
 
     // A key without its certificate is what a crash mid-mint leaves. A reload
     // reads no minted identity; the next open mints a new one.
     std::fs::remove_file(dir.path().join(TLS_CERT_FILE)).unwrap();
     let kept = open_in(TlsArgs::on(LOOPBACK), &dir).unwrap();
-    assert_ne!(kept.current().fingerprint(), dev.fingerprint());
-    let minted = kept.current().fingerprint();
+    let minted = served(&kept);
+    assert_ne!(minted, dev.identity.cert[0]);
     std::fs::remove_file(dir.path().join(TLS_CERT_FILE)).unwrap();
     kept.reload().unwrap();
-    assert_eq!(kept.current().fingerprint(), minted);
+    assert_eq!(served(&kept), minted);
     assert!(!dir.path().join(TLS_CERT_FILE).exists(), "a reload mints nothing");
 }
 
@@ -175,6 +174,10 @@ fn a_public_bind_is_served_under_the_authentication_it_names() {
         };
         let listener = open_in(args, &dir).unwrap();
         let line = listener.describe();
+        let fingerprint = line
+            .strip_prefix("certificate SHA-256 ")
+            .and_then(|l| l.split_once(';'));
+        assert_eq!(fingerprint.map(|(f, _)| f.len()), Some(32 * 3 - 1), "{line}");
         assert!(line.ends_with(&format!("authenticated by {by}")), "{line}");
         let served = listener.current();
         let held = served.tokens.as_ref().map(|t| t.check(token.as_bytes()));
@@ -229,7 +232,8 @@ fn plaintext_arrives_in_order_under_any_split_until_close_notify() {
     // Spans several 16 KiB records.
     let sent: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
     for chunk in [usize::MAX, 1_313] {
-        let (mut client, mut server) = handshake(&dev, &pem, "localhost").unwrap();
+        let (mut client, server) = handshake(&dev, &pem, "localhost").unwrap();
+        let server = RefCell::new(server);
         client.set_buffer_limit(None);
         client.writer().write_all(&sent).unwrap();
         client.send_close_notify();
@@ -238,7 +242,7 @@ fn plaintext_arrives_in_order_under_any_split_until_close_notify() {
         let ends: Vec<_> = ciphertext(&mut client)
             .chunks(chunk)
             .map(|c| {
-                ingest_cipher(&mut server, c, &mut |plain| {
+                server.ingest(c, &mut |plain| {
                     got.extend_from_slice(plain);
                     Ok(())
                 })
@@ -274,7 +278,7 @@ fn a_handshake_message_past_the_buffer_is_refused() {
 /// end, which is the client's, and the PEM the client trusts.
 fn tls_over_socketpair() -> (Reactor, Peer, UnixStream, String) {
     let r = make_reactor();
-    let (accepted, receiver) = accepted_pair(&r);
+    let (accepted, receiver) = accepted_pair(r);
     let (served, pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
     let peer = r.connect(accepted, Some(served.session()));
     (r, peer, receiver, pem)
@@ -311,7 +315,7 @@ fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
     });
     (&client).write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
 
-    let seen = read_until_eof(&r, &client).expect("the session ends");
+    let seen = read_until_eof(r, &client).expect("the session ends");
     assert!(
         seen.len() == 7 && seen[..5] == ALERT_HEADER && seen[5] == 2,
         "one fatal alert, then EOF: {seen:?}"
@@ -324,7 +328,7 @@ fn a_tls_close_ships_close_notify_before_the_shutdown() {
     let (r, peer, client, _) = tls_over_socketpair();
     r.block_on(peer.close());
 
-    let seen = read_until_eof(&r, &client).expect("the close shuts the socket down");
+    let seen = read_until_eof(r, &client).expect("the close shuts the socket down");
     assert_eq!(
         seen,
         [&ALERT_HEADER[..], &[1, 0]].concat(),
@@ -363,13 +367,13 @@ fn a_send_of_many_seals_reaches_the_client_whole() {
         peer.send(SendBody::Pooled(PooledBuf(sent))).await.expect("sent");
         peer.flush_egress().await.expect("sent")
     });
-    let handshaken = poll_until(&r, || {
+    let handshaken = poll_until(r, || {
         exchange(&fd, &mut client, &mut got);
         !client.is_handshaking()
     });
     assert!(handshaken, "the handshake completes");
     client.writer().write_all(&gnitz_wire::framed(b"hello")).unwrap();
-    let arrived = poll_until(&r, || {
+    let arrived = poll_until(r, || {
         exchange(&fd, &mut client, &mut got);
         got.len() >= body.len()
     });

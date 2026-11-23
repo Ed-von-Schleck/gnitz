@@ -147,7 +147,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     // server before it reports ready.
     gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
 
-    let tls = listeners.iter().find_map(|l| l.tls.clone());
+    let tls = listeners.iter().find_map(|l| l.tls);
     reactor.spawn(shared.dispatcher.sal().run_syncs(reactor));
     reactor.spawn(committer::run(committer_rx, shared));
     for listener in listeners {
@@ -156,7 +156,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     reactor.spawn(tick::tick_loop(shared, patient_gap));
     reactor.spawn(delta::pump(shared, asks));
 
-    serve_until_signalled(shared, tls.as_deref(), signals).await
+    serve_until_signalled(shared, tls, signals).await
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ async fn accept_loop(shared: &'static Shared, listener: ClientListener) {
     let reactor = shared.dispatcher.reactor();
     loop {
         let accepted = reactor.accept(fd.as_fd()).await;
-        let served = tls.as_ref().map(|t| t.current());
+        let served = tls.map(TlsListener::current);
         let peer = reactor.connect(accepted, served.as_ref().map(|s| s.session()));
         reactor.spawn(connection_loop(peer, shared, served));
     }

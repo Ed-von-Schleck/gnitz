@@ -1,6 +1,8 @@
 //! Access tokens, `gnitz_` and 64 random hex digits, and the file `--auth-tokens`
 //! names: one `<name> <sha256-hex>` line per token, holding no token itself.
 
+use std::fmt::Write as _;
+
 use ring::digest::{SHA256, digest};
 use ring::rand::{SystemRandom, generate};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -16,7 +18,8 @@ const MAX_NAME_BYTES: usize = 64;
 /// The tokens one read of the file holds, by digest.
 #[derive(Debug, Default)]
 pub(crate) struct Tokens {
-    by_digest: FxHashMap<[u8; 32], String>,
+    /// Keyed by the digest's lowercase hex, as [`mint`] writes it.
+    by_digest: FxHashMap<String, String>,
 }
 
 impl Tokens {
@@ -34,30 +37,17 @@ impl Tokens {
 
     /// The name `token` is held under; `None` when it is none held.
     pub(crate) fn check(&self, token: &[u8]) -> Option<&str> {
-        self.by_digest.get(&sha256(token)).map(String::as_str)
+        self.by_digest
+            .get(&to_hex(digest(&SHA256, token).as_ref()))
+            .map(String::as_str)
     }
-}
-
-pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
-    digest(&SHA256, bytes)
-        .as_ref()
-        .try_into()
-        .expect("a SHA-256 digest is 32 bytes")
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn from_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
+    bytes.iter().fold(String::with_capacity(2 * bytes.len()), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Why `name` cannot name a token, if it cannot.
@@ -90,11 +80,13 @@ fn parse(text: &str) -> Result<Tokens, String> {
             return Err(at("expected `<name> <sha256-hex>`".to_string()));
         };
         check_name(name).map_err(at)?;
-        let digest = from_hex32(hex).ok_or_else(|| at(format!("{hex:?} is not 64 hex digits")))?;
+        if hex.len() != 64 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(at(format!("{hex:?} is not 64 hex digits")));
+        }
         if !names.insert(name) {
             return Err(at(format!("a token named {name:?} is already held")));
         }
-        if let Some(held) = tokens.by_digest.insert(digest, name.to_string()) {
+        if let Some(held) = tokens.by_digest.insert(hex.to_ascii_lowercase(), name.to_string()) {
             return Err(at(format!("{name:?} and {held:?} hold the same digest")));
         }
     }
@@ -120,7 +112,7 @@ pub(crate) fn mint(path: &str, name: &str) -> Result<String, String> {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text += &format!("{name} {}\n", to_hex(&sha256(token.as_bytes())));
+    text += &format!("{name} {}\n", to_hex(digest(&SHA256, token.as_bytes()).as_ref()));
     // The file with the new line must load, which refuses a name already held.
     parse(&text).map_err(|e| at(&e))?;
     write_file_durable(path, text.as_bytes(), 0o600).map_err(|e| at(&e))?;
