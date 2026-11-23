@@ -41,8 +41,16 @@ impl RelationRegistry {
             traces.is_empty() || spec.kind.is_view(),
             "only a view keeps operator traces"
         );
-        let rows = self.build_rows(spec, schema, resume_at)?;
-        let mut relation = Relation { spec, rows, indexes: Vec::new(), traces };
+        let mut relation = Relation {
+            spec,
+            schema,
+            table: None,
+            feed: None,
+            unsealed: None,
+            indexes: Vec::new(),
+            traces,
+        };
+        self.attach_rows(&mut relation, resume_at)?;
         let filled = self.enter_indexes(&mut relation, indexes, resume_at)?;
         self.relations.insert(id, relation);
         Ok(filled)
@@ -85,13 +93,9 @@ impl RelationRegistry {
                 continue;
             }
             let key_spec = KeySpec::new(cols.as_slice(), &schema).map_err(|e| index_fault(owner.id(), cols, e))?;
-            let store = match key_spec.leads_pk() {
-                true => IndexStore::OwnerPk,
-                false => IndexStore::NotHeld,
-            };
             declared.push(SecondaryIndex {
                 cols,
-                store,
+                table: None,
                 key_spec,
                 claims: vec![claim],
             });
@@ -112,13 +116,13 @@ impl RelationRegistry {
     /// not resume are filled by one scan of the owner. Returns how many it
     /// filled.
     fn attach_indexes(&self, owner: &mut Relation, resume_at: Option<u64>) -> Result<usize, String> {
-        if owner.rows.table().is_none() {
+        if owner.table.is_none() {
             return Ok(0);
         }
         let (id, schema) = (owner.id(), owner.schema());
         let mut targets: Vec<usize> = Vec::new();
         for (at, ix) in owner.indexes.iter_mut().enumerate() {
-            if !matches!(ix.store, IndexStore::NotHeld) {
+            if ix.reads_owner_pk() || ix.table.is_some() {
                 continue;
             }
             let dir = self.child_dir(id, ChildKind::Index(ix.cols));
@@ -126,10 +130,10 @@ impl RelationRegistry {
             let table = self
                 .open_store(&dir, ix.key_spec.index_schema(&schema), recovery, None, false)
                 .map_err(|e| index_fault(id, ix.cols, e))?;
-            ix.store = IndexStore::Own(Box::new(table));
-            if !ix.resumed() {
+            if table.loaded_mark().is_none() {
                 targets.push(at);
             }
+            ix.table = Some(table);
         }
         if !targets.is_empty() {
             // One chunked scan of the owner fills every target.
@@ -175,7 +179,7 @@ impl RelationRegistry {
             .filter(|r| r.kind() != RelationKind::SystemCatalog)
             .try_fold(0usize, |filled, relation| {
                 let at = resume_at(relation.id());
-                relation.rows = self.build_rows(relation.spec, relation.schema(), at)?;
+                self.attach_rows(relation, at)?;
                 Ok::<_, String>(filled + self.attach_indexes(relation, at)?)
             });
         self.relations = relations;
@@ -186,24 +190,25 @@ impl RelationRegistry {
         Ok(filled)
     }
 
-    /// This process's rows of a relation: its store and a fed view's feed. A
-    /// view's rows resume from the manifest at `resume_at`, or are rebuilt.
-    fn build_rows(&self, spec: RelationSpec, schema: SchemaDescriptor, resume_at: Option<u64>) -> Result<Rows, String> {
-        let RelationSpec { id, kind, placement, compress, .. } = spec;
+    /// Open this process's store of `relation`'s rows, if it holds one, and a
+    /// fed view's feed. A view's rows resume from the manifest at `resume_at`,
+    /// or are rebuilt.
+    fn attach_rows(&self, relation: &mut Relation, resume_at: Option<u64>) -> Result<(), String> {
+        let (RelationSpec { id, kind, placement, compress, .. }, schema) = (relation.spec, relation.schema);
         let (recovery, capacity, feed) = match kind {
-            RelationKind::Stream => return Ok(Rows::Stream { schema: Box::new(schema), unsealed: None }),
+            RelationKind::Stream => return Ok(()),
             // Its store is the relation directory itself, outside the per-slot child
             // layout that a worker-count change relays and reclaims.
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
-                let table = self.open_store(&dir, schema, RecoverySource::SalReplay, None, false)?;
-                return Ok(Rows::Held { table: Box::new(table), feed: None });
+                relation.table = Some(self.open_store(&dir, schema, RecoverySource::SalReplay, None, false)?);
+                return Ok(());
             }
             // The master opens no user store, but it still creates the relation's
             // directory, so the directory exists by the time the DDL is acknowledged.
             _ if !self.residency.publishes(kind) => {
                 ensure_dir(&relation_dir(&self.base_dir, id))?;
-                return Ok(Rows::Absent(Box::new(schema)));
+                return Ok(());
             }
             RelationKind::BaseTable => {
                 if let Some(ms) = TABLE_CREATE_DELAY.count() {
@@ -217,10 +222,10 @@ impl RelationRegistry {
                 p.delta_bytes(),
             ),
         };
-        let table = self.open_child(id, ChildKind::Rows, schema, recovery, capacity, compress)?;
+        relation.table = Some(self.open_child(id, ChildKind::Rows, schema, recovery, capacity, compress)?);
         // Empty at every open: no delta expresses what a boot does to a view, so every cursor restarts.
-        let feed = feed.filter(|_| placement.counts_on(self.slot.rank)).map(Feed::new);
-        Ok(Rows::Held { table: Box::new(table), feed })
+        relation.feed = feed.filter(|_| placement.counts_on(self.slot.rank)).map(Feed::new);
+        Ok(())
     }
 
     /// This process's `kind` child store of relation `id`; `Err` for one told to

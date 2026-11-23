@@ -1,9 +1,8 @@
 //! The write path: unique-PK enforcement, store + secondary-index application,
 //! delta capture, the seal, and the checkpoint rounds.
 
-use super::store::{Rows, not_held};
 use super::unique_pk::{PkRule, under_pk_rule};
-use super::{CircuitState, Relation, RelationKind, RelationRegistry, SecondaryIndex};
+use super::{CircuitState, NOT_HELD, Relation, RelationKind, RelationRegistry};
 use crate::storage::Table;
 use gnitz_trace::runs::StorageError;
 use gnitz_zset::repr::Batch;
@@ -42,21 +41,16 @@ impl Landing {
 impl Relation {
     /// Whether rows sit above this relation's cut.
     fn has_pending(&self) -> bool {
-        match &self.rows {
-            Rows::Held { table, .. } => table.has_pending(),
-            Rows::Absent(_) => false,
-            Rows::Stream { unsealed, .. } => unsealed.is_some(),
-        }
+        self.unsealed.is_some() || self.table.as_ref().is_some_and(Table::has_pending)
     }
 
     /// See [`RelationRegistry::seal`].
     #[inline]
     fn seal(&mut self) -> Result<Option<Batch>, String> {
         let id = self.spec.id;
-        match &mut self.rows {
-            Rows::Held { table, .. } => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
-            Rows::Absent(_) => Ok(None),
-            Rows::Stream { unsealed, .. } => Ok(unsealed.take().filter(|delta| !delta.is_empty())),
+        match &mut self.table {
+            Some(table) => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
+            None => Ok(self.unsealed.take().filter(|delta| !delta.is_empty())),
         }
     }
 
@@ -74,32 +68,28 @@ impl Relation {
             Landing::Cut { .. } if self.has_pending() => drop(self.seal()?),
             _ => {}
         }
-        let Relation { spec, rows, indexes, .. } = self;
-        let id = spec.id;
+        let (id, kind) = (self.id(), self.kind());
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
-        let want = rows.schema().num_payload_cols();
+        let want = self.schema.num_payload_cols();
         let got = batch.schema().num_payload_cols();
         if got != want {
             return Err(format!(
                 "batch for relation {id} carries {got} payload columns, its schema has {want}"
             ));
         }
-        let (table, feed) = match rows {
-            // A stream's rows exist only as the deltas they produce.
-            Rows::Stream { unsealed, .. } => {
-                if let Landing::Pending = landing {
-                    match unsealed {
-                        Some(held) => held.append_batch(&batch),
-                        held => *held = Some(batch),
-                    }
+        // A stream's rows exist only as the deltas they produce.
+        if kind == RelationKind::Stream {
+            if let Landing::Pending = landing {
+                match &mut self.unsealed {
+                    Some(held) => held.append_batch(&batch),
+                    held => *held = Some(batch),
                 }
-                return Ok(None);
             }
-            Rows::Held { table, feed } => (&mut **table, feed),
-            Rows::Absent(_) => not_held(),
-        };
-        let kind = spec.kind;
+            return Ok(None);
+        }
+        let Relation { table, feed, indexes, .. } = self;
+        let table = table.as_mut().expect(NOT_HELD);
         let mut effective = match kind.is_base_table() {
             true => under_pk_rule(table, batch, rule),
             false => batch,
@@ -186,12 +176,7 @@ impl RelationRegistry {
     pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
         debug_assert!(entry.kind().is_view() && entry.feed().is_none());
-        entry.table_mut().clear();
-        entry
-            .indexes
-            .iter_mut()
-            .filter_map(SecondaryIndex::table_mut)
-            .for_each(Table::clear);
+        entry.rebuilt_stores_mut().for_each(Table::clear);
         Ok(())
     }
 
@@ -211,17 +196,14 @@ impl RelationRegistry {
         self.relations
             .values_mut()
             .filter(move |e| keep(e.kind()))
-            .filter_map(|e| e.rows.table_mut())
+            .filter_map(|e| e.table.as_mut())
     }
 
     // ── The checkpoint rounds ───────────────────────────────────────────
 
     /// The bytes `id`'s next published manifest carries beside its rows.
     pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), String> {
-        let entry = self.relation_mut_or_err(id)?;
-        let (kind, id) = (entry.kind(), entry.id());
-        let table = entry.rows.table_mut().ok_or_else(|| super::no_store(kind, id))?;
-        table.set_caller_record(record);
+        self.relation_mut_or_err(id)?.table_mut().set_caller_record(record);
         Ok(())
     }
 
@@ -254,12 +236,7 @@ impl RelationRegistry {
     ) -> Result<(), String> {
         let mut tables: Vec<&mut Table> = state.into_iter().flat_map(CircuitState::tables_mut).collect();
         let picked = self.relations.values_mut().filter(|e| resumes(e.id()));
-        for e in picked {
-            if e.kind().is_view() {
-                tables.extend(e.rows.table_mut());
-            }
-            tables.extend(e.indexes.iter_mut().filter_map(SecondaryIndex::table_mut));
-        }
+        tables.extend(picked.flat_map(Relation::rebuilt_stores_mut));
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }
 }

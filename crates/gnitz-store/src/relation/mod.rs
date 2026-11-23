@@ -25,7 +25,6 @@ mod feed;
 mod ingest;
 mod repartition;
 mod snapshot;
-mod store;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
@@ -34,7 +33,6 @@ pub use disk_usage::{DiskUsage, disk_usage};
 use feed::Feed;
 pub use ingest::Landing;
 pub use snapshot::Snapshot;
-use store::{Rows, not_held};
 pub use unique_pk::PkRule;
 
 // ---------------------------------------------------------------------------
@@ -53,23 +51,13 @@ pub enum IndexClaim {
     Preflight,
 }
 
-/// What backs one process's entries of a secondary index.
-enum IndexStore {
-    /// A store of its own, which this process holds.
-    Own(Box<Table>),
-    /// The owner's rows: the index's columns [lead the owner's
-    /// PK](KeySpec::leads_pk), so an owner row's entry is its PK. No process
-    /// keeps a store for it.
-    OwnerPk,
-    /// A store of its own, which this process does not hold because it holds no
-    /// store of the owner's rows: the master's state.
-    NotHeld,
-}
-
 /// A secondary index on a column list of one relation. Owns this process's store
 /// for it, if it keeps one — dropping the index drops the store.
 pub struct SecondaryIndex {
-    store: IndexStore,
+    /// This process's store of the index's entries. `None` where they are the
+    /// owner's PKs ([`Self::reads_owner_pk`]), which no process keeps a store
+    /// for, and where this process holds no store of the owner's rows.
+    table: Option<Table>,
     /// The index's declared column list, in order, which drives leading-prefix
     /// seeks. A relation holds at most one index per list.
     cols: PkColList,
@@ -105,16 +93,13 @@ impl SecondaryIndex {
     /// Whether the index's entries are read off its owner's rows, so no process
     /// keeps a store for it.
     pub fn reads_owner_pk(&self) -> bool {
-        matches!(self.store, IndexStore::OwnerPk)
+        self.key_spec.leads_pk()
     }
 
     /// This process's store of the index; panics when it holds none.
     #[track_caller]
     fn held(&self) -> &Table {
-        match &self.store {
-            IndexStore::Own(t) => t,
-            IndexStore::OwnerPk | IndexStore::NotHeld => not_held(),
-        }
+        self.table.as_ref().expect(NOT_HELD)
     }
 
     /// Non-compacting cursor over this index's own store, in the index schema;
@@ -128,33 +113,21 @@ impl SecondaryIndex {
     /// PKs](Self::reads_owner_pk). Either holds one row per key, so a reader of
     /// the entries alone may skip every payload column.
     pub(crate) fn entry_store<'a>(&'a self, owner: &'a Relation) -> &'a Table {
-        match self.store {
-            IndexStore::OwnerPk => {
+        match self.reads_owner_pk() {
+            true => {
                 debug_assert!(!owner.pk_repeats(), "an indexed owner repeats its PK");
                 owner.table()
             }
-            _ => self.held(),
-        }
-    }
-
-    /// This process's own store of the index, if it holds one.
-    fn table_mut(&mut self) -> Option<&mut Table> {
-        match &mut self.store {
-            IndexStore::Own(t) => Some(t),
-            IndexStore::OwnerPk | IndexStore::NotHeld => None,
+            false => self.held(),
         }
     }
 
     /// Project `source` into this index's layout and ingest the result. A
     /// zero-weight row, or one NULL in an indexed column, has no entry, so a
-    /// non-empty `source` can project to nothing. A no-op for an index that
-    /// reads its owner's PK.
+    /// non-empty `source` can project to nothing. A no-op for an index with no
+    /// store here: one that reads its owner's PK.
     fn project_and_ingest(&mut self, source: &Batch) -> Result<(), StorageError> {
-        let table = match &mut self.store {
-            IndexStore::Own(t) => t,
-            IndexStore::OwnerPk => return Ok(()),
-            IndexStore::NotHeld => not_held(),
-        };
+        let Some(table) = &mut self.table else { return Ok(()) };
         let projected = index_entries(source, &self.key_spec, table.schema());
         if projected.is_empty() {
             return Ok(());
@@ -166,11 +139,7 @@ impl SecondaryIndex {
     /// checkpoint manifest at its open; `false` for one that reads its owner's
     /// PK.
     pub fn resumed(&self) -> bool {
-        match &self.store {
-            IndexStore::Own(t) => t.loaded_mark().is_some(),
-            IndexStore::OwnerPk => false,
-            IndexStore::NotHeld => not_held(),
-        }
+        self.table.as_ref().is_some_and(|t| t.loaded_mark().is_some())
     }
 }
 
@@ -315,7 +284,17 @@ pub struct Relation {
     /// here too so a borrowed `Relation` names itself: nothing that has one needs
     /// the id threaded in beside it to log or to phrase an error.
     spec: RelationSpec,
-    rows: Rows,
+    /// The schema its rows are read in: a held store's own, which a column
+    /// ALTER swaps in both.
+    schema: SchemaDescriptor,
+    /// This process's store of its rows: none for a stream, which holds no
+    /// rows, nor for a user relation on the master, which opens no user store.
+    table: Option<Table>,
+    /// The delta feed this process serves for a fed view.
+    feed: Option<Feed>,
+    /// A stream's pushes since the last seal, held as they arrived, since
+    /// nothing reads them before it.
+    unsealed: Option<Batch>,
     indexes: Vec<SecondaryIndex>,
     /// The operator traces a view's compiled circuit keeps, each a child store
     /// of its own; none for any other relation.
@@ -323,15 +302,23 @@ pub struct Relation {
 }
 
 impl Relation {
+    /// The stores a boot rebuilds: a view's rows, and every index's own store.
+    fn rebuilt_stores_mut(&mut self) -> impl Iterator<Item = &mut Table> {
+        let view = self.spec.kind.is_view();
+        let rows = self.table.as_mut().filter(|_| view);
+        rows.into_iter()
+            .chain(self.indexes.iter_mut().filter_map(|ix| ix.table.as_mut()))
+    }
+
     /// This relation's delta feed, if this process serves it.
     pub(crate) fn feed(&self) -> Option<&Feed> {
-        self.rows.feed()
+        self.feed.as_ref()
     }
 
     /// By value: the borrow of `relations` ends with the call, so the descriptor
     /// survives a later `&mut` on the registry.
     pub fn schema(&self) -> SchemaDescriptor {
-        *self.rows.schema()
+        self.schema
     }
 
     pub fn id(&self) -> u64 {
@@ -390,10 +377,9 @@ impl Relation {
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> {
-        let schema = self.rows.schema();
         self.indexes
             .iter()
-            .filter(move |ic| ic.is_unique() && !schema.covers_pk(ic.cols.as_slice()))
+            .filter(|ic| ic.is_unique() && !self.schema.covers_pk(ic.cols.as_slice()))
     }
 
     /// Non-compacting cursor over this relation's store.
@@ -473,32 +459,27 @@ impl Relation {
     /// This process's store of the relation; panics when it holds none.
     #[track_caller]
     pub(crate) fn table(&self) -> &Table {
-        let Some(t) = self.rows.table() else { not_held() };
-        t
+        self.table.as_ref().expect(NOT_HELD)
     }
 
     /// [`Self::table`] as `&mut`.
     #[track_caller]
     fn table_mut(&mut self) -> &mut Table {
-        let Some(t) = self.rows.table_mut() else { not_held() };
-        t
+        self.table.as_mut().expect(NOT_HELD)
     }
 
     /// [`Self::table`], `Err` when this process holds no store of the relation.
     pub(crate) fn table_or_err(&self) -> Result<&Table, String> {
-        self.rows.table().ok_or_else(|| no_store(self.kind(), self.id()))
+        let id = self.id();
+        self.table.as_ref().ok_or_else(|| match self.kind() {
+            RelationKind::Stream => format!("relation {id} is a stream: a stream holds no rows and cannot be read"),
+            _ => format!("relation {id} holds no store in this process"),
+        })
     }
 }
 
-/// Why this process holds no store of relation `id`.
-fn no_store(kind: RelationKind, id: u64) -> String {
-    match kind {
-        RelationKind::Stream => {
-            format!("relation {id} is a stream: a stream holds no rows and cannot be read")
-        }
-        _ => format!("relation {id} holds no store in this process"),
-    }
-}
+/// The panic of an accessor of a store this process does not hold.
+const NOT_HELD: &str = "relation store is not held by this process";
 
 // ---------------------------------------------------------------------------
 // The relation to register
@@ -506,7 +487,7 @@ fn no_store(kind: RelationKind, id: u64) -> String {
 
 /// What a relation is registered as: everything about it that is fixed from its
 /// registration to its drop. Its schema is not — a column ALTER swaps it — so it
-/// is registered beside the spec and lives in the relation's rows.
+/// is registered beside the spec and held on the [`Relation`].
 #[derive(Clone, Copy)]
 pub struct RelationSpec {
     pub id: u64,
@@ -636,15 +617,18 @@ impl RelationRegistry {
         }
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
-        if !schema.is_trailing_append_of(entry.rows.schema()) {
+        if !schema.is_trailing_append_of(&entry.schema) {
             return Err(format!(
                 "ALTER on table {id}: the new descriptor is not a trailing append of the stored one"
             ));
         }
-        entry
-            .rows
-            .swap_schema(schema)
-            .map_err(|e| format!("ALTER on table {id}: rebinding shards: {e}"))
+        if let Some(table) = &mut entry.table {
+            table
+                .swap_schema(schema)
+                .map_err(|e| format!("ALTER on table {id}: rebinding shards: {e}"))?;
+        }
+        entry.schema = schema;
+        Ok(())
     }
 
     // ── Registry reads ──────────────────────────────────────────────────

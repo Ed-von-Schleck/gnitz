@@ -19,7 +19,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let entry = engine.registry.relation_or_err(sid).expect("stream registered");
     assert_eq!(entry.kind(), RelationKind::Stream);
     assert!(entry.pk_repeats());
-    // No directory is what says it holds no store: `build_rows`
+    // No directory is what says it holds no store: `attach_rows`
     // creates one for every kind that opens one.
     let stream_dir = relation_dir(engine.registry.base_dir(), sid);
     assert!(

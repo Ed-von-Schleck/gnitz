@@ -51,7 +51,7 @@ impl RelationRegistry {
             .iter()
             .filter(|(_, rel)| rel.kind().nets_unit_per_key() && self.residency.publishes(rel.kind()))
             .filter_map(|(&id, rel)| {
-                let table = rel.rows.table()?;
+                let table = rel.table.as_ref()?;
                 // A system family's one store is unpartitioned and holds all of it.
                 let (counted, share) = match rel.kind() {
                     RelationKind::SystemCatalog => (true, Slot::SOLO),
@@ -61,7 +61,7 @@ impl RelationRegistry {
                     true => table.runs().collect(),
                     false => Vec::new(),
                 };
-                Some((id, PinnedStore { schema: *table.schema(), runs, share }))
+                Some((id, PinnedStore { schema: rel.schema(), runs, share }))
             })
             .collect();
         Snapshot { stores }
