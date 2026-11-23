@@ -27,15 +27,13 @@ use crate::runtime::sync::{Either, select2};
 use crate::runtime::tls::{ResolvedTls, TlsListener};
 use crate::runtime::w2m::{self, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
+use gnitz_foundation::log::worker_log;
 use gnitz_store::relation::{PkRule, Residency, StoreConfig};
-use gnitz_zset::algebra::Slot;
+use gnitz_zset::algebra::{ScatterPlan, Slot};
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
 /// stage, so the crash-window E2E tests can cut boot at a precise point.
-static RECOVERY_PANIC: Stage = Stage::new(
-    "GNITZ_INJECT_RECOVERY_PANIC",
-    &["genbump", "reset", "backfill", "sweep"],
-);
+static RECOVERY_PANIC: Stage = Stage::new("GNITZ_INJECT_RECOVERY_PANIC", &["genbump", "reset", "backfill", "tick"]);
 
 /// `GNITZ_INJECT_BOOT_FLUSH_ERROR`: fail a worker's boot recovery after its base
 /// flush, as a real flush failure would — one that, swallowed, would let the SAL
@@ -48,8 +46,8 @@ fn inject_recovery_panic(stage: &str) {
     }
 }
 
-// Both recoveries below read the log through `sal::CommittedTail` and differ
-// only in which groups are theirs and what they do with the bytes. A group that
+// Both recoveries below read the log through `sal::CommittedTail`: the master
+// its DdlSync groups, each worker its share of the Push groups. A group that
 // does not decode, head or rows, fails the boot.
 
 /// The master's half of recovery before any worker exists: the catalog opened
@@ -62,19 +60,7 @@ fn master_pre_fork_recovery(
     config: StoreConfig,
     tail: &mut CommittedTail,
 ) -> Result<CatalogEngine, String> {
-    let ddl = tail.ingests().filter_map(|group| {
-        let (family, msg) = match group {
-            Ok((Ingest::DdlSync { family }, msg)) => (family, msg),
-            Ok(_) => return None,
-            Err(e) => return Some(Err(e)),
-        };
-        // A DdlSync group is shared: its one payload holds the rows, which the
-        // master validated and which already carry a drop's children.
-        msg.rows(msg.payloads().next().unwrap_or_default(), |_, _| None)
-            .map(|rows| Some((family, tail.lsn(&msg), rows?)))
-            .transpose()
-    });
-    let mut catalog = CatalogEngine::open_master(data_dir, num_workers, config, ddl)
+    let mut catalog = CatalogEngine::open_master(data_dir, num_workers, config, tail.catalog_rows())
         .map_err(|e| format!("failed to open catalog: {e}"))?;
     // With a replayed push, G → G+1, the resume point left at G: the workers'
     // boot flush moves the base stores past what the views at G integrate, so
@@ -121,25 +107,23 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot:
         debug_assert!(relation.kind().is_base_table());
         let (schema, placement) = (relation.schema(), relation.placement());
         // Written for another width, so no payload is this rank's share: every one
-        // is re-cut for the launched topology.
-        let reslice = msg.width() != slot.of;
-        if reslice {
+        // is re-cut for the launched topology, by the write path's own router, so
+        // what survives is exactly what the master would have sent this rank. It
+        // reads only weights and PK bytes, so it cuts before the widening below.
+        let (payloads, cut): (Vec<&[u8]>, _) = if msg.width() == slot.of {
+            (msg.slot(slot.rank).into_iter().collect(), None)
+        } else {
             resliced_from = Some(msg.width());
-        }
-        let own = (!reslice).then(|| msg.slot(slot.rank)).flatten();
-        let all = reslice.then(|| msg.payloads()).into_iter().flatten();
+            (msg.payloads().collect(), Some(ScatterPlan::native(placement)))
+        };
         let mut applied = false;
-        for data in own.into_iter().chain(all) {
+        for data in payloads {
             let Some(batch) = msg.rows(data, |tid, record| catalog.known_decode(tid, record))? else {
                 continue;
             };
-            let mut owned = if reslice {
-                // The write path's own router, so what survives is exactly what the master
-                // would have sent this rank. It reads only weights and PK bytes, so it
-                // cuts before the widening below.
-                gnitz_zset::algebra::ScatterPlan::native(placement).share(&batch, slot)
-            } else {
-                batch
+            let mut owned = match &cut {
+                Some(plan) => plan.share(&batch, slot),
+                None => batch,
             };
             if owned.is_empty() {
                 continue;
@@ -198,12 +182,6 @@ pub(crate) struct ServerArgs {
     pub(crate) backup_dir: Option<String>,
 }
 
-/// Worker `w`'s log file, which its stdout and stderr are redirected to. The
-/// name is also read by the test harnesses, which find a worker's log by it.
-fn worker_log(data_dir: &str, w: usize) -> String {
-    format!("{data_dir}/worker_{w}.log")
-}
-
 /// The forked child's whole life: latch its rank, redirect its logs to
 /// `worker_N.log`, recover, and run the worker loop. Never returns: a
 /// failed boot `_exit`s, and a worker that serves runs until it is killed or
@@ -221,7 +199,7 @@ fn run_worker_child(
 
     signals::detach_worker(master_pid);
 
-    if let Ok(log) = std::fs::File::create(worker_log(data_dir, w)) {
+    if let Ok(log) = std::fs::File::create(worker_log(data_dir.as_ref(), w)) {
         unsafe {
             libc::dup2(log.as_raw_fd(), 1);
             libc::dup2(log.as_raw_fd(), 2);
@@ -359,7 +337,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // is rewound, ending in the checkpoint a clean restart resumes from.
     let recovered = async {
         // The base tables the tail pushed to.
-        let pushed = tail.pushed().clone();
+        let pushed = tail.pushed();
         let sal = SalWriter::boot(tail, parks, reactor).await;
         inject_recovery_panic("reset");
         let disp = MasterDispatcher::new(catalog, sal, reactor);
@@ -393,7 +371,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
             .await
             .map_err(|e| format!("recovery tick of the replayed tail failed: {e}"))?;
 
-        inject_recovery_panic("sweep");
+        inject_recovery_panic("tick");
 
         // A full checkpoint before the socket opens, so a clean restart resumes
         // from it. No drain — recovery already drained everything and no pushes
@@ -409,7 +387,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
         Either::B((w, end)) => {
             return Err(format!(
                 "worker {w} {end} during recovery (log: {})",
-                worker_log(data_dir, w)
+                worker_log(data_dir.as_ref(), w).display()
             ));
         }
     };
@@ -418,7 +396,10 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     match reactor.block_on(select2(executor::serve(dispatcher, args.backup_dir, listeners), death)) {
         Either::A(()) => Ok(ServerExit::Clean),
         Either::B((w, end)) => {
-            gnitz_error!("Worker {w} {end} (log: {}); workers stopped", worker_log(data_dir, w));
+            gnitz_error!(
+                "Worker {w} {end} (log: {}); workers stopped",
+                worker_log(data_dir.as_ref(), w).display()
+            );
             Ok(ServerExit::WorkerDied)
         }
     }

@@ -10,6 +10,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// line on the server's stderr.
 pub const READY_LINE: &str = "GnitzDB ready";
 
+/// Worker `w`'s log file in a server's data directory `data_dir`, which the
+/// worker's stdout and stderr are redirected to.
+pub fn worker_log(data_dir: &std::path::Path, w: usize) -> std::path::PathBuf {
+    data_dir.join(format!("worker_{w}.log"))
+}
+
 /// Line buffer size. A line is assembled on the stack and written whole, so an
 /// over-long message is truncated rather than split across two `write(2)`s.
 const LINE_MAX: usize = 512;

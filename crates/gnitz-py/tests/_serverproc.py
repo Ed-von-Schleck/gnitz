@@ -79,7 +79,7 @@ TICK_COALESCE_ROWS = 10_000
 
 # Every stage `GNITZ_INJECT_RECOVERY_PANIC` names: the boot's recovery steps
 # from the generation bump to the tick of the replayed tail.
-RECOVERY_STAGES = ["genbump", "reset", "backfill", "sweep"]
+RECOVERY_STAGES = ["genbump", "reset", "backfill", "tick"]
 
 
 def server_env():

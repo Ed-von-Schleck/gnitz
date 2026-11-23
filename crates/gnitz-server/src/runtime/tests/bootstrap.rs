@@ -191,7 +191,7 @@ fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
         "the push zone alone, behind both groups ahead of it"
     );
     assert!(tail.holds_pushes());
-    assert_eq!(tail.pushed().iter().copied().collect::<Vec<_>>(), [t]);
+    assert_eq!(tail.pushed().into_iter().collect::<Vec<_>>(), [t]);
 
     let engine = boot(dir, slot, &log);
     assert_eq!(held(&engine, t), rows, "each row once, at its weight");

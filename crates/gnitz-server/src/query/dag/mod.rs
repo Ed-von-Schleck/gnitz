@@ -267,17 +267,21 @@ impl DagEngine {
     /// holding one.
     fn rebuilt_with(&self, invalid: FxHashSet<u64>) -> FxHashSet<u64> {
         let mut rebuilt = FxHashSet::default();
-        let mut chains = FxHashSet::default();
+        if invalid.is_empty() {
+            return rebuilt;
+        }
+        // Each chain's members, taken out with the chain's first rebuilt member.
+        let mut chains: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        for (&m, v) in &self.views {
+            chains.entry(v.chain).or_default().push(m);
+        }
         let mut stack: Vec<u64> = invalid.into_iter().collect();
         while let Some(id) = stack.pop() {
             if !rebuilt.insert(id) {
                 continue;
             }
             stack.extend_from_slice(self.dependents_of(id));
-            let chain = self.chain_of(id);
-            if chains.insert(chain) {
-                stack.extend(self.views.iter().filter(|(_, v)| v.chain == chain).map(|(&m, _)| m));
-            }
+            stack.extend(chains.remove(&self.chain_of(id)).unwrap_or_default());
         }
         rebuilt
     }

@@ -7,6 +7,8 @@ use super::format::{SalMessageKind, epoch_word, next_epoch, word_epoch};
 use super::log::{SalLog, SalMessage};
 use super::reader::SalReader;
 use super::request::Ingest;
+use crate::catalog::{SysFamily, SysFamilyExt};
+use gnitz_zset::repr::Batch;
 
 /// The committed part of the un-checkpointed tail.
 pub(crate) struct CommittedTail {
@@ -14,8 +16,6 @@ pub(crate) struct CommittedTail {
     epoch: u32,
     /// The end of the last zone closed before the walk's first defect.
     end: u64,
-    /// The relations the tail's Push groups target.
-    pushed: BTreeSet<u64>,
     /// The epoch this boot writes and drains at: above the tail's.
     pub(super) live_epoch: u32,
 }
@@ -42,24 +42,18 @@ impl CommittedTail {
     pub(crate) fn read(log: SalLog) -> Result<Self, String> {
         let epoch = log.anchor()?;
         let mut end = 0u64;
-        let (mut pushed, mut zone) = (BTreeSet::new(), Vec::new());
         for msg in log.walk(epoch).filter(|m| m.head.zoned()) {
             if !msg.intact() {
                 break;
             }
-            if msg.head.request.kind == SalMessageKind::Push {
-                zone.push(msg.head.request.target_id);
-            }
             if msg.head.zone_end() {
                 end = msg.end;
-                pushed.extend(zone.drain(..));
             }
         }
         Ok(CommittedTail {
             log,
             epoch,
             end,
-            pushed,
             live_epoch: next_epoch(epoch),
         })
     }
@@ -75,7 +69,7 @@ impl CommittedTail {
     /// Whether a push committed since the last base round: this boot's replay
     /// moves a base store.
     pub(crate) fn holds_pushes(&self) -> bool {
-        !self.pushed.is_empty()
+        self.push_targets().next().is_some()
     }
 
     /// Every group a boot replays, in log order, as the ingest it carries: a zone
@@ -89,8 +83,32 @@ impl CommittedTail {
     }
 
     /// The base tables the tail's pushes target, each once, ascending.
-    pub(crate) fn pushed(&self) -> &BTreeSet<u64> {
-        &self.pushed
+    pub(crate) fn pushed(&self) -> BTreeSet<u64> {
+        self.push_targets().collect()
+    }
+
+    /// The target of each Push group the tail holds, read off its header.
+    fn push_targets(&self) -> impl Iterator<Item = u64> {
+        self.groups()
+            .filter(|m| m.head.request.kind == SalMessageKind::Push)
+            .map(|m| m.head.request.target_id)
+    }
+
+    /// The rows of each of the tail's DdlSync groups, with the family and LSN
+    /// it was logged at, in log order. A DdlSync group is shared: its one
+    /// payload holds the rows, which the master validated and which already
+    /// carry a drop's children, under the family's own shape record.
+    pub(crate) fn catalog_rows(&self) -> impl Iterator<Item = Result<(SysFamily, u64, Batch), String>> {
+        self.ingests().filter_map(|group| match group {
+            Ok((Ingest::DdlSync { family }, msg)) => msg
+                .rows(msg.payloads().next().unwrap_or_default(), |_, record| {
+                    (record == family.shape_record()).then(|| *family.schema())
+                })
+                .transpose()
+                .map(|rows| rows.map(|rows| (family, self.lsn(&msg), rows))),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
     }
 
     /// Worker `rank`'s live drain of the log the tail was read from.

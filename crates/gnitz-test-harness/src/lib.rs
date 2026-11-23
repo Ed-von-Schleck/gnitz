@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use std::{env, fs};
 
-use gnitz_foundation::log::READY_LINE;
+use gnitz_foundation::log::{READY_LINE, worker_log};
 use gnitz_foundation::process::{await_log, default_env, die_with_parent, log_tail};
 use tempfile::TempDir;
 
@@ -336,8 +336,7 @@ impl ServerHandle {
         eprintln!("{}", log_tail(&self.paths.stderr_path, MAX_TAIL_LINES));
         for w in 0..self.workers {
             eprintln!("──── worker {w} (last {MAX_TAIL_LINES} lines) ────");
-            let log = self.paths.data_dir.join(format!("worker_{w}.log"));
-            eprintln!("{}", log_tail(&log, MAX_TAIL_LINES));
+            eprintln!("{}", log_tail(&worker_log(&self.paths.data_dir, w), MAX_TAIL_LINES));
         }
         eprintln!("──── end server logs ────");
     }
