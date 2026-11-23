@@ -268,24 +268,19 @@ async fn handshake(peer: &mut Peer, served: Option<Rc<Served>>) -> bool {
 // Signal loop: TLS reload and the final checkpoint
 // ---------------------------------------------------------------------------
 
-fn reload_tls(tls: Option<&TlsListener>) {
-    let Some(tls) = tls else {
-        gnitz_note!("SIGHUP: no TLS listener, nothing to reload");
-        return;
-    };
-    match tls.reload() {
-        Ok(()) => gnitz_note!("SIGHUP: reloaded the TLS listener: {}", tls.describe()),
-        Err(e) => gnitz_error!("SIGHUP: the TLS reload failed, the previous setup is still served: {e}"),
-    }
-}
-
 /// Until SIGTERM/SIGINT, read off `signals`: reload the TLS listener on each
 /// SIGHUP. Then close the committer, which runs one final checkpoint behind
 /// every write it admitted.
 async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>, mut signals: signals::Signals) {
     loop {
         match signals.next(shared.dispatcher.reactor()).await {
-            libc::SIGHUP => reload_tls(tls),
+            libc::SIGHUP => match tls {
+                None => gnitz_note!("SIGHUP: no TLS listener, nothing to reload"),
+                Some(tls) => match tls.reload() {
+                    Ok(()) => gnitz_note!("SIGHUP: reloaded the TLS listener: {}", tls.describe()),
+                    Err(e) => gnitz_error!("SIGHUP: the TLS reload failed, the previous setup is still served: {e}"),
+                },
+            },
             _ => {
                 gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
                 // The final checkpoint ticks every push no tick has taken yet.
@@ -301,7 +296,11 @@ async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>, mut s
 // ---------------------------------------------------------------------------
 
 /// Handle one request: a frame, or a write's every frame, which
-/// [`receive_write`] takes. `false` once the connection is to be closed: a
+/// [`receive_write`] takes; and end its reply. An arm that yields a value is
+/// answered with the request's ACK carrying it; one that yields `None` has
+/// written its last frame itself, a fault confined to one position of its
+/// reply included. An `Err` is answered with one fault frame, which fails the
+/// whole request at the client. `false` once the connection is to be closed: a
 /// frame that is not the write's broke its frames off, which leaves no answer
 /// the client could pair.
 async fn handle_message(
@@ -319,11 +318,14 @@ async fn handle_message(
             return true;
         }
     };
-    let target_id = ctrl.hdr.target_id;
+    let (hdr, data) = (ctrl.hdr, buf.as_slice());
+    let (body, blob) = (&data[ctrl.body.clone()], &data[ctrl.blob.clone()]);
     let answered = match ctrl.client_verb() {
         Ok(verb @ (ClientVerb::Push | ClientVerb::PushTxn)) => {
             let Some(frames) = receive_write(peer, verb, buf, ctrl).await else {
-                cork_fault(peer, target_id, &OpenWrite::broken_off());
+                let broken = "a write's frames were broken off by another request; nothing was written, and the \
+                              connection is closed";
+                cork_fault(peer, hdr.target_id, &broken.into());
                 return false;
             };
             let followed = peer.request_queued();
@@ -337,14 +339,41 @@ async fn handle_message(
                 // and reads and runs the requests behind it meanwhile, so one
                 // fdatasync answers a pipelined run.
                 peer.fence(shared.dispatcher.sal().durable_level(), lsn);
-                cork_ack(peer, target_id, lsn)
+                Some(lsn)
             })
         }
-        Ok(verb) => dispatch_request(peer, subs, snapshots, verb, buf, ctrl, shared).await,
+        // The multi-item frames name no single relation in `target_id`; each
+        // decodes its items from the frame's body. A DDL's future is boxed: held
+        // inline it would set the size of every connection's.
+        Ok(ClientVerb::DdlTxn) => Box::pin(handle_ddl_txn(shared, data, ctrl.body.clone()))
+            .await
+            .map(Some),
+        Ok(ClientVerb::ScanMulti) => read::handle_scan(shared, peer, body).await.map(|()| None),
+        Ok(ClientVerb::DeltaPoll) => handle_delta_poll(shared, peer, subs, &hdr, body).await.map(|()| None),
+        // `target_id` is the sequence key (= the owning table's id).
+        Ok(ClientVerb::AllocSerialRange) => reserve_serial_range(shared, hdr.target(), hdr.arg0).await.map(Some),
+        // An id allocation names no relation, so `target_id` is only echoed.
+        Ok(ClientVerb::AllocIds) => allocate_ids(shared, hdr.arg0).await.map(Some),
+        Ok(ClientVerb::Resolve) => read::handle_resolve(shared, peer, blob).await.map(|()| None),
+        Ok(ClientVerb::SyncPushed) => {
+            // Refused or not, it is answered as a sync is: out of the order of replies.
+            subs.ask_sync(shared, blob, hdr.arg0);
+            Ok(None)
+        }
+        // A snapshot and a backup name no relation of the live catalog in
+        // `target_id`: a page names one of the snapshot's.
+        Ok(ClientVerb::SnapshotOpen) => snapshot::open(shared, snapshots).await.map(Some),
+        Ok(ClientVerb::SnapshotPage) => snapshot::page(shared, peer, snapshots, &hdr, blob)
+            .await
+            .map(|()| Some(0)),
+        Ok(ClientVerb::SnapshotClose) => snapshot::close(shared, snapshots, hdr.arg0).await.map(|()| Some(0)),
+        Ok(ClientVerb::Backup) => backup::backup(shared, blob).await.map(|()| Some(0)),
         Err(e) => Err(e.into()),
     };
-    if let Err(f) = answered {
-        cork_fault(peer, target_id, &f);
+    match answered {
+        Ok(Some(value)) => cork_ack(peer, hdr.target_id, value),
+        Ok(None) => {}
+        Err(f) => cork_fault(peer, hdr.target_id, &f),
     }
     true
 }
@@ -370,79 +399,9 @@ async fn receive_write(
     Some(write.finish())
 }
 
-/// Run `verb`, a request [`handle_message`] does not run itself, and end its
-/// reply. An arm that yields a value is answered with the request's ACK
-/// carrying it; an arm that returns has written its last frame itself, a fault
-/// confined to one position of its reply included. An `Err` is answered by
-/// [`handle_message`] with one fault frame, which fails the whole request at
-/// the client.
-async fn dispatch_request(
-    peer: &mut Peer,
-    subs: &mut Subscriptions,
-    snapshots: &mut HeldSnapshots,
-    verb: ClientVerb,
-    buf: RecvBuf,
-    ctrl: gnitz_wire::DecodedControl,
-    shared: &Shared,
-) -> Result<(), WireFault> {
-    let data = buf.as_slice();
-    let target_id = ctrl.hdr.target_id;
-    let ack = match verb {
-        ClientVerb::Push | ClientVerb::PushTxn => unreachable!("handle_message runs a write"),
-        // The multi-item frames name no single relation in `target_id`; each
-        // decodes its items from the frame's body.
-        ClientVerb::DdlTxn => handle_ddl_txn(shared, data, ctrl.body).await?,
-        ClientVerb::ScanMulti => {
-            let scans = gnitz_wire::multi_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
-            return read::handle_scan(shared, peer, &scans).await;
-        }
-        ClientVerb::DeltaPoll => return handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
-
-        // `target_id` is the sequence key (= the owning table's id).
-        ClientVerb::AllocSerialRange => reserve_serial_range(shared, ctrl.hdr.target(), ctrl.hdr.arg0).await?,
-
-        // An id allocation names no relation, so `target_id` is only echoed.
-        ClientVerb::AllocIds => allocate_ids(shared, ctrl.hdr.arg0).await?,
-
-        ClientVerb::Resolve => return read::handle_resolve(shared, peer, &data[ctrl.blob.clone()]).await,
-
-        ClientVerb::SyncPushed => {
-            // Refused or not, it is answered as a sync is: out of the order of replies.
-            let held = gnitz_wire::multi_frame::decode_held(&data[ctrl.blob.clone()]).map_err(decode_fault);
-            subs.ask_sync(shared, held, ctrl.hdr.arg0);
-            return Ok(());
-        }
-
-        // A snapshot and a backup name no relation of the live catalog in
-        // `target_id`: a page names one of the snapshot's.
-        ClientVerb::SnapshotOpen => snapshot::open(shared, snapshots).await?,
-        ClientVerb::SnapshotPage => {
-            snapshot::page(shared, peer, snapshots, &ctrl.hdr, &data[ctrl.blob.clone()]).await?;
-            0
-        }
-        ClientVerb::SnapshotClose => {
-            snapshot::close(shared, snapshots, ctrl.hdr.arg0).await?;
-            0
-        }
-        ClientVerb::Backup => {
-            backup::backup(shared, &data[ctrl.blob.clone()]).await?;
-            0
-        }
-    };
-    cork_ack(peer, target_id, ack);
-    Ok(())
-}
-
 /// The fault a request whose frame does not decode is refused with.
 pub(super) fn decode_fault(e: impl std::fmt::Display) -> WireFault {
     format!("decode error: {e}").into()
-}
-
-fn not_found(tid: u64) -> WireFault {
-    WireFault {
-        status: WireStatus::NotFound,
-        text: format!("relation {tid} not found"),
-    }
 }
 
 /// Which end of a relation a request wants — the discriminator of [`target_kind`].
@@ -451,9 +410,6 @@ enum Access {
     /// Any read, a system catalog family included.
     Read,
     Write,
-    /// A write inside a `PUSH_TXN`. Refusing a stream keeps every family
-    /// inside the zone, so a transaction always opens one.
-    TxnWrite,
 }
 
 /// Resolve `target`'s kind, rejecting a request whose descriptor token is
@@ -461,8 +417,7 @@ enum Access {
 /// one names a relation whose absence or kind is not the client's error. `0` is
 /// a request that carries none.
 ///
-/// A stream holds no rows, so it may be written (outside a transaction) but not
-/// read. A view may be read
+/// A stream holds no rows, so it may be written but not read. A view may be read
 /// but not written: a push would commit rows its circuit never produced.
 ///
 /// Enforced here even though the SQL binder refuses both: a client can push to
@@ -475,17 +430,17 @@ fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<Re
     cat.check_token(target)?;
     let target_id = target.tid;
     let Some(kind) = cat.registry.relation(target_id).map(Relation::kind) else {
-        return Err(not_found(target_id));
+        return Err(WireFault {
+            status: WireStatus::NotFound,
+            text: format!("relation {target_id} not found"),
+        });
     };
     match access {
         Access::Read if kind == RelationKind::Stream => {
             Err(format!("table {target_id} is a stream: a stream holds no rows and cannot be read").into())
         }
-        Access::Write | Access::TxnWrite if !kind.is_ingestion_point() => {
+        Access::Write if !kind.is_ingestion_point() => {
             Err(format!("table {target_id} is not writable: pushes must target a base table or a stream").into())
-        }
-        Access::TxnWrite if kind == RelationKind::Stream => {
-            Err(format!("table {target_id} is a stream: a stream cannot be written inside a transaction").into())
         }
         _ => Ok(kind),
     }
@@ -537,7 +492,7 @@ fn cork_train(peer: &mut Peer, target_id: u64, rows: &gnitz_zset::repr::Batch) -
 
 /// A control-only ACK: the request's own `target_id`, and its one value — a
 /// write's LSN, an allocation's base id, or the watermark of the read whose
-/// train it ends (see [`tick::read_watermark`]) — in `arg0`.
+/// train it ends — in `arg0`.
 fn cork_ack(peer: &mut Peer, target_id: u64, value: u64) {
     let hdr = ControlHeader::ack(target_id, value);
     cork_msg(peer, WireMsg { hdr, ..Default::default() })

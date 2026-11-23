@@ -337,6 +337,14 @@ impl MasterDispatcher {
         emitted
     }
 
+    /// [`Self::emit_tick`], then its workers' ACKs.
+    pub(crate) async fn tick(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
+        if let Some(wait) = self.emit_tick(alone).await? {
+            wait.await;
+        }
+        Ok(())
+    }
+
     /// Write one Tick group for `tids` at consecutive tick rounds, and answer
     /// the wait for its ACKs. A refused write takes no round.
     fn write_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckWait, WireFault> {
@@ -355,7 +363,7 @@ impl MasterDispatcher {
     }
 
     /// The SAL watermark the last emit snapshotted.
-    pub(crate) fn last_lsn(&self) -> u64 {
+    pub(super) fn last_lsn(&self) -> u64 {
         self.ticks.last_lsn.get()
     }
 

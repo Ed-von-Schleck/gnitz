@@ -24,6 +24,7 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{Read, SalExcl, SalWriter};
 use crate::runtime::sync::{AsyncRwLock, WriteFuture};
+use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
 
 pub(crate) use workers::Workers;
@@ -125,11 +126,6 @@ pub(crate) struct ScanCut<'d> {
 }
 
 impl<'d> ScanCut<'d> {
-    /// The SAL hold the cut's groups are written under.
-    pub(crate) fn sal(&self) -> &SalExcl<'d> {
-        &self.excl
-    }
-
     /// `read` written to the workers its target and bound reach, each sent its
     /// own key set when the bound splits one, under the cut's reply id. A
     /// refused read is not one of the lease's.
@@ -140,5 +136,19 @@ impl<'d> ScanCut<'d> {
             .read(read, route.set, route.per_worker.as_deref(), self.lease.id())?;
         self.lease.add(route.set, what);
         Ok(())
+    }
+
+    /// The LSN at or below which every commit is reflected in a worker read of
+    /// a `kind` relation written under this cut: every zone at or below the
+    /// SAL watermark precedes the read's group in the log, and a view reflects
+    /// its last tick.
+    pub(crate) fn watermark(&self, kind: RelationKind) -> u64 {
+        match kind {
+            RelationKind::BaseTable => self.disp.sal.watermark(),
+            RelationKind::View(_) => self.disp.last_lsn(),
+            RelationKind::SystemCatalog | RelationKind::Stream => {
+                unreachable!("a system family is read off the master, and a stream is never read")
+            }
+        }
     }
 }

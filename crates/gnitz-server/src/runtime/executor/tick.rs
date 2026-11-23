@@ -7,10 +7,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::{CatalogLock, Shared, park_until};
-use crate::runtime::sal::SalExcl;
 use crate::runtime::sync::{Either, ReadGuard, select2};
 use gnitz_foundation::fault::Switch;
-use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
 
 /// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: hold the first tick that emitted a group in
@@ -86,20 +84,6 @@ pub(super) async fn fresh_read_lock(
         shared.dispatcher.drain(drain_by).await?;
     }
     Ok(shared.catalog_rwlock.read().await)
-}
-
-/// The LSN at or below which every commit is reflected in a worker read of a
-/// `kind` relation whose group is written under `_cut`: every zone at or below
-/// the SAL watermark precedes that group in the log. A view reflects its last
-/// tick.
-pub(super) fn read_watermark(shared: &Shared, kind: RelationKind, _cut: &SalExcl<'_>) -> u64 {
-    match kind {
-        RelationKind::BaseTable => shared.dispatcher.sal().watermark(),
-        RelationKind::View(_) => shared.dispatcher.last_lsn(),
-        RelationKind::SystemCatalog | RelationKind::Stream => {
-            unreachable!("a system family is read off the master, and a stream is never read")
-        }
-    }
 }
 
 #[cfg(test)]

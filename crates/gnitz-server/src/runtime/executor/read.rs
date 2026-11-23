@@ -1,12 +1,11 @@
 //! The catalog-shape and row reads: RESOLVE, and SCAN_MULTI under one SAL cut.
 
-use super::tick::{fresh_read_lock, read_watermark};
+use super::tick::fresh_read_lock;
 use super::{Access, Shared, cork_ack, cork_msg, cork_train, decode_fault, forward_scan, target_kind};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::reactor::{Peer, TrainLease};
 use crate::runtime::sal::Read;
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::multi_frame::ScanItem;
 use gnitz_wire::{ControlHeader, ReadSpec, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 use std::rc::Rc;
@@ -61,7 +60,8 @@ struct Scanned {
 ///
 /// An `Err` ends the reply: nothing of the request follows the router's fault
 /// frame.
-pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
+pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, body: &[u8]) -> Result<(), WireFault> {
+    let scans = &gnitz_wire::multi_frame::decode_scan_multi(body).map_err(decode_fault)?;
     // Every target's kind is resolved under this guard, so a DDL during the
     // drain is caught there and an unknown tid is rejected there.
     let catalog = fresh_read_lock(
@@ -93,7 +93,7 @@ pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, scans: &[ScanI
         let fanned = scans.iter().zip(&mut scanned).filter(|(_, s)| s.local.is_none());
         let cut = shared.dispatcher.scan_cut(|cut| {
             for (scan, s) in fanned {
-                s.lsn = read_watermark(shared, s.kind, cut.sal());
+                s.lsn = cut.watermark(s.kind);
                 cut.read(Read::ScanSpec {
                     tid: scan.target.tid,
                     reply_layout: scan.reply_layout,

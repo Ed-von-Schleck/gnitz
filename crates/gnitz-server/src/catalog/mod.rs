@@ -47,11 +47,11 @@ use crate::query::DagEngine;
 use relations::CatalogCacheSet;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use relations::{FkEdge, LockSet, RowConstraints};
+pub(crate) use relations::{FkEdge, RowConstraints};
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{DdlBundle, SysFamily, SysFamilyExt};
-pub(crate) use write_path::{AppliedDdl, ZoneError, ZoneSink};
+pub(crate) use write_path::{ZoneError, ZoneSink};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

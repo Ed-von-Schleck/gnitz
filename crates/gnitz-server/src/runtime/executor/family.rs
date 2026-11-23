@@ -1,7 +1,5 @@
-//! The unit of the write path: one table's rows of a write, and the certified
-//! client block they may lie in.
+//! The unit of the write path: one table's rows of a write.
 
-use std::ops::Range;
 use std::rc::Rc;
 
 use crate::runtime::reactor::RecvBuf;
@@ -38,10 +36,10 @@ impl TxnFamily {
 
 /// The rows of a [`TxnFamily`].
 pub(super) enum FamilyRows {
-    /// A client's block, read where it lies in the request frame that carried
-    /// it. The frame, and its charge to the inbound budget, live as long as
-    /// the rows.
-    Frame(Rc<RecvBuf>, PushedBlock),
+    /// A client's block, certified where it lies in the request frame that
+    /// carried it, under the schema it was certified under. The frame, and its
+    /// charge to the inbound budget, live as long as the rows.
+    Frame(Rc<RecvBuf>, CertifiedBlock, SchemaDescriptor),
     /// Rows the master built: a merged run of pushes, or a cascade's
     /// retractions.
     Built(Batch),
@@ -51,33 +49,8 @@ impl FamilyRows {
     /// The rows, read where they lie.
     pub(super) fn view(&self) -> MemBatch<'_> {
         match self {
-            FamilyRows::Frame(frame, block) => block.view(frame.as_slice()),
+            FamilyRows::Frame(frame, block, schema) => block.view(frame.as_slice(), schema),
             FamilyRows::Built(batch) => batch.as_mem_batch(),
         }
-    }
-}
-
-/// A client's data block, certified where it lies, under the schema it was
-/// certified under.
-pub(super) struct PushedBlock {
-    block: CertifiedBlock,
-    schema: SchemaDescriptor,
-}
-
-impl PushedBlock {
-    /// Certify the block at `range` of `data` under `schema`.
-    pub(super) fn certify(data: &[u8], range: Range<usize>, schema: SchemaDescriptor) -> Result<Self, &'static str> {
-        let block = CertifiedBlock::certify(data, range, &schema)?;
-        Ok(PushedBlock { block, schema })
-    }
-
-    /// How many rows the block holds.
-    pub(super) fn rows(&self) -> usize {
-        self.block.rows()
-    }
-
-    /// The block's rows, read from `data`: the bytes it was certified in.
-    pub(super) fn view<'a>(&'a self, data: &'a [u8]) -> MemBatch<'a> {
-        self.block.view(data, &self.schema)
     }
 }

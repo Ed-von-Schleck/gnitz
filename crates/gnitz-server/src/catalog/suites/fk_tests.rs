@@ -4,14 +4,9 @@ use gnitz_wire::{FkAction, FkRef};
 
 // ── test_write_lock_set ─────────────────────────────────────────────────
 
-/// The lock set of a write to `tid` that `deletes` or does not, as
-/// `lock_tables` acquires it: sorted and deduped.
+/// The lock set of a write to `tid` that `deletes` or does not.
 fn lock_set_of(engine: &CatalogEngine, tid: u64, deletes: bool) -> Vec<u64> {
-    let mut set = LockSet::new();
-    engine.write_lock_set_into(&mut set, tid, deletes);
-    set.sort_unstable();
-    set.dedup();
-    set.to_vec()
+    engine.write_lock_set([(tid, deletes)]).to_vec()
 }
 
 /// A deleting write's lock set.
@@ -99,13 +94,9 @@ fn a_write_locks_what_its_cascade_can_delete_from() {
     assert_eq!(lock_set(&engine, held), [root, held, under]);
     assert_eq!(lock_set_of(&engine, root, false), [root, mid, held]);
     assert_eq!(lock_set_of(&engine, mid, false), [root, mid, leaf]);
-    // Appends to what the set already holds, as a transaction's union of its
-    // families' sets is built.
-    let mut union: LockSet = [other].into_iter().collect();
-    engine.write_lock_set_into(&mut union, held, false);
-    union.sort_unstable();
-    union.dedup();
-    assert_eq!(union[..], [root, other, held, under]);
+    // A transaction's set is the union of its families' sets.
+    let union = engine.write_lock_set([(other, false), (held, false)]);
+    assert_eq!(union[..], [root, other, leaf, held, under]);
     let _ = (beyond, under);
 
     let actions = |tid| -> Vec<FkAction> { engine.fks_as_child(tid).iter().map(|e| e.on_delete).collect() };

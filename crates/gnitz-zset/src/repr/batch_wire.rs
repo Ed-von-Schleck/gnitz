@@ -548,12 +548,6 @@ impl CertifiedBlock {
         Ok(CertifiedBlock { range, rows, heap_dead })
     }
 
-    /// How many rows the block holds.
-    #[inline]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
     /// The block's rows, read from `data` under `schema`: the bytes and the
     /// schema it was certified under.
     #[inline]

@@ -247,32 +247,37 @@ impl CatalogEngine {
         self.caches.fk_by_parent.get(&parent_id).map_or(&[], Vec::as_slice)
     }
 
-    /// Append to `set` the tables a write to `table_id` locks exclusively:
-    /// itself; its FK parents, against a parent DELETE; and its FK children,
-    /// against a child INSERT. One that `deletes` rows takes the children of
-    /// every table its deletes cascade to as well. Appends without clearing,
-    /// in no particular order and with repeats.
-    pub(crate) fn write_lock_set_into(&self, set: &mut LockSet, table_id: u64, deletes: bool) {
-        set.push(table_id);
-        set.extend(self.fks_as_child(table_id).iter().map(|e| e.parent_tid));
-        // The tables the deletes cascade to, beyond `table_id`, each once.
-        let mut cascaded: Vec<u64> = Vec::new();
-        let (mut tid, mut at) = (table_id, 0);
-        loop {
-            for e in self.fks_as_parent(tid) {
-                set.push(e.child_tid);
-                if deletes
-                    && e.on_delete == FkAction::Cascade
-                    && e.child_tid != table_id
-                    && !cascaded.contains(&e.child_tid)
-                {
-                    cascaded.push(e.child_tid);
+    /// The tables a write locks, sorted and each once: for each `(table_id,
+    /// deletes)` it writes, the table itself; its FK parents, against a parent
+    /// DELETE; and its FK children, against a child INSERT. One that `deletes`
+    /// rows takes the children of every table its deletes cascade to as well.
+    pub(crate) fn write_lock_set(&self, writes: impl IntoIterator<Item = (u64, bool)>) -> LockSet {
+        let mut set = LockSet::new();
+        for (table_id, deletes) in writes {
+            set.push(table_id);
+            set.extend(self.fks_as_child(table_id).iter().map(|e| e.parent_tid));
+            // The tables the deletes cascade to, beyond `table_id`, each once.
+            let mut cascaded: Vec<u64> = Vec::new();
+            let (mut tid, mut at) = (table_id, 0);
+            loop {
+                for e in self.fks_as_parent(tid) {
+                    set.push(e.child_tid);
+                    if deletes
+                        && e.on_delete == FkAction::Cascade
+                        && e.child_tid != table_id
+                        && !cascaded.contains(&e.child_tid)
+                    {
+                        cascaded.push(e.child_tid);
+                    }
                 }
+                let Some(&next) = cascaded.get(at) else { break };
+                at += 1;
+                tid = next;
             }
-            let Some(&next) = cascaded.get(at) else { break };
-            at += 1;
-            tid = next;
         }
+        set.sort_unstable();
+        set.dedup();
+        set
     }
 
     /// Every constraint on `tid` whose validation reads committed state.

@@ -114,21 +114,16 @@ fn poll_position(shared: &Shared, _catalog: &ReadGuard<CatalogLock>, item: Delta
         return PollPosition::Moved { tag };
     };
     if cursor.tag != tag {
-        return PollPosition::Fault(foreign_cursor(tid));
+        return PollPosition::Fault(WireFault {
+            status: WireStatus::DeltaExpired,
+            text: format!("delta cursor of relation {tid} names another boot, relation or spec; re-read at 0"),
+        });
     }
     let last = shared.dispatcher.last_delta_round(tid);
     if cursor.tick.get() >= last {
         PollPosition::UpToDate { round: last, tag }
     } else {
         PollPosition::Moved { tag }
-    }
-}
-
-/// The refusal of a cursor whose tag is not the view's.
-fn foreign_cursor(view: u64) -> WireFault {
-    WireFault {
-        status: WireStatus::DeltaExpired,
-        text: format!("delta cursor of relation {view} names another boot, relation or spec; re-read at 0"),
     }
 }
 
@@ -331,17 +326,6 @@ struct Feed {
     asked: Cell<bool>,
 }
 
-/// A `u64` from the OS entropy pool for [`Feeds::cursor_tag`], so two
-/// back-to-back boots cannot collide.
-fn boot_nonce() -> u64 {
-    let rng = ring::rand::SystemRandom::new();
-    u64::from_ne_bytes(
-        ring::rand::generate(&rng)
-            .expect("the OS random number generator")
-            .expose(),
-    )
-}
-
 /// The delta feed's state: the feeds with a subscriber, the way to the one task
 /// that reads for them, [`pump`], and what every cursor tag of this boot is
 /// drawn from.
@@ -354,8 +338,9 @@ pub(super) struct Feeds {
     /// (`GNITZ_PUSH_QUEUE_BYTES`). A subscription whose train would pass it
     /// is ended, and continues by polling.
     queue_bytes: usize,
-    /// A `u64` taken from the OS at boot, mixed into every cursor tag;
-    /// [`Feeds::cursor_tag`] states what the tag answers.
+    /// A `u64` taken from the OS entropy pool at boot, mixed into every cursor
+    /// tag so two back-to-back boots cannot collide; [`Feeds::cursor_tag`]
+    /// states what the tag answers.
     boot_nonce: u64,
 }
 
@@ -367,7 +352,11 @@ impl Feeds {
             live: RefCell::default(),
             asked,
             queue_bytes: gnitz_foundation::env::env_num("GNITZ_PUSH_QUEUE_BYTES", 8usize << 20),
-            boot_nonce: boot_nonce(),
+            boot_nonce: u64::from_ne_bytes(
+                ring::rand::generate(&ring::rand::SystemRandom::new())
+                    .expect("the OS random number generator")
+                    .expose(),
+            ),
         };
         (feeds, asks)
     }
@@ -457,21 +446,6 @@ impl Subscriptions {
         self.asked_mut().held.push((joined, feed));
     }
 
-    /// Send each subscription queued through rounds that left it no row where
-    /// it stands, as a train of its terminal alone: its client's cursor passes
-    /// those rounds too.
-    fn tell(&self, peer: &mut Peer) {
-        debug_assert!(self.out.is_empty(), "a position is sent behind every train");
-        for (sub, feed) in &self.asked.held {
-            let Some(after) = sub.after_tick.get() else { continue };
-            if sub.told.replace(after) != after {
-                let tid = feed.key.view.tid;
-                cork_msg(peer, pushed_marker(tid, sub.id));
-                cork_msg(peer, terminal(tid, after, feed.tag));
-            }
-        }
-    }
-
     /// Leave the feed of every subscription whose id `gone` names.
     pub(super) fn leave(&mut self, feeds: &Feeds, gone: impl Fn(SubId) -> bool) {
         for (sub, feed) in self.asked_mut().held.extract_if(.., |(sub, _)| gone(sub.id)) {
@@ -480,10 +454,11 @@ impl Subscriptions {
         }
     }
 
-    /// SYNC_PUSHED: end every subscription `held` does not name, and owe the
-    /// connection a sync held up to `wait_ms`. An undecodable `held` is what
-    /// that sync is refused with.
-    pub(super) fn ask_sync(&mut self, shared: &Shared, held: Result<Vec<SubId>, WireFault>, wait_ms: u64) {
+    /// SYNC_PUSHED: end every subscription the list `held` encodes does not
+    /// name, and owe the connection a sync held up to `wait_ms`. An undecodable
+    /// `held` is what that sync is refused with.
+    pub(super) fn ask_sync(&mut self, shared: &Shared, held: &[u8], wait_ms: u64) {
+        let held = gnitz_wire::multi_frame::decode_held(held).map_err(decode_fault);
         if let Ok(held) = &held {
             self.leave(&shared.feeds, |id| !held.contains(&id));
         }
@@ -520,7 +495,18 @@ impl Subscriptions {
         }
         let end = match &synced {
             Ok(()) => {
-                self.tell(peer);
+                // Each subscription queued through rounds that left it no row
+                // where it stands is sent a train of its terminal alone: its
+                // client's cursor passes those rounds too.
+                debug_assert!(self.out.is_empty(), "a position is sent behind every train");
+                for (sub, feed) in &self.asked.held {
+                    let Some(after) = sub.after_tick.get() else { continue };
+                    if sub.told.replace(after) != after {
+                        let tid = feed.key.view.tid;
+                        cork_msg(peer, pushed_marker(tid, sub.id));
+                        cork_msg(peer, terminal(tid, after, feed.tag));
+                    }
+                }
                 self.out.synced();
                 WireMsg::default()
             }

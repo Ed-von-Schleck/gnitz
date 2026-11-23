@@ -150,7 +150,7 @@ fn a_unit_answers_every_client() {
         let mut s = CommitScratch { writes, ..CommitScratch::default() };
         build_units(&mut s, true);
         let mut unit = s.units.pop().expect("a unit");
-        assert!(s.units.is_empty() && unit.is_merged(), "the writes are one run");
+        assert!(s.units.is_empty() && unit.merged.is_some(), "the writes are one run");
         unit.outcome = outcome;
         unit.resolve(9);
         for (c, rx) in rxs.iter_mut().enumerate() {

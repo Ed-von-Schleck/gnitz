@@ -262,13 +262,9 @@ async fn run_checkpoint_sequence(shared: &Shared) {
     // generation-valid. Unstamped, they stay behind the generation the base
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the shutdown checkpoint.
-    match shared.dispatcher.emit_tick(&alone).await {
-        Ok(Some(wait)) => wait.await,
-        Ok(None) => {}
-        Err(e) => {
-            gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
-            return;
-        }
+    if let Err(e) = shared.dispatcher.tick(&alone).await {
+        gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
+        return;
     }
 
     shared
@@ -301,11 +297,6 @@ impl CommitUnit {
             (Ok(_), Some(merged)) => std::slice::from_ref(&**merged),
             (Ok(_), None) => &self.writes[0].families,
         }
-    }
-
-    /// A run of several clients' writes merged into one.
-    fn is_merged(&self) -> bool {
-        self.merged.is_some()
     }
 
     /// The commit LSN of a laid unit: the zone LSN when one of its groups rode
@@ -428,7 +419,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                 // A merged run goes again as the writes it merged; a unit of one
                 // write, if a checkpoint may make room for it. The unit was taken
                 // back, so the scope's next group starts where the unit did.
-                Err(full) if unit.is_merged() || full.checkpoint_may_admit() => {
+                Err(full) if unit.merged.is_some() || full.checkpoint_may_admit() => {
                     refused_at = Some(at);
                     break;
                 }

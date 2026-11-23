@@ -1,46 +1,21 @@
-//! The catalog-zone write path: one protocol, two entry points.
+//! The catalog-zone write path: one protocol, three entry points.
 //! [`handle_ddl_txn`] ingests a client bundle of system-table families;
-//! [`reserve_serial_range`] advances one sequence. Both take the SAL lock and
-//! emit the zone while the catalog applies it; only the DDL awaits the zone's
-//! fsync.
+//! [`allocate_ids`] and [`reserve_serial_range`] each advance one sequence.
+//! All take the SAL lock and emit the zone while the catalog applies it; only
+//! the DDL awaits the zone's fsync.
 //!
-//! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs
-//! none of that: a `sequences` advance has no DAG evaluation, and the row
-//! it logs is one no worker reads.
+//! A DDL bundle additionally runs under the catalog write and the apply lock.
+//! A sequence advance needs none of that: it has no DAG evaluation, and the
+//! row it logs is one no worker reads.
 
 use super::validate;
-use super::{CatalogLock, Shared, decode_fault, park_until};
-use crate::catalog::{AppliedDdl, DdlBundle, SysFamily, SysFamilyExt};
-use crate::runtime::master::ApplyLock;
+use super::{Shared, decode_fault, park_until};
+use crate::catalog::{DdlBundle, SysFamily, SysFamilyExt};
 use crate::runtime::sal::Read;
-use crate::runtime::sync::WriteGuard;
 use gnitz_foundation::fault::Switch;
-use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
+use gnitz_wire::{ClientVerb, Target, WireFault};
 use gnitz_zset::repr::Batch;
 use std::ops::Range;
-
-/// What a DDL body runs under: the catalog write, and the apply lock, so no
-/// tick is in flight, every broadcast DdlSync lands between epochs, and no
-/// checkpoint, which holds the lock from its base round through its ephemeral
-/// round, runs inside the DDL.
-struct DdlLocks {
-    catalog: WriteGuard<CatalogLock>,
-    applies: WriteGuard<ApplyLock>,
-}
-
-/// Take [`DdlLocks`].
-async fn enter_ddl(shared: &Shared) -> DdlLocks {
-    // A checkpoint already queued, or due before the writes queued with this
-    // settle, finishes before the catalog write holds off readers.
-    shared.committer.settle().await;
-    let catalog = shared.catalog_rwlock.write().await;
-    // Every writer holds a catalog read until its fdatasync, so none is queued:
-    // a checkpoint due now runs, and the DDL's groups start on a log below the
-    // threshold. Ahead of the apply lock, which that checkpoint takes.
-    shared.committer.settle().await;
-    let applies = shared.dispatcher.apply_lock().await;
-    DdlLocks { catalog, applies }
-}
 
 /// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: hold the first DDL, its zone written
 /// and its locks still held, until a task parks on the apply lock it holds.
@@ -52,34 +27,31 @@ static DDL_HOLD_FOR_CHECKPOINT: Switch = Switch::new("GNITZ_INJECT_DDL_HOLD_FOR_
 /// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
 const DDL_HOLD_MAX_POLLS: u32 = 10_000;
 
-/// Decode one `DDL_TXN` item's block, in `frame`, under its family's own schema.
-fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
-    let tid = ctrl.hdr.target_id;
-    let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
-    let block = &frame[ctrl.data.expect("a DDL_TXN item carries a data block")];
-    let batch = Batch::decode_foreign_wal_blocks(&[block], family.schema())
-        .map_err(|e| format!("family {tid} decode error: {e}"))?;
-    Ok((family, batch))
-}
-
 /// The `DDL_TXN` item list at `body` of `frame` as one block per family, each
-/// family's wal-block slice materialised into an owned batch under its own schema — see
-/// [`decode_sys_family`]. One slot per family: every list derived from a bundle
-/// reads one block of each.
+/// family's wal-block slice materialised into an owned batch under its own
+/// schema. One slot per family: every list derived from a bundle reads one
+/// block of each.
 pub(super) fn decode_bundle(frame: &[u8], body: Range<usize>) -> Result<DdlBundle, WireFault> {
     let items = gnitz_wire::multi_frame::decode_items(frame, body, ClientVerb::DdlTxn).map_err(decode_fault)?;
     let mut families = DdlBundle::default();
     for ctrl in items {
-        decode_sys_family(frame, ctrl)
-            .and_then(|(family, batch)| families.insert(family, batch))
-            .map_err(|e| format!("DDL_TXN: {e}"))?;
+        let tid = ctrl.hdr.target_id;
+        let family = SysFamily::from_id(tid).ok_or_else(|| format!("DDL_TXN: {tid} is not a system family"))?;
+        let block = &frame[ctrl.data.expect("a DDL_TXN item carries a data block")];
+        let batch = Batch::decode_foreign_wal_blocks(&[block], family.schema())
+            .map_err(|e| format!("DDL_TXN: family {tid} decode error: {e}"))?;
+        families.insert(family, batch).map_err(|e| format!("DDL_TXN: {e}"))?;
     }
     Ok(families)
 }
 
-/// DDL_TXN: apply a bundle of system-family batches as one durable SAL zone,
-/// under [`DdlLocks`]; a refused bundle leaves the catalog as it was. Returns
-/// the zone LSN.
+/// DDL_TXN: apply a bundle of system-family batches as one durable SAL zone;
+/// a refused bundle leaves the catalog as it was. Returns the zone LSN.
+///
+/// The body runs under the catalog write, and the apply lock, so no tick is in
+/// flight, every broadcast DdlSync lands between epochs, and no checkpoint,
+/// which holds the lock from its base round through its ephemeral round, runs
+/// inside the DDL.
 ///
 /// The bundle is applied and its zone laid out under one hold of the SAL lock,
 /// with no await between: a bundle the catalog or the log refuses is negated in
@@ -89,15 +61,60 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     let families = decode_bundle(frame, body)?;
     let unique_creates = families.unique_index_creates();
 
-    let locks = enter_ddl(shared).await;
-    let committed = commit_bundle(shared, &locks.applies, families, &unique_creates).await;
-    if !unique_creates.is_empty() {
-        release_preflight(shared).await;
+    // A checkpoint already queued, or due before the writes queued with this
+    // settle, finishes before the catalog write holds off readers.
+    shared.committer.settle().await;
+    let catalog = shared.catalog_rwlock.write().await;
+    // Every writer holds a catalog read until its fdatasync, so none is queued:
+    // a checkpoint due now runs, and the DDL's groups start on a log below the
+    // threshold. Ahead of the apply lock, which that checkpoint takes.
+    shared.committer.settle().await;
+    let applies = shared.dispatcher.apply_lock().await;
+
+    // Pre-flight every unique index of the bundle, then apply it and make its
+    // zone durable. Every `Err` leaves the catalog as it was.
+    let committed = async {
+        // Pre-flight global uniqueness for every unique secondary index in this
+        // bundle before opening the zone or mutating the catalog, so a
+        // violation needs no rollback.
+        for &(owner_id, cols) in &unique_creates {
+            validate::validate_unique_index_create(&shared.dispatcher, owner_id, cols).await?;
+        }
+        // Before the views exist: a tick owed now carries rows pushed ahead of
+        // them, and a stream's must not reach them.
+        if families.get(SysFamily::Circuit).is_some() {
+            shared.dispatcher.tick(&applies).await?;
+        }
+        let mut excl = shared.dispatcher.sal().lock().await;
+        let (applied, zone_lsn) = shared
+            .dispatcher
+            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?;
+        // The families whose groups landed above the cut are owed the tick
+        // that follows the backfill, even when the zone dropped every view that
+        // scanned them; `applies` keeps every other emit from taking them first.
+        for &family in &applied.held_above {
+            shared.dispatcher.owe(&excl, family, 0);
+        }
+        drop(excl);
+        shared.dispatcher.sal().durable_through(zone_lsn).await;
+        Ok::<_, WireFault>((applied, zone_lsn))
     }
-    let Committed { applied, zone_lsn } = committed?;
+    .await;
+    // Release the pre-flight's index claims, committed or not, while the DDL
+    // still holds the apply lock. The release follows the zone in the log, so
+    // a worker enters the catalog's claim on an index the DDL created before it
+    // drops the pre-flight's. A claim left standing would keep an index no
+    // catalog row owns, whose directory the next checkpoint's sweep removes
+    // from under it.
+    if !unique_creates.is_empty()
+        && let Err(e) = shared.dispatcher.command(Read::ReleasePreflight).await
+    {
+        gnitz_fatal_abort!("releasing the unique-index pre-flight's claims failed: {}", e.text);
+    }
+    let (applied, zone_lsn) = committed?;
 
     for &id in &applied.dropped_relations {
-        shared.forget_relation(&locks.catalog, id);
+        shared.forget_relation(&catalog, id);
     }
     for &(owner_id, cols) in &applied.dropped_indexes {
         shared.writes.checks.unique_filter_remove(owner_id, cols);
@@ -107,7 +124,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     // is durable), so abort — restart's boot rebuild refills it.
     if let Err(e) = shared
         .dispatcher
-        .backfill_views_in_dep_order(&locks.applies, &applied.created_views)
+        .backfill_views_in_dep_order(&applies, &applied.created_views)
         .await
     {
         gnitz_fatal_abort!("live CREATE VIEW backfill failed after the CREATE was made durable: {e}");
@@ -117,77 +134,18 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     // rows reach the views that already scanned them. The tick takes whatever
     // user commit is pending too: every writer holds a catalog read until its
     // fdatasync, so each of those was laid out before this DDL.
-    match shared.dispatcher.emit_tick(&locks.applies).await {
-        Ok(Some(wait)) => wait.await,
-        Ok(None) => {}
-        Err(e) => gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}"),
+    if let Err(e) = shared.dispatcher.tick(&applies).await {
+        gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}");
     }
     // Any DDL may change what a parked sync reads: a view dropped, a source's
     // token reset, catalog rows a view scans.
     shared.dispatcher.wake_watches();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
-        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || locks.applies.contended()).await;
+        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || applies.contended()).await;
     }
-    drop(locks);
+    drop((catalog, applies));
     Ok(zone_lsn)
-}
-
-/// A bundle made durable: what it applied and its zone.
-struct Committed {
-    applied: AppliedDdl,
-    zone_lsn: u64,
-}
-
-/// Pre-flight every unique index of the bundle, then apply it and make its zone
-/// durable. Every `Err` leaves the catalog as it was.
-async fn commit_bundle(
-    shared: &Shared,
-    alone: &WriteGuard<ApplyLock>,
-    families: DdlBundle,
-    unique_creates: &[(u64, PkColList)],
-) -> Result<Committed, WireFault> {
-    // Pre-flight global uniqueness for every unique secondary index in this
-    // bundle before opening the zone or mutating the catalog, so a
-    // violation needs no rollback.
-    for &(owner_id, cols) in unique_creates {
-        validate::validate_unique_index_create(&shared.dispatcher, owner_id, cols).await?;
-    }
-
-    // Before the views exist: a tick owed now carries rows pushed ahead of them,
-    // and a stream's must not reach them.
-    if families.get(SysFamily::Circuit).is_some()
-        && let Some(wait) = shared.dispatcher.emit_tick(alone).await?
-    {
-        wait.await;
-    }
-    let (applied, zone_lsn) = {
-        let mut excl = shared.dispatcher.sal().lock().await;
-        let (applied, zone_lsn) = shared
-            .dispatcher
-            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?;
-        // The families whose groups landed above the cut are owed the tick
-        // that follows the backfill, even when the zone dropped every view that
-        // scanned them; `alone` keeps every other emit from taking them first.
-        for &family in &applied.held_above {
-            shared.dispatcher.owe(&excl, family, 0);
-        }
-        (applied, zone_lsn)
-    };
-    shared.dispatcher.sal().durable_through(zone_lsn).await;
-    Ok(Committed { applied, zone_lsn })
-}
-
-/// Release the pre-flight's index claims, committed or not, while the DDL still
-/// holds the apply lock. The release follows the zone in the log, so a
-/// worker enters the catalog's claim on an index the DDL created before it drops
-/// the pre-flight's. A claim left standing would keep an index no catalog row
-/// owns, whose directory the next checkpoint's sweep removes from under it.
-async fn release_preflight(shared: &Shared) {
-    let released = shared.dispatcher.command(Read::ReleasePreflight).await;
-    if let Err(e) = released {
-        gnitz_fatal_abort!("releasing the unique-index pre-flight's claims failed: {}", e.text);
-    }
 }
 
 /// Allocate `count` contiguous catalog object ids and return the first. The
