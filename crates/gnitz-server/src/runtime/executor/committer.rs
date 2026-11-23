@@ -8,6 +8,7 @@
 use super::Shared;
 use super::family::{FamilyRows, TxnFamily};
 use super::write::HeldTables;
+use crate::runtime::master::route::with_routed;
 use crate::runtime::sync::{Either, chan, oneshot, select2};
 use gnitz_foundation::gnitz_warn;
 use gnitz_store::relation::PkRule;
@@ -204,7 +205,7 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
             }
             Some(BatchEnd::Backup { dir, done }) => {
                 run_checkpoint_sequence(&shared).await;
-                done.send(shared.dispatcher.backup_round(&dir).await);
+                done.send(super::backup::copy_published(&shared, &dir).await);
             }
             Some(BatchEnd::Settle(done)) => done.send(()),
         }
@@ -262,7 +263,7 @@ async fn run_checkpoint_sequence(shared: &Shared) {
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the shutdown checkpoint.
     match shared.dispatcher.emit_tick(&alone).await {
-        Ok(Some(wait)) => wait.acks().await,
+        Ok(Some(wait)) => wait.await,
         Ok(None) => {}
         Err(e) => {
             gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
@@ -399,13 +400,26 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         let mut scope = excl.begin();
 
         // A unit is all-or-nothing: a family that does not fit takes back the
-        // unit's earlier families, which were never published.
+        // unit's earlier families, which were never published. A family is one
+        // group: its target's shape record and its rows routed to the workers
+        // that own them. A base table's group rides inside the zone; a
+        // stream's, which no restart recovers, outside. No worker ACKs one: a
+        // read or tick behind it in the SAL reaches its workers after their
+        // apply, and a worker that cannot apply it exits.
+        let cat = disp.cat();
         let mut refused_at = None;
         for (at, unit) in s.units.iter_mut().enumerate() {
             let mut unit_in_zone = false;
             let written = scope.unit(|scope| {
                 for f in unit.laid() {
-                    unit_in_zone |= disp.write_commit_group(scope, f.tid, f.pk_rule, f.rows.view())?;
+                    let (rel, record) = cat
+                        .shape_target(f.tid)
+                        .expect("a push target is registered under the catalog lock");
+                    let recoverable = rel.kind().is_base_table();
+                    with_routed(f.rows.view(), rel.placement(), disp.sal().num_workers(), |rows| {
+                        scope.push(f.tid, f.pk_rule, record, rows, recoverable)
+                    })?;
+                    unit_in_zone |= recoverable;
                 }
                 Ok(())
             });

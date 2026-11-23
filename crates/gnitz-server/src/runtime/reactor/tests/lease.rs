@@ -49,7 +49,7 @@ fn the_applied_level_is_the_lowest_of_every_workers_and_keeps_early_positions() 
     let d = Rc::clone(&done);
     let wait = r.applied_through(7);
     r.spawn(async move {
-        wait.acks().await;
+        wait.await;
         d.set(true);
     });
     r.tick();
@@ -67,7 +67,7 @@ fn the_applied_level_is_the_lowest_of_every_workers_and_keeps_early_positions() 
 #[test]
 fn a_reactor_over_no_worker_awaits_no_position() {
     let (r, _) = reactor_with_rings(0);
-    assert!(try_poll_once(r.applied_through(u64::MAX).acks()).is_some());
+    assert!(try_poll_once(r.applied_through(u64::MAX)).is_some());
 }
 
 /// A frame no lease routes is released at its ring undecoded: the frames a train
@@ -104,8 +104,8 @@ fn a_position_passes_a_held_frame() {
 
     writers[0].applied(3);
     r.drain_all_w2m();
-    assert!(try_poll_once(r.applied_through(3).acks()).is_some());
-    assert!(try_poll_once(r.applied_through(4).acks()).is_none());
+    assert!(try_poll_once(r.applied_through(3)).is_some());
+    assert!(try_poll_once(r.applied_through(4)).is_none());
 }
 
 /// A passing frame is copied out of its ring as it is routed, releasing its

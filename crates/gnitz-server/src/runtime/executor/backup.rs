@@ -14,11 +14,17 @@ use std::fs;
 use std::path::Path;
 
 use super::Shared;
+use crate::runtime::sal::Read;
+use gnitz_foundation::fault::Switch;
 use gnitz_foundation::posix_io;
 use gnitz_wire::WireFault;
 
 /// The longest entry name a backup takes.
 const MAX_NAME_LEN: usize = 128;
+
+/// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
+/// its own, as a crash part-way through a backup would.
+static BACKUP_ABORT: Switch = Switch::new("GNITZ_INJECT_BACKUP_ABORT");
 
 /// BACKUP into the entry `name` of the backup directory. The copy is made under
 /// a name no entry takes and renamed onto `name` once complete, so an entry of
@@ -65,6 +71,20 @@ pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault
         }
     }
     result
+}
+
+/// A backup's copy, run by the committer right behind a checkpoint: every
+/// worker puts the stores it published into the data directory `dir`, then the
+/// master puts its system families', each store with the entries that reach it
+/// durable. `dir` exists; everything under it is made here.
+pub(super) async fn copy_published(shared: &Shared, dir: &str) -> Result<(), WireFault> {
+    shared.dispatcher.command(Read::Backup { dir }).await?;
+    if BACKUP_ABORT.armed() {
+        gnitz_fatal_abort!("injected backup abort");
+    }
+    shared.cat().registry.link_published_into(dir)?;
+    gnitz_info!("backup copied into {}", dir);
+    Ok(())
 }
 
 /// `name` as an entry of the backup directory: one path component of the

@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use super::tick::fresh_read_lock;
 use super::{Access, CatalogLock, Shared, cork_fault, cork_msg, decode_fault, forward_scan, target_kind};
@@ -610,16 +610,14 @@ async fn sync_wait(
         // read ends only a subscriber behind, whose connection is not held,
         // and a feed ended as unreadable became so by a DDL. A commit the
         // drain above did not take is un-ticked here, and refuses the watch.
-        if until > shared.dispatcher.reactor().now() && out.unsynced() == 0 && held.iter().all(caught_up) {
-            let watched: FxHashSet<u64> = {
-                let cat = shared.cat();
-                views().flat_map(|v| cat.dag.roots_of(v).iter().copied()).collect()
-            };
-            if let Some(mut watching) = shared.dispatcher.watch(watched) {
-                drop(catalog);
-                select2(&mut watching.woken, shared.dispatcher.reactor().sleep_until(until)).await;
-                continue;
-            }
+        if until > shared.dispatcher.reactor().now()
+            && out.unsynced() == 0
+            && held.iter().all(caught_up)
+            && let Some(woken) = shared.dispatcher.watch(views())
+        {
+            drop(catalog);
+            select2(woken, shared.dispatcher.reactor().sleep_until(until)).await;
+            continue;
         }
         // Every commit acknowledged before the sync is ticked here, so only a
         // subscription behind asks for a pump.

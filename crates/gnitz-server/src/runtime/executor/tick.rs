@@ -52,7 +52,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, patient_gap: Duration) {
                 if TICK_HOLD_FOR_DDL.take_once() {
                     park_until(&shared, TICK_HOLD_MAX_POLLS, "tick hold", || ticking.contended()).await;
                 }
-                wait.acks().await;
+                wait.await;
             }
             Ok(None) => {}
         }

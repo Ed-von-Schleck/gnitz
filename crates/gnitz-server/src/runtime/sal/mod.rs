@@ -43,6 +43,6 @@ pub(crate) use group::Routed;
 pub(crate) use reader::{Inbound, ReplyRoute, SalReader};
 pub(crate) use request::{Apply, Ingest, KeptRead, Read};
 pub(crate) use tail::CommittedTail;
+pub(crate) use writer::{SalExcl, SalWriter};
 #[cfg(test)]
-pub(crate) use writer::fixtures;
-pub(crate) use writer::{SalExcl, SalFull, SalScope, SalWriter};
+pub(crate) use writer::{SalFull, fixtures};

@@ -211,6 +211,11 @@ pub(crate) mod oneshot {
                 w.wake();
             }
         }
+
+        /// Whether the receiver was dropped, so nothing would read a send.
+        pub(crate) fn is_closed(&self) -> bool {
+            Rc::strong_count(&self.inner) == 1
+        }
     }
 
     impl<T> Future for Receiver<T> {

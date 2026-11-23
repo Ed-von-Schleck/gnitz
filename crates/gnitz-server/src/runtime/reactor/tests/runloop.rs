@@ -239,7 +239,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
             writer.applied(1);
-            wait.acks().await;
+            wait.await;
             d.set(true);
         });
         r.run_ready();
@@ -316,7 +316,7 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
     let pid = unsafe { fork_child(child) };
 
     let reached = r.applied_through(N_POSITIONS);
-    if let Either::B(()) = r.block_on(select2(reached.acks(), r.sleep(TIMEOUT))) {
+    if let Either::B(()) = r.block_on(select2(reached, r.sleep(TIMEOUT))) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: a lost wake");
     }

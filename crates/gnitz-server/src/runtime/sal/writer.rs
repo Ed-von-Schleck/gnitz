@@ -160,7 +160,7 @@ impl SalWriter {
     /// replayed from the tail to its stores: until then the tail is those rows'
     /// only durable copy, which the rewind gives up.
     pub(crate) async fn boot(tail: CommittedTail, parks: WorkerParks, reactor: &Reactor) -> Self {
-        reactor.applied_through(epoch_word(tail.live_epoch, 0)).acks().await;
+        reactor.applied_through(epoch_word(tail.live_epoch, 0)).await;
         Self::rewound(tail.log, parks, tail.live_epoch)
     }
 

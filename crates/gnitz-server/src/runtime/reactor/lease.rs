@@ -184,12 +184,14 @@ pub(crate) struct AckWait {
     at: u64,
 }
 
-impl AckWait {
-    /// Resolves once every launched worker has applied the log through the
-    /// position. A worker that cannot apply what lies below it exits instead,
-    /// which the master's death watch sees.
-    pub(crate) async fn acks(&self) {
-        std::future::poll_fn(|cx| self.reactor.applied.poll_reached(self.at, cx)).await
+/// Resolves once every launched worker has applied the log through the
+/// position. A worker that cannot apply what lies below it exits instead, which
+/// the master's death watch sees.
+impl std::future::Future for AckWait {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.reactor.applied.poll_reached(self.at, cx)
     }
 }
 

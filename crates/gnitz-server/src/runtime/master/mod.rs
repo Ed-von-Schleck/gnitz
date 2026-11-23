@@ -2,10 +2,10 @@
 //! value. Every group a worker answers is written here, with what the reactor
 //! reads the answer through: a read under the train lease its W2M replies are
 //! routed to, an apply — under the apply lock — with a wait on the position
-//! the workers apply the log through. A push group and a catalog zone, which
-//! no worker answers, are laid out here in a hold or scope of the caller's.
-//! The child `route` decides which workers a read or push reaches; `dispatch`
-//! holds the writes and the tick ledger; `workers` holds the worker processes.
+//! the workers apply the log through. A catalog zone, which no worker answers,
+//! is laid out here in a hold of the caller's. The child `route` decides which
+//! workers a read or push reaches; `dispatch` holds the writes and the tick
+//! ledger; `workers` holds the worker processes.
 
 pub(crate) mod route;
 

@@ -118,7 +118,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     // user commit is pending too: every writer holds a catalog read until its
     // fdatasync, so each of those was laid out before this DDL.
     match shared.dispatcher.emit_tick(&locks.applies).await {
-        Ok(Some(wait)) => wait.acks().await,
+        Ok(Some(wait)) => wait.await,
         Ok(None) => {}
         Err(e) => gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}"),
     }
@@ -159,7 +159,7 @@ async fn commit_bundle(
     if families.get(SysFamily::Circuit).is_some()
         && let Some(wait) = shared.dispatcher.emit_tick(alone).await?
     {
-        wait.acks().await;
+        wait.await;
     }
     let (applied, zone_lsn) = {
         let mut excl = shared.dispatcher.sal().lock().await;

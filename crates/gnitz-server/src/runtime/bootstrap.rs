@@ -338,7 +338,7 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
         .await
         .map_err(|e| format!("recovery tick of the replayed tail failed: {e}"))?;
     if let Some(wait) = tick {
-        wait.acks().await;
+        wait.await;
     }
 
     inject_recovery_panic("sweep");

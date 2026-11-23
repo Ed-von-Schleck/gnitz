@@ -86,7 +86,7 @@ fn reactor_pass_bench() {
         let (r2, next) = (r.clone(), Rc::clone(&awaited));
         let acks = async move || {
             next.update(|v| v + 1);
-            r2.applied_through(next.get()).acks().await;
+            r2.applied_through(next.get()).await;
         };
         arm(&format!("acks nw={nw}"), r, acks, || {
             writers.iter_mut().for_each(|w| w.applied(awaited.get()));
@@ -130,7 +130,7 @@ fn reactor_flood_bench() {
                 });
             }
             let before = voluntary_ctx_switches();
-            let (_, instructions) = counter.measure(|| r.block_on(r.applied_through(1).acks()));
+            let (_, instructions) = counter.measure(|| r.block_on(r.applied_through(1)));
             (instructions, voluntary_ctx_switches() - before)
         });
         let wakes = r.w2m.wakes() - wakes_before;
@@ -185,7 +185,7 @@ fn reactor_round_bench() {
             let before = voluntary_ctx_switches();
             for at in 1..=ROUNDS {
                 round.store(at, Ordering::Release);
-                r.block_on(r.applied_through(at).acks());
+                r.block_on(r.applied_through(at));
             }
             let sleeps = voluntary_ctx_switches() - before;
             stop.store(true, Ordering::Release);

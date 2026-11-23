@@ -27,20 +27,6 @@ pub(crate) enum WorkerEnd {
     Dumped(i32),
 }
 
-impl WorkerEnd {
-    /// How the waited-for child `info` names ended.
-    fn of(info: &libc::siginfo_t) -> Self {
-        // SAFETY: `info` was filled by a `waitid` on an exited child, whose
-        // siginfo carries `si_status`.
-        let status = unsafe { info.si_status() };
-        match info.si_code {
-            libc::CLD_KILLED => WorkerEnd::Killed(status),
-            libc::CLD_DUMPED => WorkerEnd::Dumped(status),
-            _ => WorkerEnd::Exited(status),
-        }
-    }
-}
-
 /// `sig` by number, and by name when it is one a worker dies of.
 struct Signal(i32);
 
@@ -96,11 +82,18 @@ impl Workers {
                 .map_or(Poll::Pending, Poll::Ready)
         })
         .await;
-        match res {
-            Ok(info) => (w, WorkerEnd::of(&info)),
-            // No wait on a child of this process fails but by a bug.
-            Err(e) => gnitz_fatal_abort!("waitid on worker {w}: {}", std::io::Error::from_raw_os_error(-e)),
-        }
+        // No wait on a child of this process fails but by a bug.
+        let info = res
+            .unwrap_or_else(|e| gnitz_fatal_abort!("waitid on worker {w}: {}", std::io::Error::from_raw_os_error(-e)));
+        // SAFETY: `info` was filled by a `waitid` on an exited child, whose
+        // siginfo carries `si_status`.
+        let status = unsafe { info.si_status() };
+        let end = match info.si_code {
+            libc::CLD_KILLED => WorkerEnd::Killed(status),
+            libc::CLD_DUMPED => WorkerEnd::Dumped(status),
+            _ => WorkerEnd::Exited(status),
+        };
+        (w, end)
     }
 }
 

@@ -1,26 +1,19 @@
 //! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, backfill,
-//! tick) and the tick ledger, the DDL zone, push groups, and the backup round.
+//! tick), the DDL zone, and the tick ledger.
 
-use gnitz_foundation::{gnitz_debug, gnitz_info, gnitz_note, gnitz_warn};
+use gnitz_foundation::{gnitz_debug, gnitz_note, gnitz_warn};
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::route::with_routed;
 use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
 use crate::runtime::reactor::AckWait;
-use crate::runtime::sal::{Apply, SalFull, SalScope};
+use crate::runtime::sal::Apply;
 use crate::runtime::sync::{WriteGuard, chan, oneshot};
 use gnitz_foundation::fault::Switch;
-use gnitz_store::relation::PkRule;
-use gnitz_zset::repr::MemBatch;
-
-/// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
-/// its own, as a crash part-way through a backup would.
-static BACKUP_ABORT: Switch = Switch::new("GNITZ_INJECT_BACKUP_ABORT");
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit that has something to
 /// tick, once, as a full SAL would.
@@ -45,12 +38,11 @@ pub(super) struct TickLedger {
     last_lsn: Cell<u64>,
     /// Scratch for the tids a tick is emitted for, kept across ticks.
     tids: RefCell<Vec<u64>>,
-    /// The waits for a relation to gain an un-ticked commit. An entry leaves
-    /// when a relation it names becomes pending, at a
-    /// [`MasterDispatcher::wake_watches`], or with its [`Watching`].
-    watches: RefCell<Vec<Watch>>,
-    /// The id of the next [`Watch`].
-    next_watch: Cell<u64>,
+    /// The waits for a relation to gain an un-ticked commit, each with the
+    /// relations it names. An entry leaves when a relation it names becomes
+    /// pending, at a [`MasterDispatcher::wake_watches`], or, once its receiver
+    /// is dropped, at the next [`MasterDispatcher::watch`].
+    watches: RefCell<Vec<(FxHashSet<u64>, oneshot::Sender<()>)>>,
     /// The waits for the verdict of the next emit.
     drains: RefCell<Vec<oneshot::Sender<Result<(), WireFault>>>>,
     /// The requests to the tick loop: tick whatever is pending, even nothing,
@@ -61,7 +53,7 @@ pub(super) struct TickLedger {
     inbox: Cell<Option<chan::Receiver<Instant>>>,
     /// The pending rows of one relation that fire an auto-tick.
     /// `GNITZ_TICK_COALESCE_ROWS` lowers it, so tests reach it on small tables.
-    pub(super) coalesce_rows: usize,
+    coalesce_rows: usize,
 }
 
 impl TickLedger {
@@ -74,59 +66,17 @@ impl TickLedger {
             last_lsn: Cell::new(last_lsn),
             tids: RefCell::default(),
             watches: RefCell::default(),
-            next_watch: Cell::new(0),
             drains: RefCell::default(),
             requests,
             inbox: Cell::new(Some(inbox)),
             coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
         }
     }
-
-    /// Wake every watch naming `relation`, which just became pending.
-    fn wake(&self, relation: u64) {
-        let mut watches = self.watches.borrow_mut();
-        for watch in watches.extract_if(.., |w| w.relations.contains(&relation)) {
-            watch.wake.send(());
-        }
-    }
-}
-
-struct Watch {
-    id: u64,
-    relations: FxHashSet<u64>,
-    wake: oneshot::Sender<()>,
-}
-
-/// One wait registered by [`MasterDispatcher::watch`], given up on drop.
-pub(crate) struct Watching<'a> {
-    ledger: &'a TickLedger,
-    id: u64,
-    /// Resolves when a watched relation gains an un-ticked commit, or at a
-    /// [`MasterDispatcher::wake_watches`].
-    pub(crate) woken: oneshot::Receiver<()>,
-}
-
-impl Drop for Watching<'_> {
-    fn drop(&mut self) {
-        self.ledger.watches.borrow_mut().retain(|w| w.id != self.id);
-    }
 }
 
 impl MasterDispatcher {
-    /// Write `apply` to every worker, and answer the wait for all of them to
-    /// have run it; they are woken at the write, so a caller may await the ACKs
-    /// under the hold of `excl`. `_alone` is the caller's hold of the apply lock.
-    fn write_acked(
-        &self,
-        _alone: &WriteGuard<ApplyLock>,
-        excl: &mut SalExcl<'_>,
-        apply: Apply<'_>,
-    ) -> Result<AckWait, WireFault> {
-        Ok(self.reactor.applied_through(excl.apply(apply)?))
-    }
-
     // -----------------------------------------------------------------------
-    // SAL Checkpoint
+    // ACKed rounds
     // -----------------------------------------------------------------------
 
     /// A checkpoint's first half: the round that flushes base and system tables.
@@ -145,15 +95,16 @@ impl MasterDispatcher {
     ///
     /// Every failure ends the process; a failed system flush ends it before any
     /// worker leaves the epoch.
-    pub(crate) async fn checkpoint_base(&self, alone: &WriteGuard<ApplyLock>) {
+    pub(crate) async fn checkpoint_base(&self, _alone: &WriteGuard<ApplyLock>) {
         let mut excl = self.sal.lock().await;
         if let Err(e) = self.cat_mut().flush_ahead_of_base_round(self.sal.holds_pushes()) {
             gnitz_fatal_abort!("checkpoint system flush failed: {e}");
         }
-        let wait = self
-            .write_acked(alone, &mut excl, Apply::Flush)
+        let at = excl
+            .apply(Apply::Flush)
+            .map_err(WireFault::from)
             .unwrap_or_else(|e| gnitz_fatal_abort!("checkpoint Flush refused: {e}"));
-        wait.acks().await;
+        self.reactor.applied_through(at).await;
         let epoch = excl.checkpoint_reset();
         gnitz_note!("SAL checkpoint epoch={epoch}");
         // Every worker ACKed the Flush, so each has applied every DdlSync written
@@ -178,30 +129,26 @@ impl MasterDispatcher {
     /// A boot ends with this round alone: its workers published their base
     /// stores during recovery, at the generation a replayed push advanced
     /// pre-fork, and no push is admitted yet.
-    pub(crate) async fn checkpoint_ephemeral(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
-        let wait = {
+    pub(crate) async fn checkpoint_ephemeral(&self, _alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
+        let at = {
             let mut excl = self.sal.lock().await;
             debug_assert!(
                 !self.sal.holds_pushes(),
                 "a push ahead of the ephemeral round in its epoch is integrated by the views the round stamps and replayed into them again at boot"
             );
             let generation = self.cat().durable_generation();
-            self.write_acked(alone, &mut excl, Apply::FlushEph { generation })?
+            excl.apply(Apply::FlushEph { generation })?
         };
-        wait.acks().await;
+        self.reactor.applied_through(at).await;
         self.cat_mut().flush_all_system_tables()?;
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Fan-out operations
-    // -----------------------------------------------------------------------
 
     /// Backfill `view_ids` as one group, in id order: a view's id exceeds that of
     /// every relation it scans.
     pub(crate) async fn backfill_views_in_dep_order(
         &self,
-        alone: &WriteGuard<ApplyLock>,
+        _alone: &WriteGuard<ApplyLock>,
         view_ids: &[u64],
     ) -> Result<(), WireFault> {
         let mut ordered = view_ids.to_vec();
@@ -210,11 +157,14 @@ impl MasterDispatcher {
         if ordered.is_empty() {
             return Ok(());
         }
-        let backfill = Apply::Backfill { views: ordered.into() };
-        let wait = self.write_acked(alone, &mut self.sal.lock().await, backfill)?;
-        wait.acks().await;
+        let at = self.sal.lock().await.apply(Apply::Backfill { views: ordered.into() })?;
+        self.reactor.applied_through(at).await;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // DDL zone
+    // -----------------------------------------------------------------------
 
     /// Run catalog write `write` with its groups laid out as one SAL zone, and mark
     /// the zone applied: the write's value and the zone LSN, `0` when the write
@@ -276,7 +226,10 @@ impl MasterDispatcher {
             }
             Entry::Vacant(e) => {
                 e.insert(rows);
-                self.ticks.wake(tid);
+                let mut watches = self.ticks.watches.borrow_mut();
+                for (_, wake) in watches.extract_if(.., |(relations, _)| relations.contains(&tid)) {
+                    wake.send(());
+                }
                 rows
             }
         };
@@ -300,26 +253,33 @@ impl MasterDispatcher {
         self.none_pending(targets.into_iter().flat_map(|t| cat.dag.roots_of(t).iter().copied()))
     }
 
-    /// Wait for one of `relations` to gain a commit no emitted tick has taken;
-    /// `None` when one already has. The check and the registration share no
-    /// await, so no commit falls between them.
-    pub(crate) fn watch(&self, relations: FxHashSet<u64>) -> Option<Watching<'_>> {
+    /// Resolves when a relation whose ticks reach one of `targets` gains a
+    /// commit no emitted tick has taken, or at a [`Self::wake_watches`]; `None`
+    /// when one already has. The check and the registration share no await, so
+    /// no commit falls between them. Dropping the receiver gives the wait up.
+    pub(crate) fn watch(&self, targets: impl IntoIterator<Item = u64>) -> Option<oneshot::Receiver<()>> {
+        let relations: FxHashSet<u64> = {
+            let cat = self.cat();
+            targets
+                .into_iter()
+                .flat_map(|t| cat.dag.roots_of(t).iter().copied())
+                .collect()
+        };
         if !self.none_pending(relations.iter().copied()) {
             return None;
         }
-        let ticks = &self.ticks;
-        let id = ticks.next_watch.get();
-        ticks.next_watch.set(id + 1);
         let (wake, woken) = oneshot::channel();
-        ticks.watches.borrow_mut().push(Watch { id, relations, wake });
-        Some(Watching { ledger: ticks, id, woken })
+        let mut watches = self.ticks.watches.borrow_mut();
+        watches.retain(|(_, wake)| !wake.is_closed());
+        watches.push((relations, wake));
+        Some(woken)
     }
 
     /// Wake every watch. A watch names relations read off a catalog its holder
     /// has released, which a DDL may have changed.
     pub(crate) fn wake_watches(&self) {
-        for watch in self.ticks.watches.take() {
-            watch.wake.send(());
+        for (_, wake) in self.ticks.watches.take() {
+            wake.send(());
         }
     }
 
@@ -340,7 +300,7 @@ impl MasterDispatcher {
     }
 
     /// Tick every pending relation as one Tick group, and answer the wait for
-    /// its workers' ACKs; `None` when nothing is pending. `alone` is the
+    /// its workers' ACKs; `None` when nothing is pending. `_alone` is the
     /// caller's hold of the apply lock, which it keeps through those ACKs. A
     /// refused emit leaves every relation pending and takes no round.
     ///
@@ -350,7 +310,7 @@ impl MasterDispatcher {
     /// reader's scan follows the Tick group in the SAL. The answer shares no
     /// await with the read of what is pending, so every commit pending when the
     /// wait was registered is in the group.
-    pub(crate) async fn emit_tick(&self, alone: &WriteGuard<ApplyLock>) -> Result<Option<AckWait>, WireFault> {
+    pub(crate) async fn emit_tick(&self, _alone: &WriteGuard<ApplyLock>) -> Result<Option<AckWait>, WireFault> {
         let ticks = &self.ticks;
         let emitted = async {
             if ticks.pending.borrow().is_empty() {
@@ -364,7 +324,7 @@ impl MasterDispatcher {
             let mut tids = ticks.tids.borrow_mut();
             tids.clear();
             tids.extend(ticks.pending.borrow().keys().copied());
-            let wait = self.write_tick(alone, &mut excl, &tids)?;
+            let wait = self.write_tick(&mut excl, &tids)?;
             ticks.pending.borrow_mut().clear();
             ticks.last_lsn.set(self.sal.watermark());
             Ok(Some(wait))
@@ -379,16 +339,10 @@ impl MasterDispatcher {
 
     /// Write one Tick group for `tids` at consecutive tick rounds, and answer
     /// the wait for its ACKs. A refused write takes no round.
-    fn write_tick(
-        &self,
-        alone: &WriteGuard<ApplyLock>,
-        excl: &mut SalExcl<'_>,
-        tids: &[u64],
-    ) -> Result<AckWait, WireFault> {
+    fn write_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckWait, WireFault> {
         let ticks = &self.ticks;
         let first = ticks.round.get() + 1;
-        let tick = Apply::Tick { first_round: first, tids: tids.into() };
-        let wait = self.write_acked(alone, excl, tick)?;
+        let at = excl.apply(Apply::Tick { first_round: first, tids: tids.into() })?;
         ticks.round.set(first + tids.len() as u64 - 1);
         // At the write, not at the ACKs: a round written has already reached the
         // workers, and a ledger behind it would let a feed's gate answer "nothing
@@ -397,7 +351,7 @@ impl MasterDispatcher {
         for (&tid, round) in tids.iter().zip(first..) {
             last_tick.insert(tid, round);
         }
-        Ok(wait)
+        Ok(self.reactor.applied_through(at))
     }
 
     /// The SAL watermark the last emit snapshotted.
@@ -427,44 +381,6 @@ impl MasterDispatcher {
     pub(crate) fn forget_relation(&self, id: u64) {
         self.ticks.pending.borrow_mut().remove(&id);
         self.ticks.last_tick.borrow_mut().remove(&id);
-    }
-
-    /// Lay one push batch out as a SAL group inside `scope`, held to `rule`: the
-    /// target's shape record and the rows routed to the workers that own them.
-    /// Answers whether the group rides inside the zone: a base table's rows do;
-    /// a stream's, which no restart recovers, ride outside. No worker ACKs it: a
-    /// read or tick behind it in the SAL reaches its workers after their apply,
-    /// and a worker that cannot apply it exits.
-    pub(crate) fn write_commit_group(
-        &self,
-        scope: &mut SalScope,
-        target_id: u64,
-        rule: PkRule,
-        batch: MemBatch<'_>,
-    ) -> Result<bool, SalFull> {
-        let cat = self.cat();
-        let (rel, record) = cat
-            .shape_target(target_id)
-            .expect("a push target is registered under the catalog lock");
-        let recoverable = rel.kind().is_base_table();
-        with_routed(batch, rel.placement(), self.sal.num_workers(), |rows| {
-            scope.push(target_id, rule, record, rows, recoverable)
-        })?;
-        Ok(recoverable)
-    }
-
-    /// A backup's copy, run by the committer right behind a checkpoint: every
-    /// worker puts the stores it published into the data directory `dir`, then
-    /// the master puts its system families', each store with the entries that
-    /// reach it durable. `dir` exists; everything under it is made here.
-    pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
-        self.command(Read::Backup { dir }).await?;
-        if BACKUP_ABORT.armed() {
-            gnitz_fatal_abort!("injected backup abort");
-        }
-        self.cat().registry.link_published_into(dir)?;
-        gnitz_info!("backup copied into {}", dir);
-        Ok(())
     }
 }
 

@@ -24,14 +24,14 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     first_round: 2,
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
-                let wait = disp.write_acked(&disp.apply_lock().await, &mut disp.sal().lock().await, tick)?;
+                let at = disp.sal().lock().await.apply(tick)?;
                 // Each worker's drain, read past the group.
                 for (w, writer) in writers.iter_mut().enumerate() {
                     let mut reader = disp.sal().reader(w as u32);
                     assert!(matches!(reader.next_request(|_, _| None), Some(Inbound::Apply { .. })));
                     writer.applied(reader.position());
                 }
-                wait.acks().await;
+                disp.reactor().applied_through(at).await;
                 Ok::<(), WireFault>(())
             });
             match (refused, got) {
@@ -52,19 +52,18 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
 fn a_refused_tick_takes_no_round() {
     let (_tmp, engine) = empty_catalog(1);
     let (disp, _) = test_dispatcher(1, engine);
-    let alone = disp.alone();
     let mut excl = disp.sal().excl();
     let before = disp.ticks.round.get();
 
     // Wider than the fixture's whole SAL.
     let e = disp
-        .write_tick(&alone, &mut excl, &vec![0; 2 << 17])
+        .write_tick(&mut excl, &vec![0; 2 << 17])
         .map(drop)
         .expect_err("no room for the tick");
     assert_eq!(e.status, WireStatus::Error, "{e}");
     assert_eq!(disp.ticks.round.get(), before, "the refused tick took no round");
 
-    disp.write_tick(&alone, &mut excl, &[7, 8]).expect("the tick fits");
+    disp.write_tick(&mut excl, &[7, 8]).expect("the tick fits");
     assert_eq!(disp.ticks.round.get(), before + 2, "one round per relation ticked");
     drop(excl);
     let mut reader = disp.sal().reader(0);
@@ -94,14 +93,11 @@ fn a_views_last_round_is_the_last_tick_of_a_source() {
     let under = register_identity_view(&mut engine, t, "under", &cols);
     let view = register_identity_view(&mut engine, under, "v", &cols);
     let (disp, _) = test_dispatcher(1, engine);
-    let alone = disp.alone();
     let mut excl = disp.sal().excl();
     assert_eq!(disp.last_delta_round(view), 1, "no source ticked");
 
     let first = disp.ticks.round.get() + 1;
-    let _unacked = disp
-        .write_tick(&alone, &mut excl, &[other, t, other])
-        .expect("the tick fits");
+    let _unacked = disp.write_tick(&mut excl, &[other, t, other]).expect("the tick fits");
     assert_eq!(
         disp.last_delta_round(view),
         first + 1,
@@ -109,11 +105,11 @@ fn a_views_last_round_is_the_last_tick_of_a_source() {
     );
     assert_eq!(disp.last_delta_round(under), first + 1);
 
-    disp.write_tick(&alone, &mut excl, &[other]).expect("the tick fits");
+    disp.write_tick(&mut excl, &[other]).expect("the tick fits");
     // Wider than the fixture's whole SAL.
     let mut wide = vec![other; 2 << 17];
     wide.push(t);
-    disp.write_tick(&alone, &mut excl, &wide)
+    disp.write_tick(&mut excl, &wide)
         .map(drop)
         .expect_err("no room for the tick");
     assert_eq!(disp.last_delta_round(view), first + 1);
@@ -235,37 +231,49 @@ fn a_credit_reaching_the_coalesce_threshold_or_a_drain_requests_a_tick() {
     disp.into_catalog().close();
 }
 
-/// A watch is woken by a relation it names and by no other, once; one that
-/// stops waiting for a reason of its own leaves no entry behind; and a
-/// `wake_watches` wakes them all.
+/// A watch is woken by a relation whose ticks reach a target it names and by
+/// no other, once; one that stops waiting for a reason of its own leaves no
+/// entry behind the next watch; and a `wake_watches` wakes them all.
 #[test]
-fn a_watch_is_woken_by_what_it_names_and_leaves_with_its_guard() {
-    let (_tmp, engine) = empty_catalog(1);
+fn a_watch_is_woken_by_what_it_names_and_leaves_once_given_up() {
+    use crate::test_support::{register_identity_view, u64_i64_cols};
+
+    let (_tmp, mut engine) = empty_catalog(1);
+    let cols = u64_i64_cols();
+    let [(_, vt), (u, vu), (_, vx), (y, _)] = ["t", "u", "x", "y"].map(|name| {
+        let table = engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap();
+        (
+            table,
+            register_identity_view(&mut engine, table, &format!("v{name}"), &cols),
+        )
+    });
     let (disp, _) = test_dispatcher(0, engine);
     let ticks = &disp.ticks;
-    let mut on_7 = disp.watch([7, 8].into_iter().collect()).expect("nothing is pending");
-    let mut on_9 = disp.watch([9].into_iter().collect()).expect("nothing is pending");
+    let mut on_tu = disp.watch([vt, vu]).expect("nothing is pending");
+    let mut on_x = disp.watch([vx]).expect("nothing is pending");
 
-    ticks.wake(5);
-    assert!(try_poll_once(&mut on_7.woken).is_none(), "5 is named by neither");
-    assert!(try_poll_once(&mut on_9.woken).is_none(), "5 is named by neither");
-    ticks.wake(8);
-    assert!(try_poll_once(&mut on_7.woken).is_some(), "8 is one of its relations");
-    assert!(try_poll_once(&mut on_9.woken).is_none(), "and none of the other's");
+    let excl = disp.sal().excl();
+    disp.owe(&excl, y, 0);
+    assert!(try_poll_once(&mut on_tu).is_none(), "`y` reaches neither");
+    assert!(try_poll_once(&mut on_x).is_none(), "`y` reaches neither");
+    disp.owe(&excl, u, 0);
+    assert!(try_poll_once(&mut on_tu).is_some(), "`u` reaches one of its targets");
+    assert!(try_poll_once(&mut on_x).is_none(), "and none of the other's");
     assert_eq!(ticks.watches.borrow().len(), 1, "a woken watch is no longer registered");
+    drop(excl);
 
-    drop(on_7);
-    assert_eq!(ticks.watches.borrow().len(), 1, "its guard removes only its own entry");
-    drop(on_9);
-    assert!(ticks.watches.borrow().is_empty(), "a watch given up leaves no entry");
+    drop(on_x);
+    let on_t = disp.watch([vt]).expect("`t` is not pending");
+    assert_eq!(ticks.watches.borrow().len(), 1, "given up, it leaves at the next watch");
+    drop((on_tu, on_t));
 
-    let mut on_7 = disp.watch([7].into_iter().collect()).expect("nothing is pending");
-    let mut on_9 = disp.watch([9].into_iter().collect()).expect("nothing is pending");
+    let mut on_t = disp.watch([vt]).expect("`t` is not pending");
+    let mut on_x = disp.watch([vx]).expect("nothing is pending");
     disp.wake_watches();
-    assert!(try_poll_once(&mut on_7.woken).is_some());
-    assert!(try_poll_once(&mut on_9.woken).is_some());
+    assert!(try_poll_once(&mut on_t).is_some());
+    assert!(try_poll_once(&mut on_x).is_some());
     assert!(ticks.watches.borrow().is_empty());
-    drop((on_7, on_9));
+    drop((on_t, on_x));
     disp.into_catalog().close();
 }
 
