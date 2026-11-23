@@ -24,7 +24,6 @@ mod routing;
 mod fixtures;
 
 use emit::*;
-use hydration::derive_hydration;
 use routing::ViewMeta;
 
 // ---------------------------------------------------------------------------
@@ -36,9 +35,9 @@ use routing::ViewMeta;
 pub(super) struct CompileOutput {
     pub(in crate::query) vm: Vm,
     /// The relations the circuit scans, each once, in the circuit's node order.
-    source_ids: Box<[u64]>,
+    pub(in crate::query) source_ids: Box<[u64]>,
     /// Each one's scan, in the same order.
-    scans: Box<[Scan]>,
+    pub(in crate::query) scans: Box<[Scan]>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Replay>,
 }
@@ -50,17 +49,6 @@ impl CompileOutput {
             Some(at) => &self.scans[at],
             None => panic!("the plan scans no relation {source}"),
         }
-    }
-
-    /// The relations the circuit scans, each once, in the circuit's node order.
-    pub(in crate::query) fn source_ids(&self) -> impl Iterator<Item = u64> {
-        self.source_ids.iter().copied()
-    }
-
-    /// The program, beside the sources past the first `fed` of
-    /// [`Self::source_ids`]: those a run has fed the view no row of.
-    pub(in crate::query) fn vm_and_unfed(&mut self, fed: usize) -> (&mut Vm, &[u64]) {
-        (&mut self.vm, &self.source_ids[fed.min(self.source_ids.len())..])
     }
 }
 
@@ -74,9 +62,9 @@ pub(super) fn compile_view(
     bounded: bool,
 ) -> Result<(CompileOutput, Placement, StateLayout), String> {
     let meta = ViewMeta::derive(circuit, registry)?;
-    let EmitCtx {
-        prog, regs, integrals, sources, dists, ..
-    } = EmitCtx::emit(circuit, &meta, view_id)?;
+    let ctx = EmitCtx::emit(circuit, &meta, view_id)?;
+    let replay = bounded.then(|| ctx.replay_seed()).transpose()?;
+    let EmitCtx { prog, regs, sources, dists, .. } = ctx;
     let (vm, traces) = prog.finish(regs[circuit.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
@@ -84,15 +72,16 @@ pub(super) fn compile_view(
         return Err("the circuit's output schema is not the view's".into());
     }
     let placement = dists[circuit.out()].placement(vm.out_schema());
-    let mut output = CompileOutput {
+    let hydration = replay
+        .map(|(in_reg, seed, clamp, read)| vm.replay(in_reg, seed, clamp, read))
+        .transpose()?;
+    let (source_ids, scans): (Vec<u64>, Vec<Scan>) = sources.into_iter().unzip();
+    let output = CompileOutput {
         vm,
-        source_ids: sources.iter().map(|&(id, _)| id).collect(),
-        scans: sources.into_iter().map(|(_, scan)| scan).collect(),
-        hydration: None,
+        source_ids: source_ids.into(),
+        scans: scans.into(),
+        hydration,
     };
-    if bounded {
-        output.hydration = Some(derive_hydration(circuit, &meta, &output, &regs, &integrals)?);
-    }
     Ok((output, placement, traces))
 }
 

@@ -16,17 +16,25 @@ pub(super) fn routing<'a>(circuit: &Circuit, registry: &'a RelationRegistry) -> 
 pub(super) const VIEW: u64 = 99;
 
 /// `circuit` compiled into a view of the schema it outputs.
-pub(super) fn compile(circuit: &Circuit, registry: &RelationRegistry, bounded: bool) -> Result<CompileOutput, String> {
+fn compiled(
+    circuit: &Circuit,
+    registry: &RelationRegistry,
+    bounded: bool,
+) -> Result<(CompileOutput, Placement, StateLayout), String> {
     let meta = routing(circuit, registry)?;
     let ctx = EmitCtx::emit(circuit, &meta, VIEW)?;
     let view = ctx.prog.schema_of(ctx.regs[circuit.out()]);
-    compile_view(circuit, registry, VIEW, &view, bounded).map(|(out, ..)| out)
+    compile_view(circuit, registry, VIEW, &view, bounded)
+}
+
+/// `circuit`'s plan, as a view of the schema it outputs.
+pub(super) fn compile(circuit: &Circuit, registry: &RelationRegistry, bounded: bool) -> Result<CompileOutput, String> {
+    compiled(circuit, registry, bounded).map(|(out, ..)| out)
 }
 
 /// The placement a view of the schema `circuit` outputs registers under.
 pub(super) fn placed(circuit: &Circuit, registry: &RelationRegistry) -> Result<Placement, String> {
-    let view = *compile(circuit, registry, false)?.vm.out_schema();
-    compile_view(circuit, registry, VIEW, &view, false).map(|(_, placement, _)| placement)
+    compiled(circuit, registry, false).map(|(_, placement, _)| placement)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].

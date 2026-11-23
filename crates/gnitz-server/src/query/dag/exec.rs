@@ -41,11 +41,9 @@ pub(crate) fn backfill(host: &mut impl DriveHost, views: &[u64]) -> Result<(), S
         "a backfilled view's readers are backfilled with it: each would otherwise read its deltas twice"
     );
     let mut run = std::mem::take(&mut dag.tick);
-    let ran = run.backfill(host, views);
-    // A failed ground-row landing leaves its rows held.
-    run.clear();
+    run.backfill(host, views)?;
     host.parts().0.tick = run;
-    ran
+    Ok(())
 }
 
 /// What a run feeds the views it steps.
@@ -105,7 +103,9 @@ enum Stage {
 /// A tick runs its source's schedule once. A backfill runs one over its
 /// ground rows, and one per chunk it feeds a member.
 ///
-/// The engine keeps one between runs, empty, for its capacity.
+/// The engine keeps one between runs, empty, for its capacity. A run that fails
+/// is dropped with whatever it holds, epochs standing at rounds included, and the
+/// engine is left a fresh one.
 #[derive(Default)]
 pub(super) struct TickRun {
     schedule: Rc<[Step]>,
@@ -272,9 +272,11 @@ impl TickRun {
         // Room for the schedule: growing the map rehashes it once per doubling.
         self.outputs.reserve(self.schedule.len());
         self.outputs.extend(seed);
-        let ran = self.waves(host, drained);
-        self.clear();
-        ran
+        let drained = self.waves(host, drained)?;
+        // Every step ran to its end, so no round stands and nothing waits to be read.
+        self.outputs.clear();
+        self.relays.clear();
+        Ok(drained)
     }
 
     /// Run every step: start what can start, then the rounds it stands at as one.
@@ -318,15 +320,6 @@ impl TickRun {
             }
             self.gathered = gathered;
         }
-    }
-
-    /// Drop what a run leaves: a failed step leaves the others' epochs at their
-    /// rounds, dropped here, registers and all.
-    fn clear(&mut self) {
-        self.outputs.clear();
-        self.relays.clear();
-        self.standing.clear();
-        self.gathered.clear();
     }
 
     /// [`backfill`] of `views`.
@@ -389,8 +382,7 @@ impl TickRun {
             if relation.kind() == RelationKind::Stream {
                 continue;
             }
-            // `sources` came from this view's own plan.
-            let scan = dag.views[&view].code.scan(source);
+            let scan = &dag.views[&view].code.scans[at];
             let mut cursor = relation.open_sealed(scan.bound.clone(), scan.read)?;
             let schedule = dag.schedule_from(&[view], vec![(view, source)]);
             // The source joins those fed before it as it drains.
@@ -418,9 +410,9 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
     let mut run = std::mem::take(&mut dag.tick);
     let schedule = dag.tick_schedule(source);
     let seed = delta.map(|delta| (source, delta));
-    let ran = run.run(host, schedule, Pass::Tick { round }, seed, false);
+    run.run(host, schedule, Pass::Tick { round }, seed, false)?;
     host.parts().0.tick = run;
-    ran.map(drop)
+    Ok(())
 }
 
 #[cfg(test)]

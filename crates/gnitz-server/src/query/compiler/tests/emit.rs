@@ -300,7 +300,7 @@ fn relays(of: u32, sources: [Source; 2], build: impl FnOnce(&mut Circuit)) -> (u
     let mut c = Circuit::default();
     build(&mut c);
     let out = compile(&c, &registry, false).expect("the fixture compiles");
-    let relayed = out.source_ids().filter(|&s| out.scan(s).relay.is_some()).count();
+    let relayed = out.scans.iter().filter(|s| s.relay.is_some()).count();
     let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round(_))).count();
     let shares = out.vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
     (relayed + rounds, shares)

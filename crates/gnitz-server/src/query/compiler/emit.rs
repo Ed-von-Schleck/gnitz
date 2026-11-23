@@ -20,9 +20,9 @@ use gnitz_zset::algebra::null_extend_output_schema;
 
 /// All state of one view's emission, threaded to the emit arms as one `&mut`.
 pub(super) struct EmitCtx<'a> {
-    circuit: &'a Circuit,
+    pub(super) circuit: &'a Circuit,
     /// The view's routing, and its scanned sources.
-    meta: &'a ViewMeta<'a>,
+    pub(super) meta: &'a ViewMeta<'a>,
     pub(super) prog: ProgramBuilder,
     /// The register of every node emitted so far, by node id.
     pub(super) regs: Vec<DeltaReg>,
@@ -443,8 +443,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<(DeltaReg, D
 
         OpNode::NullExtend { type_codes, nulls_first } => {
             let out = null_extend_output_schema(&in_schema, type_codes, *nulls_first)?;
-            let ahead = if *nulls_first { type_codes.len() } else { 0 };
-            let dist = in_dist.mapped(|c, _| shifted(&in_schema, &out, c, 0, ahead));
+            let dist = in_dist.mapped(|c, _| shifted(&in_schema, &out, c, *nulls_first));
             let op = Op::NullExtend { nulls_first: *nulls_first };
             (ctx.prog.push(in_reg, out, op), dist)
         }
@@ -512,18 +511,10 @@ fn emit_join_term(
         .prog
         .push(delta_reg, out, Op::JoinDT { trace, plan: Box::new(plan) });
 
-    // The output columns holding column `c` of an operand, of the right SQL
+    // The output column holding column `c` of an operand, of the right SQL
     // side iff `right`: the output is `[key, left payload, right payload]`, and a
     // cross join's pair key is the left side's PK region, then the right's.
-    let left = if delta_is_right { &int_schema } else { &delta_schema };
-    let onto = |side: SchemaDescriptor, right: bool| {
-        let (pk_by, payload_by) = match (right, kind) {
-            (false, _) => (0, 0),
-            (true, JoinKind::Cross) => (left.pk_cols().len(), left.num_payload_cols()),
-            (true, _) => (0, left.num_payload_cols()),
-        };
-        move |c: u32, _| shifted(&side, &out, c, pk_by, payload_by)
-    };
+    let onto = |side: SchemaDescriptor, right: bool| move |c: u32, _| shifted(&side, &out, c, right);
     let (d, i) = (&ctx.dists[delta], &ctx.dists[integrand]);
     let d_out = d.mapped(onto(delta_schema, delta_is_right));
     let i_out = i.mapped(onto(int_schema, !delta_is_right));

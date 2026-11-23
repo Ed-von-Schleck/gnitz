@@ -273,7 +273,7 @@ impl Dist {
     /// This distribution over a node whose columns `onto(c, ty)` hold the value
     /// its input's column `c` packs at `ty`: a key slot no column holds any more
     /// names no key.
-    pub(super) fn mapped(&self, onto: impl Fn(u32, TypeCode) -> Vec<u32>) -> Dist {
+    pub(super) fn mapped<I: IntoIterator<Item = u32>>(&self, onto: impl Fn(u32, TypeCode) -> I) -> Dist {
         let Dist::On(slots) = self else {
             return self.clone();
         };
@@ -329,26 +329,22 @@ impl Dist {
     }
 }
 
-/// The column of `out` holding PK column `c` of `input`, where `out`'s PK
-/// region is `input`'s, shifted `by` columns.
-fn pk_col_onto(input: &SchemaDescriptor, out: &SchemaDescriptor, c: u32, by: usize) -> Option<u32> {
-    let j = input.pk_cols().iter().position(|&p| p == c)?;
-    out.pk_cols().get(j + by).copied()
-}
-
-/// The columns of `out` holding column `c` of `input`, where `out` holds
-/// `input`'s PK columns `pk_by` columns into its PK region and its payload
-/// `payload_by` slots into its payload.
-pub(super) fn shifted(
-    input: &SchemaDescriptor,
-    out: &SchemaDescriptor,
-    c: u32,
-    pk_by: usize,
-    payload_by: usize,
-) -> Vec<u32> {
+/// The column of `out` holding column `c` of `input`, where `input`'s PK columns
+/// and payload each sit at the head of `out`'s region, or at its tail iff `trails`.
+pub(super) fn shifted(input: &SchemaDescriptor, out: &SchemaDescriptor, c: u32, trails: bool) -> Option<u32> {
+    let (pk_by, payload_by) = match trails {
+        false => (0, 0),
+        true => (
+            out.pk_cols().len() - input.pk_cols().len(),
+            out.num_payload_cols() - input.num_payload_cols(),
+        ),
+    };
     match input.payload_slot(c as usize) {
-        None => pk_col_onto(input, out, c, pk_by).into_iter().collect(),
-        Some(slot) => vec![out.payload_col_idx(slot + payload_by) as u32],
+        None => {
+            let j = input.pk_cols().iter().position(|&p| p == c)?;
+            out.pk_cols().get(j + pk_by).copied()
+        }
+        Some(slot) => Some(out.payload_col_idx(slot + payload_by) as u32),
     }
 }
 

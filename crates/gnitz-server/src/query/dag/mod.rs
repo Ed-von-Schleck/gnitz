@@ -109,12 +109,13 @@ impl DagEngine {
         let (code, placement, traces) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
         // A source not registered here is a root only if it is no view.
         debug_assert!(
-            code.source_ids()
-                .all(|s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view()))
+            code.source_ids
+                .iter()
+                .all(|&s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view()))
         );
         self.tick_steps.clear();
         let mut roots = Vec::new();
-        for source in code.source_ids() {
+        for &source in &code.source_ids {
             self.forward.entry(source).or_default().push(view_id);
             match self.views.get(&source) {
                 Some(view) => roots.extend_from_slice(&view.roots),
@@ -163,7 +164,10 @@ impl DagEngine {
     /// The relations `view_id` scans directly, each once, in its plan's scan order.
     /// Empty when it is no registered view.
     pub(crate) fn sources_of(&self, view_id: u64) -> impl Iterator<Item = u64> {
-        self.views.get(&view_id).into_iter().flat_map(|v| v.code.source_ids())
+        self.views
+            .get(&view_id)
+            .into_iter()
+            .flat_map(|v| v.code.source_ids.iter().copied())
     }
 
     /// Every relation that is no view and reaches `view` through the relations it
@@ -179,7 +183,7 @@ impl DagEngine {
             return;
         };
         self.tick_steps.clear();
-        for source in view.code.source_ids() {
+        for &source in &view.code.source_ids {
             if let Entry::Occupied(mut views) = self.forward.entry(source) {
                 views.get_mut().retain(|&v| v != id);
                 if views.get().is_empty() {
@@ -344,8 +348,8 @@ impl RegisteredView {
         fed: usize,
     ) -> Result<(&'a mut vm::Vm, vm::Stores<'a>), String> {
         let own = open_state(&mut self.state, registry, view_id)?;
-        let (vm, unfed) = self.code.vm_and_unfed(fed);
-        Ok((vm, vm::Stores { own, registry, unfed }))
+        let unfed = &self.code.source_ids[fed.min(self.code.source_ids.len())..];
+        Ok((&mut self.code.vm, vm::Stores { own, registry, unfed }))
     }
 }
 
