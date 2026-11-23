@@ -397,10 +397,8 @@ impl Table {
     /// same leading bytes of one — positioned on the band they span, over the
     /// rows `cut` reads.
     pub(crate) fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
-        let stride = self.shard_index.schema.pk_stride();
-        let band = group_band(first, last, stride)
-            .expect("`first <= last`, so the band from one's group to the other's holds a key");
-        self.cursor(Some(band), cut)
+        debug_assert!(first <= last, "a band runs from its first key to its last");
+        self.cursor(group_band(first, last, self.schema().pk_stride()), cut)
     }
 
     /// A cursor positioned on the key band `r` walks, over the rows `cut` reads.
@@ -411,11 +409,10 @@ impl Table {
     /// Every live row of `keys` — whole PKs, or the same leading columns of
     /// one — over the runs `cut` reads that the span they cover can reach.
     pub(crate) fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
-        let cursor = match keys.bounds() {
-            Some((first, last)) => self.cursor_between(first, last, cut),
-            None => empty_cursor(self.shard_index.schema),
-        };
-        PkSetGather::over(cursor, keys)
+        let band = keys
+            .bounds()
+            .and_then(|(first, last)| group_band(first, last, self.schema().pk_stride()));
+        PkSetGather::over(self.cursor(band, cut), keys)
     }
 
     /// A cursor positioned on the OPK key band `[start, end)` of the rows `cut`

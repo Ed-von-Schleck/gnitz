@@ -19,23 +19,6 @@ const FD_CHUNK: usize = 256;
 /// `io_uring_setup`.
 static BLOCKING: AtomicBool = AtomicBool::new(false);
 
-/// The ring, or `None` for blocking fsync where this host denies io_uring.
-fn new_ring() -> Result<Option<IoUring>, StorageError> {
-    if BLOCKING.load(Relaxed) {
-        return Ok(None);
-    }
-    let e = match IoUring::new(FD_CHUNK as u32) {
-        Ok(r) => return Ok(Some(r)),
-        Err(e) => e,
-    };
-    let Some(why) = gnitz_foundation::host::io_uring_refusal(&e) else {
-        return Err(e.into());
-    };
-    gnitz_warn!("io_uring unavailable ({e}: {why}); flushing through blocking fsync");
-    BLOCKING.store(true, Relaxed);
-    Ok(None)
-}
-
 /// Syncs batches of files through one ring, set up on the first chunk of more
 /// than one file: a lone file's sync is one blocking call, cheaper than setting
 /// up a ring, and a ring's memory is returned to the locked-memory budget only
@@ -71,9 +54,20 @@ impl Syncer {
         Ok(())
     }
 
+    /// The ring, set up on first use; `None` for blocking fsync where this
+    /// host denies io_uring.
     fn ring(&mut self) -> Result<Option<&mut IoUring>, StorageError> {
-        if self.ring.is_none() {
-            self.ring = new_ring()?;
+        if self.ring.is_none() && !BLOCKING.load(Relaxed) {
+            match IoUring::new(FD_CHUNK as u32) {
+                Ok(ring) => self.ring = Some(ring),
+                Err(e) => {
+                    let Some(why) = gnitz_foundation::host::io_uring_refusal(&e) else {
+                        return Err(e.into());
+                    };
+                    gnitz_warn!("io_uring unavailable ({e}: {why}); flushing through blocking fsync");
+                    BLOCKING.store(true, Relaxed);
+                }
+            }
         }
         Ok(self.ring.as_mut())
     }

@@ -2,7 +2,7 @@ use super::*;
 use std::os::fd::OwnedFd;
 
 fn ring() -> IoUring {
-    new_ring().unwrap().expect("io_uring is a build prerequisite")
+    IoUring::new(FD_CHUNK as u32).expect("io_uring is a build prerequisite")
 }
 
 /// An interrupted submit and one that returns with nothing reaped are retried

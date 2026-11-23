@@ -167,7 +167,7 @@ fn assert_stable(len: u64) {
 /// stamped `stamp`.
 fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
     let entry = idx
-        .write_with(Some(stamp), None, |path, opts| write_shard(batch, path, opts))
+        .write_with(None, Some(stamp), |path, opts| write_shard(batch, path, opts))
         .unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
     idx.dir.mark_published();
