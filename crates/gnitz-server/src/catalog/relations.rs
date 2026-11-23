@@ -17,7 +17,6 @@ use gnitz_wire::{
     CatalogColumn, FkAction, PkColList, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, RelDescriptorBlob, RelIndex, Target,
     WireFault, WireStatus, payload_str, payload_u64,
 };
-use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
@@ -229,16 +228,9 @@ impl FkEdge {
     }
 }
 
-/// Every constraint on one table whose validation reads committed state.
-pub(crate) struct RowConstraints {
-    pub(crate) fks_as_child: Vec<FkEdge>,
-    pub(crate) fks_as_parent: Vec<FkEdge>,
-    pub(crate) uniques: Vec<(PkColList, KeySpec)>,
-}
-
 impl CatalogEngine {
     /// All FK edges where `table_id` is the child.
-    pub(in crate::catalog) fn fks_as_child(&self, table_id: u64) -> &[FkEdge] {
+    pub(crate) fn fks_as_child(&self, table_id: u64) -> &[FkEdge] {
         self.caches.relations.get(&table_id).map_or(&[], |e| e.fks.as_slice())
     }
 
@@ -280,21 +272,8 @@ impl CatalogEngine {
         set
     }
 
-    /// Every constraint on `tid` whose validation reads committed state.
-    pub(crate) fn row_constraints(&self, tid: u64) -> RowConstraints {
-        RowConstraints {
-            fks_as_child: self.fks_as_child(tid).to_vec(),
-            fks_as_parent: self.fks_as_parent(tid).to_vec(),
-            uniques: self.registry.relation(tid).map_or_else(Vec::new, |r| {
-                r.unique_indexes_to_check()
-                    .map(|ic| (ic.cols(), ic.key_spec().clone()))
-                    .collect()
-            }),
-        }
-    }
-
     /// Does validating a write of `mode` to `tid` read committed state: an Error-mode
-    /// write, or a table with any of [`Self::row_constraints`]? One that does not may
+    /// write, or a table with an FK edge or a unique index to check? One that does not may
     /// hold its table lock shared.
     pub(crate) fn push_reads_committed_state(&self, tid: u64, mode: gnitz_wire::WireConflictMode) -> bool {
         matches!(mode, gnitz_wire::WireConflictMode::Error)

@@ -151,7 +151,7 @@ fn a_unit_answers_every_client() {
         let mut unit = s.units.pop().expect("a unit");
         assert!(s.units.is_empty() && unit.merged.is_some(), "the writes are one run");
         unit.outcome = outcome;
-        unit.resolve(9);
+        unit.resolve(&Writes::new(0), 9);
         for (c, rx) in rxs.iter_mut().enumerate() {
             let got = try_poll_once(rx).expect("answered").map_err(|_| ());
             assert_eq!(got, want, "case {i}, client {c}");

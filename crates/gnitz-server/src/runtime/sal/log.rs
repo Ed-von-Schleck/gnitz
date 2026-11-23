@@ -9,8 +9,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::format::{
-    GroupHead, HDR_PREFIX, Header, PREFIX_BYTES, SAL_FORMAT, anchor_word, dir_sizes, directory, group_total_size,
-    header_len, payload_rows, payload_spans, word_epoch,
+    GroupHead, HDR_PREFIX, Header, PREFIX_BYTES, SAL_FORMAT, anchor_word, group_total_size, header_len, payload_rows,
+    payload_sizes, payload_spans, word_epoch,
 };
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
@@ -31,12 +31,6 @@ const _: () = assert!(
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the checkpoint headroom.
 pub(super) const MIN_SAL_BYTES: usize = 16 << 20;
-
-/// `SAL_MMAP_SIZE`, or a `GNITZ_SAL_BYTES` in `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` —
-/// for test servers sharing a tmpfs, since each `fallocate`s its whole SAL.
-fn sal_mmap_size() -> usize {
-    gnitz_foundation::env::env_num_in("GNITZ_SAL_BYTES", SAL_MMAP_SIZE, MIN_SAL_BYTES..=SAL_MMAP_SIZE)
-}
 
 /// The word at `offset` as an atomic: a publication prefix, or the anchor or
 /// format word.
@@ -66,8 +60,8 @@ pub(crate) struct SalMessage<'a> {
     payload: &'a [u8],
     /// The checksum the writer stored of a zone member's payload bytes.
     payload_sum: u64,
-    /// The directory: one `DIR_ENTRY_BYTES` entry per payload.
-    dir: &'a [u8],
+    /// The verified header, whose directory sizes the payloads.
+    hdr: &'a [u8],
     /// The worker count the group was written at.
     width: u8,
 }
@@ -83,7 +77,7 @@ impl<'a> SalMessage<'a> {
     /// Each payload's bytes, in directory order.
     pub(crate) fn payloads(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
         let payload = self.payload;
-        payload_spans(dir_sizes(self.dir)).map(move |(off, sz)| &payload[off..off + sz])
+        payload_spans(payload_sizes(self.hdr)).map(move |(off, sz)| &payload[off..off + sz])
     }
 
     /// The worker count the group was written at.
@@ -102,7 +96,7 @@ impl<'a> SalMessage<'a> {
         }
         let i = self.head.targets.position(w)?;
         let i = if self.head.shared() { 0 } else { i };
-        let (off, sz) = payload_spans(dir_sizes(self.dir)).nth(i)?;
+        let (off, sz) = payload_spans(payload_sizes(self.hdr)).nth(i)?;
         Some(&self.payload[off..off + sz])
     }
 
@@ -161,7 +155,9 @@ impl SalLog {
             .mode(0o644)
             .open(format!("{data_dir}/wal.sal"))
             .map_err(|e| format!("failed to open SAL file: {e}"))?;
-        let len = sal_mmap_size();
+        // `GNITZ_SAL_BYTES` is for test servers sharing a tmpfs, since each
+        // `fallocate`s its whole SAL.
+        let len = gnitz_foundation::env::env_num_in("GNITZ_SAL_BYTES", SAL_MMAP_SIZE, MIN_SAL_BYTES..=SAL_MMAP_SIZE);
         let log =
             Self::map(Box::leak(Box::new(file)), len).map_err(|e| format!("failed to map SAL ({len} bytes): {e}"))?;
         // The file's name in `data_dir`, before any group written to it is ACKed.
@@ -333,9 +329,8 @@ impl SalLog {
             return None;
         }
 
-        let dir = directory(hdr);
         let payload_off = hdr_off + hdr.len();
-        let end = cursor as usize + group_total_size(hdr.len(), dir_sizes(dir));
+        let end = cursor as usize + group_total_size(hdr.len(), payload_sizes(hdr));
         // The payloads run from the header's end to the group's end.
         let payload = self.span(payload_off, end - payload_off)?;
         Some(SalMessage {
@@ -344,7 +339,7 @@ impl SalLog {
             end: end as u64,
             payload,
             payload_sum: h.payload_sum,
-            dir,
+            hdr,
             width: h.width,
         })
     }

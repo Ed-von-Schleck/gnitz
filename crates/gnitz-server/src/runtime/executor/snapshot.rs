@@ -22,12 +22,11 @@ use gnitz_wire::{ControlHeader, WireFault};
 const MAX_SNAPSHOTS_PER_CONNECTION: usize = 4;
 
 /// The snapshots one connection holds, by id, each with the master's own pin.
-#[derive(Default)]
-pub(super) struct HeldSnapshots(Vec<(u64, Snapshot)>);
+pub(super) type HeldSnapshots = Vec<(u64, Snapshot)>;
 
 /// SNAPSHOT_OPEN: pin, and hold the snapshot for this connection.
 pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u64, WireFault> {
-    if held.0.len() >= MAX_SNAPSHOTS_PER_CONNECTION {
+    if held.len() >= MAX_SNAPSHOTS_PER_CONNECTION {
         return Err(format!("this connection holds {MAX_SNAPSHOTS_PER_CONNECTION} snapshots; close one first").into());
     }
     let id = shared.last_snapshot.get() + 1;
@@ -49,7 +48,7 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
         release(shared, id).await;
         return Err(e);
     }
-    held.0.push((id, pinned.expect("an accepted cut pinned")));
+    held.push((id, pinned.expect("an accepted cut pinned")));
     Ok(id)
 }
 
@@ -67,7 +66,7 @@ pub(super) async fn page(
     blob: &[u8],
 ) -> Result<(), WireFault> {
     let (id, tid) = (hdr.arg0, hdr.target_id);
-    let Some((_, pin)) = held.0.iter().find(|(h, _)| *h == id) else {
+    let Some((_, pin)) = held.iter().find(|(h, _)| *h == id) else {
         return Err(format!("snapshot {id} is not this connection's").into());
     };
     let request = PageRequest::decode(blob).map_err(decode_fault)?;
@@ -91,27 +90,19 @@ pub(super) async fn page(
 
 /// SNAPSHOT_CLOSE: release snapshot `id` this connection holds.
 pub(super) async fn close(shared: &Shared, held: &mut HeldSnapshots, id: u64) -> Result<(), WireFault> {
-    let Some(at) = held.0.iter().position(|(h, _)| *h == id) else {
+    let Some(at) = held.iter().position(|(h, _)| *h == id) else {
         return Err(format!("snapshot {id} is not this connection's").into());
     };
-    held.0.swap_remove(at);
+    held.swap_remove(at);
     release(shared, id).await;
     Ok(())
-}
-
-/// Release every snapshot a connection that has ended held.
-pub(super) async fn release_all(shared: &Shared, held: HeldSnapshots) {
-    for (id, pin) in held.0 {
-        drop(pin);
-        release(shared, id).await;
-    }
 }
 
 /// Release snapshot `id` on every worker. A worker that cannot answer
 /// the release has left the cluster, which ends the server; the one failure
 /// returned is the SAL refusing the Unpin group, after which the workers keep
 /// the pin until restart, so it is logged rather than fail-stopped.
-async fn release(shared: &Shared, id: u64) {
+pub(super) async fn release(shared: &Shared, id: u64) {
     let released = shared.dispatcher.command(Read::Unpin { snapshot: id }).await;
     if let Err(e) = released {
         gnitz_warn!("snapshot {id}: release failed: {}", e.text);

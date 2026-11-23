@@ -201,17 +201,13 @@ impl Mesh {
     /// Where worker `w`'s outbox for the current part starts in the region.
     fn outbox_at(&self, w: usize) -> usize {
         assert!(w < self.nw(), "worker {w} of {}", self.nw());
-        HEADER_BYTES + (2 * w + self.parity()) * self.outbox_bytes
+        HEADER_BYTES + (2 * w + (self.part % 2) as usize) * self.outbox_bytes
     }
 
     /// Worker `w`'s outbox for the current part.
     fn outbox(&self, w: usize) -> *mut u8 {
         // SAFETY: `outbox_at` checked `w < nw`, so the outbox lies inside the region.
         unsafe { self.base.add(self.outbox_at(w)) }
-    }
-
-    fn parity(&self) -> usize {
-        (self.part % 2) as usize
     }
 
     /// The most lanes one round carries: as many heads as fit the page before
@@ -293,74 +289,65 @@ impl Mesh {
                 std::slice::from_raw_parts_mut(spans, nw).fill(Span { at: 0, len: 0 });
             }
         }
-        let (mut end, mut more) = (BLOCKS_AT, false);
-        while let Some(at) = &mut round.at {
+        let outbox = self.outbox(self.rank);
+        let mut end = BLOCKS_AT;
+        // Each lane's rows from the cursor on, as one block per row list of the
+        // lane, until the lanes end or the outbox fills.
+        'lanes: while let Some(at) = &mut round.at {
             let lane = &mut round.lanes[at.lane];
             let (batch, _) = lane.unsent.as_ref().expect("the cursor's lane is unsent");
             // SAFETY: as above.
             let spans = unsafe { std::slice::from_raw_parts_mut(self.lane_at(self.rank, at.lane).1, nw) };
-            (end, more) = self.write_rows(batch, at, end, spans);
-            if more {
-                if end == BLOCKS_AT {
-                    gnitz_fatal_abort!(
-                        "exchange of view {}: a row does not fit the {}-byte outbox",
-                        lane.view,
-                        self.outbox_bytes
-                    );
+            while at.list < at.lists {
+                let rest = &self.routed[at.list][at.offset..];
+                if !rest.is_empty() {
+                    // SAFETY: `[end, outbox_bytes)` lies inside this worker's own
+                    // outbox, which no peer reads until the arrival that follows.
+                    let out = unsafe { std::slice::from_raw_parts_mut(outbox.add(end), self.outbox_bytes - end) };
+                    let Some((n, len)) = batch.as_mem_batch().encode_scattered_prefix(rest, out) else {
+                        break 'lanes;
+                    };
+                    let span = Span { at: end as u32, len: len as u32 };
+                    match at.lists {
+                        1 => spans.fill(span),
+                        _ => spans[at.list] = span,
+                    }
+                    end = (end + len).next_multiple_of(8);
+                    if n < rest.len() {
+                        at.offset += n;
+                        break 'lanes;
+                    }
                 }
-                break;
+                at.list += 1;
+                at.offset = 0;
             }
             lane.unsent = None;
             let next = at.lane + 1;
             round.at = self.enter(round, next);
         }
-        let head = Head {
-            lanes: round.lanes.len() as u64,
-            drained: round.drained as u64,
-            more: more as u64,
-        };
-        self.arrive(&head, end);
-    }
-
-    /// Write `batch`'s rows from `at`, starting at `end`, as one block per row
-    /// list of its lane, naming each in `spans`, until the lists end or the
-    /// outbox fills. Returns where the blocks end, and whether rows are left.
-    fn write_rows(&self, batch: &Batch, at: &mut Cursor, mut end: usize, spans: &mut [Span]) -> (usize, bool) {
-        let outbox = self.outbox(self.rank);
-        while at.list < at.lists {
-            let rest = &self.routed[at.list][at.offset..];
-            if !rest.is_empty() {
-                // SAFETY: `[end, outbox_bytes)` lies inside this worker's own
-                // outbox, which no peer reads until the arrival that follows.
-                let out = unsafe { std::slice::from_raw_parts_mut(outbox.add(end), self.outbox_bytes - end) };
-                let Some((n, len)) = batch.as_mem_batch().encode_scattered_prefix(rest, out) else {
-                    return (end, true);
-                };
-                let span = Span { at: end as u32, len: len as u32 };
-                match at.lists {
-                    1 => spans.fill(span),
-                    _ => spans[at.list] = span,
-                }
-                end = (end + len).next_multiple_of(8);
-                if n < rest.len() {
-                    at.offset += n;
-                    return (end, true);
-                }
-            }
-            at.list += 1;
-            at.offset = 0;
+        // The cursor stays only where rows are left for another part.
+        if let Some(at) = &round.at
+            && end == BLOCKS_AT
+        {
+            gnitz_fatal_abort!(
+                "exchange of view {}: a row does not fit the {}-byte outbox",
+                round.lanes[at.lane].view,
+                self.outbox_bytes
+            );
         }
-        (end, false)
-    }
-
-    /// Publish `head` and the blocks before `end` as this worker's part: count
-    /// the arrival, and wake every peer if it completed the part.
-    fn arrive(&mut self, head: &Head, end: usize) {
+        // Publish the head and the blocks before `end` as this worker's part:
+        // count the arrival, and wake every peer if it completed the part.
         // SAFETY: the outbox is page-aligned and its first page holds the head;
         // no peer reads it until the arrival below.
-        unsafe { std::ptr::copy_nonoverlapping(head, self.outbox(self.rank).cast::<Head>(), 1) }
+        unsafe {
+            outbox.cast::<Head>().write(Head {
+                lanes: round.lanes.len() as u64,
+                drained: round.drained as u64,
+                more: round.at.is_some() as u64,
+            })
+        }
         self.trim(end);
-        let nw = self.nw() as u64;
+        let nw = nw as u64;
         // Release: a peer that sees the count sees the outbox writes above.
         if self.arrivals().fetch_add(1, Ordering::AcqRel) == (self.part + 1) * nw - 1 {
             self.parks.wake(WorkerSet::ALL.without(self.rank));
@@ -370,7 +357,7 @@ impl Mesh {
     /// Return the pages of this part's outbox past `end`, once they exceed
     /// [`RESIDENT_SLACK_BYTES`]. Every peer read what they held two parts ago.
     fn trim(&mut self, end: usize) {
-        let p = self.parity();
+        let p = (self.part % 2) as usize;
         let end = end.next_multiple_of(PAGE_BYTES);
         if self.resident[p] > end + RESIDENT_SLACK_BYTES {
             let at = self.outbox_at(self.rank) + end;
@@ -411,7 +398,9 @@ impl Mesh {
         let (rank, nw) = (self.rank, self.nw());
         let (mut drained, mut more) = (true, false);
         for peer in 0..nw {
-            let head = self.head(peer);
+            // SAFETY: the peer wrote its head before the arrival `complete`
+            // observed, and rewrites it only after this worker's next arrival.
+            let head = unsafe { &*self.outbox(peer).cast::<Head>() };
             if head.lanes != round.lanes.len() as u64 {
                 gnitz_fatal_abort!(
                     "exchange of view {}: worker {peer} published {} lanes, not {} — workers diverged",
@@ -440,11 +429,17 @@ impl Mesh {
                         head.view
                     );
                 }
-                let block = self.block(peer, span);
-                if !block.is_empty() {
-                    lane.merge &= head.consolidated != 0;
-                    blocks.push(block);
+                let (at, len) = (span.at as usize, span.len as usize);
+                if len == 0 {
+                    continue;
                 }
+                if at < BLOCKS_AT || at + len > self.outbox_bytes {
+                    gnitz_fatal_abort!("exchange: worker {peer}'s head names bytes [{at}, +{len}) outside its outbox");
+                }
+                lane.merge &= head.consolidated != 0;
+                // SAFETY: checked above to lie inside the peer's outbox, which it
+                // rewrites only after this worker's next arrival.
+                blocks.push(unsafe { std::slice::from_raw_parts(self.outbox(peer).add(at), len) });
             }
             if more {
                 lane.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
@@ -475,27 +470,6 @@ impl Mesh {
         }
         self.in_round = false;
         Some(drained)
-    }
-
-    /// `peer`'s head for the current part.
-    fn head(&self, peer: usize) -> &Head {
-        // SAFETY: the peer wrote its head before the arrival `complete`
-        // observed, and rewrites it only after this worker's next arrival.
-        unsafe { &*self.outbox(peer).cast::<Head>() }
-    }
-
-    /// The block `span` names in `peer`'s outbox for the current part.
-    fn block(&self, peer: usize, span: Span) -> &[u8] {
-        let (at, len) = (span.at as usize, span.len as usize);
-        if len == 0 {
-            return &[];
-        }
-        if at < BLOCKS_AT || at + len > self.outbox_bytes {
-            gnitz_fatal_abort!("exchange: worker {peer}'s head names bytes [{at}, +{len}) outside its outbox");
-        }
-        // SAFETY: checked above to lie inside the peer's outbox, which it
-        // rewrites only after this worker's next arrival.
-        unsafe { std::slice::from_raw_parts(self.outbox(peer).add(at), len) }
     }
 }
 

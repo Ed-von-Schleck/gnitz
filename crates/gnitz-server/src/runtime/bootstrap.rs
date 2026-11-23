@@ -7,11 +7,10 @@
 //! point rebuilds a view rather than silently resuming a stale one.
 
 use gnitz_foundation::{gnitz_error, gnitz_info, gnitz_note};
-use std::collections::BTreeSet;
 use std::num::NonZero;
 use std::os::fd::AsRawFd;
 
-use crate::catalog::{CatalogEngine, SysFamily};
+use crate::catalog::CatalogEngine;
 use gnitz_foundation::fault::{Stage, Switch};
 
 use crate::runtime::ServerExit;
@@ -30,30 +29,6 @@ use crate::runtime::w2m::{self, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{PkRule, Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
-use gnitz_zset::repr::Batch;
-
-// ---------------------------------------------------------------------------
-// SAL recovery: both drivers below read the log through `sal::CommittedTail`
-// and differ only in which groups are theirs and what they do with the bytes.
-// A group that does not decode, head or rows, fails the boot.
-// ---------------------------------------------------------------------------
-
-/// The tail's committed DdlSync groups, each with its LSN, in log order:
-/// what the catalog stages at open.
-fn system_tail(tail: &CommittedTail) -> impl Iterator<Item = Result<(SysFamily, u64, Batch), String>> {
-    tail.ingests().filter_map(move |group| {
-        let (family, msg) = match group {
-            Ok((Ingest::DdlSync { family }, msg)) => (family, msg),
-            Ok(_) => return None,
-            Err(e) => return Some(Err(e)),
-        };
-        // A DdlSync group is shared: its one payload holds the rows, which the
-        // master validated and which already carry a drop's children.
-        msg.rows(msg.payloads().next().unwrap_or_default(), |_, _| None)
-            .map(|rows| Some((family, tail.lsn(&msg), rows?)))
-            .transpose()
-    })
-}
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
 /// stage, so the crash-window E2E tests can cut boot at a precise point.
@@ -73,12 +48,62 @@ fn inject_recovery_panic(stage: &str) {
     }
 }
 
-/// Apply `slot`'s share of the tail's Push groups, each as a live push is but
-/// always under [`PkRule::Enforce`], whatever rule the group carries. No LSN
-/// floor: the enforced rule makes re-applying a group the shards already hold a
-/// no-op, where a group's [`PkRule::Fresh`] holds only of the store it was first
-/// applied to.
-fn recover_from_sal(tail: &CommittedTail, slot: Slot, catalog: &mut CatalogEngine) -> Result<(), String> {
+// Both recoveries below read the log through `sal::CommittedTail` and differ
+// only in which groups are theirs and what they do with the bytes. A group that
+// does not decode, head or rows, fails the boot.
+
+/// The master's half of recovery before any worker exists: the catalog opened
+/// over the tail's system groups, the system families made durable, and the
+/// boot's epoch raised above what they hold — every worker's drain starts at
+/// the epoch the writer does.
+fn master_pre_fork_recovery(
+    data_dir: &str,
+    num_workers: u32,
+    config: StoreConfig,
+    tail: &mut CommittedTail,
+) -> Result<CatalogEngine, String> {
+    let ddl = tail.ingests().filter_map(|group| {
+        let (family, msg) = match group {
+            Ok((Ingest::DdlSync { family }, msg)) => (family, msg),
+            Ok(_) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        // A DdlSync group is shared: its one payload holds the rows, which the
+        // master validated and which already carry a drop's children.
+        msg.rows(msg.payloads().next().unwrap_or_default(), |_, _| None)
+            .map(|rows| Some((family, tail.lsn(&msg), rows?)))
+            .transpose()
+    });
+    let mut catalog = CatalogEngine::open_master(data_dir, num_workers, config, ddl)
+        .map_err(|e| format!("failed to open catalog: {e}"))?;
+    // With a replayed push, G → G+1, the resume point left at G: the workers'
+    // boot flush moves the base stores past what the views at G integrate, so
+    // until the boot's ephemeral round restamps at G+1 a crash rebuilds every
+    // view instead of resuming it. With none, every base store stays what the
+    // views at G integrate, and a view this boot keeps is still valid at G.
+    catalog
+        .flush_ahead_of_base_round(tail.holds_pushes())
+        .map_err(|e| format!("boot system flush failed: {e}"))?;
+    inject_recovery_panic("genbump");
+    tail.write_above(catalog.applied_zone());
+    Ok(catalog)
+}
+
+/// Worker-boot catalog recovery: open this worker's stores, then apply `slot`'s
+/// share of the tail's Push groups, each as a live push is but always under
+/// [`PkRule::Enforce`], whatever rule the group carries, and flush the base
+/// stores. No LSN floor: the enforced rule makes re-applying a group the shards
+/// already hold a no-op, where a group's [`PkRule::Fresh`] holds only of the
+/// store it was first applied to. On `Err` the worker exits without publishing
+/// its position, which fails the boot.
+fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot: Slot) -> Result<(), String> {
+    // Before any other catalog work, and before the replay below, which
+    // projects the tail into each index exactly once.
+    let rebuilt = catalog.open_stores(slot.rank, Residency::Worker)?;
+    // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
+    // every index resumed from its checkpoint.
+    gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
+
     // Groups that applied at least one payload, and the width a re-sliced tail was
     // written at — the boot record's re-slice marker. No boot writes at a
     // previously-used epoch, so every group a walk sees carries the same width.
@@ -134,26 +159,13 @@ fn recover_from_sal(tail: &CommittedTail, slot: Slot, catalog: &mut CatalogEngin
         }
         replayed += u32::from(applied);
     }
-
     if replayed > 0 {
         match resliced_from {
             Some(n) => gnitz_note!("SAL replay: replayed {replayed} group(s), re-sliced from a {n}-worker tail"),
             None => gnitz_note!("SAL replay: replayed {replayed} group(s)"),
         }
     }
-    Ok(())
-}
 
-/// Worker-boot catalog recovery. On `Err` the worker exits without publishing
-/// its position, which fails the boot.
-fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot: Slot) -> Result<(), String> {
-    // Before any other catalog work, and before the replay below, which
-    // projects the tail into each index exactly once.
-    let rebuilt = catalog.open_stores(slot.rank, Residency::Worker)?;
-    // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
-    // every index resumed from its checkpoint.
-    gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
-    recover_from_sal(tail, slot, catalog)?;
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
@@ -238,115 +250,6 @@ fn run_worker_child(
     WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh, pinning.is_some()).run()
 }
 
-/// The master's half of recovery before any worker exists: the catalog opened
-/// over the tail's system groups, the system families made durable, and the
-/// boot's epoch raised above what they hold — every worker's drain starts at
-/// the epoch the writer does.
-fn master_pre_fork_recovery(
-    data_dir: &str,
-    num_workers: u32,
-    config: StoreConfig,
-    tail: &mut CommittedTail,
-) -> Result<CatalogEngine, String> {
-    let mut catalog = CatalogEngine::open_master(data_dir, num_workers, config, system_tail(tail))
-        .map_err(|e| format!("failed to open catalog: {e}"))?;
-    // With a replayed push, G → G+1, the resume point left at G: the workers'
-    // boot flush moves the base stores past what the views at G integrate, so
-    // until the boot's ephemeral round restamps at G+1 a crash rebuilds every
-    // view instead of resuming it. With none, every base store stays what the
-    // views at G integrate, and a view this boot keeps is still valid at G.
-    catalog
-        .flush_ahead_of_base_round(tail.holds_pushes())
-        .map_err(|e| format!("boot system flush failed: {e}"))?;
-    inject_recovery_panic("genbump");
-    tail.write_above(catalog.applied_zone());
-    Ok(catalog)
-}
-
-/// Fork one child per worker, each of which never returns and takes its own
-/// ends with it. Yields the parent's children; on a failed fork, the ones
-/// already forked are killed and reaped.
-fn fork_workers(
-    catalog: &mut CatalogEngine,
-    data_dir: &str,
-    tail: &CommittedTail,
-    workers: Vec<(W2mWriter, Mesh)>,
-    pinning: Option<&affinity::Pinning>,
-) -> Result<Workers, String> {
-    let master_pid = unsafe { libc::getpid() };
-    let num_workers = workers.len() as u32;
-    let mut forked = Workers::new(Vec::with_capacity(workers.len()));
-    for (w, ipc) in workers.into_iter().enumerate() {
-        match unsafe { libc::fork() } {
-            -1 => {
-                return Err(format!(
-                    "fork of worker {w} failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            0 => run_worker_child(
-                Slot::new(w as u32, num_workers),
-                data_dir,
-                master_pid,
-                catalog,
-                tail,
-                ipc,
-                pinning,
-            ),
-            pid => forked.push(NonZero::new(pid).expect("fork answers the parent a child's pid")),
-        }
-    }
-    Ok(forked)
-}
-
-/// The master's half of recovery once the workers have recovered and the SAL is
-/// rewound, ending in the checkpoint a clean restart resumes from.
-/// `pushed` holds the base tables the tail pushed to.
-async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64>) -> Result<(), String> {
-    // Boot is the lock's only holder: no task of the executor exists yet.
-    let alone = disp.apply_lock().await;
-    // Rebuild the views the boot verdict rejected, through the driver a live
-    // CREATE VIEW uses; they opened empty. Ahead of the tail's tick: a backfill
-    // reads its sources at their cut, which a replayed push landed above.
-    let invalid: Vec<u64> = std::mem::take(&mut disp.cat_mut().boot.rebuild).into_iter().collect();
-    // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
-    // E2E): 0 ⇒ every view resumed from its checkpoint.
-    gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
-    disp.backfill_views_in_dep_order(&alone, &invalid)
-        .await
-        .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
-
-    inject_recovery_panic("backfill");
-
-    // The replayed tail, above the cut of every scanned base store it pushed to:
-    // one tick brings it to every view, resumed or rebuilt, each row once. A
-    // view's operator state needs no tick: the boot checkpoint opens every
-    // resumed view's.
-    {
-        let laid_out = disp.sal().lock().await;
-        for tid in pushed {
-            disp.credit(&laid_out, tid, 0);
-        }
-    }
-    disp.tick(&alone)
-        .await
-        .map_err(|e| format!("recovery tick of the replayed tail failed: {e}"))?;
-
-    inject_recovery_panic("sweep");
-
-    // A full checkpoint before the socket opens, so a clean restart resumes from
-    // it. No drain — recovery already drained everything and no pushes are
-    // admitted yet.
-    disp.checkpoint_ephemeral(&alone)
-        .await
-        .map_err(|e| format!("boot checkpoint failed: {e}"))?;
-    Ok(())
-}
-
-/// Descriptors besides client connections: an fsync batch's chunk and a fixed
-/// handful.
-const FD_RESERVE: u64 = 1024;
-
 /// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
 /// limit. Best-effort: a refusal surfaces later as `EMFILE` at the open that
 /// could not be served.
@@ -361,18 +264,6 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
-/// Keeps freed memory in the heap for the next batch: with a fixed mmap
-/// threshold and a trim threshold above any phase's working set, glibc stops
-/// unmapping and trimming on free, which the next allocation would fault in
-/// again. Set before the fork, so every worker inherits it.
-fn keep_freed_memory_mapped() {
-    // SAFETY: mallopt only adjusts glibc's allocator parameters.
-    unsafe {
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
-    }
-}
-
 /// Single entry point for the entire server bootstrap: opens the catalog,
 /// allocates the shared IPC regions, forks the workers, runs recovery, and
 /// enters the executor event loop, with a TLS listener when `tls` names one.
@@ -382,12 +273,21 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // Ahead of anything a refusal would have to undo: the reactor cannot run
     // without io_uring, and nothing else tells a container why.
     check_host()?;
-    keep_freed_memory_mapped();
+    // Keep freed memory in the heap for the next batch: with a fixed mmap
+    // threshold and a trim threshold above any phase's working set, glibc stops
+    // unmapping and trimming on free, which the next allocation would fault in
+    // again. Set before the fork, so every worker inherits it.
+    // SAFETY: mallopt only adjusts glibc's allocator parameters.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
+    }
     signals::catch_reload();
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is
-    // held by its mapping, and an fsync batch opens a bounded chunk.
-    raise_fd_limit((limits.max_conns as u64).saturating_add(FD_RESERVE));
+    // held by its mapping, and an fsync batch opens a bounded chunk, which the
+    // reserve covers together with a fixed handful.
+    raise_fd_limit((limits.max_conns as u64).saturating_add(1024));
 
     // Before any io_uring worker thread exists: each keeps the mask it starts with.
     let (num_workers, pinning) = affinity::pin_master(args.workers)?;
@@ -417,11 +317,36 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     let (writers, receiver) = w2m::create(parks).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
-    let workers: Vec<(W2mWriter, Mesh)> = writers.into_iter().zip(meshes).collect();
 
     let mut catalog = master_pre_fork_recovery(data_dir, num_workers, StoreConfig::from_env("GNITZ_"), &mut tail)?;
 
-    let workers = fork_workers(&mut catalog, data_dir, &tail, workers, pinning.as_ref())?;
+    // One child per worker, each of which never returns and takes its own ends
+    // with it. On a failed fork, `workers` drops at the return, which kills and
+    // reaps the ones already forked.
+    let master_pid = unsafe { libc::getpid() };
+    let mut workers = Workers(Vec::with_capacity(nw));
+    for (w, ipc) in writers.into_iter().zip(meshes).enumerate() {
+        match unsafe { libc::fork() } {
+            -1 => {
+                return Err(format!(
+                    "fork of worker {w} failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            0 => run_worker_child(
+                Slot::new(w as u32, num_workers),
+                data_dir,
+                master_pid,
+                &mut catalog,
+                &tail,
+                ipc,
+                pinning.as_ref(),
+            ),
+            pid => workers
+                .0
+                .push(NonZero::new(pid).expect("fork answers the parent a child's pid")),
+        }
+    }
 
     // --- Parent process ---
     let reactor = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
@@ -430,13 +355,54 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // forever. `workers` drops at the return, which kills them: after the final
     // checkpoint, a death, or a failed boot.
     let mut death = std::pin::pin!(workers.death(reactor));
+    // The master's half of recovery once the workers have recovered and the SAL
+    // is rewound, ending in the checkpoint a clean restart resumes from.
     let recovered = async {
+        // The base tables the tail pushed to.
         let pushed = tail.pushed().clone();
         let sal = SalWriter::boot(tail, parks, reactor).await;
         inject_recovery_panic("reset");
-        let dispatcher = MasterDispatcher::new(catalog, sal, reactor);
-        master_post_fork_recovery(&dispatcher, pushed).await?;
-        Ok::<_, String>(dispatcher)
+        let disp = MasterDispatcher::new(catalog, sal, reactor);
+        // Boot is the lock's only holder: no task of the executor exists yet.
+        let alone = disp.apply_lock().await;
+        // Rebuild the views the boot verdict rejected, through the driver a live
+        // CREATE VIEW uses; they opened empty. Ahead of the tail's tick: a
+        // backfill reads its sources at their cut, which a replayed push landed
+        // above.
+        let invalid: Vec<u64> = std::mem::take(&mut disp.cat_mut().boot.rebuild).into_iter().collect();
+        // Resume-vs-rebuild marker (asserted by the "no backfill on clean
+        // restart" E2E): 0 ⇒ every view resumed from its checkpoint.
+        gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
+        disp.backfill_views_in_dep_order(&alone, &invalid)
+            .await
+            .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
+
+        inject_recovery_panic("backfill");
+
+        // The replayed tail, above the cut of every scanned base store it pushed
+        // to: one tick brings it to every view, resumed or rebuilt, each row
+        // once. A view's operator state needs no tick: the boot checkpoint opens
+        // every resumed view's.
+        {
+            let laid_out = disp.sal().lock().await;
+            for tid in pushed {
+                disp.credit(&laid_out, tid, 0);
+            }
+        }
+        disp.tick(&alone)
+            .await
+            .map_err(|e| format!("recovery tick of the replayed tail failed: {e}"))?;
+
+        inject_recovery_panic("sweep");
+
+        // A full checkpoint before the socket opens, so a clean restart resumes
+        // from it. No drain — recovery already drained everything and no pushes
+        // are admitted yet.
+        disp.checkpoint_ephemeral(&alone)
+            .await
+            .map_err(|e| format!("boot checkpoint failed: {e}"))?;
+        drop(alone);
+        Ok::<_, String>(disp)
     };
     let dispatcher = match reactor.block_on(select2(recovered, death.as_mut())) {
         Either::A(recovered) => recovered?,

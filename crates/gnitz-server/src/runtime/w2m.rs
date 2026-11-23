@@ -11,8 +11,10 @@
 //! (master-written) are monotonic **virtual** offsets counting bytes from 0,
 //! never physical positions; the master's read cursor sits between them —
 //! `release <= read <= write` — and never leaves this process. A
-//! [`RingCursor`] keeps the physical position of its virtual offset, and a
-//! [`Placement`] is where the next message goes.
+//! [`RingCursor`] keeps the physical position of its virtual offset. A
+//! message goes at the write position; into an empty ring, at the data head,
+//! which becomes its offset (a rewind); and past a tail too short for it, at
+//! the data head behind a [`SKIP_MARKER`] over the tail.
 //!
 //! ## The applied position
 //!
@@ -69,7 +71,7 @@ const W2M_HEADER_SIZE: usize = 128;
 const W2M_WINDOW_FRAMES: u64 = 16;
 
 /// Capacity (header + data) of each per-worker W2M mmap region. Resident as
-/// far as a ring has ever got between two [`Placement::Rewind`]s: no page is
+/// far as a ring has ever got between two rewinds: no page is
 /// given back.
 const W2M_REGION_SIZE: usize =
     (W2M_HEADER_SIZE as u64 + W2M_WINDOW_FRAMES * slot_stride(gnitz_wire::MAX_FRAME_PAYLOAD)) as usize;
@@ -206,22 +208,37 @@ struct HoldTable {
 }
 
 impl HoldTable {
-    /// A fresh shared mapping holding no lease, never unmapped.
-    fn map() -> std::io::Result<&'static HoldTable> {
-        let base = posix_io::map_shared(None, size_of::<HoldTable>())?;
-        // SAFETY: a fresh page-aligned shared mapping of one table, never
-        // unmapped; zeroed holds nothing.
-        Ok(unsafe { &*base.cast::<HoldTable>() })
-    }
-
-    /// Whether `id` is held. A read racing the master's write may miss a hold
-    /// or see one just ended; a parker's re-test behind its arm sees neither.
-    #[inline]
+    /// Whether `id` is held. The worker reads `held` before the ids, which the
+    /// master stores before it publishes `held`.
     fn holds(&self, id: RequestId) -> bool {
         let n = self.held.load(Ordering::SeqCst) as usize;
         self.ids[..n.min(HOLD_SLOTS)]
             .iter()
             .any(|x| x.load(Ordering::Relaxed) == id.get())
+    }
+
+    /// Hold `id`; false, holding nothing, when the table is full. The master's
+    /// alone.
+    fn insert(&self, id: RequestId) -> bool {
+        let n = self.held.load(Ordering::Relaxed) as usize;
+        if n == HOLD_SLOTS {
+            return false;
+        }
+        self.ids[n].store(id.get(), Ordering::Relaxed);
+        self.held.store(n as u32 + 1, Ordering::SeqCst);
+        true
+    }
+
+    /// End the hold on `id`, which the last id takes the place of. The
+    /// master's alone.
+    fn remove(&self, id: RequestId) {
+        let n = self.held.load(Ordering::Relaxed) as usize;
+        let Some(at) = self.ids[..n].iter().position(|x| x.load(Ordering::Relaxed) == id.get()) else {
+            debug_assert!(false, "an end of a hold that was never taken");
+            return;
+        };
+        self.ids[at].store(self.ids[n - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+        self.held.store(n as u32 - 1, Ordering::SeqCst);
     }
 }
 
@@ -359,7 +376,10 @@ fn rings(parks: WorkerParks, capacity: usize, frame_budget: usize) -> std::io::R
             phys: W2M_HEADER_SIZE as u64,
             cap: capacity as u64,
         };
-        let holds = HoldTable::map()?;
+        // SAFETY: a fresh page-aligned shared mapping of one table, never
+        // unmapped; zeroed holds nothing.
+        let holds: &'static HoldTable =
+            unsafe { &*posix_io::map_shared(None, size_of::<HoldTable>())?.cast::<HoldTable>() };
         writers.push(W2mWriter {
             wc: start,
             master,
@@ -384,17 +404,6 @@ fn rings(parks: WorkerParks, capacity: usize, frame_budget: usize) -> std::io::R
     // it lives.
     let rings = Box::leak(readers.into_boxed_slice());
     Ok((writers, W2mReceiver { rings, master }))
-}
-
-/// How a message gets from the write position to its slot.
-#[derive(Clone, Copy)]
-enum Placement {
-    /// It starts at the write position.
-    Here,
-    /// The ring is empty: it starts at the data head, which becomes this offset.
-    Rewind,
-    /// The tail is too short for it: it starts at the data head, past the tail.
-    Skip,
 }
 
 // ---------------------------------------------------------------------------
@@ -422,32 +431,6 @@ pub struct W2mWriter {
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
-    /// Where a `total`-byte slot goes now, `total <= DCAP`; while the publish
-    /// would lap the reader, the `release_cursor` that refusal was weighed against.
-    #[inline]
-    fn placement(&self, total: u64) -> Result<Placement, u64> {
-        let wc = &self.wc;
-        let vrel = wc.header().release.value();
-        debug_assert!(vrel <= wc.virt, "cursor inversion: vrel={vrel} vwc={}", wc.virt);
-        let used = wc.virt - vrel;
-        debug_assert!(used <= wc.dcap(), "used {used} exceeds DCAP {}", wc.dcap());
-        if used == 0 {
-            return Ok(Placement::Rewind);
-        }
-        let room_to_end = wc.room_to_end();
-        let fits = if total <= room_to_end {
-            (used + total <= wc.dcap()).then_some(Placement::Here)
-        } else {
-            debug_assert!(
-                room_to_end >= RING_PREFIX_BYTES,
-                "no room for a SKIP marker at phys={}",
-                wc.phys
-            );
-            (used + room_to_end + total <= wc.dcap()).then_some(Placement::Skip)
-        };
-        fits.ok_or(vrel)
-    }
-
     /// Publish one `sz`-byte message tagged `request_id` and `passed`, written by
     /// `encode`. `Err`, writing nothing, when the ring has no room for it now: the
     /// `release_cursor` that refusal was weighed against. A writer waits for that
@@ -461,7 +444,7 @@ impl W2mWriter {
         encode: impl FnOnce(&mut [u8]),
     ) -> Result<(), u64> {
         let total = slot_stride(sz);
-        assert!(sz > 0, "w2m: an empty message is a slot `take_next` aborts on");
+        assert!(sz > 0, "w2m: an empty message is a slot `try_read_slot` aborts on");
         assert!(
             total <= self.wc.dcap(),
             "w2m: sz={sz} exceeds this ring's {}-byte capacity — it would never fit",
@@ -469,30 +452,50 @@ impl W2mWriter {
         );
         // The slot prefix keeps `sz` in its high 32 bits.
         assert!(sz <= u32::MAX as usize, "w2m: sz={sz} does not fit a slot prefix");
-        let placement = self.placement(total)?;
-        // SAFETY: this writer is its ring's one producer, and `placement` found
-        // the bytes unborrowed: past `write_cursor`, or all of an empty ring.
+        let wc = &mut self.wc;
+        let vrel = wc.header().release.value();
+        debug_assert!(vrel <= wc.virt, "cursor inversion: vrel={vrel} vwc={}", wc.virt);
+        let used = wc.virt - vrel;
+        debug_assert!(used <= wc.dcap(), "used {used} exceeds DCAP {}", wc.dcap());
+        let room_to_end = wc.room_to_end();
+        // SAFETY: this writer is its ring's one producer, and each branch
+        // finds the bytes it writes unborrowed: past `write_cursor`, or all of
+        // an empty ring.
         unsafe {
-            match placement {
-                Placement::Here => {}
-                Placement::Rewind => {
-                    self.wc.rewind();
-                    self.wc.header().origin.store(self.wc.virt, Ordering::Release);
+            if used == 0 {
+                // The ring is empty: the message starts at the data head, which
+                // becomes this offset.
+                wc.rewind();
+                wc.header().origin.store(wc.virt, Ordering::Release);
+            } else if total <= room_to_end {
+                if used + total > wc.dcap() {
+                    return Err(vrel);
                 }
-                Placement::Skip => {
-                    self.wc.store_prefix(self.wc.phys, SKIP_MARKER);
-                    self.wc.advance(self.wc.room_to_end());
+            } else {
+                // The tail is too short: the message starts at the data head,
+                // past a SKIP marker over the tail.
+                debug_assert!(
+                    room_to_end >= RING_PREFIX_BYTES,
+                    "no room for a SKIP marker at phys={}",
+                    wc.phys
+                );
+                if used + room_to_end + total > wc.dcap() {
+                    return Err(vrel);
                 }
+                wc.store_prefix(wc.phys, SKIP_MARKER);
+                wc.advance(room_to_end);
             }
-            debug_assert!(self.wc.in_step());
-            self.wc.store_prefix(self.wc.phys, pack_prefix(sz, request_id, passed));
-            let slot = self.wc.base.add((self.wc.phys + RING_PREFIX_BYTES) as usize);
-            encode(std::slice::from_raw_parts_mut(slot, sz));
+            debug_assert!(wc.in_step());
+            wc.store_prefix(wc.phys, pack_prefix(sz, request_id, passed));
+            encode(std::slice::from_raw_parts_mut(
+                wc.base.add((wc.phys + RING_PREFIX_BYTES) as usize),
+                sz,
+            ));
         }
-        self.wc.advance(total);
+        wc.advance(total);
         // SeqCst for the master's park; it also carries the Release that makes
         // the slot's bytes visible to the reader.
-        self.wc.header().write.store(self.wc.virt, Ordering::SeqCst);
+        wc.header().write.store(wc.virt, Ordering::SeqCst);
         self.master.take_arm();
         Ok(())
     }
@@ -554,7 +557,9 @@ impl W2mWriter {
         unpack_prefix(prefix).1
     }
 
-    /// The master holds the lease `id` answers on: send it nothing more.
+    /// The master holds the lease `id` answers on: send it nothing more. A read
+    /// racing the master's write may miss a hold or see one just ended; a
+    /// parker's re-test behind its arm sees neither.
     #[inline]
     pub fn held(&self, id: RequestId) -> bool {
         self.holds.holds(id)
@@ -777,24 +782,11 @@ impl WorkerRing {
             || self.header.want_room.load(Ordering::SeqCst) != self.answered.get()
     }
 
-    /// The worker has moved its applied position since [`Self::applied`] last
+    /// The worker has moved its applied position since [`W2mReceiver::lowest_applied`] last
     /// read it. SeqCst for the master's park.
     #[inline]
     fn applied_moved(&self) -> bool {
         self.header.applied.load(Ordering::SeqCst) != self.applied.get()
-    }
-
-    /// The worker has named a shortage since the last call: answered now, by
-    /// waking every task awaiting with a slot of this ring.
-    #[inline]
-    fn answer_shortage(&self) -> bool {
-        let want = self.header.want_room.load(Ordering::SeqCst);
-        if want == self.answered.get() {
-            return false;
-        }
-        self.answered.set(want);
-        self.wake_holders();
-        true
     }
 
     /// Wake every task awaiting with a slot of this ring, to copy it out.
@@ -809,51 +801,6 @@ impl WorkerRing {
                 *state = SlotState::GivenBack;
             }
         }
-    }
-
-    /// Hold `id`: its worker sends it nothing more. False, holding nothing,
-    /// when [`HOLD_SLOTS`] leases are held.
-    #[cold]
-    fn hold(&self, id: RequestId) -> bool {
-        let holds = self.holds;
-        let n = holds.held.load(Ordering::Relaxed) as usize;
-        if n == HOLD_SLOTS {
-            return false;
-        }
-        holds.ids[n].store(id.get(), Ordering::Relaxed);
-        holds.held.store(n as u32 + 1, Ordering::SeqCst);
-        true
-    }
-
-    /// End `id`'s hold, waking the worker if it waits on the master. The
-    /// release is published again at its value: the RMW wake of [`Park`].
-    #[cold]
-    fn unhold(&self, id: RequestId) {
-        let holds = self.holds;
-        let n = holds.held.load(Ordering::Relaxed) as usize;
-        let Some(at) = holds.ids[..n]
-            .iter()
-            .position(|x| x.load(Ordering::Relaxed) == id.get())
-        else {
-            debug_assert!(false, "an end of a hold that was never taken");
-            return;
-        };
-        holds.ids[at].store(holds.ids[n - 1].load(Ordering::Relaxed), Ordering::Relaxed);
-        holds.held.store(n as u32 - 1, Ordering::SeqCst);
-        let release = &self.header.release;
-        release.publish_waking(release.value(), self.writer_park);
-    }
-
-    /// How far the worker has applied the log, read off its header. It only
-    /// rises: a position below the one last read aborts.
-    fn applied(&self) -> u64 {
-        let at = self.header.applied.load(Ordering::Acquire);
-        let last = self.applied.get();
-        if at < last {
-            applied_moved_back(at, last);
-        }
-        self.applied.set(at);
-        at
     }
 
     /// Mark the slot identified by `push_idx` as released. Advances
@@ -875,78 +822,6 @@ impl WorkerRing {
         if let Some(vrc) = last_vrc {
             self.header.release.publish_waking(vrc, self.writer_park);
         }
-    }
-
-    /// Read the next message and register it as in-flight. `None` **iff** the
-    /// ring is empty; every departure from the layout aborts.
-    #[inline]
-    fn take_next(&'static self, worker: u32) -> Option<W2mSlot> {
-        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
-        let st = unsafe { &mut *self.slots.get() };
-        let hdr = st.read.header();
-        let vwc = hdr.write.load(Ordering::Acquire);
-        debug_assert!(
-            st.read.virt <= vwc,
-            "read cursor {} ahead of write cursor {vwc}",
-            st.read.virt
-        );
-        if st.read.virt == vwc {
-            return None;
-        }
-        // Loaded behind the `vwc` that shows the message at this offset.
-        if hdr.origin.load(Ordering::Acquire) == st.read.virt {
-            debug_assert!(st.queue.is_empty(), "a slot in flight across a rewind");
-            st.read.rewind();
-        }
-        // SAFETY: `read < vwc`, and a publish puts a whole slot below `vwc`,
-        // the marker in front of it included.
-        let mut prefix = unsafe { st.read.load_prefix(st.read.phys) };
-        if prefix == SKIP_MARKER {
-            let pad = st.read.room_to_end();
-            st.read.advance(pad);
-            if st.read.virt == vwc {
-                gnitz_fatal_abort!(
-                    "w2m::take_next: SKIP marker at phys={} with no message past it — ring corrupt",
-                    st.read.phys,
-                );
-            }
-            // SAFETY: as above.
-            prefix = unsafe { st.read.load_prefix(st.read.phys) };
-        }
-        debug_assert!(st.read.in_step());
-        let (sz, request_id, passed) = unpack_prefix(prefix);
-        let Some(request_id) = request_id else {
-            gnitz_fatal_abort!("w2m::take_next: request id 0 at phys={} — ring corrupt", st.read.phys)
-        };
-        // `slot_stride(0)` is 8, so a zero-size slot would pass the span test.
-        if sz == 0 || st.read.virt + slot_stride(sz) > vwc {
-            gnitz_fatal_abort!(
-                "w2m::take_next: size={} at phys={} overruns the write cursor {} — ring corrupt",
-                sz,
-                st.read.phys,
-                vwc,
-            );
-        }
-        let payload_at = (st.read.phys + RING_PREFIX_BYTES) as usize;
-        // SAFETY: the slot ends below `vwc`, and its bytes are the writer's
-        // again only once this slot is released.
-        let frame = unsafe {
-            std::slice::from_raw_parts(
-                st.read.base.add(payload_at - gnitz_wire::FRAME_LEN_PREFIX_BYTES),
-                sz + gnitz_wire::FRAME_LEN_PREFIX_BYTES,
-            )
-        };
-        st.read.advance(slot_stride(sz));
-
-        let push_idx = st.front_idx + st.queue.len() as u64;
-        st.queue.push_back((st.read.virt, SlotState::Held));
-        Some(W2mSlot {
-            frame,
-            push_idx: push_idx | if passed { PASSED_BIT } else { 0 },
-            ring: Some(self),
-            request_id,
-            worker,
-        })
     }
 }
 
@@ -970,9 +845,79 @@ pub struct W2mReceiver {
 impl W2mReceiver {
     /// Take a slot from the ring without freeing its space. `release_cursor`
     /// advances only when the returned `W2mSlot` is dropped, which is what tells
-    /// the writer the bytes are reusable.
+    /// the writer the bytes are reusable. `None` **iff** the ring is empty;
+    /// every departure from the layout aborts.
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
-        self.rings[worker].take_next(worker as u32)
+        let ring: &'static WorkerRing = &self.rings[worker];
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+        let st = unsafe { &mut *ring.slots.get() };
+        let hdr = ring.header;
+        let vwc = hdr.write.load(Ordering::Acquire);
+        debug_assert!(
+            st.read.virt <= vwc,
+            "read cursor {} ahead of write cursor {vwc}",
+            st.read.virt
+        );
+        if st.read.virt == vwc {
+            return None;
+        }
+        // Loaded behind the `vwc` that shows the message at this offset.
+        if hdr.origin.load(Ordering::Acquire) == st.read.virt {
+            debug_assert!(st.queue.is_empty(), "a slot in flight across a rewind");
+            st.read.rewind();
+        }
+        // SAFETY: `read < vwc`, and a publish puts a whole slot below `vwc`,
+        // the marker in front of it included.
+        let mut prefix = unsafe { st.read.load_prefix(st.read.phys) };
+        if prefix == SKIP_MARKER {
+            let pad = st.read.room_to_end();
+            st.read.advance(pad);
+            if st.read.virt == vwc {
+                gnitz_fatal_abort!(
+                    "w2m::try_read_slot: SKIP marker at phys={} with no message past it — ring corrupt",
+                    st.read.phys,
+                );
+            }
+            // SAFETY: as above.
+            prefix = unsafe { st.read.load_prefix(st.read.phys) };
+        }
+        debug_assert!(st.read.in_step());
+        let (sz, request_id, passed) = unpack_prefix(prefix);
+        let Some(request_id) = request_id else {
+            gnitz_fatal_abort!(
+                "w2m::try_read_slot: request id 0 at phys={} — ring corrupt",
+                st.read.phys
+            )
+        };
+        // `slot_stride(0)` is 8, so a zero-size slot would pass the span test.
+        if sz == 0 || st.read.virt + slot_stride(sz) > vwc {
+            gnitz_fatal_abort!(
+                "w2m::try_read_slot: size={} at phys={} overruns the write cursor {} — ring corrupt",
+                sz,
+                st.read.phys,
+                vwc,
+            );
+        }
+        let payload_at = (st.read.phys + RING_PREFIX_BYTES) as usize;
+        // SAFETY: the slot ends below `vwc`, and its bytes are the writer's
+        // again only once this slot is released.
+        let frame = unsafe {
+            std::slice::from_raw_parts(
+                st.read.base.add(payload_at - gnitz_wire::FRAME_LEN_PREFIX_BYTES),
+                sz + gnitz_wire::FRAME_LEN_PREFIX_BYTES,
+            )
+        };
+        st.read.advance(slot_stride(sz));
+
+        let push_idx = st.front_idx + st.queue.len() as u64;
+        st.queue.push_back((st.read.virt, SlotState::Held));
+        Some(W2mSlot {
+            frame,
+            push_idx: push_idx | if passed { PASSED_BIT } else { 0 },
+            ring: Some(ring),
+            request_id,
+            worker: worker as u32,
+        })
     }
 
     /// [`Self::lowest_applied`], once any worker has moved its applied
@@ -987,29 +932,55 @@ impl W2mReceiver {
     }
 
     /// The lowest position any worker has applied the log through, 0 while one
-    /// is short of its boot recovery.
+    /// is short of its boot recovery. A worker's position only rises: one below
+    /// the position last read aborts.
     #[cold]
     pub(crate) fn lowest_applied(&self) -> u64 {
-        let lowest = self.rings.iter().map(WorkerRing::applied).min();
+        let applied = |ring: &WorkerRing| {
+            let (at, last) = (ring.header.applied.load(Ordering::Acquire), ring.applied.get());
+            if at < last {
+                applied_moved_back(at, last);
+            }
+            ring.applied.set(at);
+            at
+        };
+        let lowest = self.rings.iter().map(applied).min();
         lowest.expect("a receiver over no worker has no applied position")
     }
 
     /// Answer a shortage of room `worker` has named since the last call, by
     /// waking every task awaiting with a slot of its ring to copy it out;
     /// whether there was one.
+    #[inline]
     pub(crate) fn answer_shortage(&self, worker: usize) -> bool {
-        self.rings[worker].answer_shortage()
+        let ring = &self.rings[worker];
+        let want = ring.header.want_room.load(Ordering::SeqCst);
+        if want == ring.answered.get() {
+            return false;
+        }
+        ring.answered.set(want);
+        ring.wake_holders();
+        true
     }
 
     /// Hold the lease `id` on `worker`: it sends that lease nothing more until
-    /// [`Self::unhold`]. False when `worker` holds as many leases as it can.
+    /// [`Self::unhold`]. False, holding nothing, when `worker` holds
+    /// [`HOLD_SLOTS`] leases.
+    #[cold]
     pub(crate) fn hold(&self, worker: usize, id: RequestId) -> bool {
-        self.rings[worker].hold(id)
+        self.rings[worker].holds.insert(id)
     }
 
-    /// End the hold [`Self::hold`] took.
+    /// End the hold [`Self::hold`] took, waking the worker if it waits on the
+    /// master. The release is published again at its value: the RMW wake of
+    /// [`Park`].
+    #[cold]
     pub(crate) fn unhold(&self, worker: usize, id: RequestId) {
-        self.rings[worker].unhold(id)
+        let ring = &self.rings[worker];
+        ring.holds.remove(id);
+        ring.header
+            .release
+            .publish_waking(ring.header.release.value(), ring.writer_park);
     }
 
     /// Arm the master's park unless a ring has unread data, a moved applied

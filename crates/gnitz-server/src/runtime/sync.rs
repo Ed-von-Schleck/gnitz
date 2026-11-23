@@ -57,14 +57,8 @@ impl<T> WakeQueue<T> {
         self.wake();
     }
 
-    /// Hand the next value to the awaiter, `None` once the stream has ended and
-    /// is drained, or park it.
-    pub(crate) fn poll(&mut self, cx: &Context<'_>) -> Poll<Option<T>> {
-        self.poll_ready(cx).map(|()| self.pop())
-    }
-
-    /// Park the awaiter until [`Self::poll`] would not: a value is queued or
-    /// the stream has ended. Takes nothing.
+    /// Park the awaiter until a value is queued or the stream has ended, which
+    /// [`Self::pop`] then tells apart. Takes nothing.
     pub(crate) fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<()> {
         if self.is_ready() {
             return Poll::Ready(());
@@ -73,7 +67,7 @@ impl<T> WakeQueue<T> {
         Poll::Pending
     }
 
-    /// Whether [`Self::poll`] would not park.
+    /// Whether [`Self::poll_ready`] would not park.
     pub(crate) fn is_ready(&self) -> bool {
         self.closed || !self.queue.is_empty()
     }
@@ -262,10 +256,8 @@ pub(crate) mod chan {
     impl<T> Receiver<T> {
         pub(crate) async fn recv(&mut self) -> T {
             std::future::poll_fn(|cx| {
-                self.inner
-                    .borrow_mut()
-                    .poll(cx)
-                    .map(|v| v.expect("a chan never closes"))
+                let mut q = self.inner.borrow_mut();
+                q.poll_ready(cx).map(|()| q.pop().expect("a chan never closes"))
             })
             .await
         }
@@ -320,13 +312,6 @@ impl RwLockInner {
     fn free(&self) -> bool {
         !self.has_writer && self.readers == 0
     }
-
-    /// The writer queued as `me` (`None`: not queued) may enter: the lock is free
-    /// and no writer is queued ahead of it, so a fresh writer cannot take the lock
-    /// from a woken one that has yet to poll.
-    fn write_ok(&self, me: Option<u64>) -> bool {
-        self.free() && self.write_waiters.front().is_none_or(|(first, _)| me == Some(*first))
-    }
 }
 
 /// A handle on one lock tagged `K`; clones share it. Every future and guard
@@ -372,16 +357,6 @@ impl<K> AsyncRwLock<K> {
             }
         }
     }
-
-    fn release_read(&self) {
-        self.0.borrow_mut().readers -= 1;
-        self.wake_next();
-    }
-
-    fn release_write(&self) {
-        self.0.borrow_mut().has_writer = false;
-        self.wake_next();
-    }
 }
 
 pub(crate) struct ReadFuture<K = ()> {
@@ -414,7 +389,8 @@ impl<K> ReadGuard<K> {
 
 impl<K> Drop for ReadGuard<K> {
     fn drop(&mut self) {
-        self.lock.release_read();
+        self.lock.0.borrow_mut().readers -= 1;
+        self.lock.wake_next();
     }
 }
 
@@ -429,9 +405,11 @@ impl<K> Future for WriteFuture<K> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard<K>> {
         let Self { lock, waiter } = self.get_mut();
         let mut s = lock.0.borrow_mut();
-        if s.write_ok(*waiter) {
+        // The lock is free and no writer is queued ahead of this one, so a fresh
+        // writer cannot take the lock from a woken one that has yet to poll.
+        if s.free() && s.write_waiters.front().is_none_or(|(first, _)| *waiter == Some(*first)) {
             s.has_writer = true;
-            // `write_ok` admits a queued writer only at the front.
+            // A queued writer is admitted only at the front.
             if let Some(id) = waiter.take() {
                 let first = s.write_waiters.pop_front();
                 debug_assert!(first.is_some_and(|(f, _)| f == id));
@@ -480,7 +458,8 @@ impl<K> WriteGuard<K> {
 
 impl<K> Drop for WriteGuard<K> {
     fn drop(&mut self) {
-        self.lock.release_write();
+        self.lock.0.borrow_mut().has_writer = false;
+        self.lock.wake_next();
     }
 }
 

@@ -114,7 +114,7 @@ fn route_read_pkset_bench() {
     for nw in [4usize, 16] {
         std::hint::black_box(route_read(&read, &registry, nw));
         let (route, instructions) = counter.measure(|| route_read(std::hint::black_box(&read), &registry, nw));
-        assert_eq!(route.set.len(), nw, "the keys spread over every worker");
+        assert_eq!(route.0.len(), nw, "the keys spread over every worker");
         std::hint::black_box(route);
         println!(
             "route_read_pkset_bench nw={nw:<2} {KEYS} keys {:>6.1} instr/key",

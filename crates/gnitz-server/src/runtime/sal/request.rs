@@ -168,6 +168,12 @@ impl Read<'_> {
     pub(crate) fn name(&self) -> &'static str {
         self.encode().0.kind.variant_name()
     }
+
+    /// The read, owning its bytes.
+    pub(crate) fn keep(&self) -> KeptRead {
+        let (head, blob) = self.encode();
+        KeptRead { head, blob: blob.into() }
+    }
 }
 
 impl<'r> SalRequest<'r> {
@@ -235,14 +241,6 @@ impl<'r> SalRequest<'r> {
 pub(crate) struct KeptRead {
     head: RequestHead,
     blob: Box<[u8]>,
-}
-
-impl Read<'_> {
-    /// The read, owning its bytes.
-    pub(crate) fn keep(&self) -> KeptRead {
-        let (head, blob) = self.encode();
-        KeptRead { head, blob: blob.into() }
-    }
 }
 
 impl KeptRead {

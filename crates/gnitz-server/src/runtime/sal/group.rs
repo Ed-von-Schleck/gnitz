@@ -1,7 +1,7 @@
 //! One group as the writer encodes it: the request its header carries, plus
 //! the rows or blob each worker is sent.
 
-use super::format::{PayloadRows, RequestHead, payload_size};
+use super::format::{RequestHead, payload_size};
 use super::request::{Apply, Ingest, Read};
 use crate::catalog::{SysFamily, SysFamilyExt};
 use crate::runtime::park::WorkerSet;
@@ -24,7 +24,7 @@ pub(crate) enum Routed<'a> {
 pub(super) enum Payloads<'a> {
     /// One payload, which every addressed worker reads: the request's blob, and
     /// any rows, whose shape record that blob then is.
-    Shared(PayloadRows<'a>),
+    Shared(Option<WireRows<'a>>),
     /// Worker `w` is sent the request's blob, which is the rows' shape record,
     /// and the rows `each[w]`; one entry per worker.
     EachRows(&'a [Option<WireRows<'a>>]),
@@ -147,7 +147,7 @@ impl<'a> Group<'a> {
     /// definition — sizing and encoding both go through it, so a payload's size
     /// and its bytes cannot disagree.
     #[inline]
-    pub(super) fn payload(&self, w: usize) -> (&[u8], PayloadRows<'_>) {
+    pub(super) fn payload(&self, w: usize) -> (&[u8], Option<WireRows<'_>>) {
         match self.data {
             Payloads::Shared(rows) => (self.blob, rows),
             Payloads::EachRows(each) => (self.blob, each[w]),

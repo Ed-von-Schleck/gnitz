@@ -42,20 +42,20 @@ use crate::runtime::listen::ClientListener;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Peer, RecvBuf, SendBody, Train};
 use crate::runtime::signals;
-use crate::runtime::sync::{AsyncRwLock, Either, WriteGuard, chan, oneshot, select2};
+use crate::runtime::sync::{AsyncRwLock, Either, chan, oneshot, select2};
 use crate::runtime::tls::{Served, TlsListener};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::{ClientVerb, ControlHeader, Target, WireFault, WireStatus};
 
-/// Park in 1 ms reactor ticks until `ready`, or until `polls` elapse. The shape
-/// every hold-seam needs: it holds no lock while it waits, so the event it waits
-/// for can actually happen, and the bound releases it if that event never comes
-/// instead of wedging the node. It logs when it parks and which way it released,
-/// so a test waits for the park and asserts the release rather than passing on a
-/// hold that never engaged.
-async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() -> bool) {
+/// Park in 1 ms reactor ticks until `ready`, for at most 10 000 ticks: the
+/// shape every fault-injection hold needs. It holds no lock while it waits, so
+/// the event it waits for can actually happen, and the bound releases it if
+/// that event never comes instead of wedging the node. It logs when it parks
+/// and which way it released, so a test waits for the park and asserts the
+/// release rather than passing on a hold that never engaged.
+async fn park_until(shared: &Shared, what: &str, ready: impl Fn() -> bool) {
     gnitz_note!("{}: parked", what);
-    for _ in 0..polls {
+    for _ in 0..10_000 {
         if ready() {
             gnitz_note!("{}: released by its event", what);
             return;
@@ -117,15 +117,6 @@ impl Shared {
     fn cat(&self) -> Ref<'_, CatalogEngine> {
         self.dispatcher.cat()
     }
-
-    /// Drop the per-relation state of a relation whose DROP is durable: every
-    /// per-relation state a drop reclaims is cleared here. Every table lock is
-    /// taken under a catalog read guard, so the write guard proves no task holds
-    /// or awaits the lock being removed.
-    fn forget_relation(&self, _catalog_write: &WriteGuard<CatalogLock>, id: u64) {
-        self.writes.forget(id);
-        self.dispatcher.forget_relation(id);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +133,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     let patient_gap = Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10));
     let (shared, committer_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
 
-    let signals = signals::Signals::open();
+    let mut signals = signals::Signals::open();
     // Past the last env knob the boot reads, so one it refuses stops the
     // server before it reports ready.
     gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
@@ -156,7 +147,20 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     reactor.spawn(tick::tick_loop(shared, patient_gap));
     reactor.spawn(delta::pump(shared, asks));
 
-    serve_until_signalled(shared, tls, signals).await
+    // Until SIGTERM/SIGINT: reload the TLS listener on each SIGHUP.
+    while signals.next(reactor).await == libc::SIGHUP {
+        match tls {
+            None => gnitz_note!("SIGHUP: no TLS listener, nothing to reload"),
+            Some(tls) => match tls.reload() {
+                Ok(()) => gnitz_note!("SIGHUP: reloaded the TLS listener: {}", tls.describe()),
+                Err(e) => gnitz_error!("SIGHUP: the TLS reload failed, the previous setup is still served: {e}"),
+            },
+        }
+    }
+    gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
+    // Closing the committer runs one final checkpoint behind every write it
+    // admitted, which ticks every push no tick has taken yet.
+    shared.committer.close().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,16 +175,15 @@ async fn accept_loop(shared: &'static Shared, listener: ClientListener) {
     loop {
         let accepted = reactor.accept(fd.as_fd()).await;
         let served = tls.map(TlsListener::current);
-        let peer = reactor.connect(accepted, served.as_ref().map(|s| s.session()));
-        reactor.spawn(connection_loop(peer, shared, served));
+        let mut peer = reactor.connect(accepted, served.as_ref().map(|s| s.session()));
+        reactor.spawn(async move {
+            serve_connection(&mut peer, shared, served).await;
+            // The one exit: ship what is corked, a refusal included, then
+            // retire the fd.
+            let _ = peer.flush_egress().await;
+            peer.close().await;
+        });
     }
-}
-
-async fn connection_loop(mut peer: Peer, shared: &'static Shared, served: Option<Rc<Served>>) {
-    serve_connection(&mut peer, shared, served).await;
-    // The one exit: ship what is corked, a refusal included, then retire the fd.
-    let _ = peer.flush_egress().await;
-    peer.close().await;
 }
 
 /// One message is handled to completion before the next is received, so
@@ -224,7 +227,10 @@ async fn serve_connection(peer: &mut Peer, shared: &'static Shared, served: Opti
         let _ = subs.ship(peer).await;
     }
     subs.leave(&shared.feeds, |_| true);
-    snapshot::release_all(shared, snapshots).await;
+    for (id, pin) in snapshots {
+        drop(pin);
+        snapshot::release(shared, id).await;
+    }
 }
 
 /// Answer the client's HELLO, its verdict on the access token it carries; true
@@ -262,33 +268,6 @@ async fn handshake(peer: &mut Peer, served: Option<Rc<Served>>) -> bool {
         gnitz_wire::AuthStatus::Refused
     }));
     admitted
-}
-
-// ---------------------------------------------------------------------------
-// Signal loop: TLS reload and the final checkpoint
-// ---------------------------------------------------------------------------
-
-/// Until SIGTERM/SIGINT, read off `signals`: reload the TLS listener on each
-/// SIGHUP. Then close the committer, which runs one final checkpoint behind
-/// every write it admitted.
-async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>, mut signals: signals::Signals) {
-    loop {
-        match signals.next(shared.dispatcher.reactor()).await {
-            libc::SIGHUP => match tls {
-                None => gnitz_note!("SIGHUP: no TLS listener, nothing to reload"),
-                Some(tls) => match tls.reload() {
-                    Ok(()) => gnitz_note!("SIGHUP: reloaded the TLS listener: {}", tls.describe()),
-                    Err(e) => gnitz_error!("SIGHUP: the TLS reload failed, the previous setup is still served: {e}"),
-                },
-            },
-            _ => {
-                gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
-                // The final checkpoint ticks every push no tick has taken yet.
-                shared.committer.close().await;
-                return;
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

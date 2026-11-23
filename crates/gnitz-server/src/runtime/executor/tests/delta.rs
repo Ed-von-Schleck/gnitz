@@ -3,6 +3,13 @@ use std::io::Read;
 use super::*;
 use crate::runtime::reactor::test_support::make_reactor;
 
+/// `msg`'s framed bytes.
+fn framed(msg: WireMsg<'_>) -> Vec<u8> {
+    let mut out = Vec::new();
+    msg.encode_framed(&mut out);
+    out
+}
+
 /// Trains queued for a connection reach the wire whole and in queue order
 /// behind the reply already corked, and are counted until the connection's
 /// next sync is answered.

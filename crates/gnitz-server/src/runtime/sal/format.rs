@@ -194,9 +194,11 @@ pub(super) fn group_total_size(hdr_len: usize, sizes: impl Iterator<Item = usize
     PREFIX_BYTES + hdr_len + sizes.map(|sz| sz.next_multiple_of(8)).sum::<usize>()
 }
 
-/// A group's directory bytes read back as payload sizes.
-pub(super) fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = usize> {
-    dir.as_chunks::<DIR_ENTRY_BYTES>()
+/// The payload sizes the directory of the header `hdr` holds, in directory
+/// order.
+pub(super) fn payload_sizes(hdr: &[u8]) -> impl Iterator<Item = usize> {
+    hdr[OFF_DIRECTORY..]
+        .as_chunks::<DIR_ENTRY_BYTES>()
         .0
         .iter()
         .map(|c| read_u64_le(c, 0) as usize)
@@ -206,11 +208,6 @@ pub(super) fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = usize> {
 /// ring offset and its epoch, so it verifies only where and when it was published.
 fn group_digest(hdr: &[u8]) -> u64 {
     gnitz_wire::checksum(&hdr[OFF_DIGEST + 8..])
-}
-
-/// The directory of the header `hdr`: one `DIR_ENTRY_BYTES` entry per payload.
-pub(super) fn directory(hdr: &[u8]) -> &[u8] {
-    &hdr[OFF_DIRECTORY..]
 }
 
 /// What a group's author says of it: every header scalar but the ones stamped
@@ -370,12 +367,9 @@ impl Header {
 /// ends 8-aligned within its payload.
 pub(super) const PAYLOAD_HEAD: usize = 8;
 
-/// The rows of a payload to write.
-pub(super) type PayloadRows<'a> = Option<WireRows<'a>>;
-
 /// The size of the payload [`payload_encode`] writes.
 #[inline]
-pub(super) fn payload_size(blob: &[u8], rows: PayloadRows<'_>) -> usize {
+pub(super) fn payload_size(blob: &[u8], rows: Option<WireRows<'_>>) -> usize {
     PAYLOAD_HEAD + blob.len() + rows.map_or(0, |d| d.byte_size())
 }
 
@@ -386,7 +380,7 @@ pub(super) fn payload_size(blob: &[u8], rows: PayloadRows<'_>) -> usize {
 /// Always inlined: the writer encodes through it once per payload, and left to
 /// the inliner's judgement it becomes a call there as its other callers grow.
 #[inline(always)]
-pub(super) fn payload_encode(out: &mut [u8], blob: &[u8], rows: PayloadRows<'_>) {
+pub(super) fn payload_encode(out: &mut [u8], blob: &[u8], rows: Option<WireRows<'_>>) {
     debug_assert!(
         rows.is_none() || !blob.is_empty(),
         "rows need their shape record as the blob"

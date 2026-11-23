@@ -7,7 +7,7 @@
 
 use super::Shared;
 use super::family::{FamilyRows, TxnFamily};
-use super::write::HeldTables;
+use super::write::{HeldTables, Writes};
 use crate::runtime::master::route::with_routed;
 use crate::runtime::sync::{Either, chan, oneshot, select2};
 use gnitz_foundation::gnitz_warn;
@@ -177,7 +177,7 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: &'static
         }
 
         // Before this batch's groups: the checkpoint makes room for them.
-        if shared.dispatcher.sal().needs_checkpoint() {
+        if sal.needs_checkpoint() {
             run_checkpoint_sequence(shared).await;
         }
 
@@ -298,16 +298,15 @@ impl CommitUnit {
         }
     }
 
-    /// The commit LSN of a laid unit: the zone LSN when one of its groups rode
-    /// inside the zone, else `0`.
-    fn lsn(&self, zone_lsn: u64) -> u64 {
-        if matches!(self.outcome, Ok(true)) { zone_lsn } else { 0 }
-    }
-
-    /// Drop every client's table locks and answer it: [`CommitUnit::lsn`] for
-    /// a laid unit, the error for a failed one.
-    fn resolve(self, zone_lsn: u64) {
-        let lsn = self.lsn(zone_lsn);
+    /// Record the unit's families in `writes` — their FK presence caches and
+    /// commit LSNs — then drop every client's table locks and answer it. A laid
+    /// unit's commit LSN is the zone LSN when one of its groups rode inside the
+    /// zone, else `0`; a failed one is answered its error.
+    fn resolve(self, writes: &Writes, zone_lsn: u64) {
+        let lsn = if matches!(self.outcome, Ok(true)) { zone_lsn } else { 0 };
+        for f in self.laid() {
+            writes.committed(f.tid, f.rows.view(), lsn);
+        }
         let result = self.outcome.map(|_| lsn);
         for PendingWrite { held, done, .. } in self.writes {
             drop(held);
@@ -446,11 +445,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     // write is laid out behind this batch, so the fdatasync that covers it
     // covers this batch too.
     for unit in s.units.drain(..) {
-        let lsn = unit.lsn(zone_lsn);
-        for f in unit.laid() {
-            shared.writes.committed(f.tid, f.rows.view(), lsn);
-        }
-        unit.resolve(zone_lsn);
+        unit.resolve(&shared.writes, zone_lsn);
     }
     s.writes
         .extend(again.into_iter().flatten().flat_map(|unit| unit.writes));

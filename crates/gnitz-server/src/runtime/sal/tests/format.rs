@@ -1,7 +1,7 @@
 use super::{
     FLAG_SHARED, FLAG_ZONE, FLAG_ZONE_END, GroupHead, Header, KNOWN_FLAGS, MAX_WORKERS, OFF_ARG0, OFF_BASE, OFF_FLAGS,
-    OFF_KIND, OFF_TARGETS, OFF_WIDTH, PAYLOAD_HEAD, PayloadRows, SalMessageKind, dir_sizes, directory,
-    group_header_size, payload_encode, payload_parse, payload_rows, payload_size,
+    OFF_KIND, OFF_TARGETS, OFF_WIDTH, PAYLOAD_HEAD, SalMessageKind, group_header_size, payload_encode, payload_parse,
+    payload_rows, payload_size, payload_sizes,
 };
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::{assert_fail_stops, group_at, test_log};
@@ -92,7 +92,7 @@ fn every_header_field_round_trips() {
             (base, u32::MAX, 5, 0x0123_4567_89AB_CDEF)
         );
         assert_eq!(
-            dir_sizes(directory(&hdr)).collect::<Vec<_>>(),
+            payload_sizes(&hdr).collect::<Vec<_>>(),
             sizes,
             "every directory entry, the empty payload included"
         );
@@ -276,7 +276,7 @@ fn the_live_path_aborts_on_a_damaged_request_argument_internal() {
 // ---------------------------------------------------------------------------
 
 /// The payload of `blob` and `rows`, encoded over a buffer of other bytes.
-fn payload(blob: &[u8], rows: PayloadRows<'_>) -> Vec<u8> {
+fn payload(blob: &[u8], rows: Option<WireRows<'_>>) -> Vec<u8> {
     let mut out = vec![0xA5; payload_size(blob, rows)];
     payload_encode(&mut out, blob, rows);
     out

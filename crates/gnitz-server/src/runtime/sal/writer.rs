@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 
 use super::durable::Durable;
 use super::format::{
-    GroupHead, Header, PAYLOAD_HEAD, PREFIX_BYTES, PRESENT, SAL_FORMAT, SalMessageKind, anchor_word, dir_sizes,
-    directory, epoch_word, group_header_size, group_total_size, next_epoch, payload_encode, payload_spans,
+    GroupHead, Header, PAYLOAD_HEAD, PREFIX_BYTES, PRESENT, SAL_FORMAT, SalMessageKind, anchor_word, epoch_word,
+    group_header_size, group_total_size, next_epoch, payload_encode, payload_sizes, payload_spans,
 };
 use super::group::{Group, Routed};
 use super::log::{ANCHOR_BYTES, MIN_SAL_BYTES, SalLog};
@@ -365,7 +365,7 @@ impl SalWriter {
         while base < end {
             // SAFETY: as `publish`.
             let hdr = unsafe { self.log.header_mut(base) };
-            let next = base + group_total_size(hdr.len(), dir_sizes(directory(hdr))) as u64;
+            let next = base + group_total_size(hdr.len(), payload_sizes(hdr)) as u64;
             self.publish(base);
             base = next;
         }
@@ -564,7 +564,8 @@ impl<'a> SalExcl<'a> {
         SalScope {
             staged: Staged {
                 end: self.writer.write_cursor.get(),
-                zone: None,
+                zone_last: None,
+                zone_pushes: false,
             },
             in_unit: false,
             refused: None,
@@ -594,21 +595,16 @@ impl Drop for SalExcl<'_> {
     }
 }
 
-/// A scope's open zone.
-#[derive(Clone, Copy)]
-struct OpenZone {
-    /// The base of the latest zoned group.
-    last: u64,
-    /// A zoned group carries a push.
-    pushes: bool,
-}
-
 /// What a scope has laid out and not published.
 #[derive(Clone, Copy)]
 struct Staged {
     /// The end of the scope's latest group: the published end while it has none.
     end: u64,
-    zone: Option<OpenZone>,
+    /// The base of the latest zoned group: the zone's last member. `None` while
+    /// the scope has no zone.
+    zone_last: Option<u64>,
+    /// A zoned group carries a push.
+    zone_pushes: bool,
 }
 
 /// One publication span on the SAL, holding at most one zone: its zoned
@@ -647,8 +643,8 @@ impl SalScope<'_, '_> {
             }
         }
         if zoned {
-            let pushes = g.request.kind == SalMessageKind::Push || self.staged.zone.is_some_and(|z| z.pushes);
-            self.staged.zone = Some(OpenZone { last: base, pushes });
+            self.staged.zone_last = Some(base);
+            self.staged.zone_pushes |= g.request.kind == SalMessageKind::Push;
         }
         Ok(())
     }
@@ -705,28 +701,28 @@ impl SalScope<'_, '_> {
     pub(crate) fn commit(self) -> Option<u64> {
         let w = self.excl.writer;
         let from = w.write_cursor.get();
-        let Staged { end, zone } = self.staged;
+        let Staged { end, zone_last, zone_pushes } = self.staged;
         let lsn = epoch_word(w.epoch.get(), end);
         // A scope that published nothing moves nothing.
         if end > from {
             w.watermark.set(lsn);
         }
-        let closed = match zone {
+        let closed = match zone_last {
             None => {
                 w.publish_range(from, end);
                 None
             }
-            Some(z) => {
-                if z.pushes {
+            Some(last) => {
+                if zone_pushes {
                     w.holds_pushes.set(true);
                 }
                 // SAFETY: as `publish`.
-                Header::set_zone_end(unsafe { w.log.header_mut(z.last) });
-                w.publish_range(from, z.last);
-                if ZONE_PANIC.at(if z.pushes { "commit" } else { "ddl" }) {
+                Header::set_zone_end(unsafe { w.log.header_mut(last) });
+                w.publish_range(from, last);
+                if ZONE_PANIC.at(if zone_pushes { "commit" } else { "ddl" }) {
                     std::process::abort();
                 }
-                w.publish_range(z.last, end);
+                w.publish_range(last, end);
                 Some(lsn)
             }
         };

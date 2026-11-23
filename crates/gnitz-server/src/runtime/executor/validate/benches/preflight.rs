@@ -1,4 +1,3 @@
-use super::super::unique_filter::UniqueFilter;
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::master::fixtures::test_dispatcher;
@@ -62,7 +61,11 @@ fn preflight_probe_bench() {
             let (disp, _) = test_dispatcher(4, engine);
             let checks = Checks::new();
             if unique {
-                checks.unique_filter_seed(tid, PkColList::from_slice(&[1]), UniqueFilter::new());
+                let cols = PkColList::from_slice(&[1]);
+                checks
+                    .unique_filters
+                    .borrow_mut()
+                    .insert((tid, cols), UniqueFilter::default());
             }
             let mut families = vec![TxnFamily::new(
                 tid,
@@ -141,7 +144,7 @@ fn preflight_sink_bench() {
                 panic!("one PK-column probe");
             };
             let ((), sink) = counter.measure(|| {
-                let t = b.get_mut(parent).unwrap();
+                let t = b.table_mut(parent);
                 for f in &frames {
                     fold_pk_reply(&disp, t, &f.as_mem_batch(), &reply, Some(old)).unwrap();
                 }

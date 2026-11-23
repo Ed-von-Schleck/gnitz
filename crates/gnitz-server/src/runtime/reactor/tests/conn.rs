@@ -30,7 +30,7 @@ fn registered(r: Reactor) -> (Rc<ClientConn>, UnixStream) {
 /// [`registered`], past its handshake: admitting frames up to the payload ceiling.
 fn admitted(r: Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (conn, partner) = registered(r);
-    conn.q.borrow_mut().admit_full_frames();
+    conn.q.borrow_mut().max_frame = MAX_FRAME_PAYLOAD;
     (conn, partner)
 }
 
@@ -87,7 +87,7 @@ pub(super) type Deframed = (Vec<Vec<u8>>, Option<RecvEnd>);
 pub(super) fn deframe(stream: &[u8], step: usize, admitted: bool, cap: usize) -> Deframed {
     let mut q = FrameSink::new(Budget::new(cap));
     if admitted {
-        q.admit_full_frames();
+        q.max_frame = MAX_FRAME_PAYLOAD;
     }
     let mut deframer = Deframer::default();
     let mut frames = Vec::new();
@@ -309,7 +309,7 @@ fn a_frame_past_the_share_is_received_whole() {
                 Ok(n) => written += n,
                 Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
             }
-            got = conn.try_recv();
+            got = conn.q.borrow_mut().try_recv();
             got.is_some()
         }),
         "the frame never completes"

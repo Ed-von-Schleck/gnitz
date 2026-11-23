@@ -130,11 +130,10 @@ impl<'d> ScanCut<'d> {
     /// own key set when the bound splits one, under the cut's reply id. A
     /// refused read is not one of the lease's.
     pub(crate) fn read(&mut self, read: Read<'_>) -> Result<(), WireFault> {
-        let route = route::route_read(&read, &self.disp.cat().registry, self.disp.sal.num_workers());
+        let (set, per_worker) = route::route_read(&read, &self.disp.cat().registry, self.disp.sal.num_workers());
         let what = read.name();
-        self.excl
-            .read(read, route.set, route.per_worker.as_deref(), self.lease.id())?;
-        self.lease.add(route.set, what);
+        self.excl.read(read, set, per_worker.as_deref(), self.lease.id())?;
+        self.lease.add(set, what);
         Ok(())
     }
 

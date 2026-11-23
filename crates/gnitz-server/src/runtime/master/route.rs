@@ -56,17 +56,11 @@ pub(crate) fn with_routed<R>(
     })
 }
 
-/// Which workers answer a read, and what each is sent: `per_worker[w]` replaces
-/// the request's blob for worker `w` when present.
-pub(super) struct ReadRoute {
-    pub(super) set: WorkerSet,
-    pub(super) per_worker: Option<Vec<Vec<u8>>>,
-}
-
-/// Which workers answer `read`, and what each is sent: a read of no live
+/// Which workers answer `read`, and what each is sent: `per_worker[w]`, when
+/// present, replaces the request's blob for worker `w`. A read of no live
 /// relation's rows goes to every worker, any other by its relation's placement.
-pub(super) fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize) -> ReadRoute {
-    let whole = |set| ReadRoute { set, per_worker: None };
+pub(super) fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize) -> (WorkerSet, Option<Vec<Vec<u8>>>) {
+    let whole = |set| (set, None);
     // `own_pk`: a probe of the relation's own PK store, which every worker holds
     // whole for a replicated relation, so it spreads over all of them by the full key.
     let (tid, bound, own_pk) = match read {
@@ -110,10 +104,7 @@ pub(super) fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize
             match set.len() {
                 0 => whole(WorkerSet::one(0)),
                 1 => whole(set),
-                _ => ReadRoute {
-                    set,
-                    per_worker: Some(s.split(&owners, nw)),
-                },
+                _ => (set, Some(s.split(&owners, nw))),
             }
         }
         _ => whole(WorkerSet::ALL),

@@ -16,9 +16,6 @@ use gnitz_wire::WireFault;
 /// provably lands mid-tick. One-shot.
 static TICK_HOLD_FOR_DDL: Switch = Switch::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
 
-/// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
-const TICK_HOLD_MAX_POLLS: u32 = 10_000;
-
 /// One tick of everything pending per batch of the dispatcher's tick requests.
 /// A batch is ticked once its first request is due, or `patient_gap` after the
 /// loop's last tick where that is sooner. `patient_gap`
@@ -47,7 +44,7 @@ pub(super) async fn tick_loop(shared: &'static Shared, patient_gap: Duration) {
             Err(e) => gnitz_warn!("tick error: {}", e),
             Ok(Some(wait)) => {
                 if TICK_HOLD_FOR_DDL.take_once() {
-                    park_until(shared, TICK_HOLD_MAX_POLLS, "tick hold", || ticking.contended()).await;
+                    park_until(shared, "tick hold", || ticking.contended()).await;
                 }
                 wait.await;
             }

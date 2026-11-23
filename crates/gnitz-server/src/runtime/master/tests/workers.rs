@@ -37,7 +37,7 @@ fn death_names_the_dead_worker_without_reaping_it() {
     let dead = NonZero::new(unsafe { fork_child(|| libc::_exit(3)) }).unwrap();
     within(move || {
         let reactor = make_reactor();
-        let workers = Workers::new(vec![live, dead]);
+        let workers = Workers(vec![live, dead]);
         assert_eq!(reactor.block_on(workers.death(reactor)), (1, WorkerEnd::Exited(3)));
         assert_eq!(
             reactor.block_on(workers.death(reactor)),
@@ -54,9 +54,7 @@ fn death_names_the_dead_worker_without_reaping_it() {
 #[test]
 fn death_names_the_signal_that_killed_a_worker() {
     let killed = spawn_live();
-    let mut workers = Workers::new(Vec::new());
-    workers.push(spawn_live());
-    workers.push(killed);
+    let workers = Workers(vec![spawn_live(), killed]);
     unsafe { libc::kill(killed.get(), libc::SIGKILL) };
     within(move || {
         let reactor = make_reactor();

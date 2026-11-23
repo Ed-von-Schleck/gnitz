@@ -243,18 +243,13 @@ impl FrameSink {
         Ok(())
     }
 
-    /// Admit frames up to [`MAX_FRAME_PAYLOAD`]: the handshake admitted the
-    /// client, which until then sends no frame past [`HANDSHAKE_FRAME_MAX`].
-    fn admit_full_frames(&mut self) {
-        self.max_frame = MAX_FRAME_PAYLOAD;
-    }
-
     /// Take a completed frame without parking.
     fn try_recv(&mut self) -> Option<RecvBuf> {
         self.frames.pop().inspect(|f| self.held -= f.charge.weight)
     }
 
-    /// [`WakeQueue::poll`], counting the frame taken out of [`Self::held`].
+    /// Hand the next frame to the awaiter, `None` once the recv side has ended
+    /// and is drained, or park it.
     fn poll(&mut self, cx: &Context<'_>) -> Poll<Option<RecvBuf>> {
         self.frames.poll_ready(cx).map(|()| self.try_recv())
     }
@@ -345,12 +340,6 @@ impl ClientConn {
     /// Whether [`Self::readable`] would resolve at once.
     fn is_readable(&self) -> bool {
         self.q.borrow().frames.is_ready()
-    }
-
-    /// The next already-deframed frame without parking. `None` means nothing is
-    /// queued right now, not that the peer is gone.
-    fn try_recv(&self) -> Option<RecvBuf> {
-        self.q.borrow_mut().try_recv()
     }
 }
 
@@ -787,9 +776,10 @@ impl Peer {
         &self.reactor.conns.spans
     }
 
-    /// See [`FrameSink::admit_full_frames`].
+    /// Admit frames up to [`MAX_FRAME_PAYLOAD`]: the handshake admitted the
+    /// client, which until then sends no frame past [`HANDSHAKE_FRAME_MAX`].
     pub(crate) fn admit_full_frames(&self) {
-        self.conn.q.borrow_mut().admit_full_frames();
+        self.conn.q.borrow_mut().max_frame = MAX_FRAME_PAYLOAD;
     }
 
     /// The client's TCP address; `None` on the AF_UNIX socket.
@@ -806,7 +796,7 @@ impl Peer {
         self.flush_if_full().await.ok()?;
         // Not `is_readable`: a client that closed its sending side is readable,
         // and is still owed what is corked.
-        if let Some(buf) = self.conn.try_recv() {
+        if let Some(buf) = self.conn.q.borrow_mut().try_recv() {
             return Some(buf);
         }
         self.flush_egress().await.ok()?;

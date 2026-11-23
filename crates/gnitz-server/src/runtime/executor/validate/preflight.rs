@@ -11,28 +11,273 @@
 //! - **F1**: a child's reference exists after the write.
 //! - **F2**: a removed referenced value has no surviving referrer.
 //!
-//! Validating a write also completes it: the rows its
-//! deletes reach through `ON DELETE CASCADE` edges join the bundle as families
-//! of their own, under the same rules.
+//! Every rule reads the write folded per table and key ([`TxnBundle`]).
+//! Validating a write also completes it: the rows its deletes reach through
+//! `ON DELETE CASCADE` edges join the bundle as families of their own, under
+//! the same rules.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
 use std::num::NonZeroU64;
 
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
-use super::bundle::{FoldOp, PkFold, TxnBundle, TxnTable};
-use super::violation::{Clash, pk_violation_err, unique_violation_err};
 use super::*;
 
 use crate::catalog::FkEdge;
 use crate::runtime::executor::family::{FamilyRows, TxnFamily};
 use gnitz_expr::ColumnLocator;
 use gnitz_store::relation::{PkRule, Relation};
-use gnitz_wire::{FkAction, PkBuf, PkKeys, WireConflictMode};
+use gnitz_wire::{ColType, FkAction, PkBuf, PkKeys, ValueText, WireConflictMode, decode_opk_u128};
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::schema::{SchemaDescriptor, pk_keys, pk_keys_of_images};
+
+/// Per-PK last operation in a table's whole-bundle fold. `Inserted` names the
+/// surviving row by `(family index into the bundle's family list, row index)`.
+#[derive(Clone, Copy)]
+enum FoldOp {
+    Inserted(u32, u32),
+    Deleted,
+}
+
+/// One PK's fold over its table's families, in frame order.
+struct PkFold {
+    /// The latest row op on the PK; once the bundle is folded, the op that survives.
+    last: FoldOp,
+    /// An Error family's insert was the first op on the PK.
+    needs_probe: bool,
+    /// A burst-1 probe found the PK committed.
+    committed: bool,
+}
+
+/// One table of the bundle a rule reads: its catalog schema and its fold. Its
+/// constraints are read from the catalog, whose read guard the write holds.
+struct TxnTable<'a> {
+    tid: u64,
+    schema: SchemaDescriptor,
+    /// The fold, keyed by the row's OPK bytes.
+    fold: FxHashMap<&'a [u8], PkFold>,
+    /// The keys whose first op is an Error family's insert, in row order: a
+    /// client's ascending keys reach the probe's sort ascending.
+    probe_keys: Vec<&'a [u8]>,
+    /// The table's families, in bundle order.
+    fams: SmallVec<[u32; 1]>,
+    /// Whether some PK is touched by two nonzero-weight rows. Where none is, the
+    /// surviving rows are exactly the positive-weight ones.
+    repeats: bool,
+    /// Every family of the table is an Error family of positive weights. Once
+    /// the bundle is admitted, its families hold to [`PkRule::Fresh`]:
+    /// validation refused a key two of them insert, one inserts at a weight
+    /// above 1, or the store holds; and an Error family reads committed state,
+    /// so its write holds its tables' exclusive locks from that probe until the
+    /// committer lays it out, which keeps every other write off the table in
+    /// between. So each key is distinct, weighs 1, and is absent from the store
+    /// each family lands on, behind the families before it.
+    fresh: bool,
+}
+
+/// A decoded transaction bundle plus everything its rules share. Built once;
+/// every rule reads it instead of re-walking the families.
+struct TxnBundle<'a> {
+    /// The rows of the bundle's families, indexed by family number. A push's
+    /// one family is held inline.
+    mems: SmallVec<[MemBatch<'a>; 1]>,
+    /// The tables with an Error family or a constraint, in first-appearance
+    /// order, found by linear scan over the write's own table count.
+    tables: Vec<TxnTable<'a>>,
+}
+
+impl<'a> TxnBundle<'a> {
+    fn new(cat: &CatalogEngine, families: &'a [TxnFamily]) -> Result<Self, WireFault> {
+        // Each table in the order of its first family, with every family of
+        // it; judged by whether any of them reads committed state.
+        let mut all: Vec<(u64, bool, SmallVec<[u32; 1]>)> = Vec::new();
+        for (fi, fam) in families.iter().enumerate() {
+            let reads = cat.push_reads_committed_state(fam.tid, fam.mode);
+            match all.iter_mut().find(|(tid, ..)| *tid == fam.tid) {
+                Some((_, any, fams)) => {
+                    *any |= reads;
+                    fams.push(fi as u32);
+                }
+                None => all.push((fam.tid, reads, smallvec::smallvec![fi as u32])),
+            }
+        }
+        let mut tables: Vec<TxnTable<'a>> = Vec::new();
+        for (tid, reads, fams) in all {
+            if reads {
+                let rel = cat.registry.relation_or_err(tid)?;
+                tables.push(TxnTable {
+                    tid,
+                    schema: rel.schema(),
+                    fold: FxHashMap::default(),
+                    probe_keys: Vec::new(),
+                    fams,
+                    repeats: false,
+                    fresh: true,
+                });
+            }
+        }
+        let mems: SmallVec<[MemBatch<'a>; 1]> = families.iter().map(|f| f.rows.view()).collect();
+        for t in &mut tables {
+            let (tid, schema) = (t.tid, t.schema);
+            for at in 0..t.fams.len() {
+                let fi = t.fams[at] as usize;
+                let mode = families[fi].mode;
+                let error = matches!(mode, WireConflictMode::Error);
+                let batch = mems[fi];
+                t.fold.reserve(batch.len());
+                if error {
+                    t.probe_keys.reserve(batch.len());
+                }
+                t.fresh &= error && batch.all_weights_positive();
+                for row in 0..batch.len() {
+                    let w = batch.get_weight(row);
+                    if w == 0 {
+                        continue;
+                    }
+                    let pk = batch.get_pk_bytes(row);
+                    let op = if w > 0 {
+                        FoldOp::Inserted(fi as u32, row as u32)
+                    } else {
+                        FoldOp::Deleted
+                    };
+                    let inserts = error && w > 0;
+                    match t.fold.entry(pk) {
+                        Entry::Occupied(o) => {
+                            t.repeats = true;
+                            let e = o.into_mut();
+                            // A key inserted twice within one run, the consecutive
+                            // families of one table and conflict mode, is a duplicate
+                            // in the batch: a run is one batch of the write, which a
+                            // client cuts into several families to spread it over
+                            // several frames. Across runs existence is cumulative in
+                            // frame order, and a cascade's families come later and
+                            // only delete.
+                            if inserts && let FoldOp::Inserted(f, _) = e.last {
+                                let one_run = families[f as usize..fi].iter().all(|p| p.tid == tid && p.mode == mode);
+                                let clash = if one_run { Clash::InBatch } else { Clash::Committed };
+                                return Err(pk_violation_err(cat, tid, &schema, pk, clash));
+                            }
+                            e.last = op;
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(PkFold {
+                                last: op,
+                                needs_probe: inserts,
+                                committed: false,
+                            });
+                            if inserts {
+                                t.probe_keys.push(pk);
+                            }
+                        }
+                    }
+                    // `+w` is the row pushed `w` times: its second copy lands on its first.
+                    if inserts && w > 1 {
+                        return Err(pk_violation_err(cat, tid, &schema, pk, Clash::InBatch));
+                    }
+                }
+            }
+        }
+        Ok(TxnBundle { mems, tables })
+    }
+
+    fn get(&self, tid: u64) -> Option<&TxnTable<'a>> {
+        self.tables.iter().find(|t| t.tid == tid)
+    }
+
+    fn table(&self, tid: u64) -> &TxnTable<'a> {
+        self.get(tid).expect("a bundled table")
+    }
+
+    fn table_mut(&mut self, tid: u64) -> &mut TxnTable<'a> {
+        self.tables.iter_mut().find(|t| t.tid == tid).expect("a bundled table")
+    }
+
+    /// Family `fam`'s rows.
+    fn mem(&self, fam: u32) -> &MemBatch<'a> {
+        &self.mems[fam as usize]
+    }
+
+    /// The rows of `tid` that survive the whole bundle: `(pk, family, row)`.
+    fn surviving(&self, tid: u64) -> impl Iterator<Item = (&'a [u8], u32, u32)> {
+        self.table(tid).fold.iter().filter_map(|(pk, e)| match e.last {
+            FoldOp::Inserted(f, r) => Some((*pk, f, r)),
+            FoldOp::Deleted => None,
+        })
+    }
+}
+
+/// What a key collided with.
+#[derive(Clone, Copy)]
+enum Clash {
+    /// Another row of the same write.
+    InBatch,
+    /// A committed row.
+    Committed,
+}
+
+/// A PK rendered from its OPK bytes for an error message: the per-column values
+/// in PK-list order, comma-separated, each as a client prints it. `scales` are
+/// the PK columns' DECIMAL scales, which only the catalog carries: a column
+/// past them renders at scale 0, as the integer it is stored as.
+fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8], scales: &[u8]) -> String {
+    let mut off = 0usize;
+    schema
+        .pk_columns()
+        .enumerate()
+        .map(|(i, col)| {
+            let cell = &pk_bytes[off..off + col.size()];
+            off += cell.len();
+            let ty = ColType {
+                tc: col.type_code,
+                scale: scales.get(i).copied().unwrap_or(0),
+            };
+            ValueText(ty, decode_opk_u128(cell, ty.tc)).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The PG-style PK-uniqueness rejection for the key `pk_bytes` of `schema`.
+fn pk_violation_err(
+    cat: &CatalogEngine,
+    tid: u64,
+    schema: &SchemaDescriptor,
+    pk_bytes: &[u8],
+    clash: Clash,
+) -> WireFault {
+    let key_str = format_pk_bytes(schema, pk_bytes, &cat.column_scales(tid, schema.pk_cols()));
+    let (sn, tn) = cat.qualified_name_or_unknown(tid);
+    let cols = cat.column_names(tid, schema.pk_cols());
+    let what = match clash {
+        Clash::InBatch => format!("Batch contains multiple rows with key ({cols})=({key_str})"),
+        Clash::Committed => format!("Key ({cols})=({key_str}) already exists"),
+    };
+    integrity_violation(format!(
+        "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": {what}"
+    ))
+}
+
+/// The rejection of a write colliding on the unique index over `col_indices`.
+fn unique_violation_err(cat: &CatalogEngine, tid: u64, col_indices: &[u32], clash: Clash) -> WireFault {
+    let (name, cols) = (cat.qualified_name(tid), cat.column_names(tid, col_indices));
+    let text = match clash {
+        Clash::InBatch => format!("Unique index violation on '{name}' column '{cols}': duplicate in batch"),
+        Clash::Committed => format!("Unique index violation on '{name}' column '{cols}'"),
+    };
+    integrity_violation(text)
+}
+
+/// The fingerprints of the spans a write's surviving rows hold in the unique
+/// index on `cols` of `tid`, taken where its filter proved one of them absent:
+/// what the filter holds once the write is admitted.
+struct SpanClaim {
+    tid: u64,
+    cols: PkColList,
+    fps: Vec<u64>,
+}
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
 /// `plan` its replies fold into.
@@ -82,11 +327,6 @@ struct ParentDelta {
 /// `(parent tid, referenced col)` → its delta. Resolved once per key and shared
 /// by rules F1 and F2, which both turn on it.
 type ParentDeltas = FxHashMap<(u64, usize), ParentDelta>;
-
-/// The [`ParentDeltas`] key `e`'s referenced value lives under.
-fn delta_key(e: &FkEdge) -> (u64, usize) {
-    (e.parent_tid, e.parent_col)
-}
 
 /// What a burst-1 check's reply rows are folded into.
 enum Rule<'a> {
@@ -155,104 +395,143 @@ impl Checks {
             budget: self.cascade_bytes,
             probed: FxHashSet::default(),
         };
-        // A pass that finds further rows to delete gives no verdict: the rules
-        // hold of the bundle those rows are part of.
+        // Each pass applies the four rules to `families`. A pass whose deletes
+        // cascade to rows outside them gives no verdict: it appends those rows'
+        // families, and the rules hold of the bundle they are part of.
         loop {
-            let further = self.validate_bundle(disp, families, &mut cascade).await?;
-            if further.is_empty() {
-                mark_fresh(families);
-                return Ok(());
-            }
-            families.extend(further);
-        }
-    }
+            let mut b = TxnBundle::new(&disp.cat(), families)?;
 
-    /// The four rules over `families` — or, where their deletes cascade to rows
-    /// outside them, those rows' families and no verdict.
-    async fn validate_bundle(
-        &self,
-        disp: &MasterDispatcher,
-        families: &[TxnFamily],
-        cascade: &mut Cascade,
-    ) -> Result<Vec<TxnFamily>, WireFault> {
-        let mut b = TxnBundle::new(&disp.cat(), families)?;
-
-        for t in &b.tables {
-            if !t.cons.uniques.is_empty() && b.surviving(t.tid).next().is_some() {
-                self.ensure_unique_filters_warm(disp, t.tid, &t.cons.uniques).await?;
-            }
-        }
-
-        // ── Burst 1: every probe the bundle and the catalog alone decide ──
-        // U-SEC's first violation is held until its turn in the verdict order.
-        let mut unique_violation: Option<WireFault> = None;
-        let mut checks: Vec<Check<Rule>> = Vec::new();
-        let mut claims: Vec<SpanClaim> = Vec::new();
-        {
-            let cat = disp.cat();
-            // U-PK's checks go first: its sink refuses before any other rule's
-            // reply is read.
-            plan_pk_checks(&cat, &b, &mut checks)?;
-            plan_unique_checks(&cat, self, &b, &mut checks, &mut claims, &mut unique_violation)?;
-            plan_fk_existence(&cat, self, &b, &mut checks)?;
-        }
-
-        execute_probe_burst(disp, &mut checks, |check, rows| {
-            let Check { tid, probe, reply, plan, .. } = check;
-            let mut answered = answered(rows);
-            match plan {
-                Rule::Pk => fold_pk_reply(disp, b.get_mut(*tid).expect("a bundled table"), rows, reply, None)?,
-                Rule::Gather { old, .. } => {
-                    fold_pk_reply(disp, b.get_mut(*tid).expect("a bundled table"), rows, reply, Some(old))?
-                }
-                // The in-bundle duplicate check left each span one claimant, so
-                // a holder that is a fold key is that claimant or gave the span up.
-                Rule::Unique { cols, spec } => {
-                    let fold = &b.table(*tid).fold;
-                    if unique_violation.is_none() && answered.any(|(_, e)| !fold.contains_key(spec.split_entry(e).1)) {
-                        let err = unique_violation_err(&disp.cat(), *tid, cols.as_slice(), Clash::Committed);
-                        unique_violation = Some(err);
+            // Build the filter of each unique index a surviving row may claim a
+            // span of that has none, or whose filter churned, from the spans
+            // the workers' index stores hold. A churned filter is rebuilt under
+            // half the cap, so the scan of at most half the cap is paid once per
+            // at least half the cap of spans admitted after it. A filter that
+            // caps while it is built stays capped for the boot.
+            let mut warm: Vec<(u64, PkColList, SchemaDescriptor, usize)> = Vec::new();
+            {
+                let (cat, filters) = (disp.cat(), self.unique_filters.borrow());
+                for t in b.tables.iter().filter(|t| b.surviving(t.tid).next().is_some()) {
+                    for ic in cat.registry.relation_or_err(t.tid)?.unique_indexes_to_check() {
+                        let cap = match filters.get(&(t.tid, ic.cols())) {
+                            None => self.unique_filter_cap,
+                            Some(UniqueFilter::Churned) => self.unique_filter_cap / 2,
+                            Some(_) => continue,
+                        };
+                        warm.push((t.tid, ic.cols(), ic.key_spec().span_schema(), cap));
                     }
                 }
-                Rule::FkExists { span, values, .. } => {
-                    for (_, e) in answered {
-                        let v = gnitz_wire::widen_pk_be(&e[..*span]);
-                        if let Some(found) = values.get_mut(&v) {
-                            *found = true;
-                            if matches!(probe, Probe::Pk) {
-                                self.fk_presence_found(*tid, v);
+            }
+            for (tid, cols, span_schema, cap) in warm {
+                let mut lease = disp.scan(Read::KeySpans { tid, cols, claim: false }).await?;
+                let train = lease.next_train().await;
+                let mut filter = UniqueFilter::default();
+                // A capped filter reads no further; the lease drop discards the rest.
+                while let Some(frame) = train.next().await? {
+                    let spans = frame.rows(&span_schema).pk().chunks_exact(span_schema.pk_stride());
+                    if !filter.insert_all(spans.map(probe_key), cap) {
+                        break;
+                    }
+                }
+                self.unique_filters.borrow_mut().insert((tid, cols), filter);
+            }
+
+            // ── Burst 1: every probe the bundle and the catalog alone decide ──
+            // U-SEC's first violation is held until its turn in the verdict order.
+            let mut unique_violation: Option<WireFault> = None;
+            let mut checks: Vec<Check<Rule>> = Vec::new();
+            let mut claims: Vec<SpanClaim> = Vec::new();
+            {
+                let cat = disp.cat();
+                // U-PK's checks go first: its sink refuses before any other rule's
+                // reply is read.
+                plan_pk_checks(&cat, &b, &mut checks)?;
+                plan_unique_checks(&cat, self, &b, &mut checks, &mut claims, &mut unique_violation)?;
+                plan_fk_existence(&cat, self, &b, &mut checks)?;
+            }
+
+            execute_probe_burst(disp, &mut checks, |check, rows| {
+                let Check { tid, probe, reply, plan, .. } = check;
+                let mut answered = answered(rows);
+                match plan {
+                    Rule::Pk => fold_pk_reply(disp, b.table_mut(*tid), rows, reply, None)?,
+                    Rule::Gather { old, .. } => fold_pk_reply(disp, b.table_mut(*tid), rows, reply, Some(old))?,
+                    // The in-bundle duplicate check left each span one claimant, so
+                    // a holder that is a fold key is that claimant or gave the span up.
+                    Rule::Unique { cols, spec } => {
+                        let fold = &b.table(*tid).fold;
+                        if unique_violation.is_none()
+                            && answered.any(|(_, e)| !fold.contains_key(spec.split_entry(e).1))
+                        {
+                            let err = unique_violation_err(&disp.cat(), *tid, cols.as_slice(), Clash::Committed);
+                            unique_violation = Some(err);
+                        }
+                    }
+                    Rule::FkExists { span, values, .. } => {
+                        for (_, e) in answered {
+                            let v = gnitz_wire::widen_pk_be(&e[..*span]);
+                            if let Some(found) = values.get_mut(&v) {
+                                *found = true;
+                                if matches!(probe, Probe::Pk) {
+                                    let mut caches = self.fk_presence.borrow_mut();
+                                    record_present(caches.entry(*tid).or_default(), self.fk_presence_cap, v);
+                                }
                             }
                         }
                     }
                 }
+                Ok(())
+            })
+            .await?;
+
+            // ── Burst 2: every FK whose parent is bundled, keyed by the deltas ──
+            let children: Vec<FkEdge> = {
+                let cat = disp.cat();
+                b.tables
+                    .iter()
+                    .flat_map(|t| cat.fks_as_parent(t.tid).iter().copied())
+                    .collect()
+            };
+            let deltas = resolve_parent_deltas(&b, &checks, &children);
+            let (further, restricted) = removed_references(disp, &b, &children, &deltas, &mut cascade).await?;
+            if !further.is_empty() {
+                drop(b);
+                families.extend(further);
+                continue;
             }
-            Ok(())
-        })
-        .await?;
 
-        // ── Burst 2: every FK whose parent is bundled, keyed by the deltas ──
-        let children: Vec<FkEdge> = b
-            .tables
-            .iter()
-            .flat_map(|t| t.cons.fks_as_parent.iter().copied())
-            .collect();
-        let deltas = resolve_parent_deltas(&b, &checks, &children);
-        let (further, restricted) = removed_references(disp, &b, &children, &deltas, cascade).await?;
-        if !further.is_empty() {
-            return Ok(further);
+            if let Some(e) = unique_violation {
+                return Err(e);
+            }
+            fk_existence_verdict(&disp.cat(), &checks, &deltas)?;
+            if let Some(e) = restricted {
+                return Err(e);
+            }
+            // Record the spans of the admitted write: a refused one commits
+            // none, and a pass with further rows to delete is validated again.
+            // Per PK, the row validation finds surviving is the row the store
+            // keeps, so a filter holds every span a committed row holds; it
+            // holds more after a delete, and after a write its committer fails.
+            // A claim that caps its filter marks it churned.
+            //
+            // No filter is built or dropped between a write's validation and
+            // its commit: a warm scan runs under the table's write guard, which
+            // the write holds until it is laid out, and a DDL removes a filter
+            // under the catalog write guard, which the write's read guard keeps
+            // out. So the filter each claim was taken against is still there.
+            let mut filters = self.unique_filters.borrow_mut();
+            for c in claims {
+                let filter = filters.get_mut(&(c.tid, c.cols)).expect("a claim's filter stays");
+                if !filter.insert_all(c.fps, self.unique_filter_cap) {
+                    *filter = UniqueFilter::Churned;
+                }
+            }
+            let fresh: SmallVec<[u64; 4]> = b.tables.iter().filter(|t| t.fresh).map(|t| t.tid).collect();
+            drop(b);
+            for f in families.iter_mut().filter(|f| fresh.contains(&f.tid)) {
+                f.pk_rule = PkRule::Fresh;
+            }
+            return Ok(());
         }
-
-        if let Some(e) = unique_violation {
-            return Err(e);
-        }
-        fk_existence_verdict(&disp.cat(), &checks, &deltas)?;
-        if let Some(e) = restricted {
-            return Err(e);
-        }
-        // Only an admitted bundle's spans: a refused one commits none, and a
-        // pass with further rows to delete is validated again.
-        self.unique_filters_admit(&claims);
-        Ok(Vec::new())
     }
 }
 
@@ -305,7 +584,7 @@ fn plan_pk_checks<'a>(
     for t in &b.tables {
         let rel = cat.registry.relation_or_err(t.tid)?;
         let stride = t.schema.pk_stride();
-        let parent_cols = || t.cons.fks_as_parent.iter().map(|e| e.parent_col);
+        let parent_cols = || cat.fks_as_parent(t.tid).iter().map(|e| e.parent_col);
         let mut payload_refs: Vec<usize> = parent_cols().filter(|&c| !t.schema.is_pk_col(c)).collect();
         payload_refs.sort_unstable();
         payload_refs.dedup();
@@ -358,7 +637,9 @@ fn plan_unique_checks<'a>(
 ) -> Result<(), WireFault> {
     for t in &b.tables {
         let tid = t.tid;
-        for &(col_indices, ref spec) in &t.cons.uniques {
+        let rel = cat.registry.relation_or_err(tid)?;
+        for ic in rel.unique_indexes_to_check() {
+            let (col_indices, spec) = (ic.cols(), ic.key_spec());
             let key_size = spec.key_size();
 
             // NULL in an indexed column ⇒ unindexed. Where every PK is touched
@@ -387,14 +668,22 @@ fn plan_unique_checks<'a>(
             }
 
             // A span the filter proves absent has no committed holder to answer
-            // for, and is one the filter takes if the write is admitted.
-            if caches.unique_filter_retain_possible(tid, col_indices, &mut keys) {
-                claims.push(SpanClaim { tid, cols: col_indices, key_size, spans });
+            // for, and is one the filter takes if the write is admitted. An
+            // index with no filter probes every span.
+            if let Some(filter) = caches.unique_filters.borrow().get(&(tid, col_indices)) {
+                let mut fps = Vec::with_capacity(keys.len());
+                keys.retain(|k| {
+                    let fp = probe_key(k);
+                    fps.push(fp);
+                    filter.may_contain(fp)
+                });
+                if keys.len() != fps.len() {
+                    claims.push(SpanClaim { tid, cols: col_indices, fps });
+                }
             }
             if keys.is_empty() {
                 continue;
             }
-            let rel = cat.registry.relation_or_err(tid)?;
             let plan = Rule::Unique { cols: col_indices, spec: spec.clone() };
             checks.push(Check::new(rel, Probe::Index(col_indices, NonZeroU64::MAX), keys, plan)?);
         }
@@ -412,7 +701,7 @@ fn plan_fk_existence<'a>(
     b: &TxnBundle<'a>,
     checks: &mut Vec<Check<Rule<'a>>>,
 ) -> Result<(), WireFault> {
-    for &edge in b.tables.iter().flat_map(|t| &t.cons.fks_as_child) {
+    for &edge in b.tables.iter().flat_map(|t| cat.fks_as_child(t.tid)) {
         let FkEdge {
             child_tid: tid,
             parent_tid,
@@ -452,7 +741,8 @@ fn plan_fk_existence<'a>(
             // The reference is the parent's whole key, so a key the bundle writes
             // is decided by the bundle and any other by whether it is committed.
             let fold = b.get(parent_tid).map(|t| &t.fold);
-            let cache = caches.fk_presence_of(parent_tid);
+            let presence = caches.fk_presence.borrow();
+            let cache = presence.get(&parent_tid);
             let mut key = [0u8; 16];
             values.retain(|&v, _| {
                 gnitz_wire::store_opk(&mut key[..span], v);
@@ -461,7 +751,7 @@ fn plan_fk_existence<'a>(
                     Some(FoldOp::Inserted(..)) => false,
                     // The parent's delta retires it: kept for the verdict to refuse.
                     Some(FoldOp::Deleted) => true,
-                    None => !cache.as_ref().is_some_and(|c| c.holds(v)),
+                    None => !cache.is_some_and(|c| c.contains(&v)),
                 }
             });
             if values.is_empty() {
@@ -487,7 +777,7 @@ fn fk_existence_verdict(
         let Rule::FkExists { edge, values, .. } = &check.plan else {
             continue;
         };
-        let ParentDelta { retired, added } = deltas.get(&delta_key(edge)).unwrap_or(&no_delta);
+        let ParentDelta { retired, added } = deltas.get(&(edge.parent_tid, edge.parent_col)).unwrap_or(&no_delta);
         for (v, &in_committed) in values {
             if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                 continue;
@@ -505,7 +795,7 @@ fn fk_existence_verdict(
 /// The [`ParentDelta`] of each referenced column rules F1 and F2 turn on,
 /// one per `(parent tid, referenced col)` of `children`.
 fn resolve_parent_deltas(b: &TxnBundle<'_>, checks: &[Check<Rule<'_>>], children: &[FkEdge]) -> ParentDeltas {
-    let mut needed: Vec<(u64, usize)> = children.iter().map(delta_key).collect();
+    let mut needed: Vec<(u64, usize)> = children.iter().map(|e| (e.parent_tid, e.parent_col)).collect();
     needed.sort_unstable();
     needed.dedup();
 
@@ -641,7 +931,7 @@ async fn removed_references(
     // `(edge, cascades, values)`: one probe each.
     let mut seeds: Vec<(FkEdge, bool, Vec<u128>)> = Vec::new();
     for &edge in children {
-        let ParentDelta { retired, added } = &deltas[&delta_key(&edge)];
+        let ParentDelta { retired, added } = &deltas[&(edge.parent_tid, edge.parent_col)];
         let (mut deleted, mut restricted) = (Vec::new(), Vec::new());
         for (&v, verb) in retired.iter().filter(|(v, _)| !added.contains(v)) {
             let cascades = edge.on_delete == FkAction::Cascade && matches!(verb, RetireVerb::Delete);
@@ -658,7 +948,7 @@ async fn removed_references(
                 // A key member's value a surviving row of the bundle holds has not
                 // left. A found row's whole key leaves with the row, so it is asked
                 // about at once.
-                if let Some(d) = deltas.get(&delta_key(edge)) {
+                if let Some(d) = deltas.get(&(edge.parent_tid, edge.parent_col)) {
                     values.retain(|v| !d.added.contains(v));
                 }
                 values.retain(|&v| cascade.probed.insert((edge.child_tid, edge.fk_col, v)));
@@ -704,7 +994,17 @@ async fn removed_references(
             let ReferencePlan { edge, spec, cascades } = &check.plan;
             for (_, entry) in answered(rows) {
                 let (span, holder) = spec.split_entry(entry);
-                if b.retires(edge.child_tid, spec, holder, span) {
+                // A holder the bundle deletes, or whose surviving row holds a
+                // NULL or another span there, has given its claim up. One the
+                // bundle does not touch keeps it.
+                let retired = match b.get(edge.child_tid).and_then(|t| t.fold.get(holder)).map(|e| e.last) {
+                    None => false,
+                    Some(FoldOp::Deleted) => true,
+                    Some(FoldOp::Inserted(f, r)) => {
+                        spec.span(b.mem(f), r as usize).is_none_or(|own| own.pk_bytes() != span)
+                    }
+                };
+                if retired {
                     continue;
                 }
                 if *cascades {
@@ -716,7 +1016,10 @@ async fn removed_references(
                     }
                 } else if violation.is_none() {
                     // Anything but a surviving row holding a new value reads as a delete.
-                    let verb = match deltas[&delta_key(edge)].retired.get(&gnitz_wire::widen_pk_be(span)) {
+                    let verb = match deltas[&(edge.parent_tid, edge.parent_col)]
+                        .retired
+                        .get(&gnitz_wire::widen_pk_be(span))
+                    {
                         Some(RetireVerb::Update) => "update",
                         _ => "delete from",
                     };
@@ -767,31 +1070,6 @@ async fn removed_references(
         })
         .collect();
     Ok((further, violation))
-}
-
-/// Hold to [`PkRule::Fresh`] each family of every table of `families`, a
-/// bundle [`Checks::validate_txn`] admitted, whose families are all Error
-/// families of positive weights. Validation refused a key two of them insert,
-/// one inserts at a weight above 1, or the store holds; and an Error family
-/// reads committed state, so its write holds its tables' exclusive locks from
-/// that probe until the committer lays it out, which keeps every other write
-/// off the table in between. So each key is distinct, weighs 1, and is absent
-/// from the store each family lands on, behind the families before it.
-fn mark_fresh(families: &mut [TxnFamily]) {
-    // Per table, whether every family so far inserts only.
-    let mut fresh: SmallVec<[(u64, bool); 4]> = SmallVec::new();
-    for f in families.iter() {
-        let inserts = matches!(f.mode, WireConflictMode::Error) && f.rows.view().all_weights_positive();
-        match fresh.iter_mut().find(|(tid, _)| *tid == f.tid) {
-            Some((_, all)) => *all &= inserts,
-            None => fresh.push((f.tid, inserts)),
-        }
-    }
-    for f in families.iter_mut() {
-        if fresh.iter().any(|&(tid, all)| tid == f.tid && all) {
-            f.pk_rule = PkRule::Fresh;
-        }
-    }
 }
 
 #[cfg(test)]

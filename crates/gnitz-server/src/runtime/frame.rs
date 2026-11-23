@@ -66,8 +66,8 @@ impl<'a> WireMsg<'a> {
         budget: usize,
         ends: bool,
     ) -> Result<(Self, usize), WireFault> {
-        let head = Self::train_frame(target_id, false, None).size();
-        let rows = batch.wire_rows_within(from, budget.saturating_sub(head));
+        // A train frame is its control header and its rows.
+        let rows = batch.wire_rows_within(from, budget.saturating_sub(gnitz_wire::CTRL_HEADER_SIZE));
         let next = from + rows.map_or(0, |r| r.rows());
         let msg = Self::train_frame(target_id, ends && next == batch.len(), rows);
         msg.check_size()?;

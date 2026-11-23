@@ -35,9 +35,29 @@ impl Pinning {
 /// (master) process to its share. `requested` is the worker count, or `None`
 /// for [`auto_count`] over this host. `Ok((workers, None))`: nothing is pinned.
 pub fn pin_master(requested: Option<u32>) -> Result<(u32, Option<Pinning>), String> {
-    let allowed = allowed_cpus();
+    // The CPUs this process may run on: its affinity mask, which the kernel
+    // already narrows to the cgroup cpuset and to active CPUs.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let allowed: Vec<u32> = match unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) } {
+        0 => (0..libc::CPU_SETSIZE as u32)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c as usize, &set) })
+            .collect(),
+        _ => Vec::new(),
+    };
     let quota = gnitz_foundation::host::cpu_quota();
-    let order = read_order(&allowed);
+    // An unreadable sysfs file reads as an empty list.
+    let read_cpu_list = |path: String| {
+        std::fs::read_to_string(path)
+            .map(|s| parse_cpu_list(&s))
+            .unwrap_or_default()
+    };
+    let node_cpus: Vec<Vec<u32>> = read_cpu_list(format!("{NODE_ROOT}/online"))
+        .iter()
+        .map(|n| read_cpu_list(format!("{NODE_ROOT}/node{n}/cpulist")))
+        .collect();
+    let order = handout_order(&allowed, &node_cpus, |c| {
+        read_cpu_list(format!("{CPU_ROOT}/cpu{c}/topology/thread_siblings_list"))
+    });
     let workers = requested.unwrap_or_else(|| {
         let n = auto_count(order.len(), quota);
         gnitz_note!("workers: {n} (auto)");
@@ -93,24 +113,6 @@ fn parse_cpu_list(s: &str) -> Vec<u32> {
     out
 }
 
-/// An unreadable file reads as an empty list.
-fn read_cpu_list(path: &str) -> Vec<u32> {
-    std::fs::read_to_string(path)
-        .map(|s| parse_cpu_list(&s))
-        .unwrap_or_default()
-}
-
-/// `handout_order` over this machine's sysfs.
-fn read_order(allowed: &[u32]) -> Vec<Core> {
-    let node_cpus: Vec<Vec<u32>> = read_cpu_list(&format!("{NODE_ROOT}/online"))
-        .iter()
-        .map(|n| read_cpu_list(&format!("{NODE_ROOT}/node{n}/cpulist")))
-        .collect();
-    handout_order(allowed, &node_cpus, |c| {
-        read_cpu_list(&format!("{CPU_ROOT}/cpu{c}/topology/thread_siblings_list"))
-    })
-}
-
 /// The cores of `allowed` in the order workers take them: one per NUMA node
 /// per round, spreading the workers over the nodes.
 fn handout_order(allowed: &[u32], node_cpus: &[Vec<u32>], siblings: impl Fn(u32) -> Vec<u32>) -> Vec<Core> {
@@ -154,19 +156,6 @@ fn assign(order: Vec<Core>, workers: usize) -> Option<Pinning> {
     let mut master: Vec<u32> = order.flatten().collect();
     master.sort_unstable();
     Some(Pinning { master, workers: cores })
-}
-
-/// The CPUs this process may run on: its affinity mask, which the kernel
-/// already narrows to the cgroup cpuset and to active CPUs.
-fn allowed_cpus() -> Vec<u32> {
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
-        return Vec::new();
-    }
-    (0..libc::CPU_SETSIZE as usize)
-        .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
-        .map(|c| c as u32)
-        .collect()
 }
 
 fn pin_self(who: &str, cpus: &[u32]) -> Result<(), String> {

@@ -14,7 +14,7 @@ use gnitz_foundation::posix_io::retry_eintr;
 /// The master's children, by worker rank. Each stays an unreaped child until
 /// the value drops, which kills and reaps every one, so its pid names that
 /// worker for as long as it is held.
-pub(crate) struct Workers(Vec<NonZero<libc::pid_t>>);
+pub(crate) struct Workers(pub(crate) Vec<NonZero<libc::pid_t>>);
 
 /// How a worker ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,44 +27,28 @@ pub(crate) enum WorkerEnd {
     Dumped(i32),
 }
 
-/// `sig` by number, and by name when it is one a worker dies of.
-struct Signal(i32);
-
-impl fmt::Display for Signal {
+impl fmt::Display for WorkerEnd {
+    /// A signal by number, and by name when it is one a worker dies of.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self.0 {
+        let (how, sig) = match *self {
+            WorkerEnd::Exited(code) => return write!(f, "exited with status {code}"),
+            WorkerEnd::Killed(sig) => ("was killed by", sig),
+            WorkerEnd::Dumped(sig) => ("dumped core on", sig),
+        };
+        let name = match sig {
             libc::SIGKILL => "SIGKILL",
             libc::SIGABRT => "SIGABRT",
             libc::SIGSEGV => "SIGSEGV",
             libc::SIGBUS => "SIGBUS",
             libc::SIGILL => "SIGILL",
             libc::SIGFPE => "SIGFPE",
-            sig => return write!(f, "signal {sig}"),
+            _ => return write!(f, "{how} signal {sig}"),
         };
-        write!(f, "signal {} ({name})", self.0)
-    }
-}
-
-impl fmt::Display for WorkerEnd {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            WorkerEnd::Exited(code) => write!(f, "exited with status {code}"),
-            WorkerEnd::Killed(sig) => write!(f, "was killed by {}", Signal(sig)),
-            WorkerEnd::Dumped(sig) => write!(f, "dumped core on {}", Signal(sig)),
-        }
+        write!(f, "{how} signal {sig} ({name})")
     }
 }
 
 impl Workers {
-    pub(crate) fn new(pids: Vec<NonZero<libc::pid_t>>) -> Self {
-        Workers(pids)
-    }
-
-    /// Take `pid` as the next rank's worker.
-    pub(crate) fn push(&mut self, pid: NonZero<libc::pid_t>) {
-        self.0.push(pid);
-    }
-
     /// Resolves with the rank of the first worker to exit and how it ended,
     /// leaving it unreaped.
     pub(crate) async fn death(&self, reactor: Reactor) -> (usize, WorkerEnd) {

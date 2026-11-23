@@ -286,14 +286,14 @@ fn a_read_reaches_the_owners_its_bound_names() {
     ];
     for (case, schema, placement, blob, want) in cases {
         let registry = registry(schema, placement);
-        let r = route_read(&scan(16, &blob.unwrap_or_default()), &registry, NW);
-        assert_eq!(r.set, want, "{case}");
-        assert!(r.per_worker.is_none(), "{case}: every worker is sent the whole bound");
+        let (set, per_worker) = route_read(&scan(16, &blob.unwrap_or_default()), &registry, NW);
+        assert_eq!(set, want, "{case}");
+        assert!(per_worker.is_none(), "{case}: every worker is sent the whole bound");
     }
 
     let registry = registry(schema, keyed);
-    let spread = route_read(&scan(16, &set(&[0, b])), &registry, NW);
-    assert_eq!(spread.set, WorkerSet::one(owner(0)).with(owner(b)));
+    let (spread, per_worker) = route_read(&scan(16, &set(&[0, b])), &registry, NW);
+    assert_eq!(spread, WorkerSet::one(owner(0)).with(owner(b)));
     let own_keys = (0..NW)
         .map(|w| match w {
             _ if w == owner(0) => set(&[0]),
@@ -301,7 +301,7 @@ fn a_read_reaches_the_owners_its_bound_names() {
             _ => Vec::new(),
         })
         .collect();
-    assert_eq!(spread.per_worker, Some(own_keys));
+    assert_eq!(per_worker, Some(own_keys));
 }
 
 /// An own-PK probe goes to the owners of its keys — under a replicated
@@ -320,9 +320,9 @@ fn a_probe_routes_by_the_store_it_reads() {
 
     let replicated = registry(schema, Placement::Replicated);
     for own in [Probe::Pk, Probe::PkColumn(1)] {
-        let r = route_read(&probe(own), &replicated, NW);
-        assert_eq!(r.set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
-        assert!(r.per_worker.is_some(), "{own:?}: each worker is sent its own keys");
+        let (set, per_worker) = route_read(&probe(own), &replicated, NW);
+        assert_eq!(set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
+        assert!(per_worker.is_some(), "{own:?}: each worker is sent its own keys");
     }
     let one = pk_keys(8, &[b]).encode_probe();
     let r = route_read(
@@ -334,19 +334,15 @@ fn a_probe_routes_by_the_store_it_reads() {
         &replicated,
         NW,
     );
-    assert_eq!(
-        (r.set, r.per_worker),
-        (WorkerSet::one(owner(b)), None),
-        "one key, its one owner"
-    );
+    assert_eq!(r, (WorkerSet::one(owner(b)), None), "one key, its one owner");
     let r = route_read(
         &scan(16, &ReadSpec::all_rows(pk_set(8, &[0, b])).encode()),
         &replicated,
         NW,
     );
-    assert_eq!(r.set, WorkerSet::one(Placement::REPLICA_OWNER as usize));
+    assert_eq!(r.0, WorkerSet::one(Placement::REPLICA_OWNER as usize));
 
     let keyed = registry(schema, full);
     let r = route_read(&probe(index), &keyed, NW);
-    assert_eq!((r.set, r.per_worker), (WorkerSet::ALL, None));
+    assert_eq!(r, (WorkerSet::ALL, None));
 }

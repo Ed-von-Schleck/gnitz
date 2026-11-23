@@ -24,9 +24,6 @@ use std::ops::Range;
 /// crossing of the threshold woke it for. One-shot.
 static DDL_HOLD_FOR_CHECKPOINT: Switch = Switch::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
 
-/// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
-const DDL_HOLD_MAX_POLLS: u32 = 10_000;
-
 /// The `DDL_TXN` item list at `body` of `frame` as one block per family, each
 /// family's wal-block slice materialised into an owned batch under its own
 /// schema. One slot per family: every list derived from a bundle reads one
@@ -113,8 +110,12 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     }
     let (applied, zone_lsn) = committed?;
 
+    // Every per-relation state a durable DROP reclaims. Every table lock is
+    // taken under a catalog read guard, so the catalog write guard held here
+    // proves no task holds or awaits a lock being removed.
     for &id in &applied.dropped_relations {
-        shared.forget_relation(&catalog, id);
+        shared.writes.forget(id);
+        shared.dispatcher.forget_relation(id);
     }
     for &(owner_id, cols) in &applied.dropped_indexes {
         shared.writes.checks.unique_filter_remove(owner_id, cols);
@@ -142,7 +143,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     shared.dispatcher.wake_watches();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
-        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || applies.contended()).await;
+        park_until(shared, "ddl hold", || applies.contended()).await;
     }
     drop((catalog, applies));
     Ok(zone_lsn)

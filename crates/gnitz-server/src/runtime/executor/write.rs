@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use super::family::{FamilyRows, TxnFamily};
 use super::validate::Checks;
-use super::{Access, CatalogLock, Shared, decode_fault, target_kind};
+use super::{Access, Shared, decode_fault, target_kind};
 use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{Budget, Charge, RecvBuf};
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
@@ -55,6 +55,7 @@ pub(super) enum HeldTables {
     Exclusive(SmallVec<[WriteGuard; 4]>),
 }
 
+#[cfg(test)]
 impl Default for HeldTables {
     fn default() -> Self {
         HeldTables::Shared(SmallVec::new())
@@ -81,54 +82,6 @@ impl Writes {
         }
     }
 
-    /// Guard every table of `tids`, sorted and each once — the write guard when
-    /// `exclusive`, else the read guard — in ascending order, so no two sets
-    /// deadlock (a child INSERT and a parent DELETE among them), and each once,
-    /// since re-guarding a lock this task holds would hang forever. Then OCC:
-    /// `Err` names the first table of `occ` that committed a write after its
-    /// basis read. The write guard on it keeps any other commit to it from
-    /// landing before the caller's. A table not written this boot reads as
-    /// written at `boot_seed`: no basis read this boot is below it.
-    async fn lock(
-        &self,
-        _catalog: &ReadGuard<CatalogLock>,
-        tids: &[u64],
-        exclusive: bool,
-        occ: &[(u64, u64)],
-    ) -> Result<HeldTables, u64> {
-        assert!(
-            exclusive || occ.is_empty(),
-            "an OCC check holds its table's write guard"
-        );
-        let lock = |tid| self.tables.borrow_mut().entry(tid).or_default().lock.clone();
-        let held = match exclusive {
-            false => {
-                let mut guards = SmallVec::with_capacity(tids.len());
-                for &tid in tids {
-                    guards.push(lock(tid).read().await);
-                }
-                HeldTables::Shared(guards)
-            }
-            true => {
-                let mut guards = SmallVec::with_capacity(tids.len());
-                for &tid in tids {
-                    guards.push(lock(tid).write().await);
-                }
-                HeldTables::Exclusive(guards)
-            }
-        };
-        // Every table of `occ` is in `tids`, so the locking made its record,
-        // and the catalog read guard keeps it.
-        let tables = self.tables.borrow();
-        match occ
-            .iter()
-            .find(|&&(tid, basis)| tables[&tid].commit_lsn.max(self.boot_seed) > basis)
-        {
-            Some(&(tid, _)) => Err(tid),
-            None => Ok(held),
-        }
-    }
-
     /// Record a committed write of `batch` to `tid` at commit LSN `lsn`: its
     /// FK presence cache, then `tid`'s commit LSN, raised to `lsn`. The
     /// committer calls it before it drops the writer's table locks, so an OCC
@@ -141,8 +94,7 @@ impl Writes {
     }
 
     /// Drop relation `id`'s write state and validation caches. The caller
-    /// proves no task holds or awaits its lock; see
-    /// [`Shared::forget_relation`].
+    /// proves no task holds or awaits its lock.
     pub(super) fn forget(&self, id: u64) {
         self.tables.borrow_mut().remove(&id);
         self.checks.forget(id);
@@ -246,9 +198,9 @@ impl OpenWrite {
 /// Handle a client write, a `verb` of `frames` in arrival order, as one write:
 /// every frame admitted under the catalog read guard, which is held through
 /// the commit so no DDL lands between the judgement and the write; the table
-/// locks and OCC ([`Writes::lock`]); the validation of a write that reads
-/// committed state, whose families its deletes cascade to ride along; and the
-/// commit ([`Committer::write`](super::committer::Committer::write)). Such a
+/// locks and OCC; the validation of a write that reads committed state, whose
+/// families its deletes cascade to ride along; and the commit
+/// ([`Committer::write`](super::committer::Committer::write)). Such a
 /// write, and one with an OCC check, holds its locks exclusively. Every
 /// rejection is pre-SAL, so a fault or a conflict commits nothing.
 /// `followed`: the client's connection has a request queued behind this one.
@@ -264,7 +216,7 @@ pub(super) async fn handle_write(
     frames: WriteFrames,
     followed: bool,
 ) -> Result<u64, WireFault> {
-    let catalog = shared.catalog_rwlock.read().await;
+    let _catalog = shared.catalog_rwlock.read().await;
     let (mut families, occ) = admit_write(&shared.cat(), verb, frames)?;
     if verb == ClientVerb::Push && families.is_empty() {
         return Ok(0);
@@ -279,18 +231,45 @@ pub(super) async fn handle_write(
             cat.write_lock_set((families.iter()).map(|f| (f.tid, exclusive && !f.rows.view().all_weights_positive())));
         (tids, exclusive, reads_committed)
     };
-    let held = match shared.writes.lock(&catalog, &tids, exclusive, &occ).await {
-        Ok(held) => held,
-        Err(tid) => {
-            return Err(WireFault {
-                status: WireStatus::TxnConflict,
-                text: format!(
-                    "transaction conflict on '{}': it was written after the read this write was built from; retry",
-                    shared.cat().qualified_name(tid)
-                ),
-            });
+    // `tids` is sorted and each once: guarded in ascending order, so no two
+    // sets deadlock (a child INSERT and a parent DELETE among them), and each
+    // once, since re-guarding a lock this task holds would hang forever.
+    let writes = &shared.writes;
+    let lock = |tid| writes.tables.borrow_mut().entry(tid).or_default().lock.clone();
+    let held = if exclusive {
+        let mut guards = SmallVec::with_capacity(tids.len());
+        for &tid in &tids {
+            guards.push(lock(tid).write().await);
         }
+        HeldTables::Exclusive(guards)
+    } else {
+        let mut guards = SmallVec::with_capacity(tids.len());
+        for &tid in &tids {
+            guards.push(lock(tid).read().await);
+        }
+        HeldTables::Shared(guards)
     };
+    // OCC: refused when a table of `occ` committed a write after its basis
+    // read. The write guard on it keeps any other commit to it from landing
+    // before this one. A table not written this boot reads as written at
+    // `boot_seed`: no basis read this boot is below it. Every table of `occ` is
+    // in `tids`, so the locking made its record, and the catalog read guard
+    // keeps it.
+    let conflict = {
+        let tables = writes.tables.borrow();
+        occ.iter()
+            .find(|&&(tid, basis)| tables[&tid].commit_lsn.max(writes.boot_seed) > basis)
+            .map(|&(tid, _)| tid)
+    };
+    if let Some(tid) = conflict {
+        return Err(WireFault {
+            status: WireStatus::TxnConflict,
+            text: format!(
+                "transaction conflict on '{}': it was written after the read this write was built from; retry",
+                shared.cat().qualified_name(tid)
+            ),
+        });
+    }
 
     if reads_committed {
         shared

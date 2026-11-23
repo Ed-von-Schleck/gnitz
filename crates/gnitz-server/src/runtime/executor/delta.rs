@@ -29,9 +29,6 @@ use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 /// pump pass puts on the master at a time.
 const DELTA_CUT_READS: usize = 64;
 
-/// The longest a SYNC_PUSHED is held, whatever wait it asks for.
-const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
-
 /// The reads of one delta cut, taken in the order given.
 struct CutReads {
     /// The cut's lease and the round each of its reads reaches; `None` for a
@@ -465,7 +462,8 @@ impl Subscriptions {
         let now = shared.dispatcher.reactor().now();
         self.asked_mut()
             .syncs
-            .push_back(held.map(|_| now + Duration::from_millis(wait_ms).min(SYNC_MAX_WAIT)));
+            // Held an hour at most, whatever wait it asks for.
+            .push_back(held.map(|_| now + Duration::from_millis(wait_ms).min(Duration::from_secs(3600))));
     }
 
     /// The [`sync_wait`] of the oldest unanswered sync, begun if none is
@@ -544,17 +542,12 @@ fn pushed_marker(view: u64, id: SubId) -> WireMsg<'static> {
     marker
 }
 
-/// `msg`'s framed bytes, for a subscriber's queue.
-fn framed(msg: WireMsg<'_>) -> Vec<u8> {
-    let mut out = Vec::new();
-    msg.encode_framed(&mut out);
-    out
-}
-
 /// End `members`' subscriptions with `fault`. A fault frame is queued whatever
 /// the queue holds: it is what tells the subscriber to stop waiting.
 fn fail_subscribers<'a>(view: u64, members: impl IntoIterator<Item = &'a Rc<Subscriber>>, fault: &WireFault) {
-    let frame = Rc::new(framed(WireMsg::fault(view, fault)));
+    let mut frame = Vec::new();
+    WireMsg::fault(view, fault).encode_framed(&mut frame);
+    let frame = Rc::new(frame);
     for m in members {
         m.after_tick.set(None);
         m.out.send(view, m.id, Rc::clone(&frame));
