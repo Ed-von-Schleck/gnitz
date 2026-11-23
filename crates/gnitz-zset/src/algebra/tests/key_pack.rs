@@ -206,16 +206,13 @@ fn pack_rows_hashes_content_slots_as_a_row_at_a_time() {
     }
     let b = b.finish();
     let mb = b.as_mem_batch();
+    // Five columns behind a bitmap pass the PK's column limit.
+    let five: Vec<_> = (1..=5)
+        .map(|c| locate_key_col(&schema, c, "group key").unwrap())
+        .collect();
+    assert!(KeyPacker::group(&five).is_none());
     let windows: [&[(usize, usize)]; 3] = [&[(0, rows)], &[(17, 18), (40, 299)], &[(5, 5), (250, rows)]];
-    for group in [
-        &[2][..],
-        &[4],
-        &[4, 3],
-        &[2, 1],
-        &[1, 2, 3],
-        &[2, 4, 5],
-        &[1, 2, 3, 4, 5],
-    ] {
+    for group in [&[2][..], &[4], &[4, 3], &[2, 1], &[1, 2, 3], &[2, 4, 5], &[1, 2, 3, 5]] {
         let packer = group_packer(&schema, group);
         for runs in windows {
             let want: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
@@ -311,8 +308,9 @@ mod pack_proptest {
         /// slot as the value's own wire encoding at the slot type. Both sides of
         /// a join key pair pack at their common slot, so equal values
         /// co-partition. A group key over the same columns, some nullable,
-        /// packs a column at a time as a row at a time: the bitmap, the zeroed
-        /// NULL slots and the fold of the columns past the budget.
+        /// packs a column at a time as a row at a time: the bitmap and the zeroed
+        /// NULL slots — or has no packer where the bitmap passes the PK's column
+        /// limit.
         #[test]
         fn pack_rows_is_the_wire_encoding_in_both_placements(
             (cols, rows, bytes, nulls, start) in prop::collection::vec(
@@ -394,8 +392,12 @@ mod pack_proptest {
                 }
             }
 
-            let group: Vec<u32> = (1..=types.len() as u32).collect();
-            let packer = group_packer(&null_schema, &group);
+            let group: Vec<_> = (1..=types.len()).map(|c| locate_key_col(&null_schema, c as u32, "group key").unwrap()).collect();
+            let has_bitmap = cols.iter().any(|c| c.2);
+            let Some(packer) = KeyPacker::group(&group) else {
+                prop_assert!(has_bitmap && types.len() == MAX_PK_COLUMNS);
+                return Ok(());
+            };
             let mb = nb.as_mem_batch();
             let by_row = |r: usize| {
                 let mut key = vec![0u8; packer.out_stride];

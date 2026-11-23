@@ -80,7 +80,7 @@ impl GroupKey {
             return GroupKey::Global;
         }
         // A `_group_pk` holds the group itself where its packed key fits one.
-        let fits = |p: &KeyPacker| p.key_columns().count() <= MAX_PK_COLUMNS && p.out_stride() <= GROUP_PK_BYTES;
+        let fits = |p: &KeyPacker| p.out_stride() <= GROUP_PK_BYTES;
         match KeyPacker::group(group).filter(fits) {
             Some(p) => Self::packed(p).ok().expect("a packed key of at most 16 bytes"),
             None => GroupKey::Fold(FoldCols::new(locs())),
@@ -319,7 +319,7 @@ pub struct GroupOutKey {
     /// The output PK is a hidden `_group_pk`, which the key is widened to.
     synthetic: bool,
     /// Packs the group's columns as an index's [`GroupPrefix`] leads with them;
-    /// `None` where they pass the PK's column limit.
+    /// `None` where they, a bitmap counted, pass the PK's column limit.
     index_packer: Option<KeyPacker>,
     /// The input columns the output carries after its key, as the input locates them.
     carried: Vec<ColumnLocator>,

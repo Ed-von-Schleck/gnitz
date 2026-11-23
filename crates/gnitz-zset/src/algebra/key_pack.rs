@@ -210,7 +210,7 @@ const FOLD_BYTES: usize = size_of::<u128>();
 const _: () = assert!(BITMAP_BYTES == size_of::<u8>());
 // The bitmap has a bit for every column packed behind it.
 const _: () = assert!(MAX_PK_COLUMNS <= 8 * BITMAP_BYTES);
-// Any join key fits the PK region, so `new` checks no width.
+// Any packed key fits the PK region, so no constructor checks a width.
 const _: () = assert!(MAX_PK_COLUMNS * TypeCode::U128.wire_stride() <= MAX_PK_BYTES);
 
 // ---------------------------------------------------------------------------
@@ -307,13 +307,13 @@ impl KeyPacker {
     }
 
     /// The packer of a group key over `group`: each column at its reindex output
-    /// type, behind a bitmap where one is nullable; `None` where `group` passes
-    /// [`MAX_PK_COLUMNS`] columns.
+    /// type, behind a bitmap where one is nullable; `None` where those key
+    /// columns, the bitmap counted, pass [`MAX_PK_COLUMNS`].
     pub(crate) fn group(group: &[(SchemaColumn, ColumnLocator)]) -> Option<Self> {
-        if group.len() > MAX_PK_COLUMNS {
+        let has_bitmap = group.iter().any(|(col, _)| col.nullable);
+        if group.len() + usize::from(has_bitmap) > MAX_PK_COLUMNS {
             return None;
         }
-        let has_bitmap = group.iter().any(|(col, _)| col.nullable);
         let packed = group
             .iter()
             .map(|&(col, loc)| (loc, col.type_code.reindex_output_type()));
