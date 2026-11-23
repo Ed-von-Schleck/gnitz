@@ -70,8 +70,12 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
 /// against keys built from the same number of bytes.
 pub(crate) trait PkSortKey<'a>: RadixKey + Default {
     fn from_opk(opk: &'a [u8]) -> Self;
-    /// The bytes [`Self::put`] writes for a key built from `stride` bytes.
-    fn put_width(stride: usize) -> usize;
+    /// The bytes [`Self::put`] writes for a key built from `stride` bytes: the
+    /// key's own size, for a key that holds its bytes.
+    #[inline(always)]
+    fn put_width(_stride: usize) -> usize {
+        size_of::<Self>()
+    }
     /// The key's bytes big-endian into `out`, [`Self::put_width`] long: the
     /// `stride` bytes it was built from, then zeros.
     fn put(self, out: &mut [u8]);
@@ -114,10 +118,6 @@ impl PkSortKey<'_> for u64 {
         }
     }
     #[inline(always)]
-    fn put_width(_: usize) -> usize {
-        size_of::<Self>()
-    }
-    #[inline(always)]
     fn put(self, out: &mut [u8]) {
         out.copy_from_slice(&self.to_be_bytes());
     }
@@ -135,10 +135,6 @@ impl PkSortKey<'_> for u128 {
         let hi = u64::from_be_bytes(opk[..8].try_into().unwrap()) as u128;
         let tail = u64::from_be_bytes(opk[len - 8..].try_into().unwrap()) << (8 * (16 - len));
         (hi << 64) | tail as u128
-    }
-    #[inline(always)]
-    fn put_width(_: usize) -> usize {
-        size_of::<Self>()
     }
     #[inline(always)]
     fn put(self, out: &mut [u8]) {
@@ -173,10 +169,6 @@ impl PkSortKey<'_> for [u128; 2] {
         } else {
             [hi, pack_pk_be(&opk[16..])]
         }
-    }
-    #[inline(always)]
-    fn put_width(_: usize) -> usize {
-        32
     }
     #[inline(always)]
     fn put(self, out: &mut [u8]) {
