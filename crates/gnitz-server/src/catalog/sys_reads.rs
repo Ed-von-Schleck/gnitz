@@ -4,7 +4,7 @@
 use gnitz_store::relation::{Cut, Relation};
 use gnitz_trace::runs::{ReadCursor, StoredRow};
 use gnitz_wire::{
-    CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot, TableTabRow, payload_bytes, payload_str, payload_u64,
+    CatalogColumn, ColTabRow, PkKeys, SchemaTabRow, SchemaTabSlot, TableTabRow, payload_bytes, payload_str, payload_u64,
 };
 use gnitz_zset::repr::Batch;
 
@@ -55,11 +55,13 @@ impl CatalogEngine {
     /// `ids` (strictly ascending): each row for a single-column key, each owner's band
     /// for a pair.
     pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[u64]) -> Batch {
-        debug_assert!(ids.is_sorted_by(|a, b| a < b));
+        let keys = PkKeys::from_sorted(
+            8,
+            ids.iter().flat_map(|&id| gnitz_wire::sys_key(id)).collect::<Vec<u8>>(),
+        );
         let mut batch = Batch::empty_with_schema(family.schema());
-        for &id in ids {
-            self.for_each_row_under(family, id, |c| c.copy_current_row_into(&mut batch, -c.current_weight()));
-        }
+        (self.sys_relation(family).gather(keys, Cut::Now, u64::MAX))
+            .for_each_positive_capped(usize::MAX, |c| c.copy_current_row_into(&mut batch, -c.current_weight()));
         batch
     }
 
