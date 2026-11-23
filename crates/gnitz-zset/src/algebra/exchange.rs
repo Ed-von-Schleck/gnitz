@@ -76,7 +76,7 @@ impl ScatterPlan {
         }
         let slots = &mut out[..lists];
         slots.iter_mut().for_each(Vec::clear);
-        self.route_into(batch, num_workers, &mut EveryWorker(slots));
+        self.route_into(batch, num_workers, |worker, row| slots[worker].push(row));
         slots
     }
 
@@ -84,98 +84,53 @@ impl ScatterPlan {
     /// every worker holds whole, and what a round under this plan would hand it.
     pub fn share(&self, batch: &Batch, slot: Slot) -> Batch {
         let nw = slot.of as usize;
-        let mut share = Share {
-            rank: if self.is_broadcast() { 0 } else { slot.rank as usize },
-            rows: Vec::with_capacity(batch.len() / nw + 1),
-        };
-        self.route_into(&batch.as_mem_batch(), nw, &mut share);
-        batch.ascending_subset(&share.rows)
+        let rank = if self.is_broadcast() { 0 } else { slot.rank as usize };
+        let mut rows = Vec::with_capacity(batch.len() / nw + 1);
+        self.route_into(&batch.as_mem_batch(), nw, |worker, row| {
+            if worker == rank {
+                rows.push(row);
+            }
+        });
+        batch.ascending_subset(&rows)
     }
 
-    fn route_into(&self, mb: &MemBatch, nw: usize, sink: &mut impl RowSink) {
+    /// Hand `put` each nonzero-weight row of `mb` with the list it goes to: its
+    /// owner's, or a broadcast's one list 0.
+    fn route_into(&self, mb: &MemBatch, nw: usize, put: impl FnMut(usize, u32)) {
         match self.0 {
-            Some(Route::WidePacked(ref p)) if nw > 1 => route_rows_packed(mb, sink, p, nw),
+            Some(Route::WidePacked(ref p)) if nw > 1 => route_rows_packed(mb, put, p, nw),
             Some(Route::Key(ref key)) if nw > 1 => match key.form(mb) {
                 KeyForm::Cells(cells) => {
-                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw))
+                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), put, nw))
                 }
-                KeyForm::WidePk { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
-                KeyForm::Chunked => route_identities(mb, sink, key, nw),
+                KeyForm::WidePk { at, n } => {
+                    // Captured by value: read through the borrowed view, each
+                    // row's PK range costs the loop more instructions.
+                    let rows = *mb;
+                    route_rows(mb, put, move |row| {
+                        worker_for_wide_pk(rows.get_pk_range(row, at, n), nw)
+                    })
+                }
+                KeyForm::Chunked => route_identities(mb, put, key, nw),
                 // The one group of no columns has one owner, and no key to hash.
-                KeyForm::Global => route_rows(mb, sink, Owner(ground_owner(nw))),
+                KeyForm::Global => {
+                    let owner = ground_owner(nw);
+                    route_rows(mb, put, |_| owner)
+                }
             },
             // One worker owns every key, and a broadcast is the one list, so no
             // key is read or hashed.
-            _ => route_rows(mb, sink, Owner(0)),
+            _ => route_rows(mb, put, |_| 0),
         }
     }
 }
 
-/// Where a routed row goes.
-trait RowSink {
-    fn put(&mut self, worker: usize, row: u32);
-}
-
-/// One row list per worker.
-struct EveryWorker<'a>(&'a mut [Vec<u32>]);
-
-impl RowSink for EveryWorker<'_> {
-    #[inline(always)]
-    fn put(&mut self, worker: usize, row: u32) {
-        self.0[worker].push(row);
-    }
-}
-
-/// `rank`'s rows alone.
-struct Share {
-    rank: usize,
-    rows: Vec<u32>,
-}
-
-impl RowSink for Share {
-    #[inline(always)]
-    fn put(&mut self, worker: usize, row: u32) {
-        if worker == self.rank {
-            self.rows.push(row);
-        }
-    }
-}
-
-/// One kind's per-row route, forced inline into [`route_rows`] (a closure
-/// cannot be).
-trait RowWorker {
-    fn worker(&self, mb: &MemBatch, row: usize) -> usize;
-}
-
-/// A PK range wider than a key cell, routed by its hash.
-struct PkRangeW {
-    at: usize,
-    n: usize,
-    nw: usize,
-}
-
-impl RowWorker for PkRangeW {
-    #[inline(always)]
-    fn worker(&self, mb: &MemBatch, row: usize) -> usize {
-        worker_for_wide_pk(mb.get_pk_range(row, self.at, self.n), self.nw)
-    }
-}
-
-/// Every row to one worker.
-struct Owner(usize);
-
-impl RowWorker for Owner {
-    #[inline(always)]
-    fn worker(&self, _: &MemBatch, _: usize) -> usize {
-        self.0
-    }
-}
-
+/// Each nonzero-weight row to the worker `worker` names for it.
 #[inline(never)]
-fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
+fn route_rows(mb: &MemBatch, mut put: impl FnMut(usize, u32), worker: impl Fn(usize) -> usize) {
     for (row, weight) in mb.weight().as_chunks::<8>().0.iter().enumerate() {
         if *weight != [0; 8] {
-            sink.put(w.worker(mb, row), row as u32);
+            put(worker(row), row as u32);
         }
     }
 }
@@ -183,11 +138,16 @@ fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
 /// [`route_rows`] for a key that is one `W`-byte cell per row: each nonzero-weight row to the
 /// owner of its cell's image.
 #[inline(never)]
-fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8], sink: &mut impl RowSink, nw: usize) {
+fn route_cells<const W: usize, const OPK: bool>(
+    cells: &KeyCells,
+    weights: &[u8],
+    mut put: impl FnMut(usize, u32),
+    nw: usize,
+) {
     let rows = weights.as_chunks::<8>().0.iter().zip(0u32..);
     zip_cells::<W, _>(cells.region, cells.stride, cells.off, rows, |cell, (weight, row)| {
         if *weight != [0; 8] {
-            sink.put(worker_for_key(cell_image::<W, OPK>(cell, cells.signed), nw), row);
+            put(worker_for_key(cell_image::<W, OPK>(cell, cells.signed), nw), row);
         }
     });
 }
@@ -195,7 +155,7 @@ fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8]
 /// [`route_rows`] for a packed key of at most 16 bytes or a fold: each nonzero-weight row
 /// to the owner of its [`GroupKey::identities`], taken a chunk of rows at a time.
 #[inline(never)]
-fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, key: &GroupKey, nw: usize) {
+fn route_identities(mb: &MemBatch, mut put: impl FnMut(usize, u32), key: &GroupKey, nw: usize) {
     let (rows, weights) = (mb.len(), mb.weight().as_chunks::<8>().0);
     let mut buf = [MaybeUninit::<u128>::uninit(); IDENTITY_CHUNK];
     let ids = filled(&mut buf[..rows.min(IDENTITY_CHUNK)], 0);
@@ -204,7 +164,7 @@ fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, key: &GroupKey, nw: 
         key.identities(mb, start, ids);
         for ((id, weight), row) in ids.iter().zip(&weights[start..]).zip(start as u32..) {
             if *weight != [0; 8] {
-                sink.put(worker_for_key(*id, nw), row);
+                put(worker_for_key(*id, nw), row);
             }
         }
     }
@@ -215,7 +175,7 @@ fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, key: &GroupKey, nw: 
 /// since no later chunk is longer; [`KeyPacker::pack_rows`] writes every byte of each key
 /// it packs, so a chunk reads no key left by the one before.
 #[inline(never)]
-fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
+fn route_rows_packed(mb: &MemBatch, mut put: impl FnMut(usize, u32), packer: &KeyPacker, nw: usize) {
     let (rows, width, weights) = (mb.len(), packer.out_stride(), mb.weight().as_chunks::<8>().0);
     let mut buf = [MaybeUninit::<u8>::uninit(); IDENTITY_CHUNK * MAX_PK_BYTES];
     let keys = filled(&mut buf[..rows.min(IDENTITY_CHUNK) * width], 0);
@@ -228,7 +188,7 @@ fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker,
             .zip(start as u32..);
         for ((key, weight), row) in rows {
             if *weight != [0; 8] {
-                sink.put(worker_for_wide_pk(key, nw), row);
+                put(worker_for_wide_pk(key, nw), row);
             }
         }
     }
