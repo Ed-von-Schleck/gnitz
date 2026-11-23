@@ -30,13 +30,20 @@ fn index_entries_bench() {
         };
         black_box(spans());
         let (spans, span) = counter.measure(spans);
-        black_box(index_entries(batch, &spec, &idx_schema));
-        let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
-        assert_eq!((entries.len(), spans.len()), (live, live * key_size), "{label}");
+        assert_eq!(spans.len(), live * key_size, "{label}");
+        // A span that leads the PK has no entries of its own: its entry is the source PK.
+        let entry = match spec.leads_pk() {
+            true => String::from("  n/a"),
+            false => {
+                black_box(index_entries(batch, &spec, &idx_schema));
+                let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
+                assert_eq!(entries.len(), live, "{label}");
+                format!("{:5.1}", entry as f64 / N as f64)
+            }
+        };
         println!(
-            "index_entries_bench {label:<40} spans {:5.1}, entries {:5.1} instr/row ({live} entries)",
+            "index_entries_bench {label:<40} spans {:5.1}, entries {entry} instr/row ({live} entries)",
             span as f64 / N as f64,
-            entry as f64 / N as f64,
         );
     };
     let spread = |row: usize| (row as u64).wrapping_mul(2_654_435_761);
