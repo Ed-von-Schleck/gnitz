@@ -397,8 +397,12 @@ pub fn apply_ddl(
     engine: &mut CatalogEngine,
     blocks: impl IntoIterator<Item = (SysFamily, Batch)>,
 ) -> Result<(), String> {
+    let mut families = DdlBundle::default();
+    for (family, batch) in blocks {
+        families.insert(family, batch)?;
+    }
     engine
-        .apply_bundle(bundle(blocks), &mut |_, _| Ok(()))
+        .apply_bundle(families, &mut |_, _| Ok(()))
         .map(drop)
         .map_err(refusal)
 }

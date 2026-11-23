@@ -37,7 +37,7 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
         // stops a re-pushed `+1` from leaving two live heads under one PK.
         let live = engine.retract_under(family, &[id]).negated();
         assert!(!live.is_empty(), "{family:?}: the fixture holds no live row");
-        let err = engine.precheck_family(family, &live).unwrap_err();
+        let err = precheck(&engine, family, &live).unwrap_err();
         assert!(err.contains("net weight 2"), "{family:?}: {err}");
 
         // A retraction in the shape the family admits: a rewrite pair where it
@@ -61,7 +61,7 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
             (unused, "no longer exists"),
             (unused + 1, "no longer exists"),
         ] {
-            let err = engine.precheck_family(family, &retraction(leading)).unwrap_err();
+            let err = precheck(&engine, family, &retraction(leading)).unwrap_err();
             assert!(err.contains(why), "{family:?}: {err}");
         }
     }

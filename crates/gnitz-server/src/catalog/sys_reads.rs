@@ -26,14 +26,6 @@ impl CatalogEngine {
         self.sys_relation(family).unique_live_row_at(&gnitz_wire::sys_key(id))
     }
 
-    /// View `id`'s circuit, decoded from its `circuits` row.
-    pub(in crate::catalog) fn read_circuit(&self, id: u64) -> Result<gnitz_wire::Circuit, String> {
-        let row = self.live_sys_row(SysFamily::Circuit, id).ok_or("has no circuit row")?;
-        let (src, ri) = row.source();
-        let Ok(stored) = gnitz_wire::CircuitRow::read(src, ri);
-        gnitz_wire::Circuit::decode(&stored.circuit)
-    }
-
     /// Whether `tid` is a SERIAL table, from its live TABLE_TAB row; `false` for
     /// a view or an id no table holds.
     pub(in crate::catalog) fn is_serial(&self, tid: u64) -> bool {

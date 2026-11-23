@@ -590,7 +590,7 @@ fn test_dependent_view_restricts_fire_from_registered_views() {
 
     // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
     let pair = col_alter_pair(tid, 1, &cols[1], |c| c.def.is_nullable = true);
-    let err = engine.precheck_family(SysFamily::Column, &pair).unwrap_err();
+    let err = precheck(&engine, SysFamily::Column, &pair).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 
     engine.close();
@@ -707,18 +707,16 @@ fn an_index_name_is_claimed_once() {
     let live = index(&mut engine, 1, "ix");
     apply_ddl(&mut engine, [(SysFamily::Index, live)]).unwrap();
     let second = index(&mut engine, 2, "ix");
-    let err = engine.precheck_family(SysFamily::Index, &second).unwrap_err();
+    let err = precheck(&engine, SysFamily::Index, &second).unwrap_err();
     assert_eq!(err, "Index already exists: ix");
 
     let mut twice = index(&mut engine, 2, "other");
     twice.append_batch(&index(&mut engine, 1, "other"));
-    let err = engine.precheck_family(SysFamily::Index, &twice).unwrap_err();
+    let err = precheck(&engine, SysFamily::Index, &twice).unwrap_err();
     assert_eq!(err, "Index already exists: other");
 
     engine.drop_index("ix").unwrap();
-    engine
-        .precheck_family(SysFamily::Index, &second)
-        .expect("a dropped index frees its name");
+    precheck(&engine, SysFamily::Index, &second).expect("a dropped index frees its name");
 
     engine.close();
 }

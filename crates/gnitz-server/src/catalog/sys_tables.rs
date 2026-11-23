@@ -13,8 +13,8 @@ use std::sync::LazyLock;
 
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::{
-    CatalogColumn, ColTabRow, ColTabSlot, IdxTabRow, PkColList, SchemaTabRow, SysRow, TableProps, TableTabRow,
-    ViewParts, ViewTabRow,
+    BitIter, CatalogColumn, ColTabRow, ColTabSlot, IdxTabRow, PkColList, RowSource, SchemaTabRow, SysRow, TableProps,
+    TableTabRow, ViewParts, ViewTabRow,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -119,15 +119,6 @@ impl PkSignature {
         }
     }
 
-    /// The DDL verb this shape performs, for guard messages.
-    pub(super) fn verb(&self) -> &'static str {
-        match self.shape() {
-            PkShape::Pair => "ALTER",
-            PkShape::Drop => "DROP",
-            PkShape::Create => "CREATE",
-        }
-    }
-
     /// How a guard message names the `family` row this key addresses.
     pub(super) fn label(&self, family: SysFamily) -> String {
         match self.member {
@@ -173,14 +164,108 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     sigs
 }
 
+/// Whether row `ra` of `a` and row `rb` of `b` differ in a payload column outside
+/// `mask` (bit `pi` exempts payload column `pi`). A system schema holds no
+/// nullable column; STRING/BLOB compare by content through each side's own heap.
+pub(super) fn payload_differs(
+    schema: &SchemaDescriptor,
+    mask: u64,
+    a: &impl RowSource,
+    ra: usize,
+    b: &impl RowSource,
+    rb: usize,
+) -> bool {
+    BitIter(schema.payload_slots() & !mask).any(|pi| schema.payload_locator(pi).cmp_non_null(a, ra, b, rb).is_ne())
+}
+
+/// The rules a system batch must satisfy on its own, before any store is read,
+/// and its signatures.
+pub(super) fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature>, String> {
+    let noun = family.row_noun();
+    // A system row carries weight ±1: a zero weight carries no contract, and the
+    // engine's retractions emit a hard `-1`, which would leave `w - 1` of a heavier row.
+    if let Some(w) = (0..batch.len())
+        .map(|i| batch.get_weight(i))
+        .find(|w| w.unsigned_abs() != 1)
+    {
+        return Err(format!(
+            "catalog delta carries a {noun} row at weight {w} (expected ±1)"
+        ));
+    }
+    let sigs = pk_signatures(batch);
+    for sig in &sigs {
+        // At most one row per sign: two `+1` rows on one PK consolidate to weight 2.
+        if sig.repeats_a_sign {
+            return Err(format!(
+                "system-catalog write carries more than one row for {}",
+                sig.label(family)
+            ));
+        }
+        if family.retracts_with_owner() && sig.shape() == PkShape::Drop {
+            return Err(format!(
+                "a {noun} is retracted only with its owner ({})",
+                sig.label(family)
+            ));
+        }
+        // Bootstrap-owned ids sit below `FIRST_USER_TABLE_ID`. That is a property
+        // of the id space rather than of the mutation's shape, so it covers every
+        // sign: a `-1` drops a bootstrap row, a bare `+1` aliases a bootstrap id
+        // into the name indexes, and a pair renames one.
+        if sig.leading < gnitz_wire::FIRST_USER_TABLE_ID {
+            let verb = match sig.shape() {
+                PkShape::Pair => "ALTER",
+                PkShape::Drop => "DROP",
+                PkShape::Create => "CREATE",
+            };
+            return Err(format!("cannot {verb} a system {noun} ({})", sig.label(family)));
+        }
+        // A rewrite pair's `+1` may differ from its `-1` only in the family's
+        // declared mask; a family declaring none admits no pair.
+        if let (Some(nj), Some(pj)) = (sig.neg, sig.pos) {
+            let Some(mask) = family.pair_change_mask() else {
+                return Err(format!("a {noun} admits no rewrite pair ({})", sig.label(family)));
+            };
+            if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
+                return Err(format!(
+                    "a system-catalog rewrite pair on {} changes a field it may not",
+                    sig.label(family)
+                ));
+            }
+        }
+    }
+    Ok(sigs)
+}
+
+/// One family's block of a `DDL_TXN` bundle, which [`check_batch_shape`]
+/// admitted, with the signatures it answered.
+pub(crate) struct Block {
+    pub(in crate::catalog) batch: Batch,
+    pub(in crate::catalog) sigs: Vec<PkSignature>,
+}
+
+impl Block {
+    /// The ids of the rows the block creates.
+    pub(in crate::catalog) fn creates(&self) -> impl Iterator<Item = u64> {
+        self.sigs
+            .iter()
+            .filter(|s| s.shape() == PkShape::Create)
+            .map(|s| s.leading)
+    }
+
+    /// The leading ids of the rows the block leaves live: its creates and pairs.
+    pub(in crate::catalog) fn live_ids(&self) -> impl Iterator<Item = u64> + Clone {
+        self.sigs.iter().filter(|s| s.pos.is_some()).map(|s| s.leading)
+    }
+}
+
 /// One `DDL_TXN` bundle: at most one block per system family, and none for a
 /// family only the master writes (see [`SysFamilyExt::master_only`]).
 #[derive(Default)]
-pub(crate) struct DdlBundle([Option<Batch>; SysFamily::COUNT]);
+pub(crate) struct DdlBundle([Option<Block>; SysFamily::COUNT]);
 
 impl DdlBundle {
-    /// Add `family`'s block; `Err` for a family the wire may not write, or when
-    /// the bundle already carries one.
+    /// Add `family`'s block; `Err` for a family the wire may not write, for a
+    /// block [`check_batch_shape`] refuses, or when the bundle already carries one.
     pub(crate) fn insert(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
         if family.master_only() {
             return Err(format!(
@@ -189,17 +274,17 @@ impl DdlBundle {
                 family.name()
             ));
         }
-        match &mut self.0[family.index()] {
-            Some(_) => Err(format!("bundle carries two blocks for family {}", family.id())),
-            slot => {
-                *slot = Some(batch);
-                Ok(())
-            }
+        let slot = &mut self.0[family.index()];
+        if slot.is_some() {
+            return Err(format!("bundle carries two blocks for family {}", family.id()));
         }
+        let sigs = check_batch_shape(family, &batch)?;
+        *slot = Some(Block { batch, sigs });
+        Ok(())
     }
 
     /// `family`'s block, if the bundle carries one.
-    pub(crate) fn get(&self, family: SysFamily) -> Option<&Batch> {
+    pub(crate) fn get(&self, family: SysFamily) -> Option<&Block> {
         self.0[family.index()].as_ref()
     }
 
@@ -210,10 +295,7 @@ impl DdlBundle {
 
     /// The ids of the rows the bundle's `family` block creates.
     pub(in crate::catalog) fn creates(&self, family: SysFamily) -> impl Iterator<Item = u64> {
-        let sigs = self.get(family).map(pk_signatures).unwrap_or_default();
-        sigs.into_iter()
-            .filter(|s| s.shape() == PkShape::Create)
-            .map(|s| s.leading)
+        self.get(family).into_iter().flat_map(Block::creates)
     }
 
     /// The distinct `(owner, cols)` of every unique index the bundle's IDX_TAB
@@ -221,11 +303,11 @@ impl DdlBundle {
     /// precheck. A row that does not decode is skipped; the precheck refuses the
     /// bundle over it.
     pub(crate) fn unique_index_creates(&self) -> Vec<(u64, PkColList)> {
-        let Some(batch) = self.get(SysFamily::Index) else {
+        let Some(Block { batch, sigs }) = self.get(SysFamily::Index) else {
             return Vec::new();
         };
-        let mut creates: Vec<_> = pk_signatures(batch)
-            .into_iter()
+        let mut creates: Vec<_> = sigs
+            .iter()
             .filter(|s| s.shape() == PkShape::Create)
             .filter_map(|s| IdxTabRow::read(batch, s.row).ok())
             .filter_map(|r| r.is_unique.then_some((r.owner_id, r.source_col_idx)))
@@ -236,7 +318,7 @@ impl DdlBundle {
     }
 
     /// The blocks in [`SysFamily::ALL`] order.
-    pub(in crate::catalog) fn into_blocks(self) -> impl Iterator<Item = (SysFamily, Batch)> {
+    pub(in crate::catalog) fn into_blocks(self) -> impl Iterator<Item = (SysFamily, Block)> {
         SysFamily::ALL
             .into_iter()
             .zip(self.0)
@@ -477,9 +559,8 @@ impl IdSet {
     pub(in crate::catalog) fn ids(&self) -> &[u64] {
         &self.0
     }
-
-    /// These ids and `more`.
-    pub(in crate::catalog) fn with(self, more: impl IntoIterator<Item = u64>) -> Self {
-        IdSet::new(self.0.into_iter().chain(more))
-    }
 }
+
+#[cfg(test)]
+#[path = "tests/sys_tables.rs"]
+mod tests;

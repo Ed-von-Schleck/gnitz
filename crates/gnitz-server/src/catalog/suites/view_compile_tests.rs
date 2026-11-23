@@ -146,7 +146,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // Reusing the live name without retiring the incumbent is still a collision.
     let collide = sys_batch([(view_tab_row(new_vid, "vw"), 1)]);
     assert!(
-        engine.precheck_family(SysFamily::View, &collide).is_err(),
+        precheck(&engine, SysFamily::View, &collide).is_err(),
         "a second live view under one name must still be rejected"
     );
 
@@ -154,9 +154,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // is admitted. The `-1` reproduces the live row's full payload, which the
     // the retraction CAS requires.
     let replace = sys_batch([(view_tab_row(old_vid, "vw"), -1), (view_tab_row(new_vid, "vw"), 1)]);
-    engine
-        .precheck_family(SysFamily::View, &replace)
-        .expect("a bundle that retires the incumbent may reuse its name");
+    precheck(&engine, SysFamily::View, &replace).expect("a bundle that retires the incumbent may reuse its name");
 
     engine.close();
 }

@@ -36,6 +36,13 @@ use std::rc::Rc;
 use super::sys_tables::*;
 use super::*;
 
+/// `precheck_family` over `batch` as a bundle carries it: past the shape rules
+/// `DdlBundle::insert` holds it to.
+fn precheck(engine: &CatalogEngine, family: SysFamily, batch: &Batch) -> Result<IdSet, String> {
+    let sigs = check_batch_shape(family, batch)?;
+    engine.precheck_family(family, batch, &sigs)
+}
+
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
 fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> Rc<Batch> {
     let keys = pk_keys(opk.len(), [opk]);

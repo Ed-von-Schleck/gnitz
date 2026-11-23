@@ -28,7 +28,7 @@ fn a_name_that_is_not_utf8_is_refused() {
             }
         }
         bb.end_row();
-        let err = engine.precheck_family(family, &bb.finish()).unwrap_err();
+        let err = precheck(&engine, family, &bb.finish()).unwrap_err();
         assert!(err.contains("name is not UTF-8"), "{}: {err}", family.name());
     }
     engine.close();
@@ -44,22 +44,17 @@ fn a_schema_row_takes_the_full_identifier_rule_once_per_name() {
     let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
 
     for (name, why) in [("_x", "cannot start with '_'"), ("MixedCase", "not canonical")] {
-        let err = engine
-            .precheck_family(SysFamily::Schema, &schema_tab_batch(&[(a, name, 1)]))
-            .unwrap_err();
+        let err = precheck(&engine, SysFamily::Schema, &schema_tab_batch(&[(a, name, 1)])).unwrap_err();
         assert!(err.contains(why), "{name:?}: {err}");
     }
     for (rows, taken) in [
         (&[(a, "twice", 1), (b, "twice", 1)][..], "twice"),
         (&[(a, "public", 1)], "public"),
     ] {
-        let err = engine
-            .precheck_family(SysFamily::Schema, &schema_tab_batch(rows))
-            .unwrap_err();
+        let err = precheck(&engine, SysFamily::Schema, &schema_tab_batch(rows)).unwrap_err();
         assert!(err.contains(&format!("Schema already exists: {taken}")), "{err}");
     }
-    engine
-        .precheck_family(SysFamily::Schema, &schema_tab_batch(&[(a, "twice", 1)]))
+    precheck(&engine, SysFamily::Schema, &schema_tab_batch(&[(a, "twice", 1)]))
         .expect("one row under the name is legal");
 
     engine.close();
@@ -73,7 +68,7 @@ fn an_index_row_name_must_be_canonical() {
     let id = engine.allocate_ids(1).unwrap();
 
     let mixed = idx_tab_batch(id, tid, &[1], "MixedCase", false, 1);
-    let err = engine.precheck_family(SysFamily::Index, &mixed).unwrap_err();
+    let err = precheck(&engine, SysFamily::Index, &mixed).unwrap_err();
     assert!(err.contains("not canonical"), "{err}");
 
     engine.close();
@@ -95,7 +90,7 @@ fn an_index_row_repeating_a_column_is_refused() {
     };
     let word = 2 | 1 << 4 | 1 << 11;
     let batch = crate::test_support::forged_sys_batch(row, gnitz_wire::IdxTabSlot::source_col_idx as usize, word);
-    let err = engine.precheck_family(SysFamily::Index, &batch).unwrap_err();
+    let err = precheck(&engine, SysFamily::Index, &batch).unwrap_err();
     assert!(err.contains("names column 1 twice"), "{err}");
 
     engine.close();
@@ -157,16 +152,14 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
             with_option.as_str(),
         ),
     ] {
-        let err = engine.precheck_family(SysFamily::View, &view_rows(rows)).unwrap_err();
+        let err = precheck(&engine, SysFamily::View, &view_rows(rows)).unwrap_err();
         assert!(err.contains(why), "{rows:?}: {err}");
     }
     for rows in [
         &[(vid, "v", 0, 4 << 20)][..],
         &[(vid, "_seg", user, 0), (user, "user", 0, 0)],
     ] {
-        engine
-            .precheck_family(SysFamily::View, &view_rows(rows))
-            .unwrap_or_else(|e| panic!("{rows:?}: {e}"));
+        precheck(&engine, SysFamily::View, &view_rows(rows)).unwrap_or_else(|e| panic!("{rows:?}: {e}"));
     }
 
     engine.close();

@@ -70,13 +70,6 @@ impl CatalogEngine {
         self.caches.relation_by_name.get(&schema_id)?.get(name).copied()
     }
 
-    fn relation_entry(&self, tid: u64) -> &RelationEntry {
-        self.caches
-            .relations
-            .get(&tid)
-            .expect("every registered relation has an entry")
-    }
-
     /// `tid`'s relation and its shape record, which a push's blob is checked
     /// against and its SAL push groups carry; `None` for an unregistered id.
     pub(crate) fn shape_target(&self, tid: u64) -> Option<(&Relation, &[u8])> {
@@ -100,7 +93,11 @@ impl CatalogEngine {
     /// changes exactly when a RESOLVE of that name would answer differently.
     pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(Vec<u8>, u64)> {
         let rel = self.registry.relation(tid)?;
-        let entry = self.relation_entry(tid);
+        let entry = self
+            .caches
+            .relations
+            .get(&tid)
+            .expect("every registered relation has an entry");
         let desc = RelDescriptorBlob {
             class: rel.kind().class(),
             pk_repeats: rel.pk_repeats(),

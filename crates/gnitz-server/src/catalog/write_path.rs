@@ -1,4 +1,4 @@
-//! Catalog write path: `apply_bundle` over `submit` (precheck → owned-row cascade →
+//! Catalog write path: `apply_bundle` (precheck → owned-row cascade →
 //! layout through the caller's sink → ingest → `fire_hooks`), the undo of a
 //! refused write, what an applied bundle did, and the zone pin.
 
@@ -8,7 +8,7 @@ use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 
 use super::CatalogEngine;
-use super::sys_tables::{DdlBundle, IdSet, PkShape, SysFamily, SysFamilyExt, pk_signatures};
+use super::sys_tables::{Block, DdlBundle, IdSet, PkShape, SysFamily, SysFamilyExt, pk_signatures};
 
 /// Where a catalog write lays each group out, before applying it. An `Err`
 /// refuses the write, which leaves the catalog as it was.
@@ -76,33 +76,6 @@ impl AppliedDdl {
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
 
-    /// Precheck one system-family delta and apply it with the retraction of every
-    /// system row its dropped relations own. Each group is laid out through
-    /// `sink`, then pushed onto `zone` before its ingest, which can fail after
-    /// writing rows the undo must negate.
-    fn submit(
-        &mut self,
-        family: SysFamily,
-        batch: Batch,
-        zone: &mut Vec<ZoneGroup>,
-        sink: &mut ZoneSink<'_>,
-    ) -> Result<(), WireFault> {
-        let dropped = self.precheck_family(family, &batch)?;
-        for (family, batch) in self.with_owned_retractions(family, batch, dropped) {
-            if batch.is_empty() {
-                continue;
-            }
-            sink(family, &batch)?;
-            // What a worker's `ddl_sync` of this group will read: it applies the
-            // same groups in the same order.
-            let scanned = self.dag.is_scanned(family.id());
-            zone.push(ZoneGroup { family, batch, scanned });
-            let applied = &zone[zone.len() - 1].batch;
-            self.apply_family(family, applied, Landing::CUT)?;
-        }
-        Ok(())
-    }
-
     /// `batch` with the retraction of every row its dropped relations own, in
     /// reversed apply order: an index's hook reads its owner, and undoing the drop
     /// re-registers the owner from its circuit and column rows.
@@ -118,7 +91,8 @@ impl CatalogEngine {
                     && !owners.contains(gnitz_wire::sys_leading_id(s.get_pk_bytes(i)))
             });
             if !segs.is_empty() {
-                owners = owners.with((0..segs.len()).map(|i| gnitz_wire::sys_leading_id(segs.get_pk_bytes(i))));
+                let seg_ids = (0..segs.len()).map(|i| gnitz_wire::sys_leading_id(segs.get_pk_bytes(i)));
+                owners = IdSet::new(owners.ids().iter().copied().chain(seg_ids));
                 let mut merged = segs.negated();
                 merged.append_batch(&batch);
                 batch = merged;
@@ -174,11 +148,14 @@ impl CatalogEngine {
         })
     }
 
-    /// The cross-family guards, then each family through [`Self::submit`]. A bundle
-    /// that creates is applied in [`SysFamily::ALL`] order, so every register hook
+    /// The cross-family guards, then each family's precheck and its apply with the
+    /// retraction of every system row its dropped relations own. A bundle that
+    /// creates is applied in [`SysFamily::ALL`] order, so every register hook
     /// finds the families it reads applied; one that only drops in the reverse, so
-    /// a dependent is retired first. Answers the ids the bundle created; on `Err`,
-    /// `zone` holds what was applied.
+    /// a dependent is retired first. Each group is laid out through `sink`, then
+    /// pushed onto `zone` before its ingest, which can fail after writing rows the
+    /// undo must negate. Answers the ids the bundle created; on `Err`, `zone`
+    /// holds what was applied.
     fn apply_families(
         &mut self,
         families: DdlBundle,
@@ -186,12 +163,27 @@ impl CatalogEngine {
         sink: &mut ZoneSink<'_>,
     ) -> Result<FxHashSet<u64>, WireFault> {
         let created = self.precheck_bundle(&families)?;
-        let mut ordered: Vec<(SysFamily, Batch)> = families.into_blocks().collect();
-        if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
+        let mut ordered: Vec<(SysFamily, Block)> = families.into_blocks().collect();
+        if ordered
+            .iter()
+            .all(|(_, b)| b.sigs.iter().all(|s| s.shape() == PkShape::Drop))
+        {
             ordered.reverse();
         }
-        for (family, batch) in ordered {
-            self.submit(family, batch, zone, sink)?;
+        for (family, Block { batch, sigs }) in ordered {
+            let dropped = self.precheck_family(family, &batch, &sigs)?;
+            for (family, batch) in self.with_owned_retractions(family, batch, dropped) {
+                if batch.is_empty() {
+                    continue;
+                }
+                sink(family, &batch)?;
+                // What a worker's `ddl_sync` of this group will read: it applies the
+                // same groups in the same order.
+                let scanned = self.dag.is_scanned(family.id());
+                zone.push(ZoneGroup { family, batch, scanned });
+                let applied = &zone[zone.len() - 1].batch;
+                self.apply_family(family, applied, Landing::CUT)?;
+            }
         }
         Ok(created)
     }

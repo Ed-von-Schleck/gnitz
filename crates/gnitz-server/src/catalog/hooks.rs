@@ -46,7 +46,12 @@ impl CatalogEngine {
         let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice())?;
         let (placement, pk_repeats, compress, traces) = match rel.detail {
             RelDetail::View(ViewParts { owner, pk_repeats, props }) => {
-                let circuit = self.read_circuit(rel.id)?;
+                let row = self
+                    .live_sys_row(SysFamily::Circuit, rel.id)
+                    .ok_or("has no circuit row")?;
+                let (src, ri) = row.source();
+                let Ok(stored) = gnitz_wire::CircuitRow::read(src, ri);
+                let circuit = gnitz_wire::Circuit::decode(&stored.circuit)?;
                 let chain = owner.unwrap_or(rel.id);
                 for src in circuit.sources() {
                     if SysFamily::from_id(src).is_some_and(SysFamilyExt::master_only) {
@@ -132,22 +137,20 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Tear relation `id` out of the registry and the DAG. Its owned system rows are
-    /// retracted by the rows that dropped it (see `with_owned_retractions`), never from here; its
-    /// directory is left to the orphan sweep.
-    fn unregister_relation(&mut self, id: u64) {
-        self.dag.forget(id);
-        self.registry.unregister(id);
-        self.caches.remove(id);
-    }
-
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
     /// create; a rename pair carries both and is neither.
     fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let mut creates: Vec<(u64, usize)> = Vec::new();
         for sig in pk_signatures(batch) {
             match sig.shape() {
-                PkShape::Drop => self.unregister_relation(sig.leading),
+                // Torn out of the registry and the DAG. Its owned system rows are
+                // retracted by the rows that dropped it (see `with_owned_retractions`),
+                // never from here; its directory is left to the orphan sweep.
+                PkShape::Drop => {
+                    self.dag.forget(sig.leading);
+                    self.registry.unregister(sig.leading);
+                    self.caches.remove(sig.leading);
+                }
                 PkShape::Create => creates.push((sig.leading, sig.row)),
                 PkShape::Pair => {}
             }

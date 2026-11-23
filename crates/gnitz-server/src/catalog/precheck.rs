@@ -3,22 +3,19 @@
 //! catalog-level guards. A created view's circuit and the rules on what it
 //! scans are refused by its register hook, and `apply_bundle` undoes the
 //! bundle.
-use std::borrow::Cow;
-
 use gnitz_store::relation::{IndexClaim, Relation};
 use gnitz_wire::{
-    BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef, IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, SchemaTabSlot,
-    TableProps, ViewParts, payload_bytes, validate_user_identifier,
+    CatalogColumn, ColTabRow, FixedInt, IdxTabRow, IdxTabSlot, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
+    payload_bytes, validate_user_identifier,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashSet;
 
 use super::CatalogEngine;
 use super::sys_tables::{
     DdlBundle, IdSet, PkShape, PkSignature, RelDetail, RelRow, SYSTEM_SCHEMA_ID, SysFamily, SysFamilyExt,
-    build_schema_from_col_defs, pk_signatures, read_rel_row,
+    build_schema_from_col_defs, payload_differs, read_rel_row,
 };
 
 /// The name rule a schema, relation or index row must satisfy to be stored: a
@@ -41,103 +38,6 @@ fn check_stored_name(name: &str, noun: &str, segment: bool) -> Result<(), String
     Ok(())
 }
 
-/// A system row carries weight ±1: a zero weight carries no contract, and the
-/// engine's retractions emit a hard `-1`, which would leave `w - 1` of a heavier row.
-fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
-    for i in 0..batch.len() {
-        let w = batch.get_weight(i);
-        if w.unsigned_abs() != 1 {
-            return Err(format!(
-                "catalog delta carries a {} row at weight {w} (expected ±1)",
-                family.row_noun()
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// At most one row per sign: two `+1` rows on one PK consolidate to weight 2.
-fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
-    if sig.repeats_a_sign {
-        return Err(format!(
-            "system-catalog write carries more than one row for {}",
-            sig.label(family)
-        ));
-    }
-    Ok(())
-}
-
-/// Bootstrap-owned ids sit below [`gnitz_wire::FIRST_USER_TABLE_ID`]. That is a
-/// property of the id space rather than of the mutation's shape, so it covers
-/// every sign: a `-1` drops a bootstrap row, a bare `+1` aliases a bootstrap id
-/// into the name indexes, and a pair renames one.
-fn check_bootstrap_id(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
-    if sig.leading < gnitz_wire::FIRST_USER_TABLE_ID {
-        return Err(format!(
-            "cannot {} a system {} ({})",
-            sig.verb(),
-            family.row_noun(),
-            sig.label(family)
-        ));
-    }
-    Ok(())
-}
-
-/// Whether row `ra` of `a` and row `rb` of `b` differ in a payload column outside
-/// `mask` (bit `pi` exempts payload column `pi`). A system schema holds no
-/// nullable column; STRING/BLOB compare by content through each side's own heap.
-fn payload_differs(
-    schema: &SchemaDescriptor,
-    mask: u64,
-    a: &impl RowSource,
-    ra: usize,
-    b: &impl RowSource,
-    rb: usize,
-) -> bool {
-    BitIter(schema.payload_slots() & !mask).any(|pi| schema.payload_locator(pi).cmp_non_null(a, ra, b, rb).is_ne())
-}
-
-/// A rewrite pair's `+1` may differ from its `-1` only in the family's declared
-/// mask; a family declaring none admits no pair.
-fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<(), String> {
-    let (Some(nj), Some(pj)) = (sig.neg, sig.pos) else {
-        return Ok(());
-    };
-    let Some(mask) = family.pair_change_mask() else {
-        return Err(format!(
-            "a {} admits no rewrite pair ({})",
-            family.row_noun(),
-            sig.label(family)
-        ));
-    };
-    if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
-        return Err(format!(
-            "a system-catalog rewrite pair on {} changes a field it may not",
-            sig.label(family)
-        ));
-    }
-    Ok(())
-}
-
-/// The rules a system batch must satisfy on its own, before any store is read.
-fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature>, String> {
-    check_row_weights(family, batch)?;
-    let sigs = pk_signatures(batch);
-    for sig in &sigs {
-        check_pk_multiplicity(family, sig)?;
-        if family.retracts_with_owner() && sig.shape() == PkShape::Drop {
-            return Err(format!(
-                "a {} is retracted only with its owner ({})",
-                family.row_noun(),
-                sig.label(family)
-            ));
-        }
-        check_bootstrap_id(family, sig)?;
-        check_pair_fields(family, batch, sig)?;
-    }
-    Ok(sigs)
-}
-
 /// Whether column `col` of `parent` is a legal FK target: its lone PK column, or a
 /// column a single-column UNIQUE index covers through a claim outside `dropping`.
 /// A composite index never qualifies: a unique `(a, b)` does not make `a` alone
@@ -151,174 +51,7 @@ fn holds_fk_target(parent: &Relation, col: u32, dropping: &IdSet) -> bool {
         })
 }
 
-/// A circuit `+1` may only name a view this same transaction creates — one under
-/// a foreign `view_id` would pin its source table's drop or rewrite a running
-/// circuit.
-fn check_circuit_rows(batch: &Batch, created: &IdSet) -> Result<(), String> {
-    for i in batch.live_rows() {
-        let view_id = gnitz_wire::sys_leading_id(batch.get_pk_bytes(i));
-        if !created.contains(view_id) {
-            return Err(format!(
-                "a circuit names view {view_id}, which this transaction does not create"
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl CatalogEngine {
-    /// Check FK column `col` of relation `self_table_id`, about to be registered
-    /// with `self_schema` over `self_cols`. `dropped` is what the same TABLE_TAB
-    /// delta drops.
-    fn validate_fk_column(
-        &self,
-        col: &CatalogColumn,
-        fk: FkRef,
-        self_table_id: u64,
-        self_cols: &[CatalogColumn],
-        self_schema: &SchemaDescriptor,
-        dropped: &IdSet,
-    ) -> Result<(), String> {
-        let child = &col.def.name;
-        let target_type = if fk.table_id == self_table_id {
-            let Some(target) = self_cols.get(fk.col as usize) else {
-                return Err(format!(
-                    "FK column '{child}' references column {} of its own table, which has {} columns",
-                    fk.col,
-                    self_cols.len()
-                ));
-            };
-            // Self-referential FK: the table has no UNIQUE index yet — not even
-            // one its own CREATE declares — so the target must be its lone PK
-            // column. The downstream probe reads the referenced value out of the
-            // packed PK region, which is the whole key only when the PK is a
-            // single column.
-            if self_schema.lone_pk_col() != Some(fk.col as usize) {
-                return Err(format!(
-                    "FK column '{child}' references '{}' of its own table; a self-referencing FK \
-                     must reference the table's lone primary key column",
-                    target.def.name
-                ));
-            }
-            target.def.ty
-        } else {
-            if dropped.contains(fk.table_id) {
-                return Err(format!(
-                    "FK column '{child}' references {}, which this transaction drops",
-                    self.qualified_name(fk.table_id)
-                ));
-            }
-            let entry = self
-                .registry
-                .relation(fk.table_id)
-                .ok_or_else(|| format!("FK column '{child}' references unknown table_id {}", fk.table_id))?;
-            let parent = self.qualified_name(fk.table_id);
-            // Not covered by the PK/UNIQUE tests below, which read the parent's
-            // key and index claims but not its kind: a stream's or a view's PK
-            // looks like a base table's without being the unique, stored key the
-            // parent probe reads.
-            if !entry.kind().is_base_table() {
-                return Err(format!(
-                    "FK column '{child}' references {parent}, which is a {}; \
-                     a FOREIGN KEY must reference a base table",
-                    entry.kind().noun()
-                ));
-            }
-            let defs = self.read_column_defs(fk.table_id)?;
-            let Some(target) = defs.get(fk.col as usize) else {
-                return Err(format!(
-                    "FK column '{child}' references column {} of {parent}, which has {} columns",
-                    fk.col,
-                    defs.len()
-                ));
-            };
-            // No index counts as dropping here: `dropped` holds this delta's
-            // relation ids, and an index drop arrives in the index family's delta.
-            if !holds_fk_target(entry, fk.col, &IdSet::default()) {
-                return Err(format!(
-                    "FK column '{child}' references {parent}.{}, which is neither its lone \
-                     primary key nor covered by a single-column UNIQUE index",
-                    target.def.name
-                ));
-            }
-            target.def.ty
-        };
-
-        // The preflight compares child and parent values as the referenced
-        // column's key image, so both columns carry one type; SQL adopts the
-        // parent's type before the engine sees the column.
-        if col.def.ty != target_type {
-            return Err(format!(
-                "FK type mismatch: child type {} cannot reference target type {target_type}",
-                col.def.ty
-            ));
-        }
-        Ok(())
-    }
-
-    /// Claim `(schema, name)` for `self_id`, refused when an existing relation
-    /// holds it. A rewrite pair that leaves the name unchanged re-registers the
-    /// incumbent, so `existing == self_id` is not one.
-    ///
-    /// `dropped` is what this same family's delta drops. An incumbent among them
-    /// is not a collision: an ALTER VIEW retires an id and registers another
-    /// under the same name, and the retired id is returned. The name index is
-    /// read before apply, so it still maps the name to the outgoing id.
-    fn claim_qname<'a>(
-        &self,
-        sid: u64,
-        name: Cow<'a, str>,
-        self_id: u64,
-        dropped: &IdSet,
-        claimed: &mut FxHashSet<(u64, Cow<'a, str>)>,
-    ) -> Result<Option<u64>, String> {
-        let schema_name = self
-            .schema_name(sid)
-            .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
-        let incumbent = self.relation_id(sid, &name).filter(|&existing| existing != self_id);
-        let displaced = incumbent.filter(|&e| dropped.contains(e));
-        if incumbent != displaced || !claimed.insert((sid, name.clone())) {
-            return Err(format!(
-                "Table or view already exists: {}",
-                gnitz_wire::qualified_key(&schema_name, &name)
-            ));
-        }
-        Ok(displaced)
-    }
-
-    /// The `-1` must content-equal the live row — you may only retract the
-    /// element that exists — and `live + Σ batch` must land in `{0, 1}`: the sys
-    /// stores run no `enforce_unique_pk`, so nothing else stops a duplicate live
-    /// head or a persistent negative ghost.
-    fn check_cas_and_net(&self, family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<(), String> {
-        let noun = family.row_noun();
-        let live = self
-            .sys_relation(family)
-            .unique_live_row_at(batch.get_pk_bytes(sig.row));
-        if let Some(nj) = sig.neg {
-            let Some(sr) = live.as_ref() else {
-                return Err(format!(
-                    "catalog changed concurrently: retracting a {noun} that no longer exists"
-                ));
-            };
-            let (src, ri) = sr.source();
-            if payload_differs(family.schema(), 0, src, ri, batch, nj) {
-                return Err(format!(
-                    "catalog changed concurrently: the retracted {noun} differs from the current one"
-                ));
-            }
-        }
-        // `check_batch_shape` admitted at most one row of each sign, each of weight ±1.
-        let net = i64::from(live.is_some()) + sig.pos.is_some() as i64 - sig.neg.is_some() as i64;
-        if !(0..=1).contains(&net) {
-            return Err(format!(
-                "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
-                sig.label(family)
-            ));
-        }
-        Ok(())
-    }
-
     /// What a COL_TAB write means once [`Self::precheck_family`] has settled
     /// its shape: everything below depends on the *owner*, which the contract
     /// cannot see. The guards are scoped to the transition rather than blanket —
@@ -336,7 +69,7 @@ impl CatalogEngine {
             let old = sig.neg.map(decode).transpose()?;
 
             // An unregistered owner is one this bundle creates;
-            // `check_column_owners` owns those rows. A `-1` names a live record,
+            // `precheck_bundle` owns those rows. A `-1` names a live record,
             // whose owner is registered.
             let Some(owner) = self.registry.relation(owner_id) else {
                 continue;
@@ -466,26 +199,56 @@ impl CatalogEngine {
         ))
     }
 
-    /// Validate one family of a `DDL_TXN` against the catalog as the bundle's
-    /// earlier families left it: [`check_batch_shape`], the CAS and net bound per
-    /// PK against the live store, then the family's own guards. Returns the ids
-    /// the delta drops: the PKs of Drop shape (a rename pair's `-1` is not a
-    /// drop). With every system PK held to net weight 0 or 1, those are exactly
-    /// the PKs the delta leaves dead.
+    /// Validate one family of a `DDL_TXN`, whose shape [`check_batch_shape`]
+    /// admitted with `sigs`, against the catalog as the bundle's earlier families
+    /// left it: the CAS and net bound per PK against the live store, then the
+    /// family's own guards. Returns the ids the delta drops: the PKs of Drop shape
+    /// (a rename pair's `-1` is not a drop). With every system PK held to net
+    /// weight 0 or 1, those are exactly the PKs the delta leaves dead.
     ///
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
-    pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<IdSet, String> {
-        let sigs = check_batch_shape(family, batch)?;
-        for sig in &sigs {
-            self.check_cas_and_net(family, batch, sig)?;
+    pub(in crate::catalog) fn precheck_family(
+        &self,
+        family: SysFamily,
+        batch: &Batch,
+        sigs: &[PkSignature],
+    ) -> Result<IdSet, String> {
+        let (noun, store) = (family.row_noun(), self.sys_relation(family));
+        for sig in sigs {
+            // The `-1` must content-equal the live row — you may only retract the
+            // element that exists — and `live + Σ batch` must land in `{0, 1}`: the
+            // sys stores run no `enforce_unique_pk`, so nothing else stops a
+            // duplicate live head or a persistent negative ghost.
+            let live = store.unique_live_row_at(batch.get_pk_bytes(sig.row));
+            if let Some(nj) = sig.neg {
+                let Some(sr) = live.as_ref() else {
+                    return Err(format!(
+                        "catalog changed concurrently: retracting a {noun} that no longer exists"
+                    ));
+                };
+                let (src, ri) = sr.source();
+                if payload_differs(family.schema(), 0, src, ri, batch, nj) {
+                    return Err(format!(
+                        "catalog changed concurrently: the retracted {noun} differs from the current one"
+                    ));
+                }
+            }
+            // `check_batch_shape` admitted at most one row of each sign, each of weight ±1.
+            let net = i64::from(live.is_some()) + sig.pos.is_some() as i64 - sig.neg.is_some() as i64;
+            if !(0..=1).contains(&net) {
+                return Err(format!(
+                    "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
+                    sig.label(family)
+                ));
+            }
         }
         let dropped = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Drop).map(|s| s.leading));
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &dropped),
-            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &sigs, &dropped),
-            SysFamily::Column => self.precheck_column_family(batch, &sigs),
+            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, sigs, &dropped),
+            SysFamily::Column => self.precheck_column_family(batch, sigs),
             SysFamily::Index => self.precheck_index_family(batch, &dropped),
             SysFamily::Sequence | SysFamily::Circuit => Ok(()),
         }?;
@@ -497,30 +260,13 @@ impl CatalogEngine {
     /// families have not reached yet. Run before the first family is applied, so
     /// a rejection has written nothing. Answers the ids the bundle creates.
     pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<FxHashSet<u64>, String> {
-        let created = self.check_single_use(families)?;
-        let created_views = IdSet::new(families.creates(SysFamily::View));
-        if let Some(cols) = families.get(SysFamily::Column) {
-            let created = IdSet::new(
-                families
-                    .creates(SysFamily::Table)
-                    .chain(created_views.ids().iter().copied()),
-            );
-            self.check_column_owners(cols, &created, families.family_count() == 1)?;
-        }
-        if let Some(b) = families.get(SysFamily::Circuit) {
-            check_circuit_rows(b, &created_views)?;
-        }
-        Ok(created)
-    }
-
-    /// A create takes an id this boot allocated, once, across every family that
-    /// allocates ids from the one counter: an id the counter has not reached, one
-    /// an earlier boot handed out, one a committed bundle of this process
-    /// created, or one the bundle creates twice is refused. So an id never names
-    /// two objects, and a create never reopens a dropped relation's store. A
-    /// retraction needs no such rule: it names a live row, and none sits at or
-    /// above the counter. Answers the bundle's created ids.
-    fn check_single_use(&self, families: &DdlBundle) -> Result<FxHashSet<u64>, String> {
+        // A create takes an id this boot allocated, once, across every family that
+        // allocates ids from the one counter: an id the counter has not reached, one
+        // an earlier boot handed out, one a committed bundle of this process
+        // created, or one the bundle creates twice is refused. So an id never names
+        // two objects, and a create never reopens a dropped relation's store. A
+        // retraction needs no such rule: it names a live row, and none sits at or
+        // above the counter.
         let mut created = FxHashSet::default();
         let next_id = self.next_catalog_id();
         for family in SysFamily::ALL.into_iter().filter(|f| f.allocates_ids()) {
@@ -531,7 +277,7 @@ impl CatalogEngine {
                         family.row_noun()
                     ));
                 }
-                // An id below the bootstrap floor is the shape check's refusal.
+                // `DdlBundle::insert` refused an id below the bootstrap floor.
                 let earlier_boot = (gnitz_wire::FIRST_USER_TABLE_ID..self.id_floor).contains(&id);
                 if earlier_boot || self.used_ids.contains(&id) || !created.insert(id) {
                     return Err(format!(
@@ -541,30 +287,47 @@ impl CatalogEngine {
                 }
             }
         }
-        Ok(created)
-    }
-
-    /// Every column record must name an owner this bundle creates (`created`) or
-    /// the registry holds: a phantom owner is never dropped, so nothing would ever
-    /// retract the row. `alone` is whether COL_TAB is the bundle's only family.
-    fn check_column_owners(&self, cols: &Batch, created: &IdSet, alone: bool) -> Result<(), String> {
-        for i in cols.live_rows() {
-            let owner_id = gnitz_wire::sys_leading_id(cols.get_pk_bytes(i));
+        let created_views = IdSet::new(families.creates(SysFamily::View));
+        // Every column record must name an owner this bundle creates or the
+        // registry holds: a phantom owner is never dropped, so nothing would ever
+        // retract the row.
+        if let Some(cols) = families.get(SysFamily::Column) {
+            let created_owners = IdSet::new(
+                families
+                    .creates(SysFamily::Table)
+                    .chain(created_views.ids().iter().copied()),
+            );
             // An ALTER changes one column (a rewrite pair is one live row) and is
             // its bundle's only change: its descriptor swap runs last, and an ADD
             // COLUMN's cannot be undone, since the store refuses to narrow a schema.
-            if self.registry.relation(owner_id).is_some() {
-                if !alone || cols.live_rows().nth(1).is_some() {
-                    return Err("a column ALTER must be the only change in its DDL transaction".into());
+            let alter_alone = families.family_count() == 1 && cols.live_ids().nth(1).is_none();
+            for owner_id in cols.live_ids() {
+                if self.registry.relation(owner_id).is_some() {
+                    if !alter_alone {
+                        return Err("a column ALTER must be the only change in its DDL transaction".into());
+                    }
+                } else if !created_owners.contains(owner_id) {
+                    return Err(format!(
+                        "column record names owner {owner_id}, which this transaction \
+                         does not create and the catalog does not hold"
+                    ));
                 }
-            } else if !created.contains(owner_id) {
-                return Err(format!(
-                    "column record names owner {owner_id}, which this transaction \
-                     does not create and the catalog does not hold"
-                ));
             }
         }
-        Ok(())
+        // A circuit `+1` may only name a view this same transaction creates — one
+        // under a foreign `view_id` would pin its source table's drop or rewrite a
+        // running circuit.
+        let circuits = families.get(SysFamily::Circuit);
+        if let Some(view_id) = circuits
+            .into_iter()
+            .flat_map(|b| b.live_ids())
+            .find(|&view_id| !created_views.contains(view_id))
+        {
+            return Err(format!(
+                "a circuit names view {view_id}, which this transaction does not create"
+            ));
+        }
+        Ok(created)
     }
 
     /// The names the live rows of `family` hold at payload slot `slot`. A caller
@@ -617,32 +380,99 @@ impl CatalogEngine {
             unique_visible_names(&col_defs).map_err(|e| format!("{rel} {e}"))?;
         }
         let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
-        // An FK probes its parent's store on every write of the child, which only
-        // a base table's ingest runs; a stream push must stay a pure append.
-        if !rel.kind().is_base_table()
-            && let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some())
-        {
-            return Err(format!(
-                "{rel}: column '{}' may not carry a FOREIGN KEY; only a base table's may",
-                cd.def.name
-            ));
+        // `dropped` is what the same TABLE_TAB delta drops.
+        for cd in &col_defs {
+            let Some(fk) = cd.fk else { continue };
+            let child = &cd.def.name;
+            // An FK probes its parent's store on every write of the child, which only
+            // a base table's ingest runs; a stream push must stay a pure append.
+            if !rel.kind().is_base_table() {
+                return Err(format!(
+                    "{rel}: column '{child}' may not carry a FOREIGN KEY; only a base table's may"
+                ));
+            }
+            let target_ty = if fk.table_id == rel.id {
+                let Some(target) = col_defs.get(fk.col as usize) else {
+                    return Err(format!(
+                        "FK column '{child}' references column {} of its own table, which has {} columns",
+                        fk.col,
+                        col_defs.len()
+                    ));
+                };
+                // Self-referential FK: the table has no UNIQUE index yet — not even
+                // one its own CREATE declares — so the target must be its lone PK
+                // column. The downstream probe reads the referenced value out of the
+                // packed PK region, which is the whole key only when the PK is a
+                // single column.
+                if schema.lone_pk_col() != Some(fk.col as usize) {
+                    return Err(format!(
+                        "FK column '{child}' references '{}' of its own table; a self-referencing FK \
+                         must reference the table's lone primary key column",
+                        target.def.name
+                    ));
+                }
+                target.def.ty
+            } else {
+                if dropped.contains(fk.table_id) {
+                    return Err(format!(
+                        "FK column '{child}' references {}, which this transaction drops",
+                        self.qualified_name(fk.table_id)
+                    ));
+                }
+                let entry = self
+                    .registry
+                    .relation(fk.table_id)
+                    .ok_or_else(|| format!("FK column '{child}' references unknown table_id {}", fk.table_id))?;
+                let parent = self.qualified_name(fk.table_id);
+                // Not covered by the PK/UNIQUE test below, which reads the parent's
+                // key and index claims but not its kind: a stream's or a view's PK
+                // looks like a base table's without being the unique, stored key the
+                // parent probe reads.
+                if !entry.kind().is_base_table() {
+                    return Err(format!(
+                        "FK column '{child}' references {parent}, which is a {}; \
+                         a FOREIGN KEY must reference a base table",
+                        entry.kind().noun()
+                    ));
+                }
+                let defs = self.read_column_defs(fk.table_id)?;
+                let Some(target) = defs.get(fk.col as usize) else {
+                    return Err(format!(
+                        "FK column '{child}' references column {} of {parent}, which has {} columns",
+                        fk.col,
+                        defs.len()
+                    ));
+                };
+                // No index counts as dropping here: `dropped` holds this delta's
+                // relation ids, and an index drop arrives in the index family's delta.
+                if !holds_fk_target(entry, fk.col, &IdSet::default()) {
+                    return Err(format!(
+                        "FK column '{child}' references {parent}.{}, which is neither its lone \
+                         primary key nor covered by a single-column UNIQUE index",
+                        target.def.name
+                    ));
+                }
+                target.def.ty
+            };
+            // The preflight compares child and parent values as the referenced
+            // column's key image, so both columns carry one type; SQL adopts the
+            // parent's type before the engine sees the column.
+            if cd.def.ty != target_ty {
+                return Err(format!(
+                    "FK type mismatch: child type {} cannot reference target type {target_ty}",
+                    cd.def.ty
+                ));
+            }
         }
         match rel.detail {
-            RelDetail::Table(TableProps { serial, .. }) => {
-                // `TableProps::validate` holds a SERIAL table to one PK column.
-                if serial {
-                    let pk = &col_defs[rel.pk.as_slice()[0] as usize].def;
-                    if FixedInt::exact(pk.ty.tc).is_none() {
-                        return Err(format!(
-                            "{rel}: SERIAL primary key column '{}' is {}; SERIAL needs an integer of at most 8 bytes",
-                            pk.name, pk.ty
-                        ));
-                    }
-                }
-                for cd in &col_defs {
-                    if let Some(fk) = cd.fk {
-                        self.validate_fk_column(cd, fk, rel.id, &col_defs, &schema, dropped)?;
-                    }
+            // `TableProps::validate` holds a SERIAL table to one PK column.
+            RelDetail::Table(TableProps { serial: true, .. }) => {
+                let pk = &col_defs[rel.pk.as_slice()[0] as usize].def;
+                if FixedInt::exact(pk.ty.tc).is_none() {
+                    return Err(format!(
+                        "{rel}: SERIAL primary key column '{}' is {}; SERIAL needs an integer of at most 8 bytes",
+                        pk.name, pk.ty
+                    ));
                 }
             }
             RelDetail::View(ViewParts { owner: Some(owner), .. }) if !created_users.contains(owner) => {
@@ -650,7 +480,7 @@ impl CatalogEngine {
                     "{rel} names owner {owner}, which is not a user view this bundle creates"
                 ));
             }
-            RelDetail::View(_) => {}
+            RelDetail::Table(_) | RelDetail::View(_) => {}
         }
         Ok(())
     }
@@ -669,7 +499,7 @@ impl CatalogEngine {
         sigs: &[PkSignature],
         dropped: &IdSet,
     ) -> Result<(), String> {
-        let mut claimed: FxHashSet<(u64, Cow<'_, str>)> = FxHashSet::default();
+        let mut claimed: FxHashSet<(u64, &str)> = FxHashSet::default();
         // The retired ids a relation of the same name takes over: an ALTER VIEW.
         let mut replaced: Vec<u64> = Vec::new();
         let creates = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Create).map(|s| s.leading));
@@ -693,7 +523,26 @@ impl CatalogEngine {
             if creates.contains(rel.id) {
                 self.precheck_relation_create(rel, &created_users, dropped)?;
             }
-            if let Some(old) = self.claim_qname(rel.schema_id, rel.name.clone(), rel.id, dropped, &mut claimed)? {
+            // `(schema, name)` is refused when an existing relation holds it. A
+            // rewrite pair that leaves the name unchanged re-registers the
+            // incumbent, so `rel` itself is not one; nor is one this delta drops:
+            // an ALTER VIEW retires an id and registers another under the same
+            // name. The name index is read before apply, so it still maps the name
+            // to the outgoing id.
+            let Some(schema_name) = self.schema_name(rel.schema_id) else {
+                return Err(format!("Schema with ID {} does not exist", rel.schema_id));
+            };
+            let incumbent = self
+                .relation_id(rel.schema_id, &rel.name)
+                .filter(|&existing| existing != rel.id);
+            let displaced = incumbent.filter(|&e| dropped.contains(e));
+            if incumbent != displaced || !claimed.insert((rel.schema_id, &rel.name)) {
+                return Err(format!(
+                    "Table or view already exists: {}",
+                    gnitz_wire::qualified_key(&schema_name, &rel.name)
+                ));
+            }
+            if let Some(old) = displaced {
                 // The drop cascade would take the outgoing relation's indexes with it.
                 let named = |c: &IndexClaim| matches!(c, IndexClaim::Index { .. });
                 let outgoing = self.registry.relation(old);

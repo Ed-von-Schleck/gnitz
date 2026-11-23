@@ -11,7 +11,7 @@
 //! whole store. `sequences` has no hook, and its writes fire none. A
 //! registration reads the relation's COL_TAB rows, and a view's
 //! its CIRCUIT_TAB row, from the store, so those families are applied first:
-//! [`SysFamily::ALL`] is the apply order — of a live bundle, of `replay_catalog`
+//! [`SysFamily::ALL`] is the apply order — of a live bundle, of the replay
 //! at boot — reversed for a bundle that only retracts, so a dependent is retired
 //! before what it depends on, and reversed around a drop's own group by
 //! `with_owned_retractions`.

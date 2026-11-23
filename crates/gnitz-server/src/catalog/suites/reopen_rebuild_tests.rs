@@ -410,9 +410,12 @@ fn only_its_own_unbounded_chain_scans_a_segment() {
     assert!(bounded.contains("a segment of view"), "got: {bounded}");
     // Nor can it be indexed: the entries would outlive the rows its build drops.
     let iid = engine.allocate_ids(1).unwrap();
-    let indexed = engine
-        .precheck_family(SysFamily::Index, &idx_tab_batch(iid, seg, &[1], "ix", false, 1))
-        .unwrap_err();
+    let indexed = precheck(
+        &engine,
+        SysFamily::Index,
+        &idx_tab_batch(iid, seg, &[1], "ix", false, 1),
+    )
+    .unwrap_err();
     assert!(indexed.contains("a segment of a view's chain"), "got: {indexed}");
 
     engine.close();

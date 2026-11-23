@@ -66,11 +66,7 @@ impl CatalogEngine {
 
     /// The checkpoint generation's stamp, of counter `0` on a fresh database.
     pub(crate) fn durable_generation(&self) -> u64 {
-        generation_stamp(self.generation_counter())
-    }
-
-    fn generation_counter(&self) -> u64 {
-        self.sequence_value(SEQ_ID_CHECKPOINT_GEN).unwrap_or(0)
+        generation_stamp(self.sequence_value(SEQ_ID_CHECKPOINT_GEN).unwrap_or(0))
     }
 
     /// The live value of `sequences` row `seq_id`, if one is stored.
@@ -121,16 +117,6 @@ impl CatalogEngine {
             .map_err(ZoneError::Diverged)
     }
 
-    /// Move `sequences` row `seq_id` to `value`.
-    fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
-        let old = self.sequence_value(seq_id);
-        if old == Some(value) {
-            return Ok(());
-        }
-        self.registry
-            .ingest(SysFamily::Sequence.id(), sequence_delta(seq_id, old, value))
-    }
-
     /// Flush every system table in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
         self.registry.checkpoint_system(self.applied_zone)
@@ -151,8 +137,12 @@ impl CatalogEngine {
 
     /// Advance the checkpoint generation and flush it durable. Returns it.
     pub(crate) fn advance_durable_generation(&mut self) -> Result<u64, String> {
-        let counter = self.generation_counter() + 1;
-        self.set_sequence(SEQ_ID_CHECKPOINT_GEN, counter)?;
+        let old = self.sequence_value(SEQ_ID_CHECKPOINT_GEN);
+        let counter = old.unwrap_or(0) + 1;
+        self.registry.ingest(
+            SysFamily::Sequence.id(),
+            sequence_delta(SEQ_ID_CHECKPOINT_GEN, old, counter),
+        )?;
         self.flush_all_system_tables()
             .map_err(|e| format!("checkpoint generation flush failed: {e}"))?;
         Ok(generation_stamp(counter))

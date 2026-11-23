@@ -98,7 +98,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
             "Index already exists",
         ),
     ] {
-        let err = engine.precheck_family(family, &batch).unwrap_err();
+        let err = precheck(&engine, family, &batch).unwrap_err();
         assert!(err.contains(why), "{why}: {err}");
     }
 

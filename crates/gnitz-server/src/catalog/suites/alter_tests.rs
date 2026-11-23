@@ -116,9 +116,12 @@ fn column_rename_on_non_base_owner_rejected() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let vid = register_identity_view(&mut engine, tid, "v", &cols);
 
-    let err = engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(vid, 0, &cols[0], rename_to("id2")))
-        .unwrap_err();
+    let err = precheck(
+        &engine,
+        SysFamily::Column,
+        &col_alter_pair(vid, 0, &cols[0], rename_to("id2")),
+    )
+    .unwrap_err();
     assert!(err.contains("not a user base table"), "view owner: {err}");
 
     engine.close();
@@ -140,12 +143,12 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     );
 
     for (col_idx, new_name) in [(0usize, "id2"), (1, "val2")] {
-        engine
-            .precheck_family(
-                SysFamily::Column,
-                &col_alter_pair(tid, col_idx as i64, &cols[col_idx], rename_to(new_name)),
-            )
-            .expect("renaming a column with dependent views is legal");
+        precheck(
+            &engine,
+            SysFamily::Column,
+            &col_alter_pair(tid, col_idx as i64, &cols[col_idx], rename_to(new_name)),
+        )
+        .expect("renaming a column with dependent views is legal");
     }
 
     engine.close();
@@ -171,9 +174,7 @@ fn hiding_a_foreign_key_column_rejected() {
     let cols = vec![col_def("id", TypeCode::U64), fk_def("r", TypeCode::U64, ptid, 0)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    let err = engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide))
-        .unwrap_err();
+    let err = precheck(&engine, SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide)).unwrap_err();
     assert!(err.contains("carries a foreign key"), "{err}");
 
     engine.close();
@@ -185,12 +186,9 @@ fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
     let (_dir, mut engine, tid) = table_engine(1, &cols);
     engine.create_index("public.t", &["c"], false).unwrap();
 
-    let err = engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide))
-        .unwrap_err();
+    let err = precheck(&engine, SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide)).unwrap_err();
     assert!(err.contains("secondary index"), "{err}");
-    engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], unnull))
+    precheck(&engine, SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], unnull))
         .expect("DROP NOT NULL on an indexed column is legal");
 
     engine.close();
@@ -202,9 +200,7 @@ fn hiding_or_unnulling_a_pk_column_rejected() {
     let (_dir, engine, tid) = table_engine(1, &cols);
 
     for mutate in [hide as fn(&mut CatalogColumn), unnull] {
-        let err = engine
-            .precheck_family(SysFamily::Column, &col_alter_pair(tid, 0, &cols[0], mutate))
-            .unwrap_err();
+        let err = precheck(&engine, SysFamily::Column, &col_alter_pair(tid, 0, &cols[0], mutate)).unwrap_err();
         assert!(err.contains("primary-key"), "{err}");
     }
 
@@ -251,11 +247,14 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let add = crate::test_support::sys_batch([(ColTabRow::of(tid, 2, &nullable_def("v", TypeCode::U64).def, None), 1)]);
-    let err = engine.precheck_family(SysFamily::Column, &add).unwrap_err();
+    let err = precheck(&engine, SysFamily::Column, &add).unwrap_err();
     assert!(err.contains("duplicate column name"), "add: {err}");
-    let err = engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], rename_to("id")))
-        .unwrap_err();
+    let err = precheck(
+        &engine,
+        SysFamily::Column,
+        &col_alter_pair(tid, 1, &cols[1], rename_to("id")),
+    )
+    .unwrap_err();
     assert!(err.contains("duplicate column name"), "rename: {err}");
 
     engine.close();
@@ -275,13 +274,16 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let mut hidden = cols[1].clone();
     hidden.def.is_hidden = true;
 
-    let err = engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &hidden, rename_to("z")))
-        .unwrap_err();
+    let err = precheck(
+        &engine,
+        SysFamily::Column,
+        &col_alter_pair(tid, 1, &hidden, rename_to("z")),
+    )
+    .unwrap_err();
     assert!(err.contains("dropped"), "rename: {err}");
 
     let idx = idx_tab_batch(engine.allocate_ids(1).unwrap(), tid, &[1], "public__t__idx_a", false, 1);
-    let err = engine.precheck_family(SysFamily::Index, &idx).unwrap_err();
+    let err = precheck(&engine, SysFamily::Index, &idx).unwrap_err();
     assert!(err.contains("dropped"), "index: {err}");
 
     engine.close();
