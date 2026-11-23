@@ -223,35 +223,19 @@ impl Ranked {
     }
 }
 
-/// The rows [`rank_rows`] gives images: the first `n` of a source, appended to a vector, or
-/// a run's, ranked in place.
-enum Rows<'a> {
-    First(u32, &'a mut Vec<Ranked>),
-    Run(&'a mut [Ranked]),
-}
-
-/// `rows` of `src`, each with its image under `key`: an integer whose order never contradicts
-/// the key's.
-fn rank_rows(key: &OrderCol, src: &MemBatch, rows: Rows<'_>) {
+/// Give each of `rows`, rows of `src`, its image under `key`: an integer whose order never
+/// contradicts the key's.
+fn rank_rows(key: &OrderCol, src: &MemBatch, rows: &mut [Ranked]) {
     #[inline(always)]
-    fn fill(key: &OrderCol, src: &MemBatch, rows: Rows<'_>, image: impl Fn(usize) -> u64) {
+    fn fill(key: &OrderCol, src: &MemBatch, rows: &mut [Ranked], image: impl Fn(usize) -> u64) {
         let (loc, desc) = (key.image.loc, key.image.invert);
         let (null_rank, value_rank) = (key.rank(true), key.rank(false));
-        let rank = move |row: u32| {
-            let r = row as usize;
-            if loc.is_null_word(src.get_null_word(r)) {
-                return Ranked { image: 0, row, rank: null_rank };
-            }
-            let v = image(r);
-            Ranked {
-                image: if desc { !v } else { v },
-                row,
-                rank: value_rank,
-            }
-        };
-        match rows {
-            Rows::First(n, out) => out.extend((0..n).map(rank)),
-            Rows::Run(run) => run.iter_mut().for_each(|r| *r = rank(r.row)),
+        for r in rows {
+            let row = r.row as usize;
+            (r.image, r.rank) = match loc.is_null_word(src.get_null_word(row)) {
+                true => (0, null_rank),
+                false => (if desc { !image(row) } else { image(row) }, value_rank),
+            };
         }
     }
     let loc = key.image.loc;
@@ -296,7 +280,7 @@ fn sort_run(keys: &[OrderCol], src: &MemBatch, run: &mut [Ranked]) {
     for tie in run.chunk_by_mut(|a, b| a.lead() == b.lead()).filter(|t| t.len() > 1) {
         match whole {
             true => {
-                rank_rows(&keys[1], src, Rows::Run(tie));
+                rank_rows(&keys[1], src, tie);
                 sort_run(&keys[1..], src, tie);
             }
             false => tie.sort_by(|a, b| cmp_order_keys(keys, src, a.row as usize, b.row as usize)),
@@ -318,8 +302,8 @@ impl<'a> RowRanking<'a> {
     pub fn new(keys: &'a [OrderCol], src: &'a MemBatch<'a>) -> Self {
         let n = src.row_count();
         assert!(n <= u32::MAX as usize, "row count exceeds u32");
-        let mut rows = Vec::with_capacity(n);
-        rank_rows(&keys[0], src, Rows::First(n as u32, &mut rows));
+        let mut rows: Vec<Ranked> = (0..n as u32).map(|row| Ranked { row, ..Ranked::default() }).collect();
+        rank_rows(&keys[0], src, &mut rows);
         RowRanking { keys, src, rows }
     }
 
@@ -371,7 +355,7 @@ impl<'a> RowRanking<'a> {
     /// The largest lead among the rows. A sort leaves a tie its later keys' images, so the
     /// leading key ranks the rows again first.
     fn max_lead(&mut self) -> Option<u128> {
-        rank_rows(&self.keys[0], self.src, Rows::Run(&mut self.rows));
+        rank_rows(&self.keys[0], self.src, &mut self.rows);
         self.rows.iter().map(Ranked::lead).max()
     }
 
