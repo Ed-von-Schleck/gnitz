@@ -1,7 +1,7 @@
 //! A copy's registration and feed position, published in the manifest beside
 //! the copy's rows.
 
-use gnitz_core::{RelDescriptor, RelName};
+use gnitz_core::RelName;
 use gnitz_wire::multi_frame::DeltaCursor;
 use gnitz_wire::{MAX_LIST_LEN, PkColList, Writer, decode_all};
 use gnitz_zset::schema::{SchemaDescriptor, decode_schema_record};
@@ -14,7 +14,7 @@ pub(crate) struct MirrorRecord {
     pub(crate) schema: Vec<u8>,
     /// Whether two of the view's rows may share a PK.
     pub(crate) pk_repeats: bool,
-    /// The column list of each index the copy holds: [`index_lists`]' order.
+    /// The column list of each index the copy holds, ascending, none twice.
     pub(crate) indexes: Vec<PkColList>,
     pub(crate) feed: Feed,
 }
@@ -75,14 +75,6 @@ impl MirrorRecord {
         let layout = decode_schema_record(&rec.schema).ok()?;
         Some((rec, layout))
     }
-}
-
-/// The column list of each index `desc` names, ascending, none twice.
-pub(crate) fn index_lists(desc: &RelDescriptor) -> Vec<PkColList> {
-    let mut lists: Vec<PkColList> = desc.indexes.iter().map(|ix| ix.cols).collect();
-    lists.sort_unstable();
-    lists.dedup();
-    lists
 }
 
 #[cfg(test)]

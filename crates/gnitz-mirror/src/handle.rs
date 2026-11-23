@@ -17,7 +17,7 @@ use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use std::rc::Rc;
 
-use crate::record::{Feed, MirrorRecord, index_lists};
+use crate::record::{Feed, MirrorRecord};
 
 /// What a store is sized by. `Default` is the production value of every field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,8 +130,9 @@ impl Mirror {
         Ok(store)
     }
 
-    /// `tid`'s record.
-    fn record(&mut self, tid: u64) -> &mut MirrorRecord {
+    /// `tid`'s record, to change: the next checkpoint publishes it.
+    fn touch(&mut self, tid: u64) -> &mut MirrorRecord {
+        self.unpublished.insert(tid);
         self.records.get_mut(&tid).expect("a mirrored relation is recorded")
     }
 
@@ -166,34 +167,10 @@ impl Mirror {
         Ok(())
     }
 
-    /// Bring `tid`'s copy's indexes to `listed`, the new ones filled from the
-    /// rows the copy holds. If they cannot be added the copy is erased and the
-    /// registration fails, so the next one retries them.
-    fn sync_indexes(&mut self, tid: u64, listed: Vec<PkColList>) -> Result<(), String> {
-        let rec = self.records.get_mut(&tid).expect("checked by the caller");
-        for &cols in rec.indexes.iter().filter(|c| !listed.contains(c)) {
-            self.registry.release_index(tid, index_claim(cols));
-        }
-        // Kept in order, so canonical as the record codec requires.
-        rec.indexes.retain(|c| listed.contains(c));
-        let missing: Vec<_> = listed
-            .iter()
-            .filter(|c| !rec.indexes.contains(c))
-            .map(|&cols| (index_claim(cols), cols))
-            .collect();
-        if let Err(e) = self.registry.add_indexes(tid, &missing) {
-            self.erase(tid);
-            return Err(format!("indexing the copy of {tid}: {e}"));
-        }
-        rec.indexes = listed;
-        Ok(())
-    }
-
     /// Drop `tid`'s rows, its indexes' entries and its value, keeping its
     /// registration; the next checkpoint publishes it empty.
     fn erase(&mut self, tid: u64) {
-        self.record(tid).feed = Feed::Empty;
-        self.unpublished.insert(tid);
+        self.touch(tid).feed = Feed::Empty;
         self.registry
             .clear_rows(tid)
             .expect("a mirrored relation's copy is registered");
@@ -222,24 +199,10 @@ impl Mirror {
         applied.inspect_err(|_| self.erase(tid))
     }
 
-    /// Refuse deltas for a copy of `tid` that holds no cursor to continue. Where
-    /// [`INGEST_PANIC`] fires.
-    fn continuing(&self, tid: u64) -> Result<(), String> {
-        if self.cursor_of(tid).is_none() {
-            return Err(format!("relation {tid}'s copy holds no cursor for deltas to continue"));
-        }
-        if INGEST_PANIC.take_once() {
-            panic!("injected mirror ingest panic");
-        }
-        Ok(())
-    }
-
     /// Set `tid`'s value to its view's at `at`.
     fn settle(&mut self, tid: u64, at: DeltaCursor) {
-        let rec = self.record(tid);
-        if rec.feed != Feed::At(at) {
-            rec.feed = Feed::At(at);
-            self.unpublished.insert(tid);
+        if self.records[&tid].feed != Feed::At(at) {
+            self.touch(tid).feed = Feed::At(at);
         }
     }
 
@@ -255,11 +218,6 @@ impl Mirror {
             );
         }
     }
-
-    /// `tid`'s feed; [`Feed::Empty`] for a relation the store does not hold.
-    fn feed_of(&self, tid: u64) -> Feed {
-        self.records.get(&tid).map_or(Feed::Empty, |r| r.feed)
-    }
 }
 
 impl MirrorStore for Mirror {
@@ -269,7 +227,10 @@ impl MirrorStore for Mirror {
     fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         let tid = desc.tid;
         let record = desc.schema.shape_record();
-        let indexes = index_lists(desc);
+        // Ascending, none twice: canonical, as the record codec requires.
+        let mut indexes: Vec<PkColList> = desc.indexes.iter().map(|ix| ix.cols).collect();
+        indexes.sort_unstable();
+        indexes.dedup();
         // This name at another id was renamed or recreated upstream.
         let renamed = self
             .records
@@ -290,7 +251,24 @@ impl MirrorStore for Mirror {
                 }
                 if r.indexes != indexes {
                     self.unpublished.insert(tid);
-                    self.sync_indexes(tid, indexes)?;
+                    for &cols in r.indexes.iter().filter(|c| !indexes.contains(c)) {
+                        self.registry.release_index(tid, index_claim(cols));
+                    }
+                    // Kept in order, so canonical as the record codec requires.
+                    r.indexes.retain(|c| indexes.contains(c));
+                    let missing: Vec<_> = indexes
+                        .iter()
+                        .filter(|c| !r.indexes.contains(c))
+                        .map(|&cols| (index_claim(cols), cols))
+                        .collect();
+                    // Filled from the rows the copy holds. If they cannot be
+                    // added the copy is erased and the registration fails, so
+                    // the next one retries them.
+                    if let Err(e) = self.registry.add_indexes(tid, &missing) {
+                        self.erase(tid);
+                        return Err(format!("indexing the copy of {tid}: {e}"));
+                    }
+                    r.indexes = indexes;
                 }
             }
             None => {
@@ -324,12 +302,12 @@ impl MirrorStore for Mirror {
     fn refill(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         self.register(name, desc)?;
         self.erase(desc.tid);
-        self.record(desc.tid).feed = Feed::Filling;
+        self.touch(desc.tid).feed = Feed::Filling;
         Ok(())
     }
 
     fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), String> {
-        if self.feed_of(tid) != Feed::Filling {
+        if self.records.get(&tid).map(|r| r.feed) != Some(Feed::Filling) {
             return Err(format!("relation {tid}'s copy is not being refilled"));
         }
         // Block by block: a refill's blocks are large and each arrives in
@@ -346,7 +324,12 @@ impl MirrorStore for Mirror {
     }
 
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), String> {
-        self.continuing(tid)?;
+        if self.cursor_of(tid).is_none() {
+            return Err(format!("relation {tid}'s copy holds no cursor for deltas to continue"));
+        }
+        if INGEST_PANIC.take_once() {
+            panic!("injected mirror ingest panic");
+        }
         self.ingest(tid, blocks)?;
         self.settle(tid, next);
         // A cursor move applies nothing and runs on the client's thread.
@@ -372,7 +355,7 @@ impl MirrorStore for Mirror {
     }
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
-        self.feed_of(tid).cursor()
+        self.records.get(&tid)?.feed.cursor()
     }
 
     /// Publish every copy that moved since it was last published, with its
