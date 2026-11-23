@@ -1,8 +1,6 @@
 //! The ad-hoc SELECT finish: ORDER BY / OFFSET / LIMIT applied as one client-side
 //! pass over the result the client holds.
 
-use std::sync::Arc;
-
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_wire::{OrderKey, WeightSlots};
 use gnitz_zset::algebra::{OrderCol, RowRanking, order_cols};
@@ -11,11 +9,9 @@ use gnitz_zset::repr::{Pick, materialize_carrying};
 use crate::error::GnitzSqlError;
 
 /// ORDER BY / OFFSET / LIMIT over a finished result, resolved against its schema at plan
-/// time. The schema is the result's, carried for the reply; [`ResultCut::apply`] reads
-/// only the keys and the slice.
+/// time.
 #[derive(Clone)]
 pub(crate) struct ResultCut {
-    schema: Arc<Schema>,
     /// The written keys, hidden appended ones included; under a cut, extended to a total
     /// order. Empty when unordered.
     keys: Vec<OrderCol>,
@@ -25,19 +21,14 @@ pub(crate) struct ResultCut {
 
 impl ResultCut {
     /// `order`, wire keys over `schema`, then `slice`.
-    pub(crate) fn new(schema: Arc<Schema>, order: &[OrderKey], slice: WeightSlots) -> Result<Self, GnitzSqlError> {
+    pub(crate) fn new(schema: &Schema, order: &[OrderKey], slice: WeightSlots) -> Result<Self, GnitzSqlError> {
         // A cut breaks ties by identity, so which tied rows it keeps is a function of the
         // rows alone. Uncut ties stay in input order.
         let keys = match order.is_empty() {
             true => Vec::new(),
             false => order_cols(order, schema.layout(), slice != WeightSlots::ALL).map_err(GnitzSqlError::Internal)?,
         };
-        Ok(ResultCut { schema, keys, slice })
-    }
-
-    /// The schema of the result this cut applies to.
-    pub(crate) fn schema(&self) -> &Arc<Schema> {
-        &self.schema
+        Ok(ResultCut { keys, slice })
     }
 
     pub(crate) fn is_ordered(&self) -> bool {

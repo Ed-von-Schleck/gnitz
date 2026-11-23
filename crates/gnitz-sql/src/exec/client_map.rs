@@ -9,7 +9,6 @@ use gnitz_expr::LogicalProgram;
 use gnitz_zset::algebra::MapPlan;
 
 use crate::error::GnitzSqlError;
-use crate::hir::RowsReply;
 
 /// A projection program resolved over a source schema, and the output schema it fills.
 /// The output keeps its source's key region; its column list may name those key columns
@@ -23,13 +22,13 @@ pub(crate) struct ClientMap {
 }
 
 impl ClientMap {
-    /// `rows` as the client runs them over their source.
-    pub(crate) fn over(rows: RowsReply) -> Result<Self, GnitzSqlError> {
-        let RowsReply { src, schema, program, .. } = rows;
-        ClientMap::new(program, src, schema)
-    }
-
-    fn new(program: Option<LogicalProgram>, src: Arc<Schema>, out_schema: Arc<Schema>) -> Result<Self, GnitzSqlError> {
+    /// `program` from `src` onto `out_schema`: a [`crate::hir::RowsReply`]'s, as the client
+    /// runs it over its source.
+    pub(crate) fn new(
+        program: Option<LogicalProgram>,
+        src: Arc<Schema>,
+        out_schema: Arc<Schema>,
+    ) -> Result<Self, GnitzSqlError> {
         debug_assert!(
             src.layout().same_key_types(out_schema.layout()),
             "a client map keeps its source's key"

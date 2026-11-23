@@ -45,14 +45,16 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct ReadPlan {
     pub(super) case: ReadCase,
-    /// ORDER BY / OFFSET / LIMIT over the finished result, under its schema; unordered for
-    /// a constant row, which one row sorts to itself.
+    /// The result's: the rows reply, the fold's finalize output, or the constant row.
+    pub(super) schema: Arc<Schema>,
+    /// ORDER BY / OFFSET / LIMIT over the finished result; unordered for a constant row,
+    /// which one row sorts to itself.
     pub(super) cut: ResultCut,
 }
 
 #[derive(Clone)]
 pub(super) enum ReadCase {
-    /// A read whose reply is the result, under [`ResultCut::schema`].
+    /// A read whose reply is the result, under [`ReadPlan::schema`].
     Rows {
         read: SpecRead,
         /// [`RowsReply::copied`].
@@ -86,7 +88,7 @@ impl ReadPlan {
     pub(crate) fn reply_schema(&self) -> &Schema {
         match &self.case {
             ReadCase::Fold { finish, .. } => finish.partial_schema(),
-            ReadCase::Rows { .. } | ReadCase::Constant { .. } => self.cut.schema(),
+            ReadCase::Rows { .. } | ReadCase::Constant { .. } => &self.schema,
         }
     }
 
@@ -101,7 +103,7 @@ impl ReadPlan {
     /// that read of a delta.
     pub(crate) fn into_subscription(self) -> Result<gnitz_core::Subscription, GnitzSqlError> {
         // The sink ships a cut for a LIMIT only; the slice counts an OFFSET too.
-        let ReadPlan { case, cut } = self;
+        let ReadPlan { case, schema, cut } = self;
         match case {
             ReadCase::Rows { read, copied } if cut.is_identity() => {
                 // An index survives where every column it lists does, under the
@@ -117,7 +119,7 @@ impl ReadPlan {
                 Ok(gnitz_core::Subscription {
                     indexes: indexes.collect(),
                     spec: read.spec.encode(),
-                    schema: Arc::clone(cut.schema()),
+                    schema,
                     upstream: read.desc,
                 })
             }
@@ -161,15 +163,15 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
     };
     let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query)? {
         AdhocRead::Relation { desc, name, conjuncts, shape } => (desc, name, conjuncts, shape),
-        AdhocRead::Constant(rows) => {
-            // A FROM-less SELECT's one row, finished at plan time: `rows` over the
+        AdhocRead::Constant(RowsReply { src, schema, program, .. }) => {
+            // A FROM-less SELECT's one row, finished at plan time: the items over the
             // global ground row. One row sorts to itself, so its order is dropped.
-            let mut map = ClientMap::over(rows)?;
-            let mut ground_row = ZSetBatch::with_capacity(map.src(), 1);
+            let mut ground_row = ZSetBatch::with_capacity(&src, 1);
             ground_row.builder().begin_row(gnitz_wire::global_group_key(), 1);
-            let row = map.apply(ground_row);
+            let row = ClientMap::new(program, src, Arc::clone(&schema))?.apply(ground_row);
             return Ok(ReadPlan {
-                cut: ResultCut::new(Arc::clone(row.schema()), &[], slice)?,
+                cut: ResultCut::new(&schema, &[], slice)?,
+                schema,
                 case: ReadCase::Constant { row },
             });
         }
@@ -185,18 +187,18 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
         desc: Arc::clone(&desc),
         spec: ReadSpec { bound, predicate, sink },
     };
-    let (case, cut) = match shape {
+    let (case, schema, order) = match shape {
         AdhocShape::Fold { pieces, is_distinct } => {
             let FoldPieces {
                 reduce_schema,
                 agg,
                 pre,
                 having,
-                finalize,
+                finalize: RowsReply { src, schema, program, order, .. },
             } = *pieces;
-            let cut = ResultCut::new(Arc::clone(&finalize.schema), &finalize.order, slice)?;
             // Compiled here rather than at finish, so every rejection is pre-dispatch.
-            let finish = FoldFinish::new(&agg.aggs, &having, ClientMap::over(finalize)?)?;
+            let finalize = ClientMap::new(program, src, Arc::clone(&schema))?;
+            let finish = FoldFinish::new(&agg.aggs, &having, finalize)?;
             let sink = ReadSink { map: pre, kind: SinkKind::Fold(agg) };
             let case = ReadCase::Fold {
                 read: read(sink),
@@ -204,18 +206,17 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
                 reduce_schema,
                 is_distinct,
             };
-            (case, cut)
+            (case, schema, order)
         }
-        AdhocShape::Rows(rows) => {
-            let RowsReply {
-                schema,
-                program,
-                order,
-                sink_order,
-                pk_ordered,
-                copied,
-                ..
-            } = rows;
+        AdhocShape::Rows(RowsReply {
+            schema,
+            program,
+            order,
+            sink_order,
+            pk_ordered,
+            copied,
+            ..
+        }) => {
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
             let worker_cut = slice
                 .end()
@@ -233,13 +234,11 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
                 map: program.map(|p| compute_map(p, &schema)),
                 kind: SinkKind::Rows { cut: worker_cut },
             };
-            (
-                ReadCase::Rows { read: read(sink), copied },
-                ResultCut::new(schema, &order, slice)?,
-            )
+            (ReadCase::Rows { read: read(sink), copied }, schema, order)
         }
     };
-    Ok(ReadPlan { case, cut })
+    let cut = ResultCut::new(&schema, &order, slice)?;
+    Ok(ReadPlan { case, schema, cut })
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +248,7 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
 /// Run one planned `SELECT`, reading local-first: a relation the client's copy
 /// holds is answered off it, and every other one over the wire.
 pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
-    let ReadPlan { case, cut } = plan;
-    let schema = Arc::clone(cut.schema());
+    let ReadPlan { case, schema, cut } = plan;
     if cut.keeps_nothing() {
         return Ok(SqlResult::Rows(ScanReply {
             batch: ZSetBatch::new(&schema),

@@ -13,6 +13,7 @@ use crate::bind::bind_constant;
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::exec::client_map::ClientMap;
+use crate::hir::RowsReply;
 use crate::ir::BExpr;
 use crate::names::extract_object_name;
 use crate::rules::{ClassWant, column_names, require_class, require_column};
@@ -149,8 +150,9 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
             returning: returning
                 .as_deref()
                 .map(|items| {
-                    let rows = crate::hir::bind_returning(items, &target, table_name.spelled_name())?;
-                    Ok::<_, GnitzSqlError>(Box::new(ClientMap::over(rows)?))
+                    let RowsReply { src, schema, program, .. } =
+                        crate::hir::bind_returning(items, &target, table_name.spelled_name())?;
+                    Ok::<_, GnitzSqlError>(Box::new(ClientMap::new(program, src, schema)?))
                 })
                 .transpose()?,
             rows,

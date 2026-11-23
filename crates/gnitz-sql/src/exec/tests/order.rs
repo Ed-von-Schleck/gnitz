@@ -38,7 +38,7 @@ fn kv(rows: &[(u128, Cell, Cell, i64)]) -> ZSetBatch {
 
 /// `order` and `slice` over `kv_schema`.
 fn cut_of(order: &[OrderKey], slice: WeightSlots) -> ResultCut {
-    ResultCut::new(kv_schema(), order, slice).unwrap()
+    ResultCut::new(&kv_schema(), order, slice).unwrap()
 }
 
 /// The sort and cut of `b`, checked to be a well-formed batch.

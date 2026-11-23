@@ -51,7 +51,8 @@ pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     else {
         panic!("{sql}: not a fold");
     };
-    let finalize = ClientMap::over(pieces.finalize).unwrap();
+    let crate::hir::RowsReply { src, schema, program, .. } = pieces.finalize;
+    let finalize = ClientMap::new(program, src, schema).unwrap();
     FoldFinish::new(&pieces.agg.aggs, &pieces.having, finalize).unwrap()
 }
 

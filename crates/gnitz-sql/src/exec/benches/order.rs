@@ -89,7 +89,7 @@ fn order_slice_bench() {
         ("16 values, LIMIT 10", ints(16), &by_v[..], top10),
         ("pk, LIMIT 10", ints(0), &by_id[..], top10),
     ] {
-        let cut = ResultCut::new(sch, order, slice).unwrap();
+        let cut = ResultCut::new(&sch, order, slice).unwrap();
         let (out, sort) = counter.measure(|| cut.apply(b));
         assert_eq!(out.len(), slice.keep.min(ROWS as u64) as usize, "{name}");
         std::hint::black_box(out);

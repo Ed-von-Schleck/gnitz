@@ -92,13 +92,13 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
                 "read nothing (constant row)".to_string(),
                 "access: none".to_string(),
                 "predicate: none".to_string(),
-                projection_line(plan.cut.schema(), None),
+                projection_line(&plan.schema, None),
                 order_limit,
             ];
         }
         ReadCase::Rows { read, .. } => {
             let source = read.spec.sink.map.is_none().then_some(&*read.desc.schema);
-            (read, projection_line(plan.cut.schema(), source))
+            (read, projection_line(&plan.schema, source))
         }
         ReadCase::Fold { read, finish, reduce_schema, is_distinct } => {
             let SinkKind::Fold(agg) = &read.spec.sink.kind else {
