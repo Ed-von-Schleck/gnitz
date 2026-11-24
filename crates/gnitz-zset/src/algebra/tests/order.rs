@@ -2,110 +2,21 @@
 
 use std::cmp::Ordering;
 
-use super::super::order_image::order_bits;
-use super::{ImageCol, OrderCol, RowRanking, cmp_order_keys, order_cols};
+use super::{OrderCol, RowRanking, cmp_order_keys, order_cols};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{make_int_batch, pk_only_schema, u64_pk_schema};
-use gnitz_expr::ColumnLocator;
-use gnitz_wire::{FixedInt, Heap, OrderKey, RowSource, ScalarKind, TypeCode, image_mask};
+use crate::test_support::{keyed_schema, make_int_batch, pk_only_schema, pk_u64_two_i64_schema, u64_pk_schema};
+use gnitz_foundation::rng::PATTERNS;
+use gnitz_wire::{Heap, OrderKey, RowSource, TypeCode, image_mask};
 
-/// The key over `loc`, never a 16-byte integer's low half.
-fn key(loc: ColumnLocator, desc: bool, nulls_first: bool, nullable: bool) -> OrderCol {
-    OrderCol {
-        image: ImageCol::new(loc, desc),
-        nulls_first,
-        nullable,
-        low_half: false,
-    }
+/// The key `ORDER BY col` in direction `desc`, NULLs placed by `nulls_first`.
+fn key(schema: &SchemaDescriptor, col: u32, desc: bool, nulls_first: bool) -> OrderCol {
+    OrderCol::resolve(schema, &OrderKey { col, desc, nulls_first }).unwrap()
 }
-
-/// Key values that tie, that differ only in the low half of 16 bytes, that cross
-/// each width's sign bit, and one whose every byte differs.
-const PATTERNS: &[u128] = &[
-    0,
-    1,
-    0x7F,
-    0x80,
-    0xFF,
-    0x7FFF,
-    0x8000,
-    1 << 31,
-    i64::MAX as u128,
-    1 << 63,
-    u64::MAX as u128,
-    0x0123_4567_89AB_CDEF,
-    1 << 64,
-    (1 << 64) + 1,
-    i128::MAX as u128,
-    1 << 127,
-    u128::MAX,
-];
 
 /// `v` cut to the low bytes a `tc` cell holds.
 fn native(tc: TypeCode, v: u128) -> u128 {
     v & image_mask(tc.wire_stride())
-}
-
-/// `order_bits` of a float payload slot is the order image of the slot's bits.
-#[test]
-fn order_bits_reads_a_float_slot_as_its_image() {
-    const FLOATS: [f64; 3] = [-1.5, 0.0, f64::NAN];
-    for (kind, tc) in [(ScalarKind::F32, TypeCode::F32), (ScalarKind::F64, TypeCode::F64)] {
-        let schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
-            &[0],
-        );
-        let bits = |f: f64| match kind {
-            ScalarKind::F32 => (f as f32).to_bits() as u64,
-            _ => f.to_bits(),
-        };
-        let mut b = BatchBuilder::new(&schema);
-        for (row, &f) in FLOATS.iter().enumerate() {
-            b.begin_row(row as u128 + 1, 1).put_float(f);
-        }
-        let b = b.finish();
-        let loc = schema.locate(1);
-        for (row, &f) in FLOATS.iter().enumerate() {
-            assert_eq!(order_bits(&loc, &b, row, kind), kind.order_image(bits(f)), "{tc} {f}");
-        }
-    }
-}
-
-/// `order_bits` of an integer column, from a key column and from a payload slot
-/// holding the same values, is the order image of the value it decodes to.
-#[test]
-fn order_bits_reads_an_integer_as_its_image() {
-    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
-        let Some(fi) = FixedInt::from_type_code(tc) else {
-            continue;
-        };
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TypeCode::U16, false), // key column 0
-                SchemaColumn::new(tc, false),            // key column 1, at byte 2
-                SchemaColumn::new(tc, true),             // payload slot 0
-            ],
-            &[0, 1],
-        );
-        let mut b = BatchBuilder::new(&schema);
-        for (row, &p) in PATTERNS.iter().enumerate() {
-            let v = native(tc, p);
-            b.begin_row_natives(&[row as u128 + 1, v], 1).put_int(v);
-        }
-        let b = b.finish();
-        let kind = ScalarKind::Int(fi);
-        for loc in [schema.locate(1), schema.locate(2)] {
-            for (row, &p) in PATTERNS.iter().enumerate() {
-                let le = native(tc, p).to_le_bytes();
-                assert_eq!(
-                    order_bits(&loc, &b, row, kind),
-                    kind.order_image(fi.decode_le_i64(&le[..tc.wire_stride()]) as u64),
-                    "{tc} {loc:?} row {row}"
-                );
-            }
-        }
-    }
 }
 
 /// Under `total` the identity tiebreak follows the written keys: PK columns in
@@ -124,32 +35,12 @@ fn order_cols_append_the_identity_tiebreak_in_pk_list_order() {
         &[3, 0],
     );
     let written = OrderKey { col: 2, desc: true, nulls_first: false };
-    let c0 = ColumnLocator::Pk {
-        byte_off: 8,
-        size: 4,
-        type_code: TypeCode::U32,
-    };
-    let c1 = ColumnLocator::Payload {
-        slot: 0,
-        size: 16,
-        type_code: TypeCode::String,
-    };
-    let c2 = ColumnLocator::Payload {
-        slot: 1,
-        size: 8,
-        type_code: TypeCode::F64,
-    };
-    let c3 = ColumnLocator::Pk {
-        byte_off: 0,
-        size: 8,
-        type_code: TypeCode::I64,
-    };
-    let asc = |loc, nullable| key(loc, false, true, nullable);
-    let own = key(c2, true, false, false);
+    let asc = |col| key(&schema, col, false, true);
+    let own = key(&schema, 2, true, false);
     assert_eq!(order_cols(&[written], &schema, false).unwrap(), vec![own]);
     assert_eq!(
         order_cols(&[written], &schema, true).unwrap(),
-        vec![own, asc(c3, false), asc(c0, false), asc(c1, true), asc(c2, false)],
+        vec![own, asc(3), asc(0), asc(1), asc(2)],
     );
 }
 
@@ -159,11 +50,10 @@ fn order_cols_append_the_identity_tiebreak_in_pk_list_order() {
 fn null_placement_ignores_the_direction() {
     let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let v = make_int_batch(&schema, &[(1, 1, &[None]), (2, 1, &[Some(5)]), (3, 1, &[None])]);
-    let loc = schema.locate(1);
     for nulls_first in [false, true] {
         let want = if nulls_first { Ordering::Less } else { Ordering::Greater };
         for desc in [false, true] {
-            let keys = [key(loc, desc, nulls_first, true)];
+            let keys = [key(&schema, 1, desc, nulls_first)];
             assert_eq!(
                 cmp_order_keys(&keys, &v, 0, 1),
                 want,
@@ -207,9 +97,8 @@ fn a_pk_key_never_takes_the_null_arm() {
     let schema = pk_only_schema(&[TypeCode::U64]);
     let b = make_int_batch(&schema, &[(1, 1, &[]), (2, 1, &[])]);
     let v = AllNull(&b);
-    let loc = schema.locate(0);
     for desc in [false, true] {
-        let keys = [key(loc, desc, true, false)];
+        let keys = [key(&schema, 0, desc, true)];
         let want = if desc { Ordering::Greater } else { Ordering::Less };
         assert_eq!(cmp_order_keys(&keys, &v, 0, 1), want, "desc={desc}");
     }
@@ -258,14 +147,7 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
     let mut rng = gnitz_foundation::rng::Rng::new(0x9E3779B97F4A7C15);
     for &tc in TypeCode::ALL {
         // `(key column 0, the leading key, a payload column)`, the leading key a payload column.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TypeCode::U64, false),
-                SchemaColumn::new(tc, true),
-                SchemaColumn::new(TypeCode::I64, false),
-            ],
-            &[0],
-        );
+        let schema = u64_pk_schema(&[SchemaColumn::new(tc, true), SchemaColumn::new(TypeCode::I64, false)]);
         let mut b = BatchBuilder::new(&schema);
         for row in 0..ROWS {
             b.begin_row(row as u128 + 1, 1);
@@ -281,14 +163,7 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
         let mut cases = vec![(schema, b.finish(), 1u32)];
         if tc.is_pk_eligible() {
             // The leading key the first of two key columns, the second telling its ties apart.
-            let schema = SchemaDescriptor::new(
-                &[
-                    SchemaColumn::new(tc, false),
-                    SchemaColumn::new(TypeCode::U16, false),
-                    SchemaColumn::new(TypeCode::I64, true),
-                ],
-                &[0, 1],
-            );
+            let schema = keyed_schema(&[tc, TypeCode::U16], &[SchemaColumn::new(TypeCode::I64, true)]);
             let mut b = BatchBuilder::new(&schema);
             for row in 0..ROWS {
                 let lead = native(tc, rng.pick(PATTERNS));
@@ -315,7 +190,7 @@ fn a_ranking_orders_rows_as_the_comparator_does() {
 #[test]
 fn max_lead_after_a_sort_is_the_leading_keys() {
     // `(id, v, w)`: v ties on rows 0 and 1, which w tells apart far above any v.
-    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, false); 2]);
+    let schema = pk_u64_two_i64_schema();
     let v = make_int_batch(
         &schema,
         &[

@@ -1,11 +1,12 @@
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
+use gnitz_foundation::rng::PATTERNS;
 use gnitz_wire::{FixedInt, Heap, TypeCode};
 
 use super::{MORSEL, decode_f64, encode_f64};
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
-    Col, PATTERNS, TestView, f64s, fill, filter_prog, i64s, int, pairs, passing_rows, row_strs, row_values,
-    scalar_prog, schema_pk_strings, text, verdicts, view,
+    Col, TestView, f64s, fill, filter_prog, i64s, int, pairs, passing_rows, row_strs, row_values, scalar_prog,
+    schema_pk_strings, text, verdicts, view,
 };
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
 use crate::{SchemaColumn, SchemaDescriptor};

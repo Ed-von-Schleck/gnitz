@@ -116,6 +116,7 @@ fn keyed_placements_take_the_leading_pk_columns_width() {
 
 /// A keyed placement's owner reads its leading `dist_stride` key bytes alone,
 /// so rows apart only past them live together; no other placement has one.
+/// `owners` is `owner` of each key at every distribution width.
 #[test]
 fn an_owner_reads_the_distribution_prefix_alone() {
     let mut rng = Rng::new(0x0091_ACE5);
@@ -135,6 +136,18 @@ fn an_owner_reads_the_distribution_prefix_alone() {
         }
     }
     assert!(moved > 0, "the prefix reaches the owner");
+    const KEY_LEN: usize = 24;
+    let keys: Vec<u8> = (0..64 * KEY_LEN).map(|_| rng.gen_u128() as u8).collect();
+    for dist_stride in 1..=KEY_LEN as u8 {
+        let keyed = Placement::Keyed { dist_stride };
+        let want = (keys.as_chunks::<KEY_LEN>().0.iter())
+            .map(|k| keyed.owner(k, NW).unwrap() as u8)
+            .collect();
+        assert_eq!(keyed.owners(&keys, KEY_LEN, NW), Some(want), "stride {dist_stride}");
+    }
+    for p in [Placement::Replicated, Placement::Local] {
+        assert_eq!(p.owners(&keys, KEY_LEN, NW), None, "{p:?}");
+    }
 }
 
 /// `range_band` over the PK is the band of exactly the keys a range admits, and

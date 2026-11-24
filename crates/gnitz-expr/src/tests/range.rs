@@ -2,8 +2,9 @@
 
 use crate::SchemaColumn;
 use crate::SchemaDescriptor;
-use crate::test_support::{PATTERNS, TestView, assert_windows_match_whole, filter_verdicts, schema_pk};
+use crate::test_support::{TestView, assert_windows_match_whole, filter_verdicts, schema_pk};
 use crate::{ExprValidateErr, RowFilter};
+use gnitz_foundation::rng::PATTERNS;
 use gnitz_wire::{KeyRange, PkColList, TypeCode, image_mask, key_image};
 
 /// A walk pinning one column and bounding the next admits exactly the rows

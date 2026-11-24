@@ -1,25 +1,6 @@
 use super::*;
 use crate::{FixedInt, cmp_col_window};
-
-/// Bit patterns every width-parameterized sweep below truncates to its type's
-/// width: both sign boundaries, the all-ones edges, and the 2^63 / 2^64 / 2^127
-/// steps that separate a narrow image from a wide one.
-const PATTERNS: &[u128] = &[
-    0,
-    1,
-    2,
-    0x7F,
-    0x80,
-    0xFF,
-    0x100,
-    i64::MAX as u128,
-    1 << 63,
-    u64::MAX as u128,
-    1 << 64,
-    i128::MAX as u128,
-    1 << 127,
-    u128::MAX,
-];
+use gnitz_foundation::rng::PATTERNS;
 
 /// The OPK codec round-trips and orders like the typed value (`cmp_col_window`)
 /// at every PK-eligible width.

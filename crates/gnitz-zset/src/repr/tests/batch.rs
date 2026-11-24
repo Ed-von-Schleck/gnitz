@@ -126,10 +126,6 @@ fn every_producer_states_its_claim() {
     const RAW: bool = false;
     const CONSOLIDATED: bool = true;
     let schema = make_schema_u64_i64();
-    let wider = u64_pk_schema(&[
-        SchemaColumn::new(TypeCode::I64, false),
-        SchemaColumn::new(TypeCode::I64, true),
-    ]);
     let src = certified(make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
     let mut appended = src.clone();
     appended.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
@@ -149,11 +145,6 @@ fn every_producer_states_its_claim() {
         ("negated", src.clone().negated(), CONSOLIDATED),
         ("compacted", src.compacted(), CONSOLIDATED),
         ("append_above", above, CONSOLIDATED),
-        (
-            "null_extend",
-            crate::algebra::null_extend(&src, &wider, false),
-            CONSOLIDATED,
-        ),
         ("append", appended, RAW),
         ("clear", cleared, RAW),
         ("indexed_rows", src.indexed_rows(&[2, 0]), RAW),

@@ -2,8 +2,8 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::test_support::{
-    TestTrace, certified, join_reference, make_batch, make_schema_u64_i64, make_schema_u128_i64, pk_only_schema,
-    pk_payload_schema, rekey_plan, zset_of,
+    TestTrace, certified, join_reference, keyed_schema, make_batch, make_schema_u64_i64, make_schema_u128_i64,
+    pk_only_schema, pk_payload_schema, rekey_plan, zset_of,
 };
 use gnitz_wire::{NullKeys, TypeCode};
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -193,13 +193,16 @@ fn a_clamped_trace_joins_the_clamp_of_its_history() {
 /// the drawn type; `wide` adds a nullable I64 and a STRING, the columns a
 /// null-merge or blob-relocation bug in the emit loop would show up in.
 fn side_schema(pk: &[TypeCode], payload: TypeCode, wide: bool) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-    cols.push(SchemaColumn::new(payload, false));
-    if wide {
-        cols.push(SchemaColumn::new(TypeCode::I64, true));
-        cols.push(SchemaColumn::new(TypeCode::String, false));
-    }
-    SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
+    let wide_cols = [
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::String, false),
+    ];
+    let payload = [
+        &[SchemaColumn::new(payload, false)][..],
+        if wide { &wide_cols } else { &[] },
+    ]
+    .concat();
+    keyed_schema(pk, &payload)
 }
 
 /// Payload strings for the `wide` sides: an empty one, one short enough to stay
@@ -543,12 +546,7 @@ fn over_source_refuses_a_trace_its_source_does_not_prefix() {
     let source = keyed_source();
     let col = |c: u32| source.columns()[c as usize];
     for key in [&[1u32][..], &[1, 0], &[3]] {
-        let delta = SchemaDescriptor::new(
-            &key.iter()
-                .map(|&c| SchemaColumn::new(col(c).type_code, false))
-                .collect::<Vec<_>>(),
-            &(0..key.len() as u32).collect::<Vec<_>>(),
-        );
+        let delta = pk_only_schema(&key.iter().map(|&c| col(c).type_code).collect::<Vec<_>>());
         let map = rekey_plan(&source, key, &[2], NullKeys::Drop);
         assert!(
             JoinPlan::over_source(false, &delta, &source, &map).is_err(),

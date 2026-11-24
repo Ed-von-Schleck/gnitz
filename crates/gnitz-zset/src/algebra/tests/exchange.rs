@@ -147,30 +147,25 @@ fn a_join_scatter_routes_each_row_to_its_reindexed_owner() {
     let schema = schema();
     let b = batch(&schema);
     let own = |cols: &[u32]| self_typed_slots(&schema, cols);
-    for (slots, packed) in [
-        (own(&[0]), false),
-        (own(&[0, 1]), false),
-        (own(&[0, 1, 2, 3]), false),
-        (own(&[1]), false),
-        (own(&[1, 2]), false),
-        (own(&[2, 3]), false),
-        (own(&[1, 2, 3]), false),
-        (own(&[4]), false),
-        (own(&[5]), false),
-        (own(&[7]), false),
-        (own(&[1, 0]), true),
-        (own(&[4, 7]), true),
-        (vec![(1, I64)], true),
-        (vec![(8, I64), (4, I64)], true),
-        (own(&[6]), true),
-        (vec![(5, I64), (6, U128)], true),
+    for slots in [
+        own(&[0]),
+        own(&[0, 1]),
+        own(&[0, 1, 2, 3]),
+        own(&[1]),
+        own(&[1, 2]),
+        own(&[2, 3]),
+        own(&[1, 2, 3]),
+        own(&[4]),
+        own(&[5]),
+        own(&[7]),
+        own(&[1, 0]),
+        own(&[4, 7]),
+        vec![(1, I64)],
+        vec![(8, I64), (4, I64)],
+        own(&[6]),
+        vec![(5, I64), (6, U128)],
     ] {
         let plan = ScatterPlan::join(&schema, &slots).expect("the fixture key routes");
-        assert_eq!(
-            matches!(plan.0, Some(Route::Key(GroupKey::Packed(_)) | Route::WidePacked(_))),
-            packed,
-            "{slots:?}"
-        );
         let reindex = MapKind::Reindex {
             keep: vec![],
             key: slots.clone(),

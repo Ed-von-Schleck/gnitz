@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk,
-    pk_only_schema, pk_payload_schema, radix_fold_rows, u64_pk_schema,
+    arb_fold_case, cell, fold_batch, fold_schemas, keyed_schema, le_cell, make_batch_opk,
+    make_schema_pk_u64_payload_string, opk_pk, pk_only_schema, pk_payload_schema, radix_fold_rows, u64_pk_schema,
 };
 use gnitz_foundation::rng::mix;
 use gnitz_wire::{MAX_PK_BYTES, TypeCode};
@@ -26,6 +26,13 @@ fn identities(key: &GroupOutKey, mb: &MemBatch) -> Vec<u128> {
     key.key.with_identity(mb, &all, Over(&all))
 }
 
+/// Each key's first row with an equal key: two rows share an entry iff their
+/// keys are equal.
+fn firsts<K: std::hash::Hash + Eq>(keys: impl Iterator<Item = K>) -> Vec<usize> {
+    let mut seen = HashMap::new();
+    keys.enumerate().map(|(r, k)| *seen.entry(k).or_insert(r)).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Group key
 // ---------------------------------------------------------------------------
@@ -37,8 +44,10 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
     // `(identity, out_pk)` of the value `le` held in column 1 of `[U64 pk, <tc>]`,
     // with column 1 either a second PK column or the sole payload column.
     let key = |tc: TypeCode, le: &[u8], col1_is_pk: bool| -> (u128, Vec<u8>) {
-        let cols = [SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)];
-        let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
+        let schema = match col1_is_pk {
+            true => pk_only_schema(&[TypeCode::U64, tc]),
+            false => u64_pk_schema(&[SchemaColumn::new(tc, false)]),
+        };
         let mut b = BatchBuilder::new(&schema);
         match col1_is_pk {
             true => {
@@ -77,13 +86,12 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
 
 /// Under every key form — the empty set, every leading run of the PK list, each
 /// single column, each pair of columns and all of them — over `raw` and its
-/// consolidation: `ordinals` gives two rows one ordinal iff they share an
-/// `out_pk`, names each group's first row, and lists the groups in strictly
-/// ascending `out_pk` order; two rows share an `out_pk` iff they share their
-/// group columns' values, and iff they share an identity. `runs`, where it
-/// answers, cuts the rows at exactly the ordinals' boundaries, and it answers
-/// for a consolidated batch grouped by leading PK columns whose bytes are its
-/// output PK. A row's identity rebuilds its `out_pk` under every key form but
+/// consolidation: the numbering — by `runs` where it answers, else numbered —
+/// gives two rows one ordinal iff they share an `out_pk`, names each group by its
+/// least row, and lists the groups in strictly ascending `out_pk` order; two rows
+/// share an `out_pk` iff they share their group columns' values, and iff they
+/// share an identity. `runs` answers for a consolidated batch grouped by leading
+/// PK columns whose bytes are its output PK. A row's identity rebuilds its `out_pk` under every key form but
 /// a PK range, and the numbering's kept identities are its groups'.
 fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
     let schema = *raw.schema();
@@ -109,12 +117,9 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 false => key.numbered_into(batch, &mut scratch),
             }
             let groups = &scratch.groups;
-            prop_assert_eq!(groups.ord.len(), batch.len(), "{:?}", cols);
-            for (row, &g) in groups.ord.iter().enumerate() {
-                let first = groups.first[g as usize] as usize;
-                prop_assert!(first <= row, "{:?}: row {} precedes its group's first", cols, row);
-                prop_assert_eq!(out_pk(first), out_pk(row), "{:?}: a group mixes keys", cols);
-            }
+            let first = firsts((0..batch.len()).map(out_pk));
+            let named: Vec<usize> = groups.ord.iter().map(|&g| groups.first[g as usize] as usize).collect();
+            prop_assert_eq!(&named, &first, "{:?}: groups", cols);
             let mut seen = groups.by_pk.clone();
             seen.sort_unstable();
             prop_assert_eq!(seen, (0..groups.len() as u32).collect::<Vec<_>>(), "{:?}", cols);
@@ -125,18 +130,6 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 .collect();
             prop_assert!(pks.is_sorted_by(|a, b| a < b), "{:?}: groups out of order", cols);
 
-            if in_runs {
-                prop_assert_eq!(runs.len(), groups.len(), "{:?}", cols);
-                for (g, run) in runs.iter().map(|&(s, e)| s..e).enumerate() {
-                    prop_assert!(
-                        run.clone().all(|row| groups.ord[row] == g as u32),
-                        "{:?}: run {} is not group {}",
-                        cols,
-                        g,
-                        g
-                    );
-                }
-            }
             // A longer proper prefix is a fold, which no PK order groups.
             let bytes: usize = cols.iter().map(|&c| schema.columns()[c as usize].size()).sum();
             let in_place = *cols == pk || bytes <= GROUP_PK_BYTES;
@@ -161,22 +154,14 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                     prop_assert_eq!(groups.ids[g], ids[first as usize], "{:?}: group {}", cols, g);
                 }
             }
-            for a in 0..batch.len() {
-                for b in a + 1..batch.len() {
-                    let same_out_pk = out_pk(a) == out_pk(b);
-                    prop_assert_eq!(group(a) == group(b), same_out_pk, "{:?}: rows {} and {}", cols, a, b);
-                    prop_assert_eq!(
-                        groups.ord[a] == groups.ord[b],
-                        same_out_pk,
-                        "{:?}: rows {} and {}",
-                        cols,
-                        a,
-                        b
-                    );
-                    prop_assert_eq!(ids[a] == ids[b], same_out_pk, "{:?}: rows {} and {}", cols, a, b);
-                }
-            }
-            assert_prefixes_follow_out_pk(&key, cols, &mb, &ids)?;
+            prop_assert_eq!(
+                &firsts((0..batch.len()).map(group)),
+                &first,
+                "{:?}: group columns",
+                cols
+            );
+            prop_assert_eq!(&firsts(ids.iter()), &first, "{:?}: identities", cols);
+            assert_prefixes_follow_out_pk(&key, cols, &mb, &ids, &first)?;
         }
     }
     Ok(())
@@ -185,12 +170,14 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
 /// The group prefix of an index grouped by `key` — by `cols` — ahead
 /// of a suffix of one column and of two: every row's, written a batch at a time,
 /// is its own [`GroupPrefix::of`], built from its identity `ids[row]` or
-/// not, and two rows share one iff they share an output PK.
+/// not, and two rows share one iff they share an output PK: `first` names each
+/// row's first row of an equal output PK.
 fn assert_prefixes_follow_out_pk(
     key: &GroupOutKey,
     cols: &[u32],
     mb: &MemBatch,
     ids: &[u128],
+    first: &[usize],
 ) -> Result<(), TestCaseError> {
     let (ordinal, image) = (
         SchemaColumn::new(TypeCode::U8, false),
@@ -222,19 +209,7 @@ fn assert_prefixes_follow_out_pk(
             let from_id = prefix.of(mb, row, Some(id), &mut buf);
             prop_assert_eq!(from_id, &own[..], "{:?}: row {}", cols, row);
         }
-        for a in 0..mb.len() {
-            for b in a + 1..mb.len() {
-                let same_out_pk = key.out_pk(mb, a).bytes() == key.out_pk(mb, b).bytes();
-                prop_assert_eq!(
-                    prefix_of(a) == prefix_of(b),
-                    same_out_pk,
-                    "{:?}: rows {} and {}",
-                    cols,
-                    a,
-                    b
-                );
-            }
-        }
+        prop_assert_eq!(&firsts((0..mb.len()).map(prefix_of)), first, "{:?}: prefixes", cols);
     }
     Ok(())
 }
@@ -247,37 +222,12 @@ proptest! {
     }
 }
 
-/// A batch too long, over too many groups, to number by hashing, grouped by its
-/// whole PK at every width arm: the sort that numbers it puts two rows in one
-/// group iff they share a PK, names each group by its first row, and lists the
-/// groups in PK order.
+/// [`assert_groups_follow_out_pk`] over batches too long, over too many groups,
+/// to number by hashing, at every PK width arm.
 #[test]
-fn sorted_groups_of_a_long_batch_follow_its_pk() {
+fn groups_of_a_long_batch_follow_out_pk() {
     for s in fold_schemas() {
-        let batch = fold_batch(&s, &radix_fold_rows(s.pk_stride(), 1024));
-        let (key, _) = GroupOutKey::new(&s, s.pk_cols(), []).unwrap();
-        let mut scratch = GroupScratch::default();
-        key.numbered_into(&batch, &mut scratch);
-        let groups = &scratch.groups;
-        let mb = batch.as_mem_batch();
-        let mut first_of: HashMap<&[u8], usize> = HashMap::new();
-        for row in 0..batch.len() {
-            first_of.entry(mb.get_pk_bytes(row)).or_insert(row);
-        }
-        assert_eq!(groups.len(), first_of.len());
-        for (row, &g) in groups.ord.iter().enumerate() {
-            assert_eq!(
-                groups.first[g as usize] as usize,
-                first_of[mb.get_pk_bytes(row)],
-                "row {row}"
-            );
-        }
-        let pks: Vec<&[u8]> = groups
-            .by_pk
-            .iter()
-            .map(|&g| mb.get_pk_bytes(groups.first[g as usize] as usize))
-            .collect();
-        assert!(pks.is_sorted_by(|a, b| a < b), "groups out of PK order");
+        assert_groups_follow_out_pk(&fold_batch(&s, &radix_fold_rows(s.pk_stride(), 1024))).unwrap();
     }
 }
 
@@ -291,16 +241,9 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
     use TypeCode::{I32, I64, U16, U32, U64, U128};
     let c = SchemaColumn::new;
     // `[U32 pk0, I32 pk1, U64 v NULL, U128 w, U16 n NULL, I64 s]`, PK `(pk0, pk1)`.
-    let schema = SchemaDescriptor::new(
-        &[
-            c(U32, false),
-            c(I32, false),
-            c(U64, true),
-            c(U128, false),
-            c(U16, true),
-            c(I64, false),
-        ],
-        &[0, 1],
+    let schema = keyed_schema(
+        &[U32, I32],
+        &[c(U64, true), c(U128, false), c(U16, true), c(I64, false)],
     );
     let mut bb = BatchBuilder::new(&schema);
     for i in 0..64u64 {
@@ -324,18 +267,7 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
 fn groups_follow_out_pk_over_a_four_column_pk_and_nullable_bytes() {
     use TypeCode::{I32, U8, U16, U64};
     let c = SchemaColumn::new;
-    let schema = SchemaDescriptor::new(
-        &[
-            c(U8, false),
-            c(U16, false),
-            c(I32, false),
-            c(U64, false),
-            c(U8, true),
-            c(U8, true),
-            c(U8, true),
-        ],
-        &[0, 1, 2, 3],
-    );
+    let schema = keyed_schema(&[U8, U16, I32, U64], &[c(U8, true); 3]);
     let mut bb = BatchBuilder::new(&schema);
     for i in 0..48u64 {
         let m = mix(i) >> 40;

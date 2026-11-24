@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::SchemaColumn;
+use crate::test_support::u64_pk_schema;
 use gnitz_foundation::rng::mix;
 use gnitz_wire::TypeCode;
 
@@ -10,17 +11,7 @@ use gnitz_wire::TypeCode;
 fn col_moves_carry_each_copied_null_bit_into_its_slot() {
     // A U64 PK, then payload slots 0, 2 and 3 admitting NULL and slot 1 NOT NULL.
     let col = |nullable| SchemaColumn::new(TypeCode::I64, nullable);
-    let schema = SchemaDescriptor::try_new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            col(true),
-            col(false),
-            col(true),
-            col(true),
-        ],
-        &[0],
-    )
-    .unwrap();
+    let schema = u64_pk_schema(&[col(true), col(false), col(true), col(true)]);
     let pk = schema.locate(0);
     let payload = |pi: usize| schema.payload_locator(pi);
     let copies = |srcs: &[ColumnLocator]| -> Vec<ColCopy> {
@@ -62,21 +53,16 @@ fn col_moves_carry_each_copied_null_bit_into_its_slot() {
 /// from; a fixed-width or PK source adds none.
 #[test]
 fn col_moves_name_the_string_slots_they_copy() {
-    use TypeCode::{Blob, I64, String, U64, U128};
+    use TypeCode::{Blob, I64, String, U128};
     // Payload slots: 0 U128, 1-2 I64, 3 STRING, 4 I64, 5 BLOB.
-    let schema = SchemaDescriptor::try_new(
-        &[
-            SchemaColumn::new(U64, false),
-            SchemaColumn::new(U128, true),
-            SchemaColumn::new(I64, false),
-            SchemaColumn::new(I64, true),
-            SchemaColumn::new(String, true),
-            SchemaColumn::new(I64, false),
-            SchemaColumn::new(Blob, false),
-        ],
-        &[0],
-    )
-    .unwrap();
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(U128, true),
+        SchemaColumn::new(I64, false),
+        SchemaColumn::new(I64, true),
+        SchemaColumn::new(String, true),
+        SchemaColumn::new(I64, false),
+        SchemaColumn::new(Blob, false),
+    ]);
     let srcs = [
         schema.payload_locator(3),
         schema.locate(0),

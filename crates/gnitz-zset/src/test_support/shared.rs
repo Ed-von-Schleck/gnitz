@@ -17,13 +17,13 @@ use gnitz_zset::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 
 /// Leading PK columns, one per type code in `pk` and in that order, then the
 /// `payload` columns.
-fn keyed_schema(pk: &[TypeCode], payload: &[SchemaColumn]) -> SchemaDescriptor {
+pub fn keyed_schema(pk: &[TypeCode], payload: &[SchemaColumn]) -> SchemaDescriptor {
     let cols: Vec<SchemaColumn> = pk
         .iter()
         .map(|&t| SchemaColumn::new(t, false))
         .chain(payload.iter().copied())
         .collect();
-    SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
+    SchemaDescriptor::new(&cols, gnitz_expr::leading_pk(pk.len()))
 }
 
 /// The `pk` columns plus a single trailing I64 payload column.

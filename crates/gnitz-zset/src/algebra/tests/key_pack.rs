@@ -2,20 +2,13 @@ use super::*;
 use crate::repr::{BatchBuilder, MemBatch};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    STRS, edge_native, le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, random_schema,
-    u64_pk_schema,
+    STRS, edge_native, extended, le_cell, make_batch_bytes, make_schema_pk_u64_payload_blob,
+    make_schema_pk_u64_payload_string, random_schema, u64_pk_schema,
 };
+use gnitz_expr::leading_pk;
 use gnitz_foundation::rng::Rng;
-use gnitz_wire::TypeCode;
-
-/// `native`, a `tc` value in its low bytes, sign- or zero-extended to 128 bits.
-fn extended(tc: TypeCode, native: u128) -> u128 {
-    let shift = 128 - 8 * tc.wire_stride() as u32;
-    match tc.is_signed_int() {
-        true => ((native << shift) as i128 >> shift) as u128,
-        false => native << shift >> shift,
-    }
-}
+use gnitz_wire::{MAX_PK_BYTES, TypeCode};
+use proptest::prelude::*;
 
 /// The OPK bytes of `tc`'s value `native` in a slot of type `target`.
 fn slot_bytes(tc: TypeCode, native: u128, target: TypeCode) -> Vec<u8> {
@@ -135,7 +128,7 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
         let out = packer.output_schema(&in_schema, keep).unwrap();
         let types: Vec<TypeCode> = out.columns().iter().map(|c| c.type_code).collect();
         assert_eq!(types, want, "{payload:?} keyed on {key:?}");
-        assert_eq!(out.pk_cols(), (0..key.len() as u32).collect::<Vec<_>>(), "{payload:?}");
+        assert_eq!(out.pk_cols(), leading_pk(key.len()), "{payload:?}");
         let slots: usize = key.iter().map(|&(_, t)| t.wire_stride()).sum();
         assert_eq!((out.pk_stride(), packer.out_stride), (slots, slots), "{payload:?}");
     }
@@ -146,18 +139,13 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
 // -----------------------------------------------------------------------
 
 /// A STRING or BLOB key packs the big-endian `checksum_128` of its content,
-/// the empty content included: the arm the property's integer types never take.
+/// the empty content included.
 #[test]
 fn a_content_key_packs_its_content_hash() {
     let contents: [&[u8]; 3] = [b"abc", b"", b"hello-world-xyz"];
     for schema in [make_schema_pk_u64_payload_string(), make_schema_pk_u64_payload_blob()] {
-        let mut b = BatchBuilder::new(&schema);
-        for (r, content) in contents.iter().enumerate() {
-            b.begin_row(r as u128, 1);
-            b.put_blob(content);
-            b.end_row();
-        }
-        let b = b.finish();
+        let rows: Vec<(u64, i64, &[u8])> = (0..).zip(contents).map(|(r, c)| (r, 1, c)).collect();
+        let b = make_batch_bytes(&schema, &rows);
         let packer = KeyPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
         let want: Vec<u128> = contents.iter().map(|c| gnitz_wire::checksum_128(c)).collect();
         let mut got = vec![0; contents.len()];
@@ -213,30 +201,68 @@ fn pack_rows_hashes_content_slots_as_a_row_at_a_time() {
     assert!(KeyPacker::group(&five).is_none());
     let windows: [&[(usize, usize)]; 3] = [&[(0, rows)], &[(17, 18), (40, 299)], &[(5, 5), (250, rows)]];
     for group in [&[2][..], &[4], &[4, 3], &[2, 1], &[1, 2, 3], &[2, 4, 5], &[1, 2, 3, 5]] {
-        let packer = group_packer(&schema, group);
+        let cols: Vec<_> = group
+            .iter()
+            .map(|&c| locate_key_col(&schema, c, "group key").unwrap())
+            .collect();
+        let packer = KeyPacker::group(&cols).unwrap();
         for runs in windows {
-            let want: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
-            for pad in [0, 3] {
-                let stride = packer.out_stride + pad;
-                let mut got = vec![0xA5u8; want.len() * stride];
-                packer.pack_rows(&mut got, stride, &mb, runs);
-                for (key, &row) in got.chunks_exact(stride).zip(&want) {
-                    let mut one = vec![0u8; packer.out_stride];
-                    packer.pack_into(&mut one, &mb, row);
-                    assert_eq!(&key[..packer.out_stride], &one[..], "{group:?} row {row} pad {pad}");
-                }
-            }
+            assert_packs(
+                &packer,
+                &mb,
+                runs,
+                |r| packed_row(&packer, &mb, r),
+                &format!("{group:?}"),
+            )
+            .unwrap();
         }
     }
 }
 
-/// The packer of a group key over `group`.
-fn group_packer(schema: &SchemaDescriptor, group: &[u32]) -> KeyPacker {
-    let cols: Vec<_> = group
-        .iter()
-        .map(|&c| locate_key_col(schema, c, "group key").unwrap())
-        .collect();
-    KeyPacker::group(&cols).unwrap()
+/// `packer`'s key of `row`, packed by `pack_into`.
+fn packed_row(packer: &KeyPacker, mb: &MemBatch, row: usize) -> Vec<u8> {
+    let mut key = vec![0u8; packer.out_stride];
+    packer.pack_into(&mut key, mb, row);
+    key
+}
+
+/// `packer`'s keys of the rows of `runs`, packed by `pack_rows` over dirty
+/// slots `pad` bytes wider than the key and by `pack_prefix` one at a time,
+/// are each `want` of its row.
+fn assert_packs(
+    packer: &KeyPacker,
+    mb: &MemBatch,
+    runs: &[(usize, usize)],
+    want: impl Fn(usize) -> Vec<u8>,
+    what: &str,
+) -> Result<(), TestCaseError> {
+    let rows: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
+    for pad in [0, 3] {
+        let stride = packer.out_stride + pad;
+        let mut got = vec![0xA5u8; rows.len() * stride];
+        packer.pack_rows(&mut got, stride, mb, runs);
+        for (key, &row) in got.chunks_exact(stride).zip(&rows) {
+            prop_assert_eq!(
+                &key[..packer.out_stride],
+                &want(row)[..],
+                "{} row {} pad {}",
+                what,
+                row,
+                pad
+            );
+        }
+    }
+    for &row in &rows {
+        let mut one = [0u8; MAX_PK_BYTES];
+        prop_assert_eq!(
+            packer.pack_prefix(&mut one, mb, row),
+            &want(row)[..],
+            "{} row {}",
+            what,
+            row
+        );
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -246,8 +272,7 @@ fn group_packer(schema: &SchemaDescriptor, group: &[u32]) -> KeyPacker {
 mod pack_proptest {
     use super::*;
     use crate::test_support::pk_only_schema;
-    use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
-    use proptest::prelude::*;
+    use gnitz_wire::MAX_PK_COLUMNS;
     use proptest::sample::Index;
 
     /// The PK-eligible type codes.
@@ -259,45 +284,6 @@ mod pack_proptest {
                 .filter(|t| t.is_pk_eligible())
                 .collect::<Vec<_>>(),
         )
-    }
-
-    /// `packer`'s keys of the rows of `runs`, packed by `pack_rows` over dirty
-    /// slots `pad` bytes wider than the key and by `pack_prefix` one at a time,
-    /// are each `want` of its row.
-    fn assert_packs(
-        packer: &KeyPacker,
-        mb: &MemBatch,
-        runs: &[(usize, usize)],
-        want: impl Fn(usize) -> Vec<u8>,
-        what: &str,
-    ) -> Result<(), TestCaseError> {
-        let rows: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
-        for pad in [0, 3] {
-            let stride = packer.out_stride + pad;
-            let mut got = vec![0xA5u8; rows.len() * stride];
-            packer.pack_rows(&mut got, stride, mb, runs);
-            for (key, &row) in got.chunks_exact(stride).zip(&rows) {
-                prop_assert_eq!(
-                    &key[..packer.out_stride],
-                    &want(row)[..],
-                    "{} row {} pad {}",
-                    what,
-                    row,
-                    pad
-                );
-            }
-        }
-        for &row in &rows {
-            let mut one = [0u8; MAX_PK_BYTES];
-            prop_assert_eq!(
-                packer.pack_prefix(&mut one, mb, row),
-                &want(row)[..],
-                "{} row {}",
-                what,
-                row
-            );
-        }
-        Ok(())
     }
 
     proptest! {
@@ -399,13 +385,8 @@ mod pack_proptest {
                 return Ok(());
             };
             let mb = nb.as_mem_batch();
-            let by_row = |r: usize| {
-                let mut key = vec![0u8; packer.out_stride];
-                packer.pack_into(&mut key, &mb, r);
-                key
-            };
             for runs in &windows {
-                assert_packs(&packer, &mb, runs, by_row, "group key")?;
+                assert_packs(&packer, &mb, runs, |r| packed_row(&packer, &mb, r), "group key")?;
             }
         }
     }

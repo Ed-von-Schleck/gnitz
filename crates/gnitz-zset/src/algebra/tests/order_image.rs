@@ -1,11 +1,12 @@
 //! Order-image tests: the byte string whose plain lexicographic order is the
 //! column's typed order, and its inverse.
 
-use super::{ImageCol, scalar_native_of_image, wide_native, wide_native_of_image};
+use super::{ImageCol, order_bits, scalar_native_of_image, wide_native, wide_native_of_image};
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{STRS, le_cell};
-use gnitz_wire::{TypeCode, ValueForm};
+use crate::test_support::{STRS, keyed_schema, le_cell, u64_pk_schema};
+use gnitz_foundation::rng::PATTERNS;
+use gnitz_wire::{FixedInt, ScalarKind, TypeCode, ValueForm, image_mask};
 
 /// Over a PK and a payload column of every image kind: a row's image decodes
 /// back to its value, a wide one orders as the value does, and `invert`
@@ -19,7 +20,7 @@ fn an_image_orders_round_trips_and_slots_as_its_value() {
     use TypeCode::{F32, I64, I128, String, U64, U128};
     const INTS: [i128; 6] = [i128::MIN, -1, 0, 1, i128::MAX, u64::MAX as i128 + 1];
     let c = |tc| SchemaColumn::new(tc, false);
-    let schema = SchemaDescriptor::new(&[c(U64), c(I128), c(I128), c(U128), c(I64), c(F32), c(String)], &[0, 1]);
+    let schema = keyed_schema(&[U64, I128], &[c(I128), c(U128), c(I64), c(F32), c(String)]);
     let rows = 2 * STRS.len();
     let mut b = BatchBuilder::new(&schema);
     for r in 0..rows {
@@ -156,6 +157,57 @@ fn write_slots_matches_write_slot_per_row() {
                     col.write_slot(&mb, r, &mut want[at..at + slot], &mut Vec::new());
                     assert_eq!(key, &want[..], "{what} row {r}");
                 }
+            }
+        }
+    }
+}
+
+/// `order_bits` is the order image of the value a scalar column holds: a float
+/// payload slot's bits, and an integer read from a key column and from a payload
+/// slot holding the same values.
+#[test]
+fn order_bits_reads_a_scalar_as_its_image() {
+    const FLOATS: [f64; 3] = [-1.5, 0.0, f64::NAN];
+    for (kind, tc) in [(ScalarKind::F32, TypeCode::F32), (ScalarKind::F64, TypeCode::F64)] {
+        let schema = u64_pk_schema(&[SchemaColumn::new(tc, false)]);
+        let bits = |f: f64| match kind {
+            ScalarKind::F32 => (f as f32).to_bits() as u64,
+            _ => f.to_bits(),
+        };
+        let mut b = BatchBuilder::new(&schema);
+        for (row, &f) in FLOATS.iter().enumerate() {
+            b.begin_row(row as u128 + 1, 1).put_float(f);
+        }
+        let b = b.finish();
+        for (row, &f) in FLOATS.iter().enumerate() {
+            assert_eq!(
+                order_bits(&schema.locate(1), &b, row, kind),
+                kind.order_image(bits(f)),
+                "{tc} {f}"
+            );
+        }
+    }
+    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let Some(fi) = FixedInt::from_type_code(tc) else {
+            continue;
+        };
+        // Key column 1 sits at byte 2, behind a U16 key column.
+        let schema = keyed_schema(&[TypeCode::U16, tc], &[SchemaColumn::new(tc, true)]);
+        let native = |p: u128| p & image_mask(tc.wire_stride());
+        let mut b = BatchBuilder::new(&schema);
+        for (row, &p) in PATTERNS.iter().enumerate() {
+            b.begin_row_natives(&[row as u128 + 1, native(p)], 1).put_int(native(p));
+        }
+        let b = b.finish();
+        let kind = ScalarKind::Int(fi);
+        for loc in [schema.locate(1), schema.locate(2)] {
+            for (row, &p) in PATTERNS.iter().enumerate() {
+                let le = native(p).to_le_bytes();
+                assert_eq!(
+                    order_bits(&loc, &b, row, kind),
+                    kind.order_image(fi.decode_le_i64(&le[..tc.wire_stride()]) as u64),
+                    "{tc} {loc:?} row {row}"
+                );
             }
         }
     }

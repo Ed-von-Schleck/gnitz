@@ -2,7 +2,7 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     assert_folds, certified, make_batch, make_batch_bytes, make_int_batch, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows, zset_of, zset_sum,
+    make_schema_u64_i64, pk_only_schema, pk_payload_schema, u64_pk_schema, weighted_rows, zset_of, zset_sum,
 };
 use gnitz_wire::TypeCode;
 
@@ -41,7 +41,8 @@ fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], how: R
 /// and stays unconsolidated, and an empty operand on either side keeps the
 /// other's claim. A NULL and a zero hold the same bytes, so only the
 /// nullability the union merges in, from either side, keeps them two elements;
-/// equal elements at opposite weights cancel.
+/// equal elements at opposite weights cancel. Inputs of two physical layouts
+/// are refused.
 #[test]
 fn union_is_the_zset_sum_under_every_input_layout() {
     let (nonnull, nullable) = (
@@ -52,51 +53,49 @@ fn union_is_the_zset_sum_under_every_input_layout() {
     assert_eq!(union_nullability_merge(&nullable, &nonnull), Ok(out_schema));
     assert!(out_schema.columns()[1].nullable);
     assert_eq!(union_nullability_merge(&nonnull, &nonnull), Ok(nonnull));
+    assert_eq!(
+        union_nullability_merge(&pk_payload_schema(&[TypeCode::U128]), &nonnull),
+        Err("union: inputs do not share a physical layout".to_string())
+    );
     let a_rows = [(1, 1, Some(0)), (2, 1, Some(10)), (3, 2, Some(30)), (5, 1, Some(50))];
     let b_rows = [(1, -1, None), (2, -1, Some(10)), (3, 1, Some(31)), (4, 1, Some(40))];
     use Rows::*;
-    for (a_how, b_how, b_rows) in [
-        (Claimed, Claimed, &b_rows[..]),
-        (Claimed, InOrder, &b_rows),
-        (InOrder, InOrder, &b_rows),
-        (Claimed, Scrambled, &b_rows),
-        (Scrambled, Claimed, &b_rows),
-        (Scrambled, Scrambled, &b_rows),
-        (Claimed, Claimed, &[]),
-        (InOrder, Claimed, &[]),
-        (Scrambled, Claimed, &[]),
-    ] {
-        let (a, b) = (opt_batch(&nonnull, &a_rows, a_how), opt_batch(&nullable, b_rows, b_how));
-        let consolidated = match b_rows.is_empty() {
-            true => a_how == Claimed,
-            false => a_how != Scrambled && b_how != Scrambled,
-        };
-        for (form, out) in [
-            (
-                "owned",
-                op_union(Cow::Owned(a.clone()), Cow::Owned(b.clone()), &out_schema),
-            ),
-            ("lent", op_union(Cow::Borrowed(&a), Cow::Borrowed(&b), &out_schema)),
-            (
-                "flipped",
-                op_union(Cow::Borrowed(&b), Cow::Owned(a.clone()), &out_schema),
-            ),
-        ] {
-            let what = format!("a {a_how:?}, b {b_how:?}, b rows {}, {form}", b_rows.len());
-            assert_eq!(out.schema(), &out_schema, "{what}");
-            assert_eq!(out.is_consolidated(), consolidated, "{what}");
-            let inputs = [a.clone(), b.clone()];
-            match consolidated {
-                true => assert_folds(&inputs, &out, &what),
-                false => assert_eq!(zset_of(&out, &out_schema), zset_sum(&inputs, &out_schema), "{what}"),
+    let hows = [Claimed, InOrder, Scrambled];
+    let b_cases = hows.map(|h| (h, &b_rows[..])).into_iter().chain([(Claimed, &[][..])]);
+    for (b_how, b_rows) in b_cases {
+        for a_how in hows {
+            let (a, b) = (opt_batch(&nonnull, &a_rows, a_how), opt_batch(&nullable, b_rows, b_how));
+            let consolidated = match b_rows.is_empty() {
+                true => a_how == Claimed,
+                false => a_how != Scrambled && b_how != Scrambled,
+            };
+            for (form, out) in [
+                (
+                    "owned",
+                    op_union(Cow::Owned(a.clone()), Cow::Owned(b.clone()), &out_schema),
+                ),
+                ("lent", op_union(Cow::Borrowed(&a), Cow::Borrowed(&b), &out_schema)),
+                (
+                    "flipped",
+                    op_union(Cow::Borrowed(&b), Cow::Owned(a.clone()), &out_schema),
+                ),
+            ] {
+                let what = format!("a {a_how:?}, b {b_how:?}, b rows {}, {form}", b_rows.len());
+                assert_eq!(out.schema(), &out_schema, "{what}");
+                assert_eq!(out.is_consolidated(), consolidated, "{what}");
+                let inputs = [a.clone(), b.clone()];
+                match consolidated {
+                    true => assert_folds(&inputs, &out, &what),
+                    false => assert_eq!(zset_of(&out, &out_schema), zset_sum(&inputs, &out_schema), "{what}"),
+                }
             }
         }
     }
 }
 
 /// A filter keeps exactly the matching rows at their weights, in input order,
-/// and a consolidated input stays consolidated; when every row passes it hands
-/// an owned input through rather than paying a whole-batch copy for a no-op.
+/// and a consolidated input stays consolidated; when every row passes, an owned
+/// input is the output.
 #[test]
 fn filter_keeps_exactly_the_matching_rows() {
     let schema = make_schema_u64_i64();
@@ -115,7 +114,6 @@ fn filter_keeps_exactly_the_matching_rows() {
         weighted_rows(&certified(make_batch(&schema, &want)))
     );
     assert!(out.is_consolidated());
-    // Every row passes: an owned input is the output, not a copy of it.
     let owned = input.clone();
     let regions = owned.pk().as_ptr();
     assert_eq!(op_filter(Cow::Owned(owned), &mut gt(-1)).pk().as_ptr(), regions);
@@ -123,84 +121,42 @@ fn filter_keeps_exactly_the_matching_rows() {
 
 // ── Derived output schemas ──────────────────────────────────────────────
 
-/// A mismatched pair is the whole layout contract, and in release there is
-/// nothing else: adopting `a`'s schema would let `op_union` read `b`'s bytes
-/// through it.
+/// The schema `NULL_EXTEND` compiles to and the rows its dispatch writes agree
+/// at both NULL placements: the fill columns read NULL exactly where the schema
+/// declares a nullable slot, the input's PK and payload land where the placement
+/// leaves them, the blob heap comes along with a long string, and the consolidated
+/// claim carries over.
 #[test]
-fn union_of_mismatched_input_layouts_is_rejected() {
-    let a = pk_payload_schema(&[TypeCode::U128]);
-    assert_eq!(
-        union_nullability_merge(&a, &make_schema_u64_i64())
-            .expect_err("mismatched layouts")
-            .to_string(),
-        "union: inputs do not share a physical layout"
-    );
-}
-
-/// The schema `NULL_EXTEND` compiles to and the rows its dispatch writes are two
-/// derivations of one layout, off one `nulls_first`: the fill columns must read
-/// NULL at the slots the schema declares nullable, on either side.
-#[test]
-fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
-    let in_schema = make_schema_u64_i64();
-    let input = certified(make_batch(&in_schema, &[(1, 1, 42)]));
+fn null_extend_writes_the_rows_its_schema_declares_on_both_sides() {
+    let long: &[u8] = b"a-fairly-long-string-value";
+    let in_schema = make_schema_pk_u64_payload_string();
+    let input = certified(make_batch_bytes(&in_schema, &[(1, 1, long), (2, 1, b"short")]));
     for nulls_first in [false, true] {
         let out_schema = null_extend_output_schema(&in_schema, &[TypeCode::I64, TypeCode::String], nulls_first)
             .expect("two fill columns extend cleanly");
         let out = null_extend(&input, &out_schema, nulls_first);
-
+        let str_slot = if nulls_first { 2 } else { 0 };
+        assert_eq!(out.len(), 2, "nulls_first={nulls_first}");
+        assert!(out.is_consolidated(), "nulls_first={nulls_first}");
         let declared: Vec<bool> = out_schema.payload_columns().map(|(_, c)| c.nullable).collect();
-        let written: Vec<bool> = (0..out_schema.num_payload_cols())
-            .map(|pi| gnitz_wire::null_word_get(out.get_null_word(0), pi))
-            .collect();
-        assert_eq!(written, declared, "nulls_first={nulls_first}");
-    }
-}
-
-/// The null-extend at both NULL placements: the input's payload lands where the
-/// placement leaves it, the fill column reads NULL, and the input's blob heap
-/// comes along — without it a long (> 12 byte) string reads back as garbage.
-#[test]
-fn null_extend_places_the_fill_on_either_side() {
-    let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-    let b = certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, long)]));
-
-    let cols = |first: bool| -> SchemaDescriptor {
-        let pk = SchemaColumn::new(TypeCode::U64, false);
-        let s = SchemaColumn::new(TypeCode::String, false);
-        let fill = SchemaColumn::new(TypeCode::I64, true);
-        let cols = match first {
-            true => [pk, fill, s],
-            false => [pk, s, fill],
-        };
-        SchemaDescriptor::new(&cols, &[0])
-    };
-
-    for nulls_first in [false, true] {
-        let out_schema = cols(nulls_first);
-        let out = null_extend(&b, &out_schema, nulls_first);
-        let (str_slot, fill_slot) = match nulls_first {
-            true => (1, 0),
-            false => (0, 1),
-        };
-
-        assert_eq!(out.len(), 1);
-        assert_eq!(gnitz_wire::widen_pk_be(out.get_pk_bytes(0)), 1);
-        assert!(!out.blob().is_empty(), "output blob must be propagated ({nulls_first})");
-        assert_eq!(
-            gnitz_wire::payload_bytes(&out, 0, str_slot),
-            long,
-            "long string must resolve to the original ({nulls_first})"
-        );
-        let nw = out.get_null_word(0);
-        assert!(gnitz_wire::null_word_get(nw, fill_slot), "the fill column reads NULL");
-        assert!(!gnitz_wire::null_word_get(nw, str_slot), "the input column stays live");
+        for (row, (pk, s)) in [(1, long), (2, &b"short"[..])].into_iter().enumerate() {
+            let written: Vec<bool> = (0..out_schema.num_payload_cols())
+                .map(|pi| gnitz_wire::null_word_get(out.get_null_word(row), pi))
+                .collect();
+            assert_eq!(written, declared, "nulls_first={nulls_first} row {row}");
+            assert_eq!(gnitz_wire::widen_pk_be(out.get_pk_bytes(row)), pk);
+            assert_eq!(
+                gnitz_wire::payload_bytes(&out, row, str_slot),
+                s,
+                "nulls_first={nulls_first}"
+            );
+        }
     }
 }
 
 /// The null-extend output is the input schema plus one nullable column per
-/// fill slot, so the bound is on the *merged* width — a list-length bound alone
-/// would miss a near-max-width input taking a short extension over the limit.
+/// fill slot, so the bound is on the merged width: a near-max-width input
+/// taking a short extension over the limit is refused.
 #[test]
 fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     let guard = format!(
@@ -209,12 +165,7 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
         gnitz_wire::MAX_COLUMNS
     );
     let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![TypeCode::I64; n], false);
-    let narrow = make_schema_u64_i64();
-    let out = extend(&narrow, 1).expect("a short type_codes list extends cleanly");
-    assert_eq!(out.num_columns(), narrow.num_columns() + 1);
-    assert!(out.columns()[out.num_columns() - 1].nullable);
-    // One column short of the limit, extended by two: the merged width
-    // overflows, which a bound on the list length misses.
+    // Two columns short of the limit: one more fits, two overflow.
     let wide = u64_pk_schema(&vec![
         SchemaColumn::new(TypeCode::I64, false);
         gnitz_wire::MAX_COLUMNS - 2
@@ -228,16 +179,13 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
 /// bit reads NULL and every input bit keeps its value.
 #[test]
 fn null_extend_at_the_full_null_word() {
-    let pk = SchemaColumn::new(TypeCode::U64, false);
-    let fill = SchemaColumn::new(TypeCode::I64, true);
-    let pk_only = SchemaDescriptor::new(&[pk], &[0]);
+    let pk_only = pk_only_schema(&[TypeCode::U64]);
     let mut input = Batch::with_capacity(&pk_only, 3);
     for k in 1..=3u64 {
         input.push_key_row(&k.to_be_bytes(), 1);
     }
     let input = certified(input);
-    let cols: Vec<SchemaColumn> = std::iter::once(pk).chain(std::iter::repeat_n(fill, 64)).collect();
-    let wide = SchemaDescriptor::new(&cols, &[0]);
+    let wide = null_extend_output_schema(&pk_only, &[TypeCode::I64; 64], false).unwrap();
     for nulls_first in [false, true] {
         let out = null_extend(&input, &wide, nulls_first);
         assert_eq!(out.len(), 3);

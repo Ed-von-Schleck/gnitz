@@ -47,7 +47,7 @@ impl OrderCol {
     /// Where a row stands under the key on being NULL alone, 0 before 1. The direction
     /// does not flip it.
     #[inline(always)]
-    pub(crate) fn rank(&self, is_null: bool) -> u8 {
+    fn rank(&self, is_null: bool) -> u8 {
         (is_null != self.nulls_first) as u8
     }
 

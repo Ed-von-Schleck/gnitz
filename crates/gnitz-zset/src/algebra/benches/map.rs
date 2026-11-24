@@ -34,7 +34,7 @@ fn map_ranges_bench() {
     // integers below 1000, strings past the inline threshold so each is
     // heap-backed, and the first payload column NULL on every `null_every`-th row.
     let source = |payload: &[TypeCode], null_every: u64| {
-        let schema = make_schema(&[&[U64], payload].concat());
+        let schema = make_schema(payload);
         let mut b = BatchBuilder::new(&schema);
         for i in 0..N as u64 {
             b.begin_row(i as u128, 1);

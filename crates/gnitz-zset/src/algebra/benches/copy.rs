@@ -1,7 +1,8 @@
 //! Instruction benchmarks for a column copy's null words.
 
 use super::ColMoves;
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaColumn;
+use crate::test_support::u64_pk_schema;
 use gnitz_expr::ColCopy;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
@@ -13,9 +14,7 @@ use std::hint::black_box;
 fn copy_nulls_bench() {
     let n = gnitz_foundation::env::env_num("GNITZ_BENCH_ROWS", 200_000);
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend((0..8).map(|_| SchemaColumn::new(TypeCode::I64, true)));
-    let schema = SchemaDescriptor::try_new(&cols, &[0]).unwrap();
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true); 8]);
     // Payload slot `pi` of row `row` is NULL on every fifth (row, pi) step.
     let src: Vec<u8> = (0..n)
         .flat_map(|row| {

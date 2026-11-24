@@ -3,14 +3,14 @@ use std::cmp::Ordering;
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, range_band};
-use crate::test_support::{edge_native, pk_only_schema, random_schema};
+use crate::test_support::{edge_native, keyed_schema, pk_only_schema, random_schema};
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{KeyRange, MAX_PK_COLUMNS, PkColList, TypeCode, cmp_col_window, key_image};
 
 /// Over PKs of every suffix width and a nullable indexed column of every
 /// indexable width: the projection holds exactly the rows `KeySpec::span` admits,
-/// each as its span followed by its own PK, in source order — and `extend_spans`
-/// the positive-weight rows' spans.
+/// each as its span followed by its own PK, in source order, which `split_entry`
+/// splits back into the two — and `extend_spans` the positive-weight rows' spans.
 #[test]
 fn index_entries_are_each_admitted_rows_span_and_pk() {
     use TypeCode::{I16, I64, I128, U8, U32, U64, U128};
@@ -21,9 +21,10 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
         .flat_map(|pk| [U8, I16, U32, I64, U128, I128].map(|tc| (pk, tc)))
     {
         let k = pk.len() as u32;
-        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-        cols.extend([SchemaColumn::new(tc, true), SchemaColumn::new(TypeCode::I32, false)]);
-        let owner = SchemaDescriptor::new(&cols, &(0..k).collect::<Vec<_>>());
+        let owner = keyed_schema(
+            pk,
+            &[SchemaColumn::new(tc, true), SchemaColumn::new(TypeCode::I32, false)],
+        );
         let width = tc.wire_stride();
         let mut b = BatchBuilder::new(&owner);
         for row in 0..300u64 {
@@ -51,6 +52,7 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                 .map(|spec| (spec.index_schema(&owner), spec))
                 .unwrap();
             let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
+            let mut admitted = Vec::new();
             for row in 0..src.len() {
                 if src.get_weight(row) != 0
                     && let Some(span) = spec.span(&mb, row)
@@ -58,6 +60,7 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                     let mut e = span.pk_bytes().to_vec();
                     e.extend_from_slice(src.get_pk_bytes(row));
                     want.push((e, src.get_weight(row)));
+                    admitted.push(row);
                 }
             }
             let got = index_entries(&src, &spec, &idx_schema);
@@ -65,8 +68,11 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                 .map(|r| (got.get_pk_bytes(r).to_vec(), got.get_weight(r)))
                 .collect();
             assert_eq!(got, want, "{pk:?} {tc} indexed on {indexed:?}");
-
             let key_size = spec.key_size();
+            for ((e, _), &row) in got.iter().zip(&admitted) {
+                assert_eq!(spec.split_entry(e), (&e[..key_size], src.get_pk_bytes(row)));
+            }
+
             let want_spans: Vec<u8> = want
                 .iter()
                 .filter(|(_, w)| *w > 0)
@@ -86,7 +92,8 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
 ///   the band start a point walk over the indexed values' key images seeks to;
 /// - spans `memcmp` as the indexed values' typed lexicographic order;
 /// - the span schema is the key columns at their own types, the index schema
-///   those then the source PK, so an entry splits at the span's width.
+///   those then the source PK, and `split_entry` splits an entry back into the
+///   row's span and PK — a key leading the PK being its entry's leading bytes.
 #[test]
 fn key_spans_encode_the_typed_order_of_their_columns() {
     let mut rng = Rng::new(0x09C4B);
@@ -166,6 +173,16 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
                 let point = KeyRange::point(PkColList::from_slice(&span_cols), &images);
                 let (start, _) = range_band(&span_schema, &point).expect("a point walk holds its key");
                 assert_eq!(span.pk_bytes(), start.pk_bytes(), "{s:?} {cols:?} row={row}");
+                let pk = b.get_pk_bytes(row);
+                let entry = match spec.leads_pk() {
+                    true => pk.to_vec(),
+                    false => [span.pk_bytes(), pk].concat(),
+                };
+                assert_eq!(
+                    spec.split_entry(&entry),
+                    (span.pk_bytes(), pk),
+                    "{s:?} {cols:?} row={row}"
+                );
                 spans.push((vals, span.pk_bytes().to_vec()));
             }
         }

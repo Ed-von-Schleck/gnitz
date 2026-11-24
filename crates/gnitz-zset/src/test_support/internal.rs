@@ -19,6 +19,15 @@ pub(crate) fn le_cell(cell: &[u8]) -> u128 {
     u128::from_le_bytes(v)
 }
 
+/// `native`, a `tc` value in its low bytes, sign- or zero-extended to 128 bits.
+pub(crate) fn extended(tc: TypeCode, native: u128) -> u128 {
+    let shift = 128 - 8 * tc.wire_stride() as u32;
+    match tc.is_signed_int() {
+        true => ((native << shift) as i128 >> shift) as u128,
+        false => native << shift >> shift,
+    }
+}
+
 /// A native of the integer type `tc` drawn from its zero, one, signed extremes
 /// and all-ones, zero-extended: values tie often, so a tie falls through to the
 /// next column.

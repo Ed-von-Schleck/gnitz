@@ -1,6 +1,32 @@
 //! The deterministic PRNG of the workspace's tests and benchmarks
 //! (xorshift64*, the same stream on every host), and the `u64` bijections
-//! `mix` and `splitmix`.
+//! `mix` and `splitmix`, and the fixed integer patterns a width sweep truncates.
+
+/// Integer bit patterns a width-parameterized sweep truncates to its type's
+/// width: values that tie, both sign boundaries at every width, the all-ones
+/// edges, values that differ only in the low half of 16 bytes, and one whose
+/// every byte differs.
+pub const PATTERNS: &[u128] = &[
+    0,
+    1,
+    2,
+    0x7F,
+    0x80,
+    0xFF,
+    0x100,
+    0x7FFF,
+    0x8000,
+    1 << 31,
+    i64::MAX as u128,
+    1 << 63,
+    u64::MAX as u128,
+    0x0123_4567_89AB_CDEF,
+    1 << 64,
+    (1 << 64) + 1,
+    i128::MAX as u128,
+    1 << 127,
+    u128::MAX,
+];
 
 /// A bijection of `u64` that scatters consecutive values across its high bits.
 /// Its low `k` bits depend only on, and permute, the low `k` bits of `i`, so

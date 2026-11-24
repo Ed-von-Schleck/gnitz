@@ -569,28 +569,6 @@ pub fn pairs<T: Copy>(corpus: &[T]) -> (Vec<T>, Vec<T>) {
     corpus.iter().flat_map(|&x| corpus.iter().map(move |&y| (x, y))).unzip()
 }
 
-/// Key values that tie, that differ only in the low half of 16 bytes, that cross
-/// each width's sign bit, and one whose every byte differs.
-pub(crate) const PATTERNS: &[u128] = &[
-    0,
-    1,
-    0x7F,
-    0x80,
-    0xFF,
-    0x7FFF,
-    0x8000,
-    1 << 31,
-    i64::MAX as u128,
-    1 << 63,
-    u64::MAX as u128,
-    0x0123_4567_89AB_CDEF,
-    1 << 64,
-    (1 << 64) + 1,
-    i128::MAX as u128,
-    1 << 127,
-    u128::MAX,
-];
-
 /// The counters every instruction bench reads its cases through. The benches
 /// are `#[ignore]`d and meaningful only in release:
 ///

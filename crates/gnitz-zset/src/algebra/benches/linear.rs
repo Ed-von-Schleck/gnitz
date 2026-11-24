@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::test_support::{certified, prose};
+use crate::test_support::{certified, prose, u64_pk_schema};
 use std::hint::black_box;
 
 /// A null-extend of a consolidated batch of a nullable integer, a nullable
@@ -14,14 +14,12 @@ fn null_extend_bench() {
     let n = gnitz_foundation::env::env_num("GNITZ_BENCH_ROWS", 65_536);
     let counter = gnitz_foundation::perf::Counter::instructions();
     let col = SchemaColumn::new;
-    let pk = col(TypeCode::U64, false);
     let own = [
         col(TypeCode::I64, true),
         col(TypeCode::String, true),
         col(TypeCode::I32, false),
     ];
-    let fill = [col(TypeCode::I64, true), col(TypeCode::String, true)];
-    let in_schema = SchemaDescriptor::new(&[&[pk][..], &own].concat(), &[0]);
+    let in_schema = u64_pk_schema(&own);
     let mut b = BatchBuilder::new(&in_schema);
     for i in 0..n {
         b.begin_row(i as u128, 1);
@@ -36,11 +34,8 @@ fn null_extend_bench() {
     }
     let input = certified(b.finish());
     for nulls_first in [false, true] {
-        let cols = match nulls_first {
-            true => [&[pk][..], &fill, &own].concat(),
-            false => [&[pk][..], &own, &fill].concat(),
-        };
-        let out_schema = SchemaDescriptor::new(&cols, &[0]);
+        let out_schema =
+            null_extend_output_schema(&in_schema, &[TypeCode::I64, TypeCode::String], nulls_first).unwrap();
         black_box(null_extend(&input, &out_schema, nulls_first));
         let (out, instructions) = counter.measure(|| null_extend(black_box(&input), &out_schema, nulls_first));
         assert_eq!(out.len(), n);

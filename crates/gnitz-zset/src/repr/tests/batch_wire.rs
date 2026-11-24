@@ -2,7 +2,7 @@ use super::*;
 use crate::repr::{BatchBuilder, merge_consolidated};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    certified, encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
+    certified, encode_to_wire_vec, keyed_schema, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, ragged_batch, ragged_schema, u64_pk_schema, weighted_rows,
 };
 use gnitz_foundation::rng::Rng;
@@ -186,10 +186,11 @@ fn wire_batches() -> Vec<Batch> {
         (&[U64], I64),
         (&[U128], U128),
     ] {
-        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
-        cols.extend([SchemaColumn::new(payload, true), SchemaColumn::new(String, false)]);
-        let key: Vec<u32> = (0..pk.len() as u32).collect();
-        let mut b = BatchBuilder::new(&SchemaDescriptor::new(&cols, &key));
+        let schema = keyed_schema(
+            pk,
+            &[SchemaColumn::new(payload, true), SchemaColumn::new(String, false)],
+        );
+        let mut b = BatchBuilder::new(&schema);
         for i in 0..20u128 {
             b.begin_row_natives(&vec![i + 1; pk.len()], [1, -2, 3][i as usize % 3]);
             b.put_opt_int((i % 2 == 0).then_some(i * 7));

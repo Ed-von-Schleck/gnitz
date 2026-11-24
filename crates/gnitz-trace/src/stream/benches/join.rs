@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{TestTrace, rekey_plan};
+use crate::test_support::{TestTrace, keyed_schema, rekey_plan};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{NullKeys, RangeRel, TypeCode};
 use gnitz_zset::repr::BatchBuilder;
@@ -27,15 +27,13 @@ const PAYLOADS: [Payload; 3] = [Payload::Int, Payload::Nullable, Payload::Str];
 
 /// `pk_types` PK columns, a non-nullable I64, then `p`'s column.
 fn schema_for(pk_types: &[TypeCode], p: Payload) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = pk_types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
-    cols.push(SchemaColumn::new(TypeCode::I64, false));
+    let mut payload = vec![SchemaColumn::new(TypeCode::I64, false)];
     match p {
         Payload::Int => {}
-        Payload::Nullable => cols.push(SchemaColumn::new(TypeCode::I64, true)),
-        Payload::Str => cols.push(SchemaColumn::new(TypeCode::String, false)),
+        Payload::Nullable => payload.push(SchemaColumn::new(TypeCode::I64, true)),
+        Payload::Str => payload.push(SchemaColumn::new(TypeCode::String, false)),
     }
-    let pk: Vec<u32> = (0..pk_types.len() as u32).collect();
-    SchemaDescriptor::new(&cols, &pk)
+    keyed_schema(pk_types, &payload)
 }
 
 /// One fixture row: its PK column values and the I64 that orders it within its
