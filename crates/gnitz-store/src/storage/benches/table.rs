@@ -1,66 +1,44 @@
 use super::{Cut, DEFAULT_RAM_TIER_BYTES, RecoverySource, flush_barrier};
 use crate::test_support::{certified, make_batch, make_schema_u64_i64, new_table, scratch_table, table_shards};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
-use gnitz_foundation::rng::{mix, scatter};
+use gnitz_foundation::rng::mix;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::pk_keys;
+use gnitz_zset::schema::pk_keys_of_images;
 
-/// Instructions per row of `Table::ingest` at the cadence a worker
-/// runs it: a tick is one ingest and the memtable drains on its own budget. One
-/// case per way the drain ends short of a spill — the memtable's own fold, a
-/// batch past the memtable budget, and a RAM-tier fold whose cancellation spares
-/// the spill; `ingest_call_bench` prices the ingests that spill.
+/// Instructions per row of `Table::ingest` of fresh keys at the cadence a worker
+/// runs it: a tick is one ingest and the memtable drains on its own budget. The
+/// small ticks end at the memtable's own fold, the large at a batch past the
+/// memtable budget; `ram_tier_ceiling_bench` prices a RAM-tier fold whose
+/// cancellation spares the spill, and `ingest_call_bench` the ingests that spill.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn table_ingest_bench() {
     const UPDATES: u64 = 1_000_000;
-    const HOT: u64 = 8192;
-    const SMALL_TIER: usize = 1 << 20;
-    type Rows = [Option<(u64, i64, i64)>; 2];
-    // Update `u` inserts key `u`.
-    let fresh = |u: u64| -> Rows { [None, Some((u, 1, u as i64))] };
-    // Update `u` rewrites key `u % HOT`, retracting the row update `u - HOT` left there.
-    let churn = |u: u64| -> Rows {
-        let retraction = u.checked_sub(HOT).map(|old| (u % HOT, -1, old as i64));
-        [retraction, Some((u % HOT, 1, u as i64))]
-    };
-    // Label, updates per tick, the rows of an update, the RAM-tier ceiling.
-    type Case = (&'static str, u64, fn(u64) -> Rows, usize);
-    let cases: [Case; 4] = [
-        ("fresh keys, 1-row ticks", 1, fresh, DEFAULT_RAM_TIER_BYTES),
-        ("fresh keys, 100-row ticks", 100, fresh, DEFAULT_RAM_TIER_BYTES),
-        ("fresh keys, 8192-row ticks", 8192, fresh, DEFAULT_RAM_TIER_BYTES),
-        ("8192 hot keys, 16-update ticks, 1 MiB tier", 16, churn, SMALL_TIER),
-    ];
-
     let schema = make_schema_u64_i64();
     let counter = Counter::instructions();
     let dir = tempfile::tempdir().unwrap();
-    for (case, (label, per_tick, update, tier)) in cases.into_iter().enumerate() {
+    for per_tick in [1u64, 100, 8192] {
         let ticks: Vec<Batch> = (0..UPDATES / per_tick)
             .map(|t| {
-                let rows: Vec<_> = (t * per_tick..(t + 1) * per_tick).flat_map(update).flatten().collect();
+                let rows: Vec<_> = (t * per_tick..(t + 1) * per_tick).map(|u| (u, 1, u as i64)).collect();
                 // As a pushed batch arrives: decoded at its row count.
                 make_batch(&schema, &rows).trimmed()
             })
             .collect();
-        let rows: usize = ticks.iter().map(Batch::len).sum();
-        let rederive = RecoverySource::Rederive { resume_at: None };
-        let mut table = new_table(dir.path().join(case.to_string()), schema, rederive, tier);
+        let mut table = scratch_table(dir.path().join(per_tick.to_string()), schema);
         let ((), instructions) = counter.measure(|| {
             for tick in ticks {
                 table.ingest(tick).unwrap();
             }
         });
-        assert!(table.ram_tier.row_count() > 0, "{label}: the memtable never drained");
         assert!(
-            rows * 32 > tier || tier == DEFAULT_RAM_TIER_BYTES,
-            "{label}: fits the tier"
+            table.ram_tier.row_count() > 0,
+            "{per_tick}-row ticks: the memtable never drained"
         );
-        assert!(table_shards(&table).is_empty(), "{label}: spilled");
+        assert!(table_shards(&table).is_empty(), "{per_tick}-row ticks: spilled");
         println!(
-            "table_ingest_bench {label:<44} {:8.1} instr/row",
-            instructions as f64 / rows as f64
+            "table_ingest_bench {per_tick:>4}-row ticks {:8.1} instr/row",
+            instructions as f64 / UPDATES as f64
         );
     }
 }
@@ -79,8 +57,8 @@ fn ram_tier_ceiling_bench() {
     let schema = make_schema_u64_i64();
     let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     let dir = tempfile::tempdir().unwrap();
-    for fill in [50u64, 85, 92, 96, 99] {
-        let hot = (TIER as u64 / 32) * fill / 100;
+    for fill in [25u64, 50, 85, 92, 96, 99] {
+        let hot = (TIER / schema.row_width()) as u64 * fill / 100;
         let rederive = RecoverySource::Rederive { resume_at: None };
         let mut table = new_table(dir.path().join(fill.to_string()), schema, rederive, TIER);
         let load: Vec<_> = (0..hot).map(|k| (k, 1, 0)).collect();
@@ -163,27 +141,21 @@ fn ingest_call_bench() {
     }
 }
 
-/// Instructions per read at `Cut::Sealed` — a `Table::gather` of 1, 64 and 4096
-/// keys, and per row of a `cursor_between` over the whole span walked to its
-/// end — of a table whose rows sit in shards, by what stands above the cut:
-/// nothing; rows pending in RAM, pushed onto held keys one or a thousand at a
-/// time; and pending rows a barrier wrote down, a tick's worth and as many as
-/// the table holds.
+/// Instructions per read at `Cut::Sealed`, as a circuit reads a store's trace —
+/// a `Table::gather` of 1, 64 and 4096 keys, and per row of a `cursor_between`
+/// over the whole span walked to its end — of a table whose rows sit in shards,
+/// alone and under heap runs that update some of them.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn sealed_read_bench() {
+    /// Heap runs over the shards, and the held rows each updates.
+    const RUNS: u64 = 13;
+    const PER_RUN: u64 = 64;
     let schema = make_schema_u64_i64();
     let dir = tempfile::tempdir().unwrap();
     let counter = Counter::instructions();
-    // Rows held, rows pending, rows per pending push, whether a barrier wrote them down.
-    let cases: [(u64, u64, u64, bool); 5] = [
-        (1 << 18, 0, 1, false),
-        (1 << 18, 10_000, 1, false),
-        (1 << 18, 10_000, 1000, false),
-        (1 << 18, 10_000, 1000, true),
-        (1 << 20, 1_000_000, 1000, true),
-    ];
-    for (case, (held, pending, per, written)) in cases.into_iter().enumerate() {
+    let cases = [(1u64 << 18, 0), (1 << 18, RUNS), (1 << 20, 0), (1 << 20, RUNS)];
+    for (case, (held, runs)) in cases.into_iter().enumerate() {
         // A tier of less than a round, so every round spills.
         let mut t = new_table(
             dir.path().join(case.to_string()),
@@ -195,60 +167,42 @@ fn sealed_read_bench() {
             let rows: Vec<_> = (0..held / 8).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
             t.ingest(certified(make_batch(&schema, &rows))).unwrap();
         }
-        for from in (0..pending).step_by(per as usize) {
-            let row = |s: u64| (scatter(s) % held, 1, -1 - s as i64);
-            let rows: Vec<_> = (from..from + per).map(row).collect();
-            t.ingest_pending(make_batch(&schema, &rows));
-        }
-        if written {
-            flush_barrier([&mut t], 0).unwrap();
+        assert!(
+            t.ram_tiers(Cut::Now).all(|set| set.len() == 0),
+            "premise: every row is on disk"
+        );
+        // `mix(s) & (held - 1)` visits each held key once.
+        for r in 0..runs {
+            let keys = (r * PER_RUN..(r + 1) * PER_RUN).map(|s| mix(s) & (held - 1));
+            let rows: Vec<_> = keys.flat_map(|k| [(k, -1, k as i64), (k, 1, -1 - k as i64)]).collect();
+            t.ingest(make_batch(&schema, &rows)).unwrap();
         }
         assert_eq!(
-            t.pending.len() == 0,
-            pending == 0 || written,
-            "where the pending rows sit"
+            t.ram_tiers(Cut::Sealed).any(|set| set.len() > 0),
+            runs > 0,
+            "premise: the updates stay in RAM"
         );
-        let above = match (pending, written) {
-            (0, _) => "nothing pending".to_string(),
-            (_, false) => format!("{pending} pending in {per}-row pushes"),
-            (_, true) => format!("{pending} pending written by a barrier"),
-        };
-        let label = format!("{held} rows, {above}");
-        // The larger store is read fewer times.
-        let (gathers, walks) = if held > 1 << 18 { (20, 2) } else { (200, 8) };
+        let label = format!("{held} rows, {runs} heap runs");
+        // Each read once unmeasured first, to warm the batch pool.
         for n in [1u64, 64, 4096] {
             let step = held / (n + 1);
-            let key_bytes: Vec<[u8; 8]> = (1..=n).map(|i| (i * step).to_be_bytes()).collect();
-            let passes = vec![pk_keys(8, key_bytes.iter().map(|k| &k[..])); gathers];
-            let (rows, instructions) = counter.measure(|| {
-                let gather = |keys| {
-                    t.gather(keys, Cut::Sealed)
-                        .drain_chunk(usize::MAX)
-                        .map_or(0, |b| b.len())
-                };
-                passes.into_iter().map(gather).sum::<usize>()
-            });
-            assert_eq!(
-                rows,
-                gathers * n as usize,
-                "{label}: a sealed gather leaves the pending rows out"
-            );
-            println!(
-                "sealed_read_bench {label}, {n} keys: {} instr/gather",
-                instructions / gathers as u64
-            );
+            let keys = || pk_keys_of_images(8, (1..=n).map(|i| (i * step) as u128));
+            let gather = |keys| {
+                t.gather(keys, Cut::Sealed)
+                    .drain_chunk(usize::MAX)
+                    .map_or(0, |b| b.len())
+            };
+            let (warm, measured) = (keys(), keys());
+            gather(warm);
+            let (rows, instructions) = counter.measure(|| gather(measured));
+            assert_eq!(rows, n as usize, "{label}: a gather's rows");
+            println!("sealed_read_bench {label}, {n} keys: {instructions} instr/gather");
         }
         let (first, last) = (0u64.to_be_bytes(), (held - 1).to_be_bytes());
-        let (rows, instructions) = counter.measure(|| {
-            (0..walks)
-                .map(|_| t.cursor_between(&first, &last, Cut::Sealed).materialize().len())
-                .sum::<usize>()
-        });
-        assert_eq!(
-            rows,
-            walks * held as usize,
-            "{label}: a sealed walk leaves the pending rows out"
-        );
+        let walk = || t.cursor_between(&first, &last, Cut::Sealed).materialize().len();
+        walk();
+        let (rows, instructions) = counter.measure(walk);
+        assert_eq!(rows, held as usize, "{label}: a walk's rows");
         println!(
             "sealed_read_bench {label}, whole span: {:.1} instr/row",
             instructions as f64 / rows as f64
@@ -256,11 +210,9 @@ fn sealed_read_bench() {
     }
 }
 
-/// What one barrier costs over a RAM tier with rows above the cut, and the seal
-/// after it: instructions, and the most each added to the resident set. By how
-/// the pending rows lie against an ascending tier — past its last key, between
-/// its keys, as updates of the rows it holds — and for as many pending rows as
-/// a crash leaves, over an empty tier.
+/// What one barrier costs over rows pending between the keys of a RAM tier,
+/// and the seal after it: instructions, and the most each added to the resident
+/// set; and for as many pending rows as a crash leaves, over an empty tier.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn barrier_seal_bench() {
@@ -268,23 +220,11 @@ fn barrier_seal_bench() {
     const PER: u64 = 1000;
     /// Coprime to every span below, so `s * STRIDE % span` visits each key once.
     const STRIDE: u64 = 7919;
-    #[derive(Clone, Copy, Debug)]
-    enum Lie {
-        Past,
-        Between,
-        Updates,
-    }
     let schema = make_schema_u64_i64();
     let dir = tempfile::tempdir().unwrap();
     let counter = Counter::instructions();
-    // Rows in the RAM tier, at the even keys; rows pending; how they lie.
-    let cases: [(u64, u64, Lie); 4] = [
-        (500_000, 10_000, Lie::Past),
-        (500_000, 10_000, Lie::Between),
-        (500_000, 10_000, Lie::Updates),
-        (0, 1_000_000, Lie::Between),
-    ];
-    for (case, (tier, pending, lie)) in cases.into_iter().enumerate() {
+    // Rows in the RAM tier, at the even keys; rows pending, at odd keys.
+    for (case, (tier, pending)) in [(500_000u64, 10_000u64), (0, 1_000_000)].into_iter().enumerate() {
         let mut t = new_table(
             dir.path().join(case.to_string()),
             schema,
@@ -298,17 +238,9 @@ fn barrier_seal_bench() {
         assert!(table_shards(&t).is_empty(), "the tier's rows are held in RAM");
         let span = tier.max(pending);
         for from in (0..pending).step_by(PER as usize) {
-            let rows: Vec<(u64, i64, i64)> = match lie {
-                Lie::Past => (from..from + PER).map(|s| (2 * span + s, 1, -1 - s as i64)).collect(),
-                Lie::Between => (from..from + PER)
-                    .map(|s| (2 * (s * STRIDE % span) + 1, 1, -1 - s as i64))
-                    .collect(),
-                // An update is two rows: the held row retracted, and its successor.
-                Lie::Updates => (from / 2..(from + PER) / 2)
-                    .map(|s| (s * STRIDE % span, s))
-                    .flat_map(|(k, s)| [(2 * k, -1, k as i64), (2 * k, 1, -1 - s as i64)])
-                    .collect(),
-            };
+            let rows: Vec<_> = (from..from + PER)
+                .map(|s| (2 * (s * STRIDE % span) + 1, 1, -1 - s as i64))
+                .collect();
             t.ingest_pending(make_batch(&schema, &rows));
         }
 
@@ -329,7 +261,7 @@ fn barrier_seal_bench() {
         let seal_peak = mib(resident);
         assert_eq!(delta.map_or(0, |d| d.len()) as u64, pending, "the seal's delta");
         println!(
-            "barrier_seal_bench {tier} rows in the tier, {pending} pending {lie:?}: \
+            "barrier_seal_bench {tier} rows in the tier, {pending} pending: \
              barrier {:.1} M instr, peak {barrier_peak}; seal {:.1} instr/pending row, peak {seal_peak}",
             barrier as f64 / 1e6,
             seal as f64 / pending as f64,
@@ -337,8 +269,11 @@ fn barrier_seal_bench() {
     }
 }
 
-/// Instructions per repeated `Table::open_cursor` of a store whose lowest keys
-/// are inserted and retracted in different runs.
+/// Instructions per `Table::open_cursor` of a store of 15 runs whose lowest
+/// keys are inserted and retracted in different runs, by how many: an open that
+/// passes more rows than the store has runs leaves a floor the next opens seek
+/// to, so 7 cancelled keys are walked by every open and 8 are not. Per open with
+/// the floor judged, and judged anew, as the first open after an ingest does.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn open_cursor_bench() {
@@ -348,7 +283,7 @@ fn open_cursor_bench() {
     let schema = make_schema_u64_i64();
     let dir = tempfile::tempdir().unwrap();
     let counter = Counter::instructions();
-    for cancelled in [0u64, 8, 32, 64, 4096] {
+    for cancelled in [0u64, 7, 8, 4096] {
         let mut t = scratch_table(dir.path().join(cancelled.to_string()), schema);
         let held: Vec<_> = (0..HELD).map(|k| (k, 1, k as i64)).collect();
         t.ingest(certified(make_batch(&schema, &held))).unwrap();
@@ -364,14 +299,21 @@ fn open_cursor_bench() {
         let first = t.open_cursor(Cut::Now);
         assert_eq!(first.current_pk_bytes(), cancelled.to_be_bytes(), "the first live row");
         drop(first);
-        let ((), instructions) = counter.measure(|| {
+        let ((), judged) = counter.measure(|| {
             for _ in 0..OPENS {
                 std::hint::black_box(t.open_cursor(Cut::Now));
             }
         });
+        let ((), judging) = counter.measure(|| {
+            for _ in 0..OPENS {
+                t.live_floor.get_mut().judged = false;
+                std::hint::black_box(t.open_cursor(Cut::Now));
+            }
+        });
         println!(
-            "open_cursor_bench {cancelled:>5} cancelled keys {:9.1} instr/open",
-            instructions as f64 / OPENS as f64
+            "open_cursor_bench {cancelled:>5} cancelled keys {:9.1} instr/open, {:9.1} judging",
+            judged as f64 / OPENS as f64,
+            judging as f64 / OPENS as f64
         );
     }
 }

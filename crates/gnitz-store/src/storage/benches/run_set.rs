@@ -1,41 +1,20 @@
 use super::super::table::{DEFAULT_RAM_TIER_BYTES, MEMTABLE_BYTES};
 use super::*;
-use crate::test_support::{certified, make_schema_pk_u64_payload_string, make_schema_u64_i64};
+use crate::test_support::{certified, id_rows, make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
 use gnitz_foundation::rng::scatter;
-use gnitz_zset::repr::BatchBuilder;
-use std::rc::Rc;
 
 /// A consolidated run of `rows`, `(pk, weight)` each and ascending by PK; a
 /// string payload is spelled out long enough to live on the heap.
-fn run(schema: &SchemaDescriptor, rows: impl Iterator<Item = (u64, i64)>) -> Batch {
-    let mut b = BatchBuilder::new(schema);
-    for (pk, weight) in rows {
-        b.begin_row(pk as u128, weight);
-        match schema.string_payload_slots() {
-            0 => {
-                b.put_int(pk as u128);
-            }
-            _ => {
-                b.put_string(&format!("{pk:040}"));
-            }
+fn run(schema: &SchemaDescriptor, rows: impl IntoIterator<Item = (u64, i64)>) -> Batch {
+    let strings = schema.string_payload_slots() > 0;
+    certified(id_rows(schema, rows, |b, pk| {
+        if strings {
+            b.put_string(&format!("{pk:040}"));
+        } else {
+            b.put_int(pk as u128);
         }
-        b.end_row();
-    }
-    certified(b.finish())
-}
-
-/// The rows a push made `set` fold.
-fn rows_folded(runs_before: &[Rc<Batch>], rows_with_pushed: usize, set: &RunSet) -> usize {
-    let kept = set
-        .batches()
-        .zip(runs_before)
-        .take_while(|(a, b)| Rc::ptr_eq(a, b))
-        .count();
-    match kept == runs_before.len() {
-        true => 0,
-        false => rows_with_pushed - runs_before[..kept].iter().map(|r| r.len()).sum::<usize>(),
-    }
+    }))
 }
 
 /// `RunSet::fold` over string payloads: instructions per input row, and the
@@ -96,10 +75,9 @@ fn run_set_fold_bench() {
 
 /// `RunSet::push_run` at a memtable's cadence: a set is pushed `tick`-row runs of
 /// fresh keys until it is full, then cleared, as a drain leaves it. Instructions
-/// and cycles per pushed row with the set never probed, and instructions with
-/// it probed after every push, beside the rows its folds merged per row pushed.
-/// The cycles price the bulk copies of a fold, which retire next to no
-/// instructions.
+/// and cycles per pushed row, with the set never probed and with it probed after
+/// every push. The cycles price the bulk copies of a fold, which retire next to
+/// no instructions.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn run_set_push_bench() {
@@ -112,23 +90,23 @@ fn run_set_push_bench() {
     ];
     let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
     println!(
-        "run_set_push_bench {:<28} {:>9} {:>12} {:>10} {:>10} {:>10}",
-        "", "rows/fill", "folded/row", "instr/row", "cycles/row", "probed"
+        "run_set_push_bench {:<28} {:>9} {:>10} {:>10} {:>13} {:>13}",
+        "", "rows/fill", "instr/row", "cycles/row", "probed instr", "probed cycles"
     );
     for (schema_label, schema) in schemas {
         for (order_label, key) in orders {
             for tick in [1u64, 16, 128] {
+                let label = format!("{schema_label}, {order_label}, {tick}-row");
                 // Every fill's ticks, enough to fill the set, built ahead of the
-                // measurement, with what the set's own folds merge off a shadow
-                // set the same ticks fill.
-                let (mut rows, mut folded) = (0u64, 0u64);
+                // measurement and trimmed, as a pushed batch is decoded.
+                let mut rows = 0u64;
                 let mut fills = Vec::new();
                 for _ in 0..FILLS {
                     let ticks: Vec<Batch> = (0..)
                         .map(|t| {
                             let mut keys: Vec<u64> = (0..tick).map(|i| key(rows + t * tick + i)).collect();
                             keys.sort_unstable();
-                            run(&schema, keys.into_iter().map(|pk| (pk, 1)))
+                            run(&schema, keys.into_iter().map(|pk| (pk, 1))).trimmed()
                         })
                         .scan(0, |bytes, b| {
                             let full = *bytes > MEMTABLE_BYTES;
@@ -136,23 +114,13 @@ fn run_set_push_bench() {
                             (!full).then_some(b)
                         })
                         .collect();
-                    let mut shadow = RunSet::cancelling(MEMTABLE_BYTES);
-                    for b in &ticks {
-                        let before: Vec<_> = shadow.batches().cloned().collect();
-                        let rows = shadow.row_count() + b.len();
-                        shadow.push(b.clone(), &schema);
-                        folded += rows_folded(&before, rows, &shadow) as u64;
-                    }
-                    let (runs, held) = (shadow.len(), shadow.row_count() as u64);
-                    rows += held;
-                    fills.push((ticks, runs, held));
+                    rows += ticks.iter().map(|b| b.len() as u64).sum::<u64>();
+                    fills.push(ticks);
                 }
-                let mut cells = [0.0; 2];
-                let mut unprobed_cycles = 0u64;
-                for (cell, probed) in cells.iter_mut().zip([false, true]) {
-                    let mut instructions = 0;
+                let [unprobed, probed] = [false, true].map(|probed| {
                     let mut set = RunSet::cancelling(MEMTABLE_BYTES);
-                    for (ticks, runs, held) in &fills {
+                    let mut counts = [0u64; 2];
+                    for ticks in &fills {
                         let ticks = ticks.clone();
                         let ((), [i, c]) = counters.measure(|| {
                             for b in ticks {
@@ -162,24 +130,20 @@ fn run_set_push_bench() {
                                 }
                             }
                         });
-                        instructions += i;
-                        unprobed_cycles += c * !probed as u64;
-                        assert_eq!(set.len(), *runs, "{schema_label}, {order_label}, {tick}: folds");
-                        assert_eq!(set.row_count() as u64, *held);
-                        assert!(set.is_full(), "{schema_label}, {order_label}, {tick}: not filled");
-                        assert_eq!(set.bloom.get().is_some(), probed);
+                        counts = [counts[0] + i, counts[1] + c];
+                        assert!(set.is_full(), "{label}: not filled");
+                        assert_eq!(set.bloom.get().is_some(), probed, "{label}");
                         set.clear();
                     }
-                    *cell = instructions as f64 / rows as f64;
-                }
+                    counts.map(|n| n as f64 / rows as f64)
+                });
                 println!(
-                    "run_set_push_bench {:<28} {:>9} {:>12.1} {:>10.1} {:>10.1} {:>10.1}",
-                    format!("{schema_label}, {order_label}, {tick}-row"),
+                    "run_set_push_bench {label:<28} {:>9} {:>10.1} {:>10.1} {:>13.1} {:>13.1}",
                     rows / FILLS as u64,
-                    folded as f64 / rows as f64,
-                    cells[0],
-                    unprobed_cycles as f64 / rows as f64,
-                    cells[1]
+                    unprobed[0],
+                    unprobed[1],
+                    probed[0],
+                    probed[1]
                 );
             }
         }
@@ -233,15 +197,17 @@ fn run_set_probe_bench() {
         for (kind, odd) in [("hits", 0), ("misses", 1)] {
             let keys = keys(odd);
             let passes = keys.iter().filter(|(_, f)| set.may_contain(*f)).count();
-            let (found, [instr, cyc]) = counters.measure(|| {
-                let mut found = 0u64;
-                for (key, fingerprint) in &keys {
-                    for (run, rows) in set.holding(key, *fingerprint) {
-                        found += run.get_weight(rows.start) as u64
-                    }
-                }
-                found
-            });
+            // A key's first holder, as a unique-PK probe reads it.
+            let probe = || -> u64 {
+                (keys.iter())
+                    .filter_map(|(key, fingerprint)| set.holding(key, *fingerprint).next())
+                    .map(|(run, rows)| run.get_weight(rows.start) as u64)
+                    .sum()
+            };
+            // Unmeasured: the first pass builds the filters of the runs its
+            // misses reach, so the measured one is the steady state.
+            probe();
+            let (found, [instr, cyc]) = counters.measure(probe);
             assert_eq!(found, PROBES * (1 - odd), "{label}, {kind}");
             println!(
                 "run_set_probe_bench {runs:>2} {label:<17} {kind:<6} {:6.1} instr/probe, {:6.1} cycles/probe, {:5.2}% pass the bloom",
