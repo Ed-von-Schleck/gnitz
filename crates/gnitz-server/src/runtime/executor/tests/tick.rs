@@ -44,3 +44,32 @@ fn a_relations_first_unticked_commit_wakes_its_watches_and_refuses_new_ones() {
         assert!(try_poll_once(&mut on_u).is_none());
     });
 }
+
+/// A read of a view whose sources are all ticked takes the guard at once and
+/// ticks nothing, while a relation it does not read stays pending.
+#[test]
+fn a_read_of_a_ticked_view_neither_waits_on_nor_ticks_an_unrelated_commit() {
+    within(|| {
+        let (_tmp, mut engine) = empty_catalog(1);
+        let cols = u64_i64_cols();
+        let t = engine.create_table("public.t", &cols, &[0]).unwrap();
+        let u = engine.create_table("public.u", &cols, &[0]).unwrap();
+        let v = register_identity_view(&mut engine, t, "v", &cols);
+        let w = register_identity_view(&mut engine, u, "w", &cols);
+        let (dispatcher, _) = test_dispatcher(0, engine);
+        let (shared, _commits, _asks) = Shared::new(dispatcher, Duration::ZERO, None);
+        let reactor = shared.dispatcher.reactor();
+        reactor.block_on(async {
+            let laid_out = shared.dispatcher.sal().lock().await;
+            shared.dispatcher.credit(&laid_out, u, 1);
+        });
+
+        let read = try_poll_once(fresh_read_lock(shared, [v], reactor.now()));
+        assert!(read.is_some_and(|locked| locked.is_ok()), "`v` is fresh");
+        assert!(!shared.dispatcher.all_ticked([w]), "`u` is still pending");
+        assert!(
+            try_poll_once(fresh_read_lock(shared, [w], reactor.now())).is_none(),
+            "a read of `w` drains"
+        );
+    });
+}

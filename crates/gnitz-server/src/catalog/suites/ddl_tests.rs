@@ -496,9 +496,9 @@ fn test_pk_list_round_trips_into_registered_schema() {
 }
 
 // ── test_drop_view_removes_directory ─────────────────────────────────
-// DROP VIEW must delete the view's on-disk scratch directory, not just the
-// logical catalog rows. Once the catalog entry is gone no later DROP could
-// target the leaked directory, so the cleanup has to happen inside drop_view.
+// A dropped view's on-disk directory is reclaimed, not just its catalog rows:
+// once the catalog entry is gone no later DROP could target it, so the orphan
+// sweep must find it.
 
 #[test]
 fn test_drop_view_removes_directory() {

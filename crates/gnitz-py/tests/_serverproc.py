@@ -554,19 +554,20 @@ def join_or_fail(why, *threads):
             raise t.error
 
 
-def across(ddl, step, after=20):
-    """Run `step(k)` for k = 0, 1, … — once before `ddl()` starts on a `spawn`ed
-    thread, throughout it, and `after` more times once it returned — and return
-    how many steps ran. Both sides of the DDL are therefore always exercised."""
+def across(background, step, after=20):
+    """Run `step(k)` for k = 0, 1, … — once before `background()` starts on a
+    `spawn`ed thread, throughout it, and `after` more times once it returned —
+    and return how many steps ran. Both sides of it are therefore always
+    exercised."""
     step(0)
-    th = spawn(ddl)
+    th = spawn(background)
     k, past, deadline = 1, 0, time.monotonic() + HANG_TIMEOUT
     try:
         while past < after:
-            assert time.monotonic() < deadline, "the DDL never returned"
+            assert time.monotonic() < deadline, "the background operation never returned"
             past += not th.is_alive()
             step(k)
             k += 1
     finally:
-        join_or_fail("the DDL hung", th)
+        join_or_fail("the background operation hung", th)
     return k

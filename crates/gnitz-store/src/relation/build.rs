@@ -4,11 +4,6 @@
 
 use super::dirs::ensure_dir;
 use super::*;
-use gnitz_foundation::fault::Count;
-
-/// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
-/// directory and its child subdir, so a concurrent DROP races it.
-static TABLE_CREATE_DELAY: Count = Count::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 impl RelationRegistry {
     /// [`Self::register_at`] with no index and no trace, every store rebuilt.
@@ -210,12 +205,7 @@ impl RelationRegistry {
                 ensure_dir(&relation_dir(&self.base_dir, id))?;
                 return Ok(());
             }
-            RelationKind::BaseTable => {
-                if let Some(ms) = TABLE_CREATE_DELAY.count() {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
-                (RecoverySource::SalReplay, None, None)
-            }
+            RelationKind::BaseTable => (RecoverySource::SalReplay, None, None),
             RelationKind::View(p) => (
                 RecoverySource::Rederive { resume_at },
                 p.capacity_bytes(),

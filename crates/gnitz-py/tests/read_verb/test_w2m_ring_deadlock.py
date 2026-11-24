@@ -11,12 +11,12 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 
 import gnitz
+from _read import bag, rows
 from _schemas import KV, kv
-from _serverproc import NEEDS_MULTI, TINY_REPLY_FRAMES
+from _serverproc import NEEDS_MULTI, TINY_REPLY_FRAMES, join_or_fail, spawn
 
 # ~16 MB of reply per worker against a 256 KiB ring: every later worker's ring
 # fills while the master forwards the first worker's train.
@@ -57,15 +57,13 @@ def test_a_full_ring_does_not_stall_a_tick_behind_a_scan(own_server):
             time.sleep(0.15)
             scanner.send_signal(signal.SIGSTOP)
             time.sleep(0.3)
-            read = {}
-            reader = threading.Thread(
-                target=lambda: read.setdefault("rows", c.execute_sql("SELECT * FROM agg")), daemon=True)
-            reader.start()
+            read = []
+            reader = spawn(lambda: read.append(bag(rows(c, "SELECT * FROM agg"))))
             time.sleep(0.3)
             scanner.send_signal(signal.SIGCONT)
             out, _ = scanner.communicate(timeout=60)
             assert int(out.strip()) == ROWS
-            reader.join(60)
-            assert "rows" in read, "the view read never finished"
+            join_or_fail("the view read never finished", reader)
+            assert read == [{(1, 1): 1}]
         finally:
             scanner.kill()

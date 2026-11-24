@@ -18,6 +18,7 @@ import threading
 import pytest
 import gnitz
 from _read import bag, scanned
+from _schemas import KV, kv
 from _serverproc import join_or_fail, spawn
 
 # A conflict absorbed at the app level is expected; one that never clears is a
@@ -49,12 +50,15 @@ def _retry(c, sql):
 
 
 def test_racing_read_modify_writes_lose_no_update(client, ledger, peer):
-    """Three connections race increments: an UPDATE and an upsert on one row, and
-    an UPDATE on the other. Two racers that read the same `val` both write
-    `val + 1` unless the loser's commit is refused, so every increment landing is
-    the guard; the table-grain conflicts between the two rows are absorbed by the
-    retry."""
+    """Connections race increments: an UPDATE and an upsert on one row, and an
+    UPDATE on the other. Two racers that read the same `val` both write `val + 1`
+    unless the loser's commit is refused, so every increment landing is the
+    guard; the table-grain conflicts between the rows are absorbed by the retry.
+
+    A third row races an UPDATE against its DELETE: an UPDATE built on a read
+    from before the DELETE committed would bring the row back."""
     n = 25
+    client.execute_sql("INSERT INTO ledger VALUES (3, 0)")
 
     def worker(c, sql):
         for _ in range(n):
@@ -64,8 +68,10 @@ def test_racing_read_modify_writes_lose_no_update(client, ledger, peer):
         _BUMP_1.format("ledger"),
         "INSERT INTO ledger VALUES (1, 0) ON CONFLICT (pk) DO UPDATE SET val = val + 1",
         "UPDATE ledger SET val = val + 1 WHERE pk = 2",
+        "UPDATE ledger SET val = val + 1 WHERE pk = 3",
+        "DELETE FROM ledger WHERE pk = 3",
     )])
-    assert bag(scanned(client, "ledger"), "pk", "val") == {(1, 2 * n): 1, (2, n): 1}
+    assert bag(scanned(client, "ledger")) == {(1, 2 * n): 1, (2, n): 1}
 
 
 @pytest.mark.parametrize("sql, want", [
@@ -74,27 +80,28 @@ def test_racing_read_modify_writes_lose_no_update(client, ledger, peer):
      {(1, 1): 1, (2, 100): 1}),
     ("DELETE FROM ledger WHERE pk = 1", {(2, 100): 1}),
 ], ids=["update", "upsert", "delete"])
-def test_a_foreign_commit_costs_no_extra_round(ledger, peer, sql, want):
-    """A connects, then B commits to the same table, then A runs its statement. A's
-    read comes after B's ACK, so its watermark covers B's commit and the first
-    attempt commits: one RESOLVE, one read, one push — and B's write survives."""
+def test_a_commit_before_the_read_is_no_conflict(ledger, peer, sql, want):
+    """A connects, then B commits to the same table, then A runs its statement in
+    a transaction, which surfaces a conflict an autocommit would retry away. A's
+    read comes after B's ACK, so its watermark covers B's commit: A commits, and
+    B's write survives."""
     a, b = peer(), peer()
     b.execute_sql("UPDATE ledger SET val = val + 100 WHERE pk = 2")
-    before = a.requests_sent
+    a.execute_sql("BEGIN")
     a.execute_sql(sql)
-    assert a.requests_sent - before == 3, "RESOLVE, SCAN_MULTI and PUSH_TXN"
-    assert bag(scanned(a, "ledger"), "pk", "val") == want
+    a.execute_sql("COMMIT")
+    assert bag(scanned(a, "ledger")) == want
 
 
-@pytest.mark.parametrize("b_at, via, ledger_read, rename", [
-    ("before-begin", "sql", _BUMP_1.format("ledger"), False),
-    ("before-read", "sql", _BUMP_1.format("ledger"), False),
-    ("after-read", "sql", _BUMP_1.format("ledger"), False),
-    ("after-read", "context-manager", _BUMP_1.format("ledger"), False),
-    ("after-read", "sql", _BUMP_1.format("ledger"), True),
-    ("after-read", "sql", "SELECT * FROM ledger", False),
+@pytest.mark.parametrize("b_at, via, rmw, rename", [
+    ("before-begin", "sql", True, False),
+    ("before-read", "sql", True, False),
+    ("after-read", "sql", True, False),
+    ("after-read", "context-manager", True, False),
+    ("after-read", "sql", True, True),
+    ("after-read", "sql", False, False),
 ], ids=["before-begin", "before-read", "after-read", "context-manager", "rename-between", "select-only"])
-def test_a_transaction_commits_only_if_no_table_it_modified_was_written(ledger, peer, b_at, via, ledger_read, rename):
+def test_a_transaction_commits_only_if_no_table_it_modified_was_written(ledger, peer, b_at, via, rmw, rename):
     """A writes `u` and reads `ledger` in one transaction; B commits to `ledger`
     before A's BEGIN, between A's write to `u` and its read of `ledger`, or after
     that read. Each family's basis is the watermark of its own read, so only a
@@ -108,8 +115,7 @@ def test_a_transaction_commits_only_if_no_table_it_modified_was_written(ledger, 
     watermark must leave a renamed one's, or A's stale precondition would pass and
     lose B's write."""
     a, b = peer(), peer()
-    (u_tid, u_schema), (ledger_tid, ledger_schema) = (a.resolve_table(name) for name in ("u", "ledger"))
-    rmw = ledger_read != "SELECT * FROM ledger"
+    ledger_read = _BUMP_1.format("ledger") if rmw else "SELECT * FROM ledger"
     conflicts = rmw and b_at == "after-read"
 
     def b_commits_at(at):
@@ -136,16 +142,15 @@ def test_a_transaction_commits_only_if_no_table_it_modified_was_written(ledger, 
             body()
             a.execute_sql("COMMIT")
 
-    assert bag(a.scan(u_tid, u_schema), "pk", "val") == {(1, 0 if conflicts else 1): 1}
-    assert bag(a.scan(ledger_tid, ledger_schema), "pk", "val") == \
-        {(1, 100 + (rmw and not conflicts)): 1, (2, 0): 1}
+    assert bag(scanned(a, "u")) == {(1, 0 if conflicts else 1): 1}
+    assert bag(scanned(a, "ledger")) == {(1, 100 + (rmw and not conflicts)): 1, (2, 0): 1}
     if conflicts:
         a.execute_sql("BEGIN")
         a.execute_sql(_BUMP_1.format("u"))
         a.execute_sql(_BUMP_1.format("ledger"))
         a.execute_sql("COMMIT")
-        assert bag(a.scan(u_tid, u_schema), "pk", "val") == {(1, 1): 1}
-        assert bag(a.scan(ledger_tid, ledger_schema), "pk", "val") == {(1, 101): 1, (2, 0): 1}
+        assert bag(scanned(a, "u")) == {(1, 1): 1}
+        assert bag(scanned(a, "ledger")) == {(1, 101): 1, (2, 0): 1}
 
 
 # ── Refusals no concurrent writer may dilute ─────────────────────────────────
@@ -180,14 +185,13 @@ def test_a_duplicate_key_insert_is_decided_against_a_racing_upsert(client, peer)
     INSERT commits first and the upsert overwrites it, or the upsert does and the
     INSERT is refused: the key ends at the upsert's value, at weight 1, both ways.
     A pre-flight run beside the upsert would pass and commit the INSERT's row too."""
-    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
-    tid, schema = client.resolve_table("t")
+    tid = client.create_table("t", KV)
     a, b = peer(), peer()
     for k in range(1, 21):
         _race("duplicate key value",
               insert=lambda: a.execute_sql(f"INSERT INTO t VALUES ({k}, 1)"),
-              upsert=lambda: b.push(tid, gnitz.ZSetBatch(schema).append(pk=k, val=2)))
-        assert bag(client.seek(tid, schema, pk=k)) == {(k, 2): 1}, k
+              upsert=lambda: b.push(tid, kv((k, 2))))
+        assert bag(client.seek(tid, KV, pk=k)) == {(k, 2): 1}, k
 
 
 @pytest.mark.parametrize("ddl,parent_table,parent,child_table,child", [
