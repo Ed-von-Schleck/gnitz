@@ -1,8 +1,6 @@
 """ON DELETE CASCADE: what a delete of a referenced row takes with it, decided
 by the write's fold and committed with the write or not at all."""
 
-import contextlib
-
 import pytest
 import _fk
 from _serverproc import NEEDS_MULTI
@@ -110,6 +108,10 @@ _SOFT_HARD = (
     "CREATE TABLE hard (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id) ON DELETE NO ACTION)"
 )
 _SOFT_HARD_ROWS = {"parent": [(1,), (2,)], "soft": [(1, 1), (2, 2)], "hard": [(1, 1)]}
+# The FK column leads the child's compound PK.
+_LEAD_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
+               "CREATE TABLE child (pid BIGINT UNSIGNED REFERENCES parent(id) ON DELETE CASCADE,"
+               " line BIGINT UNSIGNED, PRIMARY KEY (pid, line))")
 
 # `(ddl, rows seeded per table, the write as `_fk.write` takes it, every table's
 # rows after — or None where the write is refused and every table keeps its seed)`.
@@ -214,6 +216,9 @@ _WRITES = {
     "a restricting grandchild cleared first": (
         _chain(last="RESTRICT"), _CHAIN_ROWS,
         "DELETE FROM c WHERE b_id >= 20 AND b_id < 40; DELETE FROM a WHERE id IN (2, 3)", _chain_after({2, 3})),
+    "children found by a leading PK member": (
+        _LEAD_CHILD, {"parent": [(1,), (2,), (3,)], "child": [(1, 7), (1, 8), (2, 9)]},
+        "DELETE FROM parent WHERE id = 1", {"parent": [(2,), (3,)], "child": [(2, 9)]}),
     # A cascading sibling's rows are no reason to spare the restricting one's.
     "a restricting sibling": (_SOFT_HARD, _SOFT_HARD_ROWS, "DELETE FROM parent WHERE id = 1", None),
     "a cascading sibling beside an unreferencing restricting one": (
@@ -224,8 +229,4 @@ _WRITES = {
 
 @pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
 def test_a_cascade_deletes_what_the_fold_leaves_referencing_a_deleted_row(client, ddl, seed, write, after):
-    _fk.seed(client, ddl, seed)
-    with _fk.refused() if after is None else contextlib.nullcontext():
-        _fk.write(client, write)
-    want = after or seed
-    assert _fk.held(client, want) == _fk.want(want)
+    _fk.check(client, ddl, seed, write, after)

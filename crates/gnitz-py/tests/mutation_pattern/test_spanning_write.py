@@ -91,9 +91,9 @@ def test_a_reference_refused_in_the_last_frame_commits_nothing(client, spanning)
     refs = [{"cid": i, "pid": 0, "w": i, "x": i} for i in range(_N)]
     with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)foreign key"):
         spanning.push(tid, gnitz.ZSetBatch(schema).extend(refs + [{"cid": _N, "pid": 999, "w": 0, "x": 0}]), "error")
-    assert rows(client, "SELECT * FROM c") == []
+    assert bag(rows(client, "SELECT * FROM c")) == {}
     spanning.push(tid, gnitz.ZSetBatch(schema).extend(refs), "error")
-    assert len(rows(client, "SELECT * FROM c")) == _N
+    assert bag(rows(client, "SELECT * FROM c")) == {(i, 0, i, i): 1 for i in range(_N)}
 
 
 def test_a_write_past_the_log_is_refused_as_no_retry_fits(own_server, monkeypatch):

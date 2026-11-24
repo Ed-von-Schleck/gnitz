@@ -415,12 +415,17 @@ fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<Re
         });
     };
     match access {
-        Access::Read if kind == RelationKind::Stream => {
-            Err(format!("table {target_id} is a stream: a stream holds no rows and cannot be read").into())
-        }
-        Access::Write if !kind.is_ingestion_point() => {
-            Err(format!("table {target_id} is not writable: pushes must target a base table or a stream").into())
-        }
+        Access::Read if kind == RelationKind::Stream => Err(format!(
+            "stream {} holds no rows and cannot be read",
+            cat.qualified_name(target_id)
+        )
+        .into()),
+        Access::Write if !kind.is_ingestion_point() => Err(format!(
+            "{} {} is not writable: pushes must target a base table or a stream",
+            kind.noun(),
+            cat.qualified_name(target_id)
+        )
+        .into()),
         _ => Ok(kind),
     }
 }

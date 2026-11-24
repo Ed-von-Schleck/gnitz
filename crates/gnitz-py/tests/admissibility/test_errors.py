@@ -6,14 +6,14 @@ The engine — not the SQL planner — has to hold the writes, because a binary
 push or delete is a shipped client binding no planner stands in front of.
 """
 
-import pickle
+import re
 from decimal import Decimal
 
 import pytest
 
 import gnitz
-from _read import bag
-from _schemas import KV
+from _read import bag, scanned
+from _schemas import KV, kv
 
 
 def test_a_push_whose_schema_disagrees_is_refused(client):
@@ -36,61 +36,49 @@ def test_a_push_whose_schema_disagrees_is_refused(client):
     assert bag(client.scan(tid, schema)) == {(1, Decimal("1.5000")): 1}
 
 
-@pytest.mark.parametrize("target", ["view", "system table"])
-def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target):
+@pytest.mark.parametrize("target,noun", [("v", "view"), ("_system.tables", "system table")],
+                         ids=["view", "system table"])
+def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target, noun):
     """A view's tid lives in the same id space as a base table's, and a system
     family's rows are written by DDL alone, so a raw push, delete or transaction
     addressed to either would commit rows nothing derived. SQL refuses both
     targets while planning; the raw API reaches only the server's guard. It is one guard on
     every write, the empty-batch arm included — so a client bug producing an
     empty batch fails instead of being masked by the no-op ACK a base table
-    still gives."""
+    still gives. The writes re-push and delete a row the target holds."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
         "CREATE VIEW v AS SELECT * FROM t WHERE val > 50; "
         "INSERT INTO t VALUES (1, 100), (2, 10)")
-    if target == "view":
-        tid, schema = client.resolve_table("v")
-        row = {"pk": 999, "val": 999}
-    else:
-        tid, schema = client.resolve_table("_system.tables")
-        row = {"table_id": 999999, "schema_id": 1, "name": "forged", "pk_col_idx": 0,
-               "stream": 0, "serial": 0, "replicated": 0, "dist_prefix": 0, "compress": 0}
-    before = bag(client.scan(tid, schema))
-    assert before
+    tid, schema = client.resolve_table(target)
+    held = scanned(client, target)
+    before = bag(held)
+    row = held[0]._asdict()
+    key = row[schema.columns[schema.pk_indices[0]].name]
 
     def in_a_transaction():
         with client.transaction() as txn:
             txn.push(tid, gnitz.ZSetBatch(schema).extend([row]))
 
+    name = target if "." in target else f"{client.schema}.{target}"
     for write in (lambda: client.push(tid, gnitz.ZSetBatch(schema).extend([row])),
-                  lambda: client.delete(tid, schema, [1]),
+                  lambda: client.delete(tid, schema, [key]),
                   lambda: client.push(tid, gnitz.ZSetBatch(schema)),
                   in_a_transaction):
-        with pytest.raises(gnitz.GnitzRefusedError, match="is not writable"):
+        with pytest.raises(gnitz.GnitzRefusedError, match=f"{noun} {re.escape(name)} is not writable"):
             write()
-    assert bag(client.scan(tid, schema)) == before
+    assert bag(scanned(client, target)) == before
 
     t_tid, t_schema = client.resolve_table("t")
     assert client.push(t_tid, gnitz.ZSetBatch(t_schema)) == 0
-
-
-def test_an_error_pickles_as_its_own_class(client):
-    """An exception pickles by its module and name — what a multiprocessing
-    queue or a process pool sends."""
-    with pytest.raises(gnitz.GnitzNotFoundError) as e:
-        client.resolve_table("nosuch")
-    again = pickle.loads(pickle.dumps(e.value))
-    assert type(again) is gnitz.GnitzNotFoundError and again.args == e.value.args
 
 
 def test_an_absent_relation_is_a_miss_not_a_writability_failure(client):
     """A genuinely absent tid reports 'not found' rather than 'not writable',
     and an absent schema raises the same class, so a caller branches on absence
     without matching prose. Every SQL verb's miss is pinned in Rust."""
-    batch = gnitz.ZSetBatch(gnitz.Schema([KV.columns[0]], [0])).extend([{"pk": 1}])
     with pytest.raises(gnitz.GnitzNotFoundError, match="not found"):
-        client.push(99999999, batch)
+        client.push(99999999, kv((1, 0)))
 
     absent = "schema 'nonexistent_schema_xyz' not found"
     with pytest.raises(gnitz.GnitzNotFoundError, match=absent):
@@ -103,17 +91,20 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client):
 def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, other_client):
     """The dependency graph the engine derives from a view's circuit gates DROP
     TABLE and the schema cascade that would reach the table, whichever schema
-    the view lives in. The rejected drops leave the table intact, and dropping
-    the view lifts both: the cascade at teardown is the second."""
+    the view lives in. The rejected drops leave the table and the view it feeds
+    intact, and dropping the view lifts the gate."""
     tid = other_client.create_table("t", KV)
     client.execute_sql(f"CREATE VIEW v AS SELECT * FROM {other_client.schema}.t")
+    other_client.push(tid, kv((1, 10)))
 
     for drop in ("DROP TABLE t", f"DROP SCHEMA {other_client.schema} CASCADE"):
         with pytest.raises(gnitz.GnitzRefusedError, match=rf"dependent views \({client.schema}\.v\)"):
             other_client.execute_sql(drop)
-    assert other_client.resolve_table("t")[0] == tid
+    other_client.push(tid, kv((2, 20)))
+    assert bag(scanned(client, "v")) == {(1, 10): 1, (2, 20): 1}
 
     client.execute_sql("DROP VIEW v")
+    other_client.execute_sql("DROP TABLE t")
 
 
 @pytest.mark.parametrize("tables,body,base", [

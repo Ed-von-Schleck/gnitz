@@ -528,14 +528,20 @@ fn a_read_the_relation_cannot_answer_is_refused() {
         ),
         (
             stream.probe(TID, Probe::Pk { read: 0 }, span()).map(drop),
-            "is a stream",
+            "holds no rows and cannot be read",
         ),
         (
             stream.probe(TID, Probe::Pk { read: 1 }, span()).map(drop),
-            "is a stream",
+            "holds no rows and cannot be read",
         ),
-        (streamed.open_read(ReadBound::None, u64::MAX).map(drop), "is a stream"),
-        (streamed.open_sealed(ReadBound::None, u64::MAX).map(drop), "is a stream"),
+        (
+            streamed.open_read(ReadBound::None, u64::MAX).map(drop),
+            "holds no rows and cannot be read",
+        ),
+        (
+            streamed.open_sealed(ReadBound::None, u64::MAX).map(drop),
+            "holds no rows and cannot be read",
+        ),
         (
             stream
                 .scan_spec(
@@ -545,7 +551,7 @@ fn a_read_the_relation_cannot_answer_is_refused() {
                     None,
                 )
                 .map(drop),
-            "is a stream",
+            "holds no rows and cannot be read",
         ),
     ];
     for (i, (got, why)) in refusals.into_iter().enumerate() {

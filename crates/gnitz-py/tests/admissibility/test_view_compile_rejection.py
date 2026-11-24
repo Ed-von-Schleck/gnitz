@@ -51,6 +51,11 @@ def caps(module_client):
     return module_client
 
 
+def _strings(n):
+    """An IN list of `n` strings, the first five of which `ts` holds."""
+    return ", ".join(f"'a{i}'" for i in range(n))
+
+
 # `name: (range spanning the limit, body for n, the correct answer's rows for n)`.
 _SWEEPS = {
     # N equality conjuncts in HAVING; the answer is the single cat=1 group.
@@ -59,7 +64,7 @@ _SWEEPS = {
         lambda n: [(1,)]),
     # An N-item string IN inside a view's WHERE.
     "in_list": (
-        range(30, 37), lambda n: "SELECT pk, s FROM ts WHERE s IN (" + ", ".join(f"'a{i}'" for i in range(n)) + ")",
+        range(30, 37), lambda n: f"SELECT pk, s FROM ts WHERE s IN ({_strings(n)})",
         lambda n: [(i, f"a{i}") for i in range(5)]),
     # N computed projection items: one shared column load, then a constant and
     # an add apiece.
@@ -103,19 +108,24 @@ def test_a_view_never_compiles_to_silently_empty(caps, ns, sql_for, want):
     first_rejected(create, ns)
 
 
-def test_a_dml_residual_crosses_the_same_cap_and_says_so(caps):
+# `name: (table, range spanning the limit, an identity UPDATE for n, the rows it
+# matches)`.
+_RESIDUALS = {
+    "conjuncts": ("hg", range(12, 20), lambda n: f"UPDATE hg SET cat = 1 WHERE {conjunct_ladder('cat', n)}", 2),
+    "in_list": ("ts", range(28, 40), lambda n: f"UPDATE ts SET s = s WHERE s IN ({_strings(n)})", 5),
+}
+
+
+@pytest.mark.parametrize("table,ns,stmt_for,count", _RESIDUALS.values(), ids=_RESIDUALS.keys())
+def test_a_dml_residual_crosses_the_same_cap_and_says_so(caps, table, ns, stmt_for, count):
     """A residual is compiled by the client and shipped as a blob, not built
-    into a circuit, so it is a second path to the one cap. Both shapes are
-    located rather than pinned: every size below the boundary is served, and the
-    first one past it names the limit."""
+    into a circuit, so it is a second path to the one cap: every size below the
+    boundary updates exactly the rows it matches, and the first one past it
+    names the limit."""
+    before = bag(scanned(caps, table))
+
     def update(n):
-        res = caps.execute_sql(f"UPDATE hg SET cat = 1 WHERE {conjunct_ladder('cat', n)}")
-        assert res[0]["count"] == 2, f"n={n}: both cat=1 rows satisfy every conjunct"
+        assert caps.execute_sql(stmt_for(n))[0]["count"] == count, f"n={n}"
+        assert bag(scanned(caps, table)) == before, f"n={n}"
 
-    def update_in(n):
-        items = ", ".join(f"'a{i}'" for i in range(n))
-        res = caps.execute_sql(f"UPDATE ts SET s = s WHERE s IN ({items})")
-        assert res[0]["count"] == 5, f"n={n}: every row's value is in the list"
-
-    first_rejected(update, range(12, 20))
-    first_rejected(update_in, range(28, 40))
+    first_rejected(update, ns)

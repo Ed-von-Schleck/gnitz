@@ -9,31 +9,21 @@ read stops the boot instead of running at a default nobody asked for.
 """
 
 import os
-import subprocess
 
 import pytest
-
-from _serverproc import server_binary, server_env
 
 EX_USAGE = 64
 
 
-@pytest.mark.parametrize("args,named", [
-    (("--workerz=4",), "--workerz=4"),
-    (("--tls-listen=0.0.0.0:0",), "--allow-unauthenticated"),
-], ids=["argv", "tls"])
-def test_a_refused_command_line_is_a_usage_error_that_creates_nothing(own_server, args, named):
-    assert own_server.start_expecting_exit(named, extra_args=args) == EX_USAGE
+@pytest.mark.parametrize("args,env,named", [
+    (("--workerz=4",), {}, "--workerz=4"),
+    (("--tls-listen=0.0.0.0:0",), {}, "--allow-unauthenticated"),
+    # The variable `--log-level` defaults from is read with argv.
+    ((), {"GNITZ_LOG_LEVEL": "verbos"}, "GNITZ_LOG_LEVEL"),
+], ids=["argv", "tls", "log level"])
+def test_a_refused_command_line_is_a_usage_error_that_creates_nothing(own_server, args, env, named):
+    assert own_server.start_expecting_exit(named, extra_args=args, extra_env=env) == EX_USAGE
     assert not os.path.exists(own_server.data_dir)
-
-
-@pytest.mark.parametrize("flag", ["--help", "-h"])
-def test_help_goes_to_stdout(flag):
-    out = subprocess.run([server_binary(), flag], capture_output=True, text=True,
-                         env=server_env(), timeout=30)
-    assert out.returncode == 0
-    assert out.stdout.startswith("gnitz-server —")
-    assert out.stderr == ""
 
 
 @pytest.mark.parametrize("var,value", [
@@ -49,7 +39,6 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_SCAN_CHUNK_ROWS", "3.0"),
     ("GNITZ_ADHOC_GROUP_CAP", "none"),
     ("GNITZ_CPU_AFFINITY", "off"),
-    ("GNITZ_LOG_LEVEL", "verbos"),
     ("GNITZ_CASCADE_BYTES", "1MB"),
     ("GNITZ_FK_PRESENCE_KEYS", "-1"),
     ("GNITZ_PUSH_QUEUE_BYTES", "8M"),
@@ -57,7 +46,9 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_MESH_OUTBOX_PAGES", "1"),
     ("GNITZ_PATIENT_TICK_GAP_MS", "10ms"),
     ("GNITZ_TICK_COALESCE_ROWS", "10k"),
+    ("GNITZ_W2M_RING_BYTES", "64k"),
+    ("GNITZ_WRITE_SPAN_BYTES", "0"),
 ])
 def test_an_unreadable_environment_knob_stops_the_boot(own_server, var, value):
     # A knob only a worker reads is refused in that worker's log.
-    own_server.start_expecting_exit(var, extra_env={var: value})
+    own_server.start_expecting_exit(f'{var}="{value}"', extra_env={var: value})

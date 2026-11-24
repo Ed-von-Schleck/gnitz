@@ -16,7 +16,7 @@ import gnitz
 import pytest
 
 from _read import bag, reply, rows
-from _serverproc import server_binary
+from _serverproc import server_binary, server_env
 
 pytest_plugins = ["pytester"]
 
@@ -27,6 +27,15 @@ def server_bin(monkeypatch):
     binary = server_binary()
     monkeypatch.setenv("GNITZ_SERVER_BIN", binary)
     return binary
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_goes_to_stdout(flag):
+    out = subprocess.run([server_binary(), flag], capture_output=True, text=True,
+                         env=server_env(), timeout=30)
+    assert out.returncode == 0
+    assert out.stdout.startswith("gnitz-server —")
+    assert out.stderr == ""
 
 
 def test_a_throwaway_server_serves_until_it_stops_and_takes_its_data_along(server_bin):

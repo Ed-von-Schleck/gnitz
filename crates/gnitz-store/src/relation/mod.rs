@@ -454,7 +454,7 @@ impl Relation {
     pub(crate) fn table_or_err(&self) -> Result<&Table, String> {
         let id = self.id();
         self.table.as_ref().ok_or_else(|| match self.kind() {
-            RelationKind::Stream => format!("relation {id} is a stream: a stream holds no rows and cannot be read"),
+            RelationKind::Stream => format!("stream {id} holds no rows and cannot be read"),
             _ => format!("relation {id} holds no store in this process"),
         })
     }

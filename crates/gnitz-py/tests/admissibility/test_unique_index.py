@@ -45,13 +45,6 @@ def _indices(client):
     return family(client, "indices", "index_id", where=f"owner_id = {client.resolve_table('t')[0]}")
 
 
-def _raw_table(client):
-    """Raw `t` over `KV` + a SQL unique index on `val`. Returns its tid."""
-    tid = client.create_table("t", KV)
-    client.execute_sql("CREATE UNIQUE INDEX ON t(val)")
-    return tid
-
-
 # ── CREATE over rows already present ─────────────────────────────────────────
 
 # A PK spread wide enough that routing puts the rows on different workers.
@@ -143,8 +136,6 @@ def test_create_over_present_rows_admits_exactly_a_duplicate_free_seed(
     assert bag(scanned(client, "t")) == dict.fromkeys(seed + [landed], 1)
 
 
-_n = 2000
-
 # `(server environment, seeded rows — each value held once, a row claiming a
 # seeded value, a row repeating one on a far-away PK)`.
 _MERGES = {
@@ -156,8 +147,8 @@ _MERGES = {
     # spills to shards long before its hundreds of spans are in, so they are
     # read back through a merge over many runs.
     "index past its RAM tier": (
-        {"GNITZ_RAM_TIER_BYTES": "1024"}, [(i * 7 + 1, i) for i in range(_n)],
-        (_n * 10, 5), (_n * 10 + 3, 0)),
+        {"GNITZ_RAM_TIER_BYTES": "1024"}, [(i * 7 + 1, i) for i in range(2000)],
+        (20000, 5), (20003, 0)),
 }
 
 
@@ -210,7 +201,7 @@ def test_worker_fault_mid_preflight(own_server):
         # succeeds even while every worker's scan path is faulted — for the PK
         # exactly, and for any column list containing it.
         srv.execute_sql("CREATE UNIQUE INDEX ON t(pk); CREATE UNIQUE INDEX ON t(pk, val)")
-        assert len(_indices(srv)) == 2
+        assert sorted(_indices(srv).values()) == [1, 1]
 
 
 # ── Enforcement once the index exists ────────────────────────────────────────
@@ -280,13 +271,6 @@ _CLAIMS = {
         [(1, 1, 1), (2, 2, 2)],
         f"INSERT INTO t VALUES (2, 3, 3), ({_HOLDER_PK}, 1, 1) ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a, "
         "b = EXCLUDED.b", "a, b"),
-    # A bundle that moves a second committed row's value and claims the
-    # holder's for a fresh PK: the second row is what makes it touch a committed
-    # PK, so the check reaches the holder — past a flood of NULLs, none of which
-    # may claim the zero value's all-zero key image.
-    "the holder past a NULL flood": (
-        _HOLDER.format("BIGINT UNSIGNED"), [(_HOLDER_PK, 0), (1, 77)] + _NULLS,
-        "INSERT INTO t VALUES (1, 88), (2, 0)" + _UPSERT_A, "a"),
     # Every worker holds a replicated table's whole index and answers for the
     # same span; the `W` identical answers collapse to one holder, which decides
     # the verdict.
@@ -361,6 +345,9 @@ _FOLDS = {
     "value shift": ([], [[(1, 5, 1), (2, 6, 1)], [(2, 5, 1), (1, 7, 1)]], [(1, 7), (2, 5)]),
     # A claim a later frame supersedes frees its value for a third.
     "superseded claim": ([], [[(1, 5, 1)], [(1, 6, 1)], [(2, 5, 1)]], [(1, 6), (2, 5)]),
+    # A re-run bulk load: every span comes back occupied by a holder the write
+    # does not retire.
+    "a bulk re-claim": ([(i, i) for i in range(2000)], [[(2000 + i, i, 1) for i in range(2000)]], None),
 }
 
 
@@ -372,7 +359,8 @@ _FOLDS = {
 def test_a_write_is_validated_against_its_fold(client, via, committed, frames, final):
     """The rows of one push, and the frames of one transaction, fold together
     before any claim is checked: only the holders the whole write leaves count."""
-    tid = _raw_table(client)
+    tid = client.create_table("t", KV)
+    client.execute_sql("CREATE UNIQUE INDEX ON t(val)")
     if committed:
         client.push(tid, kv(*committed))
     batches = [kv(*frame) for frame in frames]
@@ -387,20 +375,6 @@ def test_a_write_is_validated_against_its_fold(client, via, committed, frames, f
     assert bag(client.scan(tid, KV)) == dict.fromkeys(final or committed, 1)
 
 
-def test_bulk_colliding_fresh_pks_rejected(client):
-    """A re-run bulk load: 2000 fresh PKs re-claiming 2000 committed values,
-    none of which the batch frees. Every span comes back occupied by a holder
-    the bundle does not retire, so the whole push is rejected — and one
-    occupancy probe decides all 2000."""
-    tid = _raw_table(client)
-    n = 2000
-    committed = [(i, i) for i in range(n)]
-    client.push(tid, kv(*committed))
-    with _violation():
-        client.push(tid, kv(*((n + i, i) for i in range(n))))
-    assert bag(client.scan(tid, KV)) == dict.fromkeys(committed, 1)
-
-
 # ── Resolving the holder a probe reports ─────────────────────────────────────
 #
 # A NULL indexed cell must not claim the all-zero key image, and the holder a
@@ -412,19 +386,24 @@ def test_bulk_colliding_fresh_pks_rejected(client):
     ("INT", -2147483648),
 ])
 def test_the_zero_image_holder_survives_a_flood_of_nulls(client, col_type, value):
-    """The index is NULL-distinct (a NULL row has no entry at all), so both a
-    direct seek and an UPDATE/DELETE by the zero-image value must reach exactly
-    the holder's one row, however many NULL rows were written after it."""
+    """The index is NULL-distinct (a NULL row has no entry at all), so a claim
+    on the zero-image value, a direct seek and an UPDATE/DELETE by it must
+    reach exactly the holder's one row, however many NULL rows were written
+    after it. The claim rides a bundle moving a second committed row's value:
+    that row is what makes the bundle touch a committed PK, so the check
+    reaches the holder."""
     client.execute_sql(_HOLDER.format(col_type))
-    insert(client, "t", [(_HOLDER_PK, value)])
+    insert(client, "t", [(_HOLDER_PK, value), (1, 77)])
     insert(client, "t", _NULLS)
+    with _violation("a"):
+        client.execute_sql(f"INSERT INTO t VALUES (1, 88), (2, {value})" + _UPSERT_A)
 
     tid, schema = client.resolve_table("t")
     assert bag(client.seek_by_index(tid, schema, [1], [value])) == {(_HOLDER_PK, value): 1}
     for stmt in (f"UPDATE t SET a = {value} WHERE a = {value}", f"DELETE FROM t WHERE a = {value}"):
         res = client.execute_sql(stmt)
         assert (res[0]["type"], res[0]["count"]) == ("RowsAffected", 1), stmt
-    assert bag(scanned(client, "t")) == dict.fromkeys(_NULLS, 1)
+    assert bag(scanned(client, "t")) == dict.fromkeys(_NULLS + [(1, 77)], 1)
 
 
 def test_a_value_moved_across_the_drop_index_window(client):

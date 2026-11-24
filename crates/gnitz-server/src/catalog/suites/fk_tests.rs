@@ -477,6 +477,11 @@ fn test_fk_self_reference() {
     // a writer takes exactly one guard, not the same guard twice.
     assert_eq!(lock_set(&engine, emp_tid), vec![emp_tid]);
 
+    // The drop guard skips a referencing child that is itself dropped, and a
+    // self-FK's child is the table.
+    engine.drop_table("public.employees").unwrap();
+    assert!(engine.fks_as_parent(emp_tid).is_empty());
+
     engine.close();
 }
 

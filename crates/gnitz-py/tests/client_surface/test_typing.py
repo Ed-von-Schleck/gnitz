@@ -1,5 +1,6 @@
 """The package's type information: the `py.typed` marker, the stub of the
-compiled module, and the annotations of the Python around it.
+compiled module, the annotations of the Python around it, and each exception
+class being the one its module and name import.
 
 The stub is written by hand and the extension it describes is compiled, so what
 holds them together is here: stubtest compares every name, parameter and default
@@ -8,11 +9,13 @@ and the verbs — one method each at runtime, two in the stub — are held to
 each other.
 """
 import ast
+import pickle
 import subprocess
 import sys
 from pathlib import Path
 
 import gnitz
+import pytest
 from gnitz import _native
 
 TESTS = Path(__file__).resolve().parents[1]
@@ -71,3 +74,12 @@ def test_a_verb_takes_the_same_arguments_on_every_client():
 def test_a_generic_class_takes_a_parameter_at_runtime():
     """An annotation a consumer writes is evaluated."""
     assert _native.Txn[int].__origin__ is _native.Txn
+
+
+@pytest.mark.parametrize("cls", [getattr(gnitz, n) for n in gnitz.__all__ if n.endswith("Error")],
+                         ids=lambda c: c.__name__)
+def test_an_error_pickles_as_its_own_class(cls):
+    """An exception pickles by its module and name — what a multiprocessing
+    queue or a process pool sends."""
+    again = pickle.loads(pickle.dumps(cls("relation 'x' not found")))
+    assert type(again) is cls and again.args == ("relation 'x' not found",)

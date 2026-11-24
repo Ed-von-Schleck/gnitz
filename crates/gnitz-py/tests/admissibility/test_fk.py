@@ -9,13 +9,10 @@ declarations the planner refuses are pinned in its own tests, and what an
 `ON DELETE CASCADE` edge deletes in mutation_pattern/test_fk_cascade.py.
 """
 
-import contextlib
-
 import pytest
 import gnitz
 import _fk
 from _serverproc import NEEDS_MULTI
-from _sql import insert
 
 _PARENT = "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 _CHILD = ("CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
@@ -35,54 +32,6 @@ _HUGE_PAIR = ("CREATE TABLE p (pid BIGINT PRIMARY KEY, code HUGEINT); "
               "CREATE UNIQUE INDEX ON p(code); "
               "CREATE TABLE c (cid BIGINT PRIMARY KEY, ref HUGEINT REFERENCES p(code))")
 _HUGE_ROWS = {"p": [(1, -(2**100)), (2, 2**100), (3, -1)], "c": [(10, -(2**100)), (11, -1)]}
-
-
-# ── A reference lands only on a live target ──────────────────────────────────
-
-# `(ddl, rows seeded per table, a (table, row) referencing nothing)`.
-_ENFORCED = {
-    "inline-references": (_FK_PAIR, {"parent": [(1, 100)], "child": [(10, 1)]}, ("child", (11, 999))),
-    "table-level": (
-        _PARENT + "; CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT NOT NULL,"
-                  " FOREIGN KEY (pid) REFERENCES parent(id))",
-        {"parent": [(1, 100)], "child": [(10, 1)]}, ("child", (11, 999))),
-    # The existence check broadcasts, so the parent's placement decides what
-    # each worker answers from.
-    "replicated-parent": pytest.param(
-        _PARENT + " WITH (replicated = true); " + _CHILD,
-        {"parent": [(1, 100)], "child": [(10, 1)]}, ("child", (11, 999)), marks=NEEDS_MULTI),
-    # A NULL cell references nothing, so it is not checked.
-    "null-reference": (
-        _PARENT + "; CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES parent(id))",
-        {"parent": [], "child": [(10, None)]}, ("child", (11, 999))),
-    # The probe key's type and width come from the parent's PK column, not from
-    # its first declared column.
-    "parent-pk-not-first": (
-        "CREATE TABLE parent (label TEXT NOT NULL, id BIGINT NOT NULL PRIMARY KEY); " + _CHILD,
-        {"parent": [("alice", 42)], "child": [(1, 42)]}, ("child", (2, 999))),
-    # An FK column that is also the PK has no payload slot, so the check reads
-    # the value out of the key region.
-    "fk-column-is-the-pk": (
-        "CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
-        "CREATE TABLE child (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES parent(id))",
-        {"parent": [(1,)], "child": [(1,)]}, ("child", (99,))),
-    # A row of the same batch satisfies a self-reference — its own included —
-    # where a committed-state probe would refuse both.
-    "self-reference": (_TREE, {"tree": [(1, None), (2, 1), (3, 3)]}, ("tree", (4, 99))),
-    # The orphan is the positive twin of a held negative value: a probe that lost
-    # the sign would find it.
-    "hugeint-unique-target": (_HUGE_PAIR, _HUGE_ROWS, ("c", (12, 1))),
-}
-
-
-@pytest.mark.parametrize("ddl,seed,dangling", _ENFORCED.values(), ids=_ENFORCED.keys())
-def test_a_reference_lands_only_on_a_live_target(client, ddl, seed, dangling):
-    _fk.seed(client, ddl, seed)
-    assert _fk.held(client, seed) == _fk.want(seed)
-    table, row = dangling
-    with _fk.refused():
-        insert(client, table, [row])
-    assert _fk.held(client, seed) == _fk.want(seed)
 
 
 # ── A write lands only if every reference survives its fold ──────────────────
@@ -111,15 +60,44 @@ _MEMBER_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
                  "CREATE TABLE child (a BIGINT UNSIGNED REFERENCES parent(id), b BIGINT UNSIGNED,"
                  " PRIMARY KEY (b, a))")
 _LEAD_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
-               "CREATE TABLE child (pid BIGINT UNSIGNED REFERENCES parent(id){}, line BIGINT UNSIGNED,"
+               "CREATE TABLE child (pid BIGINT UNSIGNED REFERENCES parent(id), line BIGINT UNSIGNED,"
                " PRIMARY KEY (pid, line))")
 _LEAD_ROWS = {"parent": [(1,), (2,), (3,)], "child": [(1, 7), (1, 8), (2, 9)]}
 _LOOP = "CREATE TABLE loop (id BIGINT PRIMARY KEY REFERENCES loop(id))"
 
-# `(ddl, rows seeded per table, the write, every table's rows after — or None
-# where the write is refused and every table keeps its seed)`. A write is SQL
-# statements, or a binary `(verb, table, rows pushed or pks deleted)`.
+# `(ddl, rows seeded per table, the write, every table's rows after — or, where
+# the write is refused and every table keeps its seed, None or the pattern the
+# refusal matches)`. A write is SQL statements, or a binary `(verb, table, rows
+# pushed or pks deleted)`.
 _WRITES = {
+    "a child referencing nothing": (
+        _FK_PAIR, {"parent": [(1, 100)], "child": [(10, 1)]}, "INSERT INTO child VALUES (11, 999)", None),
+    # The existence check broadcasts, so the parent's placement decides what
+    # each worker answers from.
+    "a child of a replicated parent referencing nothing": pytest.param(
+        _PARENT + " WITH (replicated = true); " + _CHILD,
+        {"parent": [(1, 100)], "child": [(10, 1)]}, "INSERT INTO child VALUES (11, 999)", None,
+        marks=NEEDS_MULTI),
+    # A NULL cell references nothing, so it is not checked.
+    "a NULL reference beside a dangling one": (
+        _PARENT + "; CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES parent(id))",
+        {"parent": [], "child": [(10, None)]}, "INSERT INTO child VALUES (11, 999)", None),
+    # The probe key's type and width come from the parent's PK column, not from
+    # its first declared column.
+    "a dangling reference to a PK declared second": (
+        "CREATE TABLE parent (label TEXT NOT NULL, id BIGINT NOT NULL PRIMARY KEY); " + _CHILD,
+        {"parent": [("alice", 42)], "child": [(1, 42)]}, "INSERT INTO child VALUES (2, 999)", None),
+    # An FK column that is also the PK has no payload slot, so the check reads
+    # the value out of the key region.
+    "a dangling PK child": (
+        _PK_CHILD, {"parent": [(1,)], "child": [(1,)]}, "INSERT INTO child VALUES (99)", None),
+    # A row of the same batch satisfies a self-reference — its own included —
+    # where a committed-state probe would refuse both.
+    "a dangling self-reference": (
+        _TREE, {"tree": [(1, None), (2, 1), (3, 3)]}, "INSERT INTO tree VALUES (4, 99)", None),
+    # The orphan is the positive twin of a held negative value: a probe that lost
+    # the sign would find it.
+    "a dangling HUGEINT reference": (_HUGE_PAIR, _HUGE_ROWS, "INSERT INTO c VALUES (12, 1)", None),
     "a referenced parent's delete": (_FK_PAIR, _PARENT_CHILD, "DELETE FROM parent WHERE id = 1", None),
     "a referenced HUGEINT value's delete": (_HUGE_PAIR, _HUGE_ROWS, "DELETE FROM p WHERE pid = 1", None),
     "an unreferenced HUGEINT value's delete": (
@@ -176,12 +154,16 @@ _WRITES = {
     "a tree, leaf first": (
         _TREE, _TREE_ROWS, "DELETE FROM tree WHERE id = 2; DELETE FROM tree WHERE id = 1", {"tree": []}),
     # A bulk write over many referenced codes, and the same write over the
-    # unreferenced half.
-    "a bulk delete of referenced codes": (_CODE_PAIR, _CODE_ROWS, "DELETE FROM p WHERE pid <= 10", None),
+    # unreferenced half. A refusal names its verb and the child that still
+    # references the value.
+    "a bulk delete of referenced codes": (
+        _CODE_PAIR, _CODE_ROWS, "DELETE FROM p WHERE pid <= 10",
+        "cannot delete from '.*p', row still referenced by '.*c'"),
     "a bulk delete of unreferenced codes": (
         _CODE_PAIR, _CODE_ROWS, "DELETE FROM p WHERE pid > 10", {"p": _CODES[:10], "c": _CODES[:10]}),
     "a bulk renumbering of referenced codes": (
-        _CODE_PAIR, _CODE_ROWS, "UPDATE p SET code = code + 500000 WHERE pid <= 10", None),
+        _CODE_PAIR, _CODE_ROWS, "UPDATE p SET code = code + 500000 WHERE pid <= 10",
+        "cannot update '.*p', row still referenced by '.*c'"),
     "a bulk renumbering of unreferenced codes": (
         _CODE_PAIR, _CODE_ROWS, "UPDATE p SET code = code + 500000 WHERE pid > 10",
         {"p": _CODES[:10] + [(pid, code + 500000) for pid, code in _CODES[10:]], "c": _CODES[:10]}),
@@ -208,13 +190,10 @@ _WRITES = {
         _MEMBER_CHILD, {"parent": [(1,), (2,)], "child": [(1, 7)]}, "DELETE FROM parent WHERE id = 2",
         {"parent": [(1,)], "child": [(1, 7)]}),
     "a parent a leading PK member references": (
-        _LEAD_CHILD.format(""), _LEAD_ROWS, "DELETE FROM parent WHERE id = 1", None),
+        _LEAD_CHILD, _LEAD_ROWS, "DELETE FROM parent WHERE id = 1", None),
     "a parent no leading PK member references": (
-        _LEAD_CHILD.format(""), _LEAD_ROWS, "DELETE FROM parent WHERE id = 3",
+        _LEAD_CHILD, _LEAD_ROWS, "DELETE FROM parent WHERE id = 3",
         {**_LEAD_ROWS, "parent": [(1,), (2,)]}),
-    "a cascade through a leading PK member": (
-        _LEAD_CHILD.format(" ON DELETE CASCADE"), _LEAD_ROWS, "DELETE FROM parent WHERE id = 1",
-        {"parent": [(2,), (3,)], "child": [(2, 9)]}),
     # A row referencing itself exempts itself.
     "a self-referencing PK row": (_LOOP, {"loop": [(1,)]}, "DELETE FROM loop", {"loop": []}),
     # `retract(1)` beside `insert(2, parent=1)`: probing committed state finds 1
@@ -250,24 +229,7 @@ _WRITES = {
 
 @pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
 def test_a_write_lands_only_if_every_reference_survives_its_fold(client, ddl, seed, write, after):
-    _fk.seed(client, ddl, seed)
-    with _fk.refused() if after is None else contextlib.nullcontext():
-        _fk.write(client, write)
-    assert _fk.held(client, seed) == _fk.want(after or seed)
-
-
-def test_a_refused_parent_write_names_its_verb(client):
-    """Through a non-PK unique column: moving a referenced code is refused as an
-    update, and removing its row as a delete, each naming the child that still
-    references it."""
-    _fk.seed(client, _CODE_PAIR, _CODE_ROWS)
-    refused = lambda verb: pytest.raises(
-        gnitz.GnitzIntegrityError, match=f"cannot {verb} '.*p', row still referenced by '.*c'")
-    with refused("update"):
-        client.execute_sql("UPDATE p SET code = 5 WHERE pid = 3")
-    with refused("delete from"):
-        client.execute_sql("DELETE FROM p WHERE pid = 3")
-    assert _fk.held(client, _CODE_ROWS) == _fk.want(_CODE_ROWS)
+    _fk.check(client, ddl, seed, write, after)
 
 
 def test_restrict_over_more_values_than_one_write_carries(client):
@@ -304,7 +266,7 @@ def test_one_writes_cascade_is_bounded(own_server):
     seed = {"parent": [(1,), (2,)], "child": [(i, 1) for i in range(n)] + [(n + i, 2) for i in range(20)]}
     with gnitz.connect(own_server.target) as conn:
         _fk.seed(conn, _WIDE, seed)
-        with pytest.raises(gnitz.GnitzError, match="cascades to more rows of .*child.* than one write deletes"):
+        with pytest.raises(gnitz.GnitzRefusedError, match="cascades to more rows of .*child.* than one write deletes"):
             conn.execute_sql("DELETE FROM parent WHERE id = 1")
         assert _fk.held(conn, seed) == _fk.want(seed)
 
@@ -318,51 +280,32 @@ def test_one_writes_cascade_is_bounded(own_server):
 
 # ── What a declaration gates ─────────────────────────────────────────────────
 
-def test_dup_name_fk_create_leaves_no_phantom_child(client):
-    """A duplicate-name CREATE TABLE whose column REFERENCES a parent must not
-    strand a phantom FK child: the whole CREATE bundle rolls back, so nothing
-    blocks dropping the parent afterwards."""
-    client.execute_sql(_PARENT + "; CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
+def test_a_parent_drops_only_once_nothing_references_it(client):
+    """A live child blocks dropping its parent, naming the child. A
+    duplicate-name CREATE TABLE whose column references the parent rolls back
+    whole, so it strands no second child: once the real one is gone, the parent
+    drops."""
+    client.execute_sql(_FK_PAIR + "; CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
     with pytest.raises(gnitz.GnitzRefusedError, match="already exists"):
         client.execute_sql(
             "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY,"
             " pref BIGINT NOT NULL REFERENCES parent(id))")
-    # The real `t` has no FK to parent, so the ONLY thing that could block this
-    # is a stranded phantom child.
-    client.execute_sql("DROP TABLE parent")
-
-
-def test_drop_self_referential_table_with_rows(client):
-    """The drop guard skips a blocking child that is itself in the drop set, and
-    for a self-FK the child *is* the table being dropped."""
-    _fk.seed(client, _TREE, _TREE_ROWS)
-    client.execute_sql("DROP TABLE tree")
-    with pytest.raises(gnitz.GnitzNotFoundError):
-        client.resolve_table("tree")
-
-
-def test_the_unique_index_an_fk_resolves_through_cannot_be_dropped(client):
-    """The index is how the referenced value is resolved, so dropping it would
-    leave the constraint with no way to answer — the same gate `DROP TABLE` on
-    the parent has, one level down."""
-    client.execute_sql(_CODE_PAIR)
-    with pytest.raises(gnitz.GnitzRefusedError, match="no unique index would remain"):
-        client.execute_sql("DROP INDEX p_code")
-    client.execute_sql("DROP TABLE c; DROP INDEX p_code")
+    with pytest.raises(gnitz.GnitzRefusedError,
+                       match=rf"referenced by a foreign key of '{client.schema}\.child'"):
+        client.execute_sql("DROP TABLE parent")
+    client.execute_sql("DROP TABLE child; DROP TABLE parent")
 
 
 @NEEDS_MULTI
 def test_restrict_survives_dropping_a_unique_index_on_the_fk_column(client):
     """Dropping a UNIQUE index on an FK column keeps the column's FK circuit on
     every worker."""
-    client.execute_sql(
+    _fk.check(
+        client,
         _PARENT + "; "
         # Moves the object-id counter, which FK circuits must not depend on.
         "CREATE INDEX parent_val ON parent(val); "
         "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
-        " pid BIGINT NOT NULL UNIQUE REFERENCES parent(id))")
-    insert(client, "parent", [(1, 100)])
-    insert(client, "child", [(10, 1)])
-    client.execute_sql(f"DROP INDEX {client.schema}__child__idx_pid")
-    with _fk.refused():
-        client.execute_sql("DELETE FROM parent WHERE id = 1")
+        " pid BIGINT NOT NULL UNIQUE REFERENCES parent(id))",
+        {"parent": [(1, 100)], "child": [(10, 1)]},
+        f"DROP INDEX {client.schema}__child__idx_pid; DELETE FROM parent WHERE id = 1", None)
