@@ -1,16 +1,11 @@
 use super::*;
 use crate::test_support::{assert_rejects, parse_expr_sql, parse_query, rejected};
 
-/// The ORDER BY keys of `q`.
-fn keys_of(q: &sqlparser::ast::Query) -> Vec<OrderKey<'_>> {
-    parse_order_by(q.order_by.as_ref()).unwrap()
-}
-
 /// NULLs sort last ascending and first descending unless placed.
 #[test]
 fn each_key_sorts_in_its_direction() {
     let q = parse_query("SELECT * FROM t ORDER BY a + 1, 2, b + 1 DESC, c ASC NULLS FIRST, 1 DESC NULLS LAST");
-    let keys = keys_of(&q);
+    let keys = parse_order_by(q.order_by.as_ref()).unwrap();
     let dirs: Vec<_> = keys.iter().map(|k| (k.desc, k.nulls_first)).collect();
     assert_eq!(
         dirs,

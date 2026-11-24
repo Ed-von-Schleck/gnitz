@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{TestCatalog, col, ncol, parse_query, rejected, rel, shadowed_cols, table};
+use crate::test_support::{TestCatalog, assert_rejects, col, ncol, parse_query, rejected, rel, shadowed_cols, table};
 use gnitz_wire::{RelClass, TypeCode};
 use std::rc::Rc;
 
@@ -233,7 +233,7 @@ fn positional_aliases_rename_the_visible_columns_in_order() {
         rejected(rename(&["x"])),
         "CTE 'd' defines 1 column aliases but body returns 2 columns"
     );
-    assert!(rejected(rename(&["x", "X"])).contains("duplicate column name 'X'"));
+    assert_rejects("x, X", rename(&["x", "X"]), "duplicate column name 'X'");
 }
 
 /// A view body records each catalog reference's visible column names, except

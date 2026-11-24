@@ -4,7 +4,6 @@ use crate::test_support::Cell::{self, Int, Null};
 use crate::test_support::{batch_of, bind_sql, bind_where, col, ncol, schema};
 use gnitz_core::Schema;
 use gnitz_expr::ScalarCell;
-use gnitz_wire::ColumnDef;
 
 /// `(pk | u U64 | u32 | i8 | i I64 | f F64 | f32 | s STRING | d DATE | ts TIMESTAMP
 /// | p DECIMAL(·,2) | q DECIMAL(·,3))`, every payload column nullable.
@@ -25,11 +24,10 @@ fn typed() -> Schema {
         ("q", dec(3)),
     ];
     let mut columns = vec![col("pk", U64)];
-    columns.extend(payload.map(|(n, ty)| ColumnDef::new(n, ty, true)));
+    columns.extend(payload.map(|(n, ty)| ncol(n, ty)));
     schema(columns, &[0])
 }
 
-/// Every node types as the value it computes.
 #[test]
 fn each_node_types_as_the_value_it_computes() {
     use TypeCode::*;
@@ -166,76 +164,84 @@ fn unify_blend_type_rule() {
     }
 }
 
-/// Each shape with `{x}` a NOT NULL column and with it a nullable one:
+/// Each shape with `{x}` a NOT NULL column of its operand type and with it a
+/// nullable one:
 /// `never_null` proves the first exactly when no kernel the shape lowers to
 /// makes a NULL of its own, and never proves the second. What it proves, the
 /// evaluator holds to over every column at its edges.
 #[test]
 fn never_null_follows_the_kernels_that_make_a_null() {
-    // `c`, `nts` and `nu` are nullable, every other column NOT NULL.
+    // Each operand type as its NOT NULL and its nullable column.
+    const INT: (&str, &str) = ("n", "c");
+    const STR: (&str, &str) = ("s", "ns");
+    const BOOL: (&str, &str) = ("b", "nb");
+    const DATE: (&str, &str) = ("d", "nd");
+    use TypeCode::*;
     let s = schema(
         vec![
-            col("pk", TypeCode::U64),
-            col("n", TypeCode::I64),
-            ncol("c", TypeCode::I64),
-            col("d", TypeCode::Date),
-            col("ts", TypeCode::Timestamp),
-            ncol("nts", TypeCode::Timestamp),
-            ncol("nu", TypeCode::U64),
-            ColumnDef::new("p", ColType::decimal(2), false),
+            col("pk", U64),
+            col("n", I64),
+            ncol("c", I64),
+            col("d", Date),
+            col("ts", Timestamp),
+            ncol("nts", Timestamp),
+            ncol("nu", U64),
+            col("p", ColType::decimal(2)),
+            col("s", String),
+            ncol("ns", String),
+            col("b", Bool),
+            ncol("nb", Bool),
+            ncol("nd", Date),
         ],
         &[0],
     );
     let never_null = |sql: &str| bind_sql(sql, &s).never_null(s.columns());
     let mut proven = Vec::new();
-    for (shape, over_not_null) in [
-        ("{x} + 1", true),
-        ("POWER({x}, 2)", true),
-        ("NOT {x}", true),
-        ("ABS({x})", true),
-        ("{x} LIKE 'a%'", true),
-        ("TRIM({x})", true),
-        ("UPPER({x})", true),
-        ("EXTRACT(YEAR FROM {x})", true),
+    for (shape, over_not_null, (x, nx)) in [
+        ("{x} + 1", true, INT),
+        ("POWER({x}, 2)", true, INT),
+        ("NOT {x}", true, BOOL),
+        ("ABS({x})", true, INT),
+        ("{x} LIKE 'a%'", true, STR),
+        ("TRIM({x})", true, STR),
+        ("UPPER({x})", true, STR),
+        ("EXTRACT(YEAR FROM {x})", true, DATE),
         // A zero divisor is NULL, so only a non-zero literal one is proven.
-        ("{x} / 2", true),
-        ("{x} % 2", true),
-        ("{x} / 0", false),
-        ("{x} % 0", false),
-        ("{x} / {x}", false),
+        ("{x} / 2", true, INT),
+        ("{x} % 2", true, INT),
+        ("{x} / 0", false, INT),
+        ("{x} % 0", false, INT),
+        ("{x} / {x}", false, INT),
         // A string past `u32::MAX` bytes is NULL.
-        ("{x} || {x}", false),
-        ("CONCAT({x})", false),
-        ("REPLACE({x}, {x}, {x})", false),
+        ("{x} || {x}", false, STR),
+        ("CONCAT({x})", false, STR),
+        ("REPLACE({x}, {x}, {x})", false, STR),
         // SUBSTRING's negative length is NULL; without one it cannot be.
-        ("SUBSTR({x}, 1)", true),
-        ("SUBSTR({x}, 1, 2)", false),
-        ("{x} IN (1, 2)", true),
-        ("{x} IN (1, c)", false),
+        ("SUBSTR({x}, 1)", true, STR),
+        ("SUBSTR({x}, 1, 2)", false, STR),
+        ("{x} IN (1, 2)", true, INT),
+        ("{x} IN (1, c)", false, INT),
         // GREATEST skips a NULL argument.
-        ("GREATEST({x}, NULL)", true),
+        ("GREATEST({x}, NULL)", true, INT),
         // Text renders any scalar; every other target can refuse a value.
-        ("CAST({x} AS VARCHAR)", true),
-        ("CAST({x} AS SMALLINT)", false),
-        ("CASE WHEN TRUE THEN {x} ELSE {x} END", true),
-        ("CASE WHEN TRUE THEN c ELSE {x} END", false),
-        ("CASE WHEN TRUE THEN {x} END", false),
+        ("CAST({x} AS VARCHAR)", true, INT),
+        ("CAST({x} AS SMALLINT)", false, INT),
+        ("CASE WHEN TRUE THEN {x} ELSE {x} END", true, INT),
+        ("CASE WHEN TRUE THEN c ELSE {x} END", false, INT),
+        ("CASE WHEN TRUE THEN {x} END", false, INT),
         // A signed operand of an unsigned result is range-cast, and an unsigned
         // operand of temporal arithmetic is: either cast can refuse a value.
-        ("GREATEST({x}, nu)", false),
-        ("CASE WHEN TRUE THEN {x} ELSE pk END", false),
-        ("pk / -2 + 0 * {x}", false),
-        ("d + pk < d OR {x} = 1", false),
+        ("GREATEST({x}, nu)", false, INT),
+        ("CASE WHEN TRUE THEN {x} ELSE pk END", false, INT),
+        ("pk / -2 + 0 * {x}", false, INT),
+        ("d + pk < d OR {x} = 1", false, INT),
     ] {
-        let sql = shape.replace("{x}", "n");
+        let sql = shape.replace("{x}", x);
         assert_eq!(never_null(&sql), over_not_null, "{shape}");
         if over_not_null {
             proven.push(sql);
         }
-        assert!(
-            !never_null(&shape.replace("{x}", "c")),
-            "{shape} over a nullable column"
-        );
+        assert!(!never_null(&shape.replace("{x}", nx)), "{shape} over a nullable column");
     }
     for (sql, want) in [
         ("1.5", true),
@@ -270,33 +276,46 @@ fn never_null_follows_the_kernels_that_make_a_null() {
             proven.push(sql.to_string());
         }
     }
-    // `(n, c, d, ts, nts, nu, p)`: each NOT NULL column cycles through its edges,
-    // each nullable one is NULL on every other row.
+    // Each NOT NULL column cycles through its edges, each nullable one is NULL on
+    // every other row.
     let i64s = [0, 1, -1, i128::from(i64::MIN), i128::from(i64::MAX)];
     let days = [0, i128::from(i32::MIN), i128::from(i32::MAX)];
+    let strs = ["", "a", " é "];
     let rows: Vec<Vec<Cell>> = (0..30)
         .map(|r| {
-            let (v, day) = (Int(i64s[r % 5]), Int(days[r % 3]));
+            let (v, day, st, bit) = (
+                Int(i64s[r % 5]),
+                Int(days[r % 3]),
+                Cell::Str(strs[r % 3]),
+                Int((r % 2) as i128),
+            );
             let maybe = |cell| if r % 2 == 0 { Null } else { cell };
-            vec![v, maybe(v), day, v, maybe(v), maybe(Int(i128::from(u64::MAX))), v]
+            let u64_max = Int(i128::from(u64::MAX));
+            vec![
+                v,
+                maybe(v),
+                day,
+                v,
+                maybe(v),
+                maybe(u64_max),
+                v,
+                st,
+                maybe(st),
+                bit,
+                maybe(bit),
+                maybe(day),
+            ]
         })
         .collect();
-    let rows: Vec<&[Cell]> = rows.iter().map(|r| &r[..]).collect();
     let batch = batch_of(&s, &rows);
-    let mut lowered = 0;
     for sql in &proven {
-        // A shape lowering refuses over these columns is the classifier's alone.
-        let Ok(mut ev) = compile_scalar_evaluator(&bind_sql(sql, &s), &s) else {
-            continue;
-        };
-        lowered += 1;
+        let mut ev = compile_scalar_evaluator(&bind_sql(sql, &s), &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
         let mut nulls = 0;
         ev.for_each(&batch.view(), |cell| {
             nulls += matches!(cell, ScalarCell::Int(None) | ScalarCell::Str(None)) as usize;
         });
         assert_eq!(nulls, 0, "{sql} is proven never NULL");
     }
-    assert!(lowered >= 17, "only {lowered} proven shapes lower");
 }
 
 /// A predicate splits at every top-level AND, however the tree nests, in written

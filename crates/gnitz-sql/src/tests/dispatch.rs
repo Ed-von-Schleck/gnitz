@@ -30,31 +30,36 @@ fn reruns(client: &mut GnitzClient, status: WireStatus, refusals: usize) -> (Res
     (result, runs.get())
 }
 
-/// A run refused with nothing written is run again up to the bound, and past
-/// it the refusal is the caller's.
+/// A run refused with nothing written — a stale catalog, or an autocommit
+/// statement's conflict — is run again up to the bound, and past it the refusal
+/// is the caller's. Any other refusal, and a conflict inside an open
+/// transaction, is the caller's at once.
 #[test]
-fn a_refusal_that_wrote_nothing_is_run_again() {
+fn only_a_refusal_that_wrote_nothing_is_run_again() {
+    use WireStatus as S;
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    for status in [WireStatus::StaleCatalog, WireStatus::TxnConflict] {
-        let (result, runs) = reruns(&mut client, status, RUN_MAX_ATTEMPTS - 1);
-        assert!(matches!(result, Ok(SqlResult::TransactionStarted)), "{status:?}");
-        assert_eq!(runs, RUN_MAX_ATTEMPTS, "{status:?}");
-        let (result, runs) = reruns(&mut client, status, RUN_MAX_ATTEMPTS);
-        assert!(
-            matches!(&result, Err(GnitzSqlError::Client(e)) if e.status() == Some(status)),
-            "{status:?}"
-        );
-        assert_eq!(runs, RUN_MAX_ATTEMPTS, "{status:?}");
+    let n = RUN_MAX_ATTEMPTS;
+    for (in_txn, status, refusals, ok, want_runs) in [
+        (false, S::StaleCatalog, n - 1, true, n),
+        (false, S::StaleCatalog, n, false, n),
+        (false, S::TxnConflict, n - 1, true, n),
+        (false, S::TxnConflict, n, false, n),
+        (false, S::NotFound, 1, false, 1),
+        (true, S::TxnConflict, 1, false, 1),
+    ] {
+        if in_txn && !client.txn_active() {
+            client.txn_begin().unwrap();
+        }
+        let (result, runs) = reruns(&mut client, status, refusals);
+        let what = format!("{status:?} refused {refusals} times, in a transaction: {in_txn}");
+        match ok {
+            true => assert!(matches!(result, Ok(SqlResult::TransactionStarted)), "{what}"),
+            false => assert!(
+                matches!(&result, Err(GnitzSqlError::Client(e)) if e.status() == Some(status)),
+                "{what}"
+            ),
+        }
+        assert_eq!(runs, want_runs, "{what}");
     }
-}
-
-/// Any other refusal is the caller's at once.
-#[test]
-fn another_refusal_is_not_run_again() {
-    let srv = ServerHandle::start();
-    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let (result, runs) = reruns(&mut client, WireStatus::NotFound, 1);
-    assert!(result.is_err());
-    assert_eq!(runs, 1);
 }

@@ -129,9 +129,8 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
         // Through binary64: parsed straight to f32 this would be the float above 1.0.
         (F32, "1.00000005960464477539063", Ok(f32_bits(1.0))),
         // A float literal past the column's range is refused, as an integer
-        // column refuses one, where it was stored as an infinity.
-        // A literal past `i128` has no exact decimal, so it is quoted as its
-        // float.
+        // column refuses one; a literal past `i128` has no exact decimal, so it
+        // is quoted as its float.
         (F32, "1e39", Err("FLOAT value out of range: 1e39")),
         (I64, "1.10", Ok(1)),
         (I8, "-128.5", Err("TINYINT value out of range: -128.5")),
@@ -169,36 +168,10 @@ fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
     }
 }
 
-/// `x CMP lit` against a value of `x`'s type, or a verdict for every value.
+/// A value scaled down to an integer type places at itself or between two
+/// values, and stores the rounded one while that lies inside the type.
 #[test]
-fn a_comparison_with_a_placed_literal_is_one_against_a_value_or_a_constant() {
-    use CmpOp::*;
-    let between = Between { lo: 2, nearest: 3 };
-    let below = Below { nearest: None };
-    let above = Above { nearest: Some(9) };
-    for (p, cmp, want) in [
-        (At(5), Lt, Compared::Cmp(Lt, 5)),
-        (between, Eq, Compared::Always(false)),
-        (between, Ne, Compared::Always(true)),
-        (between, Lt, Compared::Cmp(Le, 2)),
-        (between, Le, Compared::Cmp(Le, 2)),
-        (between, Gt, Compared::Cmp(Gt, 2)),
-        (between, Ge, Compared::Cmp(Gt, 2)),
-        (below, Gt, Compared::Always(true)),
-        (below, Le, Compared::Always(false)),
-        (below, Eq, Compared::Always(false)),
-        (above, Lt, Compared::Always(true)),
-        (above, Ge, Compared::Always(false)),
-        (above, Ne, Compared::Always(true)),
-    ] {
-        assert_eq!(p.compare(cmp), want, "{p:?} {cmp:?}");
-    }
-}
-
-/// What an assignment stores: the value itself, or the rounded one while that
-/// lies inside the type.
-#[test]
-fn an_assignment_stores_the_nearest_value_inside_the_type() {
+fn a_scaled_value_stores_the_nearest_value_inside_the_type() {
     let image = |v: i128| FixedInt::I8.pack(v);
     for (n, placed, stored) in [
         (1270, At(image(127)), Some(image(127))),
@@ -211,7 +184,7 @@ fn an_assignment_stores_the_nearest_value_inside_the_type() {
         (1276, Above { nearest: None }, None),
         (-1284, Below { nearest: Some(image(-128)) }, Some(image(-128))),
     ] {
-        let p = place_ratio(FixedInt::I8, n, 10, Round::HalfAwayFromZero);
+        let p = place_scaled(FixedInt::I8, n, 1, 0);
         assert_eq!(p, placed, "{n}/10");
         assert_eq!(p.stored(), stored, "{n}/10");
     }

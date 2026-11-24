@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::assert_rejects;
+use crate::test_support::{assert_rejects, col};
 use gnitz_wire::TypeCode;
 
 /// A child adopts the referenced type: identity, or an integer domain that fits
@@ -42,10 +42,7 @@ fn an_fk_child_type_must_fit_the_parent_type() {
 
 #[test]
 fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
-    let cols: Vec<ColumnDef> = ["a", "b", "c", "d"]
-        .iter()
-        .map(|&n| ColumnDef::new(n, TypeCode::U64, false))
-        .collect();
+    let cols = ["a", "b", "c", "d"].map(|n| col(n, TypeCode::U64));
     let check = |pk: &[u32], cluster: &[u32]| dist_prefix_len(&cols, pk, cluster);
     assert_eq!(check(&[0, 1], &[0]).unwrap(), 1);
     assert_eq!(check(&[0, 1], &[0, 1]).unwrap(), 2);

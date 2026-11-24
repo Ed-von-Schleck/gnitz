@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{bind_sql, col, ncol, parse_expr_sql, rejected};
+use crate::test_support::{assert_rejects, bind_sql, col, ncol, parse_expr_sql};
 use gnitz_wire::TypeCode;
 
 /// `(pk U64, c I64 nullable, n I64 NOT NULL)`. A function's operand types are
@@ -20,10 +20,6 @@ fn b(src: &str) -> BoundExpr {
     bind_sql(src, &schema())
 }
 
-fn b_err(src: &str) -> String {
-    rejected(bind_single_table(&parse_expr_sql(src), &schema(), "t"))
-}
-
 const C: BoundExpr = BoundExpr::ColRef(1);
 
 fn bx(e: BoundExpr) -> Box<BoundExpr> {
@@ -31,7 +27,7 @@ fn bx(e: BoundExpr) -> Box<BoundExpr> {
 }
 
 /// Every desugar and alias binds to exactly the tree its written-out form
-/// binds to, so a desugar that swaps or drops an operand shows up here.
+/// binds to.
 #[test]
 fn each_sugar_binds_to_the_tree_its_plain_spelling_binds_to() {
     for (sugar, plain) in [
@@ -120,8 +116,7 @@ fn each_sugar_binds_to_the_tree_its_plain_spelling_binds_to() {
     }
 }
 
-/// The ground rows under the equivalences above, so both sides of one cannot
-/// be wrong together.
+/// The ground rows under the equivalences above.
 #[test]
 fn plain_forms_bind_to_their_node() {
     use BoundExpr as E;
@@ -267,8 +262,7 @@ fn unary_numeric_functions_bind_to_their_numfunc() {
 }
 
 /// Every string function name reaches its IR node, whichever spelling is
-/// written, and the spelling `StrFunc::sql_name` gives binds to the same node.
-/// `LENGTH` and its SQL-standard aliases must land on the *character* measure
+/// written. `LENGTH` and its SQL-standard aliases must land on the *character* measure
 /// and `OCTET_LENGTH` on the byte one — swapping them is invisible until a
 /// multibyte value shows up.
 #[test]
@@ -295,8 +289,6 @@ fn string_function_names_bind_to_their_function() {
             matches!(bound, BoundExpr::StrCall { f, .. } if f == want),
             "{src}: {bound:?}"
         );
-        let args = &src[src.find('(').unwrap()..];
-        assert_eq!(b(&format!("{}{args}", want.sql_name())), bound, "{src}");
     }
 }
 
@@ -378,8 +370,7 @@ fn bind_constant_reads_a_literal_through_parens_and_signs() {
         ("NULL IS NULL", "expected a constant"),
         ("CAST(5 AS INT)", "expected a constant"),
     ] {
-        let msg = rejected(constant(src));
-        assert!(msg.contains(want), "{src}: {msg}");
+        assert_rejects(src, constant(src), want);
     }
 }
 
@@ -403,6 +394,7 @@ fn each_unsupported_form_is_rejected_by_name() {
         ("FOO(c)", "function 'foo' not supported"),
         ("RANDOM()", "RANDOM: a non-deterministic function is not supported"),
         ("now()", "NOW: a non-deterministic function is not supported"),
+        ("CURRENT_DATE", "non-deterministic"),
         // Only a grouped context admits an aggregate — `ALL` and `DISTINCT` included.
         ("COUNT(*)", AGG),
         ("COUNT(ALL c)", AGG),
@@ -413,6 +405,13 @@ fn each_unsupported_form_is_rejected_by_name() {
         ("SUM(c) OVER (PARTITION BY pk)", WINDOW),
         ("ABS(c) OVER ()", WINDOW),
         ("ABS(DISTINCT c)", "ABS: DISTINCT is not supported"),
+        (
+            "ABS(c) WITHIN GROUP (ORDER BY c)",
+            "ABS: WITHIN GROUP (ORDER BY …) is not supported",
+        ),
+        ("ABS(c) IGNORE NULLS", "ABS: IGNORE/RESPECT NULLS is not supported"),
+        ("abs(0.5)(c)", "parametric (ClickHouse) calls"),
+        ("ABS(c ORDER BY c)", "in-argument clauses"),
         (
             "GREATEST(c) FILTER (WHERE c > 0)",
             "GREATEST: FILTER (WHERE …) is not supported",
@@ -488,8 +487,7 @@ fn each_unsupported_form_is_rejected_by_name() {
         ("TRIM(NULL FROM c)", "ASCII string literal"),
         ("TRIM(c, 'xy')", "TRIM: the (… , <characters>) form is not supported"),
     ] {
-        let msg = b_err(src);
-        assert!(msg.contains(want), "{src}: {msg}");
+        assert_rejects(src, bind_single_table(&parse_expr_sql(src), &schema(), "t"), want);
     }
     // The parser never produces an empty list; the binder still refuses one.
     let empty = Expr::In {
@@ -498,16 +496,17 @@ fn each_unsupported_form_is_rejected_by_name() {
         negated: false,
         global: false,
     };
-    assert!(rejected(bind_single_table(&empty, &schema(), "t")).contains("empty list"));
+    assert_rejects("c IN ()", bind_single_table(&empty, &schema(), "t"), "empty list");
 }
 
 /// `scalar_call` matches before the leaf ever sees a call, so a name in two
 /// tables would silently bind as the scalar call in every context at once.
 #[test]
 fn every_structurally_bound_name_is_unique() {
-    for (i, (name, _)) in SCALAR_CALLS.iter().enumerate() {
+    let names: Vec<_> = scalar_call_names().collect();
+    for (i, name) in names.iter().enumerate() {
         assert!(
-            SCALAR_CALLS[..i].iter().all(|(n, _)| !n.eq_ignore_ascii_case(name)),
+            names[..i].iter().all(|n| !n.eq_ignore_ascii_case(name)),
             "'{name}' twice"
         );
         assert!(
@@ -572,7 +571,6 @@ fn a_numeric_literal_binds_as_its_narrowest_exact_form() {
         ("1.5", BExpr::LitFloat { v: F64Bits(1.5), dec: Some((15, 1)) }),
         ("1e3", BExpr::LitFloat { v: F64Bits(1000.0), dec: Some((1000, 0)) }),
     ] {
-        let got = bind_literal(&Value::Number(src.into(), false)).unwrap();
-        assert_eq!(got, want, "{src}");
+        assert_eq!(b(src), want, "{src}");
     }
 }

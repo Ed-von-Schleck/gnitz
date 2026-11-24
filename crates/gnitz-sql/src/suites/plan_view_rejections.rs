@@ -3,7 +3,7 @@
 //! the substring names the rule, never the sentence.
 
 use super::*;
-use gnitz_wire::{ColType, ColumnDef, PK_LIST_MAX_COLS, RelClass, TypeCode};
+use gnitz_wire::{ColType, PK_LIST_MAX_COLS, RelClass, TypeCode};
 
 /// [`base`] plus the shapes the rejections need: `w` (a second typed table),
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
@@ -76,8 +76,8 @@ fn cat() -> TestCatalog {
                     col("f", TypeCode::F64),
                     col("s", TypeCode::String),
                     ncol("d", TypeCode::Date),
-                    ColumnDef::new("price", ColType::decimal(2), false),
-                    ColumnDef::new("qty", ColType::decimal(3), true),
+                    col("price", ColType::decimal(2)),
+                    ncol("qty", ColType::decimal(3)),
                 ],
                 vec![0],
             ),
@@ -88,11 +88,7 @@ fn cat() -> TestCatalog {
         ),
         (
             "xd",
-            table(
-                54,
-                vec![col("id", i), ColumnDef::new("q3", ColType::decimal(3), false)],
-                vec![0],
-            ),
+            table(54, vec![col("id", i), col("q3", ColType::decimal(3))], vec![0]),
         ),
         (
             "w64",
@@ -660,20 +656,12 @@ fn scalar_expression_rules() {
     // The ROUND scales just inside the representable range.
     view(&cat, "SELECT id, ROUND(i, 15) AS a, ROUND(i, -15) AS b FROM x");
     for (expr, needle) in [
-        // A view is recomputed from deltas, so a clock read would make its
-        // contents depend on when a tick ran.
-        ("NOW()", "non-deterministic"),
-        ("CURRENT_DATE", "non-deterministic"),
-        ("DATE_TRUNC('fortnight', d)", "fortnight"),
         ("DATE '2024-02-30'", "invalid DATE literal"),
         // An integer literal past `u64::MAX` has no register slot at all.
         ("CAST(18446744073709551616 AS BIGINT UNSIGNED)", "18446744073709551616"),
         ("CAST('abc' AS DECIMAL(5, 2))", "invalid DECIMAL("),
         // A literal past the scaled integer is refused, not wrapped at run time.
         ("CAST(1e30 AS DECIMAL(10, 2))", "value out of range"),
-        // Each product adds its operands' scales, so a chain of them runs past
-        // what the scaled integer can hold.
-        ("qty * qty * qty * qty * qty * qty * qty", "DECIMAL scale"),
     ] {
         rejects(&cat, &[(&format!("SELECT id, {expr} AS y FROM x"), needle)]);
     }

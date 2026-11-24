@@ -18,13 +18,13 @@ use std::sync::Arc;
 pub(crate) const SN: &str = "s";
 
 /// A NOT NULL column.
-pub(crate) fn col(name: &str, tc: TypeCode) -> ColumnDef {
-    ColumnDef::new(name, tc, false)
+pub(crate) fn col(name: &str, ty: impl Into<ColType>) -> ColumnDef {
+    ColumnDef::new(name, ty, false)
 }
 
 /// A nullable column.
-pub(crate) fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
-    ColumnDef::new(name, tc, true)
+pub(crate) fn ncol(name: &str, ty: impl Into<ColType>) -> ColumnDef {
+    ColumnDef::new(name, ty, true)
 }
 
 /// `[_k hidden, id, a, ID hidden, A]` — a visible name shared with a hidden
@@ -146,20 +146,11 @@ pub(crate) fn pk_schema(pk_tc: TypeCode) -> Schema {
     schema(vec![col("id", pk_tc), col("v", TypeCode::I64)], &[0])
 }
 
-/// `(pk U64 PK, val val_tc nullable)`.
-pub(crate) fn two_col(val_tc: TypeCode) -> Schema {
-    schema(vec![col("pk", TypeCode::U64), ncol("val", val_tc)], &[0])
-}
-
 /// `(pk U64 PK, c1, c2, …)`, the payload columns of types `tys`, all nullable.
-pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Arc<Schema> {
+pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Schema {
     let mut columns = vec![col("pk", TypeCode::U64)];
-    columns.extend(
-        tys.iter()
-            .enumerate()
-            .map(|(i, &ty)| ColumnDef::new(format!("c{}", i + 1), ty, true)),
-    );
-    Arc::new(schema(columns, &[0]))
+    columns.extend(tys.iter().enumerate().map(|(i, &ty)| ncol(&format!("c{}", i + 1), ty)));
+    schema(columns, &[0])
 }
 
 /// Each comparison as SQL spells it, beside the operator that holds with the
@@ -253,13 +244,15 @@ pub(crate) const EXACT_CASES: &[ExactCase] = {
 };
 
 /// The exact answer to `x op lit`, `x` an integer a `ty` column stores and `lit`
-/// a numeric literal's text, compared as the rationals they are.
+/// a numeric literal's text, compared as the rationals they are. The literal is
+/// read here digit by digit rather than by the binder's own number parser, so
+/// a parsing bug there cannot agree with itself.
 pub(crate) fn holds_exact(ty: ColType, x: i128, op: CmpOp, lit: &str) -> bool {
-    let (mag, scale) = crate::literal::decimal_of_number_text(lit.trim_start_matches('-')).expect(lit);
-    let v = if lit.starts_with('-') { -mag } else { mag };
+    let (int, frac) = lit.split_once('.').unwrap_or((lit, ""));
+    let v: i128 = format!("{int}{frac}").parse().expect(lit);
     holds(
         op,
-        x * 10i128.pow(u32::from(scale)),
+        x * 10i128.pow(frac.len() as u32),
         v * 10i128.pow(u32::from(ty.scale)),
     )
 }
@@ -299,12 +292,12 @@ pub(crate) fn keyed_batch(schema: &Schema, rows: &[(&[u128], i64, &[Cell])]) -> 
 
 /// A batch of `schema`, single-column PK: one weight-1 row per entry of `rows`,
 /// its PK the row's 1-based position, its payload the entry's cells.
-pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
+pub(crate) fn batch_of<'a>(schema: &Schema, rows: &[impl AsRef<[Cell<'a>]>]) -> ZSetBatch {
     let keys: Vec<u128> = (1..=rows.len() as u128).collect();
     let rows: Vec<_> = keys
         .iter()
         .zip(rows)
-        .map(|(k, &cells)| (std::slice::from_ref(k), 1, cells))
+        .map(|(k, cells)| (std::slice::from_ref(k), 1, cells.as_ref()))
         .collect();
     keyed_batch(schema, &rows)
 }
@@ -377,14 +370,6 @@ pub(crate) fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want: &
 /// [`bind_sql`] of a WHERE predicate, as its bound conjuncts.
 pub(crate) fn bind_where(sql: &str, schema: &Schema) -> Vec<BoundExpr> {
     bind_sql(sql, schema).conjuncts()
-}
-
-/// [`bind_where`] for a predicate that is one conjunct — the input of the
-/// single-conjunct recognizers.
-pub(crate) fn bind_conjunct(sql: &str, schema: &Schema) -> BoundExpr {
-    let mut conjuncts = bind_where(sql, schema);
-    assert_eq!(conjuncts.len(), 1, "{sql}: one conjunct");
-    conjuncts.pop().expect("one conjunct")
 }
 
 /// Parse a bare SQL expression (e.g. a WHERE predicate) via [`crate::GnitzDialect`].

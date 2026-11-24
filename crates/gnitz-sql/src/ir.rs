@@ -5,6 +5,25 @@ use gnitz_wire::{
     ColType, ColumnDef, FixedInt, FloatText, MAX_DECIMAL_SCALE, TypeCode, VALUE_TEXT_MAX, write_date, write_timestamp,
 };
 
+/// Every SQL spelling of a [`StrFunc`] the binder matches, case-insensitively.
+pub(crate) const STR_FUNC_NAMES: &[(&str, StrFunc)] = &[
+    ("UPPER", StrFunc::Upper),
+    ("LOWER", StrFunc::Lower),
+    ("LENGTH", StrFunc::LenChars),
+    ("CHAR_LENGTH", StrFunc::LenChars),
+    ("CHARACTER_LENGTH", StrFunc::LenChars),
+    ("OCTET_LENGTH", StrFunc::LenBytes),
+    ("REVERSE", StrFunc::Reverse),
+    ("LEFT", StrFunc::Left),
+    ("RIGHT", StrFunc::Right),
+    ("STRPOS", StrFunc::Pos),
+    ("REPLACE", StrFunc::Replace),
+    ("LPAD", StrFunc::Lpad),
+    ("RPAD", StrFunc::Rpad),
+    ("SPLIT_PART", StrFunc::SplitPart),
+    ("SUBSTRING", StrFunc::Substr),
+];
+
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
 pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
@@ -212,24 +231,14 @@ impl StrFunc {
         }
     }
 
-    /// The SQL spelling an error names this function by — one of the names the
-    /// binder accepts for it.
+    /// The SQL spelling an error names this function by: its first entry in
+    /// [`STR_FUNC_NAMES`].
     pub(crate) fn sql_name(self) -> &'static str {
-        match self {
-            StrFunc::Upper => "UPPER",
-            StrFunc::Lower => "LOWER",
-            StrFunc::LenBytes => "OCTET_LENGTH",
-            StrFunc::LenChars => "LENGTH",
-            StrFunc::Reverse => "REVERSE",
-            StrFunc::Left => "LEFT",
-            StrFunc::Right => "RIGHT",
-            StrFunc::Pos => "STRPOS",
-            StrFunc::Replace => "REPLACE",
-            StrFunc::Lpad => "LPAD",
-            StrFunc::Rpad => "RPAD",
-            StrFunc::SplitPart => "SPLIT_PART",
-            StrFunc::Substr => "SUBSTRING",
-        }
+        STR_FUNC_NAMES
+            .iter()
+            .find(|&&(_, f)| f == self)
+            .expect("every StrFunc has a spelling")
+            .0
     }
 
     /// The argument classes in call order — the one statement of each

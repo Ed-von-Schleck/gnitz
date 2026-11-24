@@ -11,17 +11,6 @@ fn u(name: &str) -> gnitz_wire::ColumnDef {
 }
 
 #[test]
-fn a_rows_plan_is_reused_while_its_descriptors_stand() {
-    let cat = catalog(vec![("t", table(1, vec![u("pk"), u("a")], vec![0]))]);
-    let select = cached("SELECT * FROM t");
-    let first = select.plan(&cat).unwrap();
-    assert!(select.repeated(&cat).is_some());
-    let again = select.plan(&cat).unwrap();
-    assert_eq!(again.spec(), first.spec());
-    assert_eq!(again.reply_schema(), first.reply_schema());
-}
-
-#[test]
 fn a_relation_that_resolves_anew_is_planned_anew() {
     let cat = catalog(vec![("t", table(1, vec![u("pk"), u("a")], vec![0]))]);
     let select = cached("SELECT * FROM t");
@@ -39,9 +28,10 @@ fn a_relation_that_resolves_anew_is_planned_anew() {
 }
 
 #[test]
-fn a_fold_or_a_constant_plan_is_kept_and_a_failed_one_is_not() {
+fn a_plan_is_kept_while_its_descriptors_stand_and_a_failed_one_is_not() {
     let cat = catalog(vec![("t", table(1, vec![u("pk"), u("a")], vec![0]))]);
     for sql in [
+        "SELECT * FROM t",
         "SELECT a, COUNT(*) AS n FROM t GROUP BY a",
         "SELECT DISTINCT a FROM t",
         "SELECT 1 + 2 AS x",

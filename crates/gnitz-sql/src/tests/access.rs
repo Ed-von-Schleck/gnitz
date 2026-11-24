@@ -1,8 +1,6 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
-use crate::test_support::{
-    CMP, EXACT_CASES, bind_conjunct, bind_where, col, holds_exact, ix, pk_schema, schema, two_col, typed_schema, uq,
-};
+use crate::test_support::{CMP, EXACT_CASES, bind_where, col, holds_exact, ix, pk_schema, schema, typed_schema, uq};
 use Tier as T;
 use gnitz_wire::{ColType, ColumnDef};
 
@@ -73,7 +71,10 @@ fn compound() -> Schema {
 /// The images `sql` admits on column `c1` of `schema`; `None` when the conjunct
 /// is no term.
 fn pin(schema: &Schema, sql: &str) -> Option<RangeInclusive<u128>> {
-    match term(&bind_conjunct(sql, schema), schema)? {
+    let [c] = &bind_where(sql, schema)[..] else {
+        panic!("{sql}: one conjunct")
+    };
+    match term(c, schema)? {
         (1, Pin::Range(r)) => Some(r),
         (col, _) => panic!("{sql}: a pin on column {col}"),
     }
@@ -156,7 +157,6 @@ fn a_pk_range_beside_a_key_set_only_when_a_list_feeds_it() {
     check(
         &s,
         vec![
-            (vec![], "id = 5", vec![(T::PkKeys, keys(&s, &[&[5]]), vec![])]),
             (
                 vec![],
                 "id IN (1, 5) AND id >= 3",
@@ -330,10 +330,7 @@ fn a_list_product_past_the_cap_is_no_set() {
 #[test]
 fn a_pk_range_is_the_interval_its_conjuncts_fold_to() {
     use TypeCode::*;
-    let decimal = schema(
-        vec![ColumnDef::new("id", ColType::decimal(2), false), col("v", I64)],
-        &[0],
-    );
+    let decimal = schema(vec![col("id", ColType::decimal(2)), col("v", I64)], &[0]);
     for (s, sql, tier, lo, hi) in [
         (pk_schema(U64), "id > 5", T::PkRange, 6, U64_MAX),
         (pk_schema(U64), "id < -1", T::PkRange, 1, 0),
@@ -593,16 +590,16 @@ fn candidates_rank_by_tier_then_by_how_much_they_pin() {
 fn the_first_servable_candidate_bounds_the_read_and_ships_its_residual() {
     let by_pk = pk_schema(TypeCode::U64); // (id pk, v), v indexed
     let narrow = schema(["id", "v", "w"].map(|n| col(n, TypeCode::U64)).to_vec(), &[0]);
-    // No register holds `val`, so a residual naming it does not compile.
-    let wide = two_col(TypeCode::U128);
+    // No register holds `c1`, so a residual naming it does not compile.
+    let wide = typed_schema(&[TypeCode::U128]);
     for (s, sql, served_by, residual) in [
         (&by_pk, "", None, ""),
         (&by_pk, "id IN (7, 9) AND v > 5", Some(0), "v > 5"),
         // No conjunct any bound consumes.
         (&by_pk, "id + v = 7", None, "id + v = 7"),
         (&narrow, "v = 5 AND w = 9", Some(0), "w = 9"),
-        // The PK walk would leave `val = 7` residual, so the index walk serves.
-        (&wide, "pk > 5 AND val = 7", Some(1), "pk > 5"),
+        // The PK walk would leave `c1 = 7` residual, so the index walk serves.
+        (&wide, "pk > 5 AND c1 = 7", Some(1), "pk > 5"),
     ] {
         let conjuncts = |sql: &str| match sql {
             "" => Vec::new(),

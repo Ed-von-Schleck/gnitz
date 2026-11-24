@@ -27,7 +27,7 @@ fn set_list(plan: WritePlan) -> Vec<SetCol> {
 
 /// What `UPDATE t SET <set>` writes for the rows `held` of `schema`, each read at
 /// weight 3.
-fn updated(schema: &Schema, set: &str, held: &[&[Cell]]) -> Result<ZSetBatch, GnitzSqlError> {
+fn updated<'a>(schema: &Schema, set: &str, held: &[impl AsRef<[Cell<'a>]>]) -> Result<ZSetBatch, GnitzSqlError> {
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
     let mut set = set_list(plan(&cat, &format!("UPDATE t SET {set}"))?);
     let mut rows = batch_of(schema, held);
@@ -116,7 +116,7 @@ fn a_set_list_rewrites_the_row_it_read() {
 /// A 16-byte column has no register, so it is assignable only as a copy.
 #[test]
 fn a_uuid_column_is_copied() {
-    let schema = typed_schema(&[TypeCode::UUID, TypeCode::UUID]);
+    let schema = std::sync::Arc::new(typed_schema(&[TypeCode::UUID, TypeCode::UUID]));
     let mut rows = ZSetBatch::new(&schema);
     rows.builder().begin_row(1, 1).put_int(0).put_int(u128::MAX - 7);
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
@@ -164,12 +164,10 @@ fn a_computed_value_is_written_across_morsels() {
     let schema = typed_schema(&[TypeCode::I64, TypeCode::U8]);
     let src = |i: i128| if i % 97 == 5 { Null } else { Int(i % 256) };
     let held: Vec<[Cell; 2]> = (0..700).map(|i| [src(i), Null]).collect();
-    let held: Vec<&[Cell]> = held.iter().map(|r| &r[..]).collect();
     let want: Vec<_> = (0..700).map(|i| (vec![src(i), src(i)], 1)).collect();
     assert_eq!(rows_of(&updated(&schema, "c2 = c1 + 0", &held).unwrap()), want);
     let mut bad: Vec<[Cell; 2]> = (0..700).map(|i| [src(i), Null]).collect();
     bad[650][0] = Int(300);
-    let bad: Vec<&[Cell]> = bad.iter().map(|r| &r[..]).collect();
     assert_rejects("row 650", updated(&schema, "c2 = c1 + 0", &bad), "out of range: 300");
 }
 

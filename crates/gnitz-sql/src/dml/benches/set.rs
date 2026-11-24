@@ -1,6 +1,5 @@
 use super::*;
-use crate::test_support::parse_stmt;
-use gnitz_wire::ColumnDef;
+use crate::test_support::{col, parse_stmt};
 use sqlparser::ast::Statement;
 use std::hint::black_box;
 
@@ -12,9 +11,9 @@ use std::hint::black_box;
 fn apply_set_bench() {
     const ROWS: usize = 100_000;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let mut columns = vec![ColumnDef::new("id", TypeCode::U64, false)];
-    columns.extend((1..=8).map(|i| ColumnDef::new(format!("i{i}"), TypeCode::I64, false)));
-    columns.extend((1..=2).map(|i| ColumnDef::new(format!("t{i}"), TypeCode::String, false)));
+    let mut columns = vec![col("id", TypeCode::U64)];
+    columns.extend((1..=8).map(|i| col(&format!("i{i}"), TypeCode::I64)));
+    columns.extend((1..=2).map(|i| col(&format!("t{i}"), TypeCode::String)));
     let schema = std::sync::Arc::new(Schema::from_parts(columns, &[0]).unwrap());
     let mut rows = ZSetBatch::new(&schema);
     let mut app = rows.builder();

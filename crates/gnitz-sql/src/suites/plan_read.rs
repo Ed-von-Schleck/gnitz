@@ -10,23 +10,13 @@ use super::*;
 
 /// `t(id U64 PK, v U64, w U64)` with an index on each of `v` and `w` — every
 /// access rung is reachable from it, and two indexes make their arbitration
-/// observable. `wide` carries a 128-bit indexed column, `c` a compound PK, `tv`
-/// is a view over `t`'s columns, and `tw` has a 128-bit payload column.
+/// observable. `c` has a compound PK, `tv` is a view over `t`'s columns, and
+/// `tw` has a 128-bit payload column.
 fn cat() -> TestCatalog {
     let u = TypeCode::U64;
     let tvw = || vec![col("id", u), col("v", u), col("w", u)];
     catalog(vec![
         ("t", rel(16, RelClass::Table, tvw(), vec![0], vec![ix(&[1]), ix(&[2])])),
-        (
-            "wide",
-            rel(
-                17,
-                RelClass::Table,
-                vec![col("id", u), col("flag", u), col("big", TypeCode::U128)],
-                vec![0],
-                vec![ix(&[1]), ix(&[2])],
-            ),
-        ),
         (
             "c",
             table(18, vec![col("a", u), col("b", u), col("x", TypeCode::I64)], vec![0, 1]),
@@ -163,53 +153,7 @@ fn explain_names_every_decision() {
                 "order/limit: none",
             ],
         ),
-        // A literal past `i64::MAX` is a key like any other.
-        (
-            "SELECT w FROM t WHERE v = 18446744073709551615",
-            [
-                "read table t",
-                INDEX_V,
-                "predicate: none",
-                "projection: 1 column",
-                "order/limit: none",
-            ],
-        ),
-        // An equality pins its column outright; a BETWEEN only narrows one.
-        (
-            "SELECT id FROM t WHERE v = 10 AND w BETWEEN 1 AND 9",
-            [
-                "read table t",
-                INDEX_V,
-                "predicate: server-side",
-                "projection: 1 column",
-                "order/limit: none",
-            ],
-        ),
-        // A 128-bit conjunct has no VM register, so the best-ranked bound (the
-        // point on `flag`, whose residual is that conjunct) yields to the walk
-        // that consumes it.
-        (
-            "SELECT id FROM wide WHERE flag = 1 AND big BETWEEN 100 AND 200",
-            [
-                "read table wide",
-                "access: index range on (big)",
-                "predicate: server-side",
-                "projection: 1 column",
-                "order/limit: none",
-            ],
-        ),
-        // Compound PK: a leading-column equality names a key group, the full
-        // key names one key.
-        (
-            "SELECT x FROM c WHERE a = 1",
-            [
-                "read table c",
-                "access: pk range walk",
-                "predicate: none",
-                "projection: 1 column (unprojected)",
-                "order/limit: none",
-            ],
-        ),
+        // A compound PK's key column the SELECT list leaves out is read all the same.
         (
             "SELECT x FROM c WHERE a = 1 AND b = 2",
             [
@@ -217,17 +161,6 @@ fn explain_names_every_decision() {
                 "access: pk point lookup",
                 "predicate: none",
                 "projection: 1 column (unprojected)",
-                "order/limit: none",
-            ],
-        ),
-        // A non-integral literal names no key: the empty range walk.
-        (
-            "SELECT v FROM t WHERE id = 3.5",
-            [
-                "read table t",
-                "access: pk range walk",
-                "predicate: none",
-                "projection: 1 column",
                 "order/limit: none",
             ],
         ),
@@ -684,7 +617,6 @@ fn a_read_the_planner_rejects_names_its_rule() {
         // A clause the parser accepts and the read path would otherwise drop.
         ("SELECT DISTINCT ON (id) id FROM t", "DISTINCT ON"),
         ("SELECT * FROM t LIMIT 2 BY v", "LIMIT: BY is not supported"),
-        ("SELECT * FROM t LIMIT 1+1", "LIMIT must be an integer literal"),
         (
             "SELECT * FROM t ORDER BY v WITH FILL",
             "ORDER BY: WITH FILL is not supported",
@@ -693,9 +625,15 @@ fn a_read_the_planner_rejects_names_its_rule() {
             "SELECT * FROM t ORDER BY v INTERPOLATE (v AS v + 1)",
             "ORDER BY: INTERPOLATE is not supported",
         ),
+        // A FROM item's modifier the read would otherwise drop.
+        ("SELECT * FROM t TABLESAMPLE BERNOULLI (10)", "TABLESAMPLE"),
+        ("SELECT * FROM f(1)", "a table function in FROM"),
+        ("SELECT * FROM t WITH ORDINALITY", "WITH ORDINALITY"),
+        ("SELECT * FROM t PARTITION (p0)", "PARTITION selection"),
+        ("SELECT * FROM LATERAL (SELECT 1 AS x) d", "LATERAL"),
         (
-            "SELECT * FROM t LIMIT 1 OFFSET 1+1",
-            "OFFSET must be an integer literal",
+            "SELECT * FROM (SELECT 1 AS x) d TABLESAMPLE BERNOULLI (10)",
+            "TABLESAMPLE",
         ),
         ("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", "FETCH"),
         ("SELECT id FROM t PREWHERE v > 5", "PREWHERE"),

@@ -9,7 +9,8 @@ use crate::agg::{AggArg, AggFunc};
 use crate::ast_util::{CallSurface, PlainCall, classify_agg_call, col_ref_parts, peel_nested, single_part_ident};
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::ir::{
-    BExpr, BOOL, BinOp, BoundExpr, F64Bits, FloatUnaryOp, LeafTyping, NumFunc, NumLit, StrArg, StrFunc, TrimMode,
+    BExpr, BOOL, BinOp, BoundExpr, F64Bits, FloatUnaryOp, LeafTyping, NumFunc, NumLit, STR_FUNC_NAMES, StrArg, StrFunc,
+    TrimMode,
 };
 use crate::literal::{decimal_of_number_text, invalid_literal, parse_bool, parse_temporal};
 use crate::rules::single_relation_col_idx;
@@ -192,7 +193,7 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
                 col_ref_parts(expr).ok_or_else(|| GnitzSqlError::rejected("expected a column reference"))?;
             leaf.bind_column(qual, name)
         }
-        // The names of [`SCALAR_CALLS`] bind here, above the leaf, so no leaf
+        // The names of [`scalar_calls`] bind here, above the leaf, so no leaf
         // carries them. Any other name is an aggregate's or no function's.
         Expr::Function(f @ Function { over: Some(over), .. }) => leaf.bind_window(f, over),
         Expr::Function(f) => match scalar_call(f) {
@@ -549,8 +550,9 @@ impl Call {
 }
 
 /// The function names `bind_structural` binds above the leaf, keyed by their SQL
-/// spelling (which also names the call in its arity errors). Matched
-/// case-insensitively. The one name→call map, like `AGG_NAMES` is for the
+/// spelling (which also names the call in its arity errors), beside the string
+/// functions' [`STR_FUNC_NAMES`]. Matched case-insensitively. Read through
+/// [`scalar_calls`], the one name→call map, like `AGG_NAMES` is for the
 /// aggregates: a name added here reaches every binding context at once.
 const SCALAR_CALLS: &[(&str, Call)] = &[
     ("COALESCE", Call::Coalesce),
@@ -569,21 +571,6 @@ const SCALAR_CALLS: &[(&str, Call)] = &[
     ("MOD", Call::Binary(BinOp::Mod)),
     ("GREATEST", Call::MinMax(true)),
     ("LEAST", Call::MinMax(false)),
-    ("UPPER", Call::Str(StrFunc::Upper)),
-    ("LOWER", Call::Str(StrFunc::Lower)),
-    ("LENGTH", Call::Str(StrFunc::LenChars)),
-    ("CHAR_LENGTH", Call::Str(StrFunc::LenChars)),
-    ("CHARACTER_LENGTH", Call::Str(StrFunc::LenChars)),
-    ("OCTET_LENGTH", Call::Str(StrFunc::LenBytes)),
-    ("REVERSE", Call::Str(StrFunc::Reverse)),
-    ("LEFT", Call::Str(StrFunc::Left)),
-    ("RIGHT", Call::Str(StrFunc::Right)),
-    ("STRPOS", Call::Str(StrFunc::Pos)),
-    ("REPLACE", Call::Str(StrFunc::Replace)),
-    ("LPAD", Call::Str(StrFunc::Lpad)),
-    ("RPAD", Call::Str(StrFunc::Rpad)),
-    ("SPLIT_PART", Call::Str(StrFunc::SplitPart)),
-    ("SUBSTRING", Call::Str(StrFunc::Substr)),
     ("IF", Call::If),
     ("IFNULL", Call::Ifnull),
     ("NVL", Call::Ifnull),
@@ -608,9 +595,17 @@ pub(crate) const KEYWORD_CALLS: &[&str] = &[
     "TRY_CAST",
 ];
 
-/// The names of [`SCALAR_CALLS`].
+/// Every scalar call by name: [`SCALAR_CALLS`], then the string functions.
+fn scalar_calls() -> impl Iterator<Item = (&'static str, Call)> {
+    SCALAR_CALLS
+        .iter()
+        .copied()
+        .chain(STR_FUNC_NAMES.iter().map(|&(n, f)| (n, Call::Str(f))))
+}
+
+/// The names of [`scalar_calls`].
 pub(crate) fn scalar_call_names() -> impl Iterator<Item = &'static str> {
-    SCALAR_CALLS.iter().map(|&(n, _)| n)
+    scalar_calls().map(|(n, _)| n)
 }
 
 /// The clock and random functions, beside [`SCALAR_CALLS`] so the two name
@@ -659,13 +654,10 @@ pub(crate) const CALENDAR_FIELDS: &[(&str, CalendarOp)] = &[
 
 fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
     let n = single_part_ident(&f.name)?;
-    SCALAR_CALLS
-        .iter()
-        .find(|(name, _)| n.eq_ignore_ascii_case(name))
-        .copied()
+    scalar_calls().find(|(name, _)| n.eq_ignore_ascii_case(name))
 }
 
-/// Bind one of the [`SCALAR_CALLS`].
+/// Bind one of the [`scalar_calls`].
 fn bind_scalar_call<R: Clone>(
     name: &str,
     call: Call,

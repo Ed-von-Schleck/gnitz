@@ -9,18 +9,19 @@ fn each_statement_keeps_its_own_text() {
         .map(|(_, t)| t.text())
         .collect();
     assert_eq!(texts, ["SELECT 1", "CREATE VIEW \"ü\" AS SELECT 'ä;' AS a", "SELECT 2"]);
-}
-
-#[test]
-fn statements_run_together_without_a_delimiter_are_refused() {
-    assert!(split_statements("SELECT 1 SELECT 2").is_err());
-}
-
-#[test]
-fn an_end_after_a_statement_is_refused() {
-    assert!(split_statements("SELECT * FROM v END garbage here").is_err());
-    assert!(split_statements("SELECT * FROM v END").is_err());
     assert!(split_statements(" ; ;").unwrap().is_empty());
+}
+
+/// Statements run together without a delimiter, or an END after one, are refused.
+#[test]
+fn a_statement_not_ended_by_a_delimiter_is_refused() {
+    for script in [
+        "SELECT 1 SELECT 2",
+        "SELECT * FROM v END garbage here",
+        "SELECT * FROM v END",
+    ] {
+        assert!(split_statements(script).is_err(), "{script}");
+    }
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use super::*;
-use sqlparser::ast::{SetExpr, Statement};
+use crate::test_support::parse_query;
+use sqlparser::ast::SetExpr;
 
 /// Every keyword, and names no keyword is, written as a column or as the parts of
 /// a relation name it may be, reads back as itself; a name that reads back bare is written
@@ -10,12 +11,9 @@ fn a_name_is_written_as_sql_reads_it_back() {
     let keywords = sqlparser::keywords::ALL_KEYWORDS.iter().map(|k| k.to_lowercase());
     for n in keywords.chain(specials.map(String::from)) {
         let sql = format!("SELECT {} FROM t", column_text(&n));
-        let read = match &Parser::parse_sql(&GnitzDialect, &sql).unwrap()[..] {
-            [Statement::Query(q)] => match &*q.body {
-                SetExpr::Select(s) => match &s.projection[..] {
-                    [SelectItem::UnnamedExpr(Expr::Identifier(i))] => Some(i.value.clone()),
-                    _ => None,
-                },
+        let read = match &*parse_query(&sql).body {
+            SetExpr::Select(s) => match &s.projection[..] {
+                [SelectItem::UnnamedExpr(Expr::Identifier(i))] => Some(i.value.clone()),
                 _ => None,
             },
             _ => None,

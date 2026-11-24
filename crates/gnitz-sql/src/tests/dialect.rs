@@ -31,6 +31,15 @@ fn parses_as_generic_dialect() {
     }
 }
 
+/// A `/*! … */` hint, which `GenericDialect` reads as SQL, is a comment here.
+#[test]
+fn a_hint_comment_is_a_comment() {
+    let sql = "SELECT /*! x */ 1";
+    assert!(Parser::parse_sql(&GenericDialect {}, sql).is_err());
+    let ours = Parser::parse_sql(&GnitzDialect, sql).unwrap();
+    assert_eq!(ours[0].to_string(), "SELECT 1");
+}
+
 /// Tokenizing under `GnitzDialect` yields the same tokens and locations as
 /// under `GenericDialect`.
 #[test]

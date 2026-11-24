@@ -173,6 +173,13 @@ fn cases() -> (Vec<Case>, Vec<Case>) {
     ];
     let adhoc: Vec<Case> = vec![
         ("point lookup", "SELECT * FROM orders WHERE id = 7".into()),
+        (
+            "PK IN 512",
+            format!(
+                "SELECT * FROM orders WHERE id IN ({})",
+                (0..512).map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        ),
         ("project 2 + filter", "SELECT id, amt FROM orders WHERE amt > 10".into()),
         ("wide SELECT *", "SELECT * FROM wide".into()),
         (

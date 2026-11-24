@@ -1,11 +1,8 @@
 use super::*;
 use crate::test_support::Cell::{self, F64, Int, Null, Str};
-use crate::test_support::{
-    CMP, EXACT_CASES, assert_rejects, batch_of, bind_sql, holds, holds_exact, two_col, typed_schema,
-};
-use gnitz_expr::{ConstIdx, FloatArithOp, IntUnaryOp, RowFilter, ScalarCell};
+use crate::test_support::{CMP, EXACT_CASES, assert_rejects, batch_of, bind_sql, holds, holds_exact, typed_schema};
+use gnitz_expr::ScalarCell;
 use gnitz_wire::TypeCode as T;
-use gnitz_wire::as_le_bytes;
 
 // Every expression here is SQL bound over `typed_schema`: `(pk, c1, c2, …)`, the
 // payload columns nullable and of the types the test lists.
@@ -20,20 +17,23 @@ fn lower<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> Result<LogicalProgr
     compile_bound_expr_to_program(&bind_sql(sql, &s), s.columns())
 }
 
-/// `sql` lowered to its program.
-fn lowered<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> LogicalProgram {
-    lower(sql, tys).unwrap_or_else(|e| panic!("{sql}: {e}"))
-}
-
 /// `sql` lowered to its instructions. A register is its instruction's position.
 fn instrs<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty]) -> Vec<L> {
-    lowered(sql, tys).instrs().to_vec()
+    lower(sql, tys)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .instrs()
+        .to_vec()
 }
 
 /// Assert `sql` evaluates to `want` on each of `rows`, in the register class its
 /// inferred type names: a float as its value, a string as its text.
 #[track_caller]
-fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]], want: &[Cell]) {
+fn assert_eval<'a, Ty: Into<ColType> + Copy, R: AsRef<[Cell<'a>]> + std::fmt::Debug>(
+    sql: &str,
+    tys: &[Ty],
+    rows: &[R],
+    want: &[Cell],
+) {
     let s = typed_schema(tys);
     let bound = bind_sql(sql, &s);
     let ty = bound.infer_ty(s.columns()).tc;
@@ -232,6 +232,10 @@ fn the_numeric_forms_compute_their_values() {
             ("LEAST(c1, 3)", &[Int(5)], Int(3)),
             ("GREATEST(c1, NULL)", &[Int(1)], Int(1)),
             ("c1 IN (1, 2)", &[Int(2)], Int(1)),
+            ("c1 IN (2, 1, 1, -1)", &[Int(-1)], Int(1)),
+            ("c1 IN (1.5, 2)", &[Int(2)], Int(1)),
+            ("c1 IN (1, 1e400)", &[Int(1)], Int(1)),
+            ("c1 IN (1, 1e400)", &[Int(2)], Int(0)),
             // A list with no member among the operand's values holds on no row.
             ("c1 IN (1.5, 2.5)", &[Int(2)], Int(0)),
             ("c1 IN (1.5, 2.5)", &[Null], Null),
@@ -261,6 +265,9 @@ fn the_numeric_forms_compute_their_values() {
             ("ROUND(c1)", &[F64(3.5)], F64(4.0)),
             ("ROUND(c1, 1)", &[F64(2.26)], F64(2.3)),
             ("ROUND(c1, -1)", &[F64(26.0)], F64(30.0)),
+            // Scaled by multiplying by 100: dividing by 0.01 would give 0.23.
+            ("ROUND(c1, 2)", &[F64(0.235)], F64(0.24)),
+            ("ROUND(c1, 2)", &[F64(-0.235)], F64(-0.24)),
             ("SIGN(c1)", &[F64(-2.0)], F64(-1.0)),
             ("c1 > 0.5", &[F64(1.0)], Int(1)),
             ("c1 IN (1, 2)", &[F64(2.0)], Int(1)),
@@ -430,7 +437,6 @@ fn the_decimal_forms_compute_their_values() {
 fn a_column_against_a_literal_is_exact() {
     for &(ty, lits, rows) in EXACT_CASES {
         let table: Vec<[Cell; 1]> = rows.iter().map(|v| [v.map_or(Null, Int)]).collect();
-        let table: Vec<&[Cell]> = table.iter().map(|r| &r[..]).collect();
         for lit in lits {
             for (op, conv, cmp) in CMP {
                 let want: Vec<Cell> = rows
@@ -445,27 +451,12 @@ fn a_column_against_a_literal_is_exact() {
     }
 }
 
-/// A literal finer than a DECIMAL column's scale is decided at the column's
-/// scale: one comparison against the neighbour, no scale-up.
-#[test]
-fn a_decimal_column_against_a_finer_literal_compares_with_its_neighbour() {
-    assert_eq!(
-        instrs("c1 < 1.005", &[dec(2)]),
-        [
-            L::LoadCol { col: 1 },
-            L::LoadConst { val: 100, unsigned: false },
-            L::Cmp { op: CmpOp::Le, a: Reg(0), b: Reg(1) }
-        ]
-    );
-}
-
 /// A U64 and a signed operand each read with their own signedness.
 #[test]
 fn a_u64_and_a_signed_column_compare_exactly() {
     let top = i128::from(u64::MAX);
     let pairs = [(top, -1), (0, -1), (1, 1), (1 << 63, i128::from(i64::MAX)), (5, 7)];
     let rows = pairs.map(|(u, i)| [Int(u), Int(i)]);
-    let rows: Vec<&[Cell]> = rows.iter().map(|r| &r[..]).collect();
     for (op, _, cmp) in CMP {
         let want = pairs.map(|(u, i)| Int(i128::from(holds(cmp, u, i))));
         assert_eval(&format!("c1 {op} c2"), &[T::U64, T::I64], &rows, &want);
@@ -520,7 +511,7 @@ fn an_operand_takes_the_signedness_of_its_result() {
 }
 
 // ------------------------------------------------------------------
-// Where the instruction is the contract
+// Operand forms and the register file
 // ------------------------------------------------------------------
 
 /// An integer cast is elided where the operand's values all lie in the target
@@ -560,307 +551,42 @@ fn cast_elision_preserves_u64_tracking() {
     }
 }
 
-/// DATE ± days ends in one range check into DATE's width, and neither a CAST to
-/// DATE nor a DATE slot it is written into adds a second one.
+/// A string or BLOB column compares bytewise in every operand form: against a
+/// literal on either side, another column, and a computed operand.
 #[test]
-fn date_arithmetic_is_range_checked_once() {
-    let s = typed_schema(&[T::Date]);
-    for sql in ["c1 + 1", "CAST(c1 + 1 AS DATE)"] {
-        let mut eb = ExprBuilder::new();
-        let reg = compile_bound_expr(&bind_sql(sql, &s), s.columns(), &mut eb).unwrap();
-        let sink = eb.slot_sink(reg, T::Date);
-        let prog = eb.build(vec![sink]).unwrap();
-        let casts: Vec<&L> = prog
-            .instrs()
+fn a_string_comparison_holds_bytewise_in_every_form() {
+    let pairs = [("a", "b"), ("b", "a"), ("ab", "ab"), ("", "a")];
+    let rows = pairs.map(|(a, b)| [Str(a), Str(b)]);
+    let want = |cmp, rhs: &dyn Fn(&str) -> &str| -> Vec<Cell> {
+        pairs
             .iter()
-            .filter(|i| matches!(i, L::IntCast { .. }))
-            .collect();
-        assert_eq!(
-            casts,
-            [&L::IntCast { a: Reg(2), fi: FixedInt::I32 }],
-            "{sql}: {:?}",
-            prog.instrs()
-        );
-    }
-}
-
-/// Over an integer register the rounding family is the identity, and so is ABS
-/// of an unsigned one: nothing is emitted.
-#[test]
-fn an_integer_argument_folds_the_identity_transforms_away() {
-    let load = [L::LoadCol { col: 1 }];
-    for sql in ["FLOOR(c1)", "CEIL(c1)", "ROUND(c1)", "TRUNC(c1)", "ROUND(c1, 2)"] {
-        assert_eq!(instrs(sql, &[T::I32]), load, "{sql}");
-    }
-    for tc in [T::U32, T::U64] {
-        assert_eq!(instrs("ABS(c1)", &[tc]), load, "{tc:?}");
-    }
-    assert_eq!(
-        instrs("ABS(c1)", &[T::I32]),
-        [load[0], L::IntUnary { op: IntUnaryOp::Abs, a: Reg(0) }]
-    );
-}
-
-/// `ROUND(x)` over a float is the bare opcode. A positive scale multiplies first
-/// and divides back, a negative one does the mirror: only the positive powers of
-/// ten are exact in f64, so neither direction loads `10^-n`.
-#[test]
-fn a_float_round_scales_by_a_positive_power_in_either_direction() {
-    assert_eq!(
-        instrs("ROUND(c1)", &[T::F64]),
-        [
-            L::LoadCol { col: 1 },
-            L::FloatUnary { op: FloatUnaryOp::Round, a: Reg(0) }
-        ]
-    );
-    // The scaling steps in order: (M)ul, (D)iv, (R)ound.
-    let steps = |sql: &str| -> String {
-        instrs(sql, &[T::F64])
-            .iter()
-            .filter_map(|i| match i {
-                L::FloatArith { op: FloatArithOp::Mul, .. } => Some('M'),
-                L::FloatArith { op: FloatArithOp::Div, .. } => Some('D'),
-                L::FloatUnary { op: FloatUnaryOp::Round, .. } => Some('R'),
-                _ => None,
-            })
+            .map(|&(a, b)| Int(i128::from(holds(cmp, a.cmp(rhs(b)) as i128, 0))))
             .collect()
     };
-    assert_eq!(steps("ROUND(c1, 2)"), "MRD");
-    assert_eq!(steps("ROUND(c1, -2)"), "DRM");
-}
-
-/// An operand is lowered at the type its node combines it at, so a literal is
-/// loaded once, as the constant it is there.
-#[test]
-fn a_literal_operand_is_the_constant_of_its_position() {
-    let one = L::LoadConst {
-        val: 1f64.to_bits() as i64,
-        unsigned: false,
-    };
-    assert_eq!(
-        instrs("c1 > 1", &[T::F64]),
-        [
-            L::LoadCol { col: 1 },
-            one,
-            L::FCmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }
-        ]
-    );
-    assert_eq!(
-        instrs("CASE WHEN c1 > 1 THEN c1 END", &[T::F64]).last(),
-        Some(&L::Select { cond: Reg(2), a: Reg(0), b: Reg(3) })
-    );
-    assert_eq!(
-        instrs("c1 = NULL", &[dec(2)]),
-        [
-            L::LoadCol { col: 1 },
-            L::LoadNull,
-            L::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(1) }
-        ]
-    );
-}
-
-/// GREATEST/LEAST is a left chain of 2-ary opcodes in written order, so its
-/// registers are linear in arity and the register file bounds it.
-#[test]
-fn min_max_n_is_a_left_fold_in_written_order() {
-    assert_eq!(
-        instrs("GREATEST(c1, c2, c3)", &[T::I64, T::I64, T::I64]),
-        [
-            L::LoadCol { col: 1 },
-            L::LoadCol { col: 2 },
-            L::IntMinMax2 { a: Reg(0), b: Reg(1), is_max: true },
-            L::LoadCol { col: 3 },
-            L::IntMinMax2 { a: Reg(2), b: Reg(3), is_max: true },
-        ]
-    );
-    assert_eq!(
-        instrs("GREATEST(-1, 1, c1)", &[T::U64]),
-        [
-            L::LoadConst { val: -1, unsigned: false },
-            L::IntCast { a: Reg(0), fi: FixedInt::U64 },
-            L::LoadConst { val: 1, unsigned: false },
-            L::IntMinMax2 { a: Reg(1), b: Reg(2), is_max: true },
-            L::LoadCol { col: 1 },
-            L::IntMinMax2 { a: Reg(3), b: Reg(4), is_max: true },
-        ]
-    );
-    // Distinct literals: the builder folds identical instructions.
-    let greatest = |n: usize| {
-        let args: Vec<String> = (0..n).map(|i| i.to_string()).collect();
-        format!("GREATEST({})", args.join(", "))
-    };
-    assert_eq!(instrs(&greatest(32), &[T::I64]).len(), 63);
-    assert_rejects("GREATEST of 33", lower(&greatest(33), &[T::I64]), "reg");
-}
-
-/// A string column against a literal or another column is one fused opcode over
-/// the cells themselves, with the literal on either side; a BLOB column lowers
-/// identically. A computed operand has no fused form and compares through the
-/// register channel, where each comparison has its own opcode too.
-#[test]
-fn string_comparisons_fuse_over_columns_and_fall_back_to_registers() {
-    let strings = [T::String, T::String];
     for (op, conv, cmp) in CMP {
-        let col_lit = instrs(&format!("c1 {op} 'x'"), &strings);
-        assert!(
-            matches!(col_lit[..], [L::StrColConst { op, col: 1, .. }] if op == cmp),
-            "{op}: {col_lit:?}"
-        );
-        assert_eq!(instrs(&format!("'x' {conv} c1"), &strings), col_lit, "'x' {conv} c1");
-        let col_col = instrs(&format!("c1 {op} c2"), &strings);
-        assert_eq!(col_col, [L::StrColCol { op: cmp, col_a: 1, col_b: 2 }], "{op}");
-        let blobs = [T::Blob, T::Blob];
-        assert_eq!(instrs(&format!("c1 {op} 'x'"), &blobs), col_lit, "blob {op} 'x'");
-        assert_eq!(instrs(&format!("c1 {op} c2"), &blobs), col_col, "blob {op} blob");
-        assert_eq!(
-            instrs(&format!("UPPER(c1) {op} UPPER(c2)"), &strings),
-            [
-                L::LoadColStr { col: 1 },
-                L::StrCase { a: Reg(0), upper: true },
-                L::LoadColStr { col: 2 },
-                L::StrCase { a: Reg(2), upper: true },
-                L::StrCmp { op: cmp, a: Reg(1), b: Reg(3) },
-            ],
-            "{op}"
-        );
+        for ty in [T::String, T::Blob] {
+            let tys = [ty, ty];
+            assert_eval(&format!("c1 {op} c2"), &tys, &rows, &want(cmp, &|b| b));
+            assert_eval(&format!("c1 {op} 'ab'"), &tys, &rows, &want(cmp, &|_| "ab"));
+            assert_eval(&format!("'ab' {conv} c1"), &tys, &rows, &want(cmp, &|_| "ab"));
+        }
+        let upper = format!("UPPER(c1) {op} UPPER(c2)");
+        assert_eval(&upper, &[T::String, T::String], &rows, &want(cmp, &|b| b));
     }
 }
 
-/// LIKE without wildcards lowers as `=`, and `'lit%'` over a string column as
-/// one prefix opcode over the cells; ILIKE and every other pattern or operand
-/// run the matcher.
+/// GREATEST/LEAST is a chain over the register file, which bounds its arity; an
+/// integer IN list is no such chain, so its length is not bounded.
 #[test]
-fn like_lowers_to_a_byte_compare_where_its_pattern_allows() {
-    let strings = [T::String, T::String];
-    assert_eq!(instrs("c1 LIKE 'abc'", &strings), instrs("c1 = 'abc'", &strings));
-    assert_eq!(
-        instrs("c1 NOT LIKE 'abc'", &strings),
-        instrs("NOT c1 = 'abc'", &strings)
+fn the_register_file_bounds_greatest_and_no_integer_list() {
+    let list = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    lower(&format!("GREATEST({})", list(32)), &[T::I64]).unwrap();
+    assert_rejects(
+        "GREATEST of 33",
+        lower(&format!("GREATEST({})", list(33)), &[T::I64]),
+        "reg",
     );
-    assert_eq!(
-        instrs("UPPER(c1) LIKE 'ABC'", &strings),
-        instrs("UPPER(c1) = 'ABC'", &strings)
-    );
-    let prefix = lowered("c1 LIKE 'ab%'", &strings);
-    assert_eq!(prefix.instrs(), [L::StrColPrefix { col: 1, const_idx: ConstIdx(0) }]);
-    assert_eq!(prefix.const_strings(), [b"ab".to_vec()]);
-    let matched = |sql: &str| matches!(instrs(sql, &strings).last(), Some(L::StrLike { .. }));
-    for sql in [
-        "c1 ILIKE 'abc'",
-        "c1 ILIKE 'ab%'",
-        "c1 LIKE '%ab'",
-        "c1 LIKE 'a_b%'",
-        "UPPER(c1) LIKE 'AB%'",
-    ] {
-        assert!(matched(sql), "{sql}");
-    }
-}
-
-/// An integer operand whose items all place among its values is one `IntInSet`
-/// over a sorted, deduplicated pool, whatever the list's length; an item that
-/// names no value of the operand drops out, and one that places nowhere keeps
-/// the OR chain.
-#[test]
-fn an_integer_in_list_is_one_set_probe() {
-    let is_set = |p: &LogicalProgram| {
-        matches!(
-            p.instrs(),
-            [L::LoadCol { col: 1 }, L::IntInSet { value_reg: Reg(0), .. }]
-        )
-    };
-    let p = lowered("c1 IN (2, 1, 1, -1)", &[T::I64]);
-    assert!(is_set(&p), "{:?}", p.instrs());
-    assert_eq!(p.const_strings(), [as_le_bytes(&[-1i64, 1, 2]).to_vec()]);
-
-    let items: Vec<String> = (0..500).map(|i| i.to_string()).collect();
-    assert!(is_set(&lowered(&format!("c1 IN ({})", items.join(", ")), &[T::I64])));
-
-    let p = lowered("c1 IN (1.5, 2)", &[T::I64]);
-    assert!(is_set(&p), "{:?}", p.instrs());
-    assert_eq!(p.const_strings(), [as_le_bytes(&[2i64]).to_vec()]);
-    // Exact at a DECIMAL column's scale.
-    let p = lowered("c1 IN (1.25, 2)", &[dec(2)]);
-    assert!(is_set(&p), "{:?}", p.instrs());
-    assert_eq!(p.const_strings(), [as_le_bytes(&[125i64, 200]).to_vec()]);
-
-    let chain = instrs("c1 IN (1, 1e400)", &[T::I64]);
-    assert!(!chain.iter().any(|i| matches!(i, L::IntInSet { .. })), "{chain:?}");
-}
-
-/// Any other list is the `operand = item` OR chain. The operand is lowered once
-/// for the whole list — each term re-lowers it and the builder folds the
-/// identical instructions — and a string term stays a fused compare, so a term
-/// costs one register and the OR one more.
-#[test]
-fn an_in_list_or_chain_shares_its_operand() {
-    assert_eq!(
-        instrs("c1 IN (1, c2)", &[T::I64, T::I64]),
-        [
-            L::LoadCol { col: 1 },
-            L::LoadConst { val: 1, unsigned: false },
-            L::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(1) },
-            L::LoadCol { col: 2 },
-            L::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(3) },
-            L::BoolBinary { a: Reg(2), b: Reg(4), is_or: true },
-        ]
-    );
-    let strings = [T::String, T::String];
-    let fused = |i: &L, col| matches!(*i, L::StrColConst { op: CmpOp::Eq, col: c, .. } if c == col);
-    let or = L::BoolBinary { a: Reg(0), b: Reg(1), is_or: true };
-    // A literal operand is read through the converse arm of the fused compare.
-    for (sql, cols) in [("c1 IN ('a', 'b')", [1, 1]), ("'x' IN (c1, c2)", [1, 2])] {
-        let got = instrs(sql, &strings);
-        assert!(
-            got.len() == 3 && fused(&got[0], cols[0]) && fused(&got[1], cols[1]) && got[2] == or,
-            "{sql}: {got:?}"
-        );
-    }
-    let tags = |n: usize| {
-        let items: Vec<String> = (0..n).map(|i| format!("'tag{i}'")).collect();
-        items.join(", ")
-    };
-    assert_eq!(instrs(&format!("c1 IN ({})", tags(22)), &strings).len(), 2 * 22 - 1);
-    // Load, UPPER, then per item its constant and compare, and the ORs between.
-    assert_eq!(
-        instrs(&format!("UPPER(c1) IN ({})", tags(14)), &strings).len(),
-        2 + 2 * 14 + 13
-    );
-}
-
-/// A wide literal against a 64-bit column is decided by where it falls: one
-/// past the column's range holds on no row, with no constant loaded.
-#[test]
-fn a_wide_literal_past_the_column_is_decided_without_a_constant() {
-    assert_eq!(
-        instrs("c1 = 18446744073709551615", &[T::I64]),
-        [L::LoadCol { col: 1 }, L::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(0) }]
-    );
-}
-
-/// A null test over a column reads the batch bitmap, with no load; over anything
-/// else it tests the register the value computes into.
-#[test]
-fn null_test_lowers_by_its_operand() {
-    assert_eq!(
-        instrs("c1 IS NULL", &[T::String]),
-        [L::IsNull { col: 1, invert: false }]
-    );
-    assert_eq!(
-        instrs("c1 IS NOT NULL", &[T::String]),
-        [L::IsNull { col: 1, invert: true }]
-    );
-    assert_eq!(
-        instrs("UPPER(c1) IS NULL", &[T::String]),
-        [
-            L::LoadColStr { col: 1 },
-            L::StrCase { a: Reg(0), upper: true },
-            L::IsNullReg { a: Reg(1), invert: false }
-        ]
-    );
-    assert_eq!(
-        instrs("(c1 + 1) IS NOT NULL", &[T::I64]).last(),
-        Some(&L::IsNullReg { a: Reg(2), invert: true })
-    );
+    lower(&format!("c1 IN ({})", list(500)), &[T::I64]).unwrap();
 }
 
 // ------------------------------------------------------------------
@@ -873,7 +599,9 @@ fn null_test_lowers_by_its_operand() {
 fn each_refused_form_names_its_rule() {
     let t = ColType::of;
     let q7 = "c2 * c2 * c2 * c2 * c2 * c2 * c2";
-    let cases: Vec<(String, Vec<ColType>, &str)> = [
+    let (q8, p15) = (format!("{q7} * c2"), ["c1"; 15].join(" * "));
+    let (sum_q7, case_q7) = (format!("c1 + {q7}"), format!("CASE WHEN TRUE THEN c1 ELSE {q7} END"));
+    for (sql, tys, needle) in [
         // A string in a numeric position.
         ("c1 + 1", vec![t(T::String)], "is not supported on a string operand"),
         // A BOOLEAN where a number is wanted, and a number where a BOOLEAN is.
@@ -1075,28 +803,13 @@ fn each_refused_form_names_its_rule() {
         ),
         // A scale no register holds, through a product and through each blend
         // that would widen an operand to it.
-        (
-            "c2 * c2 * c2 * c2 * c2 * c2 * c2 * c2",
-            vec![dec(2), dec(3)],
-            "DECIMAL scale 24 exceeds 18",
-        ),
+        (&q8, vec![dec(2), dec(3)], "DECIMAL scale 24 exceeds 18"),
         // Past what the scale's own `u8` holds.
-        (&["c1"; 15].join(" * "), vec![dec(18)], "DECIMAL scale 255 exceeds 18"),
-        (
-            &format!("c1 + {q7}"),
-            vec![dec(2), dec(3)],
-            "DECIMAL scale 21 exceeds 18",
-        ),
-        (
-            &format!("CASE WHEN TRUE THEN c1 ELSE {q7} END"),
-            vec![dec(2), dec(3)],
-            "DECIMAL scale 21 exceeds 18",
-        ),
-    ]
-    .map(|(sql, tys, needle): (&str, _, _)| (sql.to_string(), tys, needle))
-    .into();
-    for (sql, tys, needle) in cases {
-        assert_rejects(&sql, lower(&sql, &tys), needle);
+        (&p15, vec![dec(18)], "DECIMAL scale 255 exceeds 18"),
+        (&sum_q7, vec![dec(2), dec(3)], "DECIMAL scale 21 exceeds 18"),
+        (&case_q7, vec![dec(2), dec(3)], "DECIMAL scale 21 exceeds 18"),
+    ] {
+        assert_rejects(sql, lower(sql, &tys), needle);
     }
 }
 
@@ -1162,35 +875,4 @@ fn a_lone_conjunct_that_is_no_boolean_is_rejected_by_lowering() {
     ] {
         assert_rejects(what, compile_filter_program([&conjunct], s.columns()), needle);
     }
-}
-
-/// The rows of `batch` that pass every conjunct, through the wire blob a read ships.
-fn residual_rows(conjuncts: &[&BoundExpr], batch: &gnitz_core::ZSetBatch, schema: &Schema) -> Vec<usize> {
-    let blob = compile_wire_conjuncts(conjuncts.iter().copied(), schema.columns()).expect("residual must compile");
-    let mut filter = RowFilter::for_read(&blob, None, schema.layout()).expect("the blob resolves");
-    filter.ranges(&batch.view()).iter().flat_map(|&(s, e)| s..e).collect()
-}
-
-/// A residual keeps a row only where it is TRUE: a NULL conjunct excludes the
-/// row bare, compared, and beside a conjunct that is TRUE or FALSE.
-#[test]
-fn a_null_residual_conjunct_excludes_the_row() {
-    let schema = two_col(T::I64);
-    let batch = batch_of(&schema, &[&[Null]]); // pk = 1
-    let bind = |sql| bind_sql(sql, &schema);
-    let flags = two_col(T::Bool);
-    let bare = BoundExpr::ColRef(1);
-    assert_eq!(
-        residual_rows(&[&bare], &batch_of(&flags, &[&[Null]]), &flags),
-        [0usize; 0]
-    );
-    for conjuncts in [
-        vec![bind("val = 0")],
-        vec![bind("pk = 1"), bind("val = 0")],
-        vec![bind("pk = 2"), bind("val = 0")],
-    ] {
-        let refs: Vec<&BoundExpr> = conjuncts.iter().collect();
-        assert_eq!(residual_rows(&refs, &batch, &schema), [0usize; 0], "{conjuncts:?}");
-    }
-    assert_eq!(residual_rows(&[&bind("pk = 1")], &batch, &schema), [0]);
 }

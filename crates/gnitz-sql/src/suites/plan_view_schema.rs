@@ -2,7 +2,7 @@
 //! key slots, nullability, type codes and the PK column set — planned with no
 //! server against a hand-built catalog.
 
-use gnitz_wire::{ColType, ColumnDef, PK_LIST_MAX_COLS, RelClass, TypeCode};
+use gnitz_wire::{ColType, PK_LIST_MAX_COLS, RelClass, TypeCode};
 use std::sync::Arc;
 
 use super::*;
@@ -806,10 +806,10 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
 #[test]
 fn a_synthetic_key_over_a_decimal_keeps_its_scale() {
     let i = TypeCode::I64;
-    let d = |name| ColumnDef::new(name, ColType::decimal(2), false);
+    let d = ColType::decimal(2);
     let cat = catalog(vec![
-        ("a", table(30, vec![d("k"), col("x", i)], vec![0])),
-        ("b", table(31, vec![d("k"), col("y", i)], vec![0])),
+        ("a", table(30, vec![col("k", d), col("x", i)], vec![0])),
+        ("b", table(31, vec![col("k", d), col("y", i)], vec![0])),
     ]);
     for (body, key) in [
         ("SELECT a.x, b.y FROM a JOIN b ON a.k = b.k", "_join_pk"),
