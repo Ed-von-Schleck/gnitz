@@ -4,7 +4,6 @@ use std::ops::Range;
 
 use super::columnar::ColPtr;
 use crate::schema::{PkSortKey, pk_width_dispatch};
-use gnitz_wire::RowSource;
 
 /// Lower bound over `[lo, hi)`: the first index whose row sorts at-or-after the
 /// probe, where `lt(i)` reports row `i < probe`.
@@ -89,15 +88,16 @@ pub unsafe fn seek_pk_rows(count: usize, width: usize, pk: ColPtr, key: &[u8], h
     })
 }
 
-/// The first row past `start` of a PK-sorted source not sharing row `start`'s
-/// leading `width` key bytes.
+/// The first row past `start` of a sorted PK region of `stride`-byte rows not
+/// sharing row `start`'s leading `width` key bytes.
 #[inline]
-pub fn pk_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
-    let count = src.row_count();
+pub fn pk_group_end(pk: &[u8], stride: usize, start: usize, width: usize) -> usize {
+    let count = pk.len() / stride;
     debug_assert!(start < count, "pk_group_end: row {start} out of {count}");
-    let k = &src.get_pk_bytes(start)[..width];
+    let row = |i: usize| &pk[i * stride..i * stride + width];
+    let k = row(start);
     let mut j = start + 1;
-    while j < count && crate::schema::compare_pk_ordering(&src.get_pk_bytes(j)[..width], k).is_eq() {
+    while j < count && crate::schema::compare_pk_ordering(row(j), k).is_eq() {
         j += 1;
     }
     j

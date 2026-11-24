@@ -121,7 +121,7 @@ impl OrderedPlan {
         };
         while walk.end < n {
             walk.next = walk.end;
-            walk.end = pk_group_end(entries, walk.next, width);
+            walk.end = pk_group_end(entries.pk(), entries.schema().pk_stride(), walk.next, width);
             let delta_row = origins.source_row(walk.next);
             let out_pk = index.key.out_pk(&mb, delta_row);
             walk.group = prefix(walk.next);

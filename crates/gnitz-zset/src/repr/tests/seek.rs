@@ -50,30 +50,6 @@ fn seek_matches_the_linear_lower_bound_at_every_width() {
     }
 }
 
-/// A PK region of `stride`-byte rows, read as a source for `pk_group_end`.
-struct PkRows<'a> {
-    region: &'a [u8],
-    stride: usize,
-}
-
-impl RowSource for PkRows<'_> {
-    fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        &self.region[row * self.stride..(row + 1) * self.stride]
-    }
-    fn get_null_word(&self, _row: usize) -> u64 {
-        0
-    }
-    fn get_col_ptr(&self, _row: usize, _payload_col: usize, _col_size: usize) -> &[u8] {
-        unreachable!("a PK region has no payload")
-    }
-    fn heap(&self) -> gnitz_wire::Heap<'_> {
-        gnitz_wire::Heap::Plain(&[])
-    }
-    fn row_count(&self) -> usize {
-        self.region.len() / self.stride.max(1)
-    }
-}
-
 /// `pk_group_end` equals the linear scan for the end of each row's run of equal
 /// leading `width` bytes, for every stride up to `MAX_PK_BYTES` and every width
 /// up to it. Rows differ at their first, a middle and their last byte, so every
@@ -104,7 +80,6 @@ fn pk_group_end_matches_the_linear_scan_at_every_width() {
                 k
             })
             .collect();
-        let src = PkRows { region: &region, stride };
         let row = |i: usize| &region[i * stride..(i + 1) * stride];
         for width in 0..=stride {
             for start in 0..digits.len() {
@@ -112,7 +87,7 @@ fn pk_group_end_matches_the_linear_scan_at_every_width() {
                     .find(|&j| row(j)[..width] != row(start)[..width])
                     .unwrap_or(digits.len());
                 assert_eq!(
-                    pk_group_end(&src, start, width),
+                    pk_group_end(&region, stride, start, width),
                     expected,
                     "stride={stride} width={width} start={start}"
                 );

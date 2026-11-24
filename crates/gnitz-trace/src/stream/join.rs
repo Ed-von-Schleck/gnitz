@@ -610,7 +610,7 @@ fn equi_merge_walk(delta: &Batch, cursor: &mut ReadCursor, mut emit: impl FnMut(
     while i < n {
         let dk = delta.get_pk_bytes(i);
         if cursor.seek_pk_group_ascending(dk) {
-            let j = pk_group_end(delta, i, k); // delta group
+            let j = pk_group_end(delta.pk(), k, i, k); // delta group
             cursor.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
         } else if let Some(pk) = cursor.current_pk() {
@@ -640,7 +640,7 @@ fn range_merge_walk(
     let (stride, last) = (delta.schema().pk_stride(), probe.last_before_split());
     let mut lo = 0;
     while lo < delta.len() {
-        let hi = pk_group_end(delta, lo, eq_size);
+        let hi = pk_group_end(delta.pk(), stride, lo, eq_size);
         // The group shares one bound, so the row whose other bound spans
         // widest cuts for all of them.
         let cut_row = if above { lo } else { hi - 1 };

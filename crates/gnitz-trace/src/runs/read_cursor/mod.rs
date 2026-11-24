@@ -121,7 +121,8 @@ fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
     let mut got = Vec::new();
     let mut i = 0;
     while i < out.len() {
-        let j = gnitz_zset::repr::pk_group_end(out, i, out.schema().pk_stride());
+        let stride = out.schema().pk_stride();
+        let j = gnitz_zset::repr::pk_group_end(out.pk(), stride, i, stride);
         got.push((out.get_pk_bytes(i), out.as_mem_batch().sum_weights(i, j)));
         i = j;
     }
