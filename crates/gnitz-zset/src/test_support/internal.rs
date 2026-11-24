@@ -84,6 +84,12 @@ pub(crate) fn ragged_batch(rows: usize) -> Batch {
     b.finish()
 }
 
+/// `batch` over its heap padded with `pad` unreferenced bytes, charged dead.
+pub(crate) fn padded(mut batch: Batch, pad: usize) -> Batch {
+    batch.adopt_heap(&vec![0; pad], pad, 0);
+    batch
+}
+
 /// U64 pk + a single BLOB payload column.
 pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
     u64_pk_schema(&[SchemaColumn::new(TypeCode::Blob, false)])

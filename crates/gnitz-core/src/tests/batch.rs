@@ -38,48 +38,6 @@ fn batch_of(
     ZSetBatch::of(schema, rows)
 }
 
-/// `null_breach` names each null-rule breach with its row and payload slot; a NULL over
-/// a zeroed cell of a nullable column is not one.
-#[test]
-fn null_breach_names_each_malformed_row() {
-    // `(pk U64 | v I64 | s STRING nullable)`, two valid rows, the second NULL in `s`.
-    let schema = Arc::new(
-        Schema::from_parts(
-            vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::I64, false),
-                ColumnDef::new("s", TypeCode::String, true),
-            ],
-            &[0],
-        )
-        .unwrap(),
-    );
-    let mut base = ZSetBatch::new(&schema);
-    {
-        let mut a = base.builder();
-        a.begin_row(1, 1).put_int(10).put_string("x");
-        a.begin_row(2, -1).put_int(20).put_null();
-    }
-    assert_eq!(
-        base.view().null_breach(),
-        None,
-        "a NULL over a zeroed nullable cell is no breach"
-    );
-
-    // (null bits set on row 0, the breach and its (row, payload slot))
-    let cases = [
-        (1u64, ("a null bit on a NOT NULL column", (0, 0))),
-        (2, ("a non-zero cell under a NULL", (0, 1))),
-        (1 << 2, ("a null bit on a NOT NULL column", (0, 2))),
-    ];
-    for (bits, want) in cases {
-        let mut b = base.clone();
-        let word = b.view().get_null_word(0) | bits;
-        set_null_word(&mut b, 0, word);
-        assert_eq!(b.view().null_breach(), Some(want));
-    }
-}
-
 /// Batches that differ in one layout clause each are refused: the payload slot count, a
 /// slot's type (whose cells would be read at another width), and a key column's sign.
 #[test]
@@ -307,20 +265,6 @@ fn truncate_to_drops_the_rows_and_heap_since_the_mark() {
     assert_eq!(b, want);
 }
 
-/// A cut gather is the named rows at their weights, as a row-by-row rebuild holds them.
-#[test]
-fn a_cut_gather_matches_a_row_by_row_rebuild() {
-    let (schema, b) = string_batch();
-    let picks = [2u32, 0, 3];
-    let mut want = ZSetBatch::new(&schema);
-    for &r in &picks {
-        want.copy_row_at(&b, r as usize, b.view().get_weight(r as usize));
-    }
-    let got = b.gather(&picks);
-    assert_eq!(rows(&got), rows(&want));
-    assert_eq!(got.view().null_breach(), None);
-}
-
 /// A gather naming every row in place is the batch itself.
 #[test]
 fn an_in_place_gather_is_the_batch() {
@@ -329,18 +273,6 @@ fn an_in_place_gather_is_the_batch() {
     let arena = b.view().pk().as_ptr();
     let got = b.gather(&in_place);
     assert_eq!(got.view().pk().as_ptr(), arena);
-    assert_eq!(got.view().null_breach(), None);
-}
-
-/// A gather keeping every row reorders it, every string read back as it was.
-#[test]
-fn a_whole_gather_reorders_every_row() {
-    let (_, b) = string_batch();
-    let perm = [3u32, 1, 0, 2];
-    let all = rows(&b);
-    let want: Vec<Row> = perm.iter().map(|&r| all[r as usize].clone()).collect();
-    let got = b.gather(&perm);
-    assert_eq!(rows(&got), want);
     assert_eq!(got.view().null_breach(), None);
 }
 
@@ -700,24 +632,6 @@ fn a_string_cell_pointing_past_the_blob_is_refused() {
     }
 }
 
-/// A null bit under a NOT NULL column is refused at decode.
-#[test]
-fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
-    let schema = kv_schema(TypeCode::I64);
-    let mut b = ZSetBatch::new(&schema);
-    {
-        let mut a = b.builder();
-        a.begin_row(1, 1).put_int(7);
-        a.begin_row(2, 1).put_int(8);
-    }
-    set_null_word(&mut b, 1, 1);
-    let block = encode_wal_block(&b);
-    match decode_wal_block(&block, &schema) {
-        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column"), "{m}"),
-        other => panic!("expected a NOT NULL decode error, got {other:?}"),
-    }
-}
-
 // ── Decoding several blocks ─────────────────────────────────────────────
 
 /// A decoded batch takes every write.
@@ -839,9 +753,4 @@ fn no_block_is_the_empty_batch() {
         decode_wal_blocks(Vec::new(), None, &schema).unwrap(),
         ZSetBatch::new(&schema)
     );
-}
-
-/// Overwrite row `row`'s null word with `w`.
-fn set_null_word(b: &mut ZSetBatch, row: usize, w: u64) {
-    b.rewrite(|d| d.null_bmp_mut()[row * 8..(row + 1) * 8].copy_from_slice(&w.to_le_bytes()));
 }

@@ -3,7 +3,7 @@ use crate::repr::{BatchBuilder, UnifiedSet};
 use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     FoldRow, arb_fold_case, assert_folds, certified, fold_batch, fold_schemas, make_batch, make_batch_bytes,
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, radix_fold_rows, u64_pk_schema,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, padded, radix_fold_rows, u64_pk_schema,
 };
 
 // ── The Z-set fold, over every path that runs it ────────────────────────
@@ -199,8 +199,8 @@ fn a_carried_merge_reads_back_every_string() {
     let b_rows: Vec<(u64, i64, &[u8])> = vec![(3, 1, &r), (4, 1, &p), (5, 1, &r), (5, -2, &s), (8, 1, &q)];
     for (pad_a, pad_b) in [(0, 0), (1000, 0), (0, 1000)] {
         let (a, b) = (
-            certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &a_rows)).padded(pad_a),
-            certified(make_batch_bytes(&make_schema_pk_u64_payload_string(), &b_rows)).padded(pad_b),
+            padded(certified(make_batch_bytes(&schema, &a_rows)), pad_a),
+            padded(certified(make_batch_bytes(&schema, &b_rows)), pad_b),
         );
         let out = merge_consolidated(&[a.as_mem_batch(), b.as_mem_batch()], &schema);
         assert_folds(&[a, b], &out, &format!("padding ({pad_a}, {pad_b})"));

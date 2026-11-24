@@ -216,11 +216,12 @@ fn append_batch_strings_bench() {
     );
 }
 
-/// Retired instructions per row of `Batch::from_ranges` copying every other run
-/// of a `U64` key over three `U64` columns, by run length.
+/// Retired instructions per row of a subset copy of every other run of a `U64`
+/// key over three `U64` columns, by run length: `Batch::from_ranges` naming the
+/// runs, and `indexed_rows` naming their rows one by one.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn from_ranges_run_length_bench() {
+fn subset_copy_bench() {
     const ROWS: usize = 1 << 16;
     const PASSES: usize = 20;
     let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false); 3]);
@@ -236,18 +237,17 @@ fn from_ranges_run_length_bench() {
     let counter = Counter::instructions();
     for run in [1usize, 2, 4, 16, 256] {
         let ranges: Vec<(usize, usize)> = (0..ROWS).step_by(2 * run).map(|s| (s, s + run)).collect();
-        let (copied, instructions) = counter.measure(|| {
-            let mut copied = 0;
-            for _ in 0..PASSES {
-                let out = Batch::from_ranges(black_box(&src), black_box(&ranges), 0);
-                copied += black_box(&out).count;
-            }
-            copied
-        });
-        assert_eq!(copied, PASSES * ROWS / 2);
-        println!(
-            "from_ranges_run_length_bench: run {run:>3}: {:.1} instr/row",
+        let indices: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
+        let per_row = |copy: &dyn Fn() -> Batch| {
+            let (copied, instructions) =
+                counter.measure(|| (0..PASSES).map(|_| black_box(copy()).count).sum::<usize>());
+            assert_eq!(copied, PASSES * ROWS / 2);
             instructions as f64 / copied as f64
+        };
+        println!(
+            "subset_copy_bench: run {run:>3}: from_ranges {:5.1} instr/row, indexed_rows {:5.1}",
+            per_row(&|| Batch::from_ranges(black_box(&src), black_box(&ranges), 0)),
+            per_row(&|| black_box(&src).indexed_rows(black_box(&indices))),
         );
     }
 }

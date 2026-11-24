@@ -42,10 +42,10 @@ fn seek_bench() {
         let pk = ColPtr { base: region.as_ptr(), stride };
         let mut rng = Rng::new(0xC0FFEE + stride as u64);
         let probes: Vec<usize> = (0..PROBES).map(|_| rng.gen_range(ROWS as u64) as usize).collect();
+        let keys: Vec<[u8; 40]> = probes.iter().map(|&r| key(r)).collect();
         let lower_bounds = || {
             let mut landed = 0;
-            for &r in &probes {
-                let k = key(r);
+            for k in &keys {
                 // SAFETY: `region` holds `ROWS` rows of `stride` bytes.
                 landed += unsafe { seek_lower_bound(ROWS, stride, pk, black_box(&k[..stride]), None) };
             }
@@ -64,10 +64,10 @@ fn seek_bench() {
                 if descending {
                     probes.reverse();
                 }
+                let keys: Vec<[u8; 40]> = probes.iter().map(|&r| key(r)).collect();
                 let sweep = || {
                     let (mut at, mut landed) = (0, 0);
-                    for &r in &probes {
-                        let k = key(r);
+                    for (&r, k) in probes.iter().zip(&keys) {
                         // SAFETY: `region` holds `ROWS` rows of `stride` bytes.
                         at = unsafe { seek_lower_bound(ROWS, stride, pk, black_box(&k[..stride]), Some(hint(at, r))) };
                         landed += at;

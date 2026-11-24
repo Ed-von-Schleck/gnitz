@@ -8,6 +8,16 @@ use gnitz_foundation::perf::Counter;
 use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
+/// `rows` rows of a (u64 PK, two i64 payload) schema.
+fn two_i64_batch(rows: u64) -> Batch {
+    let mut b = BatchBuilder::new(&pk_u64_two_i64_schema());
+    for i in 0..rows {
+        b.begin_row(i as u128, 1).put_u64(i).put_u64(i * 3);
+        b.end_row();
+    }
+    b.finish()
+}
+
 /// Instructions to frame, and to decode in place, 1-row and 100-row blocks of a
 /// (u64 PK, two i64 payload) schema: the per-block constant of each.
 #[test]
@@ -16,15 +26,8 @@ fn wal_block_bench() {
     const ITERS: usize = 100_000;
     let counter = Counter::instructions();
     let schema = pk_u64_two_i64_schema();
-    for rows in [1usize, 100] {
-        let mut b = BatchBuilder::new(&schema);
-        for i in 0..rows as u64 {
-            b.begin_row(i as u128, 1);
-            b.put_int(i as u128);
-            b.put_int((i * 3) as u128);
-            b.end_row();
-        }
-        let batch = b.finish();
+    for rows in [1u64, 100] {
+        let batch = two_i64_batch(rows);
         let mut buf = vec![0u8; batch.wire_whole().unwrap().byte_size()];
         let ((), encode) = counter.measure(|| {
             for _ in 0..ITERS {
@@ -36,7 +39,7 @@ fn wal_block_bench() {
                 .map(|_| MemBatch::of_wal_block(black_box(&buf), &schema).unwrap().count)
                 .sum::<usize>()
         });
-        assert_eq!(decoded, rows * ITERS);
+        assert_eq!(decoded, rows as usize * ITERS);
         println!(
             "wal_block_bench {rows} rows: encode {} instr/block, decode {}",
             encode / ITERS as u64,
@@ -45,8 +48,8 @@ fn wal_block_bench() {
     }
 }
 
-/// Instructions per row of `decode_foreign_wal_block`, the validating decode,
-/// over 1000 rows: a fixed-width nullable schema, then one NOT NULL STRING
+/// Instructions per row of `CertifiedBlock::certify`, the validating decode a
+/// pushed block takes in place, over 1000 rows: a fixed-width nullable schema, then one NOT NULL STRING
 /// column at each value shape its validation tells apart — inline or in the
 /// heap, ASCII or not, and where in a long value the first non-ASCII byte sits.
 #[test]
@@ -60,10 +63,8 @@ fn foreign_decode_bench() {
         let (rows, instructions) = counter.measure(|| {
             (0..PASSES)
                 .map(|_| {
-                    MemBatch::of_foreign_wal_block(black_box(&block), batch.schema())
-                        .unwrap()
-                        .to_batch()
-                        .len()
+                    let certified = CertifiedBlock::certify(black_box(&block), 0..block.len(), batch.schema()).unwrap();
+                    certified.view(&block, batch.schema()).len()
                 })
                 .sum::<usize>()
         });
@@ -164,14 +165,7 @@ fn reply_chunk_strings_bench() {
 fn wire_listed_encode_bench() {
     const ROWS: usize = 1000;
     const PASSES: usize = 1000;
-    let mut b = BatchBuilder::new(&pk_u64_two_i64_schema());
-    for i in 0..ROWS as u64 {
-        b.begin_row(i as u128, 1);
-        b.put_int(i as u128);
-        b.put_int((i * 3) as u128);
-        b.end_row();
-    }
-    let fixed = b.finish();
+    let fixed = two_i64_batch(ROWS as u64);
     let strings = |value: &dyn Fn(u64) -> String| {
         make_batch_bytes(
             &make_schema_pk_u64_payload_string(),

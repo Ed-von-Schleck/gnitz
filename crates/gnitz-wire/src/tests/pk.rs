@@ -81,6 +81,26 @@ fn the_column_codec_is_the_cell_codec_per_row() {
     }
 }
 
+/// A value fits a column when the bits outside its width are all clear or, for
+/// a sign-extended negative, all set; anything else would be truncated.
+#[test]
+fn native_fits_admits_only_what_the_width_keeps() {
+    let minus_one = (-1i128) as u128;
+    for (v, width, fits) in [
+        (0xFF, 1, true),
+        (0x100, 1, false),
+        (minus_one, 1, true),
+        (0xFFFF_FFFF, 4, true),
+        (1 << 32, 4, false),
+        (u64::MAX as u128, 8, true),
+        (1 << 64, 8, false),
+        (u128::MAX, 16, true),
+        (1 << 127, 16, true),
+    ] {
+        assert_eq!(native_fits(v, width), fits, "{v:#x} in {width} bytes");
+    }
+}
+
 /// The width-specialized arms must agree with the general right-align form at
 /// every stride a PK region can have — the 9..=15 overlapping-load band and
 /// the 3/5/6/7 widths only the buffer arm serves — including the all-zero and

@@ -280,14 +280,6 @@ impl Batch {
         self.dead_heap = self.dead_heap.saturating_add(bytes).min(self.blob.len());
     }
 
-    /// These rows over their heap padded with `pad` unreferenced bytes, charged dead.
-    #[cfg(test)]
-    pub(in crate::repr) fn padded(mut self, pad: usize) -> Batch {
-        self.blob.extend(std::iter::repeat_n(0u8, pad));
-        self.dead_heap += pad;
-        self
-    }
-
     /// Where region `r` starts in the arena.
     #[inline(always)]
     fn region_start(&self, r: usize) -> usize {

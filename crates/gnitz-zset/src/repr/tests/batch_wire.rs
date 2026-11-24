@@ -2,8 +2,9 @@ use super::*;
 use crate::repr::{BatchBuilder, merge_consolidated};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    certified, encode_to_wire_vec, keyed_schema, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, ragged_batch, ragged_schema, u64_pk_schema, weighted_rows,
+    assert_folds, certified, encode_to_wire_vec, keyed_schema, make_batch, make_batch_bytes,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, padded, ragged_batch, ragged_schema, u64_pk_schema,
+    weighted_rows,
 };
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, TypeCode};
@@ -13,131 +14,81 @@ fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
     wal::WAL_HEADER_SIZE + schema.region_start(r, rows)
 }
 
-/// The foreign decode makes no consolidation claim, and refuses a non-canonical
-/// string cell the engine's own decode admits.
+/// The foreign decode refuses a block the engine's own decode admits when one
+/// byte run of it is forged: a non-canonical string cell, a NULL over a non-zero
+/// cell, a null bit on no nullable column, and a BOOLEAN byte past 1 in the key
+/// and in the payload.
 #[test]
-fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
-    let schema = make_schema_pk_u64_payload_string();
+fn a_foreign_decode_refuses_a_forged_byte() {
+    // A nullable STRING payload, row 0 short and row 1 long.
+    let strings = u64_pk_schema(&[SchemaColumn::new(TypeCode::String, true)]);
     let long: &[u8] = b"a string long enough to spill";
-    let clean = encode_to_wire_vec(&certified(make_batch_bytes(
-        &schema,
+    let string_block = encode_to_wire_vec(&make_batch_bytes(
+        &strings,
         &[(1, 1, b"short".as_slice()), (2, 1, long)],
-    )));
-    assert_eq!(
-        Batch::decode_foreign_wal_blocks(&[&clean], &schema).map(|b| b.len()),
-        Ok(2)
-    );
-    assert!(
-        !Batch::decode_foreign_wal_blocks(&[&clean], &schema)
-            .unwrap()
-            .is_consolidated(),
-        "a foreign block carries no consolidation claim"
-    );
-
-    let cells = region_offset(&schema, 2, REG_PAYLOAD_START);
-    let forgeries: [fn(&mut [u8]); 2] = [
-        // Row 0 is "short" (5 bytes): its suffix padding starts at byte 9.
-        |cell| cell[15] = 0xAA,
-        // Row 1 is long: point its heap offset past the blob.
-        |cell| gnitz_wire::write_u64_le(cell, 8, 1 << 20),
-    ];
-    for (row, forge) in forgeries.into_iter().enumerate() {
-        let mut buf = clean.clone();
-        forge(&mut buf[cells + row * 16..cells + (row + 1) * 16]);
-        assert!(MemBatch::of_wal_block(&buf, &schema).is_ok(), "row {row}");
-        assert_eq!(
-            Batch::decode_foreign_wal_blocks(&[&buf], &schema).err(),
-            Some("data WAL German string is not in canonical form"),
-            "row {row}"
-        );
-    }
-}
-
-/// The foreign decode refuses the two NULL encodings the schema does not admit:
-/// a NULL over a non-zero cell, and a null bit on a NOT NULL column — each over
-/// a block that breaks that rule alone.
-#[test]
-fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
-    // `(U64 pk, I64 NOT NULL, I64 NULL)`: the nullable column is payload slot 1.
-    let schema = u64_pk_schema(&[
-        SchemaColumn::new(TypeCode::I64, false),
-        SchemaColumn::new(TypeCode::I64, true),
-    ]);
-    // Row 2's NOT NULL cell is zero, the NULL encoding should its bit be set.
-    let block = |not_null_bit: bool| {
-        let mut b = BatchBuilder::new(&schema);
-        for pk in [1u128, 2] {
-            b.begin_row(pk, 1);
-            if pk == 2 && not_null_bit {
-                b.put_null();
-            } else {
-                b.put_int((pk - 1) * 10);
-            }
-            b.put_null();
-            b.end_row();
-        }
-        encode_to_wire_vec(&b.finish())
-    };
-    let clean = block(false);
-    assert_eq!(
-        Batch::decode_foreign_wal_blocks(&[&clean], &schema).map(|b| b.len()),
-        Ok(2)
-    );
-
-    let cell = region_offset(&schema, 2, REG_PAYLOAD_START + 1) + 8;
-    let mut valued_null = clean.clone();
-    valued_null[cell..cell + 8].fill(0xFF);
-    // A bit past the schema's two payload slots: no column's, so no reader
-    // agrees with another on what it means.
-    let nulls = region_offset(&schema, 2, REG_NULL_BMP);
-    let mut stray_bit = clean.clone();
-    stray_bit[nulls] |= 0b100;
-    for (forged, why) in [
-        (valued_null, "a non-zero cell under a NULL"),
-        (block(true), "a null bit on a NOT NULL column"),
-        (stray_bit, "a null bit on a NOT NULL column"),
-    ] {
-        assert!(MemBatch::of_wal_block(&forged, &schema).is_ok(), "{why}");
-        assert_eq!(Batch::decode_foreign_wal_blocks(&[&forged], &schema).err(), Some(why));
-    }
-}
-
-/// The foreign decode refuses a BOOLEAN byte past 1, in the key and in the
-/// payload: a second encoding of true, which the engine's own decode admits.
-#[test]
-fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
+    ));
+    let cells = region_offset(&strings, 2, REG_PAYLOAD_START);
+    let nulls = region_offset(&strings, 2, REG_NULL_BMP);
     // `(BOOLEAN, U64)` keyed, then a BOOLEAN payload: the key's flag is the
     // first of its 9 bytes.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::Bool, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::Bool, true),
-        ],
-        &[0, 1],
+    let bools = keyed_schema(
+        &[TypeCode::Bool, TypeCode::U64],
+        &[SchemaColumn::new(TypeCode::Bool, true)],
     );
-    let mut b = BatchBuilder::new(&schema);
+    let mut b = BatchBuilder::new(&bools);
     for (flag, id) in [(0u128, 7u128), (1, 8)] {
         b.begin_row_natives(&[flag, id], 1);
         b.put_int(1 - flag);
         b.end_row();
     }
-    let clean = encode_to_wire_vec(&b.finish());
-    assert_eq!(
-        Batch::decode_foreign_wal_blocks(&[&clean], &schema).map(|b| b.len()),
-        Ok(2)
-    );
-
-    let second_key = wal::WAL_HEADER_SIZE + schema.pk_stride();
-    let first_cell = region_offset(&schema, 2, REG_PAYLOAD_START);
-    for at in [second_key, first_cell] {
-        let mut forged = clean.clone();
-        forged[at] = 2;
-        assert!(MemBatch::of_wal_block(&forged, &schema).is_ok(), "byte {at}");
+    let bool_block = encode_to_wire_vec(&b.finish());
+    let canonical = "data WAL German string is not in canonical form";
+    let boolean = "a BOOLEAN cell is neither 0 nor 1";
+    for (schema, clean, at, bytes, err) in [
+        // Row 0 is "short" (5 bytes): its suffix padding starts at byte 9.
+        (&strings, &string_block, cells + 15, &[0xAA][..], canonical),
+        // Row 1 is long: its heap offset points past the blob.
+        (
+            &strings,
+            &string_block,
+            cells + 16 + 8,
+            &(1u64 << 20).to_le_bytes(),
+            canonical,
+        ),
+        (&strings, &string_block, nulls, &[0b1], "a non-zero cell under a NULL"),
+        (
+            &strings,
+            &string_block,
+            nulls,
+            &[0b10],
+            "a null bit on a NOT NULL column",
+        ),
+        (
+            &bools,
+            &bool_block,
+            wal::WAL_HEADER_SIZE + bools.pk_stride(),
+            &[2],
+            boolean,
+        ),
+        (
+            &bools,
+            &bool_block,
+            region_offset(&bools, 2, REG_PAYLOAD_START),
+            &[2],
+            boolean,
+        ),
+    ] {
         assert_eq!(
-            Batch::decode_foreign_wal_blocks(&[&forged], &schema).err(),
-            Some("a BOOLEAN cell is neither 0 nor 1"),
-            "byte {at}"
+            Batch::decode_foreign_wal_blocks(&[clean], schema).map(|b| b.len()),
+            Ok(2)
+        );
+        let mut forged = clean.clone();
+        forged[at..at + bytes.len()].copy_from_slice(bytes);
+        assert!(MemBatch::of_wal_block(&forged, schema).is_ok(), "{err} at {at}");
+        assert_eq!(
+            Batch::decode_foreign_wal_blocks(&[&forged], schema).err(),
+            Some(err),
+            "at {at}"
         );
     }
 }
@@ -145,9 +96,7 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
 /// Twenty rows naming one 200-byte span, as a join's fan-out writes them.
 fn shared_span() -> Batch {
     let one = make_batch_bytes(&make_schema_pk_u64_payload_string(), &[(1, 1, "v".repeat(200))]);
-    let mut shared = Batch::with_capacity(one.schema(), 20);
-    let src = one.as_mem_batch();
-    shared.write_rows(20, |w| crate::repr::scatter::copy_ranges(&src, None, &[(0, 1); 20], w));
+    let shared = one.indexed_rows(&[0; 20]);
     assert_eq!(shared.blob().len(), 200, "precondition: one span for every row");
     shared
 }
@@ -310,9 +259,11 @@ fn a_viewed_wal_block_reads_as_its_batch() {
         two.append_ranges(&mb, &[(0, cut), (cut, rows)]);
         assert_eq!(weighted_rows(&two), want, "{rows} rows: two ranges");
 
-        let merged = merge_consolidated(&[mb, mb], &schema);
-        let doubled: Vec<_> = want.iter().map(|(row, w)| (row.clone(), 2 * w)).collect();
-        assert_eq!(weighted_rows(&merged), doubled, "{rows} rows: merge");
+        assert_folds(
+            &[src.clone(), src.clone()],
+            &merge_consolidated(&[mb, mb], &schema),
+            &format!("{rows} rows: merge"),
+        );
     }
 }
 
@@ -348,31 +299,27 @@ fn foreign_blocks_decode_to_their_sum() {
 
     assert_eq!(Batch::decode_foreign_wal_blocks(&[], &schema).map(|b| b.len()), Ok(0));
     let one = Batch::decode_foreign_wal_blocks(&[&a], &schema).unwrap();
+    assert!(!one.is_consolidated(), "a foreign block carries no consolidation claim");
     assert_eq!(weighted_rows(&one), sum(&[(1, 1, 10), (3, 1, 30), (5, -1, 50)]));
     assert!(Batch::decode_foreign_wal_blocks(&[&a, &b[..b.len() - 1]], &schema).is_err());
 }
 
 /// An engine block states its batch's dead-byte bound and the engine decode
-/// adopts it.
-#[test]
-fn dead_heap_round_trips_an_engine_block() {
-    let schema = make_schema_pk_u64_payload_string();
-    let b = certified(make_batch_bytes(
-        &schema,
-        &[(1, 1, [b'a'; 20].as_slice()), (2, 1, &[b'b'; 30])],
-    ))
-    .padded(7);
-    let block = encode_to_wire_vec(&b);
-    let decoded = MemBatch::of_wal_block(&block, &schema).unwrap().to_batch();
-    assert_eq!((decoded.dead_heap(), decoded.blob().len()), (7, b.blob().len()));
-}
-
-/// A foreign block's header is not trusted: the decode measures the heap,
+/// adopts it; a foreign block's is not trusted: the decode measures the heap,
 /// counting a span two cells share once, the overlap of two spans once, and an
 /// unreferenced tail whole.
 #[test]
 fn a_foreign_decode_measures_the_dead_heap_exactly() {
     let schema = make_schema_pk_u64_payload_string();
+    let engine = padded(
+        make_batch_bytes(&schema, &[(1, 1, [b'a'; 20].as_slice()), (2, 1, &[b'b'; 30])]),
+        7,
+    );
+    let decoded = MemBatch::of_wal_block(&encode_to_wire_vec(&engine), &schema)
+        .unwrap()
+        .to_batch();
+    assert_eq!((decoded.dead_heap(), decoded.blob().len()), (7, engine.blob().len()));
+
     // Longer than one word of the span bitset.
     let heap: Vec<u8> = (0..200u8).map(|b| b % 128).collect();
     let cell = |start: usize, len: usize| {
@@ -515,32 +462,27 @@ fn raw_two_col_batch(nullable: [bool; 2], cols: [[u64; 3]; 2], words: [u64; 3]) 
     })
 }
 
+/// `null_breach` names the first row breaching the null rule and its lowest
+/// offending slot: a null bit on a NOT NULL column or past the last payload
+/// slot, or a NULL over a non-zero cell.
 #[test]
-fn null_breach_names_the_first_row_and_its_lowest_null_bit_on_a_not_null_column() {
-    let breach = |nullable, words| {
-        raw_two_col_batch(nullable, [[0; 3]; 2], words)
-            .as_mem_batch()
-            .null_breach()
-    };
+fn null_breach_names_the_first_breach() {
     let not_null = "a null bit on a NOT NULL column";
-    assert_eq!(breach([true, true], [0b01, 0, 0b11]), None);
-    assert_eq!(breach([true, false], [0b01, 0, 0b11]), Some((not_null, (2, 1))));
-    assert_eq!(breach([false, true], [0b10, 0b11, 0b01]), Some((not_null, (1, 0))));
-    // A bit past the last payload slot sits on no nullable column.
-    assert_eq!(breach([true, true], [0, 0b100, 0]), Some((not_null, (1, 2))));
-}
-
-#[test]
-fn null_breach_names_the_first_null_bit_over_a_non_zero_cell() {
-    let cols = [[7, 0, 9], [0, 5, 0]];
-    let breach = |words| {
-        raw_two_col_batch([false, true], cols, words)
-            .as_mem_batch()
-            .null_breach()
-    };
-    assert_eq!(breach([0b10, 0, 0b10]), None);
-    assert_eq!(
-        breach([0b10, 0b10, 0b10]),
-        Some(("a non-zero cell under a NULL", (1, 1)))
-    );
+    let valued = [[7, 0, 9], [0, 5, 0]];
+    for (nullable, cols, words, want) in [
+        ([true, true], [[0; 3]; 2], [0b01, 0, 0b11], None),
+        ([true, false], [[0; 3]; 2], [0b01, 0, 0b11], Some((not_null, (2, 1)))),
+        ([false, true], [[0; 3]; 2], [0b10, 0b11, 0b01], Some((not_null, (1, 0)))),
+        ([true, true], [[0; 3]; 2], [0, 0b100, 0], Some((not_null, (1, 2)))),
+        ([false, true], valued, [0b10, 0, 0b10], None),
+        (
+            [false, true],
+            valued,
+            [0b10, 0b10, 0b10],
+            Some(("a non-zero cell under a NULL", (1, 1))),
+        ),
+    ] {
+        let breach = raw_two_col_batch(nullable, cols, words).as_mem_batch().null_breach();
+        assert_eq!(breach, want, "{nullable:?} {words:?}");
+    }
 }

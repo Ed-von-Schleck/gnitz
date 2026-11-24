@@ -1,36 +1,10 @@
 use super::*;
 
-/// Carrying two whole heaps charges each source's rows the output leaves out —
-/// survivors interleaved across both — and every kept string reads back.
-#[test]
-fn materialize_carrying_charges_each_sources_dropped_rows() {
-    use crate::test_support::{certified, make_batch_bytes, make_schema_pk_u64_payload_string, read_strings};
-    let schema = make_schema_pk_u64_payload_string();
-    // Eight rows a side, one dropped from each: too little to make either
-    // carried heap wasteful.
-    let side = |first: u64, fill: u8, dropped: &'static [u8]| {
-        let kept = [fill; 40];
-        let mut rows: Vec<(u64, i64, &[u8])> = (0..8).map(|i| (first + 2 * i, 1, &kept[..])).collect();
-        rows[3].2 = dropped;
-        certified(make_batch_bytes(&schema, &rows))
-    };
-    let (a, b) = (side(1, b'a', &[b'x'; 30]), side(2, b'b', &[b'y'; 50]));
-    let sources = [a.as_mem_batch(), b.as_mem_batch()];
-    let rows: Vec<Pick> = (0..8)
-        .filter(|&r| r != 3)
-        .flat_map(|r| [(0, r, 1), (1, r, 1)])
-        .collect();
-    let out = materialize_carrying(&sources, &schema, &rows);
-    assert_eq!(out.dead_heap(), 30 + 50);
-    assert_eq!(out.blob().len(), a.blob().len() + b.blob().len());
-    let want: Vec<Vec<u8>> = (0..14).map(|i| vec![b"ab"[i % 2]; 40]).collect();
-    assert_eq!(read_strings(&out), want);
-}
-
 /// Six sources of six payload columns, past the inline sizes of the per-source
 /// views, the payload column table and the kept counts: every pick reads back
 /// in pick order at its weight, whether its source's heap is carried whole or
-/// relocated cell by cell.
+/// relocated cell by cell, and a carried heap is charged each row its source
+/// left out.
 #[test]
 fn materialize_carrying_reads_past_the_inline_tables() {
     use crate::repr::BatchBuilder;
@@ -63,8 +37,8 @@ fn materialize_carrying_reads_past_the_inline_tables() {
         .collect();
     let sources: Vec<MemBatch> = batches.iter().map(Batch::as_mem_batch).collect();
     // The last source keeps one row of eight, so its heap is relocated; the
-    // others keep every row and carry theirs.
-    let picked = |key: u64| key % SOURCES != SOURCES - 1 || key < SOURCES;
+    // others carry theirs, sources 0 and 1 leaving one row out.
+    let picked = |key: u64| (key % SOURCES != SOURCES - 1 || key < SOURCES) && key != 6 && key != 7;
     let rows: Vec<Pick> = (0..ROWS)
         .filter(|&key| picked(key))
         .map(|key| ((key % SOURCES) as u32, (key / SOURCES) as u32, 1 + (key % 3) as i64))
@@ -77,6 +51,6 @@ fn materialize_carrying_reads_past_the_inline_tables() {
     assert_eq!(weighted_rows(&out), weighted_rows(&want.finish()));
     let carried: usize = batches[..SOURCES as usize - 1].iter().map(|b| b.blob().len()).sum();
     assert!(out.blob().len() >= carried && out.blob().len() < carried + batches[SOURCES as usize - 1].blob().len());
-    assert_eq!(out.dead_heap(), 0);
+    assert_eq!(out.dead_heap(), 2 * 36, "the 36-byte strings of keys 6 and 7");
     out.debug_verify_dead_heap();
 }
