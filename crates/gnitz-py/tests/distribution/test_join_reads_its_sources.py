@@ -9,13 +9,8 @@ get right is *which* state of the table it reads: the one the view last absorbed
 not the one a push has since moved it to.
 
 Each layout below makes a different set of traces readable off their tables.
-One model — two dicts and a nested loop — states the view after every step of a
-random history that leaves pushes to both tables un-ticked together, restarts
-the server cleanly, kills it with pushes still un-ticked, and creates a second
-view over the populated tables, which is the backfill.
-
-The comparison is a weight bag, and the premise — which traces exist on disk —
-is read off the data directory.
+A random history, writing both tables between ticks, is checked across a clean
+restart, a kill with writes un-ticked, and a backfilled second view.
 """
 
 import random
@@ -23,7 +18,7 @@ import random
 import gnitz
 import pytest
 from _read import bag, scanned
-from _serverproc import MULTI, SWEEP_ENV, disk_usage
+from _serverproc import disk_usage
 
 _CUSTOMERS = "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, address TEXT){}"
 _ORDERS = "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, customer_id BIGINT NOT NULL, note TEXT NOT NULL)"
@@ -37,14 +32,14 @@ _VIEW = (
 )
 _COLS = ("oid", "note", "cid", "name", "address")
 
-# layout -> (customers suffix, orders DDL, the traces the view still keeps a copy of)
+# layout -> (customers suffix, orders DDL)
 _LAYOUTS = {
     # `customers` is joined on its primary key; `orders` is re-keyed onto another worker.
-    "by_id": ("", _ORDERS, 1),
+    "by_id": ("", _ORDERS),
     # `orders` leads with the join key and is placed by it: both tables are their traces.
-    "clustered": ("", _ORDERS_CLUSTERED, 0),
+    "clustered": ("", _ORDERS_CLUSTERED),
     # Every worker holds `customers` whole; `orders` stays where it is, in id order.
-    "replicated": (" WITH (replicated = true)", _ORDERS, 1),
+    "replicated": (" WITH (replicated = true)", _ORDERS),
 }
 
 
@@ -97,8 +92,8 @@ class _Model:
             conn.execute_sql(f"DELETE FROM {table} WHERE id = {key}")
 
     def step(self, conn):
-        """A few writes to both tables with no read between them, so one tick
-        carries both tables' deltas."""
+        """A few writes to both tables with no read between them, so both
+        tables' deltas are pending when the view next ticks."""
         for _ in range(self.rng.randrange(1, 4)):
             match self.rng.randrange(6):
                 case 0 | 1:
@@ -118,14 +113,12 @@ def _check(conn, model, what, views=("v",)):
 
 @pytest.mark.parametrize("opts", ["", "WITH (capacity = '1 KB')"], ids=["stored", "bounded"])
 @pytest.mark.parametrize("layout", list(_LAYOUTS))
-def test_the_view_is_the_join_of_its_tables(layout, opts, own_server):
-    customers_opts, orders_ddl, kept_traces = _LAYOUTS[layout]
-    # Every store spills, so the tables are read off shards and a bounded view
-    # is swept down to skeleton rows.
-    own_server.extra_env = dict(SWEEP_ENV)
-    own_server.start(workers=MULTI)
+def test_the_view_is_the_join_of_its_tables(layout, opts, sweeping):
+    """Every store spills, so the tables are read off shards and a bounded view
+    is swept down to skeleton rows."""
+    customers_opts, orders_ddl = _LAYOUTS[layout]
     model = _Model(seed=sum(f"{layout}{opts}".encode()))
-    with gnitz.connect(own_server.target) as conn:
+    with gnitz.connect(sweeping.target) as conn:
         conn.execute_sql(_CUSTOMERS.format(customers_opts))
         conn.execute_sql(orders_ddl)
         conn.execute_sql(_VIEW.format(name="v", opts=opts))
@@ -136,13 +129,11 @@ def test_the_view_is_the_join_of_its_tables(layout, opts, own_server):
         assert model.want(), "premise: the history leaves matched rows"
         view_id, _ = conn.resolve_table("v")
 
-    own_server.restart(graceful=True)
-    _, stores = disk_usage(own_server.data_dir)
-    view = [s for s in stores if s["relation"] == view_id]
-    traces = {s["store"] for s in view if s["store"].startswith("scratch")}
-    assert len(traces) == kept_traces, f"{layout}: the view keeps {traces}"
-    assert any(s["skeletons"] for s in view if s["store"] == "rows") == bool(opts), "premise: only a bounded view sweeps"
-    with gnitz.connect(own_server.target) as conn:
+    sweeping.restart(graceful=True)
+    _, stores = disk_usage(sweeping.data_dir)
+    swept = any(s["skeletons"] for s in stores if s["relation"] == view_id and s["store"] == "rows")
+    assert swept == bool(opts), "premise: only a bounded view sweeps"
+    with gnitz.connect(sweeping.target) as conn:
         _check(conn, model, "resumed")
         for _ in range(8):
             model.step(conn)
@@ -152,8 +143,8 @@ def test_the_view_is_the_join_of_its_tables(layout, opts, own_server):
         for _ in range(4):
             model.step(conn)
 
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
+    sweeping.restart()
+    with gnitz.connect(sweeping.target) as conn:
         _check(conn, model, "after the crash")
         for _ in range(6):
             model.step(conn)

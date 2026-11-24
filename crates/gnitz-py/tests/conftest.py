@@ -10,7 +10,7 @@ from gnitz import aio
 from gnitz.testing import fresh_schema
 from _paths import REPO_ROOT
 from _uid import uid
-from _serverproc import SWEEP_ENV, ServerProc
+from _serverproc import MULTI, SWEEP_ENV, ServerProc
 
 _TMP_DIR = str(REPO_ROOT / "tmp")
 os.makedirs(_TMP_DIR, exist_ok=True)
@@ -95,9 +95,10 @@ def own_server(tmp_path, _sock_path):
 
 @pytest.fixture
 def sweeping(own_server):
-    """An `own_server`, started, whose stores reach the disk on modest data."""
+    """An `own_server`, started at more than one worker, whose stores reach the
+    disk on modest data."""
     own_server.extra_env.update(SWEEP_ENV)
-    return own_server.start()
+    return own_server.start(workers=MULTI)
 
 
 @pytest.fixture(scope="module")

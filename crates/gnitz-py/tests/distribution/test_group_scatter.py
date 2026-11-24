@@ -3,11 +3,9 @@ payload columns whose values fit the hidden group key packed, NULLs marked.
 Either way each row scatters by its group's bytes — and a group of exactly the
 table's distribution columns scatters nowhere at all.
 
-Asserted by WEIGHT against a Python recomputation after every write: a group
-routed by one key and stamped by another splits across workers into two rows
-under one group, and a packing that aliased NULL with zero would merge two
-groups into one — neither shows in a comparison of which groups exist. At one
-worker every row is already co-located, so the whole module needs W > 1.
+An ad-hoc fold of the same group, merged by the client from every worker's
+partials, must agree with the view. At one worker every row is already
+co-located, so the whole module needs W > 1.
 """
 
 import pytest
@@ -30,7 +28,7 @@ _COL = {c: i for i, c in enumerate("abcghnv")}
 
 # view -> its GROUP BY list.
 _FOLDS = {"by_ab": "a, b", "by_gh": "g, h", "by_gn": "g, n", "by_ng": "n, g"}
-_TOPS = {"top_ab": "a, b", "top_gh": "g, h"}
+_TOPS = {"top_ab": "a, b", "top_gh": "g, h", "top_gn": "g, n"}
 
 
 def _fold(group):
@@ -45,10 +43,12 @@ def _set(c, **cols):
     return tuple(cols.get(name, v) for name, v in zip(_COL, _ROWS[c]))
 
 
-# Rows move between the zero and the NULL group both ways; the minimum of `(0,
+# The backfill alone is observed first; then rows move between the zero and the
+# NULL group both ways; the minimum of `(0,
 # 0)` leaves, as does all of `(1, 2)`; a row rises to the top of `(2, 3)`; and
 # every NULL of one `g` leaves.
 _CHURN = [
+    (None, {}),
     (f"INSERT INTO t VALUES {values(_ROWS[36:])}", {r[2]: r for r in _ROWS[36:]}),
     ("UPDATE t SET n = NULL WHERE c = 2", {2: _set(2, n=None)}),
     ("UPDATE t SET n = 0 WHERE c = 32", {32: _set(32, n=0)}),
@@ -88,7 +88,8 @@ def test_a_scattered_group_holds_one_row_per_group(client, cluster):
     state = {r[2]: r for r in _ROWS[:36]}
     for sql in churn(client, state, _CHURN):
         for view, group in _FOLDS.items():
-            assert bag(rows(client, f"SELECT * FROM {view}")) == _want_fold(state, group), (sql, view)
-            assert bag(rows(client, _fold(group))) == _want_fold(state, group), (sql, f"ad-hoc {group}")
+            want = _want_fold(state, group)
+            assert bag(rows(client, f"SELECT * FROM {view}")) == want, (sql, view)
+            assert bag(rows(client, _fold(group))) == want, (sql, f"ad-hoc {group}")
         for view, group in _TOPS.items():
             assert bag(rows(client, f"SELECT * FROM {view}")) == _want_top(state, group), (sql, view)
