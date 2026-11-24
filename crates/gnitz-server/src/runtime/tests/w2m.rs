@@ -59,29 +59,6 @@ fn an_empty_ring_starts_over_at_its_head() {
     assert_eq!(recv.release_cursor(0), recv.write_cursor(0));
 }
 
-/// A message the tail is too short for is read at the head, and the tail it
-/// skipped counts as published.
-#[test]
-fn a_message_short_of_the_tail_is_read_at_the_head_past_it() {
-    let (mut writer, recv) = make_ring(MSG, 4, 8);
-    let read = || recv.try_read_slot(0).expect("the next message");
-    for tag in 1..=3u8 {
-        assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(tag)).is_ok());
-    }
-    // Never empty: each publish finds the message before it unread.
-    drop((read(), read()));
-    assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(4)).is_ok());
-    drop(read());
-    assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(5)).is_ok());
-    assert_eq!(recv.write_cursor(0), 5 * slot_stride(MSG) + 8);
-
-    assert!(read().bytes().iter().all(|&b| b == 4));
-    let wrapped = read();
-    assert_eq!(wrapped.bytes().as_ptr(), data_head(&writer));
-    assert!(wrapped.bytes().iter().all(|&b| b == 5));
-    assert!(recv.try_read_slot(0).is_none());
-}
-
 /// The oldest publish the master has not released names the lease it answers
 /// on, wherever it was placed — at the head of an emptied ring, behind the
 /// publish before it, or at the head past a tail it skipped — and whether or
@@ -118,7 +95,9 @@ fn the_oldest_unreleased_publish_names_its_lease() {
         Some(id(5)),
         "at the head, past the tail skipped"
     );
-    drop(read());
+    let wrapped = read();
+    assert_eq!(wrapped.bytes().as_ptr(), data_head(&writer), "read at the head");
+    drop(wrapped);
     assert_eq!(writer.oldest_unreleased(), None, "a ring released whole");
 
     publish(&mut writer, 6);
@@ -161,7 +140,7 @@ proptest! {
             let tag = tag as u8;
             match op {
                 SlotOp::Publish(len) => {
-                    let len = len.min((writer.wc.dcap() - RING_PREFIX_BYTES) as usize);
+                    let len = len.min(writer.max_message_bytes());
                     let empty = unread.is_empty() && held.is_empty();
                     if writer.try_publish(id(1), false, len, |slot| slot.fill(tag)).is_ok() {
                         unread.push_back((tag, len, empty));

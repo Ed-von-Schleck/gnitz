@@ -10,11 +10,9 @@ pub(crate) fn test_rings(nw: usize, capacity: usize) -> (Vec<W2mWriter>, W2mRece
     test_rings_over(WorkerParks::create(nw).expect("map the test parks"), capacity)
 }
 
-/// [`test_rings`] over `parks`, one ring per park. The frame budget is a whole
-/// frame rather than the environment's, so a shell that exports
-/// `GNITZ_REPLY_FRAME_BUDGET` does not reshape a test's frames.
+/// [`test_rings`] over `parks`, one ring per park.
 pub(crate) fn test_rings_over(parks: WorkerParks, capacity: usize) -> (Vec<W2mWriter>, W2mReceiver) {
-    rings(parks, capacity, gnitz_wire::MAX_FRAME_PAYLOAD).expect("map the test rings")
+    rings(parks, capacity).expect("map the test rings")
 }
 
 /// The capacity of a ring holding `n_msgs` messages of `msg_sz` bytes plus
@@ -40,11 +38,6 @@ impl W2mWriter {
         while let Err(at) = self.try_send_msg(request_id, false, msg) {
             self.park(true, || self.release_cursor() == at);
         }
-    }
-
-    /// Cut this ring's trains into frames of `budget` bytes.
-    pub(crate) fn set_frame_budget(&mut self, budget: usize) {
-        self.frame_budget = budget;
     }
 
     /// The master has armed its park, and no publish has taken it.

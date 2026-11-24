@@ -1,33 +1,46 @@
-//! The single-threaded async primitives: `Level`, `oneshot`, `AsyncRwLock`,
-//! `select2` and the cancellation shapes each must survive.
+//! The single-threaded async primitives: `WakeQueue`, `Level`, `oneshot`,
+//! `AsyncRwLock`, `select2` and the cancellation shapes each must survive.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Wake;
 
 use super::*;
-use crate::runtime::reactor::test_support::{make_reactor, poll_until};
-use crate::runtime::test_support::try_poll_once;
-use crate::runtime::test_support::yield_once;
+use crate::runtime::reactor::test_support::make_reactor;
+use crate::runtime::test_support::{Wakes, try_poll_once, yield_once};
+
+/// A parked awaiter is woken by a value and by the end, a value queued before
+/// the end is handed out after it, and a drained burst gives back the slots it
+/// grew past the retained ones.
+#[test]
+fn a_wake_queue_hands_out_every_value_before_its_end() {
+    let (wakes, waker) = Wakes::waker();
+    let cx = Context::from_waker(&waker);
+    let mut q = WakeQueue::default();
+    assert_eq!(q.poll_ready(&cx), Poll::Pending);
+    let burst: Vec<usize> = (0..4 * RETAINED_SLOTS).collect();
+    burst.iter().for_each(|&v| q.push(v));
+    assert_eq!(wakes.count(), 1, "the parked awaiter, once");
+    assert_eq!(std::iter::from_fn(|| q.pop()).collect::<Vec<_>>(), burst);
+    assert!(q.queue.capacity() < 2 * RETAINED_SLOTS, "{}", q.queue.capacity());
+
+    assert_eq!(q.poll_ready(&cx), Poll::Pending);
+    q.push(7);
+    q.close();
+    assert_eq!(wakes.count(), 2);
+    assert_eq!(q.poll_ready(&cx), Poll::Ready(()));
+    assert_eq!((q.pop(), q.pop()), (Some(7), None));
+    assert_eq!(q.poll_ready(&cx), Poll::Ready(()), "an ended queue stays ready");
+}
 
 /// Raising a level wakes each waiter at or below it once, keeps none of them
 /// and leaves the rest parked; a raise at or below the level moves nothing.
 #[test]
 fn a_raised_level_wakes_the_waiters_at_or_below_it_and_no_other() {
-    #[derive(Default)]
-    struct Wakes(AtomicUsize);
-    impl Wake for Wakes {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
     let level = Level::default();
-    let wakes = [5u64, 9].map(|_| Arc::new(Wakes::default()));
-    let wakers = wakes.each_ref().map(|w| Waker::from(Arc::clone(w)));
+    let [(w5, waker5), (w9, waker9)] = [(); 2].map(|()| Wakes::waker());
+    let wakers = [waker5, waker9];
     let poll = |i: usize| level.poll_reached([5, 9][i], &Context::from_waker(&wakers[i]));
-    let woken = || wakes.each_ref().map(|w| w.0.load(Ordering::Relaxed));
+    let woken = || [w5.count(), w9.count()];
 
     assert_eq!((poll(0), poll(1)), (Poll::Pending, Poll::Pending));
     level.raise(7);
@@ -61,110 +74,37 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
     assert!(dropped.get(), "the undeliverable value must be dropped, not leaked");
 }
 
-/// Every reader admitted while no writer holds or waits enters at once.
+/// Readers share the lock, and a writer parked behind them blocks a new reader:
+/// the last reader out admits the writer ahead of it, and cancelling the writer
+/// instead admits the blocked reader at once.
 #[test]
-fn async_rwlock_multiple_readers() {
-    let r = make_reactor();
-    let active = Rc::new(Cell::new(0u32));
-    let max = Rc::new(Cell::new(0u32));
-    let lock: AsyncRwLock = AsyncRwLock::default();
-    for _ in 0..4 {
-        let l = lock.clone();
-        let a = Rc::clone(&active);
-        let m = Rc::clone(&max);
-        r.spawn(async move {
-            let _g = l.read().await;
-            a.update(|v| v + 1);
-            m.update(|v| v.max(a.get()));
-            // Yield once to let other tasks acquire too.
-            yield_once().await;
-            a.update(|v| v - 1);
-        });
+fn async_rwlock_a_parked_writer_blocks_new_readers_until_it_acquires_or_drops() {
+    for cancel in [false, true] {
+        let lock: AsyncRwLock = AsyncRwLock::default();
+        let readers: Vec<_> = (0..4)
+            .map(|_| try_poll_once(lock.read()).expect("readers share the lock"))
+            .collect();
+        let ((w_wakes, w_waker), (r_wakes, r_waker)) = (Wakes::waker(), Wakes::waker());
+        let mut writer = Box::pin(lock.write());
+        let mut reader = Box::pin(lock.read());
+        assert!(writer.as_mut().poll(&mut Context::from_waker(&w_waker)).is_pending());
+        assert!(
+            reader.as_mut().poll(&mut Context::from_waker(&r_waker)).is_pending(),
+            "a parked writer blocks a new reader"
+        );
+        if cancel {
+            drop(writer);
+            assert_eq!(r_wakes.count(), 1, "the last parked writer's cancel admits the reader");
+            assert!(try_poll_once(&mut reader).is_some());
+            continue;
+        }
+        drop(readers);
+        assert_eq!((w_wakes.count(), r_wakes.count()), (1, 0), "the writer goes first");
+        let held = try_poll_once(&mut writer).expect("the woken writer acquires");
+        assert!(try_poll_once(&mut reader).is_none(), "the writer holds the lock");
+        drop(held);
+        assert_eq!(r_wakes.count(), 1, "the writer's release admits the reader");
     }
-    r.block_until_idle();
-    assert_eq!(max.get(), 4, "all four readers must hold the lock together");
-}
-
-/// A waiting writer blocks a new reader, and acquires the lock before it.
-#[test]
-fn async_rwlock_new_readers_blocked_by_waiting_writer() {
-    let r = make_reactor();
-    let lock: AsyncRwLock = AsyncRwLock::default();
-    let order: Rc<RefCell<Vec<&'static str>>> = Rc::default();
-
-    // Task A: holds read lock, yields once.
-    let l_a = lock.clone();
-    let o_a = Rc::clone(&order);
-    r.spawn(async move {
-        let _g = l_a.read().await;
-        o_a.borrow_mut().push("R1");
-        yield_once().await;
-    });
-
-    // Task B: writer — parks while A holds the read lock.
-    let l_b = lock.clone();
-    let o_b = Rc::clone(&order);
-    r.spawn(async move {
-        let _g = l_b.write().await;
-        o_b.borrow_mut().push("W");
-    });
-
-    // Task C: new reader — must be blocked by the waiting writer
-    // (writer-preference) and only enter after B releases.
-    let l_c = lock.clone();
-    let o_c = Rc::clone(&order);
-    r.spawn(async move {
-        let _g = l_c.read().await;
-        o_c.borrow_mut().push("R2");
-    });
-
-    r.block_until_idle();
-    assert_eq!(*order.borrow(), ["R1", "W", "R2"], "writer-preference violated");
-}
-
-/// Readers hold the lock and the cancelled `WriteFuture` was the last waiting
-/// writer: the readers it was blocking must enter at once, not when the holder
-/// releases.
-#[test]
-fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
-    let r = make_reactor();
-    let lock: AsyncRwLock = AsyncRwLock::default();
-    let done = Rc::new(Cell::new(false));
-    let (release_tx, release_rx) = oneshot::channel::<()>();
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-    // Task A: holds the read lock until released.
-    let l_a = lock.clone();
-    r.spawn(async move {
-        let _g = l_a.read().await;
-        release_rx.await;
-    });
-
-    // Task B: races write acquisition against `cancel_rx`, so its WriteFuture
-    // parks until the cancel.
-    let l_b = lock.clone();
-    r.spawn(async move {
-        let _ = select2(l_b.write(), cancel_rx).await;
-    });
-
-    // Task C: new reader; parks behind B.
-    let l_c = lock.clone();
-    let d = Rc::clone(&done);
-    r.spawn(async move {
-        let _g = l_c.read().await;
-        d.set(true);
-    });
-
-    r.tick(); // A acquires, B and C park
-    assert!(!done.get(), "C must be blocked while write waiter B is alive");
-
-    cancel_tx.send(());
-    assert!(
-        poll_until(r, || done.get()),
-        "C must unblock when the last write waiter (B) is cancelled"
-    );
-    release_tx.send(());
-    r.block_until_idle();
 }
 
 /// The reader/writer/cancellation state space, enumerated rather than sampled:

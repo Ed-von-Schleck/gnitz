@@ -8,7 +8,6 @@
 //! the damage every SAL test builds on are here.
 
 use super::*;
-use crate::runtime::ServerExit;
 use crate::runtime::sal::format::RequestHead;
 use crate::runtime::sal::log::SalMessage;
 use crate::runtime::sal::reader::SalReader;
@@ -286,22 +285,4 @@ pub(crate) fn group_at(log: &SalLog, base: u64) -> SalMessage<'_> {
 /// A read of `tid` under the blob `spec`.
 pub(crate) fn scan(tid: u64, spec: &[u8]) -> Read<'_> {
     Read::ScanSpec { tid, reply_layout: 0, spec }
-}
-
-/// Run the test `internal` of the module `module` in a re-exec'd child and
-/// require it to fail-stop with `reason` on stderr.
-pub(in crate::runtime::sal) fn assert_fail_stops(module: &str, internal: &str, reason: &str) {
-    let out = gnitz_test_harness::run_test_in_child(module, internal, &[]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(ServerExit::FailStop.code()),
-        "{internal} must fail-stop (exit 134)\nstdout:\n{}\nstderr:\n{stderr}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    // The code alone would be satisfied by any other fatal abort reached first.
-    assert!(
-        stderr.contains(reason),
-        "{internal} aborted for the wrong reason\nstderr:\n{stderr}"
-    );
 }

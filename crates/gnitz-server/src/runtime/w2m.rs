@@ -333,23 +333,17 @@ impl RingCursor {
 /// master's read end over all of them. A release wakes its worker's park.
 pub(crate) fn create(parks: WorkerParks) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)> {
     // `GNITZ_W2M_RING_BYTES` shrinks every ring, so tests fill one on small
-    // data; `GNITZ_REPLY_FRAME_BUDGET` lowers the frame budget, so they reach
-    // multi-frame trains on small tables.
+    // data.
     rings(
         parks,
         gnitz_foundation::env::env_num("GNITZ_W2M_RING_BYTES", W2M_REGION_SIZE),
-        gnitz_foundation::env::env_num_in(
-            "GNITZ_REPLY_FRAME_BUDGET",
-            gnitz_wire::MAX_FRAME_PAYLOAD,
-            1..=gnitz_wire::MAX_FRAME_PAYLOAD,
-        ),
     )
 }
 
 /// [`create`] over rings of `capacity` bytes: its body, and the test rings'.
 /// A zeroed mapping is an empty ring with both cursors and its origin at 0, and
 /// an unarmed park, so nothing is stored here.
-fn rings(parks: WorkerParks, capacity: usize, frame_budget: usize) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)> {
+fn rings(parks: WorkerParks, capacity: usize) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)> {
     let nw = parks.len();
     assert!(
         capacity as u64 >= W2M_HEADER_SIZE as u64 + slot_stride(1),
@@ -380,13 +374,7 @@ fn rings(parks: WorkerParks, capacity: usize, frame_budget: usize) -> std::io::R
         // unmapped; zeroed holds nothing.
         let holds: &'static HoldTable =
             unsafe { &*posix_io::map_shared(None, size_of::<HoldTable>())?.cast::<HoldTable>() };
-        writers.push(W2mWriter {
-            wc: start,
-            master,
-            park,
-            holds,
-            frame_budget,
-        });
+        writers.push(W2mWriter { wc: start, master, park, holds });
         readers.push(WorkerRing {
             header: start.header(),
             writer_park: park,
@@ -420,9 +408,6 @@ pub struct W2mWriter {
     park: &'static Park,
     /// The leases this worker sends nothing more for.
     holds: &'static HoldTable,
-    /// The wire budget of a frame of a reply train, as asked for: see
-    /// [`Self::frame_budget`].
-    frame_budget: usize,
 }
 
 // SAFETY: the raw `base` inside the cursor and the master's park are
@@ -521,13 +506,6 @@ impl W2mWriter {
     /// The largest message this ring holds at all.
     pub fn max_message_bytes(&self) -> usize {
         (self.wc.dcap() - RING_PREFIX_BYTES) as usize
-    }
-
-    /// The wire budget of a frame of a reply train: never past what a client
-    /// reads in one frame, which `create` refuses a budget above, nor past what
-    /// this ring holds.
-    pub fn frame_budget(&self) -> usize {
-        self.frame_budget.min(self.max_message_bytes())
     }
 
     /// Everything below it the master has released.

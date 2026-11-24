@@ -1,10 +1,11 @@
 use super::{Inbound, SalMessageKind, SalReader};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::sal::fixtures::{assert_fail_stops, control_push as to, group_at, scan, test_log, unanswered};
+use crate::runtime::sal::fixtures::{control_push as to, group_at, scan, test_log, unanswered};
 use crate::runtime::sal::format::{epoch_word, payload_encode, payload_rows, payload_size};
 use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Apply, SalExcl};
+use crate::runtime::test_support::assert_fail_stops;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::RequestId;
 use crate::runtime::w2m::fixtures::{id, test_rings};

@@ -26,7 +26,7 @@ use crate::runtime::signals;
 use crate::runtime::sync::{Either, select2};
 use crate::runtime::tls::{ResolvedTls, TlsListener};
 use crate::runtime::w2m::{self, W2mWriter};
-use crate::runtime::worker::WorkerProcess;
+use crate::runtime::worker::{self, WorkerProcess};
 use gnitz_foundation::log::worker_log;
 use gnitz_store::relation::{PkRule, Residency, StoreConfig};
 use gnitz_zset::algebra::{ScatterPlan, Slot};
@@ -192,7 +192,7 @@ fn run_worker_child(
     master_pid: i32,
     catalog: &mut CatalogEngine,
     tail: &CommittedTail,
-    (mut w2m_writer, mesh): (W2mWriter, Mesh),
+    (mut w2m_writer, frame_budget, mesh): (W2mWriter, usize, Mesh),
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
     let w = slot.rank as usize;
@@ -225,7 +225,7 @@ fn run_worker_child(
     let sal_reader = tail.reader(slot.rank);
     // The boot ACK: the recovery above has flushed what it replayed.
     w2m_writer.applied(sal_reader.position());
-    WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh, pinning.is_some()).run()
+    WorkerProcess::new(catalog, sal_reader, w2m_writer, frame_budget, mesh, pinning.is_some()).run()
 }
 
 /// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
@@ -295,6 +295,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     let (writers, receiver) = w2m::create(parks).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
+    let frame_budget = worker::frame_budget();
 
     let mut catalog = master_pre_fork_recovery(data_dir, num_workers, StoreConfig::from_env("GNITZ_"), &mut tail)?;
 
@@ -303,7 +304,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // reaps the ones already forked.
     let master_pid = unsafe { libc::getpid() };
     let mut workers = Workers(Vec::with_capacity(nw));
-    for (w, ipc) in writers.into_iter().zip(meshes).enumerate() {
+    for (w, (writer, mesh)) in writers.into_iter().zip(meshes).enumerate() {
         match unsafe { libc::fork() } {
             -1 => {
                 return Err(format!(
@@ -317,7 +318,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
                 master_pid,
                 &mut catalog,
                 &tail,
-                ipc,
+                (writer, frame_budget, mesh),
                 pinning.as_ref(),
             ),
             pid => workers

@@ -17,7 +17,10 @@ use std::rc::Rc;
 /// receiver that reads the ring.
 fn queue_over(ring_bytes: usize) -> (Replies, W2mReceiver) {
     let (mut writers, receiver) = test_rings(1, ring_bytes);
-    (Replies::new(writers.pop().unwrap()), receiver)
+    (
+        Replies::new(writers.pop().unwrap(), gnitz_wire::MAX_FRAME_PAYLOAD),
+        receiver,
+    )
 }
 
 impl Replies {
@@ -28,7 +31,7 @@ impl Replies {
 
     /// Cut this queue's trains into frames of `budget` bytes.
     pub(in crate::runtime::worker) fn set_frame_budget(&mut self, budget: usize) {
-        self.w2m.set_frame_budget(budget);
+        self.frame_budget = budget;
     }
 
     /// Owe `answer` at the back of the queue, sending none of it.

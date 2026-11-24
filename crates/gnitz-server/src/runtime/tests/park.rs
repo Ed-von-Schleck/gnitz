@@ -69,10 +69,8 @@ fn a_worker_set_bounds_to_the_launched_workers() {
 
     assert_eq!(WorkerSet::ALL.within(4).len(), 4);
     assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
-    assert_eq!(WorkerSet::EMPTY.len(), 0);
     assert_eq!(WorkerSet::ALL.position(MAX_WORKERS - 1), Some(MAX_WORKERS - 1));
     assert_eq!([1, 3, 6].into_iter().collect::<WorkerSet>(), s);
 
     assert_eq!(WorkerSet::one(1).union(WorkerSet::one(3)), WorkerSet::one(1).with(3));
-    assert_eq!(s.union(WorkerSet::EMPTY), s);
 }

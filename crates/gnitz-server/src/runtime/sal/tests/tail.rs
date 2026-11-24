@@ -5,7 +5,7 @@ use crate::runtime::sal::format::{PREFIX_BYTES, RequestHead, SAL_FORMAT, anchor_
 use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Routed, SalWriter};
 use crate::test_support::encode_schema_record;
-use crate::test_support::sweep_bit_flips;
+use crate::test_support::{batch_rows, sweep_bit_flips, table_tab_batch};
 use gnitz_store::relation::PkRule;
 
 const SIZE: usize = 1 << 20;
@@ -378,11 +378,13 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
 // -----------------------------------------------------------------------
 
 /// The members of the closed zones, each as its ingest: a command between
-/// zones and the member of an open zone are not among them.
+/// zones and the member of an open zone are not among them. The pushes name
+/// their targets, and a DdlSync's rows decode under its family's shape.
 #[test]
 fn the_tail_yields_each_members_ingest_in_log_order() {
     let log = test_log(SIZE, NW, 1);
-    log.ddl_zone(&[(SysFamily::Table, &zone_rows())]);
+    let table_tab = table_tab_batch(&[(TID, "t", 1)]);
+    log.ddl_zone(&[(SysFamily::Table, &table_tab)]);
     log.push_zone(&[TID, TID + 1]);
     log.command();
     log.open_member();
@@ -397,6 +399,12 @@ fn the_tail_yields_each_members_ingest_in_log_order() {
             Ingest::Push { tid: TID + 1, rule: PkRule::Enforce },
         ]
     );
+    assert_eq!(tail.pushed(), BTreeSet::from([TID, TID + 1]));
+    let catalog: Vec<_> = (tail.catalog_rows())
+        .map(|g| g.map(|(family, _, rows)| (family, batch_rows(&rows))))
+        .collect::<Result<_, _>>()
+        .expect("the rows decode");
+    assert_eq!(catalog, [(SysFamily::Table, batch_rows(&table_tab))]);
 }
 
 /// A committed zone member whose header decodes to no ingest is an error of

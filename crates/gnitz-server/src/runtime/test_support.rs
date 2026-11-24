@@ -7,6 +7,9 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Wake, Waker};
 
 impl crate::runtime::frame::WireMsg<'_> {
     /// Encode into a fresh `Vec` sized by `WireMsg::size`.
@@ -94,6 +97,28 @@ pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Opt
     }
 }
 
+/// A waker that counts how often it is woken.
+#[derive(Default)]
+pub(crate) struct Wakes(AtomicUsize);
+
+impl Wakes {
+    /// A fresh count and a waker that bumps it.
+    pub(crate) fn waker() -> (Arc<Self>, Waker) {
+        let wakes = Arc::new(Self::default());
+        (Arc::clone(&wakes), Waker::from(wakes))
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Read `expect` bytes off `s` and close it, so the send under test never
 /// stalls on a full socket buffer. Returns how many it saw before `expect` or EOF.
 pub(crate) fn spawn_drain(s: UnixStream, expect: usize) -> std::thread::JoinHandle<u64> {
@@ -125,4 +150,22 @@ pub(crate) fn yield_once() -> impl std::future::Future<Output = ()> {
         cx.waker().wake_by_ref();
         std::task::Poll::Pending
     })
+}
+
+/// Run the test `internal` of the module `module` in a re-exec'd child and
+/// require it to fail-stop with `reason` on stderr.
+pub(crate) fn assert_fail_stops(module: &str, internal: &str, reason: &str) {
+    let out = gnitz_test_harness::run_test_in_child(module, internal, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(crate::runtime::ServerExit::FailStop.code()),
+        "{internal} must fail-stop (exit 134)\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The code alone would be satisfied by any other fatal abort reached first.
+    assert!(
+        stderr.contains(reason),
+        "{internal} aborted for the wrong reason\nstderr:\n{stderr}"
+    );
 }

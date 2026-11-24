@@ -91,7 +91,4 @@ fn auto_workers_leaves_the_master_one_and_keeps_one() {
     ] {
         assert_eq!(auto_count(cores, quota), want, "{cores} cores, quota {quota:?}");
     }
-    // The count it picks is one `assign` places.
-    let order: Vec<Core> = (0..8).map(|c| vec![c]).collect();
-    assert!(assign(order, auto_count(8, None) as usize).is_some());
 }

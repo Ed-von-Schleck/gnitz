@@ -2,6 +2,7 @@ use super::reply::tests::{drain, frame_size, frames, owed, reqs, route};
 use super::*;
 use crate::catalog::{SysFamily, SysFamilyExt};
 use crate::query::{DriveHost, Lane};
+use crate::runtime::mesh::fixtures::meshes;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::{Routed, SalExcl, SalFull, SalWriter};
@@ -40,7 +41,8 @@ pub(super) fn worker_over(
         .unwrap()
         .pop()
         .unwrap();
-    let wp = WorkerProcess::new(catalog, sal.reader(0), writers.pop().unwrap(), mesh, false);
+    let (w2m, budget) = (writers.pop().unwrap(), gnitz_wire::MAX_FRAME_PAYLOAD);
+    let wp = WorkerProcess::new(catalog, sal.reader(0), w2m, budget, mesh, false);
     (wp, sal, receiver)
 }
 
@@ -88,8 +90,7 @@ pub(super) fn probe(tid: u64, keys: &[u8]) -> Read<'_> {
 /// Serve every group on the SAL as an exchange wait whose round is still out
 /// does: a turn inside a round of a two-worker mesh whose peer never arrives.
 fn drain_in_wait(wp: &mut WorkerProcess) {
-    let parks = crate::runtime::park::WorkerParks::create(2).unwrap();
-    let mesh = crate::runtime::mesh::create(1 << 16, parks).unwrap().swap_remove(0);
+    let mesh = meshes(2, 1 << 16).swap_remove(0);
     let own = std::mem::replace(&mut wp.mesh, mesh);
     let (empty, plan) = (make_batch(&make_schema_u64_i64(), &[]), ScatterPlan::broadcast());
     let _round = wp.mesh.open_one(9, Cow::Borrowed(&empty), &plan, false, false);
@@ -327,10 +328,9 @@ fn exchange_answers_the_rounds_verdict() {
     let part = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let plan = ScatterPlan::broadcast();
     for (own, peers, all) in [(true, true, true), (true, false, false), (false, true, false)] {
-        let parks = crate::runtime::park::WorkerParks::create(2).unwrap();
-        let mut meshes = crate::runtime::mesh::create(1 << 16, parks).unwrap();
-        let mut peer = meshes.pop().unwrap();
-        wp.mesh = meshes.pop().unwrap();
+        let mut mesh = meshes(2, 1 << 16);
+        let mut peer = mesh.pop().unwrap();
+        wp.mesh = mesh.pop().unwrap();
         // The peer arrives first, so this worker's own open completes the round.
         let _peers_round = peer.open_one(9, Cow::Borrowed(&part), &plan, false, peers);
         let lane = Lane {

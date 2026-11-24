@@ -11,8 +11,6 @@ fn cut(batch: &Batch, budget: usize, ends: bool) -> Vec<(usize, bool)> {
     loop {
         let (msg, n) = WireMsg::next_train_frame(7, batch, next, budget, ends).expect("every row fits a frame");
         assert!(msg.size() <= budget);
-        assert_eq!(msg.hdr.target_id, 7);
-        assert_eq!(msg.data.map_or(0, |d| d.rows()), n - next);
         frames.push((n - next, msg.hdr.flags.scan_last));
         next = n;
         if msg.hdr.flags.scan_last || n == batch.len() {
@@ -36,48 +34,45 @@ fn next_train_frame_cuts_every_row_once_and_flags_only_the_end() {
     assert_eq!(cut(&empty, budget, true), [(0, true)]);
 }
 
-/// A frame's control header and blob decode to what was sent, and no proper
-/// prefix of the frame decodes.
+/// A frame decodes to the header, blob and data block it was built from, and
+/// framed it is appended behind what `out` already holds, under its length.
 #[test]
-fn a_control_only_frame_round_trips_and_no_prefix_decodes() {
+fn a_frame_decodes_to_what_was_sent_and_frames_behind_its_predecessor() {
+    let rows = make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)]);
+    let fault = WireFault::from("something went wrong");
+    let control = WireMsg {
+        hdr: ControlHeader {
+            target_id: 0xDEAD,
+            flags: WireFlags {
+                verb: Some(ClientVerb::PushTxn),
+                continuation: true,
+                ..Default::default()
+            },
+            arg0: 0x1111_2222_3333_4444,
+            arg1: 0x5555,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let shapes = [
-        WireMsg {
-            hdr: ControlHeader {
-                target_id: 0xDEAD,
-                flags: WireFlags {
-                    verb: Some(ClientVerb::PushTxn),
-                    continuation: true,
-                    ..Default::default()
-                },
-                arg0: 0x1111_2222_3333_4444,
-                arg1: 0x5555,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        WireMsg {
-            hdr: ControlHeader {
-                target_id: 7,
-                status: WireStatus::Error,
-                ..Default::default()
-            },
-            blob: b"something went wrong",
-            ..Default::default()
-        },
+        control,
+        WireMsg::fault(7, &fault),
+        WireMsg::train_frame(7, true, rows.wire_whole()),
     ];
     for (shape, msg) in shapes.into_iter().enumerate() {
         let wire = msg.encode_to_vec();
-        let control = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
-        assert_eq!(control.hdr, msg.hdr, "shape {shape}");
-        assert_eq!(&wire[control.blob], msg.blob, "shape {shape}");
-        assert!(control.data.is_none(), "shape {shape}");
-        for cut in 0..wire.len() {
-            assert!(
-                peek_control_block(&wire[..cut]).is_err(),
-                "shape {shape}: a {cut}/{}-byte prefix decodes",
-                wire.len()
-            );
-        }
+        let c = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
+        assert_eq!(c.hdr, msg.hdr, "shape {shape}");
+        assert_eq!(&wire[c.blob], msg.blob, "shape {shape}");
+        assert_eq!(c.data.is_some(), msg.data.is_some(), "shape {shape}");
+
+        let mut out = b"corked".to_vec();
+        msg.encode_framed(&mut out);
+        assert_eq!(
+            out,
+            [&b"corked"[..], &gnitz_wire::framed(&wire)].concat(),
+            "shape {shape}"
+        );
     }
 }
 

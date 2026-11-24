@@ -12,6 +12,8 @@
 
 mod reply;
 
+pub(crate) use reply::frame_budget;
+
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, DriveHost, Lane};
 use crate::runtime::mesh::Mesh;
@@ -52,11 +54,13 @@ static KEY_SPANS_ERROR: Switch = Switch::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
     /// `pinned`: this worker runs on a core of its own, so an exchange wait
-    /// spins before it parks.
+    /// spins before it parks. Its reply trains are cut into frames of
+    /// `frame_budget` bytes.
     pub(super) fn new(
         catalog: &'c mut CatalogEngine,
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
+        frame_budget: usize,
         mesh: Mesh,
         pinned: bool,
     ) -> Self {
@@ -64,7 +68,7 @@ impl<'c> WorkerProcess<'c> {
             catalog,
             sal_reader,
             mesh,
-            replies: Replies::new(w2m_writer),
+            replies: Replies::new(w2m_writer, frame_budget),
             snapshots: FxHashMap::default(),
             seals_ahead: false,
             spins: if pinned { SPINS_BEFORE_PARK } else { 0 },

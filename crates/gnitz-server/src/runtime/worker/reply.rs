@@ -15,6 +15,9 @@ use gnitz_zset::repr::Batch;
 
 pub(super) struct Replies {
     w2m: W2mWriter,
+    /// The wire budget of a frame of a reply train: never past what a client
+    /// reads in one frame, nor past what the ring holds.
+    frame_budget: usize,
     /// Replies this worker owes, in the order their requests were read off the
     /// SAL: one lease's are consecutive.
     owed: VecDeque<Owed>,
@@ -94,7 +97,7 @@ impl Train {
     /// once it was the last; `Err` refused, with the release cursor the ring
     /// weighed. A row too wide for any frame, or for the ring, turns the train
     /// into that fault.
-    fn emit_next(&mut self, w2m: &mut W2mWriter) -> Result<bool, u64> {
+    fn emit_next(&mut self, w2m: &mut W2mWriter, budget: usize) -> Result<bool, u64> {
         let id = self.route.request_id;
         loop {
             let (batch, ends) = match &mut self.answer {
@@ -114,18 +117,17 @@ impl Train {
                     (spans.chunk(), spans.chunk().is_empty())
                 }
             };
-            let fault =
-                match WireMsg::next_train_frame(self.route.target_id, batch, self.next_row, w2m.frame_budget(), ends) {
-                    Ok((msg, _)) if msg.size() > w2m.max_message_bytes() => {
-                        format!("a row of {} bytes exceeds what the reply ring holds", msg.size()).into()
-                    }
-                    Ok((msg, next_row)) => {
-                        w2m.try_send_msg(id, false, &msg)?;
-                        self.next_row = next_row;
-                        return Ok(msg.hdr.flags.scan_last);
-                    }
-                    Err(fault) => fault,
-                };
+            let fault = match WireMsg::next_train_frame(self.route.target_id, batch, self.next_row, budget, ends) {
+                Ok((msg, _)) if msg.size() > w2m.max_message_bytes() => {
+                    format!("a row of {} bytes exceeds what the reply ring holds", msg.size()).into()
+                }
+                Ok((msg, next_row)) => {
+                    w2m.try_send_msg(id, false, &msg)?;
+                    self.next_row = next_row;
+                    return Ok(msg.hdr.flags.scan_last);
+                }
+                Err(fault) => fault,
+            };
             self.answer = Err(fault);
         }
     }
@@ -145,9 +147,23 @@ fn whole<'a>(route: &ReplyRoute, answer: &'a Result<Rows, WireFault>, budget: us
     (msg.data.is_none() || msg.size() <= budget).then_some(msg)
 }
 
+/// The frame budget [`Replies::new`] is given at boot: a whole frame, or
+/// `GNITZ_REPLY_FRAME_BUDGET` bytes, so tests reach multi-frame trains on small
+/// tables.
+pub(crate) fn frame_budget() -> usize {
+    gnitz_foundation::env::env_num_in(
+        "GNITZ_REPLY_FRAME_BUDGET",
+        gnitz_wire::MAX_FRAME_PAYLOAD,
+        1..=gnitz_wire::MAX_FRAME_PAYLOAD,
+    )
+}
+
 impl Replies {
-    pub(super) fn new(w2m: W2mWriter) -> Self {
-        Replies { w2m, owed: VecDeque::new() }
+    /// A queue over `w2m` cutting trains into frames of `frame_budget` bytes, or
+    /// of the most the ring holds when that is less.
+    pub(super) fn new(w2m: W2mWriter, frame_budget: usize) -> Self {
+        let frame_budget = frame_budget.min(w2m.max_message_bytes());
+        Replies { w2m, frame_budget, owed: VecDeque::new() }
     }
 
     /// Owe `route` the answer of `read`, once [`Self::applied`] asks for it.
@@ -163,7 +179,7 @@ impl Replies {
     pub(super) fn reply(&mut self, route: ReplyRoute, answer: Result<Rows, WireFault>) {
         let id = route.request_id;
         if self.owed.back().is_none_or(|ahead| ahead.id() != id)
-            && let Some(msg) = whole(&route, &answer, self.w2m.frame_budget())
+            && let Some(msg) = whole(&route, &answer, self.frame_budget)
         {
             let passing = !self.owed.is_empty();
             if self.w2m.try_send_msg(id, passing, &msg).is_ok() {
@@ -210,7 +226,7 @@ impl Replies {
         if train.refused_at == Some(self.w2m.release_cursor()) {
             return self.refused(id);
         }
-        match train.emit_next(&mut self.w2m) {
+        match train.emit_next(&mut self.w2m, self.frame_budget) {
             Ok(last) => {
                 if last {
                     self.owed.remove(i);

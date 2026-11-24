@@ -4,13 +4,15 @@ use crate::runtime::master::route::with_routed;
 use crate::runtime::sal::Apply;
 use crate::runtime::sal::fixtures::test_log;
 use crate::test_support::{
-    batch_rows, certified, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight,
+    batch_rows, certified, circuit_batch, col_tab_batch, empty_catalog, identity_circuit, make_batch, net_weight,
     register_identity_view, sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
+
+type Row = (u64, i64, i64);
 
 const SAL_SIZE: usize = 1 << 20;
 
@@ -35,20 +37,21 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
 }
 
 /// Write `rows` to `log` as the master's push of them to `tid`, in a zone of its
-/// own: that zone's LSN.
-fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) -> u64 {
+/// own.
+fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &[Row]) {
     let (rel, record) = engine.shape_target(tid).unwrap();
+    let rows = certified(make_batch(&rel.schema(), rows));
     let mut excl = log.excl();
     let mut scope = excl.begin();
     with_routed(rows.as_mem_batch(), rel.placement(), log.num_workers(), |data| {
         scope.push(tid, PkRule::Enforce, record, data, true)
     })
     .expect("group fits");
-    scope.commit().expect("the zone was open")
+    scope.commit().expect("the zone was open");
 }
 
 /// The rows `tid`'s store holds, with their weights.
-fn held(engine: &CatalogEngine, tid: u64) -> Vec<(u64, i64, i64)> {
+fn held(engine: &CatalogEngine, tid: u64) -> Vec<Row> {
     batch_rows(&engine.registry.relation(tid).unwrap().full_scan())
 }
 
@@ -57,9 +60,8 @@ fn held(engine: &CatalogEngine, tid: u64) -> Vec<(u64, i64, i64)> {
 /// A view's VIEW_TAB and COL_TAB rows flushed, its circuit only in the SAL.
 #[test]
 fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
-    let tmp = tempfile::tempdir().unwrap();
+    let (tmp, mut engine) = empty_catalog(1);
     let dir = tmp.path().to_str().unwrap();
-    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let r = engine
         .create_table_with("public.r", &u64_i64_cols(), &[0], replicated())
         .unwrap();
@@ -86,10 +88,9 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
 /// drop already flushed and stages it no second time.
 #[test]
 fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
-    let tmp = tempfile::tempdir().unwrap();
+    let (tmp, mut engine) = empty_catalog(1);
     let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 1);
-    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let t = engine.allocate_ids(1).unwrap();
     let table_tab = |weight| table_tab_batch(&[(t, "t", weight)]);
     engine.registry.ingest(SysFamily::Column.id(), col_tab(t, 1)).unwrap();
@@ -120,28 +121,22 @@ fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
 #[test]
 fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     const ROWS: u64 = 64;
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 2);
-    let mut engine = CatalogEngine::open(dir, slot.of).unwrap();
+    let (tmp, mut engine) = empty_catalog(slot.of);
+    let dir = tmp.path().to_str().unwrap();
     let r = engine
         .create_table_with("public.r", &u64_i64_cols(), &[0], replicated())
         .unwrap();
     let k = engine.create_table("public.k", &u64_i64_cols(), &[0]).unwrap();
-    let keyed = engine.registry.relation(k).unwrap().placement();
-    let all: Vec<_> = (0..ROWS).map(|pk| (pk, 1, pk as i64)).collect();
-    let own: Vec<_> = all
-        .iter()
-        .copied()
-        .filter(|(pk, ..)| keyed.owner(&pk.to_be_bytes(), slot.of as usize) == Some(slot.rank as usize))
-        .collect();
+    let keyed = engine.registry.relation(k).unwrap();
+    let all: Vec<Row> = (0..ROWS).map(|pk| (pk, 1, pk as i64)).collect();
+    let own = batch_rows(&ScatterPlan::native(keyed.placement()).share(&make_batch(&keyed.schema(), &all), slot));
     assert!(!own.is_empty() && own.len() < all.len(), "the key space is split");
-    let rows = certified(make_batch(&engine.registry.relation(k).unwrap().schema(), &all));
     let tails: Vec<_> = [(r, 4, &all), (k, 1, &own), (k, 2, &own)]
         .into_iter()
         .map(|(tid, written_at, expected)| {
             let log = test_log(SAL_SIZE, written_at, 1);
-            push(&log, &engine, tid, &rows);
+            push(&log, &engine, tid, &all);
             (tid, written_at, log, expected)
         })
         .collect();
@@ -153,59 +148,15 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     }
 }
 
-/// A crash behind a completed checkpoint leaves the drain's tick and the
-/// ephemeral round ahead of the pushes committed since, in one epoch. The tail
-/// is those pushes alone, and the boot replays exactly them.
-#[test]
-fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_str().unwrap();
-    let slot = Slot::new(0, 1);
-    let mut engine = CatalogEngine::open(dir, slot.of).unwrap();
-    let t = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
-    let rows = [(1, 1, 10), (2, 1, 20)];
-    let log = test_log(SAL_SIZE, slot.of as usize, 1);
-    {
-        let mut excl = log.excl();
-        let tick = Apply::Tick { first_round: 2, tids: vec![t].into() };
-        excl.apply(tick).expect("group fits");
-        excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
-    }
-    let lsn = push(
-        &log,
-        &engine,
-        t,
-        &certified(make_batch(&engine.registry.relation(t).unwrap().schema(), &rows)),
-    );
-    engine.close();
-
-    let tail = CommittedTail::read(*log.log()).unwrap();
-    let members: Vec<_> = tail
-        .ingests()
-        .map(|g| g.map(|(ingest, msg)| (ingest, tail.lsn(&msg))))
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(
-        members,
-        [(Ingest::Push { tid: t, rule: PkRule::Enforce }, lsn)],
-        "the push zone alone, behind both groups ahead of it"
-    );
-    assert!(tail.holds_pushes());
-    assert_eq!(tail.pushed().into_iter().collect::<Vec<_>>(), [t]);
-
-    let engine = boot(dir, slot, &log);
-    assert_eq!(held(&engine, t), rows, "each row once, at its weight");
-}
-
 /// A replayed push lands above its base's cut, past the boot flush, for a tick
 /// to take: under a view the boot keeps and under one it rebuilds alike, whose
-/// backfill reads the base at the cut.
+/// backfill reads the base at the cut. The checkpoint's drain tick and
+/// ephemeral round, in the log ahead of the pushes, replay nothing.
 #[test]
 fn a_tail_lands_above_the_cut_of_a_scanned_table() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 1);
-    let mut engine = CatalogEngine::open(dir, slot.of).unwrap();
+    let (tmp, mut engine) = empty_catalog(slot.of);
+    let dir = tmp.path().to_str().unwrap();
     let kept = engine.create_table("public.kept", &u64_i64_cols(), &[0]).unwrap();
     let rejected = engine.create_table("public.rejected", &u64_i64_cols(), &[0]).unwrap();
     register_identity_view(&mut engine, kept, "v_kept", &u64_i64_cols());
@@ -215,13 +166,17 @@ fn a_tail_lands_above_the_cut_of_a_scanned_table() {
     let v_rejected = register_identity_view(&mut engine, rejected, "v_rejected", &u64_i64_cols());
     let rows = [(1, 1, 10), (2, 1, 20)];
     let log = test_log(SAL_SIZE, slot.of as usize, 1);
+    {
+        let mut excl = log.excl();
+        excl.apply(Apply::Tick {
+            first_round: 2,
+            tids: vec![kept, rejected].into(),
+        })
+        .expect("group fits");
+        excl.apply(Apply::FlushEph { generation: g }).expect("group fits");
+    }
     for tid in [kept, rejected] {
-        push(
-            &log,
-            &engine,
-            tid,
-            &certified(make_batch(&engine.registry.relation(tid).unwrap().schema(), &rows)),
-        );
+        push(&log, &engine, tid, &rows);
     }
     engine.close();
 

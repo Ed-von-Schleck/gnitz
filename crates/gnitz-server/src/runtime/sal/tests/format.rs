@@ -4,9 +4,10 @@ use super::{
     payload_rows, payload_size, payload_sizes,
 };
 use crate::runtime::park::WorkerSet;
-use crate::runtime::sal::fixtures::{assert_fail_stops, group_at, test_log};
+use crate::runtime::sal::fixtures::{group_at, test_log};
 use crate::runtime::sal::format::RequestHead;
 use crate::runtime::sal::{Apply, Inbound};
+use crate::runtime::test_support::assert_fail_stops;
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::encode_schema_record;
 use crate::test_support::{

@@ -18,10 +18,7 @@ fn park_wake_bench() {
     for (advance, publish) in [("bump", false), ("publish", true)] {
         let parks = WorkerParks::create(2).unwrap();
         // The child's park, and the word it waits on.
-        let (park, word) = match publish {
-            true => (parks.park(0), parks.park(1)),
-            false => (parks.park(0), parks.park(0)),
-        };
+        let (park, word) = (parks.park(0), parks.park(publish as usize));
         // The child's voluntary context switches, written before it exits.
         let sleeps = posix_io::map_shared(None, 4096).unwrap().cast::<i64>();
         let child = || {

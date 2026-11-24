@@ -119,12 +119,11 @@ fn a_push_is_acked_only_once_it_is_durable() {
             });
             let lsn = sal.watermark();
             assert!(sal.durable_level().get() < lsn, "laid out, not yet durable");
-            let mut want = Vec::new();
-            WireMsg {
+            let ack = WireMsg {
                 hdr: ControlHeader::ack(target, lsn),
                 ..Default::default()
-            }
-            .encode_framed(&mut want);
+            };
+            let want = gnitz_wire::framed(&ack.encode_to_vec());
 
             let mut flush = Box::pin(async move {
                 peer.flush_egress().await.expect("an open peer");

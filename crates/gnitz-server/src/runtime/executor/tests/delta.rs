@@ -3,11 +3,9 @@ use std::io::Read;
 use super::*;
 use crate::runtime::reactor::test_support::make_reactor;
 
-/// `msg`'s framed bytes.
+/// `msg`'s framed bytes, by the wire crate's framing.
 fn framed(msg: WireMsg<'_>) -> Vec<u8> {
-    let mut out = Vec::new();
-    msg.encode_framed(&mut out);
-    out
+    gnitz_wire::framed(&msg.encode_to_vec())
 }
 
 /// Trains queued for a connection reach the wire whole and in queue order

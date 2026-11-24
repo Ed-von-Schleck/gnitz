@@ -473,6 +473,12 @@ impl Mesh {
     }
 }
 
+/// The mesh fixture, shared by `mesh`'s own suites and by the `runtime` tests
+/// that need a live mesh.
+#[cfg(test)]
+#[path = "tests/mesh_fixtures.rs"]
+pub(crate) mod fixtures;
+
 #[cfg(test)]
 #[path = "tests/mesh.rs"]
 mod tests;
