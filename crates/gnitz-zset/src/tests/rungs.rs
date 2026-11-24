@@ -9,8 +9,8 @@ use crate::test_support::assert_ladder;
 
 const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
-/// The tiers, bottom first — the table in `lib.rs`.
-const LADDER: &[&[&str]] = &[&["schema"], &["repr"], &["algebra"]];
+/// The rungs, bottom first: the table in `lib.rs` describes this ladder.
+const LADDER: &[&str] = &["schema", "repr", "algebra"];
 
 #[test]
 fn every_rung_names_only_the_rungs_beneath_it() {

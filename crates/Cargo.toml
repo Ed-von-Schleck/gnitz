@@ -32,9 +32,8 @@ keywords = ["database", "sql", "dbsp", "incremental", "materialized-views"]
 categories = ["database-implementations"]
 
 # One lint policy for the workspace, taken by every crate with
-# `[lints] workspace = true`. `gnitz-zset` and `gnitz-store` are the exceptions:
-# each spells its own table out so it can add `unreachable_pub`, which cargo does
-# not let a crate layer on top of the shared one.
+# `[lints] workspace = true`. A crate that publishes an API adds
+# `#![warn(unreachable_pub)]` at its root.
 [workspace.lints.rust]
 warnings = "deny"
 # `cargo bolero` builds a fuzz target with `--cfg fuzzing`.

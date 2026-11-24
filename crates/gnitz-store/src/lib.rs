@@ -15,7 +15,7 @@
 //! nothing links what is there.
 //!
 //! The module roots below form a layer ladder, each naming only those beneath it
-//! — `tests/rungs.rs` states that table and enforces it. `relation` and `read`
+//! — `tests/rungs.rs` states that ladder and enforces it. `relation` and `read`
 //! are the API; `storage`, the LSM under them, is reached only through a
 //! relation's stores. The submodules under each root are private; what a root
 //! re-exports is what it publishes. An item is `pub` because another crate

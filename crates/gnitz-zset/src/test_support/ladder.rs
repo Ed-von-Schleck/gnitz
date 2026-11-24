@@ -5,41 +5,34 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The entries of `src/` that are not rungs: the crate roots and the test
-/// scaffolding. A file may name the scaffolding; a `#[macro_export]` macro is a
-/// crate-root name wherever it is defined, so a rung's own may be named too.
+/// scaffolding, which any file may name.
 const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 
 /// Assert that every rung under `src_root` names only the rungs beneath it.
 ///
-/// `ladder` lists the tiers bottom first: a rung may name itself and the rungs
-/// of every earlier tier, and rungs sharing a tier are incomparable. Every
-/// entry of `src_root` must be a rung or one of `UNLADDERED`.
+/// `ladder` lists the rungs bottom first: a rung may name itself, every earlier
+/// rung, and its own `#[macro_export]` macros, which are crate-root names
+/// wherever they are defined. Every entry of `src_root` must be a rung or one
+/// of `UNLADDERED`.
 ///
 /// It reads the name each `crate::` path leads with, so a crate-root item other
-/// than an exported macro and a grouped `crate::{…}` import are refused along
-/// with a higher rung. It does not see `super::`-relative reaches, so it is a
-/// regression guard and not a proof.
-pub fn assert_ladder(src_root: impl AsRef<Path>, ladder: &[&[&str]]) {
+/// than a rung's own exported macro and a grouped `crate::{…}` import are
+/// refused along with a higher rung. It does not see `super::`-relative
+/// reaches, so it is a regression guard and not a proof.
+pub fn assert_ladder(src_root: impl AsRef<Path>, ladder: &[&str]) {
     let src_root = src_root.as_ref();
-    let rungs = ladder.concat();
     for p in entries(src_root) {
         let name = p.file_stem().unwrap().to_str().unwrap();
         assert!(
-            rungs.contains(&name) || UNLADDERED.contains(&name),
+            ladder.contains(&name) || UNLADDERED.contains(&name),
             "{name} is a module root the ladder does not place",
         );
     }
-    let macros: Vec<String> = rungs
-        .iter()
-        .flat_map(|rung| rs_files(src_root.join(rung)))
-        .flat_map(exported_macros)
-        .collect();
-    let macros: Vec<&str> = macros.iter().map(String::as_str).collect();
-    for (tier, tier_rungs) in ladder.iter().enumerate() {
-        for rung in *tier_rungs {
-            let allowed = [&[*rung], &ladder[..tier].concat()[..], &UNLADDERED[..], &macros[..]].concat();
-            assert_names_only(src_root.join(rung), "crate", &allowed);
-        }
+    for (tier, rung) in ladder.iter().enumerate() {
+        let dir = src_root.join(rung);
+        let macros: Vec<String> = rs_files(&dir).into_iter().flat_map(exported_macros).collect();
+        let macros: Vec<&str> = macros.iter().map(String::as_str).collect();
+        assert_names_only(dir, "crate", &[&ladder[..=tier], &UNLADDERED[..], &macros[..]].concat());
     }
 }
 

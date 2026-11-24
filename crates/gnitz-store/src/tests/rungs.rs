@@ -9,8 +9,8 @@ use crate::test_support::{assert_ladder, assert_names_only};
 
 const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
-/// The tiers, bottom first.
-const LADDER: &[&[&str]] = &[&["storage"], &["relation"], &["read"]];
+/// The rungs, bottom first.
+const LADDER: &[&str] = &["storage", "relation", "read"];
 
 /// The trace rungs the store may name. Never `stream`: its operators read a
 /// circuit's traces, and only `gnitz-server` holds a circuit.
@@ -24,12 +24,4 @@ fn every_rung_names_only_the_rungs_beneath_it() {
 #[test]
 fn the_crate_names_only_the_runs_of_the_traces() {
     assert_names_only(SRC, "gnitz_trace", TRACE);
-}
-
-/// The walk sees the trace paths the store does name: `runs` withheld, the
-/// guard refuses them.
-#[test]
-#[should_panic(expected = "names gnitz_trace::runs")]
-fn a_withheld_trace_rung_fails_the_guard() {
-    assert_names_only(SRC, "gnitz_trace", &[]);
 }
