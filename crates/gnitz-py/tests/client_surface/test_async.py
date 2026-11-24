@@ -1,8 +1,9 @@
 """`gnitz.aio` — what a client on an event loop owes of its own.
 
 Submit-on-call, pipelining, reply correlation across mixed verb kinds, error
-propagation out of a gather, and the loop's own costs. The decode is shared with the sync client (`scan_result`),
-so a value- or row-level claim belongs to the coordinate that owns it —
+propagation out of a gather, a held sync and its cancellation, and the loop's
+own costs. The decode is shared with the sync client (`scan_result`), so a
+value- or row-level claim belongs to the coordinate that owns it —
 `mutation_pattern`, `value_domain`, `read_verb` — not here.
 """
 
@@ -16,8 +17,11 @@ import pytest
 import gnitz
 from gnitz import aio
 import _childproc
+from _catalog import schema_id
+from _feedviews import fed_view, mk_feed
 from _read import bag
 from _schemas import KV, SCHEMAS, kv
+from _sql import insert
 
 
 @pytest.fixture
@@ -231,6 +235,70 @@ async def test_calls_made_while_connecting_wait_for_it(server):
     async with conn as entered:
         assert entered is conn
         assert len(await conn.scan(*schemas)) > 0
+
+
+# ---------------------------------------------------------------------------
+# Held syncs
+# ---------------------------------------------------------------------------
+
+
+async def test_a_held_sync_leaves_an_async_client_free(client, aconn):
+    """A sync held with nothing to report does not hold its client: a scan and a
+    subscription submitted beside it are answered and leave it held, and it
+    waits for that subscription too — a DDL reaching its view of the catalog
+    alone ends the hold, with that DDL's catalog rows."""
+    fed_view(client)
+    mk_feed(client, "g", f"SELECT table_id, name FROM _system.tables WHERE schema_id = {schema_id(client)}")
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
+    (fid, f_schema), (gid, g_schema) = client.resolve_table("f"), client.resolve_table("g")
+    await aconn.subscribe(fid, f_schema)
+    held = asyncio.ensure_future(aconn.sync(60))
+    scanned = await asyncio.wait_for(aconn.scan(fid, f_schema), 20)
+    assert not held.done(), "the scan left the sync held"
+    late, _, cursor = await aconn.subscribe(gid, g_schema)
+    assert not held.done(), "subscribing left the sync held"
+    client.execute_sql("CREATE TABLE late (id BIGINT NOT NULL PRIMARY KEY)")
+    pushed = {p.sub: p for p in (await asyncio.wait_for(held, 20)).pushed}[late]
+    assert bag(scanned) == {(1, 100, "seed"): 1}
+    assert (pushed.error, bag(pushed.rows, "name")) == (None, {("late",): 1})
+    assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] > cursor[1]
+
+
+async def test_a_cancelled_sync_loses_nothing(client, aconn):
+    """A sync cancelled while held, and one whose task is cancelled once its
+    answer is in but before the task resumes, each hand nothing to nobody: the
+    next sync brings what the cancelled one's answer carried, and is not held
+    behind it."""
+    fed_view(client)
+    vid, schema = client.resolve_table("f")
+    sub, _, _ = await aconn.subscribe(vid, schema)
+
+    async def next_sync_brings(keys):
+        (pushed,) = (await asyncio.wait_for(aconn.sync(60), 20)).pushed
+        assert (pushed.sub, pushed.error, bag(pushed.rows)) == (sub, None, {(i, 100, "w"): 1 for i in keys})
+
+    held = asyncio.ensure_future(aconn.sync(60))
+    # Answered behind the sync's request, so the server holds that one.
+    await asyncio.wait_for(aconn.scan(vid, schema), 20)
+    assert not held.done(), "the scan left the sync held"
+    held.cancel()
+    insert(client, "t", [(i, 100, "w") for i in range(10)])
+    await next_sync_brings(range(10))
+
+    insert(client, "t", [(i, 100, "w") for i in range(10, 20)])
+    task = asyncio.ensure_future(aconn.sync(60))
+    await asyncio.sleep(0)
+    # The answer resolves the future the task awaits from a loop callback,
+    # which schedules the task's resumption behind this coroutine's.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 20
+    while not task._fut_waiter.done():
+        assert loop.time() < deadline, "the sync was never answered"
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await next_sync_brings(range(10, 20))
 
 
 # ---------------------------------------------------------------------------

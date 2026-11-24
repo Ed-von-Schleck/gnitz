@@ -73,8 +73,8 @@ class Subscriber:
         self.sub, rows, self.cursor = self.client.subscribe(self.vid, self.schema, self.cursor, self.spec)
         return self._apply(rows)
 
-    def sync(self, wait=0.0):
-        (pushed,) = self.client.sync(wait).pushed
+    def sync(self):
+        (pushed,) = self.client.sync().pushed
         assert pushed.sub == self.sub and pushed.error is None, pushed
         self.cursor = pushed.cursor
         return self._apply(pushed.rows)

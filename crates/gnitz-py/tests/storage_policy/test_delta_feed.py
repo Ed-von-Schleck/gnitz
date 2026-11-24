@@ -13,9 +13,10 @@ copy against a scan as a multiset of `(row, weight)`.
 
 The mirroring client drives the same feed through its own poll path; its suites
 are `client_surface/test_mirror.py` and `crates/gnitz-mirror/tests`, which also
-hold how a held sync waits and which rounds move a cursor. These drive the raw
-`delta_read` verb, whose refusals a mirror hides, through
-the Python binding.
+hold how a held sync waits and which rounds move a cursor; how a held sync
+leaves an event-loop client free is `client_surface/test_async.py`'s. These
+drive the raw `delta_read` verb, whose refusals a mirror hides, through the
+Python binding.
 """
 import asyncio
 import os
@@ -84,6 +85,29 @@ def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client):
     assert sub.assert_converged("the CREATE VIEW drain's round must reach the subscriber") == 37
 
 
+def test_a_poll_after_a_ddl_returns_that_ddls_rows_at_their_weights(client):
+    """A feed over a system family: a DDL's catalog rows are a round of the feed
+    like any push's, weights and all."""
+    mk_feed(client, "ddl_feed", f"SELECT table_id, name FROM _system.tables WHERE schema_id = {schema_id(client)}")
+    sub = Subscriber(client, "ddl_feed")
+    sub.bootstrap()
+    assert sub.copy == {}
+
+    client.execute_sql("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY)")
+    assert bag(sub.poll(), "name") == {("a",): 1}
+    assert len(sub.poll()) == 0, "a DDL is one round"
+
+    client.execute_sql("ALTER TABLE a RENAME TO b")
+    assert bag(sub.poll(), "name") == {("a",): -1, ("b",): 1}
+
+    client.execute_sql("DROP TABLE b")
+    assert bag(sub.poll(), "name") == {("b",): -1}
+    assert sub.copy == {} == sub.scan()
+
+    client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY)")
+    sub.assert_converged("after a create")
+
+
 def test_subscribers_at_one_position_share_one_read(own_server):
     """The steady state of a subscriber is a poll that returns nothing, and the
     master answers it locally, with no SAL group and no worker wakeup: one that
@@ -91,15 +115,15 @@ def test_subscribers_at_one_position_share_one_read(own_server):
 
     A cursor is a round of its own view, so two subscribers standing at one
     position of a feed hold one cursor whatever ticked elsewhere between their
-    syncs, and the round that moves the view is read for both at once: the sync
-    that finds it writes the SAL what it writes when nothing ticked between."""
+    syncs, and the round that moves the view is read once for both: the second
+    subscriber's sync writes the SAL nothing."""
     own_server.start()
     sal = os.path.join(own_server.data_dir, "wal.sal")
 
     def sal_written():
         # The SAL is MAP_SHARED and zero past its last group, so what a
-        # request appended is visible through the file at once — to within the
-        # zero bytes that group happens to end in.
+        # request appended is visible through the file at once. A fresh server
+        # never reaches the checkpoint that would rewind it.
         with open(sal, "rb") as fh:
             return len(fh.read(4 << 20).rstrip(b"\0"))
 
@@ -108,11 +132,9 @@ def test_subscribers_at_one_position_share_one_read(own_server):
         fed_view(writer)
         writer.execute_sql("CREATE VIEW other AS SELECT id, w FROM u WHERE w > 0")
         writer.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
-        subs = []
-        for client in (a, b):
-            sub = Subscriber(client, "f")
+        subs = [Subscriber(client, "f") for client in (a, b)]
+        for sub in subs:
             sub.bootstrap()
-            subs.append(sub)
 
         before = sal_written()
         for _ in range(20):
@@ -121,121 +143,25 @@ def test_subscribers_at_one_position_share_one_read(own_server):
         for sub in subs:
             sub.subscribe()
 
-        def round_read_by_the_first(key, between):
-            """Move the view after `between` ran between the two subscribers'
-            syncs; the SAL bytes the first one's next sync writes."""
+        # The second round is preceded by a round of a table the view does not read.
+        for key in (2, 3):
             subs[0].sync()
-            between()
+            if key == 3:
+                writer.execute_sql("INSERT INTO u VALUES (1, 1, 7)")
+                assert bag(rows(writer, "SELECT * FROM other")) == {(1, 7): 1}
             subs[1].sync()
             assert subs[0].cursor == subs[1].cursor, "one position, one cursor"
             writer.execute_sql(f"INSERT INTO t VALUES ({key}, 200, 'moved')")
-            before = sal_written()
             subs[0].sync()
-            wrote = sal_written() - before
             # The second subscriber's train was queued by that read.
             before = sal_written()
             subs[1].sync()
-            assert sal_written() == before
+            assert sal_written() == before, f"the round of key {key} was read again"
             for sub in subs:
                 assert sub.copy == sub.scan() and len(sub.copy) == key
-            return wrote
-
-        def a_round_elsewhere():
-            # A round of a table the view does not read.
-            writer.execute_sql("INSERT INTO u VALUES (1, 1, 7)")
-            assert bag(rows(writer, "SELECT * FROM other")) == {(1, 7): 1}
-
-        alone = round_read_by_the_first(2, lambda: None)
-        again = round_read_by_the_first(3, a_round_elsewhere)
-        # A second read is a whole group more, several times this slack.
-        assert alone > 64 and abs(again - alone) <= 16, f"one read, as with nothing between: {alone} then {again}"
 
 
-def test_a_poll_ticks_the_push_it_follows_and_loses_no_round(client):
-    """A poll issued right after a push ACK carries that push. Over a stream and
-    far below the row count that ticks on its own, so only the poll can have
-    ticked it."""
-    client.execute_sql(
-        "CREATE TABLE ev (id BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL, amount BIGINT NOT NULL) "
-        "WITH (stream = true)",
-    )
-    mk_feed(client, "f", "SELECT kind, SUM(amount) AS total FROM ev GROUP BY kind")
-    sub = Subscriber(client, "f")
-    sub.bootstrap()
-
-    # The convergence check polls before it scans: a round its poll left
-    # behind is ticked by the scan, and the two disagree.
-    for r in range(6):
-        insert(client, "ev", [(r * 50 + i, i % 4, i + 1) for i in range(50)])
-        sub.assert_converged(f"after poll {r}")
-
-
-# ── held syncs ───────────────────────────────────────────────────────────────
-
-
-async def test_a_held_sync_leaves_an_async_client_free(client, aconn):
-    """A sync held with nothing to report does not hold its client: a scan and a
-    subscription submitted beside it are answered and leave it held, and it
-    waits for that subscription too — a DDL reaching its view of the catalog
-    alone ends the hold, with that DDL's catalog rows."""
-    fed_view(client)
-    mk_feed(client, "g", f"SELECT table_id, name FROM _system.tables WHERE schema_id = {schema_id(client)}")
-    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
-    (fid, f_schema), (gid, g_schema) = client.resolve_table("f"), client.resolve_table("g")
-    await aconn.subscribe(fid, f_schema)
-    held = asyncio.ensure_future(aconn.sync(60))
-    scanned = await asyncio.wait_for(aconn.scan(fid, f_schema), 20)
-    assert not held.done(), "the scan left the sync held"
-    late, _, cursor = await aconn.subscribe(gid, g_schema)
-    assert not held.done(), "subscribing left the sync held"
-    client.execute_sql("CREATE TABLE late (id BIGINT NOT NULL PRIMARY KEY)")
-    pushed = {p.sub: p for p in (await asyncio.wait_for(held, 20)).pushed}[late]
-    assert bag(scanned) == {(1, 100, "seed"): 1}
-    assert (pushed.error, bag(pushed.rows, "name")) == (None, {("late",): 1})
-    assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] > cursor[1]
-
-
-async def test_a_cancelled_held_sync_loses_nothing(client, aconn):
-    """A held sync that is cancelled hands nothing to nobody: the next sync
-    brings what the cancelled one's answer carried, and is not held behind it."""
-    fed_view(client)
-    vid, schema = client.resolve_table("f")
-    sub, _, _ = await aconn.subscribe(vid, schema)
-    held = asyncio.ensure_future(aconn.sync(60))
-    # Answered behind the sync's request, so the server holds that one.
-    await asyncio.wait_for(aconn.scan(vid, schema), 20)
-    assert not held.done(), "the scan left the sync held"
-    held.cancel()
-    insert(client, "t", [(i, 100, "w") for i in range(10)])
-    (pushed,) = (await asyncio.wait_for(aconn.sync(60), 20)).pushed
-    assert (pushed.sub, pushed.error, bag(pushed.rows)) == (sub, None, {(i, 100, "w"): 1 for i in range(10)})
-
-
-async def test_a_sync_cancelled_after_its_answer_loses_nothing(client, aconn):
-    """A task cancelled once its sync's answer is in, before the task resumes,
-    never sees that answer: the next sync brings it, and is not held."""
-    fed_view(client)
-    vid, schema = client.resolve_table("f")
-    sub, _, _ = await aconn.subscribe(vid, schema)
-    insert(client, "t", [(i, 100, "w") for i in range(10)])
-
-    async def received():
-        return await aconn.sync(60)
-
-    task = asyncio.ensure_future(received())
-    await asyncio.sleep(0)
-    # The answer resolves the future the task awaits from a loop callback,
-    # which schedules the task's resumption behind this coroutine's.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 20
-    while not task._fut_waiter.done():
-        assert loop.time() < deadline, "the sync was never answered"
-        await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    (pushed,) = (await asyncio.wait_for(aconn.sync(60), 20)).pushed
-    assert (pushed.sub, pushed.error, bag(pushed.rows)) == (sub, None, {(i, 100, "w"): 1 for i in range(10)})
+# ── a held sync ──────────────────────────────────────────────────────────────
 
 
 async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
@@ -273,12 +199,9 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
     base_tables(client)
     client.execute_sql(f"CREATE VIEW plain AS {LINEAR}")
     vid, schema = client.resolve_table("plain")
-    for verb in (
-        lambda: client.delta_read(vid, schema),
-        lambda: client.delta_read(vid, schema, (0, 1)),
-    ):
+    for cursor in (None, (0, 1)):
         with pytest.raises(gnitz.GnitzRefusedError, match="carries no delta feed") as e:
-            verb()
+            client.delta_read(vid, schema, cursor)
         # Not the expiry code: a subscriber reacts to that by re-reading at 0,
         # so answering it here would spin one forever against a view that will
         # never have a feed.

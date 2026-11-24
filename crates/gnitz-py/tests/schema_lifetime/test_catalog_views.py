@@ -1,7 +1,7 @@
 """A view over a system family is maintained from catalog deltas: every DDL's
 rows have reached it by the time the DDL is acknowledged.
 
-The per-DDL deltas of such a view are `storage_policy/test_catalog_feed.py`'s.
+The per-DDL deltas of such a view are `storage_policy/test_delta_feed.py`'s.
 """
 
 import pytest

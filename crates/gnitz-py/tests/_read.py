@@ -1,5 +1,5 @@
-"""How a test observes a read: the SELECT accessor, the Z-set bag, and the
-plan's access line.
+"""How a test observes a read: the SELECT accessor, the Z-set bag, the plan's
+access line, and a relation read against its twin.
 
 `bag` rather than a row list is the default here on purpose. A Z-set engine
 defines correctness as weights, so a row count, a `sorted(pks)` list or a
@@ -90,3 +90,24 @@ def scanned(client, name, *, hidden=False):
     compose with `bag`."""
     result = client.scan(*client.resolve_table(name))
     return list(result.including_hidden() if hidden else result)
+
+
+def reads_alike(client, got, want, reads=(), key="id"):
+    """Relation `got` reads as relation `want`, weight for weight and never
+    vacuously: a full scan, a seek at keys from both ends and the middle of the
+    range of column `key` (no seeks when `key` is None), and each SELECT of
+    `reads`, `{v}` standing for the relation.
+
+    `got` is a relation whose storage differs from its twin's — bounded,
+    compressed — so every read verb has to answer through that storage."""
+    live = scanned(client, want)
+    assert live and bag(scanned(client, got)) == bag(live), f"{got}: full scan"
+    if key is not None:
+        g, w = client.resolve_table(got), client.resolve_table(want)
+        keys = sorted({getattr(r, key) for r in live})
+        mid = len(keys) // 2
+        for pk in keys[:5] + keys[mid : mid + 5] + keys[-5:]:
+            assert bag(client.seek(*g, pk)) == bag(client.seek(*w, pk)), f"{got}: seek {pk}"
+    for q in reads:
+        expected = bag(rows(client, q.format(v=want)))
+        assert expected and bag(rows(client, q.format(v=got))) == expected, f"{got}: {q}"

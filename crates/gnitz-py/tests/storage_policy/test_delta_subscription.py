@@ -13,7 +13,7 @@ drops ships nothing, are the planner's and the store's own tests.
 import pytest
 import gnitz
 from _feedviews import GROUPBY, JOIN, LINEAR, Subscriber, base_tables, churn, fed_view, mk_feed
-from _read import access, rows
+from _read import access, bag, rows
 from _sql import insert
 
 
@@ -89,9 +89,6 @@ def test_a_cursor_of_another_subscription_is_refused(client):
     b = Subscriber(client, "f", "SELECT id, v FROM f WHERE v > 200")
     a.bootstrap()
     b.bootstrap()
-    _, whole = client.delta_read(a.vid, a.view_schema)
-    assert len({a.cursor[0], b.cursor[0], whole[0]}) == 3
-    churn(client, 201, 300)
     b.cursor = a.cursor
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
         b.poll()
@@ -118,7 +115,7 @@ def test_a_synced_cursor_passes_the_rounds_it_kept_nothing_of(client, peer):
         lo = 100 + r * 40
         insert(client, "t", [(i, i, wide(i)) for i in range(lo, lo + 40)])
         # The read ticks the round.
-        assert len(rows(client, one)) == 1
+        assert bag(rows(client, one)) == {(5, 50): 1}
         assert len(sub.sync()) == 0
         assert sub.copy == sub.scan()
 

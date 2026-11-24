@@ -104,7 +104,7 @@ _SHAPES = {
     "grown": ("SELECT k FROM dim EXCEPT SELECT kind FROM s", {(3,): 1}, {(1,): 1, (2,): 1, (3,): 1}),
     # Created over a table and retargeted onto the stream by `ALTER VIEW`: the
     # boot decides by the view's sources as they are, not as created.
-    "moved": (None, _PAIR, {}),
+    "moved": ("SELECT kind, SUM(amount) AS total FROM t GROUP BY kind", _PAIR, {}),
 }
 
 
@@ -123,10 +123,8 @@ def test_a_view_a_stream_reaches_comes_back_as_if_the_stream_never_received_a_ro
         conn.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})")
         _stream(conn)
         conn.execute_sql("CREATE VIEW tv AS SELECT kind, SUM(amount) AS total FROM t GROUP BY kind")
-        conn.execute_sql("CREATE VIEW moved AS SELECT kind, SUM(amount) AS total FROM t GROUP BY kind")
         for name, (body, _, _) in _SHAPES.items():
-            if body is not None:
-                conn.execute_sql(f"CREATE VIEW {name} AS {body}")
+            conn.execute_sql(f"CREATE VIEW {name} AS {body}")
         insert(conn, "dim", [(k, k * 7) for k in (1, 2, 3)])
         insert(conn, "t", [(100, 5, 50)])
         assert _read(conn, "moved") == {(5, 50): 1}
