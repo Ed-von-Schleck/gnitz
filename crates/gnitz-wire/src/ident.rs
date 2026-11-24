@@ -2,9 +2,8 @@
 //! user-name rule and its canonical fold, the qualified key, and the two reserved
 //! schema names.
 
-/// The character set every stored catalog name is drawn from; the engine checks a
-/// chain segment's name against it, and the client builds generated index names
-/// from it.
+/// The character set every stored catalog name is drawn from; the client builds
+/// generated index names from it.
 pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
@@ -52,6 +51,13 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
 pub fn canonical_identifier(name: &str) -> Result<String, String> {
     validate_user_identifier(name)?;
     Ok(name.to_ascii_lowercase())
+}
+
+/// The name of the chain segment with view id `vid`. It is unique because vids
+/// are, and no SQL surface can spell it because [`validate_user_identifier`]
+/// refuses a leading `_`.
+pub fn segment_name(vid: u64) -> String {
+    format!("_seg{vid}")
 }
 
 /// `"schema.relation"`: the catalog key when both names are canonical. `.`

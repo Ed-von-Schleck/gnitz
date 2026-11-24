@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
+use gnitz_wire::segment_name;
 
 /// A name whose bytes are not UTF-8 is refused as such in every family that
 /// stores one, not read as some other name.
@@ -97,9 +98,10 @@ fn an_index_row_repeating_a_column_is_refused() {
 }
 
 /// A VIEW_TAB `+1`'s `owner_view_id` must name a user view its own bundle
-/// creates, and its name must be canonical.
+/// creates; a segment holds the name minted for its id, and a user view a user
+/// identifier.
 #[test]
-fn a_view_row_names_a_real_owner_and_a_canonical_name() {
+fn a_view_row_names_a_real_owner_and_its_kinds_name() {
     let (_dir, mut engine) = empty_catalog(1);
     let table = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
     let existing = register_identity_view(&mut engine, table, "existing", &u64_i64_cols());
@@ -123,41 +125,33 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
         }))
     };
 
+    let names = [segment_name(vid), segment_name(other)];
+    let [seg, other_seg] = [names[0].as_str(), names[1].as_str()];
     let not_created = "is not a user view this bundle creates";
-    let with_option = format!("view '_seg' (id={vid}) is a chain segment carrying a WITH option");
+    let with_option = format!("view '{seg}' (id={vid}) is a chain segment carrying a WITH option");
+    let minted = format!("a chain segment is named '{seg}'");
     for (rows, why) in [
-        (&[(vid, "_seg", 999_999, 0)][..], not_created),
-        (&[(vid, "_seg", table, 0)], not_created),
-        (&[(vid, "_seg", existing, 0)], not_created),
+        (&[(vid, seg, 999_999, 0)][..], not_created),
+        (&[(vid, seg, table, 0)], not_created),
+        (&[(vid, seg, existing, 0)], not_created),
         // A segment of the bundle is no user view.
         (
-            &[
-                (vid, "_seg", other, 0),
-                (other, "_other", user, 0),
-                (user, "user", 0, 0),
-            ],
+            &[(vid, seg, other, 0), (other, other_seg, user, 0), (user, "user", 0, 0)],
             not_created,
         ),
-        (&[(vid, "_seg", vid, 0)], not_created),
-        (&[(vid, "MixedCase", 0, 0)], "not canonical"),
+        (&[(vid, seg, vid, 0)], not_created),
         // A leading `_` names a segment and nothing else.
         (&[(vid, "_v", 0, 0)], "cannot start with '_'"),
-        (
-            &[(vid, "seg", user, 0), (user, "user", 0, 0)],
-            "a chain segment's name starts with '_'",
-        ),
+        (&[(vid, other_seg, user, 0), (user, "user", 0, 0)], minted.as_str()),
         // A segment is planner-minted, so it carries no WITH option; a user view may.
-        (
-            &[(vid, "_seg", user, 4 << 20), (user, "user", 0, 0)],
-            with_option.as_str(),
-        ),
+        (&[(vid, seg, user, 4 << 20), (user, "user", 0, 0)], with_option.as_str()),
     ] {
         let err = precheck(&engine, SysFamily::View, &view_rows(rows)).unwrap_err();
         assert!(err.contains(why), "{rows:?}: {err}");
     }
     for rows in [
         &[(vid, "v", 0, 4 << 20)][..],
-        &[(vid, "_seg", user, 0), (user, "user", 0, 0)],
+        &[(vid, seg, user, 0), (user, "user", 0, 0)],
     ] {
         precheck(&engine, SysFamily::View, &view_rows(rows)).unwrap_or_else(|e| panic!("{rows:?}: {e}"));
     }

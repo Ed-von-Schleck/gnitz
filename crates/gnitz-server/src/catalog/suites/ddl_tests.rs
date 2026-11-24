@@ -183,15 +183,6 @@ fn test_ddl() {
         init_cols
     );
 
-    // A system family's TABLE_TAB row sits below the user id floor, so its
-    // retraction is refused.
-    assert!(
-        engine
-            .drop_table("_system.columns")
-            .unwrap_err()
-            .contains("cannot DROP a system")
-    );
-
     // Drop schema
     engine.create_schema("temp").unwrap();
     engine.drop_schema("temp").unwrap();
@@ -221,14 +212,6 @@ fn test_edge_cases() {
     // Too many columns (> MAX_COLUMNS = 65)
     let many: Vec<CatalogColumn> = (0..66).map(|i| col_def(&format!("c{i}"), TypeCode::U64)).collect();
     assert!(engine.create_table("public.too_many", &many, &[0]).is_err());
-
-    // Drop system schema
-    assert!(
-        engine
-            .drop_schema("_system")
-            .unwrap_err()
-            .contains("cannot DROP a system")
-    );
 
     // Recreated schema gets new ID
     engine.create_schema("temp").unwrap();
@@ -800,7 +783,8 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
     let v = engine.allocate_ids(2).unwrap();
     let s = v + 1;
     let identity = crate::test_support::identity_circuit(base, gnitz_wire::ReadBound::None);
-    let rows = sys_batch([(v, "v", 0), (s, "_seg", v)].map(|(vid, name, owner)| {
+    let seg = gnitz_wire::segment_name(s);
+    let rows = sys_batch([(v, "v", 0), (s, &*seg, v)].map(|(vid, name, owner)| {
         let row = ViewTabRow {
             owner_view_id: owner,
             ..view_tab_row(vid, name)

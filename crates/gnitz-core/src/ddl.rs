@@ -265,7 +265,7 @@ pub struct ViewBundle {
 
 impl ViewBundle {
     /// The chain's catalog rows at `+1`, its first member standing at `base`:
-    /// each segment named `_seg{vid}` and owned by the user-named view,
+    /// each segment named [`gnitz_wire::segment_name`] and owned by the user-named view,
     /// which stands last under its own name and props, recording `definition`.
     fn put_rows(&self, b: &mut DdlBundle, definition: &[u8], schema_id: u64, base: u64) {
         let owner_vid = base + self.segments.len() as u64;
@@ -276,9 +276,7 @@ impl ViewBundle {
             for src in circuit.sources_mut() {
                 *src = bind_pending(*src, base);
             }
-            // A segment's name is unique because vids are, and no SQL surface can
-            // spell it because gnitz_wire::validate_user_identifier rejects a leading
-            // `_`; the owner_view_id column records its ownership.
+            // The owner_view_id column records a segment's ownership.
             let (name, owner, props, definition) = if vid == owner_vid {
                 (
                     self.name.name().to_string(),
@@ -287,7 +285,12 @@ impl ViewBundle {
                     definition,
                 )
             } else {
-                (format!("_seg{vid}"), Some(owner_vid), ViewProps::default(), &[][..])
+                (
+                    gnitz_wire::segment_name(vid),
+                    Some(owner_vid),
+                    ViewProps::default(),
+                    &[][..],
+                )
             };
 
             // A foreign key constrains a base table, not a view.

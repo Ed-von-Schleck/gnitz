@@ -721,7 +721,7 @@ pub fn try_register_chain(
     let seg = engine.allocate_ids(2).unwrap();
     let top = seg + 1;
     let owner = owner(seg);
-    let names = [format!("_seg{seg}"), format!("top{top}")];
+    let names = [gnitz_wire::segment_name(seg), format!("top{top}")];
     let segment_row = ViewTabRow {
         owner_view_id: top,
         ..view_tab_row(seg, &names[0])

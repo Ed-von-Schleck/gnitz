@@ -6,7 +6,7 @@
 use gnitz_store::relation::{IndexClaim, Relation};
 use gnitz_wire::{
     CatalogColumn, ColTabRow, FixedInt, IdxTabRow, IdxTabSlot, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
-    payload_bytes, validate_user_identifier,
+    canonical_identifier, payload_bytes, segment_name,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
@@ -18,19 +18,11 @@ use super::sys_tables::{
     build_schema_from_col_defs, payload_differs, read_rel_row,
 };
 
-/// The name rule a schema, relation or index row must satisfy to be stored: a
-/// chain segment's name (`segment`) is `_` then `[A-Za-z0-9_]`, every other
-/// name a user identifier; and every one already canonical, since every name-index key is
-/// compared byte-wise against the client's folded form.
-fn check_stored_name(name: &str, noun: &str, segment: bool) -> Result<(), String> {
-    if !segment {
-        validate_user_identifier(name)?;
-    } else if !name.starts_with('_') {
-        return Err(format!("{noun} '{name}': a chain segment's name starts with '_'"));
-    } else if !name.bytes().all(gnitz_wire::is_valid_ident_char) {
-        return Err(format!("{noun} name contains invalid characters: {name}"));
-    }
-    if name.bytes().any(|c| c.is_ascii_uppercase()) {
+/// The name rule a schema, relation or index row other than a chain segment must
+/// satisfy to be stored: a user identifier, already in its canonical form, since
+/// every name-index key is compared byte-wise against the client's folded form.
+fn check_stored_name(name: &str, noun: &str) -> Result<(), String> {
+    if canonical_identifier(name).map_err(|e| format!("{noun}: {e}"))? != name {
         return Err(format!(
             "{noun} name '{name}' is not canonical: catalog names are stored ASCII-lowercase"
         ));
@@ -351,7 +343,7 @@ impl CatalogEngine {
             let name = SchemaTabRow::read(batch, i).map_err(|e| format!("Schema: {e}"))?.name;
             // Nothing synthesizes a schema name, so the reserved `_` prefix
             // applies with no carve-out.
-            check_stored_name(&name, "schema", false)?;
+            check_stored_name(&name, "schema")?;
             if !taken.insert(name.as_bytes().into()) {
                 return Err(format!("Schema already exists: {name}"));
             }
@@ -519,9 +511,15 @@ impl CatalogEngine {
         );
 
         for rel in &rels {
-            // A leading `_` names a chain segment and nothing else.
-            let segment = matches!(rel.detail, RelDetail::View(ViewParts { owner: Some(_), .. }));
-            check_stored_name(&rel.name, rel.kind().noun(), segment)?;
+            // A chain segment holds the one name minted for its id.
+            if matches!(rel.detail, RelDetail::View(ViewParts { owner: Some(_), .. })) {
+                let minted = segment_name(rel.id);
+                if rel.name != minted {
+                    return Err(format!("{rel}: a chain segment is named '{minted}'"));
+                }
+            } else {
+                check_stored_name(&rel.name, rel.kind().noun())?;
+            }
             if creates.contains(rel.id) {
                 self.precheck_relation_create(rel, &created_users, dropped)?;
             }
@@ -632,7 +630,7 @@ impl CatalogEngine {
         for i in batch.live_rows() {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
             let index_name = r.name;
-            check_stored_name(&index_name, noun, false)?;
+            check_stored_name(&index_name, noun)?;
             self.validate_index_create(r.owner_id, r.source_col_idx.as_slice(), r.is_unique)?;
             if !taken.insert(index_name.as_bytes().into()) {
                 return Err(format!("Index already exists: {index_name}"));
@@ -685,7 +683,3 @@ fn unique_visible_names(defs: &[CatalogColumn]) -> Result<(), String> {
         None => Ok(()),
     }
 }
-
-#[cfg(test)]
-#[path = "tests/precheck.rs"]
-mod tests;

@@ -18,19 +18,18 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
         col_def("a_long_column_name", TypeCode::U64),
     ];
     let table = "a_schema_with_a_long_name.a_table_with_a_long_name";
-    let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
-    let tid = engine.create_table_with(table, &cols, &[0], serial).unwrap();
-    reserve(&mut engine, tid, 64).unwrap();
+    let tid = engine.create_table(table, &cols, &[0]).unwrap();
     let idx = engine.create_index(table, &["a_long_column_name"], false).unwrap();
     let vid = register_identity_view(&mut engine, tid, "a_view_with_a_long_name", &cols);
     let unused = engine.allocate_ids(1).unwrap();
 
-    for family in SysFamily::ALL {
+    for family in SysFamily::ALL.into_iter().filter(|f| !f.master_only()) {
         let id = match family {
             SysFamily::Schema => sid,
-            SysFamily::Table | SysFamily::Column | SysFamily::Sequence => tid,
+            SysFamily::Table | SysFamily::Column => tid,
             SysFamily::View | SysFamily::Circuit => vid,
             SysFamily::Index => idx,
+            SysFamily::Sequence => unreachable!("the wire writes no Sequence row"),
         };
 
         // The sys stores run no `enforce_unique_pk`, so nothing but the net

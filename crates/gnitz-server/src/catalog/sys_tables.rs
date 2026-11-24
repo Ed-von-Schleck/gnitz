@@ -174,9 +174,16 @@ pub(super) fn payload_differs(
     BitIter(schema.payload_slots() & !mask).any(|pi| schema.payload_locator(pi).cmp_non_null(a, ra, b, rb).is_ne())
 }
 
-/// The rules a system batch must satisfy on its own, before any store is read,
-/// and its signatures.
+/// The rules a client's system batch must satisfy on its own, before any store
+/// is read, and its signatures.
 pub(super) fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature>, String> {
+    if family.master_only() {
+        return Err(format!(
+            "family {} ({}) is not writable from the wire",
+            family.id(),
+            family.name()
+        ));
+    }
     let noun = family.row_noun();
     // A system row carries weight ±1: a zero weight carries no contract, and the
     // engine's retractions emit a hard `-1`, which would leave `w - 1` of a heavier row.
@@ -252,16 +259,9 @@ impl Block {
 pub(crate) struct DdlBundle([Option<Block>; SysFamily::COUNT]);
 
 impl DdlBundle {
-    /// Add `family`'s block; `Err` for a family the wire may not write, for a
-    /// block [`check_batch_shape`] refuses, or when the bundle already carries one.
+    /// Add `family`'s block; `Err` for a block [`check_batch_shape`] refuses,
+    /// or when the bundle already carries one.
     pub(crate) fn insert(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
-        if family.master_only() {
-            return Err(format!(
-                "family {} ({}) is not writable from the wire",
-                family.id(),
-                family.name()
-            ));
-        }
         let slot = &mut self.0[family.index()];
         if slot.is_some() {
             return Err(format!("bundle carries two blocks for family {}", family.id()));
@@ -387,9 +387,10 @@ pub(crate) trait SysFamilyExt: Copy {
     /// Does this family's PK draw from the catalog object-id counter?
     fn allocates_ids(self) -> bool;
 
-    /// The payload columns a rewrite pair (`-1` + `+1` on one PK) may change, as
-    /// a payload-index bit mask; `None` where no emitter produces a pair —
-    /// there is no schema-rename or index-rename surface.
+    /// The payload columns a client's rewrite pair (`-1` + `+1` on one PK) may
+    /// change, as a payload-index bit mask; `None` where no client emits a pair —
+    /// there is no schema-rename or index-rename surface, and the wire writes no
+    /// Sequence row.
     fn pair_change_mask(self) -> Option<u64>;
 
     /// Are this family's rows retracted only with the relation that owns them — as a band,
