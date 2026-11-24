@@ -52,3 +52,7 @@ impl Snapshot {
 #[cfg(test)]
 #[path = "tests/pinned.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/pinned.rs"]
+mod bench;

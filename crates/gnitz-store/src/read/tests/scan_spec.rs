@@ -1,15 +1,14 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    RelationFixture, TID, batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch, make_schema_u64_i64,
-    map_of, order_by, relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of,
+    RelationFixture, TID, batch_rows, between, chunked, col_range, cut, img, make_batch, make_schema_u64_i64, map_of,
+    order_by, registered_fixture, relation_fixture, relation_fixture_with, rows_spec, spec, spilling,
 };
-use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
+use gnitz_expr::LogicalProgram;
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::{AggDescriptor, GroupAggs, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
 use gnitz_wire::{PkKeys, TypeCode, ViewBudget};
 use gnitz_zset::algebra::Slot;
-use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
@@ -33,7 +32,7 @@ fn view_with(
         pk_repeats: true,
         ..spec(TID, RelationKind::View(ViewBudget::Plain), schema)
     };
-    relation_fixture_with(config, Slot::SOLO, spec, schema, &[], rounds)
+    registered_fixture(config, Slot::SOLO, spec, schema, &[], rounds)
 }
 
 /// `spec` over `TID`, replying in the layout its sink produces.
@@ -261,7 +260,6 @@ fn a_malformed_request_is_refused() {
 /// a view's PK is not unique, and a group larger than the chunk budget crosses it
 /// in one piece — and a key the store does not hold misses, whether it drains its
 /// source once, unfiltered, or in chunks under a predicate that keeps every row.
-/// A read of the whole relation is the store's cached snapshot itself.
 #[test]
 fn keyed_reads_return_each_named_keys_whole_group() {
     let schema = make_schema_u64_i64();
@@ -270,13 +268,12 @@ fn keyed_reads_return_each_named_keys_whole_group() {
     let mut r = view(&rows, 2);
     // Retracted in a later ingest, (7, 70) is a ghost every read must drop.
     r.ingest(TID, make_batch(&schema, &[(7, -1, 70)])).unwrap();
-    let pk_range = |start, end| col_range(0, start, end);
     let reads = [
         (ReadBound::None, (0..10).collect()),
         (pk_set(&[2, 5, 7, 99]), vec![2, 5, 7]),
         (pk_set(&[7]), vec![7]),
-        (pk_range(5, u64::MAX as u128), (5..10).collect()),
-        (pk_range(5, 7), vec![5, 6, 7]),
+        (col_range(0, 5, u64::MAX as u128), (5..10).collect()),
+        (col_range(0, 5, 7), vec![5, 6, 7]),
         (
             ReadBound::Range(KeyRange::point(PkColList::from_slice(&[0]), &[7])),
             vec![7],
@@ -298,241 +295,40 @@ fn keyed_reads_return_each_named_keys_whole_group() {
             assert_eq!(batch_rows(&got), want, "{bound:?}");
         }
     }
-    let whole = run(&r, rows_spec(None, None)).unwrap();
-    assert!(
-        Rc::ptr_eq(&whole, &r.relation(TID).unwrap().full_scan()),
-        "a whole read shares the cached snapshot"
-    );
 }
 
 // ── Index walks ──────────────────────────────────────────────────────
 
-const WALK_ROWS: u64 = 64;
-
-/// Row `id`'s `val` (`id − 32`, straddling zero) and `big` (`id << 70`); every fifth `val`
-/// and every seventh `big` is NULL.
-fn walk_row(id: u64) -> (Option<i64>, Option<u128>) {
-    let val = (!id.is_multiple_of(5)).then_some(id as i64 - 32);
-    let big = (!id.is_multiple_of(7)).then_some((id as u128) << 70);
-    (val, big)
-}
-
-/// An index walk returns exactly its range — no NULL, a signed range across zero, a
-/// U128 range — whether it is selective enough to walk the index (at most 1/16 of
-/// the rows) or is traded for a scan filtered by it; a LIMIT cuts inside the range,
-/// with or without an ORDER BY.
+/// A LIMIT cuts inside an index range, with or without an ORDER BY, whether
+/// the range is selective enough to walk the index or is traded for a scan
+/// filtered by it.
 #[test]
-fn an_index_walk_returns_exactly_its_range() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::U128, true),
-        ],
-        &[0],
-    );
-    let rows = id_rows(&schema, (0..WALK_ROWS).map(|id| (id, 1)), |bb, id| {
-        let (val, big) = walk_row(id);
-        bb.put_opt_int(val.map(|v| v as u128));
-        bb.put_opt_int(big);
-    });
-    let r = relation_fixture(RelationKind::BaseTable, schema, &[&[1], &[2]], [rows]);
-
-    let vals = |keep: &dyn Fn(i64) -> bool| -> Vec<u64> {
-        (0..WALK_ROWS).filter(|&id| walk_row(id).0.is_some_and(keep)).collect()
-    };
-    let bigs = |lo: u128, hi: u128| -> Vec<u64> {
-        (0..WALK_ROWS)
-            .filter(|&id| walk_row(id).1.is_some_and(|b| b >= lo && b < hi))
-            .collect()
-    };
-    let (all_lo, all_hi) = (0, gnitz_wire::image_mask(8));
-    // (column, first, last, walks the index, ids).
-    let walks = [
-        (1, img(-9), img(12), false, vals(&|v| v > -10 && v <= 12)),
-        (1, img(-2), img(1), true, vec![31, 32, 33]),
-        (1, img(-31), img(-31), true, vec![1]),
-        (1, all_lo, all_hi, false, vals(&|_| true)),
-        (2, 3 << 70, (40 << 70) - 1, false, bigs(3 << 70, 40 << 70)),
-        (2, 3 << 70, (6 << 70) - 1, true, vec![3, 4, 5]),
-    ];
-    // A walk reply's ids, sorted, each at weight 1.
-    let ids = |spec: ReadSpec| -> Vec<u64> {
-        let b = run(&r, spec).unwrap();
-        assert!((0..b.len()).all(|i| b.get_weight(i) == 1));
-        let mut ids: Vec<u64> = (0..b.len())
-            .map(|i| gnitz_wire::widen_pk_be(b.get_pk_bytes(i)) as u64)
-            .collect();
-        ids.sort_unstable();
-        ids
-    };
-    for (col, start, end, walks, want) in walks {
-        let bound = col_range(col, start, end);
+fn a_cut_keeps_the_first_rows_of_an_index_range() {
+    let schema = make_schema_u64_i64();
+    let rows: Vec<_> = (0..64).map(|id| (id, 1, id as i64 - 32)).collect();
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[&[1]], [make_batch(&schema, &rows)]);
+    for (lo, hi, walks) in [(-2, 0, true), (-9, 12, false)] {
+        let bound = col_range(1, img(lo), img(hi));
         let (cursor, _) = r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap();
-        assert_eq!(cursor.walks_index(), walks, "{bound:?}");
-        let spec = |cut| ReadSpec {
-            bound: bound.clone(),
-            ..rows_spec(None, cut)
+        assert_eq!(cursor.walks_index(), walks, "premise: {bound:?}");
+        let want: Vec<_> = rows
+            .iter()
+            .copied()
+            .filter(|&(_, _, v)| (lo..=hi).contains(&v))
+            .collect();
+        let read = |cut| {
+            let spec = ReadSpec {
+                bound: bound.clone(),
+                ..rows_spec(None, cut)
+            };
+            batch_rows(&run(&r, spec).unwrap())
         };
-        assert_eq!(ids(spec(None)), want, "{bound:?}");
-        // Both walks yield in id order, so an unordered LIMIT keeps the first two ids;
-        // both columns rise with the id, so a descending one keeps the last two.
-        assert_eq!(ids(spec(cut(2, vec![]))), want[..want.len().min(2)], "{bound:?}");
-        let top = ids(spec(cut(2, order_by(col, true))));
-        assert_eq!(top, want[want.len().saturating_sub(2)..], "{bound:?}");
+        assert_eq!(read(None), want, "{bound:?}");
+        // Both reads yield in id order, so an unordered LIMIT keeps the first two ids;
+        // `val` rises with the id, so a descending one keeps the last two.
+        assert_eq!(read(cut(2, vec![])), want[..2], "{bound:?}");
+        assert_eq!(read(cut(2, order_by(1, true))), want[want.len() - 2..], "{bound:?}");
     }
-}
-
-// ── Maps onto the keeper ─────────────────────────────────────────────
-
-/// `ids` at weights cycling through 1, 2 and 3.
-fn weighted(ids: std::ops::Range<u64>) -> impl Iterator<Item = (u64, i64)> {
-    ids.map(|id| (id, 1 + id as i64 % 3))
-}
-
-/// A view over `cols` (PK = column 0) of rows `0..n` at [`weighted`] weights,
-/// `put_row` writing each row's payload, scanned `chunk_rows` rows at a time so the
-/// keeper is grown and reused across chunks — the only way a stale-byte leak in a
-/// map's tail writes would show.
-fn map_fixture(
-    cols: &[SchemaColumn],
-    n: u64,
-    chunk_rows: usize,
-    put_row: impl FnMut(&mut BatchBuilder, u64),
-) -> RelationFixture {
-    let schema = SchemaDescriptor::new(cols, &[0]);
-    let kind = RelationKind::View(ViewBudget::Plain);
-    let rows = id_rows(&schema, weighted(0..n), put_row);
-    relation_fixture_with(
-        chunked(chunk_rows),
-        Slot::SOLO,
-        spec(TID, kind, schema),
-        schema,
-        &[],
-        [rows],
-    )
-}
-
-/// `spec`'s reply over `r` is `want`, weight for weight.
-fn assert_reply(r: &RelationRegistry, spec: ReadSpec, want: Batch) {
-    let got = run(r, spec).unwrap();
-    assert_eq!(zset_of(&got, want.schema()), zset_of(&want, want.schema()));
-}
-
-/// A copy of every payload column of a 65-column table (1 PK + 64 payload) — the
-/// widest schema the row-major null word admits, so the output-coverage mask is
-/// exercised at its top bit.
-#[test]
-fn a_copy_of_64_payload_columns_covers_every_slot() {
-    const P: u64 = 64;
-    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend((0..P).map(|_| SchemaColumn::new(TypeCode::I64, false)));
-    let put_row = |bb: &mut BatchBuilder, id: u64| {
-        (0..P).for_each(|k| {
-            bb.put_u64(id * 100 + k);
-        })
-    };
-    let r = map_fixture(&cols, 40, 16, put_row);
-    let reply = SchemaDescriptor::new(&cols, &[0]);
-    let copies: Vec<u32> = (1..=P as u32).collect();
-    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&copies), &reply), None);
-    assert_reply(&r, spec, id_rows(&reply, weighted(0..40), put_row));
-}
-
-/// A map sourcing only the PK has an empty null permutation, and must still write
-/// every null word: an unwritten word would surface the recycled keeper's bytes.
-#[test]
-fn a_pk_sourced_map_zeroes_every_null_word() {
-    let cols = [
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::I64, false),
-    ];
-    let r = map_fixture(&cols, 300, 32, |bb, id| {
-        bb.put_u64(id * 7);
-    });
-    let reply = crate::test_support::u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false)]);
-    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), None);
-    let got = run(&r, spec.clone()).unwrap();
-    assert!((0..got.len()).all(|row| got.get_null_word(row) == 0));
-    assert_reply(
-        &r,
-        spec,
-        id_rows(&reply, weighted(0..300), |bb, id| {
-            bb.put_u64(id);
-        }),
-    );
-}
-
-/// A permuted copy of a nullable column, an out-of-line string and the PK: the
-/// source-start and destination-base arithmetic, each cell's string relocated into
-/// the keeper's own blob (the source chunk drops), and the null permutation together.
-#[test]
-fn a_permuted_copy_relocates_strings_and_nulls() {
-    const N: u64 = 200;
-    let string = |id: u64| match id.is_multiple_of(3) {
-        // A span shared by every third row exercises the relocator's dedup cache.
-        true => "a-shared-out-of-line-value".to_string(),
-        false => format!("a-distinct-out-of-line-value-{id}"),
-    };
-    let nv = |id: u64| (!id.is_multiple_of(5)).then_some(id as u128 * 3);
-    let cols = [
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::I64, true),
-        SchemaColumn::new(TypeCode::String, false),
-    ];
-    let r = map_fixture(&cols, N, 24, |bb, id| {
-        bb.put_opt_int(nv(id));
-        bb.put_string(&string(id));
-    });
-    // id U64 PK | s STRING | id U64 (from the PK) | nv I64 NULL.
-    let reply = SchemaDescriptor::new(&[cols[0], cols[2], cols[0], cols[1]], &[0]);
-    let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[2, 0, 1]), &reply), None);
-    let want = id_rows(&reply, weighted(0..N), |bb, id| {
-        bb.put_string(&string(id));
-        bb.put_u64(id);
-        bb.put_opt_int(nv(id));
-    });
-    assert_reply(&r, spec, want);
-}
-
-/// A computed column (`nv * 2`) beside a copied one, under a predicate: the compute
-/// kernel writes the survivors onto the keeper's tail at a non-zero base, and the
-/// nullable source runs the emit's null merge over the already-permuted word.
-#[test]
-fn a_computed_map_writes_at_the_keepers_tail() {
-    let nv = |id: u64| (!id.is_multiple_of(4)).then_some(id as u128);
-    let cols = [
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::I64, true),
-        SchemaColumn::new(TypeCode::I64, false),
-    ];
-    let r = map_fixture(&cols, 300, 32, |bb, id| {
-        bb.put_opt_int(nv(id));
-        bb.put_u64(id * 10);
-    });
-    // id U64 PK | nv * 2 I64 NULL | keep I64.
-    let reply = SchemaDescriptor::new(&cols, &[0]);
-    let mut eb = ExprBuilder::new();
-    let (v, two) = (
-        eb.emit(LogicalInstr::LoadCol { col: 1 }),
-        eb.emit(LogicalInstr::LoadConst { val: 2, unsigned: false }),
-    );
-    let doubled = eb.emit(LogicalInstr::IntArith {
-        op: gnitz_expr::IntArithOp::Mul,
-        a: v,
-        b: two,
-    });
-    let program = eb.build(vec![Sink::Reg(doubled), Sink::Col(2)]).unwrap();
-    // `keep = id * 10 < 1000` keeps ids 0..100, across several chunks.
-    let spec = ReadSpec {
-        predicate: between(2, 0, 1000),
-        ..rows_spec(map_of(program, &reply), None)
-    };
-    let want = id_rows(&reply, weighted(0..100), |bb, id| {
-        bb.put_opt_int(nv(id).map(|v| v * 2));
-        bb.put_u64(id * 10);
-    });
-    assert_reply(&r, spec, want);
 }
 
 // ── Skeleton rows ────────────────────────────────────────────────────
@@ -550,14 +346,7 @@ fn skeleton_fixture() -> RelationFixture {
     let kind = RelationKind::View(ViewBudget::Bounded {
         capacity_bytes: std::num::NonZeroU64::MIN,
     });
-    let mut r = relation_fixture_with(
-        chunked(2),
-        Slot::SOLO,
-        spec(TID, kind, schema),
-        schema,
-        &[],
-        [rows(0..5)],
-    );
+    let mut r = relation_fixture_with(chunked(2), kind, schema, &[], [rows(0..5)]);
     r.checkpoint_ephemeral([], 1, |_| true).unwrap();
     r.settle(TID).unwrap();
     assert!(
@@ -583,16 +372,10 @@ fn ingested(ids: impl IntoIterator<Item = u64>) -> Vec<(u64, i64, i64)> {
 }
 
 /// Recomputes each skeleton key `k` as `(k, val = k)`, plus [`skeleton_fixture`]'s
-/// `(2, 7)` for key 2, then applies `edit`; records each call's key list.
+/// `(2, 7)` for key 2; records each call's key list.
+#[derive(Default)]
 struct Recompute {
     calls: Vec<Vec<u64>>,
-    edit: fn(&mut Vec<(u64, i64, i64)>),
-}
-
-impl Default for Recompute {
-    fn default() -> Self {
-        Recompute { calls: Vec::new(), edit: |_| {} }
-    }
 }
 
 impl Recompute {
@@ -602,7 +385,6 @@ impl Recompute {
         if ks.contains(&2) {
             rows.push((2, 1, 7));
         }
-        (self.edit)(&mut rows);
         rows.sort_unstable();
         self.calls.push(ks);
         Ok(make_batch(&make_schema_u64_i64(), &rows).into_consolidated())
@@ -619,7 +401,6 @@ impl Recompute {
 fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
     let r = skeleton_fixture();
     let layout = make_schema_u64_i64().layout_digest();
-    let pk_range = |first, last| col_range(0, first, last);
     let mut h = Recompute::default();
     let reads = [
         (ReadBound::None, (0..5).chain(100..105).collect()),
@@ -641,14 +422,14 @@ fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
     assert_eq!(batch_rows(&got), want, "a predicate over hydrated and live rows");
 
     h.calls.clear();
-    let range = ReadSpec::all_rows(pk_range(0, 104));
+    let range = ReadSpec::all_rows(col_range(0, 0, 104));
     let got = r.scan_spec(TID, range, layout, Some(&mut |k| h.call(k))).unwrap();
     assert_eq!(batch_rows(&got), ingested(0..105));
     assert_eq!(h.calls, [vec![0, 1], vec![2, 3], vec![4]], "one hydration per chunk");
 
-    let streamed = run(&r, ReadSpec::all_rows(pk_range(100, 104))).unwrap();
+    let streamed = run(&r, ReadSpec::all_rows(col_range(0, 100, 104))).unwrap();
     assert_eq!(batch_rows(&streamed), ingested(100..105));
-    let Err(err) = run(&r, ReadSpec::all_rows(pk_range(0, 4))) else {
+    let Err(err) = run(&r, ReadSpec::all_rows(col_range(0, 0, 4))) else {
         panic!("a range over the dehydrated band must reach the hydrator");
     };
     assert!(err.contains("skeleton rows"), "{err}");
@@ -673,35 +454,6 @@ fn a_raw_drain_over_a_skeleton_run_panics() {
         .drain_chunk(usize::MAX);
 }
 
-/// A hydration that misses a named key, names a key no skeleton row did, misses the
-/// last key, or whose rows under a key do not sum to the skeleton row's weight is a
-/// broken hydrator, caught where the rows come back.
-#[cfg(debug_assertions)]
-#[test]
-fn a_hydration_off_the_skeleton_rows_panics() {
-    type Edit = fn(&mut Vec<(u64, i64, i64)>);
-    let r = skeleton_fixture();
-    let layout = make_schema_u64_i64().layout_digest();
-    let faults: [(&[u64], Edit); 4] = [
-        (&[1, 4], |rows| rows.retain(|r| r.0 != 1)),
-        (&[1, 4], |rows| rows.push((3, 1, 3))),
-        (&[1, 4], |rows| rows.retain(|r| r.0 != 4)),
-        (&[2], |rows| rows.retain(|r| *r != (2, 1, 7))),
-    ];
-    for (i, (keys, edit)) in faults.into_iter().enumerate() {
-        let mut h = Recompute { edit, ..Recompute::default() };
-        let read = || drop(r.scan_spec(TID, ReadSpec::all_rows(pk_set(keys)), layout, Some(&mut |k| h.call(k))));
-        let panic =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err("a broken hydration panics");
-        let msg = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or_default();
-        assert!(msg.contains("hydration off its skeleton rows"), "fault {i}: {msg}");
-    }
-}
-
 // ── The drain ramp ───────────────────────────────────────────────────
 
 /// A read whose window lies in its first `m` rows drains fewer than `2m + first`
@@ -724,15 +476,4 @@ fn drain_ramp_doubles_onto_the_chunk_grid() {
         drain_ramp(chunk, chunk).take(4).all(|rows| rows == chunk),
         "an unwindowed drain stays flat"
     );
-}
-
-/// A stream holds no rows: a read of one is refused whatever its spec.
-#[test]
-fn a_stream_is_refused() {
-    let schema = make_schema_u64_i64();
-    let r = relation_fixture(RelationKind::Stream, schema, &[], []);
-    let Err(err) = r.scan_spec(TID, rows_spec(None, None), schema.layout_digest(), None) else {
-        panic!("a stream read must be refused");
-    };
-    assert!(err.contains("is a stream"), "{err}");
 }

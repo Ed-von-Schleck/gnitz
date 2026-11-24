@@ -147,18 +147,22 @@ pub(crate) fn relation_fixture(
     indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
-    relation_fixture_with(
-        StoreConfig::default(),
-        Slot::SOLO,
-        spec(TID, kind, schema),
-        schema,
-        indexed,
-        rounds,
-    )
+    relation_fixture_with(StoreConfig::default(), kind, schema, indexed, rounds)
 }
 
-/// [`relation_fixture`] under `config`, at `slot`, registered as `spec`.
+/// [`relation_fixture`] under `config`.
 pub(crate) fn relation_fixture_with(
+    config: StoreConfig,
+    kind: RelationKind,
+    schema: SchemaDescriptor,
+    indexed: &[&[u32]],
+    rounds: impl IntoIterator<Item = Batch>,
+) -> RelationFixture {
+    registered_fixture(config, Slot::SOLO, spec(TID, kind, schema), schema, indexed, rounds)
+}
+
+/// [`relation_fixture_with`] at `slot`, registered as `spec`.
+pub(crate) fn registered_fixture(
     config: StoreConfig,
     slot: Slot,
     spec: RelationSpec,

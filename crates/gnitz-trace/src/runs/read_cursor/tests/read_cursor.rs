@@ -2,15 +2,15 @@ use super::*;
 use crate::runs::MappedShard;
 use crate::runs::ShardWriteOpts;
 use crate::test_support::{
-    RowKey, arb_fold_case, assert_folds, certified, fold_batch, make_batch, make_batch_u128,
+    RowKey, arb_fold_case, assert_folds, assert_skips_as_zeroes, certified, fold_batch, make_batch, make_batch_u128,
     make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64, map_shard, payload0_i64, row_key,
-    u64_pk_schema, weighted_rows, zset_of,
+    skipping_rounds, skipping_schema, u64_pk_schema, weighted_rows, zset_of,
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::{PkKeys, TypeCode};
 use gnitz_zset::repr::ColumnarSource;
 use gnitz_zset::repr::{Batch, BatchBuilder, MAX_POOLED_BYTES, gather_rows, with_picks};
-use gnitz_zset::schema::SchemaColumn;
+use gnitz_zset::schema::{SchemaColumn, pk_keys_of_images};
 use proptest::prelude::*;
 use std::rc::Rc;
 
@@ -710,114 +710,42 @@ proptest! {
     }
 }
 
-/// Generation `generation` of key `pk` over [`skipping_schema`]: a nullable
-/// I64, a heap STRING and an I64.
-fn put_skipping_row(bb: &mut BatchBuilder, pk: u64, generation: u64, weight: i64) {
-    bb.begin_row(pk as u128, weight);
-    bb.put_opt_int((pk % 3 != 1).then_some((pk * 10 + generation) as u128));
-    bb.put_string(&format!("{pk:0>24}/{generation}"));
-    bb.put_int((pk + generation) as u128);
-    bb.end_row();
-}
-
-fn skipping_schema() -> SchemaDescriptor {
-    u64_pk_schema(&[
-        SchemaColumn::new(TypeCode::I64, true),
-        SchemaColumn::new(TypeCode::String, false),
-        SchemaColumn::new(TypeCode::I64, false),
-    ])
-}
-
-/// A drain that skips payload columns emits the rows and weights of one that
-/// does not, every kept cell as it, and each skipped cell as a zero that is
-/// not NULL: through the merge of shards and a heap run, through the
+/// A drain that skips payload columns writes each skipped cell as a zero that
+/// is not NULL: through the merge of shards and a heap run, through the
 /// single-source slice of one shard, and through the gather of a key list
 /// over the merge.
 #[test]
 fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     let dir = tempfile::tempdir().unwrap();
     let schema = skipping_schema();
-    let run = |rows: Vec<(u64, u64, i64)>| {
-        let mut bb = BatchBuilder::new(&schema);
-        for (pk, generation, w) in rows {
-            put_skipping_row(&mut bb, pk, generation, w);
-        }
-        bb.finish().into_consolidated()
-    };
-    // Every key at generation 0; a newer shard rewrites every third key, which
-    // ties it across the shards, and a heap run deletes every tenth.
-    let latest = |pk: u64| u64::from(pk.is_multiple_of(3));
-    let old = map_shard(
-        &dir.path().join("old.db"),
-        &run((0..200).map(|pk| (pk, 0, 1)).collect()),
+    // A newer shard rewrites every third key, which ties it across the
+    // shards, and a heap run deletes every tenth.
+    let [old, new, gone] = skipping_rounds(200);
+    let (old, new) = (
+        map_shard(&dir.path().join("old.db"), &old),
+        map_shard(&dir.path().join("new.db"), &new),
     );
-    let new = map_shard(
-        &dir.path().join("new.db"),
-        &run((0..200).step_by(3).flat_map(|pk| [(pk, 0, -1), (pk, 1, 1)]).collect()),
-    );
-    let gone = Rc::new(run((0..200).step_by(10).map(|pk| (pk, latest(pk), -1)).collect()));
-
+    let gone = Rc::new(gone);
     let merged = || create_read_cursor(&[Rc::clone(&gone)], &[Rc::clone(&old), Rc::clone(&new)], schema);
-    // Every other key, the deleted ones among them.
-    let keys = || {
-        PkKeys::from_sorted(
-            8,
-            (0..200u64).step_by(2).flat_map(u64::to_be_bytes).collect::<Vec<u8>>(),
-        )
-    };
-    let drain = |label, skip| -> Vec<Batch> {
-        let mut c = match label {
-            "single" => create_read_cursor(&[], &[Rc::clone(&old)], schema),
-            _ => merged(),
-        };
-        c.skip_payload(skip);
-        if label != "pk set" {
-            return std::iter::from_fn(|| c.drain_chunk(64)).collect();
-        }
-        let mut g = PkSetGather::over(c, keys());
-        std::iter::from_fn(|| g.drain_chunk(64)).collect()
-    };
     assert!(
         create_read_cursor(&[], &[Rc::clone(&old)], schema).mode.is_some(),
         "one source drains through the single-source copy"
     );
     for label in ["merged", "single", "pk set"] {
-        let want = drain(label, 0);
-        assert!(!want.is_empty(), "{label}: rows");
-        for skip in [0b001, 0b010, 0b011, 0b110] {
-            let got = drain(label, skip);
-            assert_eq!(got.len(), want.len(), "{label} {skip:#b}: chunks");
-            for (g, w) in got.iter().zip(&want) {
-                assert_eq!(g.len(), w.len(), "{label} {skip:#b}: rows");
-                assert!(g.is_consolidated(), "{label} {skip:#b}");
-                for i in 0..g.len() {
-                    assert_eq!(
-                        (g.get_pk_bytes(i), g.get_weight(i)),
-                        (w.get_pk_bytes(i), w.get_weight(i))
-                    );
-                    for pi in 0..3 {
-                        let null = |b: &Batch| gnitz_wire::null_word_get(b.get_null_word(i), pi);
-                        let cell = |b: &Batch| match pi {
-                            1 => gnitz_wire::payload_bytes(b, i, pi).into_owned(),
-                            _ => gnitz_wire::payload_u64(b, i, pi).to_le_bytes().to_vec(),
-                        };
-                        if skip >> pi & 1 == 1 {
-                            assert!(!null(g), "{label} {skip:#b}: row {i} column {pi} is NULL");
-                            assert!(
-                                cell(g).iter().all(|&b| b == 0),
-                                "{label} {skip:#b}: row {i} column {pi}"
-                            );
-                        } else {
-                            assert_eq!(
-                                (null(g), cell(g)),
-                                (null(w), cell(w)),
-                                "{label} {skip:#b}: row {i} column {pi}"
-                            );
-                        }
-                    }
-                }
+        let drain = |skip| -> Vec<Batch> {
+            let mut c = match label {
+                "single" => create_read_cursor(&[], &[Rc::clone(&old)], schema),
+                _ => merged(),
+            };
+            c.skip_payload(skip);
+            if label != "pk set" {
+                return std::iter::from_fn(|| c.drain_chunk(64)).collect();
             }
-        }
+            // Every other key, the deleted ones among them.
+            let mut g = PkSetGather::over(c, pk_keys_of_images(8, (0..200).step_by(2)));
+            std::iter::from_fn(|| g.drain_chunk(64)).collect()
+        };
+        assert_skips_as_zeroes(drain, label);
     }
 }
 
@@ -1092,5 +1020,30 @@ fn pick_scratch_interleaves_across_kernels() {
             weighted_rows(&out),
             weighted_rows(&certified(make_batch(&schema, &[(100, 1, 0)])))
         );
+    }
+}
+
+/// A hydration that misses a key asked, names a key not asked, misses the last
+/// key, or whose rows under a key do not sum to its skeleton row's weight trips
+/// the tripwire; one that matches does not.
+#[cfg(debug_assertions)]
+#[test]
+fn a_hydration_off_its_skeleton_rows_trips() {
+    let schema = make_schema_u64_i64();
+    let (keys, coarse) = (pk_keys_of_images(8, [1, 4]), [1, 2]);
+    let check = |rows: &[(u64, i64, i64)]| {
+        let out = make_batch(&schema, rows).into_consolidated();
+        std::panic::catch_unwind(|| assert_hydration_matches(&out, &keys, &coarse))
+    };
+    assert!(check(&[(1, 1, 1), (4, 1, 4), (4, 1, 5)]).is_ok());
+    for rows in [
+        &[(4, 2, 4)][..],
+        &[(1, 1, 1), (3, 1, 3), (4, 2, 4)],
+        &[(1, 1, 1)],
+        &[(1, 1, 1), (4, 1, 4)],
+    ] {
+        let panic = check(rows).expect_err("a broken hydration trips");
+        let msg = panic.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(msg.contains("hydration off its skeleton rows"), "{rows:?}: {msg}");
     }
 }

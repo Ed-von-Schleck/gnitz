@@ -120,6 +120,24 @@ fn a_string_projection_moves_content_and_leaves_a_dead_heap() {
     assert!(dropped.blob().len() < batch.blob().len(), "the dropped column's heap");
 }
 
+/// A copy of 64 payload columns, as many as a null word has bits, carries
+/// every slot's value and NULL, the top slot's included.
+#[test]
+fn a_copy_of_64_payload_columns_carries_every_slot() {
+    let s = make_schema(&[TypeCode::U64; 65]);
+    let mut b = BatchBuilder::new(&s);
+    for i in 0..40u64 {
+        b.begin_row(i as u128, 1 + i as i64 % 3);
+        for k in 0..64 {
+            b.put_opt_int((!(i + k).is_multiple_of(5)).then_some((i * 100 + k) as u128));
+        }
+        b.end_row();
+    }
+    let src = b.finish();
+    let out = project(&s, &(1..=64).collect::<Vec<_>>()).evaluate_map_batch(&src.as_mem_batch());
+    assert_eq!(weighted_rows(&out), weighted_rows(&src));
+}
+
 /// A copied column holds each row's value in its slot — a PK column decoded
 /// from its OPK image, a narrow column sign- or zero-extended by its own
 /// signedness into a wider slot — whether it is the whole PK, one column of a

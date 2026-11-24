@@ -18,8 +18,7 @@ use crate::test_support::{
 };
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{
-    AggDescriptor, AggFunc, ComputeMap, GroupAggs, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode,
-    ViewBudget,
+    AggDescriptor, AggFunc, ComputeMap, GroupAggs, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode, ViewBudget,
 };
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
@@ -37,16 +36,30 @@ fn schema(payload: &[TypeCode]) -> SchemaDescriptor {
     )
 }
 
-/// A base table over [`schema`]`(payload)`, indexed on `indexed`, holding ids
-/// `0..ROWS` at weight 1 as one run of the RAM tier. `put_row` writes a row's
-/// payload.
-fn fixture(payload: &[TypeCode], indexed: &[&[u32]], put_row: impl FnMut(&mut BatchBuilder, u64)) -> RelationFixture {
+/// A `kind` relation over [`schema`]`(payload)`, indexed on `indexed`, holding
+/// ids `0..ROWS` at weight 1 as one run of the RAM tier. `put_row` writes a
+/// row's payload.
+fn fixture(
+    kind: RelationKind,
+    payload: &[TypeCode],
+    indexed: &[&[u32]],
+    put_row: impl FnMut(&mut BatchBuilder, u64),
+) -> RelationFixture {
     let schema = schema(payload);
     let rows = id_rows(&schema, (0..ROWS).map(|id| (id, 1)), put_row);
-    let r = relation_fixture(RelationKind::BaseTable, schema, indexed, [rows]);
+    let r = relation_fixture(kind, schema, indexed, [rows]);
     let table = r.relation(TID).unwrap().table();
     assert_eq!((table_shards(table).len(), table.runs().count()), (0, 1));
     r
+}
+
+/// Row `id` of the four-column fixture: `c0 = id % 512 | c1 = id % 2 | c2, a
+/// permutation of the ids | c3 = id / 7`.
+fn put_c(bb: &mut BatchBuilder, id: u64) {
+    bb.put_u64(id % 512);
+    bb.put_u64(id % 2);
+    bb.put_u64(id * 179_999 % ROWS);
+    bb.put_u64(id / 7);
 }
 
 /// `col < lit` over a fixed-int column, as a wire predicate.
@@ -85,14 +98,8 @@ fn scan_spec_bench() {
         );
     };
 
-    // `id | c0 = id % 512 | c1 = id % 2 | c2, a permutation of the ids | c3 = id / 7`,
-    // indexed on `c2`.
-    let r = fixture(&[I64; 4], &[&[3]], |bb, id| {
-        bb.put_u64(id % 512);
-        bb.put_u64(id % 2);
-        bb.put_u64(id * 179_999 % ROWS);
-        bb.put_u64(id / 7);
-    });
+    // [`put_c`]'s rows, indexed on `c2`.
+    let r = fixture(RelationKind::BaseTable, &[I64; 4], &[&[3]], put_c);
 
     // `c2, c3, c0`.
     let copy = map_of(LogicalProgram::copy_cols(&[3, 4, 1]), &schema(&[I64; 3]));
@@ -178,27 +185,25 @@ fn scan_spec_bench() {
     );
 
     // The widest range of `c2` the index is walked for, and one row wider,
-    // which scans the table under the range.
-    for (label, width, walks) in [
-        ("range, index walk", ROWS / 16, true),
-        ("range, filtered scan", ROWS / 16 + 1, false),
-    ] {
-        let bound = col_range(3, img(0), img(width as i64 - 1));
-        let (source, _) = r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap();
-        assert_eq!(source.walks_index(), walks, "{label}");
-        cell(label, &r, ReadSpec::all_rows(bound), width, width);
+    // which scans the store under the range: a table probes each entry's row,
+    // a view gathers it off a merge cursor.
+    let view = fixture(RelationKind::View(ViewBudget::Plain), &[I64; 4], &[&[3]], put_c);
+    for (name, r) in [("table", &r), ("view", &view)] {
+        for (what, width, walks) in [("index walk", ROWS / 16, true), ("filtered scan", ROWS / 16 + 1, false)] {
+            let label = format!("range, {what}, {name}");
+            let bound = col_range(3, img(0), img(width as i64 - 1));
+            let (source, _) = r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap();
+            assert_eq!(source.walks_index(), walks, "{label}");
+            cell(&label, r, ReadSpec::all_rows(bound), width, width);
+        }
     }
+    drop(view);
 
     // The same rows, the even ids in a shard and the odd ones in the RAM tier, so
     // every drain merges the two.
     let half = |parity| {
         let rows = (parity..ROWS).step_by(2).map(|id| (id, 1));
-        id_rows(&schema(&[I64; 4]), rows, |bb, id| {
-            bb.put_u64(id % 512);
-            bb.put_u64(id % 2);
-            bb.put_u64(id * 179_999 % ROWS);
-            bb.put_u64(id / 7);
-        })
+        id_rows(&schema(&[I64; 4]), rows, put_c)
     };
     let mut r = relation_fixture(RelationKind::BaseTable, schema(&[I64; 4]), &[], [half(0)]);
     r.checkpoint_base().unwrap();
@@ -215,7 +220,7 @@ fn scan_spec_bench() {
     // `id | s | c1 = id % 2`: of the rows `c1 < 1` keeps, every other `s` is
     // out of line.
     let strings = [TypeCode::String, I64];
-    let r = fixture(&strings, &[], |bb, id| {
+    let r = fixture(RelationKind::BaseTable, &strings, &[], |bb, id| {
         match id % 4 < 2 {
             true => {
                 bb.put_string(&format!("a-fairly-long-out-of-line-value-{id}"));
@@ -244,10 +249,7 @@ fn scan_spec_bench() {
             let label = |what: &str| format!("{what}, wide {name}, {shards} shard(s)");
             let filtered = |spec: ReadSpec| ReadSpec { predicate: lt(2, 1), ..spec };
             let keyed = |spec: ReadSpec| ReadSpec {
-                bound: ReadBound::PkSet(PkKeys::from_sorted(
-                    8,
-                    (0..ROWS).step_by(16).flat_map(u64::to_be_bytes).collect::<Vec<u8>>(),
-                )),
+                bound: ReadBound::PkSet(pk_keys_of_images(8, (0..ROWS).step_by(16).map(u128::from))),
                 ..spec
             };
             cell(

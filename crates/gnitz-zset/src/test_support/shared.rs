@@ -250,6 +250,72 @@ pub fn weighted_rows(batch: &Batch) -> Vec<(RowKey, i64)> {
         .collect()
 }
 
+/// `(id U64 PK | a I64 NULL | s STRING | v I64)`, whose drains skip a nullable
+/// fixed column, a heap string and a NOT NULL fixed column: see
+/// [`assert_skips_as_zeroes`].
+pub fn skipping_schema() -> SchemaDescriptor {
+    u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::I64, false),
+    ])
+}
+
+/// Three consolidated rounds of keys `0..n` over [`skipping_schema`]: every key
+/// at generation 0; every third key rewritten to generation 1; every tenth key
+/// deleted. Generation `g` of key `pk` is `a = v = pk * 10 + g`, NULL in `a`
+/// for every third key.
+pub fn skipping_rounds(n: u64) -> [Batch; 3] {
+    let run = |rows: &mut dyn Iterator<Item = (u64, u64, i64)>| {
+        let mut bb = BatchBuilder::new(&skipping_schema());
+        for (pk, generation, w) in rows {
+            let v = (pk * 10 + generation) as u128;
+            bb.begin_row(pk as u128, w);
+            bb.put_opt_int((pk % 3 != 1).then_some(v));
+            bb.put_string(&format!("{pk:0>24}/{generation}"));
+            bb.put_int(v);
+            bb.end_row();
+        }
+        bb.finish().into_consolidated()
+    };
+    let latest = |pk: u64| u64::from(pk.is_multiple_of(3));
+    [
+        run(&mut (0..n).map(|pk| (pk, 0, 1))),
+        run(&mut (0..n).step_by(3).flat_map(|pk| [(pk, 0, -1), (pk, 1, 1)])),
+        run(&mut (0..n).step_by(10).map(|pk| (pk, latest(pk), -1))),
+    ]
+}
+
+/// A drain over [`skipping_schema`] rows that skips payload columns emits the
+/// chunks of one that skips none — consolidated, row for row and weight for
+/// weight, every kept cell as it — and each skipped cell as a zero that is not
+/// NULL. `drain(skip)` drains the source skipping the payload slots `skip` names.
+pub fn assert_skips_as_zeroes(drain: impl Fn(u64) -> Vec<Batch>, what: &str) {
+    let schema = skipping_schema();
+    let want = drain(0);
+    assert!(!want.is_empty(), "{what}: rows");
+    for skip in [0b001, 0b010, 0b011, 0b110] {
+        let got = drain(skip);
+        assert_eq!(got.len(), want.len(), "{what} {skip:#b}: chunks");
+        for (g, w) in got.iter().zip(&want) {
+            assert!(g.is_consolidated(), "{what} {skip:#b}");
+            let zeroed: Vec<(RowKey, i64)> = (weighted_rows(w).into_iter())
+                .map(|((pk, mut vals), weight)| {
+                    for (pi, col) in schema.payload_columns().filter(|&(pi, _)| skip >> pi & 1 == 1) {
+                        let zero = match col.type_code.is_german_string() {
+                            true => 0,
+                            false => col.type_code.wire_stride(),
+                        };
+                        vals[pi] = Some(vec![0; zero]);
+                    }
+                    ((pk, vals), weight)
+                })
+                .collect();
+            assert_eq!(weighted_rows(g), zeroed, "{what} {skip:#b}");
+        }
+    }
+}
+
 /// Whether the kind admits the pair of PK regions `(dpk, tpk)`. `rel` relates the
 /// **left** slot to the right one, so the delta's side decides the operand order.
 fn join_pair_matches(kind: gnitz_wire::JoinKind, delta_is_right: bool, eq_size: usize, dpk: &[u8], tpk: &[u8]) -> bool {

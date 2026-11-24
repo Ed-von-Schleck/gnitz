@@ -39,30 +39,29 @@ impl RelationRegistry {
     pub fn probe(&self, id: u64, probe: Probe, keys: PkKeys) -> Result<Batch, String> {
         let relation = self.relation_or_err(id)?;
         let keyed_as = |stride| check_stride("probe", id, keys.stride(), stride);
-        let out_schema = relation.probe_reply_schema(probe)?;
-        let cols = match probe {
-            Probe::Pk { read } => read_cols(&relation.schema(), read),
+        let schema = relation.schema();
+        match probe {
             Probe::Index(cols, cap) => {
                 let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.
                 keyed_as(index.key_spec().key_size())?;
-                let store = index.entry_store(relation);
-                let mut gather = store.gather(keys, Cut::Now);
-                // An entry is its row's key, so no payload column is read.
-                gather.skip_payload(store.schema().payload_slots());
-                let mut entries = Batch::empty_with_schema(&out_schema);
+                let mut gather = index.entry_store(relation).gather(keys, Cut::Now);
+                let mut entries = Batch::empty_with_schema(&index.key_spec().index_schema(&schema));
                 let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
                 gather.for_each_positive_capped(cap, |c| entries.push_key_row(c.current_pk_bytes(), 1));
-                return Ok(entries);
+                Ok(entries)
             }
-        };
-        keyed_as(relation.schema().pk_stride())?;
-        let table = relation.table_or_err()?;
-        // A PK store probe reads a store whose keys net 0 or 1.
-        if !relation.kind().nets_unit_per_key() {
-            return Err(format!("probe: PK probe of relation {id}, whose keys may net above 1"));
+            Probe::Pk { read } => {
+                let out_schema = relation.probe_reply_schema(probe)?;
+                keyed_as(schema.pk_stride())?;
+                let table = relation.table_or_err()?;
+                // A PK store probe reads a store whose keys net 0 or 1.
+                if !relation.kind().nets_unit_per_key() {
+                    return Err(format!("probe: PK probe of relation {id}, whose keys may net above 1"));
+                }
+                Ok(project_unique(table, &keys, &read_cols(&schema, read), &out_schema))
+            }
         }
-        Ok(project_unique(table, &keys, &cols, &out_schema))
     }
 }
 
@@ -320,10 +319,6 @@ impl UniqueGather<'_> {
     }
 }
 
-/// Every live row of `keys`, a strictly ascending list of whole PKs of
-/// `table`, probed from it, whose every key nets 0 or 1, at weight 1 and
-/// in `out_schema`, the [`project_schema`] layout of `cols`: the PK, then the
-/// payload columns `cols` names. The probe reads the rows `Cut::Now` reads.
 /// The columns of the payload slots `read` names, in slot order.
 fn read_cols(schema: &SchemaDescriptor, read: u64) -> Vec<u32> {
     (0..schema.num_payload_cols())
@@ -332,6 +327,10 @@ fn read_cols(schema: &SchemaDescriptor, read: u64) -> Vec<u32> {
         .collect()
 }
 
+/// Every live row of `keys`, a strictly ascending list of whole PKs of
+/// `table`, probed from it, whose every key nets 0 or 1, at weight 1 and
+/// in `out_schema`, the [`project_schema`] layout of `cols`: the PK, then the
+/// payload columns `cols` names. The probe reads the rows `Cut::Now` reads.
 fn project_unique(table: &Table, keys: &PkKeys, cols: &[u32], out_schema: &SchemaDescriptor) -> Batch {
     let schema = table.schema();
     let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();

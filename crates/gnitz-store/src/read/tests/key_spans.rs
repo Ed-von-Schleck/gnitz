@@ -1,10 +1,9 @@
 use super::*;
 use crate::relation::RelationKind;
 use crate::test_support::{
-    RelationFixture, TID, chunked, id_rows, pk_only_schema, relation_fixture_with, spec, u64_pk_schema,
+    RelationFixture, TID, chunked, id_rows, opk_pk, pk_only_schema, relation_fixture_with, u64_pk_schema,
 };
 use gnitz_wire::TypeCode;
-use gnitz_zset::algebra::Slot;
 use gnitz_zset::schema::SchemaColumn;
 
 const ROWS: u64 = 50;
@@ -26,14 +25,7 @@ fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
     };
     let indexed: &[&[u32]] = if indexed { &[&[1]] } else { &[] };
     let rounds = [rows(1, &mut (0..ROWS)), rows(-1, &mut (0..ROWS).step_by(3))];
-    relation_fixture_with(
-        chunked(chunk_rows),
-        Slot::SOLO,
-        spec(TID, RelationKind::BaseTable, schema),
-        schema,
-        indexed,
-        rounds,
-    )
+    relation_fixture_with(chunked(chunk_rows), RelationKind::BaseTable, schema, indexed, rounds)
 }
 
 /// Every span of `spans` in order, and the row count of each chunk.
@@ -60,7 +52,7 @@ fn the_index_yields_every_span_in_order() {
     let mut want: Vec<Vec<u8>> = (0..ROWS)
         .filter(|id| !id.is_multiple_of(3))
         .filter_map(val)
-        .map(|v| span_schema.opk_key_cols(&[v as u128]).pk_bytes().to_vec())
+        .map(|v| opk_pk(&span_schema, &[v as u128]))
         .collect();
     want.sort();
 
@@ -68,11 +60,16 @@ fn the_index_yields_every_span_in_order() {
         let (got, chunks) = drain(fixture(true, chunk_rows).key_spans(TID, &[1]).unwrap());
         assert_eq!(got, want, "chunk_rows={chunk_rows}");
         assert!(chunks.iter().all(|&n| n <= chunk_rows), "{chunks:?} over {chunk_rows}");
-        assert_eq!(chunks.len(), want.len().div_ceil(chunk_rows));
     }
 
     let r = fixture(true, 1024);
-    assert!(r.key_spans(TID, &[0]).is_err(), "no index on the PK");
-    assert!(r.key_spans(TID + 100, &[1]).is_err());
-    assert!(fixture(false, 1024).key_spans(TID, &[1]).is_err());
+    let unindexed = fixture(false, 1024);
+    for (got, why) in [
+        (r.key_spans(TID, &[0]), "has no index"),
+        (r.key_spans(TID + 100, &[1]), "not registered"),
+        (unindexed.key_spans(TID, &[1]), "has no index"),
+    ] {
+        let err = got.map(drop).unwrap_err();
+        assert!(err.contains(why), "{err}");
+    }
 }

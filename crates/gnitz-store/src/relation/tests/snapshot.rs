@@ -5,7 +5,6 @@ use crate::test_support::{
     spilling,
 };
 use gnitz_wire::snapshot::{MAX_PAGE_ROWS, PageRequest};
-use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::Batch;
 
 fn page(layout: u64, limit: u64) -> PageRequest {
@@ -22,14 +21,7 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     let schema = make_schema_u64_i64();
     let rounds = (0..8).map(|i| round(i * 10, i * 10 + 10, 1));
     // Spilling, so later rounds fold the pinned runs and retire their shards.
-    let mut r = relation_fixture_with(
-        spilling(),
-        Slot::SOLO,
-        spec(TID, RelationKind::BaseTable, schema),
-        schema,
-        &[],
-        rounds,
-    );
+    let mut r = relation_fixture_with(spilling(), RelationKind::BaseTable, schema, &[], rounds);
     r.checkpoint_base().unwrap();
     let layout = schema.layout_digest();
     let before = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());

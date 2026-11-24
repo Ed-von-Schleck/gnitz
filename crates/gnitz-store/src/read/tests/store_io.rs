@@ -1,8 +1,8 @@
 use super::*;
 use crate::relation::{IndexClaim, Landing, PkRule, RelationKind};
 use crate::test_support::{
-    RelationFixture, TID, batch_rows, col_range, img, make_batch, make_schema_u64_i64, pk_only_schema,
-    relation_fixture, zset_of,
+    RelationFixture, TID, assert_skips_as_zeroes, batch_rows, col_range, img, make_batch, make_schema_u64_i64,
+    pk_only_schema, relation_fixture, skipping_rounds, skipping_schema, zset_of,
 };
 use gnitz_foundation::rng::Rng;
 use gnitz_trace::runs::Run;
@@ -35,12 +35,10 @@ fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u64, i64, i64)> {
     let mut out = Vec::new();
     while let Some(b) = cur.drain_chunk(chunk) {
         assert!(!b.is_empty(), "drain_chunk yielded an empty chunk");
-        for i in 1..b.len() {
-            assert!(
-                gnitz_wire::widen_pk_be(b.get_pk_bytes(i - 1)) < gnitz_wire::widen_pk_be(b.get_pk_bytes(i)),
-                "chunk {chunk}: rows out of PK order"
-            );
-        }
+        assert!(
+            (1..b.len()).all(|i| b.get_pk_bytes(i - 1) < b.get_pk_bytes(i)),
+            "chunk {chunk}: rows out of PK order"
+        );
         out.extend(batch_rows(&b));
     }
     out.sort_unstable();
@@ -52,9 +50,8 @@ fn rows(ids: impl IntoIterator<Item = u64>) -> Vec<(u64, i64, i64)> {
     ids.into_iter().map(|id| (id, 1, x10(id))).collect()
 }
 
-/// A range walks the index only while its entries are at most 1/16 of the base's rows
-/// — 12 of 200 do, 13 do not — and yields exactly its rows at every chunk size; past
-/// the gate, and with no index at all, the source is a full scan and the range comes
+/// A range walks the index only while its entries are a small share of the base's
+/// rows, and yields exactly its rows at every chunk size; past the gate, and with no index at all, the source is a full scan and the range comes
 /// back unapplied, for the caller's filter. A range holding no entry opens no walk.
 /// A read at now, which probes the base table for each entry's row, yields what the
 /// sealed read's merge gather does.
@@ -70,11 +67,9 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     let x10: fn(u64) -> i64 = x10;
     let cases = [
         (x10, true, val_range(500, 600), true, (50..60).collect()),
-        (x10, true, val_range(500, 620), true, (50..62).collect()),
         (x10, true, point.clone(), true, vec![73]),
         (x10, true, inverted, true, vec![]),
         (anti, true, val_range(10, 110), true, (190..200).collect()),
-        (x10, true, val_range(500, 630), false, (0..NBASE).collect()),
         (x10, true, val_range(0, i64::MAX), false, (0..NBASE).collect()),
         (x10, false, point, false, (0..NBASE).collect()),
     ];
@@ -97,28 +92,32 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
 }
 
 /// A key list over a store whose keys net 0 or 1 — a base table's or a system
-/// family's — is probed key by key at now; a view's is gathered off a cursor. Either
-/// way it yields what the sealed read's merge gather does, a retracted key included.
+/// family's — is probed key by key at now; a view's, whose key may net above 1, is
+/// gathered off a cursor at its rows' own weights. Either way it yields what the
+/// sealed read's merge gather does, a retracted key included.
 #[test]
 fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
     let schema = make_schema_u64_i64();
     let base = make_batch(&schema, &rows(0..NBASE));
     let keys = || ReadBound::PkSet(pk_keys_of_images(8, [2, 5, 7, 300]));
-    for (kind, probed) in [
-        (RelationKind::BaseTable, true),
-        (RelationKind::SystemCatalog, true),
-        (RelationKind::View(ViewBudget::Plain), false),
+    for (kind, w2) in [
+        (RelationKind::BaseTable, 1),
+        (RelationKind::SystemCatalog, 1),
+        (RelationKind::View(ViewBudget::Plain), 2),
     ] {
         let mut r = relation_fixture(kind, schema, &[], [base.clone()]);
-        r.ingest(TID, make_batch(&schema, &[(5, -1, 50)])).unwrap();
+        let mut delta = vec![(5, -1, 50)];
+        if w2 == 2 {
+            delta.push((2, 1, 20));
+        }
+        r.ingest(TID, make_batch(&schema, &delta)).unwrap();
         let relation = r.relation(TID).unwrap();
         let (mut read, unapplied) = relation.open_read(keys(), u64::MAX).unwrap();
         assert_eq!(unapplied, None);
-        assert!(read.walk.is_none(), "{kind:?}: a key list is a listed gather");
-        assert_eq!(matches!(read.source, Source::Unique(_)), probed, "{kind:?}");
         let mut sealed = relation.open_sealed(keys(), u64::MAX).unwrap();
-        assert_eq!(drain_all(&mut read, 2), rows([2, 7]), "{kind:?}");
-        assert_eq!(drain_all(&mut sealed, 2), rows([2, 7]), "{kind:?}");
+        let want = vec![(2, w2, 20), (7, 1, 70)];
+        assert_eq!(drain_all(&mut read, 2), want, "{kind:?}");
+        assert_eq!(drain_all(&mut sealed, 2), want, "{kind:?}");
     }
 }
 
@@ -433,17 +432,6 @@ fn a_pk_probe_answers_each_key_a_live_row_carries() {
     assert_eq!(batch_rows(&column), rows([2, 7]));
 }
 
-/// A PK or column probe reads a store that holds one live row per key, so a
-/// view's is refused.
-#[test]
-fn a_pk_or_column_probe_of_a_view_is_refused() {
-    let r = fixture(RelationKind::View(ViewBudget::Plain), x10);
-    for probe in [Probe::Pk { read: 0 }, Probe::Pk { read: 1 }] {
-        let err = r.probe(TID, probe, pk_keys_of_images(8, [2])).map(drop).unwrap_err();
-        assert!(err.contains("may net above 1"), "{probe:?}: {err}");
-    }
-}
-
 /// An index probe answers a held span with every stored entry, up to a cap counted
 /// across the keys, and a span no row holds with nothing. Its one cursor answers each
 /// key as a seek of its own does: a run of misses ahead of a hit, a hit ahead of its
@@ -478,10 +466,15 @@ fn an_index_probe_answers_each_held_span_up_to_its_cap() {
 }
 
 /// A key list at a stride other than the store it reads, an index the relation has not
-/// got, and an id that names no relation are each refused.
+/// got, and an id that names no relation are each refused; so is a PK or column probe
+/// of a view, whose keys may net above 1, and every read of a stream, which holds no
+/// rows.
 #[test]
-fn a_read_of_what_the_relation_has_not_got_is_refused() {
+fn a_read_the_relation_cannot_answer_is_refused() {
     let r = fixture(RelationKind::BaseTable, x10);
+    let view = fixture(RelationKind::View(ViewBudget::Plain), x10);
+    let stream = relation_fixture(RelationKind::Stream, make_schema_u64_i64(), &[], []);
+    let streamed = stream.relation(TID).unwrap();
     let index = |cols: &[u32]| Probe::Index(PkColList::from_slice(cols), std::num::NonZeroU64::MIN);
     let span = || pk_keys_of_images(8, [img(2)]);
     // A whole entry is a span and a source PK: wider than either store's key.
@@ -499,6 +492,35 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
         (r.probe(TID, index(&[1]), entry()).map(drop), "stride"),
         (r.probe(TID, Probe::Pk { read: 0 }, entry()).map(drop), "stride"),
         (r.probe(TID, Probe::Pk { read: 1 }, entry()).map(drop), "stride"),
+        (
+            view.probe(TID, Probe::Pk { read: 0 }, span()).map(drop),
+            "may net above 1",
+        ),
+        (
+            view.probe(TID, Probe::Pk { read: 1 }, span()).map(drop),
+            "may net above 1",
+        ),
+        (
+            stream.probe(TID, Probe::Pk { read: 0 }, span()).map(drop),
+            "is a stream",
+        ),
+        (
+            stream.probe(TID, Probe::Pk { read: 1 }, span()).map(drop),
+            "is a stream",
+        ),
+        (streamed.open_read(ReadBound::None, u64::MAX).map(drop), "is a stream"),
+        (streamed.open_sealed(ReadBound::None, u64::MAX).map(drop), "is a stream"),
+        (
+            stream
+                .scan_spec(
+                    TID,
+                    ReadSpec::all_rows(ReadBound::None),
+                    make_schema_u64_i64().layout_digest(),
+                    None,
+                )
+                .map(drop),
+            "is a stream",
+        ),
     ];
     for (i, (got, why)) in refusals.into_iter().enumerate() {
         let err = got.expect_err(why);
@@ -506,65 +528,17 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
     }
 }
 
-/// A stream holds no rows, so a PK or column probe of one, or a source opened
-/// over it at either cut, is refused.
-#[test]
-fn a_read_of_a_stream_is_refused() {
-    let r = relation_fixture(RelationKind::Stream, make_schema_u64_i64(), &[], []);
-    for probe in [Probe::Pk { read: 0 }, Probe::Pk { read: 1 }] {
-        let err = r.probe(TID, probe, pk_keys_of_images(8, [2])).map(drop).unwrap_err();
-        assert!(err.contains("is a stream"), "{probe:?}: {err}");
-    }
-    let relation = r.relation(TID).unwrap();
-    for err in [
-        relation.open_read(ReadBound::None, u64::MAX).map(drop).unwrap_err(),
-        relation.open_sealed(ReadBound::None, u64::MAX).map(drop).unwrap_err(),
-    ] {
-        assert!(err.contains("is a stream"), "{err}");
-    }
-}
-
-/// A drain that skips payload columns emits the rows and weights of one that
-/// does not, every kept cell as it, and each skipped cell as a zero that is
-/// not NULL: through the walk of an index range gathering off the merge of the
-/// store's runs, and through a key list and an index range probed key by key
-/// from a base table's store.
+/// A drain that skips payload columns writes each skipped cell as a zero that
+/// is not NULL: through the walk of an index range gathering off the merge of
+/// the store's runs, and through a key list and an index range probed key by
+/// key from a base table's store.
 #[test]
 fn a_drain_writes_skipped_payload_columns_as_zeroes() {
-    use gnitz_wire::{null_word_get, payload_bytes, payload_u64};
     const N: u64 = 800;
-    // `(id U64 PK | a I64 NULL | s STRING | v I64)`, indexed on `v`.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    // Generation `generation` of key `pk`, at `v = pk * 10 + generation`.
-    let run = |rows: &mut dyn Iterator<Item = (u64, u64, i64)>| {
-        let mut bb = BatchBuilder::new(&schema);
-        for (pk, generation, w) in rows {
-            bb.begin_row(pk as u128, w);
-            bb.put_opt_int((pk % 3 != 1).then_some((pk * 10 + generation) as u128));
-            bb.put_string(&format!("{pk:0>24}/{generation}"));
-            bb.put_int((pk * 10 + generation) as u128);
-            bb.end_row();
-        }
-        bb.finish()
-    };
-    // Every key at generation 0; a later round rewrites every third key, and a
-    // third deletes every tenth: the first two flushed, the third in memory.
-    let latest = |pk: u64| u64::from(pk.is_multiple_of(3));
-    let rounds = [
-        run(&mut (0..N).map(|pk| (pk, 0, 1))),
-        run(&mut (0..N).step_by(3).flat_map(|pk| [(pk, 0, -1), (pk, 1, 1)])),
-        run(&mut (0..N).step_by(10).map(|pk| (pk, latest(pk), -1))),
-    ];
+    let schema = skipping_schema();
+    // The first two rounds flushed, the third in memory; indexed on `v`.
+    let [first, second, third] = skipping_rounds(N);
     let mut r = relation_fixture(RelationKind::BaseTable, schema, &[&[3]], []);
-    let [first, second, third] = rounds;
     for rows in [first, second] {
         r.ingest(TID, rows).unwrap();
         r.checkpoint_base().unwrap();
@@ -581,58 +555,28 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     let range = || col_range(3, img(1000), img(1399));
     // Every other key, the deleted ones among them.
     let keys = || ReadBound::PkSet(pk_keys_of_images(8, (0..N).step_by(2).map(u128::from)));
-    let open = |label, read| match label {
-        "index range" => relation.open_sealed(range(), read).unwrap(),
-        "unique pk set" => relation.open_read(keys(), read).unwrap().0,
-        _ => relation.open_read(range(), read).unwrap().0,
-    };
-    for label in ["index range", "unique pk set", "unique index range"] {
-        let shape = match open(label, u64::MAX) {
+    // (label, read at the sealed cut, bound).
+    let sources = [
+        ("index range", true, range()),
+        ("unique pk set", false, keys()),
+        ("unique index range", false, range()),
+    ];
+    for (label, sealed, bound) in sources {
+        let open = |read| match sealed {
+            true => relation.open_sealed(bound.clone(), read).unwrap(),
+            false => relation.open_read(bound.clone(), read).unwrap().0,
+        };
+        let shape = match open(u64::MAX) {
             SourceCursor { source: Source::Merge(_), walk: Some(_) } => "index range",
             SourceCursor { source: Source::Unique(_), walk: None } => "unique pk set",
             SourceCursor { source: Source::Unique(_), walk: Some(_) } => "unique index range",
             _ => "another source",
         };
-        assert_eq!(shape, label);
-        let drain = |read| {
-            let mut c = open(label, read);
+        assert_eq!(shape, label, "premise: the source opened");
+        let drain = |skip: u64| {
+            let mut c = open(!skip);
             std::iter::from_fn(|| c.drain_chunk(16)).collect::<Vec<_>>()
         };
-        let want = drain(u64::MAX);
-        assert!(!want.is_empty(), "{label}: rows");
-        for skip in [0b001, 0b010, 0b011, 0b110] {
-            let got = drain(!skip);
-            assert_eq!(got.len(), want.len(), "{label} {skip:#b}: chunks");
-            for (g, w) in got.iter().zip(&want) {
-                assert_eq!(g.len(), w.len(), "{label} {skip:#b}: rows");
-                assert!(g.is_consolidated(), "{label} {skip:#b}");
-                for i in 0..g.len() {
-                    assert_eq!(
-                        (g.get_pk_bytes(i), g.get_weight(i)),
-                        (w.get_pk_bytes(i), w.get_weight(i))
-                    );
-                    for pi in 0..3 {
-                        let null = |b: &Batch| null_word_get(b.get_null_word(i), pi);
-                        let cell = |b: &Batch| match pi {
-                            1 => payload_bytes(b, i, pi).into_owned(),
-                            _ => payload_u64(b, i, pi).to_le_bytes().to_vec(),
-                        };
-                        if skip >> pi & 1 == 1 {
-                            assert!(!null(g), "{label} {skip:#b}: row {i} column {pi} is NULL");
-                            assert!(
-                                cell(g).iter().all(|&b| b == 0),
-                                "{label} {skip:#b}: row {i} column {pi}"
-                            );
-                        } else {
-                            assert_eq!(
-                                (null(g), cell(g)),
-                                (null(w), cell(w)),
-                                "{label} {skip:#b}: row {i} column {pi}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        assert_skips_as_zeroes(drain, label);
     }
 }

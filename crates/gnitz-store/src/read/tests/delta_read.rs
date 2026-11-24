@@ -5,8 +5,8 @@ use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
     TID, batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch,
-    make_schema_u64_i64, map_of, pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec,
-    spec,
+    make_schema_u64_i64, map_of, pk_only_schema, pk_payload_schema, registered_fixture, relation_fixture,
+    relation_fixture_with, rows_spec, spec,
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_foundation::rng::Rng;
@@ -251,7 +251,7 @@ fn reads_past_any_cursor_match_a_model() {
             scan_chunk_rows: [1, 3, 200, 8192][(seed % 4) as usize],
             ..StoreConfig::default()
         };
-        let mut r = relation_fixture_with(config, Slot::SOLO, feed_spec(budget), view_schema(), &[], []);
+        let mut r = registered_fixture(config, Slot::SOLO, feed_spec(budget), view_schema(), &[], []);
         let cases = cases();
         let mut subs: Vec<Subscriber> = (0..cases.len())
             .flat_map(|case| [false, true].map(|lagging| (case, lagging)))
@@ -434,14 +434,7 @@ fn a_delta_read_refuses_what_it_cannot_answer() {
 #[test]
 fn a_delta_read_reads_each_round_once_however_rounds_are_chunked() {
     let schema = make_schema_u64_i64();
-    let mut r = relation_fixture_with(
-        chunked(10),
-        Slot::SOLO,
-        spec(TID, fed_view(1 << 30), schema),
-        schema,
-        &[],
-        [],
-    );
+    let mut r = relation_fixture_with(chunked(10), fed_view(1 << 30), schema, &[], []);
     // 4 + 4 + 2 fills a chunk of 10; 1 + 7 leaves no room for the 8 after it.
     let sizes = [3, 5, 200, 4, 4, 2, 130, 1, 7, 8, 129, 10, 1];
     let mut want = Vec::new();
