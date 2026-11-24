@@ -14,7 +14,7 @@ value. A value alone cannot distinguish `Decimal("37.50")` from
 distinction the catalog has to carry.
 
 That DECIMAL is a type — its literals, its storage integer, its key behaviour —
-is `value_domain/test_decimal.py`.
+is `value_domain/test_decimal.py`'s and `value_domain/test_key_promotion.py`'s.
 """
 
 from decimal import Decimal as D

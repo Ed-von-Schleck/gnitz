@@ -13,33 +13,45 @@ type. A cross-sign pair is where this bites: the unsigned side zero-extends and
 the signed side sign-extends, so only a shared target makes the two images equal.
 
 The engine's own unit tests sweep the promotion lattice exhaustively over every
-type code and worker count. What only an end-to-end test can add is that the
+type code. What only an end-to-end test can add is that the
 planner picks the common type and the two legs actually meet, so one
 representative per arm is the right density rather than the cross-product.
 
 Every case is asserted as a weighted bag over `(key, left tag, right tag)`: a
 key claimed by two workers shows up as weight 2, and a dropped match as a
-missing row — and a row count sees neither.
+missing row — and a row count sees neither. A key read back is also held to its
+Python type and spelling, which `==` cannot see: `True == 1`, and
+`Decimal("0.10") == Decimal("0.1")` though only one carries the column's scale.
 """
 
 from collections import Counter
+from datetime import date, datetime
+from decimal import Decimal
 
 import pytest
 from _read import bag, scanned
 from _shapes import setop
-from _sql import churn, insert, values
+from _sql import churn, insert, lit, values
 
-# (left type, right type, keys representable on both sides). One row per arm:
-# the identity promotion at each sign, then the cross-sign pairs in both
-# directions and at both widths. The keys always include the boundary that
-# separates the two encodings: the unsigned maximum for a cross-sign pair, a
-# negative for a signed one, and 0 everywhere because it is the value a NULL's
-# zero-fill collides with.
+# (left type, right type, keys representable on both sides, ascending). One row
+# per arm: the identity promotion at each sign and for each named type over a
+# stored integer, then the cross-sign pairs in both directions and at both
+# widths. The keys always include the boundary that separates the two
+# encodings: the unsigned maximum for a cross-sign pair, a negative for a signed
+# one, and the type's zero.
 _PAIRS = [
     # Same type on both sides takes the identity arm, which is one route
     # whatever the width — the widest of each sign stands for the ladder.
     ("BIGINT", "BIGINT", [-9223372036854775808, -1, 0, 1, 100]),
     ("BIGINT UNSIGNED", "BIGINT UNSIGNED", [0, 1, 2**63, 2**64 - 1]),
+    # A named type keys at the integer it is stored as, scale or epoch and all.
+    ("BOOLEAN", "BOOLEAN", [False, True]),
+    ("DECIMAL(10, 2)", "DECIMAL(10, 2)", [Decimal("-0.50"), Decimal("0.00"), Decimal("0.10"), Decimal("12.50")]),
+    ("DATE", "DATE", [date(1969, 12, 31), date(1970, 1, 1), date(2024, 2, 29)]),
+    ("TIMESTAMP", "TIMESTAMP", [datetime(1969, 12, 31, 23, 59, 59), datetime(1970, 1, 1),
+                                datetime(2024, 2, 29, 12, 0, 0, 1)]),
+    ("UUID", "UUID", ["00000000-0000-0000-0000-000000000000", "550e8400-e29b-41d4-a716-446655440000",
+                      "ffffffff-ffff-ffff-ffff-ffffffffffff"]),
     # Cross-sign, in both directions because the two sides reach the hash by
     # different routes. Keys sit above the unsigned side's signed midpoint,
     # where a missing zero-extension shows up.
@@ -54,6 +66,11 @@ _PAIRS = [
 
 def _ids(pairs):
     return [f"{a}={b}".replace(" ", "").lower() for a, b, *_ in pairs]
+
+
+def _spelled(vals):
+    """Each value as its Python type and spelling, which `==` folds together."""
+    return {(type(v), str(v)) for v in vals}
 
 
 @pytest.mark.parametrize("cust_sql,ord_sql,keys", _PAIRS, ids=_ids(_PAIRS))
@@ -74,31 +91,38 @@ def test_a_join_matches_every_key_across_the_two_declared_types(
     insert(client, "orders", list(enumerate(keys)))
 
     matched = {(i, 1000 + i): 1 for i in range(len(keys))}
-    assert bag(scanned(client, "v"), "oid", "tag") == matched
-    assert bag(scanned(client, "v", hidden=True), "_join_pk", "oid") == \
-        {(k, i): 1 for i, k in enumerate(keys)}
+    assert bag(scanned(client, "v")) == matched
+    hidden = scanned(client, "v", hidden=True)
+    assert bag(hidden, "_join_pk", "oid") == {(k, i): 1 for i, k in enumerate(keys)}
+    assert _spelled(r._join_pk for r in hidden) == _spelled(keys)
 
     # A delta after both traces exist takes the seek path rather than the build
     # path, and must route to the same worker the build side landed on.
-    client.execute_sql(f"INSERT INTO orders VALUES (99, {keys[-1]})")
-    assert bag(scanned(client, "v"), "oid", "tag") == matched | {(99, 1000 + len(keys) - 1): 1}
+    client.execute_sql(f"INSERT INTO orders VALUES (99, {lit(keys[-1])})")
+    assert bag(scanned(client, "v")) == matched | {(99, 1000 + len(keys) - 1): 1}
 
     # Retracting it must cancel exactly, leaving no ghost at the promoted key.
     client.execute_sql("DELETE FROM orders WHERE id = 99")
-    assert bag(scanned(client, "v"), "oid", "tag") == matched
+    assert bag(scanned(client, "v")) == matched
 
 
-@pytest.mark.parametrize("key_sql,keys", [
+_GROUP_KEYS = [
     ("TINYINT", [-100, -1, 0, 1, 100]),
     ("INT", [-2_000_000_000, -1, 0, 5, 2_000_000_000]),
     ("INT UNSIGNED", [0, 1, 5, 4_000_000_000]),
-], ids=["i8", "i32", "u32"])
+    ("BOOLEAN", [False, True]),
+    ("DECIMAL(10, 2)", [Decimal("-0.50"), Decimal("0.00"), Decimal("0.10"), Decimal("12.50")]),
+]
+
+
+@pytest.mark.parametrize("key_sql,keys", _GROUP_KEYS, ids=[sql.split("(")[0].replace(" ", "").lower() for sql, _ in _GROUP_KEYS])
 def test_a_group_by_lands_every_row_of_a_group_on_one_worker(
         client, key_sql, keys):
     """Grouping routes by the same key the aggregate is stored under. If the two
     disagreed, one group's rows would be reduced on two workers and each would
     publish a partial — which sums to the right total only by accident, so the
-    per-group aggregate is what has to be asserted."""
+    per-group aggregate is what has to be asserted. The group key reads back as
+    the column's own type, at its scale."""
     client.execute_sql(
         f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, grp {key_sql} NOT NULL, "
         "amount BIGINT NOT NULL)")
@@ -109,13 +133,15 @@ def test_a_group_by_lands_every_row_of_a_group_on_one_worker(
     # Two rows per group, so a split group publishes 10 and 5 instead of 15.
     insert(client, "t", [(2 * i + j, g, amount)
                          for i, g in enumerate(keys) for j, amount in enumerate((10, 5))])
-    assert bag(scanned(client, "v"), "grp", "total", "n") == \
-        {(g, 15, 2): 1 for g in keys}
+    got = scanned(client, "v")
+    assert bag(got) == {(g, 15, 2): 1 for g in keys}
+    assert _spelled(r.grp for r in got) == _spelled(keys)
 
-    # Retracting one row of a group re-seeks the aggregate by that same key.
-    client.execute_sql("DELETE FROM t WHERE pk = 1")
-    assert bag(scanned(client, "v"), "grp", "total", "n") == \
-        {(g, 15, 2): 1 for g in keys[1:]} | {(keys[0], 10, 1): 1}
+    # Moving a row between groups retracts it under one key and inserts it under
+    # another, re-seeking both aggregates by those same keys.
+    client.execute_sql(f"UPDATE t SET grp = {lit(keys[1])} WHERE pk = 1")
+    assert bag(scanned(client, "v")) == \
+        {(g, 15, 2): 1 for g in keys[2:]} | {(keys[0], 10, 1): 1, (keys[1], 20, 3): 1}
 
 
 # (left type, right type, a value both hold, one only the left holds, one only
@@ -127,23 +153,27 @@ _SET_OP_PAIRS = [
 ]
 
 
-@pytest.mark.parametrize("not_null", [False, True], ids=["nullable", "not-null"])
+@pytest.mark.parametrize("nn,t1_key", [("", "pk"), (" NOT NULL", "pk"), (" NOT NULL", "pk, val")],
+                         ids=["nullable", "not-null", "key"])
 @pytest.mark.parametrize("lt,rt,shared,left_only,right_only", _SET_OP_PAIRS, ids=_ids(_SET_OP_PAIRS))
 def test_a_set_op_widens_both_branches_to_one_element_key(
-        client, not_null, lt, rt, shared, left_only, right_only):
+        client, nn, t1_key, lt, rt, shared, left_only, right_only):
     """A set op keys each branch's row by its element — NOT NULL integer
     branches by their columns themselves — so the narrower side widens to the
     common type first: the shared value coalesces under UNION, is the INTERSECT
     and cancels under EXCEPT, while a value only one type holds stays distinct.
     The NULLs on both sides coalesce with each other and never with the left's
-    0, and a two-column identity matches only on the whole pair."""
+    0, and a two-column identity matches only on the whole pair.
+
+    In the `key` arm the left `val` is second in a compound PK, so its encoded
+    offset is non-zero and it decodes at its own width before it widens:
+    zero-extension would read the INT -7 as 4294967289."""
     t1 = [(1, shared, 1), (2, left_only, 1), (3, None, 1), (4, 0, 1)]
     t2 = [(1, shared, 1), (2, right_only, 1), (3, None, 1), (4, shared, 2)]
-    if not_null:
+    if nn:
         t1, t2 = ([r for r in t if r[1] is not None] for t in (t1, t2))
-    nn = " NOT NULL" if not_null else ""
     client.execute_sql(
-        f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt}{nn}, tag BIGINT NOT NULL); "
+        f"CREATE TABLE t1 (pk BIGINT NOT NULL, val {lt}{nn}, tag BIGINT NOT NULL, PRIMARY KEY ({t1_key})); "
         f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt}{nn}, tag BIGINT NOT NULL); "
         "CREATE VIEW vu AS SELECT val FROM t1 UNION SELECT val FROM t2; "
         "CREATE VIEW vi AS SELECT val FROM t1 INTERSECT SELECT val FROM t2; "
@@ -153,9 +183,9 @@ def test_a_set_op_widens_both_branches_to_one_element_key(
 
     def expect():
         for view, op in (("vu", "UNION"), ("vi", "INTERSECT"), ("ve", "EXCEPT")):
-            assert bag(scanned(client, view), "val") == setop(
+            assert bag(scanned(client, view)) == setop(
                 op, Counter((v,) for _, v, _ in t1), Counter((v,) for _, v, _ in t2)), view
-        assert bag(scanned(client, "vt"), "val", "tag") == setop(
+        assert bag(scanned(client, "vt")) == setop(
             "INTERSECT", Counter(r[1:] for r in t1), Counter(r[1:] for r in t2))
 
     expect()
@@ -163,23 +193,6 @@ def test_a_set_op_widens_both_branches_to_one_element_key(
     client.execute_sql("DELETE FROM t2 WHERE pk = 1")
     t2 = t2[1:]
     expect()
-
-
-def test_a_narrow_key_column_sign_extends_into_a_wider_branch(client):
-    """A branch projecting a narrow PK column — INT, second in a compound key, so
-    its encoded offset is non-zero — decodes at its own width and sign-extends
-    into the BIGINT slot. Zero-extension would read -3 as 4294967293."""
-    client.execute_sql(
-        "CREATE TABLE t1 (a BIGINT NOT NULL, id INT NOT NULL, PRIMARY KEY (a, id)); "
-        "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
-        "CREATE VIEW vu AS SELECT id FROM t1 UNION SELECT val FROM t2; "
-        "CREATE VIEW vi AS SELECT id FROM t1 INTERSECT SELECT val FROM t2; "
-        "CREATE VIEW ve AS SELECT id FROM t1 EXCEPT SELECT val FROM t2; "
-        "INSERT INTO t2 VALUES (1, 5), (2, -3), (3, 100); "
-        "INSERT INTO t1 VALUES (1, 5), (2, -3), (3, 7)")
-    assert bag(scanned(client, "vu"), "id") == {(5,): 1, (-3,): 1, (7,): 1, (100,): 1}
-    assert bag(scanned(client, "vi"), "id") == {(5,): 1, (-3,): 1}
-    assert bag(scanned(client, "ve"), "id") == {(7,): 1}
 
 
 def test_a_band_join_promotes_its_key_and_its_range_together(client):
@@ -195,7 +208,7 @@ def test_a_band_join_promotes_its_key_and_its_range_together(client):
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, y BIGINT NOT NULL); "
         "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.x > b.y; "
         f"INSERT INTO a VALUES {values(a_rows)}; INSERT INTO b VALUES {values(b_rows)}")
-    assert bag(scanned(client, "v"), "aid", "bid") == {
+    assert bag(scanned(client, "v")) == {
         (ai, bi): 1 for ai, ak, x in a_rows for bi, bk, y in b_rows if ak == bk and x > y}
 
 
@@ -249,6 +262,6 @@ def test_a_pure_range_threshold_is_probed_in_the_pairs_own_type(client, x_ty, y_
         ("DELETE FROM b", "b", {low_b: None}),
     ]):
         hits = {ai: [bi for bi, y in state["b"].items() if x < y] for ai, x in state["a"].items()}
-        assert bag(scanned(client, "v"), "aid", "bid") == {
+        assert bag(scanned(client, "v")) == {
             (ai, bi): 1 for ai, bs in hits.items() for bi in bs or [None]}, sql
-        assert bag(scanned(client, "ex"), "aid") == {(ai,): 1 for ai, bs in hits.items() if bs}, sql
+        assert bag(scanned(client, "ex")) == {(ai,): 1 for ai, bs in hits.items() if bs}, sql
