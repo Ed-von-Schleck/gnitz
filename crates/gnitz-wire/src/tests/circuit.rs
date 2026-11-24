@@ -155,10 +155,9 @@ fn every_op_node_variant_roundtrips() {
             nulls: NullKeys::Keep,
         }),
     ]);
-    // Every join kind on either side, and every relation the range kind can carry
-    // — `Join`'s own sample can only be one of them. Same for the reduce's kinds and the
-    // null-extend's two placements.
-    nodes.push(OpNode::Join(JoinKind::Cross));
+    // Every relation the range kind can carry — `JoinRange`'s own sample can
+    // only be one of them. Same for the reduce's kinds and the null-extend's two
+    // placements.
     for &kind in ReduceKind::ALL {
         nodes.push(OpNode::Reduce {
             group: GroupAggs {
@@ -249,11 +248,10 @@ fn each_decode_guard_rejects_its_own_forgery() {
     };
     let cases = [
         (poke(&aux, 1, outside(NullKeys::from_wire)), "unknown NullKeys"),
-        (poke(&aux, 8, 0), "unknown TypeCode 0"),
-        (poke(&aux, 8, 200), "unknown TypeCode 200"),
+        (poke(&aux, 8, outside(TypeCode::from_wire)), "unknown TypeCode"),
         (poke(&reduce, 1, outside(ReduceKind::from_wire)), "unknown ReduceKind"),
-        (poke(&hash_row, 7, 0), "unknown TypeCode 0"),
-        (poke(&null_ext, 4, 200), "unknown TypeCode 200"),
+        (poke(&hash_row, 7, outside(TypeCode::from_wire)), "unknown TypeCode"),
+        (poke(&null_ext, 4, outside(TypeCode::from_wire)), "unknown TypeCode"),
         // tag 0 | rel 1
         (
             poke(&sample(Opcode::JoinRange), 1, outside(RangeRel::from_wire)),

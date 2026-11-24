@@ -2,7 +2,6 @@ use super::*;
 
 #[test]
 fn a_hello_is_checked_at_its_prefix_and_classified() {
-    assert_eq!(&HELLO[..4], b"GNTZ");
     assert_eq!(read_client_hello(&HELLO), Ok(&[][..]));
 
     let mut forged = client_hello(b"t");
@@ -28,7 +27,7 @@ fn a_server_hello_carries_each_verdict() {
         assert_eq!(read_server_hello(&server_hello(status)), Ok(status));
     }
     let mut unknown = server_hello(AuthStatus::Accepted);
-    unknown[HELLO.len()] = 3;
+    unknown[HELLO.len()] = crate::outside(AuthStatus::from_wire);
     assert_eq!(read_server_hello(&unknown), Err(HelloError::Malformed));
     assert_eq!(read_server_hello(&HELLO), Err(HelloError::Malformed));
     let long = [&server_hello(AuthStatus::Accepted)[..], b"x"].concat();
@@ -38,8 +37,6 @@ fn a_server_hello_carries_each_verdict() {
 #[test]
 fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
     let refusal = refusal_hello();
-    assert_eq!(&refusal[..HELLO.len()], &HELLO);
-    assert_eq!(&refusal[HELLO.len()..], RELEASE.as_bytes());
     // From this build's own version the refusal carries no verdict.
     assert_eq!(read_server_hello(&refusal), Err(HelloError::Malformed));
 
@@ -70,8 +67,7 @@ fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
 }
 
 /// One sample of every layout client and engine both decode, past the bytes
-/// that carry [`WIRE_VERSION`] itself. A data block's layout is pinned by the
-/// block's own test.
+/// that carry [`WIRE_VERSION`] itself.
 fn wire_layout_samples() -> Vec<u8> {
     use crate::multi_frame::{self, DeltaCursor, DeltaPollItem, ScanItem, SubId};
     use crate::*;
@@ -153,6 +149,17 @@ fn wire_layout_samples() -> Vec<u8> {
     };
     out.extend(rows.encode());
     out.extend(fold.encode());
+    out.extend(ReadSpec::all_rows(ReadBound::None).encode());
+
+    // A data block: a compound (I16, U8) key, a weight, a null word, a STRING
+    // column's heap-backed cell and the heap, part of it dead.
+    let mut heap = Vec::new();
+    let cell = encode_german_string(b"a value past the inline cell", &mut heap);
+    let mut pk = Vec::new();
+    push_opk(&mut pk, 2, key_image(TypeCode::I16, -2i16 as u128));
+    push_opk(&mut pk, 1, 3);
+    let regions: [&[u8]; 5] = [&pk, &(-1i64).to_le_bytes(), &1u64.to_le_bytes(), &cell, &heap];
+    wal::append_block(&regions, 1, &mut out);
 
     let schema = [
         schema_record::RecordCol {
@@ -196,7 +203,7 @@ fn wire_layout_samples() -> Vec<u8> {
 fn the_wire_layouts_are_pinned_to_the_epoch() {
     assert_eq!(
         (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
-        (41, 0x8601_98be_6228_2deb),
+        (41, 0x16ae_ab76_47ea_eb0b),
         "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
     );
 }

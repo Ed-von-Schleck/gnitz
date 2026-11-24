@@ -109,14 +109,9 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
             continue;
         }
         for (blob, data) in [(&b""[..], false), (b"blob", false), (b"", true), (b"blob", true)] {
-            let fits = |rule: Section, present: bool| match rule {
-                Section::Never => !present,
-                Section::May => true,
-                Section::Must => present,
-            };
             assert_eq!(
                 accepts(verb, 7, blob, data, b""),
-                fits(sections.blob, !blob.is_empty()) && fits(sections.data, data),
+                sections.blob.admits(!blob.is_empty()) && sections.data.admits(data),
                 "{verb:?} blob {blob:?} data {data}"
             );
         }
@@ -129,9 +124,9 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
 }
 
 /// A client frame carries no status and no reply flag but `continuation` on a
-/// write's frame, and sets a conflict mode
-/// only where its verb's shape reads one, never on a multi-item prologue; a multi-item prologue sets no argument but a `DELTA_POLL`'s
-/// `arg0`.
+/// write's frame, and sets a conflict mode only where its verb's shape reads
+/// one, never on a multi-item prologue; a multi-item prologue sets no argument
+/// but a `DELTA_POLL`'s `arg0`.
 #[test]
 fn client_verb_refuses_a_header_word_the_verb_does_not_carry() {
     let verdict = |hdr: ControlHeader| {
@@ -279,9 +274,7 @@ fn wire_flags_reject_unknown() {
 #[test]
 fn every_reply_header_reads_back_as_built() {
     let peeked = |hdr: ControlHeader, blob: &[u8]| {
-        let mut buf = Vec::new();
-        append_frame(&mut buf, &hdr, blob, None);
-        let ctrl = peek_control_block(&buf).unwrap();
+        let ctrl = peek_control_block(&frame(&hdr, blob, false)).unwrap();
         assert_eq!(ctrl.hdr, hdr);
         ctrl
     };

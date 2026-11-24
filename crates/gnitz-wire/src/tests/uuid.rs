@@ -1,5 +1,4 @@
 use super::*;
-use crate::VALUE_TEXT_MAX;
 
 #[test]
 fn format_is_canonical_and_parse_accepts_its_spellings() {

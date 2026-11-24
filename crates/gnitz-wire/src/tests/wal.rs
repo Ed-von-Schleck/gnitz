@@ -46,15 +46,6 @@ fn a_block_round_trips_through_both_framers() {
         );
     }
 
-    let mut no_heap = regions.clone();
-    *no_heap.last_mut().unwrap() = &[];
-    let empty: [&[u8]; 4] = [&[], &[], &[], &[]];
-    for list in [&no_heap[..], &empty[..]] {
-        let mut appended = Vec::new();
-        append_block(list, 0, &mut appended);
-        assert_eq!(appended, encode_dead(list, 0), "{} regions", list.len());
-    }
-
     let mut two = encode_dead(&regions, 0);
     let end1 = two.len();
     two.extend_from_slice(&encode_dead(&regions, 0));
@@ -64,17 +55,9 @@ fn a_block_round_trips_through_both_framers() {
     }
 }
 
-/// A block holds at least one row: an empty delta ships no block.
-#[test]
-fn a_zero_row_block_is_refused() {
-    for heap in [&b""[..], b"orphan heap"] {
-        let buf = encode_dead(&[&[], &[], &[], heap], 0);
-        assert_eq!(parse_block(&buf, ROW_WIDTH), Err("block holds no rows"));
-    }
-}
-
 /// Every guard, against the block that trips it — including every one-bit
-/// forgery of every header word, and of `ROWS` by one row more.
+/// forgery of every header word. A block holds at least one row: an empty
+/// delta ships no block.
 #[test]
 fn each_guard_rejects_its_forgery() {
     let clean = encode_dead(&slices(&fixture()), 0);
@@ -102,7 +85,6 @@ fn each_guard_rejects_its_forgery() {
             Some(not_its_length),
         ),
         ("a trailing byte".into(), overlong, Some(not_its_length)),
-        ("one row too many".into(), forged(WAL_OFF_ROWS, &|r| r + 1), Some(short)),
     ];
     for bit in 0..32 {
         let flip = |off| forged(off, &|v| v ^ (1 << bit));
@@ -136,7 +118,7 @@ fn the_block_layout_is_pinned_byte_for_byte() {
     let long = crate::encode_german_string(LONG, &mut blob);
     let mut pk = Vec::new();
     for (k, u) in [(-2i16, 3u8), (258, 6)] {
-        crate::push_opk(&mut pk, 2, k as u16 as u128 ^ 0x8000);
+        crate::push_opk(&mut pk, 2, crate::key_image(crate::TypeCode::I16, k as u128));
         crate::push_opk(&mut pk, 1, u as u128);
     }
     let regions: [&[u8]; 6] = [

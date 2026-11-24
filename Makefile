@@ -64,10 +64,11 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 # gnitz-fuzz builds gnitz-wire with its field map, and cargo would unify that
-# feature into every crate of one build: it is tested in a build of its own.
+# feature into every crate of one build: it is tested in a build of its own,
+# which also runs gnitz-wire's own tests with the field map on.
 test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
 	cd crates && cargo test --workspace --exclude gnitz-py --exclude gnitz-fuzz $(INTEGRATION) $(T)
-	cd crates && cargo test -p gnitz-fuzz $(T)
+	cd crates && cargo test -p gnitz-fuzz -p gnitz-wire $(T)
 
 rust-engine-test: ## Run only the gnitz-foundation + gnitz-zset + gnitz-trace + gnitz-store + gnitz-server tests (faster inner loop)
 	cd crates && cargo test -p gnitz-foundation -p gnitz-zset -p gnitz-trace -p gnitz-store -p gnitz-server $(T)

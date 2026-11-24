@@ -3,9 +3,11 @@ use std::cmp::Ordering;
 
 /// Encode → decode at one length, out of an arena that already holds `prefix`
 /// bytes: a heap payload must be found at its own non-zero offset, not at 0.
-/// The encoded cell is canonical; the short-cell accessors classify it; and
-/// shifting it by the bytes an appender put in front of its arena keeps its
-/// content.
+/// The encoded cell is canonical; the short-cell accessors classify it; its
+/// long length counts a long cell's content and nothing for a short one; its
+/// lead is the content's first eight bytes zero-padded, with a short cell's pad
+/// left dirty; and shifting it by the bytes an appender put in front of its
+/// arena keeps its content.
 fn roundtrip(s: &[u8], prefix: usize) {
     let mut blob = vec![0xEEu8; prefix];
     let st = encode_german_string(s, &mut blob);
@@ -32,26 +34,33 @@ fn roundtrip(s: &[u8], prefix: usize) {
     let short = s.len() <= SHORT_STRING_THRESHOLD;
     assert_eq!(canonical_short_cell(&st), short.then_some(st));
     assert_eq!(german_string_short_ascii(&st), short && s.is_ascii());
+    assert_eq!(german_string_long_len(&st), if short { 0 } else { s.len() });
+    let mut lead = [0u8; 8];
+    lead[..s.len().min(8)].copy_from_slice(&s[..s.len().min(8)]);
+    let lead = u64::from_be_bytes(lead);
+    assert_eq!(german_string_lead(&st, Heap::Plain(&blob)), lead);
+    if short {
+        let mut dirty = st;
+        dirty[4 + s.len()..].fill(0xFF);
+        assert_eq!(german_string_lead(&dirty, Heap::Plain(&[])), lead, "dirty pad");
+    }
     let mut shifted = st;
     shift_german_string_heaps(&mut shifted, 7);
     let grown = [&[0u8; 7][..], &blob].concat();
     assert_eq!(german_string_content(&shifted, &grown), s, "shifted by 7");
 }
 
+/// Every length through the threshold and past a long cell's eight-byte lead,
+/// its content crossing into non-ASCII at byte 7.
 #[test]
 fn roundtrip_across_length_boundaries() {
     // Both a fresh arena and one with bytes already in it, so an offset the
     // encoder got wrong cannot coincide with 0.
     for prefix in [0usize, 5] {
-        roundtrip(b"", prefix); // empty
-        roundtrip(b"a", prefix); // 1 (prefix only)
-        roundtrip(b"abcd", prefix); // 4 (prefix exactly full)
-        roundtrip(b"abcde", prefix); // 5 (prefix + 1 suffix byte)
-        roundtrip(b"\xc3\xa9", prefix); // short, not ASCII
-        roundtrip(b"abcdefghijkl", prefix); // 12 == SHORT_STRING_THRESHOLD (fully inline)
-        roundtrip(b"abcdefghijklm", prefix); // 13 (first length that spills to blob)
-        roundtrip(b"abcdefghijklmnopqrstuvwxyz", prefix); // 26
-        roundtrip(&vec![0xABu8; 1000], prefix); // long blob string
+        for len in (0..=40).chain([1000]) {
+            let content: Vec<u8> = (0..len).map(|i| 0x79u8.wrapping_add(i as u8)).collect();
+            roundtrip(&content, prefix);
+        }
     }
 }
 
@@ -77,10 +86,6 @@ fn shift_touches_only_long_offsets() {
     }
 }
 
-/// A relocated cell is rebuilt in canonical form: a long cell overrunning its
-/// heap becomes the empty string, its prefix zeroed with its length, and a
-/// skewed short-cell pad does not survive — either left as it was would order
-/// the cell apart from an equal-content one.
 /// A `place` for [`relocate_german_string_with`] appending the content to `dst`.
 fn append(dst: &mut Vec<u8>) -> impl FnOnce(&[u8]) -> usize + '_ {
     move |content| {
@@ -90,6 +95,10 @@ fn append(dst: &mut Vec<u8>) -> impl FnOnce(&[u8]) -> usize + '_ {
     }
 }
 
+/// A relocated cell is rebuilt in canonical form: a long cell overrunning its
+/// heap becomes the empty string, its prefix zeroed with its length, and a
+/// skewed short-cell pad does not survive — either left as it was would order
+/// the cell apart from an equal-content one.
 #[test]
 fn relocation_rebuilds_each_cell_canonically() {
     let mut overrun = encode_german_string(&[0xAB; 20], &mut Vec::new());
@@ -241,36 +250,5 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
                 );
             }
         }
-    }
-}
-
-/// A cell's long length counts a long cell's content
-/// and nothing for a short one, and its lead is the content's first eight bytes
-/// zero-padded, with a short cell's pad left dirty.
-#[test]
-fn long_len_and_lead_agree_with_the_encoder() {
-    for len in 0..=40usize {
-        let content: Vec<u8> = (0..len).map(|i| b'a' + i as u8).collect();
-        let mut blob = vec![0x5Au8; 3];
-        let cell = encode_german_string(&content, &mut blob);
-        let mut lead = [0u8; 8];
-        lead[..len.min(8)].copy_from_slice(&content[..len.min(8)]);
-        if len <= SHORT_STRING_THRESHOLD {
-            assert_eq!(german_string_long_len(&cell), 0, "short {len}");
-            let mut dirty = cell;
-            dirty[4 + len..].fill(0xFF);
-            assert_eq!(
-                german_string_lead(&dirty, Heap::Plain(&[])),
-                u64::from_be_bytes(lead),
-                "dirty {len}"
-            );
-        } else {
-            assert_eq!(german_string_long_len(&cell), len, "long {len}");
-        }
-        assert_eq!(
-            german_string_lead(&cell, Heap::Plain(&blob)),
-            u64::from_be_bytes(lead),
-            "{len}"
-        );
     }
 }

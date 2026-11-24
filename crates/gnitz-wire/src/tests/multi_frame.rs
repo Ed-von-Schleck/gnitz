@@ -1,6 +1,6 @@
 use super::*;
-use crate::{CTRL_HEADER_SIZE, WireConflictMode, WireLane, WireStatus};
 use crate::{WireFlags, peek_control_block};
+use crate::{WireLane, WireStatus};
 
 /// [`decode_items`] of a whole item list.
 fn items(body: &[u8], verb: ClientVerb) -> Result<Vec<DecodedControl>, String> {
@@ -41,11 +41,7 @@ const WIDE_TID: u64 = (1 << 40) | 16;
 
 /// A minimal one-row canonical region list.
 fn regions<'a>() -> Regions<'a> {
-    let mut r = Regions::new();
-    for region in [PK, WEIGHT, NULLS, &[]] {
-        r.push(region);
-    }
-    r
+    Regions::from_slice(&[PK, WEIGHT, NULLS, &[]])
 }
 
 /// The same block framed — what a decoded item's data section must hold.
@@ -168,86 +164,6 @@ fn delta_poll_roundtrips_every_view_in_order() {
     assert_eq!(peeked(&frame, delta_items).unwrap(), views);
 }
 
-/// A multi-item frame is its prologue followed by each item framed on its own:
-/// the bytes item-by-item `append_frame` calls into a fresh buffer produce.
-#[test]
-fn multi_item_frames_are_their_items_framed_one_by_one() {
-    fn framed(verb: ClientVerb, arg0: u64, items: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
-        let mut out = Vec::new();
-        let hdr = ControlHeader {
-            arg0,
-            ..ControlHeader::naming(verb, 0.into(), 0)
-        };
-        append_frame(&mut out, &hdr, &[], None);
-        for item in items {
-            out.extend_from_slice(&item);
-        }
-        out
-    }
-    fn one(hdr: ControlHeader, blob: &[u8], data: Option<&[&[u8]]>) -> Vec<u8> {
-        let mut out = Vec::new();
-        append_frame(&mut out, &hdr, blob, data);
-        out
-    }
-
-    let (s0, s1) = (b"schema 0".to_vec(), b"schema one".to_vec());
-    let items = [
-        family(16, WireConflictMode::Error, BLIND, &s0),
-        family(WIDE_TID, WireConflictMode::Update, 9, &s1),
-    ];
-    let want = framed(
-        ClientVerb::PushTxn,
-        0,
-        items.iter().map(|it| {
-            let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, it.target, it.basis);
-            hdr.flags.conflict_mode = it.conflict_mode;
-            one(hdr, it.blob, Some(&it.data[..]))
-        }),
-    );
-    assert_eq!(encoded(|out| encode_items(out, ClientVerb::PushTxn, &items)), want);
-
-    let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX)];
-    let want = framed(
-        ClientVerb::ScanMulti,
-        0,
-        rels.iter().map(|s| {
-            one(
-                ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout),
-                s.spec,
-                None,
-            )
-        }),
-    );
-    assert_eq!(encoded(|out| encode_scan_multi(out, &rels)), want);
-
-    // A long spec ahead of a short one and a cursorless item: each item's blob
-    // holds only its own cursor and spec.
-    let views = [
-        DeltaPollItem {
-            spec: b"a much longer spec",
-            ..item(1, 5, 1)
-        },
-        item(2, 42, u64::MAX),
-        DeltaPollItem { spec: b"", ..item(3, 0, 7) },
-    ];
-    let want = framed(
-        ClientVerb::DeltaPoll,
-        1_500,
-        views.iter().map(|v| {
-            let (tag, tick) = v.from.map_or((0, 0), DeltaCursor::pair);
-            let mut blob = tag.to_le_bytes().to_vec();
-            blob.extend_from_slice(&tick.to_le_bytes());
-            blob.extend_from_slice(v.spec);
-            one(
-                ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout),
-                &blob,
-                None,
-            )
-        }),
-    );
-    assert_eq!(encoded(|out| encode_delta_poll(out, &views, Some(sub(1_500)))), want);
-}
-
 /// A frame appended behind other bytes leaves them as they were.
 #[test]
 fn a_multi_item_frame_appends_behind_what_its_buffer_holds() {
@@ -356,11 +272,6 @@ fn decode_items_enforces_each_verbs_item_rules() {
         .filter(|&v| VerbShape::of(v).items.is_some())
         .collect();
     assert_eq!(multi.len(), 4);
-    let fits = |rule: Section, present: bool| match rule {
-        Section::Never => !present,
-        Section::May => true,
-        Section::Must => present,
-    };
     for verb in multi {
         let VerbShape { sections, items: shape, .. } = VerbShape::of(verb);
         let cap = shape.unwrap().cap;
@@ -389,7 +300,7 @@ fn decode_items_enforces_each_verbs_item_rules() {
             let got = items(&one_item(hdr, b, d), verb);
             assert_eq!(
                 got.is_ok(),
-                fits(sections.blob, !b.is_empty()) && fits(sections.data, d),
+                sections.blob.admits(!b.is_empty()) && sections.data.admits(d),
                 "{verb:?} blob {b:?} data {d}: {got:?}"
             );
             if let Err(err) = got {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{FixedInt, TypeCode, cmp_col_window};
+use crate::{FixedInt, cmp_col_window};
 
 /// Bit patterns every width-parameterized sweep below truncates to its type's
 /// width: both sign boundaries, the all-ones edges, and the 2^63 / 2^64 / 2^127

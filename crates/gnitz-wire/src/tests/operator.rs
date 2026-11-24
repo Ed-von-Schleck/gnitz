@@ -59,24 +59,14 @@ fn agg_merge_preserves_output_type() {
 /// A count and a SUM never render NULL; MIN/MAX do over a nullable source or with no group.
 #[test]
 fn raw_output_nullable_matches_emit_semantics() {
-    for f in [
-        AggFunc::Count,
-        AggFunc::CountNonNull,
-        AggFunc::CountPosInf,
-        AggFunc::CountNegInf,
-        AggFunc::Sum,
-        AggFunc::FiniteSum,
-    ] {
-        for src_nullable in [false, true] {
-            for ungrouped in [false, true] {
-                assert!(!f.raw_output_nullable(src_nullable, ungrouped), "{f:?}");
-            }
+    for &f in AggFunc::ALL {
+        let extreme = matches!(f, AggFunc::Min | AggFunc::Max);
+        for (nullable, ungrouped) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                f.raw_output_nullable(nullable, ungrouped),
+                extreme && (nullable || ungrouped),
+                "{f:?} nullable {nullable} ungrouped {ungrouped}"
+            );
         }
-    }
-    for f in [AggFunc::Min, AggFunc::Max] {
-        assert!(!f.raw_output_nullable(false, false), "{f:?} grouped, non-nullable");
-        assert!(f.raw_output_nullable(true, false), "{f:?} grouped, nullable");
-        assert!(f.raw_output_nullable(false, true), "{f:?} global, non-nullable");
-        assert!(f.raw_output_nullable(true, true), "{f:?} global, nullable");
     }
 }

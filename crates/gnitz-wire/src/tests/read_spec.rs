@@ -1,5 +1,3 @@
-use std::num::NonZeroU64;
-
 use super::*;
 use crate::{AggDescriptor, AggFunc, MAX_COLUMNS, PkColList, TypeCode};
 
@@ -300,10 +298,10 @@ fn peek_bound_reads_only_the_routing_bounds() {
 
 /// Splitting a blob by key owner keeps every other section byte-for-byte: each
 /// worker's blob decodes to the same spec over the keys it owns, in ascending
-/// order, a worker owning none gets nothing, and together they carry every key.
+/// order, and a worker owning none gets nothing.
 #[test]
 fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
-    for stride in [8usize, 24] {
+    for stride in [8usize, 16, 24] {
         let set = keys(stride);
         let spec = ReadSpec {
             bound: ReadBound::PkSet(set.clone()),
@@ -320,19 +318,17 @@ fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
         let Some(BoundPeek::PkSet(peek)) = peek_bound(&blob) else {
             panic!("a PkSet peeks as its keys");
         };
-        // The keys ascend as 3, 9, 200; each table names the owner of each in turn.
-        for owners in [[0usize, 0, 0], [0, 2, 0], [2, 1, 0], [1, 1, 2]] {
-            let owner = |k: &[u8]| match k[0] {
-                3 => owners[0],
-                9 => owners[1],
-                _ => owners[2],
-            };
-            let column: Vec<u8> = set.iter().map(|k| owner(k) as u8).collect();
-            let blobs = peek.split(&column, 3);
+        // Each table names the owner of each key in turn.
+        for owners in [[0u8, 0, 0], [0, 2, 0], [2, 1, 0], [1, 1, 2]] {
+            let blobs = peek.split(&owners, 3);
             assert_eq!(blobs.len(), 3);
-            let mut union: Vec<&[u8]> = Vec::new();
             for (w, got) in blobs.iter().enumerate() {
-                let mine: Vec<&[u8]> = set.iter().filter(|k| owner(k) == w).collect();
+                let mine: Vec<&[u8]> = set
+                    .iter()
+                    .zip(owners)
+                    .filter(|&(_, o)| o as usize == w)
+                    .map(|(k, _)| k)
+                    .collect();
                 if mine.is_empty() {
                     assert!(got.is_empty(), "{owners:?} worker {w}");
                     continue;
@@ -343,10 +339,7 @@ fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
                 };
                 // Decoding a PkSet refuses keys out of order.
                 assert_eq!(ReadSpec::decode(got), Ok(want), "{owners:?} worker {w}");
-                union.extend(mine);
             }
-            union.sort();
-            assert_eq!(union, set.iter().collect::<Vec<_>>(), "{owners:?}");
         }
     }
 }

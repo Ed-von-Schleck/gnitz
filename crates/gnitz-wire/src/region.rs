@@ -194,7 +194,3 @@ pub fn zip_cells<const W: usize, D>(
 #[cfg(test)]
 #[path = "tests/region.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "benches/region.rs"]
-mod benches;

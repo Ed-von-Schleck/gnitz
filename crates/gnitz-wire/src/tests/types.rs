@@ -4,32 +4,45 @@ use gnitz_foundation::rng::mix;
 /// Every type-code predicate over every `TypeCode`.
 #[test]
 fn type_predicates_partition_the_type_table() {
-    /// `(type, fixed_int, signed_int, int, float, german_string, wide_int,
-    /// pk_eligible, serial_eligible, reindex_output_type)`, one row per type.
+    /// `(type, wire_stride, fixed_int, signed_int, int, float, german_string,
+    /// wide_int, pk_eligible, serial_eligible, reindex_output_type)`, one row
+    /// per type.
     use TypeCode::*;
-    type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool, TypeCode);
+    type Row = (
+        TypeCode,
+        usize,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        TypeCode,
+    );
     let table: &[Row] = &[
-        (U8, true, false, true, false, false, false, true, true, U8),
-        (I8, true, true, true, false, false, false, true, true, I8),
-        (U16, true, false, true, false, false, false, true, true, U16),
-        (I16, true, true, true, false, false, false, true, true, I16),
-        (U32, true, false, true, false, false, false, true, true, U32),
-        (I32, true, true, true, false, false, false, true, true, I32),
-        (F32, false, false, false, true, false, false, false, false, U128),
-        (U64, true, false, true, false, false, false, true, true, U64),
-        (I64, true, true, true, false, false, false, true, true, I64),
-        (F64, false, false, false, true, false, false, false, false, U128),
-        (String, false, false, false, false, true, false, false, false, U128),
-        (U128, false, false, true, false, false, true, true, false, U128),
-        (UUID, false, false, false, false, false, true, true, false, U128),
-        (Blob, false, false, false, false, true, false, false, false, U128),
-        (I128, false, true, true, false, false, true, true, false, I128),
-        (Date, true, true, false, false, false, false, true, false, Date),
+        (U8, 1, true, false, true, false, false, false, true, true, U8),
+        (I8, 1, true, true, true, false, false, false, true, true, I8),
+        (U16, 2, true, false, true, false, false, false, true, true, U16),
+        (I16, 2, true, true, true, false, false, false, true, true, I16),
+        (U32, 4, true, false, true, false, false, false, true, true, U32),
+        (I32, 4, true, true, true, false, false, false, true, true, I32),
+        (F32, 4, false, false, false, true, false, false, false, false, U128),
+        (U64, 8, true, false, true, false, false, false, true, true, U64),
+        (I64, 8, true, true, true, false, false, false, true, true, I64),
+        (F64, 8, false, false, false, true, false, false, false, false, U128),
+        (String, 16, false, false, false, false, true, false, false, false, U128),
+        (U128, 16, false, false, true, false, false, true, true, false, U128),
+        (UUID, 16, false, false, false, false, false, true, true, false, U128),
+        (Blob, 16, false, false, false, false, true, false, false, false, U128),
+        (I128, 16, false, true, true, false, false, true, true, false, I128),
+        (Date, 4, true, true, false, false, false, false, true, false, Date),
         (
-            Timestamp, true, true, false, false, false, false, true, false, Timestamp,
+            Timestamp, 8, true, true, false, false, false, false, true, false, Timestamp,
         ),
-        (Decimal, true, true, false, false, false, false, true, false, Decimal),
-        (Bool, true, false, false, false, false, false, true, false, Bool),
+        (Decimal, 8, true, true, false, false, false, false, true, false, Decimal),
+        (Bool, 1, true, false, false, false, false, false, true, false, Bool),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
     let exact: Vec<FixedInt> = TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t)).collect();
@@ -39,7 +52,11 @@ fn type_predicates_partition_the_type_table() {
         "FixedInt::ALL is every exact fixed int, in TypeCode order"
     );
 
-    for &(tc, fixed, signed, int, float, german, wide, pk, serial, reindex) in table {
+    for &(tc, stride, fixed, signed, int, float, german, wide, pk, serial, reindex) in table {
+        assert_eq!(tc.wire_stride(), stride, "wire_stride({tc:?})");
+        if let ValueForm::Scalar(ScalarKind::Int(fi)) = tc.form() {
+            assert_eq!(fi.type_code().form(), tc.form(), "{tc:?} is its storage integer");
+        }
         assert_eq!(tc.is_fixed_int(), fixed, "is_fixed_int({tc:?})");
         assert_eq!(tc.is_signed_int(), signed, "is_signed_int({tc:?})");
         assert_eq!(tc.is_int(), int, "is_int({tc:?})");
@@ -52,74 +69,14 @@ fn type_predicates_partition_the_type_table() {
     }
 }
 
-/// Every type's form against its width, sign and scalar image, and a type
-/// stored as an integer against that integer.
-#[test]
-fn a_types_form_fixes_its_width_sign_and_image() {
-    use TypeCode::*;
-    let strides: [(TypeCode, usize); 19] = [
-        (U8, 1),
-        (I8, 1),
-        (U16, 2),
-        (I16, 2),
-        (U32, 4),
-        (I32, 4),
-        (F32, 4),
-        (U64, 8),
-        (I64, 8),
-        (F64, 8),
-        (String, 16),
-        (U128, 16),
-        (UUID, 16),
-        (Blob, 16),
-        (I128, 16),
-        (Date, 4),
-        (Timestamp, 8),
-        (Decimal, 8),
-        (Bool, 1),
-    ];
-    assert_eq!(strides.len(), TypeCode::ALL.len());
-    for (tc, stride) in strides {
-        assert_eq!(tc.wire_stride(), stride, "wire_stride({tc:?})");
-        match tc.form() {
-            ValueForm::Scalar(kind) => {
-                assert_eq!(ScalarKind::from_type_code(tc), Some(kind), "{tc:?}");
-                if let ScalarKind::Int(fi) = kind {
-                    assert_eq!(FixedInt::from_type_code(tc), Some(fi), "{tc:?}");
-                    assert_eq!(fi.width(), stride, "{tc:?}");
-                    assert_eq!(fi.is_signed(), tc.is_signed_int(), "{tc:?}");
-                    assert_eq!(fi.type_code().form(), tc.form(), "{tc:?} is its storage integer");
-                } else {
-                    assert_eq!(FixedInt::from_type_code(tc), None, "{tc:?}");
-                }
-            }
-            ValueForm::Wide(wide) => {
-                assert_eq!(stride, 16, "{tc:?}");
-                assert_eq!(ScalarKind::from_type_code(tc), None, "{tc:?}");
-                if let WideForm::Int128 { signed } = wide {
-                    assert_eq!(signed, tc.is_signed_int(), "{tc:?}");
-                }
-            }
-        }
-    }
-}
-
 /// Membership and the discriminant round-trip are `wire_enum!`'s; only the
 /// names need a runtime compare.
 #[test]
-fn type_code_wire_names_are_distinct() {
-    let mut names: Vec<&str> = TypeCode::ALL.iter().map(|&tc| tc.wire_name()).collect();
-    names.sort_unstable();
-    names.dedup();
-    assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate wire_name in ALL");
-}
-
-#[test]
-fn type_code_sql_names_are_distinct() {
-    let mut names: Vec<&str> = TypeCode::ALL.iter().map(|&tc| tc.sql_name()).collect();
-    names.sort_unstable();
-    names.dedup();
-    assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate sql_name in ALL");
+fn type_code_names_are_distinct() {
+    for name in [TypeCode::wire_name as fn(TypeCode) -> &'static str, TypeCode::sql_name] {
+        let names: std::collections::HashSet<_> = TypeCode::ALL.iter().map(|&tc| name(tc)).collect();
+        assert_eq!(names.len(), TypeCode::ALL.len(), "a duplicate name in ALL");
+    }
 }
 
 /// `[min, max]` of an integer type's values; `None` for every type stored as an

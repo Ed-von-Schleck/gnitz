@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::{Writer, decode_all};
+use crate::codec::decode_all;
 
 fn enc(r: &KeyRange) -> Vec<u8> {
     let mut w = Writer::new();

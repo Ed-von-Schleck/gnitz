@@ -108,6 +108,8 @@ impl Feeder {
     fn read(&mut self, bytes: &[u8]) -> usize {
         assert!(self.window.1 > 0, "a window is never zero-length");
         let n = bytes.len().min(self.window.1);
+        // SAFETY: the window is `self.window.1 >= n` writable bytes the
+        // deframer handed out and nothing else holds.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.window.0, n) };
         // SAFETY: `n` bytes were just written at the head of the window.
         let mut src = unsafe { self.deframer.landed(&self.carry, n) };
@@ -141,6 +143,12 @@ fn a_run_of_frames_costs_the_reads_it_needs() {
         // A frame larger than the carry reads straight into its own buffer,
         // and the frame after it parses from the carry again.
         (vec![vec![0xC3; 2 * CARRY_BYTES + 500], vec![0x11; 300]], 3),
+        // A payload received into a pooled buffer larger than it: the window
+        // ends at its length, never reaching into the next frame.
+        (
+            vec![vec![0x5A; 3 * crate::frame_buf::POOL_MIN_BYTES / 2], b"next".to_vec()],
+            3,
+        ),
     ];
     // A frame whose carry read ends in its prefix, at its payload's start or in
     // its payload completes on the next read.

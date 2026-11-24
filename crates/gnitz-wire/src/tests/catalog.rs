@@ -87,7 +87,6 @@ fn a_column_reads_back_out_of_its_row() {
 fn a_column_row_refuses_forged_words() {
     let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
     let sound = ColTabRow::of(16, 0, &col, None);
-    assert!(sound.column().is_ok());
     for (r, expect) in [
         (ColTabRow { type_code: 0x104, ..sound.clone() }, "type_code"),
         (ColTabRow { type_code: 99, ..sound.clone() }, "invalid column type 99"),
@@ -96,7 +95,13 @@ fn a_column_row_refuses_forged_words() {
             ColTabRow { fk_col_idx: 3, ..sound.clone() },
             "FK column 3 with no FK table",
         ),
-        (ColTabRow { fk_on_delete: 2, ..sound.clone() }, "fk_on_delete"),
+        (
+            ColTabRow {
+                fk_on_delete: crate::outside(FkAction::from_wire).into(),
+                ..sound.clone()
+            },
+            "fk_on_delete",
+        ),
         (
             ColTabRow { fk_on_delete: 1, ..sound.clone() },
             "an FK action with no FK table",
@@ -162,22 +167,8 @@ fn a_relation_rows_parts_invert_its_written_words() {
     }
     let table = TableTabRow::of(17, 2, "t", pk, crate::TableProps::default());
     for (r, expect) in [
-        (
-            TableTabRow {
-                stream: true,
-                serial: true,
-                ..table.clone()
-            },
-            "SERIAL",
-        ),
-        (
-            TableTabRow {
-                stream: true,
-                compress: true,
-                ..table.clone()
-            },
-            "compressed",
-        ),
+        // `TableProps::validate`'s rules are its own; one shows the row routes
+        // through it.
         (
             TableTabRow { dist_prefix: 3, ..table.clone() },
             "exceeds PK column count",

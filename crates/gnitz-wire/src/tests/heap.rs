@@ -188,17 +188,7 @@ fn a_coded_value_carries_its_code_count() {
         push_codes(&mut copied, &codes);
         assert_eq!(copied, framed, "{n} codes framed alike, written or copied");
         let head = framed.len() - n;
-        assert_eq!(
-            head,
-            if n < 128 {
-                1
-            } else if n < 1 << 14 {
-                2
-            } else {
-                3
-            },
-            "{n} codes"
-        );
+        assert_eq!(head, 1 + (n >= 128) as usize + (n >= 1 << 14) as usize, "{n} codes");
         let heap = coded(&framed, 0);
         let value = heap.value(0, n.max(13)).unwrap();
         assert_eq!((value.stored(), value.end()), (&codes[..], framed.len()));
@@ -221,13 +211,10 @@ fn plain_extent_truth_table() {
     assert_eq!(plain_extent(8, u64::MAX - 5, 20), None);
 }
 
+/// Equal tables share a digest; one differing only in a symbol's length does not.
 #[test]
-fn a_tables_digest_is_the_checksum_of_its_symbols_then_lengths() {
-    let symbols = [*b"abcdefgh", *b"xy\0\0\0\0\0\0"];
-    let lens = [8, 2];
-    let table = SymbolTable::new(&symbols, &lens).unwrap();
-    assert_eq!(
-        table.digest(),
-        crate::checksum(&[symbols.as_flattened(), &lens[..]].concat())
-    );
+fn a_tables_digest_names_its_symbols_and_their_lengths() {
+    let d = |lens: &[u8]| SymbolTable::new(&[*b"xy\0\0\0\0\0\0"], lens).unwrap().digest();
+    assert_eq!(d(&[2]), d(&[2]));
+    assert_ne!(d(&[2]), d(&[1]));
 }

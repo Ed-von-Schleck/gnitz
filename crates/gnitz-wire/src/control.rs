@@ -442,6 +442,17 @@ pub(crate) enum Section {
     Must,
 }
 
+impl Section {
+    /// Whether a frame carrying (`present`) or lacking the section obeys the rule.
+    pub(crate) const fn admits(self, present: bool) -> bool {
+        match self {
+            Section::Never => !present,
+            Section::May => true,
+            Section::Must => present,
+        }
+    }
+}
+
 /// What a single-item verb's frame, or each item of a multi-item verb, carries.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Sections {
@@ -459,16 +470,23 @@ impl Sections {
         if !self.conflict_mode && ctrl.hdr.flags.conflict_mode != WireConflictMode::default() {
             return Err("a conflict mode on a request that pushes nothing");
         }
-        match (self.blob, !ctrl.blob.is_empty()) {
-            (Section::Never, true) => return Err("frame carries a blob its verb does not read"),
-            (Section::Must, false) => return Err("frame lacks the blob its verb requires"),
-            _ => {}
+        let blob = !ctrl.blob.is_empty();
+        if !self.blob.admits(blob) {
+            return Err(if blob {
+                "frame carries a blob its verb does not read"
+            } else {
+                "frame lacks the blob its verb requires"
+            });
         }
-        match (self.data, ctrl.data.is_some()) {
-            (Section::Never, true) => Err("frame carries a data block its verb does not read"),
-            (Section::Must, false) => Err("frame lacks the data block its verb requires"),
-            _ => Ok(()),
+        let data = ctrl.data.is_some();
+        if !self.data.admits(data) {
+            return Err(if data {
+                "frame carries a data block its verb does not read"
+            } else {
+                "frame lacks the data block its verb requires"
+            });
         }
+        Ok(())
     }
 }
 

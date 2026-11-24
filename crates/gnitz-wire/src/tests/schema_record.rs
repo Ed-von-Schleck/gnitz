@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ColType, TypeCode};
+use crate::TypeCode;
 
 fn col(tc: TypeCode, name: &str, nullable: bool) -> RecordCol<'_> {
     RecordCol {
@@ -120,8 +120,8 @@ fn each_guard_rejects_its_own_forgery() {
 }
 
 /// The exact bytes of a compound-PK schema whose last column carries every flag
-/// and a long name — the one pin of the format, which `gnitz-mirror` relies on
-/// as a view's schema identity.
+/// and a long name. `gnitz-mirror` relies on the format as a view's schema
+/// identity.
 #[test]
 fn the_record_layout_is_fixed() {
     let long = "a_rather_long_column_name";

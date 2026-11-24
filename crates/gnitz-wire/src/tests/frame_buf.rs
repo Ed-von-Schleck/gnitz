@@ -1,7 +1,5 @@
-use std::mem::MaybeUninit;
-
 use super::*;
-use crate::{Deframer, FrameLenError, framed};
+use crate::Deframer;
 
 /// A pool with one user, as one open connection makes it.
 fn used() -> Pool {
@@ -105,31 +103,4 @@ fn a_dropped_frame_buf_returns_its_buffer() {
     drop(FrameBuf::from(b));
     let again = try_alloc(cap).unwrap();
     assert_eq!((again.as_ptr(), again.capacity()), (at, cap), "the buffer given back");
-}
-
-/// A payload received into a buffer larger than it ends at its own length: no
-/// read window reaches past it into the next frame, and the frame after it
-/// parses whole.
-#[test]
-fn a_frame_in_a_larger_buffer_stops_at_its_length() {
-    let len = 3 * POOL_MIN_BYTES / 2;
-    let first: Vec<u8> = (0..len).map(|i| i as u8).collect();
-    let wire = [framed(&first), framed(b"next")].concat();
-    let mut d = Deframer::default();
-    let mut carry: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(64 * 1024);
-    let mut frames = Vec::new();
-    let mut rest = &wire[..];
-    while !rest.is_empty() {
-        let window = d.window(&mut carry);
-        let n = window.len().min(rest.len());
-        window[..n].write_copy_of_slice(&rest[..n]);
-        rest = &rest[n..];
-        // SAFETY: `n` bytes were just written at the head of the window.
-        let mut src = unsafe { d.landed(&carry, n) };
-        while let Some((f, ())) = d.feed(&mut src, |_| Ok::<_, FrameLenError>(())).unwrap() {
-            frames.push(f.into_owned());
-        }
-    }
-    assert!(frames[0].0.capacity() > len, "received into a size class");
-    assert_eq!(frames.iter().map(|f| &f[..]).collect::<Vec<_>>(), [&first[..], b"next"]);
 }

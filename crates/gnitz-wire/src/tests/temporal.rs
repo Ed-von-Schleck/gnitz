@@ -1,5 +1,4 @@
 use super::*;
-use crate::VALUE_TEXT_MAX;
 
 /// 2024-02-29.
 const LEAP_DAY: i64 = 19_782;
@@ -65,23 +64,12 @@ fn a_timestamp_parses_as_a_date_and_an_optional_time_of_day() {
     assert_eq!(split_micros(-1), (-1, 23, 59, 59, 999_999));
 }
 
-#[test]
-fn formatted_dates_and_timestamps_parse_back() {
-    let buf = &mut [0; VALUE_TEXT_MAX];
-    for days in [-719_528, -1, 0, 1, 19_000, 2_932_896, i32::MIN, i32::MAX] {
-        let text = write_date(days.into(), buf);
-        assert_eq!(parse_date(text), Some(days), "{text}");
-    }
-    for micros in [0, 1, -1, 1_500_000, 86_399_999_999, 1_700_000_000_123_400] {
-        let text = write_timestamp(micros, buf);
-        assert_eq!(parse_timestamp(text), Some(micros), "{text}");
-    }
-}
-
 /// The year is at least four characters wide with its sign, so year -1 is
 /// `-001`; a fraction is as long as it needs to be and absent on a whole second.
+/// Every spelling parses back to the value it prints, which also inverts
+/// `split_micros` through `join_micros`.
 #[test]
-fn dates_and_timestamps_print_their_fixed_spelling() {
+fn dates_and_timestamps_print_their_fixed_spelling_and_parse_back() {
     let buf = &mut [0; VALUE_TEXT_MAX];
     let day = |y, m, d| i32::try_from(days_from_civil(y, m, d)).unwrap();
     for (days, want) in [
@@ -92,8 +80,11 @@ fn dates_and_timestamps_print_their_fixed_spelling() {
         (day(12_345, 6, 7), "12345-06-07"),
         (i32::MIN, "-5877641-06-23"),
         (i32::MAX, "5881580-07-11"),
+        (-719_528, "0000-01-01"),
+        (2_932_896, "9999-12-31"),
     ] {
         assert_eq!(write_date(days.into(), buf), want, "{days}");
+        assert_eq!(parse_date(want), Some(days), "{want}");
     }
     for (micros, want) in [
         (0, "1970-01-01 00:00:00"),
@@ -106,25 +97,18 @@ fn dates_and_timestamps_print_their_fixed_spelling() {
         ),
         (i64::MIN, "-290308-12-21 19:59:05.224192"),
         (i64::MAX, "294247-01-10 04:00:54.775807"),
+        (86_399_999_999, "1970-01-01 23:59:59.999999"),
+        (-86_400_000_001, "1969-12-30 23:59:59.999999"),
     ] {
         assert_eq!(write_timestamp(micros, buf), want, "{micros}");
+        assert_eq!(parse_timestamp(want), Some(micros), "{want}");
     }
 }
 
+/// A join past either end of `i64` microseconds, or of a field's range, is no
+/// timestamp.
 #[test]
-fn joined_micros_invert_the_split() {
-    for micros in [
-        0,
-        1,
-        -1,
-        1_500_000,
-        86_399_999_999,
-        1_700_000_000_123_400,
-        -86_400_000_001,
-    ] {
-        let (days, h, mi, s, us) = split_micros(micros);
-        assert_eq!(join_micros(days, h, mi, s, us), Some(micros), "{micros}");
-    }
+fn a_join_out_of_range_is_refused() {
     assert_eq!(join_micros(i64::MAX / MICROS_PER_DAY + 1, 0, 0, 0, 0), None);
     assert_eq!(join_micros(i64::MAX / MICROS_PER_DAY, 23, 59, 59, 999_999), None);
     assert_eq!(join_micros(0, u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
