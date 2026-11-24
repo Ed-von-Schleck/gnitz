@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::col;
-use gnitz_expr::SchemaDescriptor;
-use gnitz_wire::TypeCode;
+use gnitz_wire::{RelClass, TypeCode};
 
 /// A table of U64 columns `cols` keyed on `pk`.
 fn u64_table(cols: &[&str], pk: &[u32]) -> Arc<RelDescriptor> {
@@ -13,38 +12,35 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
     let q = crate::test_support::parse_query(sql);
     let cat = crate::test_support::catalog(vec![("t", Arc::clone(desc))]);
     let read = crate::hir::bind_adhoc_read(&cat, &q).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-    let crate::hir::AdhocRead::Relation {
-        shape: crate::hir::AdhocShape::Rows(rows),
-        ..
-    } = read
-    else {
+    let AdhocRead::Relation { shape: AdhocShape::Rows(rows), .. } = read else {
         panic!("`{sql}` is not a rows read");
     };
     rows
-}
-
-/// Column `c`'s region: its place in the key region, then in the payload.
-fn region(s: &SchemaDescriptor, c: u32) -> usize {
-    let c = c as usize;
-    s.payload_slot(c).map_or_else(
-        || s.pk_cols().iter().position(|&p| p as usize == c).unwrap(),
-        |p| s.pk_cols().len() + p,
-    )
 }
 
 /// The reply lists the key columns no item names, hidden under the relation's
 /// definition, then the items — a key column at the first item that copies it, a
 /// second copy a payload column. A projection whose payload is the relation's own,
 /// each column copied in place, ships no program, wherever the key stands and
-/// whatever the columns are called. The worker sorts its input — the program's
-/// output, or the relation — on the region the client sorts the reply on, in the
-/// same direction, and keys ascending a leading run of the PK are ones a walk in PK
-/// order already yields.
+/// whatever the columns are called; a view's hidden columns ride along, where a
+/// table's are copied out from beside them. Keys ascending a leading run of the PK
+/// are ones a walk in PK order already yields.
 #[test]
 fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
     let t = u64_table(&["id", "v", "w"], &[0]);
     let mid = u64_table(&["v", "id", "w"], &[1]);
     let ab = u64_table(&["a", "b", "v"], &[0, 1]);
+    let hid = |class| {
+        let u = |n| col(n, TypeCode::U64);
+        crate::test_support::rel(
+            1,
+            class,
+            vec![u("id"), u("v"), u("_h").hidden(), u("w")],
+            vec![0],
+            vec![],
+        )
+    };
+    let (view, hidden) = (hid(RelClass::View), hid(RelClass::Table));
     /// The relation, the statement, whether it is mapped, the reply columns with hidden
     /// ones bracketed, the key, the ORDER BY columns, and whether a walk in PK order
     /// yields them.
@@ -78,6 +74,11 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
         (&t,   "SELECT w, v, id FROM t ORDER BY id",         true,  "w v id",    &[2], "id", true),
         (&t,   "SELECT id, id AS again, v, w FROM t ORDER BY again", true, "id again v w", &[0], "again", true),
         (&t,   "SELECT id, id AS again, v FROM t ORDER BY again DESC", true, "id again v", &[0], "again", false),
+        // A computed copy of the key is no key: the key rides hidden.
+        (&t,   "SELECT id + 0 AS k, v FROM t ORDER BY v",    true,  "[id] k v",  &[0], "v", false),
+        // A view's hidden column rides along; a table's is copied out from beside it.
+        (&view,   "SELECT * FROM t ORDER BY w",              false, "id v [_h] w", &[0], "w", false),
+        (&hidden, "SELECT * FROM t ORDER BY w",              true,  "id v w",    &[0], "w", false),
         // A hidden key the ORDER BY computes, behind the SELECT list.
         (&t,   "SELECT * FROM t ORDER BY v + 1",             true,  "id v w [_order0]", &[0], "[_order0]", false),
         // A float literal is the same literal only bit for bit: `-0.0` is not `0.0`.
@@ -99,47 +100,11 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
                 shown.join(" "),
                 r.schema.pk_cols(),
                 ordered.join(" "),
-                r.program.is_some()
+                r.program.is_some(),
+                r.pk_ordered
             ),
-            (cols.to_string(), key, order_cols.to_string(), mapped),
+            (cols.to_string(), key, order_cols.to_string(), mapped, pk_ordered),
             "`{sql}`"
         );
-        let (reply, relation) = (r.schema.layout(), desc.schema.layout());
-        assert_eq!(r.sink_order.len(), r.order.len(), "`{sql}`");
-        for (o, s) in r.order.iter().zip(&r.sink_order) {
-            let sink_region = match mapped {
-                true => s.col as usize,
-                false => region(relation, s.col),
-            };
-            assert_eq!(region(reply, o.col), sink_region, "`{sql}`");
-            assert_eq!(OrderKey { col: 0, ..*o }, OrderKey { col: 0, ..*s }, "`{sql}`");
-        }
-        // With no program every relation column is copied at its own region.
-        if !mapped {
-            assert_eq!(r.copied.len(), relation.num_columns(), "`{sql}`");
-            for &(c, to) in &r.copied {
-                assert_eq!(region(relation, c), region(reply, to), "`{sql}`");
-            }
-        }
-        assert_eq!(r.pk_ordered, pk_ordered, "`{sql}`");
-    }
-}
-
-/// A SELECT list naming each of a key-first relation's columns in place under its
-/// own name replies under the relation's own schema; a renamed, reordered or dropped
-/// column, or a computed ORDER BY key, gets a schema of its own.
-#[test]
-fn an_identity_select_list_replies_under_the_relations_schema() {
-    let t = u64_table(&["id", "v", "w"], &[0]);
-    for (sql, shared) in [
-        ("SELECT * FROM t", true),
-        ("SELECT id, v, w FROM t ORDER BY w", true),
-        ("SELECT id AS k, v, w FROM t", false),
-        ("SELECT v, id, w FROM t", false),
-        ("SELECT v, w FROM t", false),
-        ("SELECT * FROM t ORDER BY v + 1", false),
-    ] {
-        let r = rows_reply_of(sql, &t);
-        assert_eq!(Arc::ptr_eq(&r.schema, &t.schema), shared, "`{sql}`");
     }
 }

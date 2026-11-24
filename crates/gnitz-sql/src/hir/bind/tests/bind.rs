@@ -235,30 +235,3 @@ fn positional_aliases_rename_the_visible_columns_in_order() {
     );
     assert_rejects("x, X", rename(&["x", "X"]), "duplicate column name 'X'");
 }
-
-/// A view body records each catalog reference's visible column names, except
-/// where a column alias list renames them.
-#[test]
-fn a_view_body_records_its_references_column_names() {
-    let (cat, ids) = (catalog(), ColIdGen::new());
-    let mut cx = BindCx::new(
-        &cat,
-        &ids,
-        Surface::View(ViewBody {
-            stmt: "CREATE VIEW",
-            replacing: None,
-            bounded: false,
-        }),
-    );
-    let sql = "SELECT t.id FROM t JOIN u AS x(p, q) ON t.a = x.q";
-    bind_query(&mut cx, &parse_query(sql)).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-    let got: Vec<_> = cx.refs.into_inner().into_iter().map(|r| (r.name, r.columns)).collect();
-    let names = |ns: &[&str]| Some(ns.iter().map(|n| n.to_string()).collect());
-    assert_eq!(
-        got,
-        vec![
-            ("t".to_string(), names(&["id", "a", "b", "f"])),
-            ("u".to_string(), None)
-        ]
-    );
-}

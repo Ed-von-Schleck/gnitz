@@ -538,30 +538,6 @@ fn visible(s: &gnitz_core::Schema) -> Vec<String> {
     s.visible_columns().map(|(_, c)| c.name.to_lowercase()).collect()
 }
 
-/// The reply schema a projection produces: the SELECT list in order over the
-/// source PK, which the first item copying it names and which rides hidden in
-/// front when none does, so `* EXCEPT (id)` keeps its key.
-#[test]
-fn a_reads_reply_schema_is_the_select_list_over_the_source_pk() {
-    let cat = base();
-    // `(statement, visible columns, the key's column, whether it is hidden)`.
-    for (sql, want, key, hidden) in [
-        ("SELECT * EXCEPT (g) FROM t", vec!["id", "v"], 0, false),
-        ("SELECT * EXCEPT (id) FROM t", vec!["g", "v"], 0, true),
-        ("SELECT * RENAME (g AS x) FROM t", vec!["id", "x", "v"], 0, false),
-        ("SELECT t.g AS x, t.id FROM t", vec!["x", "id"], 1, false),
-        ("SELECT g, id AS k, id FROM t", vec!["g", "k", "id"], 1, false),
-        ("SELECT id + 0 AS k, g FROM t", vec!["k", "g"], 0, true),
-    ] {
-        let s = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        let schema = s.reply_schema();
-        assert_eq!(visible(schema), want, "`{sql}`");
-        assert_eq!(schema.pk_cols(), [key], "`{sql}`");
-        assert_eq!(schema.columns()[key as usize].is_hidden, hidden, "`{sql}`");
-        assert_eq!(schema.columns().len(), want.len() + usize::from(hidden), "`{sql}`");
-    }
-}
-
 /// `SELECT *` over a table at the column cap reads the table's own layout.
 #[test]
 fn a_reproducing_read_at_the_column_cap_ships_no_program() {
@@ -726,6 +702,18 @@ fn a_subscription_is_a_plain_rows_read() {
             .into_subscription()
     };
     assert!(sub("SELECT id, v FROM tv WHERE v > 1").is_ok());
+    // An index survives where every column it lists is copied, under the reply's
+    // numbering at the first item copying it; a computed column is no copy.
+    for (sql, want) in [
+        ("SELECT id, v, w FROM t", &[&[1u32][..], &[2]][..]),
+        ("SELECT w, id FROM t", &[&[0]]),
+        ("SELECT v AS a, v AS b, id FROM t", &[&[0]]),
+        ("SELECT v + 1 AS v, w, id FROM t", &[&[1]]),
+    ] {
+        let s = sub(sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+        let ix: Vec<&[u32]> = s.indexes.iter().map(|i| i.cols.as_slice()).collect();
+        assert_eq!(ix, want, "`{sql}`");
+    }
     for sql in [
         "SELECT COUNT(*) FROM tv",
         "SELECT DISTINCT v FROM tv",

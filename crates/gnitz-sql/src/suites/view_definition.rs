@@ -210,6 +210,12 @@ fn a_definition_keeps_the_body_verbatim_and_names_each_source_once() {
     assert_eq!(t.alias, "T");
     assert_eq!(def.refs[1].alias_end, None);
     assert_eq!(def.body_columns, ["id"]);
+    // Each reference records its visible column names, except where a column alias
+    // list renames them.
+    let def = definition(&view(&base(), "SELECT t.id FROM t JOIN u AS x(p, q, r) ON t.g = x.q"));
+    let names = |ns: &[&str]| Some(ns.iter().map(|n| n.to_string()).collect());
+    let cols: Vec<_> = def.refs.into_iter().map(|r| r.columns).collect();
+    assert_eq!(cols, [names(&["id", "g", "v"]), None]);
 }
 
 #[test]

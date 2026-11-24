@@ -58,6 +58,14 @@ fn unique_key_is_the_flag_carried_through_set_preserving_nodes() {
         ("SELECT id, a FROM st INTERSECT ALL SELECT uid, a FROM u", Some("id")),
         ("SELECT id, a FROM st EXCEPT SELECT id, a FROM t", Some("id a")),
         ("SELECT id, a FROM st EXCEPT ALL SELECT id, a FROM t", None),
+        // A DISTINCT INTERSECT keeps a set left operand as it is, and clamps a bag.
+        ("SELECT id, a FROM st INTERSECT SELECT uid, a FROM u", Some("id")),
+        ("SELECT id, a FROM st INTERSECT SELECT id, a FROM st", Some("id a")),
+        // A global reduce is at most one row: its key is empty, and a cross join
+        // onto it keeps the other side's.
+        ("SELECT COUNT(*) AS n FROM t", Some("")),
+        ("SELECT t.id FROM t CROSS JOIN (SELECT MAX(a) AS m FROM u) s", Some("id")),
+        ("SELECT st.id FROM st CROSS JOIN (SELECT MAX(a) AS m FROM u) s", None),
         // The right key is equated: each left row matches at most one right row.
         ("SELECT t.id, u.uid FROM t JOIN u ON t.a = u.uid", Some("id")),
         ("SELECT t.id, u.uid FROM t LEFT JOIN u ON t.a = u.uid", Some("id")),

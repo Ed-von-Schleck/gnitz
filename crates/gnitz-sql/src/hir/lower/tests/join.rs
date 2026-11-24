@@ -2,9 +2,9 @@ use super::*;
 use crate::hir::{ColIdGen, KeyPair};
 use crate::test_support::{col, schema};
 use ExistsKind::{Anti, Mark, Semi};
+use JoinPlan::{Band, Cross, Equi, PureRange};
 use JoinType::{Exists, Full, Inner, Left, Right};
-use Shape::{Band, Cross, Equi, PureRange};
-use gnitz_wire::RangeRel;
+use gnitz_wire::RangeRel::Le;
 use std::sync::Arc;
 
 /// Four `U64` columns keyed on the slots `pk`, their ids minted from `ids`.
@@ -13,15 +13,6 @@ fn frame(ids: &ColIdGen, names: [&str; 4], pk: &[u32]) -> Frame {
         layout: names.map(|_| Some(ids.next())).to_vec(),
         schema: Arc::new(schema(names.map(|n| col(n, TypeCode::U64)).to_vec(), pk)),
     }
-}
-
-/// Which keys a `join_keep_rules` case joins on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Shape {
-    Equi,
-    Band,
-    PureRange,
-    Cross,
 }
 
 /// Every `join_keep` rule over left `(v, id, k, x)` keyed on `id` and right
@@ -45,27 +36,27 @@ fn join_keep_rules() {
         cols: [col(0, 3), col(1, 2)],
         ty: TypeCode::U64.into(),
     };
-    /// The shape, the kind, what is read above the join, and each side's keep list,
+    /// The plan, the kind, what is read above the join, and each side's keep list,
     /// a pinned PK at its front.
-    type Case = (Shape, JoinType, &'static [(usize, usize)], [&'static [u32]; 2]);
+    type Case = (JoinPlan, JoinType, &'static [(usize, usize)], [&'static [u32]; 2]);
     #[rustfmt::skip]
     let cases: &[Case] = &[
         // Rule 4: a pair-PK side keeps its PK, in PK-list order; an INNER keeps no key
         // for a ν it lacks.
-        (Band,  Inner, &[], [&[1], &[3, 0]]),
-        (PureRange, Inner, &[], [&[1], &[3, 0]]),
+        (Band(Le),  Inner, &[], [&[1], &[3, 0]]),
+        (PureRange(Le), Inner, &[], [&[1], &[3, 0]]),
         (Cross, Inner, &[], [&[1], &[3, 0]]),
         // Rule 3: each side with a ν keeps its keys, behind its pinned PK.
-        (Band,  Left,  &[], [&[1, 2, 3], &[3, 0]]),
-        (Band,  Right, &[], [&[1], &[3, 0, 1, 2]]),
-        (Band,  Full,  &[], [&[1, 2, 3], &[3, 0, 1, 2]]),
-        (PureRange, Left,  &[], [&[1, 3], &[3, 0]]),
+        (Band(Le),  Left,  &[], [&[1, 2, 3], &[3, 0]]),
+        (Band(Le),  Right, &[], [&[1], &[3, 0, 1, 2]]),
+        (Band(Le),  Full,  &[], [&[1, 2, 3], &[3, 0, 1, 2]]),
+        (PureRange(Le), Left,  &[], [&[1, 3], &[3, 0]]),
         // A decorrelated kind has a ν over its left and pins that side alone.
-        (Band,  Exists(Semi),  &[], [&[1, 2, 3], &[]]),
-        (PureRange, Exists(Anti),  &[], [&[1, 3], &[]]),
+        (Band(Le),  Exists(Semi),  &[], [&[1, 2, 3], &[]]),
+        (PureRange(Le), Exists(Anti),  &[], [&[1, 3], &[]]),
         // The pinned PK leads even ahead of a lower slot read above, and appears once.
-        (Band,  Left,  &[(0, 0), (0, 1)], [&[1, 0, 2, 3], &[3, 0]]),
-        (Band,  Left,  &[(1, 1)], [&[1, 2, 3], &[3, 0, 1]]),
+        (Band(Le),  Left,  &[(0, 0), (0, 1)], [&[1, 0, 2, 3], &[3, 0]]),
+        (Band(Le),  Left,  &[(1, 1)], [&[1, 2, 3], &[3, 0, 1]]),
         // An equi side keeps only what is read above the join; its ν is a linear difference.
         (Equi, Left,  &[], [&[], &[]]),
         (Equi, Right, &[], [&[], &[]]),
@@ -76,20 +67,13 @@ fn join_keep_rules() {
         (Equi, Inner, &[(1, 3)], [&[], &[3]]),
         (Equi, Inner, &[], [&[], &[]]),
     ];
-    for &(shape, kind, reads, want) in cases {
+    for &(plan, kind, reads, want) in cases {
         let class = JoinClass {
-            eq: matches!(shape, Equi | Band).then_some(eq).into_iter().collect(),
-            range: matches!(shape, Band | PureRange).then_some((range, RangeRel::Le)),
+            eq: matches!(plan, Equi | Band(_)).then_some(eq).into_iter().collect(),
+            range: matches!(plan, Band(_) | PureRange(_)).then_some((range, Le)),
         };
         class.admit(kind).unwrap();
-        let plan = class.plan();
-        let planned = match plan {
-            JoinPlan::Equi => Equi,
-            JoinPlan::Band(_) => Band,
-            JoinPlan::PureRange(..) => PureRange,
-            JoinPlan::Cross => Cross,
-        };
-        assert_eq!(planned, shape);
+        assert_eq!(class.plan(), plan);
         let refs: ColSet = reads
             .iter()
             .map(|&(side, slot)| col(side, slot))
@@ -97,6 +81,6 @@ fn join_keep_rules() {
             .collect();
         let got = join_keep(&refs, &class, kind, out_key(plan, kind), frames.each_ref()).unwrap();
         let got = got.each_ref().map(Vec::as_slice);
-        assert_eq!(got, want, "{shape:?} {kind:?} reads={reads:?}");
+        assert_eq!(got, want, "{plan:?} {kind:?} reads={reads:?}");
     }
 }

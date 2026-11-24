@@ -1,20 +1,13 @@
 use super::*;
 use crate::test_support::{TestCatalog, catalog, col, ncol, parse_query, table};
-use gnitz_wire::TypeCode;
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// The relations every case plans against: a 64-column `wide` table, and a small
 /// star of `orders`, `customers`, `regions`, `items` and `events`.
 fn bench_catalog() -> TestCatalog {
     let (i, s, f) = (TypeCode::I64, TypeCode::String, TypeCode::F64);
     let mut wide = vec![col("id", i)];
-    for c in 1..64 {
-        let tc = [i, s, f, TypeCode::I32][c % 4];
-        wide.push(if c % 3 == 0 {
-            ncol(&format!("c{c}"), tc)
-        } else {
-            col(&format!("c{c}"), tc)
-        });
-    }
+    wide.extend((1..64).map(|c| ColumnDef::new(format!("c{c}"), [i, s, f, TypeCode::I32][c % 4], c % 3 == 0)));
     catalog(vec![
         ("wide", table(1, wide, vec![0])),
         (

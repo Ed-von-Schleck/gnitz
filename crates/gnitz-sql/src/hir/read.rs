@@ -320,8 +320,8 @@ pub(crate) struct RowsReply {
     /// Whether `order` ascends a leading run of the source's PK columns, so a walk in
     /// PK order already yields it.
     pub(crate) pk_ordered: bool,
-    /// `(relation column, reply column)` for each relation column an item copies
-    /// verbatim, at the first item that does.
+    /// `(relation column, reply column)` for each item copying a relation column
+    /// verbatim, in item order.
     pub(crate) copied: Vec<(u32, u32)>,
 }
 
@@ -371,13 +371,9 @@ pub(crate) fn reply_rows(
     // The worker's sink numbers its input: the program's output, or the relation
     // itself, which an identity projection numbers alike.
     let sink_order = out.order_keys(&order)?;
-    let mut copied: Vec<(u32, u32)> = Vec::with_capacity(proj.len());
-    for (slot, item) in proj.iter().enumerate() {
-        let src = item.as_col().map(|s| s as u32);
-        if let Some(src) = src.filter(|s| copied.iter().all(|(c, _)| c != s)) {
-            copied.push((src, column_of[slot]));
-        }
-    }
+    let copied = (proj.iter().enumerate())
+        .filter_map(|(slot, item)| Some((item.as_col()? as u32, column_of[slot])))
+        .collect();
     // A walk in PK order yields keys ascending a leading run of the PK columns.
     let pk_ordered = sink_order.len() <= k
         && (sink_order.iter().zip(src.pk_cols()))

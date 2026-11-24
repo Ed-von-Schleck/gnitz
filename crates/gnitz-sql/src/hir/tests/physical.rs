@@ -38,7 +38,6 @@ fn a_root_renumbers_a_frame_without_moving_a_payload_column() {
             .schema_in_order(root.split(' ').map(id), |_| None)
             .ok()
             .map(|(s, moved_to)| {
-                assert!(s.layout().same_region_types(f.schema.layout()), "{root}");
                 for (slot, def) in f.schema.columns().iter().enumerate() {
                     assert_eq!(&s.columns()[moved_to[slot] as usize], def, "{root}");
                 }

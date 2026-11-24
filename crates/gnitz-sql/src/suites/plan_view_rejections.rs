@@ -158,6 +158,10 @@ fn join_key_rules() {
             ),
             ("SELECT * FROM ty JOIN a ON ty.big = a.k", "signed-256"),
             ("SELECT * FROM ty JOIN w ON ty.s = w.big", "content hash never matches"),
+            (
+                "SELECT a.id FROM a JOIN (SELECT id, k > 1 AS flag FROM b) d ON a.k = d.flag",
+                "cannot equijoin BOOLEAN column",
+            ),
             (&over_cap, "join key list"),
             ("SELECT * FROM a LEFT JOIN b ON a.v <> b.w", "may be keyless"),
             ("SELECT * FROM a RIGHT JOIN b ON 1 = 1", "may be keyless"),
@@ -297,6 +301,20 @@ fn subquery_rules() {
             (
                 "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.v > 5)",
                 "hoist it into the view's own WHERE",
+            ),
+            // A correlation conjunct neither keying nor ranging would have to decide
+            // match existence.
+            (
+                "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)",
+                "the semi-join cannot consume",
+            ),
+            (
+                "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)",
+                "the semi-join cannot consume",
+            ),
+            (
+                "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v AND b.id > a.id)",
+                "the semi-join cannot consume",
             ),
             (
                 "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)",
