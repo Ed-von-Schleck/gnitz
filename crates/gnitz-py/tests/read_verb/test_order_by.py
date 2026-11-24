@@ -8,6 +8,10 @@ in the same place however a bag is split across workers and entries.
 What the bound refuses is pinned in the planner's `gnitz-sql/src/suites/plan_read.rs`.
 """
 
+from collections import Counter
+from itertools import groupby
+from operator import itemgetter
+
 import pytest
 from _read import bag, ordered, plan_line, reply, rows
 from _shapes import sorted_by
@@ -90,16 +94,16 @@ def test_a_base_table_sort_and_window(src, q, want, fields):
 @pytest.mark.parametrize("tail,want", [
     # LIMIT 2 = 2 logical rows, so only the smallest value survives; an
     # entry-counting LIMIT would spill into val=20.
-    ("ORDER BY val LIMIT 2", {(10,): 2}),
+    ("ORDER BY val LIMIT 2", [(10, 2)]),
     # LIMIT 3 straddles the boundary, clipping the boundary entry to weight 1.
-    ("ORDER BY val LIMIT 3", {(10,): 2, (20,): 1}),
+    ("ORDER BY val LIMIT 3", [(10, 2), (20, 1)]),
     # A window landing inside the weight-2 group.
-    ("ORDER BY val LIMIT 1 OFFSET 1", {(10,): 1}),
-    ("ORDER BY val DESC LIMIT 3", {(20,): 2, (10,): 1}),
-    ("ORDER BY val", {(10,): 2, (20,): 2}),
+    ("ORDER BY val LIMIT 1 OFFSET 1", [(10, 1)]),
+    ("ORDER BY val DESC LIMIT 3", [(20, 2), (10, 1)]),
+    ("ORDER BY val", [(10, 2), (20, 2)]),
 ])
 def test_a_cut_over_a_bag_counts_logical_rows(src, tail, want):
-    assert bag(rows(src, f"SELECT val FROM dup {tail}")) == want
+    assert ordered(rows(src, f"SELECT val FROM dup {tail}"), "val") == [((v,), w) for v, w in want]
 
 
 def test_a_grouped_views_hidden_key_is_not_a_positional_column(client):
@@ -158,17 +162,6 @@ def test_a_cut_in_key_order_matches_a_full_sort(client):
 # ---------------------------------------------------------------------------
 
 
-def _window(entries, offset, limit):
-    """`entries` — `(row, weight)` in order — cut to logical rows `[offset, offset + limit)`."""
-    out, at = [], 0
-    for row, w in entries:
-        kept = min(at + w, offset + limit) - max(at, offset)
-        if kept > 0:
-            out.append((row, kept))
-        at += w
-    return out
-
-
 def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
     """Each worker trims thousands of rows whose leading key ties heavily — 16 values and
     NULLs, strings sharing their first 8 bytes — to its own window, and the client cuts
@@ -187,8 +180,12 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
         insert(client, "big", as_rows[at:at + 1000])
         insert(client, "twice", [r for r in as_rows[at:at + 1000] if r[0] % 3 == 0])
     cols = ("id", "v", "s")
-    values = lambda r: tuple(r[c] for c in cols)
-    weight = lambda r: 2 if r["id"] % 3 == 0 else 1
+    values = itemgetter(*cols)
+    # The view's logical rows: each row of `twice` once more, beside its copy.
+    both = data + [r for r in data if r["id"] % 3 == 0]
+
+    def runs(logical):
+        return [(values(rs[0]), len(rs)) for rs in (list(g) for _, g in groupby(logical, itemgetter("id")))]
 
     # `(ORDER BY, the keys it names, OFFSET, LIMIT)`; a cut breaks ties by ascending id.
     for order, keys, offset, limit in [
@@ -212,20 +209,16 @@ def test_a_cut_over_tied_keys_on_every_worker_keeps_the_sorted_prefix(client):
         # Uncut, ties are open: the written keys must be total for the order to be pinned.
         q = f"SELECT * FROM big ORDER BY {order}"
         assert ordered(rows(client, q), *cols) == [(values(r), 1) for r in sorted_by(data, keys)], q
-        full = [(r, weight(r)) for r in sorted_by(data, keys)]
+        logical = sorted_by(both, keys)
         # The window opens on the second logical row of the first weight-2 entry past 40.
-        first = next(i for i, (_, w) in enumerate(full) if i >= 40 and w == 2)
-        offset = sum(w for _, w in full[:first]) + 1
+        first = next(r for r in sorted_by(data, keys)[40:] if r["id"] % 3 == 0)
+        offset = logical.index(first) + 1
         for limit in (1, 2, 60):
             q = f"SELECT * FROM both ORDER BY {order} LIMIT {limit} OFFSET {offset}"
-            want = [(values(r), w) for r, w in _window(full, offset, limit)]
+            want = runs(logical[offset:offset + limit])
             assert want[0][1] == 1, q
             assert ordered(rows(client, q), *cols) == want, q
     # Ordered by the leading key alone, the view's ties break by its own identity; the
     # values the window holds are fixed all the same.
-    full = [(r, weight(r)) for r in sorted_by(data, [("v", False, False)])]
     got = rows(client, "SELECT v FROM both ORDER BY v LIMIT 900 OFFSET 333")
-    want = {}
-    for r, w in _window(full, 333, 900):
-        want[(r["v"],)] = want.get((r["v"],), 0) + w
-    assert bag(got) == want
+    assert bag(got) == dict(Counter((r["v"],) for r in sorted_by(both, [("v", False, False)])[333:1233]))

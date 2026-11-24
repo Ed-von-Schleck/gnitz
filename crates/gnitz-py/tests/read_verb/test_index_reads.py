@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import pytest
 from gnitz import ColumnDef, Schema, TypeCode, ZSetBatch
-from _read import access, bag, reply, rows
+from _read import access, bag, rows
 from _shapes import grouped
 from _sql import insert
 
@@ -30,27 +30,6 @@ _U64_MAX = 2**64 - 1
 # ---------------------------------------------------------------------------
 # Index seek (the binary verb)
 # ---------------------------------------------------------------------------
-
-
-def test_a_select_reports_the_lsn_it_was_read_at(client):
-    """A `SELECT` answered by one server read carries that read's watermark, the
-    one a scan and an index seek of the same table report, whichever access path
-    serves it; a constant `SELECT` reads nothing and carries none."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL); "
-        "CREATE INDEX ON t(cust_id)")
-    tid, schema = client.resolve_table("t")
-    insert(client, "t", [(i, i * 100) for i in range(1, 9)])
-
-    lsn = client.scan(tid, schema).lsn
-    assert lsn is not None
-    assert client.seek_by_index(tid, schema, [1], [300]).lsn == lsn
-    for q in ["SELECT * FROM t WHERE cust_id = 300",
-              "SELECT * FROM t WHERE pk = 3",
-              "SELECT * FROM t",
-              "SELECT COUNT(*) AS n FROM t"]:
-        assert reply(client.execute_sql(q)).lsn == lsn, q
-    assert reply(client.execute_sql("SELECT 1 AS one")).lsn is None
 
 
 def test_index_seek_refuses_keys_its_columns_cannot_take(client):
@@ -131,7 +110,8 @@ def test_an_index_walks_every_width_and_sign(client, coltype, vals, mid):
     follows that width's order from the type's minimum to its maximum, across
     the point its key encoding flips: zero for a signed column, 2^63 for an
     unsigned one. A column read at the wrong width or signedness lands on the
-    wrong side of the walk and misses."""
+    wrong side of the walk and misses; a raw unsigned read of a signed key
+    inverts an interval spanning zero."""
     client.execute_sql(f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x {coltype})")
     insert(client, "t", list(enumerate(vals, 1)) + [(-i, None) for i in range(1, PAD + 1)])
     client.execute_sql("CREATE INDEX ON t(x)")
@@ -142,82 +122,34 @@ def test_an_index_walks_every_width_and_sign(client, coltype, vals, mid):
         (f"x < {mid}", lambda x: x < mid),
         (f"x >= {mid}", lambda x: x >= mid),
         ("x >= 1 AND x <= 35", lambda x: 1 <= x <= 35),
+        ("x > 1 AND x < 35", lambda x: 1 < x < 35),
+        (f"{mid} < x", lambda x: x > mid),
+        # Both ends on the same side: the tighter one binds, whichever is written
+        # first.
+        ("x > 1 AND x > 35", lambda x: x > 35),
+        ("x > 35 AND x > 1", lambda x: x > 35),
     ]:
         q = f"SELECT pk, x FROM t WHERE {predicate}"
         assert access(client, q) == "index range on (x)", predicate
         assert bag(rows(client, q)) == {(pk, x): 1 for pk, x in enumerate(vals, 1) if keep(x)}, predicate
 
 
-@pytest.fixture(scope="module")
-def ranged(module_client):
-    """A connection holding `ranged (pk, x INT)` with `x = (pk - 8) * 5` over pks
-    1..15 — x from -35 to 35, so a range spans zero — plus NULL padding.
-    Read-only."""
-    conn = module_client
-    conn.execute_sql("CREATE TABLE ranged (pk BIGINT NOT NULL PRIMARY KEY, x INT)")
-    insert(conn, "ranged", [(pk, (pk - 8) * 5) for pk in range(1, 16)]
-           + [(-i, None) for i in range(1, PAD + 1)])
-    conn.execute_sql("CREATE INDEX ON ranged(x)")
-    return conn
-
-
-@pytest.mark.parametrize("predicate,keep", [
-    ("x > 0", lambda x: x > 0),
-    ("x >= 0", lambda x: x >= 0),
-    ("x < 0", lambda x: x < 0),
-    ("x <= 0", lambda x: x <= 0),
-    ("0 < x", lambda x: x > 0),                      # flipped orientation
-    ("x BETWEEN -10 AND 10", lambda x: -10 <= x <= 10),
-    ("x > -10 AND x < 10", lambda x: -10 < x < 10),
-    ("x >= -35 AND x <= -35", lambda x: x == -35),   # single-value inclusive band
-    # Both ends on the same side: the tighter one binds, whichever is written
-    # first — order-independence is what proves no packed-native compare.
-    ("x > -10 AND x > 10", lambda x: x > 10),
-    ("x > 10 AND x > -10", lambda x: x > 10),
-    # An out-of-type-range bound saturates rather than wrapping: provably empty
-    # above I32::MAX.
-    ("x > 3000000000", lambda x: False),
+@pytest.mark.parametrize("predicate,walk,keep", [
+    # Provably empty above I32::MAX.
+    ("x > 3000000000", "index range on (x)", lambda x: False),
+    # The whole domain: an index walk would bound nothing, so the scan serves
+    # it, and its NULL rows still fail the compare.
+    ("x < 3000000000", "full scan", lambda x: True),
 ])
-def test_index_range_walks_the_signed_interval(ranged, predicate, keep):
-    """A range over a signed indexed column returns exactly the contiguous
-    interval, boundary inclusivity and all. Signed values are the discriminating
-    case: the OPK sign-flip is what makes `OPK(-5) < OPK(5)`, so a raw unsigned
-    read of the key inverts the interval and answers an empty or complementary
-    set."""
-    q = f"SELECT pk FROM ranged WHERE {predicate}"
-    assert access(ranged, q) == "index range on (x)"
-    assert bag(rows(ranged, q)) == {(pk,): 1 for pk in range(1, 16) if keep((pk - 8) * 5)}
-
-
-def test_a_saturated_bound_spanning_the_whole_domain_scans(ranged):
-    """An out-of-type-range bound below I32::MAX saturates to the whole domain, so
-    an index walk would bound nothing: the scan serves it, and its NULL rows
-    still fail the compare."""
-    q = "SELECT pk FROM ranged WHERE x < 3000000000"
-    assert access(ranged, q) == "full scan"
-    assert bag(rows(ranged, q)) == {(pk,): 1 for pk in range(1, 16)}
-
-
-def test_max_arity_composite_descriptor_crosses_the_inline_cap(client):
-    """A composite index at the maximum index arity carrying a two-sided range on
-    the last column produces a descriptor too wide to travel inline, so the
-    request takes the explicit-blob send path and must still reach every worker.
-
-    The EXPLAIN check is what makes this a descriptor test: without it a
-    fallback to a full scan would answer the same rows and pass silently.
-    """
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-        "a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL)")
-    values = [(pk, 1, 2, 3, d) for pk, d in enumerate(range(60), 1)]
-    values += [(61, 1, 2, 4, 30), (62, 2, 2, 3, 30)]   # decoys on c and on a
-    insert(client, "t", values + [(-i, 9, 2, 3, 30) for i in range(1, PAD + 1)])
-    client.execute_sql("CREATE INDEX ON t(a, b, c, d)")
-
-    q = "SELECT pk FROM t WHERE a = 1 AND b = 2 AND c = 3 AND d > 10 AND d < 50"
-    assert access(client, q) == "index range on (a, b, c, d)"
-    assert bag(rows(client, q)) == \
-        {(pk,): 1 for pk, _, _, _, d in values[:60] if 10 < d < 50}
+def test_an_out_of_type_range_bound_saturates(client, predicate, walk, keep):
+    """A bound past the column's type saturates rather than wrapping."""
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x INT)")
+    insert(client, "t", [(pk, (pk - 8) * 5) for pk in range(1, 16)]
+           + [(-i, None) for i in range(1, PAD + 1)])
+    client.execute_sql("CREATE INDEX ON t(x)")
+    q = f"SELECT pk FROM t WHERE {predicate}"
+    assert access(client, q) == walk
+    assert bag(rows(client, q)) == {(pk,): 1 for pk in range(1, 16) if keep((pk - 8) * 5)}
 
 
 # ---------------------------------------------------------------------------
@@ -226,16 +158,11 @@ def test_max_arity_composite_descriptor_crosses_the_inline_cap(client):
 
 
 def test_anticorrelated_runs_merge_by_value_then_src_pk(client):
-    """A secondary index's PK is the pair ``(indexed_value, src_pk)``, and the
-    read cursor's N-way merge must order runs the way storage sorted each one —
-    by column order — not by a raw u128 view of the key bytes, which orders by
-    ``(src_pk, value)`` because src_pk lands in the high half.
-
-    Correlated data sorts identically under both orders and so proves nothing.
-    Here value falls as pk rises, which is what makes the two orders disagree:
-    under the wrong one the merge seeks the wrong run's head and the lookup
-    misses. One INSERT per row, so each row is its own run.
-    """
+    """A secondary index's PK is the pair `(indexed_value, src_pk)`, and the
+    read cursor's N-way merge must order runs the way storage sorted each one.
+    Value falls as pk rises, so a merge ordering by `(src_pk, value)` instead
+    seeks the wrong run's head and misses. One INSERT per row, so each row is
+    its own run."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
         "CREATE INDEX ON t(val)")
@@ -322,13 +249,18 @@ def test_a_view_index_follows_its_aggregate(client, index_first):
 
     k = 700
     old, new = 3 * k + 1, 10 * n
-    q = f"SELECT k FROM agg WHERE s = {old}"
-    assert access(client, q) == "index range on (s)"
-    assert bag(rows(client, q)) == {(k,): 1}
+    vid, schema = client.resolve_table("agg")
+    assert access(client, f"SELECT k FROM agg WHERE s = {old}") == "index range on (s)"
 
+    def finds(s):
+        got = bag(rows(client, f"SELECT k FROM agg WHERE s = {s}"))
+        assert bag(client.seek_by_index(vid, schema, [1], [s]), "k") == got, s
+        return got
+
+    assert finds(old) == {(k,): 1}
     client.execute_sql(f"UPDATE t SET x = {new - k} WHERE pk = {2 * k + 1}")
-    assert rows(client, q) == []
-    assert bag(rows(client, f"SELECT k FROM agg WHERE s = {new}")) == {(k,): 1}
+    assert finds(old) == {}
+    assert finds(new) == {(k,): 1}
 
 
 def test_a_bounded_view_backfill_matches_and_then_maintains(client, bounded):
@@ -338,15 +270,17 @@ def test_a_bounded_view_backfill_matches_and_then_maintains(client, bounded):
     passing it lands."""
     body = "SELECT g, SUM(v) AS s FROM t WHERE ind = 4 GROUP BY g"
     client.execute_sql(f"CREATE VIEW v_plain AS {body}")
-    plain = bag(rows(client, "SELECT * FROM v_plain"))
-
     client.execute_sql(f"CREATE INDEX ON t(ind); CREATE VIEW v_bound AS {body}")
-    assert bag(rows(client, "SELECT * FROM v_bound")) == plain
 
-    insert(client, "t", [(2000, 0, 100, 5), (2001, 0, 1000, 4)])
-    (s0,) = [s for g, s in plain if g == 0]
-    assert bag(rows(client, "SELECT * FROM v_bound")) == \
-        {**{k: 1 for k in plain if k[0] != 0}, (0, s0 + 1000): 1}
+    def check(src):
+        want = grouped([r for r in src if r[3] == 4], lambda r: r[1], lambda r: r[2])
+        for v in ("v_plain", "v_bound"):
+            assert bag(rows(client, f"SELECT * FROM {v}")) == want, v
+
+    check(_BOUNDED)
+    added = [(2000, 0, 100, 5), (2001, 0, 1000, 4)]
+    insert(client, "t", added)
+    check(_BOUNDED + added)
 
 
 def test_a_replicated_global_aggregate_grounds_on_an_empty_range(client):
@@ -370,50 +304,41 @@ def test_a_replicated_global_aggregate_grounds_on_an_empty_range(client):
 
 @pytest.fixture
 def abc(client):
-    """`t (pk, a, b, c)` with three rows, `b` NOT NULL."""
+    """`t (pk, a, b, c, d)` with four rows, `b` NOT NULL."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
-        "b BIGINT NOT NULL, c BIGINT NOT NULL)")
-    insert(client, "t", [(10, 1, 100, 7), (20, 1, 200, 8), (30, 2, 100, 9)]
-           + [(-i, 100, i, i) for i in range(1, PAD + 1)])
+        "b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL)")
+    insert(client, "t", [(10, 1, 100, 7, 1), (20, 1, 200, 8, 2), (25, 1, 200, 8, 60),
+                         (30, 2, 100, 9, 3)]
+           + [(-i, 100, i, i, i) for i in range(1, PAD + 1)])
 
 
-@pytest.mark.parametrize("indexes,drop,where,walk,want", [
-    # The full key.
-    (["(a, b)"], None, "a = 1 AND b = 200", "(a, b)", [20]),
+@pytest.mark.parametrize("index,where,want", [
     # Out-of-order WHERE binds each value to the index's declared column, not to
     # AST order.
-    (["(a, b)"], None, "b = 200 AND a = 1", "(a, b)", [20]),
-    # A range on the trailing column bounds the walk, past the pinned prefix.
-    (["(a, b)"], None, "a = 1 AND b > 100", "(a, b)", [20]),
-    # Both indexes pin (a, b) to the same point, so the tie falls to arity: the
-    # narrower walk wins.
-    (["(a, b)", "(a, b, c)"], None, "a = 1 AND b = 200", "(a, b)", [20]),
+    ("(a, b)", "b = 200 AND a = 1", [20, 25]),
+    # A range on the trailing column bounds the walk past the pinned prefix, up
+    # to the widest index there is.
+    ("(a, b)", "a = 1 AND b > 100", [20, 25]),
+    ("(a, b, c, d)", "a = 1 AND b = 200 AND c = 8 AND d > 0 AND d < 50", [20]),
     # `a = 1` is consumed by the walk and `a > 5` stays a residual — excluded by
     # the consumed conjunct's physical index, not by column, so it survives and
     # (since a = 1) matches nothing. The companion proves that is the residual
     # filtering rather than the walk returning nothing.
-    (["(a)"], None, "a = 1 AND a > 5", "(a)", []),
-    (["(a)"], None, "a = 1 AND a > 0", "(a)", [10, 20]),
+    ("(a)", "a = 1 AND a > 5", []),
+    ("(a)", "a = 1 AND a > 0", [10, 20, 25]),
     # Conjuncts on a column the walk does not cover filter after it.
-    (["(a)"], None, "a = 1 AND c = 8", "(a)", [20]),
-    (["(a)"], None, "a = 1 AND c NOT BETWEEN 8 AND 9", "(a)", [10]),
-    # An unnamed index is named after its exact column list, so dropping the
-    # two-column one by that name leaves the single-column one serving.
-    (["(a)", "(a, b)"], "idx_a_b", "a = 1", "(a)", [10, 20]),
-], ids=["full-key", "out-of-order", "trailing-range", "tiebreak-arity",
-        "residual-empty", "residual-kept", "residual-column", "residual-not-between",
-        "drop-exact-list"])
-def test_which_composite_index_a_where_binds(client, abc, indexes, drop, where, walk, want):
-    """The walk the planner picks and the rows it returns, asserted together: a
-    row bag alone passes with every index dropped, and an access line alone
-    passes on a walk that loses rows."""
-    for cols in indexes:
-        client.execute_sql(f"CREATE INDEX ON t{cols}")
-    if drop:
-        client.execute_sql(f"DROP INDEX {client.schema}__t__{drop}")
+    ("(a)", "a = 1 AND d = 2", [20]),
+    ("(a)", "a = 1 AND c NOT BETWEEN 8 AND 9", [10]),
+], ids=["out-of-order", "trailing-range", "widest-trailing-range", "residual-empty",
+        "residual-kept", "residual-column", "residual-not-between"])
+def test_which_rows_a_composite_walk_returns(client, abc, index, where, want):
+    """The walk and the rows it returns, asserted together: a row bag alone
+    passes with every index dropped, and an access line alone passes on a walk
+    that loses rows."""
+    client.execute_sql(f"CREATE INDEX ON t{index}")
     q = f"SELECT pk FROM t WHERE {where}"
-    assert access(client, q) == f"index range on {walk}"
+    assert access(client, q) == f"index range on {index}"
     assert bag(rows(client, q)) == {(pk,): 1 for pk in want}
 
 

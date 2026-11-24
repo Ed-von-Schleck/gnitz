@@ -173,7 +173,7 @@ def await_log(proc, read_log, marker, timeout):
             raise RuntimeError(
                 f"server exited rc={proc.returncode} before logging {marker!r}\n"
                 f"{read_log()[-4096:]}")
-        line = next((l for l in read_log().splitlines() if marker in l), None)
+        line = next((ln for ln in read_log().splitlines() if marker in ln), None)
         if line is not None:
             return line
         time.sleep(_READY_POLL_S)
@@ -537,15 +537,16 @@ def spawn(target, *args):
     return t
 
 
-def join_or_fail(why, *threads):
-    """Join `spawn`ed `threads` against the ceiling above, failing with `why` on
-    the first still running, then re-raise the first exception one of them
-    raised. One deadline for the group, not one each.
+def join_or_fail(why, *threads, timeout=HANG_TIMEOUT):
+    """Join `spawn`ed `threads` against `timeout` seconds, the ceiling above
+    unless a claim needs a tighter one, failing with `why` on the first still
+    running, then re-raise the first exception one of them raised. One deadline
+    for the group, not one each.
 
     Joining and checking are one call because the ceiling catches a wedge only if
     someone looks afterwards: a bare `join(timeout=...)` returns silently and
     leaves the test asserting against a thread that never finished."""
-    deadline = time.monotonic() + HANG_TIMEOUT
+    deadline = time.monotonic() + timeout
     for t in threads:
         t.join(max(0.0, deadline - time.monotonic()))
         assert not t.is_alive(), why

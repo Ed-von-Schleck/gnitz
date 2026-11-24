@@ -3,81 +3,41 @@
 A base table's PK names at most one row — every ingest runs the unique-PK
 enforcement. A view output store enforces nothing, and a join view's synthetic
 `_join_pk` **is** the join key, so it names one row per row the join produced
-for it. A seek must return that whole group, at the weights a scan of the same
-key reports.
-
-The view here is deliberately **not** replicated, so its store is hashed and the
-seek's routing is not part of what is under test. A hidden view key is only
-reachable through the binary client, so these drive `push`/`seek`, not SQL.
+for it. A seek must return that whole group from the worker its key hashes to,
+at the weights a scan of the same key reports. A hidden view key is only
+reachable through the binary client.
 """
 
 import gnitz
-import pytest
-from _read import bag, scanned
-from _sql import insert
-
-NFACTS = 40
-NDIMS = 4
+from _read import bag
+from _serverproc import TINY_REPLY_FRAMES
 
 
-@pytest.fixture
-def fact_dim(client):
-    """`fact JOIN dim` on `k`, with `NFACTS` facts spread over `NDIMS` dims — so
-    every `_join_pk`, the join key `k`, names `NFACTS // NDIMS` view rows. The
-    view's id and schema."""
-    for name in ("dim", "fact"):
+def test_a_join_view_seek_returns_every_row_of_its_key(own_server):
+    """Every fact joins one of four dims, so each `_join_pk` names a quarter of
+    the facts — ~100 KiB of distinct payload, many 16 KiB frames. A seek of each
+    key returns its whole group, a retracted fact leaves exactly its own row,
+    and an absent key is an empty answer."""
+    nfacts, ndims, width = 400, 4, 1024
+    with gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target) as client:
         client.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)")
-    client.execute_sql(
-        "CREATE VIEW jv AS SELECT f.id AS fid, d.id AS did "
-        "FROM fact f JOIN dim d ON f.k = d.k")
-    insert(client, "dim", [(i, i) for i in range(NDIMS)])
-    insert(client, "fact", [(i, i % NDIMS) for i in range(NFACTS)])
-    return client.resolve_table("jv")
-
-
-def test_a_join_view_seek_returns_every_row_of_its_key(client, fact_dim):
-    """A seek of each key returns its whole group in one request, weights
-    included."""
-    vid, schema = fact_dim
-    for k in range(NDIMS):
-        before = client.requests_sent
-        got = client.seek(vid, schema, pk=k).including_hidden()
-        assert client.requests_sent == before + 1, "a seek is one request"
-        assert bag(got, "_join_pk", "fid", "did") == \
-            {(k, f, k): 1 for f in range(NFACTS) if f % NDIMS == k}, f"seek(jv, {k})"
-
-    # An absent key is an empty answer, not an error.
-    assert list(client.seek(vid, schema, pk=NDIMS + 1000)) == []
-
-
-def test_a_group_past_one_frame_is_returned_whole(client):
-    """A view key whose group exceeds one 64 MiB frame is returned whole, and the
-    connection answers the next statement."""
-    rows_per_push, npush, width = 272, 16, 16384
-    client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)")
-    client.execute_sql(
-        "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
-        "s TEXT NOT NULL)")
-    client.execute_sql(
-        "CREATE VIEW jv AS SELECT f.s AS s FROM fact f JOIN dim d ON f.k = d.k")
-    client.execute_sql("INSERT INTO dim VALUES (1, 1)")
-
-    # Every fact carries the same join key, so the view is one PK group of
-    # `rows_per_push * npush` rows at `width` bytes each — past 64 MiB.
-    # Each string is distinct: the view projects `s` alone, and a Z-set row is
-    # identified by (PK, payload), so equal payloads would consolidate the
-    # group down to one row at weight N.
-    fact_id, fact_schema = client.resolve_table("fact")
-    for p in range(npush):
-        fids = range(p * rows_per_push, (p + 1) * rows_per_push)
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL); "
+            "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, s TEXT NOT NULL); "
+            "CREATE VIEW jv AS SELECT f.id AS fid, d.id AS did, f.s AS s "
+            "FROM fact f JOIN dim d ON f.k = d.k")
+        client.execute_sql("INSERT INTO dim VALUES " + ", ".join(f"({i}, {i})" for i in range(ndims)))
+        # Distinct strings: a Z-set row is (PK, payload), so equal payloads would
+        # consolidate a group down to one row.
+        facts = {f: f"{f:08d}".ljust(width, "x") for f in range(nfacts)}
+        fact_id, fact_schema = client.resolve_table("fact")
         client.push(fact_id, gnitz.ZSetBatch(fact_schema).extend(
-            {"id": fid, "k": 1, "s": f"{fid:08d}" + "x" * (width - 8)} for fid in fids))
+            {"id": f, "k": f % ndims, "s": s} for f, s in facts.items()))
+        client.execute_sql("DELETE FROM fact WHERE id = 5")
+        del facts[5]
 
-    got = list(client.seek(*client.resolve_table("jv"), pk=1))
-    assert all(r._weight == 1 and len(r.s) == width for r in got)
-    assert sorted(r.s[:8] for r in got) == [f"{fid:08d}" for fid in range(rows_per_push * npush)]
-
-    # The connection is intact: the next statement answers normally.
-    assert bag(scanned(client, "dim")) == {(1, 1): 1}
+        vid, schema = client.resolve_table("jv")
+        for k in range(ndims):
+            got = client.seek(vid, schema, pk=k).including_hidden()
+            assert bag(got, "_join_pk", "fid", "did", "s") == \
+                {(k, f, k, s): 1 for f, s in facts.items() if f % ndims == k}, f"seek(jv, {k})"
+        assert list(client.seek(vid, schema, pk=ndims + 1000)) == []

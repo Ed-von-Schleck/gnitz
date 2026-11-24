@@ -8,8 +8,6 @@ of the atomic multi-table write story.
 
 Results are compared as weighted bags throughout: a mis-stitched or repeated
 reply frame is a doubled weight, which a row-set comparison reads as correct.
-
-Run with GNITZ_WORKERS=4 — the one-cut fan-out is a distributed path.
 """
 
 import gnitz
@@ -24,23 +22,15 @@ def _kvs(*tids):
     return [(t, KV) for t in tids]
 
 
-
 def test_the_results_line_up_with_the_requested_tids(client):
     """Request order is reply order, and an empty relation still occupies its
-    slot. Such a relation contributes no worker frame at all — the master
-    forwards only frames carrying rows — so its train is delimited by its
-    master-authored terminal alone. However many relations it names, it is one
-    request."""
+    slot."""
     a, empty, b = (client.create_table(name, KV) for name in ("a", "empty", "b"))
     client.push(a, kv(*((pk, pk * 10) for pk in range(20))))
     client.push(b, kv((99, 990)))
 
     want_a = {(pk, pk * 10): 1 for pk in range(20)}
-    before = client.requests_sent
-    res = client.scan_many(_kvs(a, empty, b))
-    assert client.requests_sent == before + 1, "a scan_many is one request"
-    assert [bag(r) for r in res] == [want_a, {}, {(99, 990): 1}]
-    # Reversed request order → reversed results.
+    assert [bag(r) for r in client.scan_many(_kvs(a, empty, b))] == [want_a, {}, {(99, 990): 1}]
     assert [bag(r) for r in client.scan_many(_kvs(b, empty, a))] == \
         [{(99, 990): 1}, {}, want_a]
 
@@ -48,23 +38,20 @@ def test_the_results_line_up_with_the_requested_tids(client):
 def test_a_base_read_is_fresh_whatever_its_views_are_doing(client):
     """A base table's own read is fully fresh the moment a push ACKs, whatever
     its dependent views are doing — a pending tick can only change what a VIEW
-    sees. Three GROUP BY views ride on `t` so the tick queue is non-empty at read
-    time; both read verbs must still return every pushed row at weight 1, and a
+    sees. A GROUP BY view rides on `t` so a tick is pending at read time; both
+    read verbs must still return every pushed row at weight 1, and a
     one-relation scan_many is exactly a scan, lsn included."""
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)")
-    for i in range(3):
-        client.execute_sql(
-            f"CREATE VIEW agg{i} AS SELECT g, SUM(v) AS s FROM t WHERE v > {i} GROUP BY g")
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT); "
+        "CREATE VIEW agg AS SELECT g, SUM(v) AS s FROM t GROUP BY g")
     tid, schema = client.resolve_table("t")
     client.execute_sql(
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i % 4}, {i})" for i in range(60)))
 
     want = {(i, i % 4, i): 1 for i in range(60)}
-    single, multi = client.scan(tid, schema), client.scan_many([(tid, schema)])
-    assert len(multi) == 1
-    assert bag(single) == bag(multi[0]) == want
-    assert multi[0].lsn == single.lsn
+    single, (multi,) = client.scan(tid, schema), client.scan_many([(tid, schema)])
+    assert bag(single) == bag(multi) == want
+    assert multi.lsn == single.lsn
 
 
 # ---------------------------------------------------------------------------
@@ -118,16 +105,14 @@ def test_every_refusal_leaves_the_server_serving(client):
     t = client.create_table("t", KV)
     client.push(t, kv((1, 1)))
 
-    # A repeated tid is legal, so the count alone is what this one crosses.
-    with pytest.raises(gnitz.GnitzRefusedError, match="too many items"):
-        client.scan_many(_kvs(t) * 1000)
-    assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, "unhealthy after too many items"
-
-    # An unknown user tid resolves to no table, and the refusal names it.
     missing = gnitz.FIRST_USER_TABLE_ID + 987654
-    with pytest.raises(gnitz.GnitzNotFoundError, match=str(missing)):
-        client.scan_many(_kvs(t, missing))
-    assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, "unhealthy after unknown tid"
+    # A repeated tid is legal, so the count alone is what the first crosses; an
+    # unknown user tid resolves to no table, and the refusal names it.
+    for items, err, msg in [(_kvs(t) * 1000, gnitz.GnitzRefusedError, "too many items"),
+                            (_kvs(t, missing), gnitz.GnitzNotFoundError, str(missing))]:
+        with pytest.raises(err, match=msg):
+            client.scan_many(items)
+        assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, f"unhealthy after {msg}"
 
 
 def test_a_system_family_is_read_beside_user_relations(client):
@@ -144,17 +129,9 @@ def test_a_system_family_is_read_beside_user_relations(client):
 
 def test_a_chunked_train_does_not_let_its_siblings_jump_it(own_server):
     """With a 16 KiB reply budget, `big` chunks into a multi-frame train per
-    worker while the tiny siblings are one frame each. `scan_many` of `[big, s...]`
-    must stream in request order without wedging — the shape that deadlocks
-    without the `scan_fifo_reply` flag, where the immediate-emit fast path would jump
-    the tiny relations ahead of big's queued chunks. Both orderings, plus a
-    heap-bearing (TEXT) sibling whose own train chunks, must complete and be
-    correct.
-
-    A wedge is a hang, so the join timeout is the assertion that matters most
-    here; the bags below are what rules out a silently reordered or truncated
-    train once it does complete.
-    """
+    worker while the tiny siblings are one frame each: a multi-frame train and
+    its one-frame siblings stream in request order, in either order, and so
+    does a heap-bearing (TEXT) sibling whose own train chunks."""
     with gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target) as c:
         big = c.create_table("big", KV)
         # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers

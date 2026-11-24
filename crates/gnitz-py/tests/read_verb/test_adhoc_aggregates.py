@@ -4,13 +4,12 @@ versus a `CREATE VIEW` of the same statement.
 
 The central assertion is **parity**: for a query with no ORDER BY / LIMIT, the
 ad-hoc result equals a scan of `CREATE VIEW v AS <same query>`, exactly — every
-fixture here aggregates an integer source, so both paths agree bit for bit.
-Parity is compared as a weighted bag, so a group emitted twice by one path is a
-divergence rather than a matching row set. A float SUM/AVG instead follows the
-summation order; the tests at the bottom pin what that does and does not
-promise.
-
-Run with GNITZ_WORKERS=4 (the fold is per-worker; the client merges partials).
+parity source here is integer, string or UUID valued, so both paths agree bit
+for bit. Parity is compared as a weighted bag, so a group emitted twice by one
+path is a divergence rather than a matching row set; and since parity would
+also hold were both paths wrong, every case is pinned against an in-Python
+oracle too. A float SUM/AVG instead follows the summation order; the tests at
+the bottom pin what that does and does not promise.
 """
 import random
 
@@ -19,48 +18,25 @@ import pytest
 from _caps import conjunct_ladder, first_rejected
 from _read import access, bag, ordered, reply, rows
 from _serverproc import TINY_SCAN_CHUNKS
-from _shapes import groups
+from _shapes import agg, groups
 from _sql import insert
-from _uid import uid as _uid
+from _uid import uid
 
 
 def _parity(client, query):
-    """Assert the ad-hoc result of `query` (no ORDER BY / LIMIT) equals a scan of
-    a view built from the identical statement, as weighted bags, and return the
-    ad-hoc rows. The view is left for the schema's teardown."""
+    """The ad-hoc bag of `query` (no ORDER BY / LIMIT), asserted equal — names
+    and weighted bag — to a scan of a view built from the identical statement.
+    The view is left for the schema's teardown."""
     adhoc = reply(client.execute_sql(query))
-    vn = "pv_" + _uid()
+    vn = "pv_" + uid()
     client.execute_sql(f"CREATE VIEW {vn} AS {query}")
     view = client.scan(*client.resolve_table(vn))
-
-    assert bag(adhoc) == bag(view), f"ad-hoc != view for `{query}`"
     assert adhoc._fields == view._fields, f"column names differ for `{query}`"
-    return list(adhoc)
+    assert bag(adhoc) == bag(view), f"ad-hoc != view for `{query}`"
+    return bag(adhoc)
 
 
-def _parity_ordered(client, body, *tails):
-    """Assert the ad-hoc result of `body tail` equals reading a view of `body`
-    with the same `tail` applied — row for row, in order, for each of `tails`
-    against one shared view.
-
-    `CREATE VIEW` rejects ORDER BY, which is what makes `_parity` blind to tie
-    order; here the cut runs as a second read over a view of the body, so the
-    client's tiebreak is compared against the worker's.
-
-    GROUP BY only. An ad-hoc `SELECT DISTINCT` keys its ties off the reduce group
-    key and a view's DISTINCT off a content digest, so each is deterministic but
-    they do not agree; for DISTINCT the guarantee is cross-worker-count
-    determinism alone.
-    """
-    vn = "po_" + _uid()
-    client.execute_sql(f"CREATE VIEW {vn} AS {body}")
-    for tail in tails:
-        assert ordered(rows(client, f"{body} {tail}")) == \
-            ordered(rows(client, f"SELECT * FROM {vn} {tail}")), \
-            f"ordered ad-hoc != view for `{body} {tail}`"
-
-
-def _grouped_oracle(src, key, value):
+def _by(src, key, value):
     """`{(key(group), value(rows of that group)): 1}` over `src` — the weighted
     bag a `SELECT key, value … GROUP BY key` owes."""
     return {(k, value(g)): 1 for k, g in groups(src, key).items()}
@@ -69,10 +45,9 @@ def _grouped_oracle(src, key, value):
 # ---------------------------------------------------------------------------
 # The shared read-only sources
 #
-# Module-scoped: every test sharing one only reads from it, and a `_parity` view
-# is created under a unique name. Each oracle computes over the same rows the
-# fixture inserts, so changing a fixture cannot leave an expectation quietly
-# describing the old data.
+# Module-scoped: every case only reads, and a `_parity` view is created under a
+# unique name. Each oracle computes over the same rows the fixture inserts, so
+# changing a fixture cannot leave an expectation quietly describing the old data.
 # ---------------------------------------------------------------------------
 
 
@@ -84,29 +59,27 @@ _NL = [(i * 1.5, "a" if i % 2 else "b", i, i % 4) for i in range(1, 13)]
 _WX_LABELS = ["shared/prefix/aa", "shared/prefix/a", "shared/prefix/ab", "b", ""]
 _WX = [(i, i % 3, _WX_LABELS[i % 5], f"550e8400-e29b-41d4-a716-4466554400{i:02d}")
        for i in range(20)]
+# `(pk, c, a)`, replicated.
+_RT = [(i, i % 3, i) for i in range(1, 13)]
+# `(pk, g, c0..c7)`.
+_M8 = [(i, i % 4, *((i * (j + 1)) % 50 for j in range(8))) for i in range(1, 31)]
+_WMAX = f"w{gnitz.MAX_COLUMNS}"
 
 
 @pytest.fixture(scope="module")
-def orders(module_client):
+def src(module_client):
     conn = module_client
     conn.execute_sql(
         "CREATE TABLE orders (pk BIGINT NOT NULL PRIMARY KEY, category BIGINT NOT NULL,"
         " amount BIGINT NOT NULL, note BIGINT)")
     insert(conn, "orders", _ORDERS)
-    return conn
-
-
-@pytest.fixture(scope="module")
-def hg(module_client):
-    """The HAVING source: one column of each shape the compiled predicate has a
-    separate arm for — a nullable TEXT, a U64 crossing i64::MAX, a narrow
-    SMALLINT, a NOT NULL BIGINT and a nullable one."""
-    conn = module_client
+    # The HAVING source: one column of each shape the compiled predicate has a
+    # separate arm for — a nullable TEXT, a U64 crossing i64::MAX, a narrow
+    # SMALLINT, a NOT NULL BIGINT and a nullable one.
     conn.execute_sql(
         "CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, s TEXT,"
         "                 u BIGINT UNSIGNED NOT NULL, sm SMALLINT, nn BIGINT NOT NULL,"
-        "                 v BIGINT)")
-    conn.execute_sql(
+        "                 v BIGINT); "
         "INSERT INTO hg VALUES "
         "(1, 1, 'a',  9223372036854775808, -5,   10, 1),"
         "(2, 1, 'a',  9223372036854775808, -1,   20, NULL),"
@@ -114,324 +87,22 @@ def hg(module_client):
         "(4, 2, NULL, 5,                    NULL, 40, NULL),"
         "(5, 3, 'c',  18446744073709551615, 9,   50, NULL),"
         "(6, 3, 'c',  18446744073709551615, 2,   60, NULL)")
-    return conn
-
-
-@pytest.fixture(scope="module")
-def nl(module_client):
-    """`nl (x DOUBLE, s TEXT, id, v)` — a DOUBLE and a TEXT column ahead of the
-    PK, holding `_NL`."""
-    conn = module_client
+    # A DOUBLE and a TEXT column ahead of the PK.
     conn.execute_sql(
         "CREATE TABLE nl (x DOUBLE NOT NULL, s TEXT NOT NULL, id BIGINT NOT NULL,"
         " v BIGINT NOT NULL, PRIMARY KEY (id))")
     insert(conn, "nl", _NL)
-    return conn
-
-
-@pytest.fixture(scope="module")
-def wx(module_client):
-    """`wx (pk, g, label TEXT, u UUID)` holding `_WX`."""
-    conn = module_client
     conn.execute_sql(
         "CREATE TABLE wx (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
         " label TEXT NOT NULL, u UUID NOT NULL)")
     insert(conn, "wx", _WX)
-    return conn
-
-
-# ---------------------------------------------------------------------------
-# Grouped + global aggregate parity
-# ---------------------------------------------------------------------------
-
-
-# Each aggregate over a group's `_ORDERS` rows.
-_AGGS = {
-    "COUNT(*)": len,
-    "COUNT(note)": lambda g: sum(r[3] is not None for r in g),
-    "SUM(amount)": lambda g: sum(r[2] for r in g),
-    "MIN(amount)": lambda g: min(r[2] for r in g),
-    "MAX(amount)": lambda g: max(r[2] for r in g),
-    "AVG(amount)": lambda g: sum(r[2] for r in g) / len(g),
-}
-
-
-@pytest.mark.parametrize("agg", _AGGS)
-@pytest.mark.parametrize("grouped,where,keep", [
-    (True, "", lambda r: True),
-    (True, "WHERE pk > 5 AND amount < 80", lambda r: r[0] > 5 and r[2] < 80),
-    (False, "", lambda r: True),
-    (False, "WHERE category = 2", lambda r: r[1] == 2),
-], ids=["grouped", "grouped-where", "global", "global-where"])
-def test_aggregate_parity(orders, agg, grouped, where, keep):
-    """Every aggregate, grouped and global, with and without a WHERE that pushes
-    a bounded PK range plus a residual."""
-    src = [r for r in _ORDERS if keep(r)]
-    if grouped:
-        got = _parity(orders, f"SELECT category, {agg} AS m FROM orders {where} GROUP BY category")
-        assert bag(got) == _grouped_oracle(src, lambda r: r[1], _AGGS[agg])
-    else:
-        got = _parity(orders, f"SELECT {agg} AS m FROM orders {where}")
-        assert bag(got) == {(_AGGS[agg](src),): 1}
-
-
-# ---------------------------------------------------------------------------
-# Computed group keys and computed finalize items
-#
-# A computed GROUP BY key or aggregate argument is the **pre-map**, which runs on
-# the worker between the predicate and the fold; an expression over the
-# aggregates is the **finalize map**, which the client runs over its combined
-# reduce output. Parity alone would also hold if both paths were wrong, so each
-# case is pinned against an in-Python oracle too.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("select,group,key,value", [
-    # An expression whose operand is an aggregate — the finalize map.
-    ("category, SUM(amount) + 1 AS m", "category",
-     lambda r: r[1], lambda g: sum(r[2] for r in g) + 1),
-    # Two aggregates in one expression, and an aggregate under a second operator.
-    ("category, SUM(amount) - COUNT(*) * 2 AS m", "category",
-     lambda r: r[1], lambda g: sum(r[2] for r in g) - len(g) * 2),
-    # AVG's own divide feeding another operator.
-    ("category, AVG(amount) * 2 AS m", "category",
-     lambda r: r[1], lambda g: sum(r[2] for r in g) / len(g) * 2),
-    # A group column inside an expression, mixed with an aggregate.
-    ("category, category * 100 + COUNT(*) AS m", "category",
-     lambda r: r[1], lambda g: g[0][1] * 100 + len(g)),
-    # An aggregate whose argument is computed — the pre-map.
-    ("category, SUM(amount * category) AS m", "category",
-     lambda r: r[1], lambda g: sum(r[2] * r[1] for r in g)),
-    # A pre-map column feeding a non-linear aggregate.
-    ("category, MAX(amount + pk) AS m", "category",
-     lambda r: r[1], lambda g: max(r[2] + r[0] for r in g)),
-    # A GROUP BY over an expression — the pre-map materializing the key.
-    ("category + amount AS k, COUNT(*) AS m", "category + amount",
-     lambda r: r[1] + r[2], len),
-    # A computed key and a computed aggregate argument in one reduce.
-    ("category + 1 AS k, SUM(amount * 3) AS m", "category + 1",
-     lambda r: r[1] + 1, lambda g: sum(r[2] * 3 for r in g)),
-])
-def test_computed_key_and_finalize_parity(orders, select, group, key, value):
-    got = _parity(orders, f"SELECT {select} FROM orders GROUP BY {group}")
-    assert bag(got) == _grouped_oracle(_ORDERS, key, value)
-
-
-def test_a_computed_key_reaches_every_position_as_one_column(orders):
-    """The written key reaches the SELECT list and HAVING by its expression, not
-    by a name, and the same expression written twice is ONE pre-map column
-    rather than two."""
-    got = _parity(orders,
-                  "SELECT amount * 2 AS k, SUM(pk) AS s FROM orders "
-                  "GROUP BY amount * 2 HAVING SUM(pk) > 20")
-    assert bag(got) == {
-        (k, s): 1 for (k, s) in _grouped_oracle(
-            _ORDERS, lambda r: r[2] * 2, lambda g: sum(r[0] for r in g)) if s > 20}
-
-    got = _parity(orders,
-                  "SELECT category + amount AS k, category + amount AS again, "
-                  "COUNT(*) AS c FROM orders GROUP BY category + amount")
-    assert bag(got) == {
-        (k, k, c): 1 for k, c in _grouped_oracle(_ORDERS, lambda r: r[1] + r[2], len)}
-
-
-def test_a_premap_over_a_source_at_the_column_limit(client):
-    """The pre-map carries only the PK and what the fold reads, so a computed key
-    over a maximally wide source still fits."""
-    name = f"w{gnitz.MAX_COLUMNS}"
-    payload = ", ".join(f"c{i} BIGINT NOT NULL" for i in range(gnitz.MAX_COLUMNS - 1))
-    client.execute_sql(f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, {payload})")
-    insert(client, name, [range(gnitz.MAX_COLUMNS)])
-    q = f"SELECT c0 + 1 AS k, COUNT(*) AS c FROM {name} GROUP BY c0 + 1"
-    assert bag(rows(client, q)) == {(2, 1): 1}
-
-
-@pytest.mark.parametrize("where,select,group,keep,key,value", [
-    # A TEXT column sits where the permutation puts an integer, so a predicate
-    # resolved against the permuted order would be type-rejected.
-    ("s = 'a'", "v + 1 AS k, COUNT(*) AS m", "v + 1",
-     lambda r: r[1] == "a", lambda r: r[3] + 1, len),
-    # A DOUBLE column likewise, which would fail in the engine instead.
-    ("x > 6.0", "v AS k, SUM(id * 2) AS m", "v",
-     lambda r: r[0] > 6.0, lambda r: r[3], lambda g: sum(r[2] * 2 for r in g)),
-    # The pre-map reached by a computed argument rather than by the key.
-    ("s = 'b'", "v AS k, MAX(id * 3) AS m", "v",
-     lambda r: r[1] == "b", lambda r: r[3], lambda g: max(r[2] * 3 for r in g)),
-])
-def test_a_premap_over_a_source_whose_pk_is_not_first(
-        nl, where, select, group, keep, key, value):
-    """The pre-map's output schema is the source's columns with the PK columns
-    moved to the front, so it is a *permutation* of the source whenever the PK
-    is not already leading — and a WHERE is resolved to positions against the
-    source, not against that permutation. Every other fixture here declares `pk`
-    first, which makes the permutation the identity and hides any confusion
-    between the two orders.
-
-    The columns ahead of the PK are a DOUBLE and a TEXT because the symptom of
-    that confusion is a *type* mismatch at the permuted slot, where a same-width
-    integer would just compare the wrong column.
-    """
-    got = _parity(nl, f"SELECT {select} FROM nl WHERE {where} GROUP BY {group}")
-    assert bag(got) == _grouped_oracle([r for r in _NL if keep(r)], key, value)
-
-
-def test_a_computed_key_over_a_replicated_source(client):
-    """Replication is the trap for anything that touches reduce routing: every
-    worker holds every row, so a fold that double-counted would still return
-    plausible groups. The pre-map hands the fold a derived schema (source PK
-    columns plus the computed ones), which must not change which rows a worker
-    folds."""
-    src = [(i, i % 3, i) for i in range(1, 13)]
-    client.execute_sql(
+    conn.execute_sql(
         "CREATE TABLE rt (pk BIGINT PRIMARY KEY, c BIGINT NOT NULL, a BIGINT NOT NULL) "
         "WITH (replicated = true)")
-    insert(client, "rt", src)
-    # The control: no pre-map, so a double-count would show here too.
-    assert bag(_parity(client, "SELECT c, COUNT(*) AS n FROM rt GROUP BY c")) == \
-        {(0, 4): 1, (1, 4): 1, (2, 4): 1}
-    got = _parity(client, "SELECT c + 1 AS k, SUM(a * 2) AS s FROM rt GROUP BY c + 1")
-    assert bag(got) == _grouped_oracle(src, lambda r: r[1] + 1, lambda g: sum(r[2] * 2 for r in g))
-
-
-# ---------------------------------------------------------------------------
-# HAVING through the shared expression evaluator
-#
-# The ad-hoc HAVING and a grouped view's post-reduce filter run one compiled
-# program, so `_parity` cannot catch a wrong *expression* result — each case
-# pins the surviving groups as well. What parity still discriminates is the
-# surrounding shape: where the group key lives (a view's PK region against the
-# fold's payload slot), the nullability each side declares, and the client's
-# reduce-output batch against the engine's.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("query,col,want", [
-    # A single NOT NULL U64 group column: the view keeps it in its PK region,
-    # ad-hoc in a payload slot. Also pins the unsigned comparison.
-    ("SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > 9223372036854775807",
-     "u", [9223372036854775808, 18446744073709551615]),
-    # Every U64 value is above a negative literal, on both paths.
-    ("SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > -1", "u",
-     [5, 9223372036854775808, 18446744073709551615]),
-    # A NOT NULL aggregate source, grouped: the two sides declare its
-    # nullability differently, so they take different evaluation arms.
-    ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING SUM(nn) > 0", "cat", [1, 2, 3]),
-    # The only narrow (2-byte) aggregate partial: MIN over SMALLINT keeps the
-    # source width, so the value round-trips through sign extension.
-    ("SELECT cat, MIN(sm) AS m FROM hg GROUP BY cat HAVING MIN(sm) < 0", "cat", [1]),
-    # Strings, IS NULL, a CASE, and IN over both a string and an aggregate.
-    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s = 'a'", "s", ["a"]),
-    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s > 'a'", "s", ["b", "c"]),
-    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IN ('a', 'c')", "s", ["a", "c"]),
-    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IS NULL", "s", [None]),
-    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IS NOT NULL", "s", ["a", "b", "c"]),
-    ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IS NULL", "cat", [3]),
-    ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IN (1, 7)", "cat", [1, 2]),
-    ("SELECT cat, COUNT(*) AS c FROM hg GROUP BY cat "
-     "HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1", "cat", [1, 2, 3]),
-    # A scalar function wrapping the aggregate.
-    ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING ABS(SUM(nn)) > 0", "cat", [1, 2, 3]),
-    # Constant predicates: TRUE folds away at plan time, FALSE compiles to a
-    # constant that drops every group, NULL is UNKNOWN and never true, and a
-    # statically-false one drops everything.
-    ("SELECT cat FROM hg GROUP BY cat HAVING TRUE", "cat", [1, 2, 3]),
-    ("SELECT cat FROM hg GROUP BY cat HAVING FALSE", "cat", []),
-    ("SELECT cat FROM hg GROUP BY cat HAVING NULL", "cat", []),
-    ("SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'", "cat", []),
-    # An aggregate appearing only in HAVING: all groups dropped, all kept, and
-    # several filter ranges rather than one.
-    ("SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 99", "cat", []),
-    ("SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 0", "cat", [1, 2, 3]),
-    ("SELECT cat FROM hg GROUP BY cat HAVING cat <> 2", "cat", [1, 3]),
-    # A HAVING with no GROUP BY groups the whole relation, even when the
-    # projection carries no aggregate or none is written at all.
-    ("SELECT COUNT(*) AS c FROM hg HAVING COUNT(*) > 0", "c", [6]),
-    ("SELECT 1 AS one FROM hg HAVING SUM(cat) > 1", "one", [1]),
-    ("SELECT 1 AS one FROM hg HAVING 1 = 1", "one", [1]),
-])
-def test_having_parity_and_value(hg, query, col, want):
-    assert bag(_parity(hg, query), col) == {(w,): 1 for w in want}
-
-
-def test_the_register_cap_is_located_not_pinned(hg):
-    """The register cap on the direct path, found rather than hardcoded. The
-    builder folds identical instructions, so the conjuncts must share nothing:
-    `cat * k < k + 1` over distinct odd `k` is true exactly for `cat = 1`."""
-    def having(k):
-        return f"SELECT cat FROM hg GROUP BY cat HAVING {conjunct_ladder('cat', k)}"
-
-    k = first_rejected(lambda k: rows(hg, having(k)), range(1, 64))
-    assert bag(_parity(hg, having(k - 1)), "cat") == {(1,): 1}
-
-    def having_in(n):
-        items = ", ".join(repr(v) for v in ["a", *(f"v{i}" for i in range(1, n))])
-        return f"SELECT s FROM hg GROUP BY s HAVING s IN ({items})"
-
-    n = first_rejected(lambda n: rows(hg, having_in(n)), range(1, 64))
-    assert bag(_parity(hg, having_in(n - 1))) == {("a",): 1}
-
-
-# ---------------------------------------------------------------------------
-# AVG reads its SUM accumulator at the declared type
-#
-# The client combines integer SUM partials into an i64 whose bit pattern is the
-# sum mod 2^64. A SUM over a `BIGINT UNSIGNED` source is declared U64, so past
-# 2^63 that bit pattern reads correctly only as unsigned — and AVG divides the
-# value, where SUM's render only reinterprets its bits.
-# ---------------------------------------------------------------------------
-
-
-def test_avg_reads_its_accumulator_at_the_declared_type(hg):
-    """cat = 3 sums two 2^64-1 cells: the high bit is set, so a signed read of
-    the accumulator renders the average negative."""
-    # 2^64-2 has no exact f64 image; it rounds to 2^64, so the average is 2^63.
-    got = _parity(hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat")
-    assert bag(got)[(3, 9.223372036854776e18)] == 1, got
-    # The same accumulator with no group columns at all.
-    assert bag(_parity(hg, "SELECT AVG(u) AS a FROM hg WHERE cat = 3")) == \
-        {(9.223372036854776e18,): 1}
-    # One 2^64-1 cell does not wrap, so its true average is representable.
-    assert bag(_parity(hg, "SELECT AVG(u) AS a FROM hg WHERE pk = 5")) == \
-        {(1.8446744073709552e19,): 1}
-    # HAVING and the render read one accumulator: the predicate keeps cat = 3 on
-    # a correctly-computed average, so a mis-signed render disagrees with itself.
-    got = _parity(hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0")
-    assert bag(got, "cat") == {(2,): 1, (3,): 1}, got
-    # SUM's raw-bits render wraps to the u64.
-    got = _parity(hg, "SELECT cat, SUM(u) AS t FROM hg WHERE cat = 3 GROUP BY cat")
-    assert bag(got) == {(3, 18446744073709551614): 1}
-
-    # What the unsigned read must not disturb: a signed source (every non-U64
-    # integer widens to the same signed accumulator), an all-NULL group, and the
-    # global ground row.
-    assert bag(_parity(hg, "SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat")) == \
-        {(1, -3.0): 1, (2, 3.0): 1, (3, 5.5): 1}
-    got = _parity(hg, "SELECT cat, AVG(v) AS a FROM hg GROUP BY cat")
-    assert bag(got)[(3, None)] == 1, got
-    assert bag(_parity(hg, "SELECT AVG(v) AS a FROM hg WHERE cat = 99")) == {(None,): 1}
-
-
-def test_a_null_group_and_an_all_null_aggregate(hg):
-    """A NULL group forms its own group, and a group whose aggregated column is
-    entirely NULL still emits."""
-    got = _parity(hg,
-                  "SELECT s, COUNT(v) AS cv, SUM(v) AS sv, MIN(v) AS mv FROM hg GROUP BY s")
-    assert bag(got) == {("a", 1, 1, 1): 1, ("b", 1, 7, 7): 1,
-                        ("c", 0, None, None): 1, (None, 0, None, None): 1}
-
-
-# ---------------------------------------------------------------------------
-# DISTINCT
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def dd(module_client):
-    """The DISTINCT sources: `u` repeating its cities, `c` whose computed sums
-    collide, `dup` a join view naming `pk` and `a` twice, and `w` a group wider
-    than 8 columns."""
-    conn = module_client
-    cols = ", ".join(f"c{i} BIGINT" for i in range(10))
+    insert(conn, "rt", _RT)
+    # The DISTINCT sources: `u` repeating its cities, `c` whose computed sums
+    # collide, `dup` a join view naming `pk` and `a` twice, and `w` a group wider
+    # than 8 columns.
     conn.execute_sql(
         "CREATE TABLE u (pk BIGINT PRIMARY KEY, city TEXT, region BIGINT); "
         "INSERT INTO u VALUES (1,'nyc',1),(2,'sf',2),(3,'nyc',1),(4,'sf',2),(5,'la',3),"
@@ -441,12 +112,206 @@ def dd(module_client):
         "CREATE TABLE d (pk BIGINT PRIMARY KEY, a BIGINT NOT NULL); "
         "INSERT INTO d VALUES (1, 1), (2, 2); "
         "CREATE VIEW dup AS SELECT * FROM c JOIN d ON c.a = d.pk; "
-        f"CREATE TABLE w (pk BIGINT PRIMARY KEY, {cols})")
+        "CREATE TABLE w (pk BIGINT PRIMARY KEY, " + ", ".join(f"c{i} BIGINT" for i in range(10)) + ")")
     insert(conn, "w", [(1, *range(10)), (2, *range(10)), (3, *range(1, 11))])
+    # An empty source; a UNION ALL view whose rows weigh 2; eight aggregated
+    # columns; a source at the column limit.
+    conn.execute_sql(
+        "CREATE TABLE e (pk BIGINT PRIMARY KEY, v BIGINT); "
+        "CREATE TABLE base (pk BIGINT PRIMARY KEY, v BIGINT); "
+        "INSERT INTO base VALUES (1, 10), (2, 20), (3, 10); "
+        "CREATE VIEW dbl AS SELECT pk, v FROM base UNION ALL SELECT pk, v FROM base; "
+        "CREATE TABLE m8 (pk BIGINT PRIMARY KEY, g BIGINT NOT NULL, "
+        + ", ".join(f"c{i} BIGINT" for i in range(8)) + "); "
+        f"CREATE TABLE {_WMAX} (pk BIGINT PRIMARY KEY, "
+        + ", ".join(f"c{i} BIGINT NOT NULL" for i in range(gnitz.MAX_COLUMNS - 1)) + ")")
+    insert(conn, "m8", _M8)
+    insert(conn, _WMAX, [range(gnitz.MAX_COLUMNS)])
     return conn
 
 
-@pytest.mark.parametrize("query,want", [
+# ---------------------------------------------------------------------------
+# Every parity case: `(query, the oracle's bag)`
+# ---------------------------------------------------------------------------
+
+
+# Each aggregate over `_ORDERS`: its kind and the column it reads.
+_AGGS = {"COUNT(*)": ("COUNT*", 0), "COUNT(note)": ("COUNT", 3), "SUM(amount)": ("SUM", 2),
+         "MIN(amount)": ("MIN", 2), "MAX(amount)": ("MAX", 2), "AVG(amount)": ("AVG", 2)}
+
+
+def _fold(name, g):
+    kind, col = _AGGS[name]
+    return agg(kind, [r[col] for r in g])
+
+
+_I64_MAX, _U64_MAX, _I64_MIN_U = 2**63 - 1, 2**64 - 1, 2**63
+
+_CASES = [
+    # Every aggregate, grouped and global, with and without a WHERE that pushes a
+    # bounded PK range plus a residual, and one that keeps no row.
+    *((f"SELECT category, {a} AS m FROM orders{where} GROUP BY category",
+       _by([r for r in _ORDERS if keep(r)], lambda r: r[1], lambda g, a=a: _fold(a, g)))
+      for a in _AGGS
+      for where, keep in [("", lambda r: True),
+                          (" WHERE pk > 5 AND amount < 80", lambda r: r[0] > 5 and r[2] < 80),
+                          (" WHERE pk > 1000", lambda r: False)]),
+    *((f"SELECT {a} AS m FROM orders{where}", {(_fold(a, [r for r in _ORDERS if keep(r)]),): 1})
+      for a in _AGGS
+      for where, keep in [("", lambda r: True),
+                          (" WHERE category = 2", lambda r: r[1] == 2),
+                          (" WHERE pk > 1000", lambda r: False)]),
+
+    # Computed group keys and computed finalize items. A computed GROUP BY key or
+    # aggregate argument is the **pre-map**, which runs on the worker between the
+    # predicate and the fold; an expression over the aggregates is the **finalize
+    # map**, which the client runs over its combined reduce output.
+    *((f"SELECT {select} FROM orders GROUP BY {group}", _by(_ORDERS, key, value))
+      for select, group, key, value in [
+          # An expression whose operand is an aggregate — the finalize map.
+          ("category, SUM(amount) + 1 AS m", "category",
+           lambda r: r[1], lambda g: sum(r[2] for r in g) + 1),
+          # Two aggregates in one expression, and an aggregate under a second operator.
+          ("category, SUM(amount) - COUNT(*) * 2 AS m", "category",
+           lambda r: r[1], lambda g: sum(r[2] for r in g) - len(g) * 2),
+          # AVG's own divide feeding another operator.
+          ("category, AVG(amount) * 2 AS m", "category",
+           lambda r: r[1], lambda g: sum(r[2] for r in g) / len(g) * 2),
+          # A group column inside an expression, mixed with an aggregate.
+          ("category, category * 100 + COUNT(*) AS m", "category",
+           lambda r: r[1], lambda g: g[0][1] * 100 + len(g)),
+          # An aggregate whose argument is computed — the pre-map.
+          ("category, SUM(amount * category) AS m", "category",
+           lambda r: r[1], lambda g: sum(r[2] * r[1] for r in g)),
+          # A pre-map column feeding a non-linear aggregate.
+          ("category, MAX(amount + pk) AS m", "category",
+           lambda r: r[1], lambda g: max(r[2] + r[0] for r in g)),
+          # A GROUP BY over an expression — the pre-map materializing the key.
+          ("category + amount AS k, COUNT(*) AS m", "category + amount",
+           lambda r: r[1] + r[2], len),
+          # A computed key and a computed aggregate argument in one reduce.
+          ("category + 1 AS k, SUM(amount * 3) AS m", "category + 1",
+           lambda r: r[1] + 1, lambda g: sum(r[2] * 3 for r in g)),
+      ]),
+    # The written key reaches the SELECT list and HAVING by its expression, not
+    # by a name.
+    ("SELECT amount * 2 AS k, SUM(pk) AS s FROM orders GROUP BY amount * 2 HAVING SUM(pk) > 20",
+     {(k, s): 1 for (k, s) in _by(_ORDERS, lambda r: r[2] * 2, lambda g: sum(r[0] for r in g))
+      if s > 20}),
+    ("SELECT category + amount AS k, category + amount AS again, COUNT(*) AS c "
+     "FROM orders GROUP BY category + amount",
+     {(k, k, c): 1 for k, c in _by(_ORDERS, lambda r: r[1] + r[2], len)}),
+    # The pre-map carries only the PK and what the fold reads, so a computed key
+    # over a maximally wide source still fits.
+    (f"SELECT c0 + 1 AS k, COUNT(*) AS c FROM {_WMAX} GROUP BY c0 + 1", {(2, 1): 1}),
+    # The pre-map's output schema is the source's columns with the PK moved to
+    # the front, so over `nl` it is a *permutation* of the source — and a WHERE
+    # is resolved to positions against the source, not that permutation. The
+    # columns ahead of the PK are a TEXT and a DOUBLE because the symptom of
+    # confusing the two orders is a *type* mismatch at the permuted slot: the
+    # TEXT is type-rejected, the DOUBLE fails in the engine.
+    *((f"SELECT {select} FROM nl WHERE {where} GROUP BY {group}",
+       _by([r for r in _NL if keep(r)], key, value))
+      for where, select, group, keep, key, value in [
+          ("s = 'a'", "v + 1 AS k, COUNT(*) AS m", "v + 1",
+           lambda r: r[1] == "a", lambda r: r[3] + 1, len),
+          ("x > 6.0", "v AS k, SUM(id * 2) AS m", "v",
+           lambda r: r[0] > 6.0, lambda r: r[3], lambda g: sum(r[2] * 2 for r in g)),
+          # The pre-map reached by a computed argument rather than by the key.
+          ("s = 'b'", "v AS k, MAX(id * 3) AS m", "v",
+           lambda r: r[1] == "b", lambda r: r[3], lambda g: max(r[2] * 3 for r in g)),
+      ]),
+    # Over a replicated source every worker holds every row, so a fold that
+    # double-counted would still return plausible groups: once with no pre-map,
+    # once through the pre-map's derived schema.
+    ("SELECT c, COUNT(*) AS n FROM rt GROUP BY c", {(0, 4): 1, (1, 4): 1, (2, 4): 1}),
+    ("SELECT c + 1 AS k, SUM(a * 2) AS s FROM rt GROUP BY c + 1",
+     _by(_RT, lambda r: r[1] + 1, lambda g: sum(r[2] * 2 for r in g))),
+
+    # HAVING through the shared expression evaluator. The ad-hoc HAVING and a
+    # grouped view's post-reduce filter run one compiled program, so parity
+    # cannot catch a wrong *expression* result; what it still discriminates is
+    # the surrounding shape: where the group key lives (a view's PK region
+    # against the fold's payload slot), the nullability each side declares, and
+    # the client's reduce-output batch against the engine's.
+    #
+    # A single NOT NULL U64 group column: the view keeps it in its PK region,
+    # ad-hoc in a payload slot. Also pins the unsigned comparison.
+    (f"SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > {_I64_MAX}",
+     {(_I64_MIN_U, 2): 1, (_U64_MAX, 2): 1}),
+    # Every U64 value is above a negative literal, on both paths.
+    ("SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > -1",
+     {(5, 2): 1, (_I64_MIN_U, 2): 1, (_U64_MAX, 2): 1}),
+    # A NOT NULL aggregate source, grouped: the two sides declare its
+    # nullability differently, so they take different evaluation arms.
+    ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING SUM(nn) > 0",
+     {(1, 30): 1, (2, 70): 1, (3, 110): 1}),
+    # The only narrow (2-byte) aggregate partial: MIN over SMALLINT keeps the
+    # source width, so the value round-trips through sign extension.
+    ("SELECT cat, MIN(sm) AS m FROM hg GROUP BY cat HAVING MIN(sm) < 0", {(1, -5): 1}),
+    # Strings, IS NULL, a CASE, and IN over both a string and an aggregate.
+    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s = 'a'", {("a", 2): 1}),
+    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s > 'a'", {("b", 1): 1, ("c", 2): 1}),
+    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IN ('a', 'c')", {("a", 2): 1, ("c", 2): 1}),
+    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IS NULL", {(None, 1): 1}),
+    ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IS NOT NULL",
+     {("a", 2): 1, ("b", 1): 1, ("c", 2): 1}),
+    ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IS NULL", {(3, None): 1}),
+    ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IN (1, 7)", {(1, 1): 1, (2, 7): 1}),
+    ("SELECT cat, COUNT(*) AS c FROM hg GROUP BY cat "
+     "HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1", {(1, 2): 1, (2, 2): 1, (3, 2): 1}),
+    # A scalar function wrapping the aggregate.
+    ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING ABS(SUM(nn)) > 0",
+     {(1, 30): 1, (2, 70): 1, (3, 110): 1}),
+    # Constant predicates: TRUE folds away at plan time, FALSE compiles to a
+    # constant that drops every group, NULL is UNKNOWN and never true, and a
+    # statically-false one drops everything.
+    ("SELECT cat FROM hg GROUP BY cat HAVING TRUE", {(1,): 1, (2,): 1, (3,): 1}),
+    ("SELECT cat FROM hg GROUP BY cat HAVING FALSE", {}),
+    ("SELECT cat FROM hg GROUP BY cat HAVING NULL", {}),
+    ("SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'", {}),
+    # An aggregate appearing only in HAVING: all groups dropped, all kept, and
+    # several filter ranges rather than one.
+    ("SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 99", {}),
+    ("SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 0", {(1,): 1, (2,): 1, (3,): 1}),
+    ("SELECT cat FROM hg GROUP BY cat HAVING cat <> 2", {(1,): 1, (3,): 1}),
+    # A HAVING with no GROUP BY groups the whole relation, even when the
+    # projection carries no aggregate or none is written at all.
+    ("SELECT COUNT(*) AS c FROM hg HAVING COUNT(*) > 0", {(6,): 1}),
+    ("SELECT 1 AS one FROM hg HAVING SUM(cat) > 1", {(1,): 1}),
+    ("SELECT 1 AS one FROM hg HAVING 1 = 1", {(1,): 1}),
+    # A NULL group forms its own group, and a group whose aggregated column is
+    # entirely NULL still emits.
+    ("SELECT s, COUNT(v) AS cv, SUM(v) AS sv, MIN(v) AS mv FROM hg GROUP BY s",
+     {("a", 1, 1, 1): 1, ("b", 1, 7, 7): 1, ("c", 0, None, None): 1, (None, 0, None, None): 1}),
+
+    # AVG reads its SUM accumulator at the declared type. The client combines
+    # integer SUM partials into an i64 whose bit pattern is the sum mod 2^64. A
+    # SUM over a `BIGINT UNSIGNED` source is declared U64, so past 2^63 that bit
+    # pattern reads correctly only as unsigned — and AVG divides the value,
+    # where SUM's render only reinterprets its bits. cat = 1's two 2^63 cells
+    # wrap to 0; cat = 3 sums two 2^64-1 cells to 2^64-2, which has no exact f64
+    # image and rounds to 2^64, so its average is 2^63 — and a signed read of
+    # the accumulator would render it negative.
+    ("SELECT cat, AVG(u) AS a FROM hg GROUP BY cat",
+     {(1, 0.0): 1, (2, 5.0): 1, (3, 9.223372036854776e18): 1}),
+    # The same accumulator with no group columns at all.
+    ("SELECT AVG(u) AS a FROM hg WHERE cat = 3", {(9.223372036854776e18,): 1}),
+    # One 2^64-1 cell does not wrap, so its true average is representable.
+    ("SELECT AVG(u) AS a FROM hg WHERE pk = 5", {(1.8446744073709552e19,): 1}),
+    # HAVING and the render read one accumulator, so a mis-signed render
+    # disagrees with the predicate that kept it.
+    ("SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0",
+     {(2, 5.0): 1, (3, 9.223372036854776e18): 1}),
+    # SUM's raw-bits render wraps to the u64.
+    ("SELECT cat, SUM(u) AS t FROM hg WHERE cat = 3 GROUP BY cat", {(3, _U64_MAX - 1): 1}),
+    # What the unsigned read must not disturb: a signed source (every non-U64
+    # integer widens to the same signed accumulator), an all-NULL group, and the
+    # global ground row.
+    ("SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat", {(1, -3.0): 1, (2, 3.0): 1, (3, 5.5): 1}),
+    ("SELECT cat, AVG(v) AS a FROM hg GROUP BY cat", {(1, 1.0): 1, (2, 7.0): 1, (3, None): 1}),
+    ("SELECT AVG(v) AS a FROM hg WHERE cat = 99", {(None,): 1}),
+
     # DISTINCT is the weight-clamp primitive, so what it owes is not a row set but
     # a weight: every survivor at exactly 1, however many source rows folded into
     # it. `SELECT ALL` spells the default quantifier: the bag.
@@ -465,59 +330,63 @@ def dd(module_client):
     # A >8-column group collapses the duplicate pair.
     ("SELECT DISTINCT " + ", ".join(f"c{i}" for i in range(10)) + " FROM w",
      {tuple(range(10)): 1, tuple(range(1, 11)): 1}),
-])
-def test_distinct_and_all_parity(dd, query, want):
-    assert bag(_parity(dd, query)) == want
+
+    # An empty source grounds a global fold but not a grouped one, and HAVING
+    # still filters the ground row: a NULL aggregate drops it, COUNT keeps it.
+    ("SELECT COUNT(*) AS c, SUM(v) AS s, MAX(v) AS m FROM e", {(0, None, None): 1}),
+    ("SELECT v, COUNT(*) AS c FROM e GROUP BY v", {}),
+    ("SELECT COUNT(*) AS c FROM e HAVING SUM(v) = 0", {}),
+    ("SELECT COUNT(*) AS c FROM e HAVING MAX(v) >= 0", {}),
+    ("SELECT COUNT(*) AS c FROM e HAVING COUNT(*) = 0", {(0,): 1}),
+    # Over a bag, COUNT(*) counts the multiplicity, not the entries.
+    ("SELECT COUNT(*) AS c FROM dbl", {(6,): 1}),
+    ("SELECT v, COUNT(*) AS c FROM dbl GROUP BY v", {(10, 4): 1, (20, 2): 1}),
+    # Every accumulator kind at once over eight columns, with a group column.
+    ("SELECT g, " + ", ".join(f"SUM(c{i}) AS s{i}, MIN(c{i}) AS l{i}, MAX(c{i}) AS m{i}, "
+                              f"COUNT(c{i}) AS n{i}" for i in range(8)) + " FROM m8 GROUP BY g",
+     {(k, *(agg(f, [r[2 + j] for r in g]) for j in range(8) for f in ("SUM", "MIN", "MAX", "COUNT"))): 1
+      for k, g in groups(_M8, lambda r: r[1]).items()}),
+
+    # MIN/MAX over a TEXT or UUID column: every worker's partial carries the
+    # value itself, and the client's combine orders them as the engine does —
+    # strings by content, past the inline bound and across a shared prefix. An
+    # empty source still grounds the global extreme to NULL.
+    *(case for a, col in [("MIN(label)", 2), ("MAX(label)", 2), ("MIN(u)", 3), ("MAX(u)", 3)]
+      for pick in [min if a.startswith("MIN") else max]
+      for case in [
+          (f"SELECT g, {a} AS m FROM wx GROUP BY g",
+           _by(_WX, lambda r: r[1], lambda g, col=col, pick=pick: pick(r[col] for r in g))),
+          (f"SELECT {a} AS m FROM wx", {(pick(r[col] for r in _WX),): 1}),
+          (f"SELECT {a} AS m FROM wx WHERE pk > 100", {(None,): 1}),
+      ]),
+    # A TEXT group column some of whose values spill past the German-string
+    # inline bound: it is copied out of the fold's group batch into the result,
+    # where a spilled cell's heap offset means nothing — a verbatim copy of the
+    # 16-byte struct hands back an empty string for exactly those values.
+    ("SELECT label, SUM(pk) AS s FROM wx GROUP BY label",
+     _by(_WX, lambda r: r[2], lambda g: sum(r[0] for r in g))),
+]
 
 
-# ---------------------------------------------------------------------------
-# Empty input, ground row, bag-valued source, fold width, group cap
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("query,want", _CASES, ids=[q for q, _ in _CASES])
+def test_an_adhoc_fold_is_its_views_fold(src, query, want):
+    assert _parity(src, query) == want
 
 
-def test_an_empty_source_grounds_a_global_fold_but_not_a_grouped_one(client):
-    client.execute_sql("CREATE TABLE e (pk BIGINT PRIMARY KEY, v BIGINT)")
-    assert bag(rows(client, "SELECT COUNT(*) AS c, SUM(v) AS s, MAX(v) AS m FROM e")) \
-        == {(0, None, None): 1}
-    assert rows(client, "SELECT v, COUNT(*) AS c FROM e GROUP BY v") == []
-    # HAVING still filters the ground row: a NULL aggregate drops it, COUNT
-    # keeps it.
-    assert _parity(client, "SELECT COUNT(*) AS c FROM e HAVING SUM(v) = 0") == []
-    assert _parity(client, "SELECT COUNT(*) AS c FROM e HAVING MAX(v) >= 0") == []
-    assert bag(_parity(client, "SELECT COUNT(*) AS c FROM e HAVING COUNT(*) = 0")) == \
-        {(0,): 1}
-    # A WHERE filtering out every row behaves identically to an empty table.
-    client.execute_sql("INSERT INTO e VALUES (1, 5)")
-    assert bag(rows(client, "SELECT COUNT(*) AS c, SUM(v) AS s FROM e WHERE v > 100")) \
-        == {(0, None): 1}
-    assert rows(client, "SELECT v, COUNT(*) AS c FROM e WHERE v > 100 GROUP BY v") == []
+def test_the_register_cap_is_located_not_pinned(src):
+    """The register cap on the direct path, found rather than hardcoded."""
+    def having(k):
+        return f"SELECT cat FROM hg GROUP BY cat HAVING {conjunct_ladder('cat', k)}"
 
+    k = first_rejected(lambda k: rows(src, having(k)), range(1, 64))
+    assert _parity(src, having(k - 1)) == {(1,): 1}
 
-def test_a_fold_over_a_bag_counts_logical_rows(client):
-    """A UNION ALL view whose rows carry weight 2: COUNT(*) counts the
-    multiplicity, not the entries."""
-    client.execute_sql(
-        "CREATE TABLE base (pk BIGINT PRIMARY KEY, v BIGINT); "
-        "INSERT INTO base VALUES (1, 10), (2, 20), (3, 10); "
-        "CREATE VIEW dbl AS SELECT pk, v FROM base UNION ALL SELECT pk, v FROM base")
-    assert bag(rows(client, "SELECT COUNT(*) AS c FROM dbl")) == {(6,): 1}
-    assert bag(_parity(client, "SELECT v, COUNT(*) AS c FROM dbl GROUP BY v")) == {(10, 4): 1, (20, 2): 1}
+    def having_in(n):
+        items = ", ".join(repr(v) for v in ["a", *(f"v{i}" for i in range(1, n))])
+        return f"SELECT s FROM hg GROUP BY s HAVING s IN ({items})"
 
-
-def test_many_aggregates(client):
-    """A wide multi-aggregate query with a group column still folds, every
-    accumulator kind at once."""
-    n = 8
-    cols = ", ".join(f"c{i} BIGINT" for i in range(n))
-    client.execute_sql(
-        f"CREATE TABLE t (pk BIGINT PRIMARY KEY, g BIGINT NOT NULL, {cols})")
-    src = [(i, i % 4, *((i * (j + 1)) % 50 for j in range(n))) for i in range(1, 31)]
-    insert(client, "t", src)
-    aggs = ", ".join(f"SUM(c{i}) AS s{i}, MIN(c{i}) AS l{i}, MAX(c{i}) AS m{i}, COUNT(c{i}) AS n{i}"
-                     for i in range(n))
-    want = {(g, *v): 1 for g, v in _grouped_oracle(src, lambda r: r[1], lambda g: tuple(
-        x for c in ([r[2 + j] for r in g] for j in range(n)) for x in (sum(c), min(c), max(c), len(c))))}
-    assert bag(_parity(client, f"SELECT g, {aggs} FROM t GROUP BY g")) == want
+    n = first_rejected(lambda n: rows(src, having_in(n)), range(1, 64))
+    assert _parity(src, having_in(n - 1)) == {("a",): 1}
 
 
 def test_the_per_worker_group_cap_aborts_and_the_worker_keeps_serving(own_server):
@@ -563,61 +432,57 @@ def test_a_tied_cut_is_worker_count_independent(own_server):
         "desc": "SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c DESC LIMIT 4",
         "distinct": "SELECT DISTINCT g, h FROM t ORDER BY h LIMIT 4",
     }
-    per_count = {}
     with gnitz.connect(own_server.start(workers=2).target) as client:
         _tied_groups(client)
-        per_count[2] = {k: rows(client, q) for k, q in queries.items()}
+        two = {k: ordered(rows(client, q)) for k, q in queries.items()}
     with gnitz.connect(own_server.restart(graceful=True, workers=4).target) as client:
-        per_count[4] = {k: rows(client, q) for k, q in queries.items()}
-    for workers, got in per_count.items():
-        # A single non-nullable integer group column keys on the
-        # order-preserving route key, so the GROUP BY tie breaks ascending by `g`
-        # — ASC in both directions, because tiebreak keys are always ASC. (DISTINCT
-        # over two columns keys on a digest: deterministic, but arbitrary with
-        # respect to the data, so only cross-worker-count equality is asserted.)
-        for k in ("asc", "desc"):
-            assert ordered(got[k], "g", "c") == [((g, 3), 1) for g in range(4)], (workers, got[k])
-
-    for k, q in queries.items():
-        assert ordered(per_count[2][k]) == ordered(per_count[4][k]), \
-            f"`{q}` differs across worker counts"
+        four = {k: ordered(rows(client, q)) for k, q in queries.items()}
+    assert two == four
+    # A single non-nullable integer group column keys on the order-preserving
+    # route key, so the GROUP BY tie breaks ascending by `g` — in both
+    # directions, because tiebreak keys are always ASC. DISTINCT over two
+    # columns keys on a digest: deterministic, but arbitrary with respect to
+    # the data.
+    for k in ("asc", "desc"):
+        assert two[k] == [((("g", g), ("c", 3)), 1) for g in range(4)], k
 
 
 def test_a_tied_cut_agrees_with_a_views_cut(client):
-    """The ad-hoc cut and a view's cut return the *same* tied rows. The two keys
-    are not the same bytes — a view over a single non-nullable integer group
-    column keys on that column's OPK, the fold on a wider group key — but the
-    route key is order-preserving, so both induce the identical order."""
+    """The ad-hoc cut and a cut read off a view of the same body return the
+    *same* tied rows, in order. Over a single non-nullable integer group column
+    a view keys on that column's OPK and the fold on a wider group key — not the
+    same bytes, but the route key is order-preserving, so both induce the
+    identical order; over two group columns both key on the digest. (An ad-hoc
+    `SELECT DISTINCT` keys its ties off the reduce group key and a view's off a
+    content digest, so those two do not agree.)"""
     _tied_groups(client)
-    # A single natural group column: the key is the plain route key.
-    body = "SELECT g, COUNT(*) AS c FROM t GROUP BY g"
-    _parity_ordered(client, body, "ORDER BY c LIMIT 4", "ORDER BY c DESC LIMIT 4",
-                    "ORDER BY c OFFSET 5 LIMIT 6")
-    assert ordered(rows(client, f"{body} ORDER BY c LIMIT 4"), "g", "c") == \
-        [((g, 3), 1) for g in range(4)]
-    # A two-column group key: both sides key on the digest, so this is where a
-    # divergence between the fold's stamp and the view's would show.
-    _parity_ordered(client, "SELECT g, h, COUNT(*) AS c FROM t GROUP BY g, h",
-                    "ORDER BY c LIMIT 5")
+    for body, tails in [
+        ("SELECT g, COUNT(*) AS c FROM t GROUP BY g",
+         ["ORDER BY c LIMIT 4", "ORDER BY c DESC LIMIT 4", "ORDER BY c OFFSET 5 LIMIT 6"]),
+        ("SELECT g, h, COUNT(*) AS c FROM t GROUP BY g, h", ["ORDER BY c LIMIT 5"]),
+    ]:
+        vn = "po_" + uid()
+        client.execute_sql(f"CREATE VIEW {vn} AS {body}")
+        for tail in tails:
+            assert ordered(rows(client, f"{body} {tail}")) == \
+                ordered(rows(client, f"SELECT * FROM {vn} {tail}")), f"{body} {tail}"
 
 
-def test_order_by_an_aggregate_by_alias_call_and_position(orders):
+def test_order_by_an_aggregate_by_alias_call_and_position(src):
     """ORDER BY an aggregate or an expression over the grouped relation binds
     like a SELECT item, by call or by alias alike."""
     # Every category's sum is distinct, so the aggregate key alone decides the
     # order and the category tiebreak never fires.
-    sums = _grouped_oracle(_ORDERS, lambda r: r[1], lambda g: sum(r[2] for r in g))
-    want = sorted(sums, key=lambda cs: -cs[1])
-    assert len({s for _, s in sums}) == len(sums) and want != sorted(sums)
-    by_call = rows(orders,
+    sums = _by(_ORDERS, lambda r: r[1], lambda g: sum(r[2] for r in g))
+    want = [(cs, 1) for cs in sorted(sums, key=lambda cs: -cs[1])]
+    by_call = rows(src,
                    "SELECT category, SUM(amount) FROM orders GROUP BY category "
                    "ORDER BY SUM(amount) DESC, category")
-    by_alias = rows(orders,
+    by_alias = rows(src,
                     "SELECT category, SUM(amount) AS s FROM orders GROUP BY category "
                     "ORDER BY s DESC, category")
-    assert ordered(by_call, *by_call[0]._fields) == ordered(by_alias, "category", "s") == \
-        [(cs, 1) for cs in want]
-    positional = rows(orders,
+    assert ordered(by_call, *by_call[0]._fields) == ordered(by_alias, "category", "s") == want
+    positional = rows(src,
                       "SELECT category, COUNT(*) AS c FROM orders GROUP BY category ORDER BY 1")
     assert ordered(positional, "category", "c") == [((c, 8), 1) for c in range(5)]
 
@@ -627,28 +492,8 @@ def test_order_by_an_aggregate_by_alias_call_and_position(orders):
 #
 # A float SUM / AVG is a function of the summation order, so of (query, data,
 # worker count, access path, scan chunk size). It is stable for a fixed
-# deployment and a fixed plan — which is the guarantee, and is what these pin.
+# deployment and a fixed plan — which is the guarantee, and is what this pins.
 # ---------------------------------------------------------------------------
-
-
-# 2000 rows over 500 categories. The category count is what makes the range
-# `cat >= 5 AND cat < 13` about 1.6% of the table — selective enough to clear the
-# index cost gate, and wide enough that the range spans several scan chunks.
-_FLOAT_ROWS = 2000
-_FLOAT_CATS = 500
-
-
-def _float_table(client):
-    rnd = random.Random(11)
-    out = []
-    for i in range(1, _FLOAT_ROWS + 1):
-        # Alternating +/-1e15 and 1e-8 magnitudes: the sums cancel
-        # catastrophically, so any reassociation moves the low bits.
-        mag = 1e15 if i % 4 == 0 else (-1e15 if i % 4 == 1 else 1e-8)
-        out.append((i, (i * 37) % _FLOAT_CATS, mag * (1 + rnd.random())))
-    client.execute_sql(
-        "CREATE TABLE f (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, x DOUBLE NOT NULL)")
-    insert(client, "f", out)
 
 
 def _bits(rows):
@@ -658,87 +503,37 @@ def _bits(rows):
 
 
 def test_a_float_sum_repeats_and_an_index_keeps_the_exact_answer(own_server):
-    """Same query, same data, same worker count, same access path → a
-    bit-identical float SUM: the one reproducibility guarantee the float contract
-    does make.
-
-    `CREATE INDEX` re-plans these reads onto an index-bounded walk, which sorts
-    and dedups PKs one chunk at a time. What that owes the caller is pinned here:
-    the same rows, and the same aggregates that are exact over them, chunk
-    boundaries and all — plus a float SUM that still repeats under the new plan.
-
-    What it does not owe is the full scan's float bits. A float SUM follows the
-    summation order and the access path is part of that order, so the indexed and
-    unindexed float sums are deliberately never compared: they may legitimately
-    agree, and requiring either answer would pin an access-path detail as a promise.
-
-    The 3-row chunk is the point: each worker's share spans several chunks, the
-    only regime in which the walk visits rows in an order a PK scan never would."""
+    """Under a full scan and then under an index-bounded walk, which sorts and
+    dedups PKs one 3-row chunk at a time: the rows and the aggregates exact over
+    them are the oracle's, and a float SUM repeats bit for bit under each plan.
+    The two plans' float sums are never compared: the access path is part of the
+    summation order."""
+    rnd = random.Random(11)
+    # 2000 rows over 500 categories, so `cat >= 5 AND cat < 13` is 1.6% of the
+    # table — selective enough to clear the index cost gate, and wide enough
+    # that each worker's share spans several chunks. Alternating ±1e15 and 1e-8
+    # magnitudes cancel catastrophically, so any reassociation moves the low bits.
+    data = [(i, (i * 37) % 500, (1e15 if i % 4 == 0 else -1e15 if i % 4 == 1 else 1e-8)
+             * (1 + rnd.random())) for i in range(1, 2001)]
+    sel = [(pk, x) for pk, cat, x in data if 5 <= cat < 13]
+    src = "FROM f WHERE cat >= 5 AND cat < 13"
+    rows_q = f"SELECT pk, x {src}"
+    exact_q = f"SELECT COUNT(*) AS c, SUM(pk) AS sp, MIN(x) AS mn, MAX(x) AS mx {src}"
+    float_q = f"SELECT SUM(x) AS s {src}"
+    repeat_qs = (float_q, "SELECT SUM(x) AS s FROM f", "SELECT cat, SUM(x) AS s FROM f GROUP BY cat",
+                 "SELECT cat, AVG(x) AS s FROM f GROUP BY cat")
     with gnitz.connect(own_server.start(extra_env=TINY_SCAN_CHUNKS).target) as client:
-        _float_table(client)
-        for q in ("SELECT SUM(x) AS s FROM f",
-                  "SELECT cat, SUM(x) AS s FROM f GROUP BY cat",
-                  "SELECT cat, AVG(x) AS s FROM f GROUP BY cat"):
-            assert _bits(rows(client, q)) == _bits(rows(client, q)), f"`{q}` is not repeatable"
-
-        src = "FROM f WHERE cat >= 5 AND cat < 13"
-        rows_q = f"SELECT pk, x {src}"
-        exact_q = f"SELECT COUNT(*) AS c, SUM(pk) AS sp, MIN(x) AS mn, MAX(x) AS mx {src}"
-        float_q = f"SELECT SUM(x) AS s {src}"
-
-        # The control: with no index to bound on these are full scans, so the
-        # assertion after CREATE INDEX reads the plan and not a constant.
-        for q in (rows_q, exact_q, float_q):
-            assert access(client, q) == "full scan", q
-        before_rows = bag(rows(client, rows_q))
-        before_exact = bag(rows(client, exact_q))
-        # 8 of `_FLOAT_CATS` categories at 4 rows each — coupled to that fixture.
-        # 1.6% of the table, well inside the worker's cost gate, and 8 rows per
-        # worker at 4 workers: three 3-row chunks each.
-        assert len(before_rows) == 32, before_rows
-
-        client.execute_sql("CREATE INDEX fi ON f (cat)")
-        # One access planner serves the rows sink and the fold sink alike, so all
-        # three re-plan.
-        for q in (rows_q, exact_q, float_q):
-            assert access(client, q) == "index range on (cat)", q
-
-        # A chunked drain and an unchunked one yield identical multisets: the rows,
-        # then the aggregates exact over them — COUNT and an integer SUM fold
-        # associatively, and MIN/MAX copy a cell's bits rather than combining them.
-        assert bag(rows(client, rows_q)) == before_rows
-        assert bag(rows(client, exact_q)) == before_exact
-        # The float SUM under the index plan: repeatable, and that alone.
-        assert _bits(rows(client, float_q)) == _bits(rows(client, float_q))
-
-
-# ---------------------------------------------------------------------------
-# Wide (string / UUID) extremes and a spilling group column
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("agg", ["MIN(label)", "MAX(label)", "MIN(u)", "MAX(u)"])
-def test_a_wide_extreme_combines_by_content(wx, agg):
-    """MIN/MAX over a TEXT or UUID column: every worker's partial carries the
-    value itself, and the client's combine orders them as the engine does —
-    strings by content, past the inline bound and across a shared prefix."""
-    col = 2 if "label" in agg else 3
-    pick = min if agg.startswith("MIN") else max
-    got = _parity(wx, f"SELECT g, {agg} AS m FROM wx GROUP BY g")
-    assert bag(got) == _grouped_oracle(_WX, lambda r: r[1],
-                                                 lambda g: pick(r[col] for r in g))
-    assert bag(_parity(wx, f"SELECT {agg} AS m FROM wx")) == {(pick(r[col] for r in _WX),): 1}
-    # An empty source still grounds the global extreme to NULL.
-    assert bag(_parity(wx, f"SELECT {agg} AS m FROM wx WHERE pk > 100")) == {(None,): 1}
-
-
-def test_a_spilling_string_group_column_survives_the_finalize(wx):
-    """A GROUP BY over a TEXT column, some of whose values are longer than the
-    German-string inline bound.
-
-    The group column is copied out of the fold's own group batch into the result,
-    and a spilled cell's heap offset means nothing in the destination's arena —
-    so a copy that moved the 16-byte struct verbatim would hand back an empty
-    string for exactly the values that do not fit inline."""
-    got = _parity(wx, "SELECT label, SUM(pk) AS s FROM wx GROUP BY label")
-    assert bag(got) == _grouped_oracle(_WX, lambda r: r[2], lambda g: sum(r[0] for r in g))
+        client.execute_sql(
+            "CREATE TABLE f (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, x DOUBLE NOT NULL)")
+        insert(client, "f", data)
+        for walk in ("full scan", "index range on (cat)"):
+            if walk != "full scan":
+                client.execute_sql("CREATE INDEX fi ON f (cat)")
+            # One access planner serves the rows sink and the fold sink alike.
+            for q in (rows_q, exact_q, float_q):
+                assert access(client, q) == walk, q
+            assert bag(rows(client, rows_q)) == dict.fromkeys(sel, 1)
+            assert bag(rows(client, exact_q)) == \
+                {(len(sel), sum(pk for pk, _ in sel), min(x for _, x in sel), max(x for _, x in sel)): 1}
+            for q in repeat_qs:
+                assert _bits(rows(client, q)) == _bits(rows(client, q)), f"`{q}` is not repeatable"

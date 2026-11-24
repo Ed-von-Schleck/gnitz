@@ -18,19 +18,32 @@ from _paths import REPO_ROOT
 _TESTS_DIR = str(REPO_ROOT / "crates" / "gnitz-py" / "tests")
 
 
-def run(module, *args, prefix=(), extra_env=None, rc=0, timeout=180):
-    """Run the child to completion under `prefix` — a command it runs inside,
-    such as a tracer — assert it exited `rc`, and return its stdout and stderr.
+def _argv(module, args, prefix=()):
+    return [*prefix, sys.executable, "-m", module, *map(str, args)]
 
-    Its environment is this process's, with the helpers beside it importable,
-    plus `extra_env`."""
+
+def _env(extra_env):
+    """This process's environment, with the helpers beside it importable, plus
+    `extra_env`."""
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([_TESTS_DIR, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     env.update(extra_env or {})
+    return env
+
+
+def run(module, *args, prefix=(), extra_env=None, rc=0, timeout=180):
+    """Run the child to completion under `prefix` — a command it runs inside,
+    such as a tracer — assert it exited `rc`, and return its stdout and stderr."""
     done = subprocess.run(
-        [*prefix, sys.executable, "-m", module, *map(str, args)],
-        capture_output=True, text=True, env=env, timeout=timeout,
+        _argv(module, args, prefix), capture_output=True, text=True, env=_env(extra_env),
+        timeout=timeout,
     )
     assert done.returncode == rc, (
         f"child exited {done.returncode}, not {rc}\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}")
     return done.stdout, done.stderr
+
+
+def start(module, *args):
+    """Start the child with its stdout piped, for a test that acts on it while
+    it runs — reads a line it prints, signals it — and return the `Popen`."""
+    return subprocess.Popen(_argv(module, args), stdout=subprocess.PIPE, text=True, env=_env(None))
