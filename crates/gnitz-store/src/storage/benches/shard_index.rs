@@ -371,11 +371,11 @@ fn compaction_amplification_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn compressed_upkeep_bench() {
+    use crate::test_support::{BASE64, prose, random_chars, u64_pk_schema};
     use gnitz_foundation::perf::Counter;
     use gnitz_wire::TypeCode;
     use gnitz_zset::repr::BatchBuilder;
     use gnitz_zset::schema::SchemaColumn;
-    use gnitz_zset_testkit::{BASE64, prose, random_chars, u64_pk_schema};
     const RUN_ROWS: u64 = 8192;
     const KEYSPACE: u64 = 200_000_000;
     const RUNS: u64 = 200;
@@ -431,6 +431,8 @@ fn compressed_upkeep_bench() {
                 upkeep += counter.measure(|| idx.maintain(u64::MAX).unwrap()).1;
             }
             let coded = idx.all_entries().filter(|e| e.shard.heap().plain().is_none()).count();
+            assert!(compress || coded == 0, "{label}: a plain store coded a shard");
+            assert!(!compress || label != "prose" || coded > 0, "prose went uncoded");
             let book = (idx.codebook.as_ref()).map_or("none".to_string(), |b| {
                 format!("{}/16, pays {}", b.trained_sixteenths(), b.pays())
             });

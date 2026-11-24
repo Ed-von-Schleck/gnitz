@@ -513,10 +513,7 @@ impl Table {
         let heap: i64 = heap
             .map(|(batch, rows)| rows.map(|r| batch.get_weight(r)).sum::<i64>())
             .sum();
-        let shards = self.shard_index.holding(key, fp);
-        heap + shards
-            .map(|(shard, rows)| rows.map(|r| shard.get_weight(r)).sum::<i64>())
-            .sum::<i64>()
+        heap + self.shard_index.net_weight_at(key, fp)
     }
 }
 

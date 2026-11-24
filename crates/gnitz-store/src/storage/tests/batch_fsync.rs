@@ -33,24 +33,6 @@ fn batch_sync_reaps_through_interrupted_and_short_submits() {
     assert_eq!(got, Err(StorageError::Io(libc::EIO)));
 }
 
-/// Two full chunks plus a tail, through a ring, and a directory.
-#[test]
-fn sync_paths_spans_several_chunks() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths: Vec<_> = (0..2 * FD_CHUNK + 1)
-        .map(|i| {
-            let p = dir.path().join(i.to_string());
-            File::create(&p).unwrap();
-            p
-        })
-        .collect();
-    let mut sync = Syncer::default();
-    sync.sync_paths(&paths, FsyncFlags::DATASYNC)
-        .expect("chunked fdatasync");
-    sync.sync_paths([dir.path()], FsyncFlags::empty())
-        .expect("directory fsync");
-}
-
 /// A failed fsync surfaces its errno, from a CQE and from the fallback alike.
 #[test]
 fn a_failed_fsync_reports_its_errno() {
@@ -65,11 +47,11 @@ fn a_failed_fsync_reports_its_errno() {
 }
 
 /// A failed batch drops the ring it ran on, and the next batch syncs through a
-/// fresh one.
+/// fresh one: two full chunks plus a tail, and a directory.
 #[test]
 fn a_failed_batch_leaves_the_syncer_reusable() {
     let dir = tempfile::tempdir().unwrap();
-    let paths: Vec<_> = (0..8)
+    let paths: Vec<_> = (0..2 * FD_CHUNK + 1)
         .map(|i| {
             let p = dir.path().join(i.to_string());
             File::create(&p).unwrap();
@@ -84,6 +66,9 @@ fn a_failed_batch_leaves_the_syncer_reusable() {
         Err(StorageError::Io(libc::EINVAL))
     );
     assert!(sync.ring.is_none());
-    sync.sync_paths(&paths, FsyncFlags::DATASYNC).expect("a fresh ring");
+    sync.sync_paths(&paths, FsyncFlags::DATASYNC)
+        .expect("chunked fdatasync through a fresh ring");
     assert!(sync.ring.is_some());
+    sync.sync_paths([dir.path()], FsyncFlags::empty())
+        .expect("directory fsync");
 }

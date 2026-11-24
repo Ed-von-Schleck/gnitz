@@ -2,12 +2,13 @@ use super::*;
 use crate::storage::Cut;
 use crate::storage::manifest::{self, StoreDir};
 use crate::test_support::{
-    make_batch, make_batch_opk, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
+    make_batch, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, make_schema_u64_i64, payload0_i64,
+    pk_payload_schema,
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_trace::runs::write_shard;
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::probe_key;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::path::Path;
@@ -114,9 +115,9 @@ fn gk(v: u64) -> PkBuf {
     PkBuf::from_bytes(&v.to_be_bytes())
 }
 
-/// A `(U64 PK | I64 payload)` batch at weight 1.
-fn test_batch(pks: &[u64], values: &[i64]) -> Batch {
-    let rows: Vec<(u64, i64, i64)> = pks.iter().zip(values).map(|(&p, &v)| (p, 1, v)).collect();
+/// A `(U64 PK | I64 payload)` batch of `(pk, payload)` rows at weight 1.
+fn test_batch(rows: impl IntoIterator<Item = (u64, i64)>) -> Batch {
+    let rows: Vec<(u64, i64, i64)> = rows.into_iter().map(|(p, v)| (p, 1, v)).collect();
     make_batch(&make_schema_u64_i64(), &rows)
 }
 
@@ -133,24 +134,19 @@ fn ramp(i: u64) -> i64 {
 
 /// A `(U64 PK | I64)` batch of `n` dense keys from `base`, payload [`spread`].
 fn dense_batch(base: u64, n: u64) -> Batch {
-    let pks: Vec<u64> = (base..base + n).collect();
-    let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
-    test_batch(&pks, &vals)
+    test_batch((base..base + n).map(|p| (p, spread(p))))
 }
 
 /// `n` rows of a `width`-byte STRING payload, which a fold cannot pack smaller.
 fn fat_batch(base: u64, n: u64, width: usize) -> Batch {
-    let schema = make_schema_pk_u64_payload_string();
-    let mut b = BatchBuilder::new(&schema);
-    for pk in base..base + n {
-        // No two rows share a body, so the writer has no value to store once.
+    // No two rows share a body, so the writer has no value to store once.
+    let body = |pk: u64| {
         let mut body = pk.to_string().into_bytes();
         body.extend((body.len()..width).map(|i| b'a' + ((pk as usize + i) % 26) as u8));
-        b.begin_row(pk as u128, 1);
-        b.put_blob(&body);
-        b.end_row();
-    }
-    b.finish()
+        body
+    };
+    let rows: Vec<_> = (base..base + n).map(|pk| (pk, 1, body(pk))).collect();
+    make_batch_bytes(&make_schema_pk_u64_payload_string(), &rows)
 }
 
 /// Rows in a shard the guard rebalance neither splits nor merges.
@@ -163,37 +159,34 @@ fn assert_stable(len: u64) {
     );
 }
 
-/// Write `batch` as a published entry of `level_idx`'s guard `key`, creating it,
-/// stamped `stamp`.
+/// Write `batch` as an entry of `level_idx`'s guard `key`, creating it, stamped
+/// `stamp`, and publish the manifest naming it.
 fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
     let entry = idx
         .write_with(None, Some(stamp), |path, opts| write_shard(batch, path, opts))
         .unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
-    idx.dir.mark_published();
+    publish_manifest(idx);
 }
 
-/// [`seed_guard`] of a stable shard of keys `base..`; answers them.
-fn seed_stable(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, base: u64, stamp: u64) -> Vec<u64> {
-    seed_guard(idx, level_idx, key, &dense_batch(base, STABLE_ROWS), stamp);
-    assert_stable(
-        idx.levels[level_idx]
-            .get_or_create_guard(key)
-            .entries
-            .last()
-            .unwrap()
-            .shard
-            .file_len(),
-    );
-    (base..base + STABLE_ROWS).collect()
+/// [`seed_guard`] of a stable shard of keys `base..`, under guard key `base`.
+fn seed_stable(idx: &mut ShardIndex, level_idx: usize, base: u64, stamp: u64) {
+    seed_guard(idx, level_idx, gk(base), &dense_batch(base, STABLE_ROWS), stamp);
+    let guard = idx.levels[level_idx].guards.iter().find(|g| g.guard_key == gk(base));
+    assert_stable(guard.unwrap().entries.last().unwrap().shard.file_len());
 }
 
 /// A stable terminal guard of the even keys from `base`, so odd keys inside its
 /// extent are free for a source to hold; answers its keys.
 fn seed_even_terminal(idx: &mut ShardIndex, base: u64) -> Vec<u64> {
     let pks: Vec<u64> = (0..STABLE_ROWS).map(|i| base + 2 * i).collect();
-    let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
-    seed_guard(idx, TERMINAL, gk(base), &test_batch(&pks, &vals), 80);
+    seed_guard(
+        idx,
+        TERMINAL,
+        gk(base),
+        &test_batch(pks.iter().map(|&p| (p, spread(p)))),
+        80,
+    );
     assert_stable(idx.levels[TERMINAL].guards.last().unwrap().bytes());
     pks
 }
@@ -211,10 +204,11 @@ fn append_stable(idx: &mut ShardIndex, base: u64) -> u64 {
 fn assert_weighs(idx: &ShardIndex, weight: i64, keys: impl IntoIterator<Item = PkBuf>) {
     for k in keys {
         let key = k.pk_bytes();
-        let sum: i64 = (idx.holding(key, probe_key(key)))
-            .flat_map(|(shard, rows)| rows.map(|r| shard.get_weight(r)))
-            .sum();
-        assert_eq!(sum, weight, "key {key:?} through the guard partition");
+        assert_eq!(
+            idx.net_weight_at(key, probe_key(key)),
+            weight,
+            "key {key:?} through the guard partition"
+        );
     }
 }
 
@@ -248,7 +242,7 @@ fn a_fold_and_reload_keep_every_key_and_track_what_is_unsynced() {
     let mut idx = fresh(dir.path(), schema);
     let pks: Vec<u64> = (1..=5).map(|i| i * 10).collect();
     for &pk in &pks {
-        idx.append_l0_run(&test_batch(&[pk], &[pk as i64])).unwrap();
+        idx.append_l0_run(&test_batch([(pk, pk as i64)])).unwrap();
     }
     let spills: Vec<String> = idx.unsynced_paths().collect();
     assert_eq!(spills.len(), 5);
@@ -266,10 +260,10 @@ fn a_fold_and_reload_keep_every_key_and_track_what_is_unsynced() {
 
     publish_manifest(&mut idx);
     let mut idx2 = fresh(dir.path(), schema);
-    assert!(idx2.shard_set() == idx.shard_set());
+    assert_eq!(idx2.shard_set(), idx.shard_set());
     assert!(idx2.unsynced_paths().next().is_none(), "a manifest names durable files");
     let loaded = idx2.all_entries().map(|e| e.seq).max().unwrap();
-    idx2.append_l0_run(&test_batch(&[99], &[990])).unwrap();
+    idx2.append_l0_run(&test_batch([(99, 990)])).unwrap();
     assert!(
         idx2.l0.iter().all(|e| e.seq > loaded),
         "a write after the reload takes a fresh name"
@@ -285,7 +279,7 @@ fn guards_over_the_file_threshold_fold_in_place() {
     let schema = make_schema_u64_i64();
     let mut idx = fresh(dir.path(), schema);
     for pk in 1..=GUARD_FILE_THRESHOLD[L1] as u64 + 1 {
-        seed_guard(&mut idx, L1, gk(0), &test_batch(&[pk], &[pk as i64]), 1);
+        seed_guard(&mut idx, L1, gk(0), &test_batch([(pk, pk as i64)]), 1);
     }
     // Alternating inserts and retractions of the same rows, netting to zero.
     for i in 0..GUARD_FILE_THRESHOLD[L1] as i64 + 2 {
@@ -367,7 +361,7 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     // One L1 guard spanning both of them.
     let src_pks: Vec<u64> = vec![201, 301, 100_101, 100_201];
     for &pk in &src_pks {
-        seed_guard(&mut idx, L1, gk(201), &test_batch(&[pk], &[pk as i64]), 100);
+        seed_guard(&mut idx, L1, gk(201), &test_batch([(pk, pk as i64)]), 100);
     }
 
     let (cut_outputs, high_band_fold) = (2, 1);
@@ -400,12 +394,12 @@ fn an_l0_fold_routes_keys_below_the_first_l1_guard() {
     let mut idx = fresh(dir.path(), schema);
 
     // L1 already has a guard at key 100 (keys 100, 200).
-    seed_guard(&mut idx, L1, gk(100), &test_batch(&[100, 200], &[1000, 2000]), 1);
+    seed_guard(&mut idx, L1, gk(100), &test_batch([(100, 1000), (200, 2000)]), 1);
 
     // Insert 5 L0 shards (> L0_COMPACT_THRESHOLD) with keys all below 100.
     let low_keys = [50u64, 60, 70, 80, 90];
     for &k in &low_keys {
-        idx.append_l0_run(&test_batch(&[k], &[k as i64 * 10])).unwrap();
+        idx.append_l0_run(&test_batch([(k, k as i64 * 10)])).unwrap();
     }
     assert!(idx.level_shape().0 > L0_COMPACT_THRESHOLD);
     idx.run_compact().unwrap();
@@ -464,7 +458,7 @@ fn a_schema_change_rebinds_every_shard() {
         let dir = tempfile::tempdir().unwrap();
         let mut idx = fresh(dir.path(), make_schema_u64_i64());
         for i in 0..3u64 {
-            idx.append_l0_run(&test_batch(&[i * 10 + 1], &[i as i64])).unwrap();
+            idx.append_l0_run(&test_batch([(i * 10 + 1, i as i64)])).unwrap();
         }
         publish_manifest(&mut idx);
         idx.swap_schema(new).unwrap();
@@ -514,9 +508,8 @@ fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
     let mut guards_before = 0;
     for run in 0..3u64 {
         for spill in run * 5..run * 5 + 5 {
-            let pks: Vec<u64> = (spill * SPILL..(spill + 1) * SPILL).collect();
-            let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
-            idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
+            let pks = spill * SPILL..(spill + 1) * SPILL;
+            idx.append_l0_run(&test_batch(pks.map(|p| (p, spread(p))))).unwrap();
         }
         let spilled = idx.l0_bytes();
         idx.run_compact().unwrap();
@@ -540,10 +533,10 @@ fn a_failing_compaction_leaves_its_inputs_and_no_output() {
         let mut idx = fresh(dir.path(), make_schema_u64_i64());
 
         // Two L1 guards, one per L0 run, so the fold writes two outputs.
-        seed_guard(&mut idx, L1, gk(10), &test_batch(&[11], &[1]), 1);
-        seed_guard(&mut idx, L1, gk(150), &test_batch(&[151], &[1]), 1);
-        idx.append_l0_run(&test_batch(&[10, 50], &[1, 1])).unwrap();
-        idx.append_l0_run(&test_batch(&[150, 250], &[1, 1])).unwrap();
+        seed_guard(&mut idx, L1, gk(10), &test_batch([(11, 1)]), 1);
+        seed_guard(&mut idx, L1, gk(150), &test_batch([(151, 1)]), 1);
+        idx.append_l0_run(&test_batch([(10, 1), (50, 1)])).unwrap();
+        idx.append_l0_run(&test_batch([(150, 1), (250, 1)])).unwrap();
         // A directory at an output's name: that shard cannot be created.
         std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.dir.last_seq() + failing))).unwrap();
         let before = shard_seqs(dir.path());
@@ -583,8 +576,7 @@ fn a_vertical_rewrites_exactly_the_terminal_guards_its_source_overlaps() {
 
     // One L1 guard over the first two bands.
     let src_pks = [201u64, 301, 100_101, 100_201];
-    let vals: Vec<i64> = src_pks.iter().map(|&p| p as i64).collect();
-    seed_guard(&mut idx, L1, gk(201), &test_batch(&src_pks, &vals), 100);
+    seed_guard(&mut idx, L1, gk(201), &test_batch(src_pks.map(|p| (p, p as i64))), 100);
 
     idx.vertical_fold(0).unwrap();
 
@@ -607,7 +599,7 @@ fn open_removes_exactly_the_unreferenced_files() {
     std::fs::write(&stray, b"orphan").unwrap();
     let mut idx = fresh(dir.path(), make_schema_u64_i64());
     assert!(!stray.exists());
-    idx.append_l0_run(&test_batch(&[10], &[100])).unwrap();
+    idx.append_l0_run(&test_batch([(10, 100)])).unwrap();
     publish_manifest(&mut idx);
     let live = manifest::shard_name(idx.dir.last_seq());
 
@@ -662,9 +654,7 @@ fn a_guard_of_one_distinct_key_neither_splits_nor_refolds() {
     // 9000 rows of one PK at distinct payloads — a legal intermediate batch
     // shape, and past the target even with the PK region as compressible as
     // it gets.
-    let pks = vec![7u64; 9000];
-    let vals: Vec<i64> = (0..9000).map(ramp).collect();
-    seed_guard(&mut idx, L1, gk(7), &test_batch(&pks, &vals), 1);
+    seed_guard(&mut idx, L1, gk(7), &test_batch((0..9000).map(|i| (7, ramp(i)))), 1);
 
     let target = idx.guard_target_bytes(L1);
     assert!(idx.levels[L1].guards[0].bytes() > target, "premise: over target");
@@ -900,9 +890,14 @@ fn the_guard_count_comes_back_down_after_the_bytes_do() {
     // Eight rows per key: dehydration folds each key to one `(PK, Σweight)`
     // row, which is the order-of-magnitude shrink the merge pass exists for.
     let keys = 4_000u64;
-    let pks: Vec<u64> = (1..=keys).flat_map(|k| std::iter::repeat_n(k, 8)).collect();
-    let vals: Vec<i64> = (0..pks.len() as u64).map(ramp).collect();
-    seed_guard(&mut idx, TERMINAL, gk(1), &test_batch(&pks, &vals), 1);
+    let pks = (1..=keys).flat_map(|k| std::iter::repeat_n(k, 8));
+    seed_guard(
+        &mut idx,
+        TERMINAL,
+        gk(1),
+        &test_batch(pks.zip(0..).map(|(k, i)| (k, ramp(i)))),
+        1,
+    );
 
     idx.split_overfull_guards(TERMINAL).unwrap();
     let split_count = idx.levels[TERMINAL].guards.len();
@@ -1118,7 +1113,7 @@ fn no_fold_sinks_data_into_a_floor_already_at_the_capacity() {
     idx.drain().unwrap();
     let floor = idx.levels[TERMINAL].bytes();
     let mut idx = reopened_under(idx, Some(floor));
-    let small = test_batch(&[7_500, 70_007], &[7, 7]);
+    let small = test_batch([(7_500, 7), (70_007, 7)]);
     assert!(
         idx.l1_target_bytes() > 4 * small.total_bytes() as u64,
         "premise: L1 may hold bytes"
@@ -1127,7 +1122,7 @@ fn no_fold_sinks_data_into_a_floor_already_at_the_capacity() {
     idx.append_l0_run(&small).unwrap();
     let fold = idx.plan_l0_fold().unwrap();
     idx.run(fold).unwrap();
-    idx.append_l0_run(&test_batch(&[9_500], &[9])).unwrap();
+    idx.append_l0_run(&test_batch([(9_500, 9)])).unwrap();
     let terminal: Vec<u64> = idx.levels[TERMINAL].entries().map(|e| e.seq).collect();
     idx.drain().unwrap();
 
@@ -1181,7 +1176,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     // Three hydrated terminal guards at distinct write recencies, each too
     // big for the rebalance to merge into its neighbour.
     for (i, base) in [1u64, 10_000, 20_000].into_iter().enumerate() {
-        seed_stable(&mut idx, TERMINAL, gk(base), base, 30 - i as u64);
+        seed_stable(&mut idx, TERMINAL, base, 30 - i as u64);
     }
     let (dehy, hyd) = terminal_split(&idx);
     assert!(dehy.is_empty() && hyd.len() >= 2, "several hydrated terminal guards");
@@ -1247,7 +1242,7 @@ fn a_jump_in_r_is_merged_within_each_calls_budget() {
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
     const GUARDS: u64 = 40;
     for i in 0..GUARDS {
-        seed_stable(&mut idx, TERMINAL, gk(i * 10_000 + 1), i * 10_000 + 1, 1);
+        seed_stable(&mut idx, TERMINAL, i * 10_000 + 1, 1);
     }
     // Five stable spills fold to an `R` several guards wide, so every adjacent
     // pair of the seeded guards now fits one merge run.
@@ -1288,7 +1283,7 @@ fn a_call_stops_at_the_destination_past_its_budget() {
         let mut keys: Vec<u64> = (0..2048).map(|_| rng.gen_range(KEYS)).collect();
         keys.sort_unstable();
         keys.dedup();
-        idx.append_l0_run(&test_batch(&keys, &keys.iter().map(|&k| k as i64).collect::<Vec<_>>()))
+        idx.append_l0_run(&test_batch(keys.iter().map(|&k| (k, k as i64))))
             .unwrap();
         // A budget of one byte: the call does one destination and stops.
         let before = idx.dir.last_seq();
@@ -1319,10 +1314,10 @@ fn a_call_stops_at_the_destination_past_its_budget() {
 fn a_vertical_of_a_guard_with_a_low_tail_reads_each_terminal_guard_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    seed_guard(&mut idx, TERMINAL, gk(10), &test_batch(&[10, 20], &[1, 2]), 1);
-    seed_guard(&mut idx, TERMINAL, gk(100), &test_batch(&[100, 110], &[3, 4]), 1);
+    seed_guard(&mut idx, TERMINAL, gk(10), &test_batch([(10, 1), (20, 2)]), 1);
+    seed_guard(&mut idx, TERMINAL, gk(100), &test_batch([(100, 3), (110, 4)]), 1);
     // L1's lowest guard owns the keys below its own key.
-    seed_guard(&mut idx, L1, gk(150), &test_batch(&[5, 105, 160], &[5, 6, 7]), 2);
+    seed_guard(&mut idx, L1, gk(150), &test_batch([(5, 5), (105, 6), (160, 7)]), 2);
 
     idx.vertical_fold(0).unwrap();
     let stats = &idx.stats;
@@ -1370,11 +1365,11 @@ fn an_ascending_stream_is_written_once() {
 fn a_few_keys_above_l1_mint_no_guard() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    seed_stable(&mut idx, L1, gk(1), 1, 1);
+    seed_stable(&mut idx, L1, 1, 1);
     for i in 0..5u64 {
-        let pks: Vec<u64> = (1..=2000).chain([1_000_000 + i]).collect();
-        let vals: Vec<i64> = pks.iter().map(|&p| (p + i) as i64).collect();
-        idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
+        let pks = (1..=2000).chain([1_000_000 + i]);
+        idx.append_l0_run(&test_batch(pks.map(|p| (p, (p + i) as i64))))
+            .unwrap();
     }
     idx.run_compact().unwrap();
     assert!(
@@ -1390,7 +1385,7 @@ fn a_few_keys_above_l1_mint_no_guard() {
 fn a_fence_stays_above_a_tail_only_l1_guard() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    seed_guard(&mut idx, L1, gk(100_000), &test_batch(&[5, 6], &[5, 6]), 1);
+    seed_guard(&mut idx, L1, gk(100_000), &test_batch([(5, 5), (6, 6)]), 1);
     for i in 0..5u64 {
         idx.append_l0_run(&dense_batch(50 + i * 3000, 2000)).unwrap();
     }
@@ -1409,7 +1404,7 @@ fn a_fence_stays_above_a_tail_only_l1_guard() {
 fn a_vertical_over_target_writes_its_parts_directly() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    seed_stable(&mut idx, TERMINAL, gk(1), 1, 1);
+    seed_stable(&mut idx, TERMINAL, 1, 1);
     seed_guard(&mut idx, L1, gk(2000), &dense_batch(2000, STABLE_ROWS), 2);
 
     idx.vertical_fold(0).unwrap();
@@ -1553,10 +1548,12 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
         *per_pk.entry(pk.clone()).or_default() += w;
     }
     for pk in m.seen.iter() {
-        let sum: i64 = (idx.holding(pk, probe_key(pk)))
-            .flat_map(|(shard, rows)| rows.map(|r| shard.get_weight(r)))
-            .sum();
-        assert_eq!(sum, per_pk.get(pk).copied().unwrap_or(0), "{what}: key {pk:?} by probe");
+        let want = per_pk.get(pk).copied().unwrap_or(0);
+        assert_eq!(
+            idx.net_weight_at(pk, probe_key(pk)),
+            want,
+            "{what}: key {pk:?} by probe"
+        );
     }
 
     // The full cursor.
@@ -1575,9 +1572,7 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
         let mut elems: BTreeMap<Elem, i64> = BTreeMap::new();
         for r in 0..got.len() {
             let pk = got.get_pk_bytes(r).to_vec();
-            *elems
-                .entry((pk, crate::test_support::payload0_i64(&*got, r)))
-                .or_default() += got.get_weight(r);
+            *elems.entry((pk, payload0_i64(&*got, r))).or_default() += got.get_weight(r);
         }
         elems.retain(|_, w| *w != 0);
         let want: BTreeMap<Elem, i64> = m.rows.iter().map(|(e, &w)| (e.clone(), w)).collect();
@@ -1664,12 +1659,10 @@ fn shard_index_model() {
                         }
                         3 if !idx.l0.is_empty() => {
                             let _ = idx.finish_fold();
-                            idx.abandon_fold();
                             let _ = idx.run_compact();
                         }
                         4 if !idx.levels[L1].guards.is_empty() => {
                             let _ = idx.finish_fold();
-                            idx.abandon_fold();
                             if !idx.levels[L1].guards.is_empty() {
                                 let gi = rng.gen_range(idx.levels[L1].guards.len() as u64) as usize;
                                 let _ = idx.vertical_fold(gi);
@@ -1680,7 +1673,6 @@ fn shard_index_model() {
                         }
                         6 => {
                             let _ = idx.finish_fold();
-                            idx.abandon_fold();
                             let _ = idx.rebalance_guards([L1, TERMINAL][rng.gen_range(2) as usize]);
                         }
                         7 => {
@@ -1813,7 +1805,7 @@ fn the_newest_shard_holding_a_key_holds_its_live_row() {
         let (shard, rows) = idx.holding(&key, probe_key(&key)).next().expect("a live key is held");
         let live: Vec<i64> = rows
             .filter(|&r| shard.get_weight(r) > 0)
-            .map(|r| i64::from_le_bytes(shard.get_col_ptr(r, 0, 8).try_into().unwrap()))
+            .map(|r| payload0_i64(&**shard, r))
             .collect();
         assert_eq!(live, [want], "key {k}");
     }

@@ -53,7 +53,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         let mut pk_vals = leading.clone();
         pk_vals.push(i as u128);
         let w = 1 + rng.gen_range(4) as i64;
-        batch.begin_row_bytes(schema.opk_key_cols(&pk_vals).pk_bytes(), w);
+        batch.begin_row_natives(&pk_vals, w);
 
         // Payload columns, in payload (not schema-column) index order; a NULL
         // only where the column is nullable.

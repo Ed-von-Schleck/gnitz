@@ -65,6 +65,19 @@ pub fn certified(mut batch: Batch) -> Batch {
     batch
 }
 
+/// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
+pub fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
+    let mut batch = BatchBuilder::new(schema);
+    for &(pk, weight, cells) in rows {
+        batch.begin_row(pk as u128, weight);
+        for &cell in cells {
+            batch.put_opt_int(cell.map(|v| v as u128));
+        }
+        batch.end_row();
+    }
+    batch.finish()
+}
+
 /// A batch over [`make_schema_u64_i64`]-shaped schemas of native
 /// `(pk, weight, payload)` rows, unconsolidated in the order given.
 pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
@@ -634,6 +647,15 @@ pub fn prose(i: usize) -> String {
         s.push(' ');
     }
     s
+}
+
+/// Rows `range` over [`make_schema_pk_u64_payload_string`], each row `i`
+/// carrying [`prose`]`(i)` at weight 1: a heap a codebook trains on.
+pub fn prose_batch(range: std::ops::Range<usize>) -> Batch {
+    make_batch_bytes(
+        &make_schema_pk_u64_payload_string(),
+        &range.map(|i| (i as u64, 1, prose(i))).collect::<Vec<_>>(),
+    )
 }
 
 /// Base64's alphabet: random characters of it code under no symbol table.

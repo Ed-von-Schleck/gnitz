@@ -89,19 +89,6 @@ pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
     u64_pk_schema(&[SchemaColumn::new(TypeCode::Blob, false)])
 }
 
-/// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
-pub(crate) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
-    let mut batch = BatchBuilder::new(schema);
-    for &(pk, weight, cells) in rows {
-        batch.begin_row(pk as u128, weight);
-        for &cell in cells {
-            batch.put_opt_int(cell.map(|v| v as u128));
-        }
-        batch.end_row();
-    }
-    batch.finish()
-}
-
 /// `n` rows of keys of `stride` that differ in their first byte's low bit and
 /// their last byte alone — so a batch of at least 256 of them takes the radix
 /// sort — with repeats, cancels and payload ties.

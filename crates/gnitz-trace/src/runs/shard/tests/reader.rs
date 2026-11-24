@@ -5,8 +5,8 @@ use crate::runs::Codebook;
 use crate::runs::StorageError;
 use crate::runs::write_shard;
 use crate::test_support::{
-    certified, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    make_schema_u128_i64, map_coded_shard, payload0_i64, pk_only_schema, prose, sweep_bit_flips, u64_pk_schema,
+    certified, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_schema_u128_i64,
+    map_coded_shard, payload0_i64, pk_only_schema, prose, prose_batch, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_foundation::rng::{Rng, mix};
 use gnitz_wire::{MAX_SYMBOL_LEN, write_u64_le};
@@ -989,10 +989,7 @@ fn a_symbol_table_its_image_cannot_hold_is_refused() {
 fn a_table_under_a_corrupt_body_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.db");
-    let batch = make_batch_bytes(
-        &make_schema_pk_u64_payload_string(),
-        &(0..400).map(|i| (i as u64, 1, prose(i))).collect::<Vec<_>>(),
-    );
+    let batch = prose_batch(0..400);
     let book = Codebook::for_batch(None, &batch).unwrap();
     map_coded_shard(&path, &batch, &book);
     let mut image = std::fs::read(&path).unwrap();
@@ -1342,10 +1339,7 @@ fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
 #[test]
 fn a_table_read_back_codes_as_the_one_trained() {
     let dir = tempfile::tempdir().unwrap();
-    let batch = make_batch_bytes(
-        &make_schema_pk_u64_payload_string(),
-        &(0..400).map(|i| (i as u64, 1, prose(i))).collect::<Vec<_>>(),
-    );
+    let batch = prose_batch(0..400);
     let book = Codebook::for_batch(None, &batch).expect("enough long bytes to train");
     let shard = map_coded_shard(&dir.path().join("s.db"), &batch, &book);
     let read = shard.codebook().unwrap();

@@ -63,6 +63,11 @@ fn encode(m: &Manifest) -> Vec<u8> {
     for e in &m.shards.entries {
         w.u64(e.seq).u64(e.newest).u64(e.level).put(&e.guard_key);
     }
+    seal(w)
+}
+
+/// `w`'s bytes sealed by the digest [`decode`] checks.
+fn seal(w: Writer) -> Vec<u8> {
     let mut buf = w.into_vec();
     let digest = gnitz_wire::checksum(&buf);
     buf.extend_from_slice(&digest.to_le_bytes());
@@ -428,12 +433,6 @@ impl StoreDir {
     #[cfg(test)]
     pub(super) fn last_seq(&self) -> u64 {
         self.seq
-    }
-
-    /// Treat every shard drawn so far as published.
-    #[cfg(test)]
-    pub(super) fn mark_published(&mut self) {
-        self.published_through = self.seq;
     }
 
     /// The path of the shard drawn at `seq`.

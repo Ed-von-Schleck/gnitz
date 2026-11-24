@@ -729,6 +729,14 @@ impl ShardIndex {
         }
     }
 
+    /// The net weight at OPK `key`, summed over every shard holding it.
+    pub(super) fn net_weight_at(&self, key: &[u8], filter_key: u64) -> i64 {
+        let holding = self.holding(key, filter_key);
+        holding
+            .map(|(shard, rows)| rows.map(|r| shard.get_weight(r)).sum::<i64>())
+            .sum()
+    }
+
     /// Start `fold`: pin its inputs and verify them.
     fn begin(&mut self, fold: Fold) -> Result<(), StorageError> {
         let dehydrate = fold.kind == CompactionKind::Dehydrate;

@@ -1,13 +1,6 @@
 use super::*;
-use crate::test_support::{BASE64, make_batch_bytes, make_schema_pk_u64_payload_string, prose, random_chars};
+use crate::test_support::{BASE64, make_batch_bytes, make_schema_pk_u64_payload_string, prose_batch, random_chars};
 use gnitz_foundation::rng::{Rng, mix};
-
-fn prose_batch(range: std::ops::Range<usize>) -> Batch {
-    make_batch_bytes(
-        &make_schema_pk_u64_payload_string(),
-        &range.map(|i| (i as u64, 1, prose(i))).collect::<Vec<_>>(),
-    )
-}
 
 #[test]
 fn too_few_long_bytes_train_no_table() {

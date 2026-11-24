@@ -8,8 +8,8 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    FoldRow, RowKey, arb_fold_case, fold_batch, make_batch, make_schema_u64_i64, new_table, row_key, scratch_table,
-    table_shards, zset_of, zset_sum,
+    FoldRow, RowKey, arb_fold_case, fold_batch, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    new_table, prose_batch, row_key, scratch_table, table_shards, zset_of, zset_sum,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -24,25 +24,32 @@ fn shard_files(dir: &Path) -> usize {
     shard_seqs(dir.to_str().unwrap()).unwrap().len()
 }
 
-/// A model step: ingest the next `n` generated rows, or move the tiers.
+/// A model step: write `w` below the cut or, `pending`, above it; or move the
+/// tiers.
 #[derive(Clone, Debug)]
-enum Op {
-    Ingest(usize),
-    IngestPending(usize),
+enum Op<W> {
+    Write { w: W, pending: bool },
     Seal,
     FoldToRam,
     Flush,
     Crash,
 }
 
-fn arb_op() -> impl Strategy<Value = Op> {
+fn arb_op<W: Clone + std::fmt::Debug>(write: impl Strategy<Value = W>) -> impl Strategy<Value = Op<W>> {
     prop_oneof![
-        4 => (1usize..8).prop_map(Op::Ingest),
-        3 => (1usize..8).prop_map(Op::IngestPending),
+        7 => (write, any::<bool>()).prop_map(|(w, pending)| Op::Write { w, pending }),
         2 => Just(Op::Seal),
         2 => Just(Op::FoldToRam),
         1 => Just(Op::Flush),
         1 => Just(Op::Crash),
+    ]
+}
+
+/// The recovery source a model store opens under.
+fn arb_recovery() -> impl Strategy<Value = RecoverySource> {
+    prop_oneof![
+        Just(RecoverySource::SalReplay),
+        Just(RecoverySource::Rederive { resume_at: Some(0) })
     ]
 }
 
@@ -119,14 +126,10 @@ proptest! {
     #[test]
     fn a_table_serves_the_zset_its_ingests_sum_to(
         (s, stream) in arb_fold_case(),
-        ops in prop::collection::vec(arb_op(), 1..48),
-        salreplay in any::<bool>(),
+        ops in prop::collection::vec(arb_op(1usize..8), 1..48),
+        rs in arb_recovery(),
         spills in any::<bool>(),
     ) {
-        let rs = match salreplay {
-            true => RecoverySource::SalReplay,
-            false => RecoverySource::Rederive { resume_at: Some(0) },
-        };
         let ram = if spills { 100 } else { DEFAULT_RAM_TIER_BYTES };
         let dir = tempfile::tempdir().unwrap();
         let open = || new_table(dir.path(), s, rs, ram);
@@ -142,7 +145,7 @@ proptest! {
         // however many they are, until the next upkeep.
         for op in ops {
             match op {
-                Op::Ingest(n) | Op::IngestPending(n) => {
+                Op::Write { w: n, pending } => {
                     // Base-table positivity: a retraction never takes an element
                     // below zero.
                     let mut batch = Vec::new();
@@ -154,10 +157,10 @@ proptest! {
                     }
                     live.retain(|_, w| *w != 0);
                     let batch = fold_batch(&s, &batch);
-                    match op {
-                        Op::IngestPending(_) => t.ingest_pending(batch),
+                    match pending {
+                        true => t.ingest_pending(batch),
                         // Below the cut, as the registry ingests: no row is left above it.
-                        _ => {
+                        false => {
                             t.seal().unwrap();
                             t.ingest(batch).unwrap();
                             sealed = live.clone();
@@ -405,58 +408,39 @@ fn a_damaged_manifest_fails_a_replayed_open_and_rebuilds_a_rederived_one() {
     }
 }
 
-/// `Rederive`'s open verdict: a manifest at the caller's generation loads, any
-/// other generation erases the shards and unlinks the manifest, so a later
-/// open cannot reload it.
+/// A reopen reports the last published checkpoint mark, none without a
+/// manifest. `Rederive` loads a manifest at the caller's generation; any other
+/// generation erases the shards and unlinks the manifest, so a later open
+/// cannot reload it.
 #[test]
-fn rederive_checkpointed_conditional_load() {
+fn a_reopen_loads_the_checkpoint_its_generation_names() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let manifest = manifest_path(dir.path().to_str().unwrap());
-    let pushed = rows(&[(1, 1, 100), (2, 1, 200)]);
-    let reopen = |at| {
-        new_table(
-            dir.path(),
-            schema,
-            RecoverySource::Rederive { resume_at: Some(at) },
-            1 << 20,
-        )
-    };
-    {
-        let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
-        t.ingest(pushed.clone()).unwrap();
-        flush_barrier([&mut t], 7).unwrap();
-    }
-    let t = reopen(7);
-    assert!(t.loaded_mark().is_some());
-    assert_eq!(
-        zset_of(&t.full_scan(), &schema),
-        zset_of(&pushed, &schema),
-        "a matching generation loads"
-    );
-    drop(t);
-    let t = reopen(8);
-    assert!(t.loaded_mark().is_none());
-    assert_eq!(t.full_scan().len(), 0, "a mismatched generation erases");
-    assert!(!std::fs::exists(&manifest).unwrap());
-}
-
-/// A reopen reports the last published checkpoint mark; a store without a
-/// manifest reports none.
-#[test]
-fn a_barriers_checkpoint_mark_is_what_the_reopen_reports() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
+    let reopen = |rs| new_table(dir.path(), schema, rs, 1 << 20);
+    let rederive = |at| reopen(RecoverySource::Rederive { resume_at: Some(at) });
+    let mut t = reopen(RecoverySource::SalReplay);
     assert_eq!(t.loaded_mark(), None, "a fresh store carries no mark");
-    t.ingest(rows(&[(1, 1, 10)])).unwrap();
+    let pushed = [rows(&[(1, 1, 100)]), rows(&[(2, 1, 200)])];
+    t.ingest(pushed[0].clone()).unwrap();
     flush_barrier([&mut t], 9).unwrap();
-    t.ingest(rows(&[(2, 1, 10)])).unwrap();
+    t.ingest(pushed[1].clone()).unwrap();
     flush_barrier([&mut t], 7).unwrap();
     assert_eq!(t.loaded_mark(), None, "the open's mark is read-only");
     drop(t);
-    let t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
+    let t = reopen(RecoverySource::SalReplay);
     assert_eq!(t.loaded_mark(), Some(7), "the last published mark, not the highest");
+    drop(t);
+
+    let t = rederive(7);
+    assert_eq!(t.loaded_mark(), Some(7));
+    let want = zset_sum(&pushed, &schema);
+    assert_eq!(zset_of(&t.full_scan(), &schema), want, "a matching generation loads");
+    drop(t);
+    let t = rederive(8);
+    assert_eq!(t.loaded_mark(), None);
+    assert_eq!(t.full_scan().len(), 0, "a mismatched generation erases");
+    assert!(!std::fs::exists(&manifest).unwrap());
 }
 
 /// A barrier publishes exactly when the manifest would change — rows, shards or
@@ -468,8 +452,9 @@ fn a_barrier_publishes_exactly_when_the_manifest_changes() {
     let resume = RecoverySource::Rederive { resume_at: Some(0) };
     let mut t = new_table(dir.path(), schema, resume, 100);
     let publishes = |t: &mut Table| {
-        let staged = t.flush_prepare(0).unwrap().is_some();
-        flush_barrier([&mut *t], 0).unwrap();
+        let work = t.flush_prepare(0).unwrap();
+        let staged = work.is_some();
+        StoreDir::publish(work.into_iter().collect()).unwrap();
         staged
     };
     assert!(publishes(&mut t), "a first round publishes");
@@ -683,27 +668,13 @@ fn a_seal_that_enters_shards_into_l0_compacts_it() {
     }
 }
 
-/// Row `i`'s sentence: words of a short list, so that a symbol table codes a
-/// heap of them to a fraction of its bytes, and unique to `i`.
-fn sentence(i: u64) -> String {
-    const WORDS: [&str; 8] = [
-        "the", "river", "carried", "every", "lantern", "toward", "the", "harbour",
-    ];
-    let mut s = format!("{i} ");
-    for k in 0..8 + i % 7 {
-        s.push_str(WORDS[((i * 3 + k * 5) % 8) as usize]);
-        s.push(' ');
-    }
-    s
-}
-
 /// A compressing store codes the heaps of the shards it spills and compacts
 /// under one table, which a reopen takes up again, and serves its rows as
 /// given.
 #[test]
 fn a_compressing_store_codes_its_shards_under_one_table() {
     let dir = tempfile::tempdir().unwrap();
-    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let schema = make_schema_pk_u64_payload_string();
     let open = || {
         Table::new(
             dir.path().to_str().unwrap(),
@@ -715,14 +686,6 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
         )
         .unwrap()
     };
-    let batch = |keys: std::ops::Range<u64>| {
-        let values: Vec<String> = keys.clone().map(sentence).collect();
-        let rows: Vec<(u64, i64, &[u8])> = keys.zip(&values).map(|(k, v)| (k, 1, v.as_bytes())).collect();
-        crate::test_support::certified(crate::test_support::make_batch_bytes(
-            &crate::test_support::make_schema_pk_u64_payload_string(),
-            &rows,
-        ))
-    };
     let digests = |t: &Table| -> Vec<Option<u64>> {
         let shards = table_shards(t);
         shards
@@ -732,10 +695,10 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
     };
     let mut t = open();
     let mut pushed = Vec::new();
-    for round in 0..=L0_COMPACT_THRESHOLD as u64 {
-        pushed.push(batch(round * 400..(round + 1) * 400));
+    for round in 0..=L0_COMPACT_THRESHOLD {
+        pushed.push(prose_batch(round * 400..(round + 1) * 400));
         t.ingest(pushed.last().unwrap().clone()).unwrap();
-        flush_barrier([&mut t], round).unwrap();
+        flush_barrier([&mut t], round as u64).unwrap();
     }
     t.settle().unwrap();
     assert_eq!(t.level_shape().0, 0, "the spills folded out of L0");
@@ -745,7 +708,7 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
     drop(t);
 
     let mut t = open();
-    pushed.push(batch(10_000..10_400));
+    pushed.push(prose_batch(10_000..10_400));
     t.ingest(pushed.last().unwrap().clone()).unwrap();
     flush_barrier([&mut t], 99).unwrap();
     let reopened = digests(&t);
@@ -760,36 +723,10 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
 /// long enough to probe through a filter of its own.
 const UNIQUE_KEYS: u64 = 256;
 
-/// A step of a base table's history: upsert or delete distinct keys, below
-/// or above the cut, or move the tiers.
-#[derive(Clone, Debug)]
-enum UniqueOp {
-    Write {
-        keys: Vec<(u64, Option<i64>)>,
-        pending: bool,
-    },
-    Seal,
-    FoldToRam,
-    Flush,
-    Crash,
-}
-
-fn arb_unique_op() -> impl Strategy<Value = UniqueOp> {
-    let write = (
-        prop::collection::btree_map(0u64..UNIQUE_KEYS, prop::option::weighted(0.8, 0i64..4), 1..96),
-        any::<bool>(),
-    )
-        .prop_map(|(keys, pending)| UniqueOp::Write {
-            keys: keys.into_iter().collect(),
-            pending,
-        });
-    prop_oneof![
-        6 => write,
-        2 => Just(UniqueOp::Seal),
-        2 => Just(UniqueOp::FoldToRam),
-        1 => Just(UniqueOp::Flush),
-        1 => Just(UniqueOp::Crash),
-    ]
+/// A base table's write: upsert (`Some`) or delete distinct keys.
+fn arb_unique_write() -> impl Strategy<Value = Vec<(u64, Option<i64>)>> {
+    prop::collection::btree_map(0u64..UNIQUE_KEYS, prop::option::weighted(0.8, 0i64..4), 1..96)
+        .prop_map(|keys| keys.into_iter().collect())
 }
 
 proptest! {
@@ -801,15 +738,11 @@ proptest! {
     /// one live row.
     #[test]
     fn unique_live_row_at_answers_each_keys_live_row(
-        ops in prop::collection::vec(arb_unique_op(), 1..40),
-        salreplay in any::<bool>(),
+        ops in prop::collection::vec(arb_op(arb_unique_write()), 1..40),
+        rs in arb_recovery(),
         spills in any::<bool>(),
     ) {
         let s = make_schema_u64_i64();
-        let rs = match salreplay {
-            true => RecoverySource::SalReplay,
-            false => RecoverySource::Rederive { resume_at: Some(0) },
-        };
         let ram = if spills { 100 } else { DEFAULT_RAM_TIER_BYTES };
         let dir = tempfile::tempdir().unwrap();
         let open = || new_table(dir.path(), s, rs, ram);
@@ -817,7 +750,7 @@ proptest! {
         let (mut live, mut durable) = (HashMap::<u64, i64>::new(), HashMap::new());
         for op in ops {
             match op {
-                UniqueOp::Write { keys, pending } => {
+                Op::Write { w: keys, pending } => {
                     let mut delta = Vec::new();
                     for (k, new) in keys {
                         if let Some(old) = live.remove(&k) {
@@ -839,13 +772,13 @@ proptest! {
                         }
                     }
                 }
-                UniqueOp::Seal => drop(t.seal().unwrap()),
-                UniqueOp::FoldToRam => t.fold_to_ram().unwrap(),
-                UniqueOp::Flush => {
+                Op::Seal => drop(t.seal().unwrap()),
+                Op::FoldToRam => t.fold_to_ram().unwrap(),
+                Op::Flush => {
                     flush_barrier([&mut t], 0).unwrap();
                     durable = live.clone();
                 }
-                UniqueOp::Crash => {
+                Op::Crash => {
                     drop(t);
                     t = open();
                     live = durable.clone();

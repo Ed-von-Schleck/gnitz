@@ -1,10 +1,10 @@
 use super::*;
 use crate::test_support::{
-    RowKey, arb_fold_case, certified, fold_batch, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, opk_pk, row_key, u64_pk_schema, weighted_rows, zset_add, zset_of, zset_sum,
+    RowKey, arb_fold_case, certified, fold_batch, make_batch, make_batch_bytes, make_int_batch,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, row_key, u64_pk_schema, weighted_rows, zset_add,
+    zset_of, zset_sum,
 };
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
 use proptest::prelude::*;
 use std::collections::{BTreeSet, HashMap};
@@ -26,7 +26,7 @@ proptest! {
         for (n, action) in steps {
             let run = fold_batch(&s, &rows.by_ref().take(n).cloned().collect::<Vec<_>>()).into_consolidated();
             pushed.push(run.clone());
-            set.push_run(Rc::new(run.trimmed()), &s);
+            set.push(run, &s);
             match action {
                 0 => set.fold(&s),
                 1 => {
@@ -70,6 +70,13 @@ proptest! {
     }
 }
 
+impl RunSet {
+    /// Push `run` trimmed, as a store's tiers hand theirs over.
+    pub(super) fn push(&mut self, run: Batch, schema: &SchemaDescriptor) {
+        self.push_run(Rc::new(run.trimmed()), schema);
+    }
+}
+
 fn keyed_run(schema: &SchemaDescriptor, keys: std::ops::Range<u64>, w: i64, v: i64) -> Batch {
     certified(make_batch(schema, &keys.map(|k| (k, w, v)).collect::<Vec<_>>()))
 }
@@ -86,19 +93,19 @@ fn holds(set: &RunSet, schema: &SchemaDescriptor, k: u64) -> bool {
 fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
     let schema = make_schema_u64_i64();
     let mut set = RunSet::cancelling(usize::MAX);
-    set.push_run(Rc::new(keyed_run(&schema, 0..100, 1, 0).trimmed()), &schema);
-    set.push_run(Rc::new(keyed_run(&schema, 100..200, 1, 0).trimmed()), &schema);
+    set.push(keyed_run(&schema, 0..100, 1, 0), &schema);
+    set.push(keyed_run(&schema, 100..200, 1, 0), &schema);
     assert_eq!(set.len(), 2, "an insert-only run stays apart");
 
     let update: Vec<_> = (100..160).flat_map(|k| [(k, -1, 0), (k, 1, 1)]).collect();
-    set.push_run(Rc::new(certified(make_batch(&schema, &update)).trimmed()), &schema);
+    set.push(certified(make_batch(&schema, &update)), &schema);
     assert_eq!(set.len(), 2, "the update cancelled into the run before it");
     assert_eq!(set.row_count(), 200, "its retractions and their rows are gone");
 
-    set.push_run(Rc::new(keyed_run(&schema, 150..160, -1, 1).trimmed()), &schema);
+    set.push(keyed_run(&schema, 150..160, -1, 1), &schema);
     assert_eq!(set.len(), 3, "a run much larger than its successor is not merged into");
 
-    set.push_run(Rc::new(keyed_run(&schema, 0..50, -1, 0).trimmed()), &schema);
+    set.push(keyed_run(&schema, 0..50, -1, 0), &schema);
     assert_eq!(set.len(), 4, "retractions of an older run's rows stay apart");
     set.fold(&schema);
     assert_eq!(set.row_count(), 140);
@@ -113,9 +120,7 @@ fn a_filter_grows_with_its_rows_and_is_dropped_once_most_of_its_keys_are_gone() 
     let schema = make_schema_u64_i64();
     // Caps the filter at 64 blocks: room for 1638 keys.
     let mut set = RunSet::new(1638 * schema.row_width());
-    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| {
-        set.push_run(Rc::new(keyed_run(&schema, keys, w, 7).trimmed()), &schema)
-    };
+    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| set.push(keyed_run(&schema, keys, w, 7), &schema);
 
     push(&mut set, 0..10, 1);
     assert!(holds(&set, &schema, 3), "the first probe builds the filter");
@@ -148,7 +153,7 @@ fn a_filter_grows_with_its_rows_and_is_dropped_once_most_of_its_keys_are_gone() 
 fn a_set_with_a_tiny_budget_probes() {
     let schema = make_schema_u64_i64();
     let mut set = RunSet::new(0);
-    set.push_run(Rc::new(keyed_run(&schema, 0..10, 1, 7).trimmed()), &schema);
+    set.push(keyed_run(&schema, 0..10, 1, 7), &schema);
     assert!(holds(&set, &schema, 3) && !holds(&set, &schema, 10));
 }
 
@@ -157,17 +162,13 @@ fn a_set_with_a_tiny_budget_probes() {
 #[test]
 fn widening_fills_nulls_and_keeps_the_filter() {
     let narrow = make_schema_u64_i64();
-    let wide = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
+    let wide = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, true),
+    ]);
     let mut set = RunSet::new(1 << 20);
-    set.push_run(Rc::new(keyed_run(&narrow, 0..10, 1, 7).trimmed()), &narrow);
-    set.push_run(Rc::new(keyed_run(&narrow, 10..20, 1, 7).trimmed()), &narrow);
+    set.push(keyed_run(&narrow, 0..10, 1, 7), &narrow);
+    set.push(keyed_run(&narrow, 10..20, 1, 7), &narrow);
     assert!(holds(&set, &narrow, 15), "the first probe builds the filter");
 
     set.widen_runs(&wide);
@@ -189,32 +190,22 @@ fn widening_fills_nulls_and_keeps_the_filter() {
 fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
     let label = |nullable| u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, nullable)]);
     let (not_null, nullable) = (label(false), label(true));
-    let run = |schema: SchemaDescriptor, rows: &[(u128, Option<i64>, i64)]| {
-        let mut b = BatchBuilder::new(&schema);
-        for &(pk, v, w) in rows {
-            b.begin_row(pk, w);
-            b.put_opt_int(v.map(|v| v as u128));
-            b.end_row();
-        }
-        let mut b = b.finish();
-        b.certify_consolidated();
-        b
-    };
+    let run = |schema, rows: &[(u64, i64, &[Option<i64>])]| certified(make_int_batch(schema, rows));
 
     let mut set = RunSet::new(1 << 20);
-    set.push_run(
-        Rc::new(run(not_null, &[(1, Some(-3), 1), (2, Some(7), 1), (3, Some(8), 1)]).trimmed()),
+    set.push(
+        run(
+            &not_null,
+            &[(1, 1, &[Some(-3)]), (2, 1, &[Some(7)]), (3, 1, &[Some(8)])],
+        ),
         &not_null,
     );
-    set.push_run(
-        Rc::new(run(nullable, &[(1, None, 1), (1, Some(-3), -1)]).trimmed()),
-        &nullable,
-    );
+    set.push(run(&nullable, &[(1, 1, &[None]), (1, -1, &[Some(-3)])]), &nullable);
     set.fold(&nullable);
 
     let folded = &set.runs[0].batch;
     assert!(*folded.schema() == nullable);
-    let want = run(nullable, &[(1, None, 1), (2, Some(7), 1), (3, Some(8), 1)]);
+    let want = run(&nullable, &[(1, 1, &[None]), (2, 1, &[Some(7)]), (3, 1, &[Some(8)])]);
     assert_eq!(weighted_rows(folded), weighted_rows(&want));
 }
 
@@ -233,7 +224,7 @@ fn a_fold_under_churn_keeps_every_run_trimmed() {
     let mut set = RunSet::new(usize::MAX);
     let mut latest = vec![0u64; KEYS as usize];
     let push = |set: &mut RunSet, rows: &[(u64, i64, Vec<u8>)]| {
-        set.push_run(Rc::new(certified(make_batch_bytes(&schema, rows)).trimmed()), &schema);
+        set.push(certified(make_batch_bytes(&schema, rows)), &schema);
     };
     push(
         &mut set,

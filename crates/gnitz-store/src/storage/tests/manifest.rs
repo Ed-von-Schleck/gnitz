@@ -38,10 +38,7 @@ fn framed(magic: u64, version: u64, body: impl FnOnce(&mut Writer)) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(magic).u64(version);
     body(&mut w);
-    let mut buf = w.into_vec();
-    let digest = gnitz_wire::checksum(&buf);
-    buf.extend_from_slice(&digest.to_le_bytes());
-    buf
+    seal(w)
 }
 
 #[test]

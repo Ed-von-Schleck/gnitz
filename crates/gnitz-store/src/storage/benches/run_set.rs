@@ -1,6 +1,6 @@
 use super::super::table::{DEFAULT_RAM_TIER_BYTES, MEMTABLE_BYTES};
 use super::*;
-use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
+use crate::test_support::{certified, make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
 use gnitz_foundation::rng::mix;
 use gnitz_zset::repr::BatchBuilder;
@@ -22,9 +22,7 @@ fn run(schema: &SchemaDescriptor, rows: impl Iterator<Item = (u64, i64)>) -> Bat
         }
         b.end_row();
     }
-    let mut run = b.finish();
-    run.certify_consolidated();
-    run
+    certified(b.finish())
 }
 
 /// The rows a push made `set` fold.
@@ -74,16 +72,10 @@ fn run_set_fold_bench() {
     for (label, has_dominant, small_runs, rows) in arms {
         let mut set = RunSet::new(usize::MAX);
         if has_dominant {
-            set.push_run(
-                Rc::new(run(&schema, (0..DOMINANT).map(|i| (2 * i, 1))).trimmed()),
-                &schema,
-            );
+            set.push(run(&schema, (0..DOMINANT).map(|i| (2 * i, 1))), &schema);
         }
         for k in 0..small_runs {
-            set.push_run(
-                Rc::new(run(&schema, (0..PER_RUN).map(|i| rows(k, i))).trimmed()),
-                &schema,
-            );
+            set.push(run(&schema, (0..PER_RUN).map(|i| rows(k, i))), &schema);
         }
         assert_eq!(
             set.len(),
@@ -131,38 +123,45 @@ fn run_set_push_bench() {
     for (schema_label, schema) in schemas {
         for (order_label, key) in orders {
             for tick in [1u64, 16, 128] {
+                // Every fill's ticks, enough to fill the set, built ahead of the
+                // measurement, with what the set's own folds merge off a shadow
+                // set the same ticks fill.
+                let (mut rows, mut folded) = (0u64, 0u64);
+                let mut fills = Vec::new();
+                for _ in 0..FILLS {
+                    let ticks: Vec<Batch> = (0..)
+                        .map(|t| {
+                            let mut keys: Vec<u64> = (0..tick).map(|i| key(rows + t * tick + i)).collect();
+                            keys.sort_unstable();
+                            run(&schema, keys.into_iter().map(|pk| (pk, 1)))
+                        })
+                        .scan(0, |bytes, b| {
+                            let full = *bytes > MEMTABLE_BYTES;
+                            *bytes += b.total_bytes();
+                            (!full).then_some(b)
+                        })
+                        .collect();
+                    let mut shadow = RunSet::cancelling(MEMTABLE_BYTES);
+                    for b in &ticks {
+                        let before: Vec<_> = shadow.batches().cloned().collect();
+                        let rows = shadow.row_count() + b.len();
+                        shadow.push(b.clone(), &schema);
+                        folded += rows_folded(&before, rows, &shadow) as u64;
+                    }
+                    let (runs, held) = (shadow.len(), shadow.row_count() as u64);
+                    rows += held;
+                    fills.push((ticks, runs, held));
+                }
                 let mut cells = [0.0; 2];
-                let (mut rows, mut folded, mut unprobed_cycles) = (0u64, 0u64, 0u64);
+                let mut unprobed_cycles = 0u64;
                 for (cell, probed) in cells.iter_mut().zip([false, true]) {
-                    (rows, folded) = (0, 0);
                     let mut instructions = 0;
                     let mut set = RunSet::cancelling(MEMTABLE_BYTES);
-                    for _ in 0..FILLS {
-                        // Enough ticks to fill the set, built ahead of the measurement.
-                        let ticks: Vec<Batch> = (0..)
-                            .map(|t| {
-                                let mut keys: Vec<u64> = (0..tick).map(|i| key(rows + t * tick + i)).collect();
-                                keys.sort_unstable();
-                                run(&schema, keys.into_iter().map(|pk| (pk, 1)))
-                            })
-                            .scan(0, |bytes, b| {
-                                let full = *bytes > MEMTABLE_BYTES;
-                                *bytes += b.total_bytes();
-                                (!full).then_some(b)
-                            })
-                            .collect();
-                        // What the set's own folds merge, off a set the same ticks fill.
-                        let mut shadow = RunSet::cancelling(MEMTABLE_BYTES);
-                        for b in &ticks {
-                            let before: Vec<_> = shadow.batches().cloned().collect();
-                            let rows = shadow.row_count() + b.len();
-                            shadow.push_run(Rc::new(b.clone().trimmed()), &schema);
-                            folded += rows_folded(&before, rows, &shadow) as u64;
-                        }
-                        let (runs, held) = (shadow.len(), shadow.row_count() as u64);
+                    for (ticks, runs, held) in &fills {
+                        let ticks = ticks.clone();
                         let ((), [i, c]) = counters.measure(|| {
                             for b in ticks {
-                                set.push_run(Rc::new(b.trimmed()), &schema);
+                                set.push(b, &schema);
                                 if probed {
                                     std::hint::black_box(set.may_contain(0));
                                 }
@@ -170,9 +169,8 @@ fn run_set_push_bench() {
                         });
                         instructions += i;
                         unprobed_cycles += c * !probed as u64;
-                        rows += held;
-                        assert_eq!(set.len(), runs, "{schema_label}, {order_label}, {tick}: folds");
-                        assert_eq!(set.row_count() as u64, held);
+                        assert_eq!(set.len(), *runs, "{schema_label}, {order_label}, {tick}: folds");
+                        assert_eq!(set.row_count() as u64, *held);
                         assert!(set.is_full(), "{schema_label}, {order_label}, {tick}: not filled");
                         assert_eq!(set.bloom.get().is_some(), probed);
                         set.clear();
@@ -223,8 +221,8 @@ fn run_set_probe_bench() {
         let per_run = ROWS / runs;
         let mut set = RunSet::cancelling(DEFAULT_RAM_TIER_BYTES);
         for r in 0..runs {
-            set.push_run(
-                Rc::new(run(&schema, (0..per_run).map(|i| (2 * layout(r, i, per_run), 1))).trimmed()),
+            set.push(
+                run(&schema, (0..per_run).map(|i| (2 * layout(r, i, per_run), 1))),
                 &schema,
             );
         }

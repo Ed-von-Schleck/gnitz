@@ -7,9 +7,9 @@ use gnitz_zset::schema::pk_keys;
 
 /// Instructions per row of `Table::ingest` at the cadence a worker
 /// runs it: a tick is one ingest and the memtable drains on its own budget. One
-/// case per way the drain ends — the memtable's own fold, a batch past the
-/// memtable budget, a RAM-tier fold whose cancellation spares the spill, and the
-/// spill.
+/// case per way the drain ends short of a spill — the memtable's own fold, a
+/// batch past the memtable budget, and a RAM-tier fold whose cancellation spares
+/// the spill; `ingest_call_bench` prices the ingests that spill.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn table_ingest_bench() {
@@ -24,26 +24,19 @@ fn table_ingest_bench() {
         let retraction = u.checked_sub(HOT).map(|old| (u % HOT, -1, old as i64));
         [retraction, Some((u % HOT, 1, u as i64))]
     };
-    // Label, updates per tick, the rows of an update, the RAM-tier ceiling, whether it spills.
-    type Case = (&'static str, u64, fn(u64) -> Rows, usize, bool);
-    let cases: [Case; 5] = [
-        ("fresh keys, 1-row ticks", 1, fresh, DEFAULT_RAM_TIER_BYTES, false),
-        ("fresh keys, 100-row ticks", 100, fresh, DEFAULT_RAM_TIER_BYTES, false),
-        ("fresh keys, 8192-row ticks", 8192, fresh, DEFAULT_RAM_TIER_BYTES, false),
-        (
-            "8192 hot keys, 16-update ticks, 1 MiB tier",
-            16,
-            churn,
-            SMALL_TIER,
-            false,
-        ),
-        ("fresh keys, 100-row ticks, 1 MiB tier", 100, fresh, SMALL_TIER, true),
+    // Label, updates per tick, the rows of an update, the RAM-tier ceiling.
+    type Case = (&'static str, u64, fn(u64) -> Rows, usize);
+    let cases: [Case; 4] = [
+        ("fresh keys, 1-row ticks", 1, fresh, DEFAULT_RAM_TIER_BYTES),
+        ("fresh keys, 100-row ticks", 100, fresh, DEFAULT_RAM_TIER_BYTES),
+        ("fresh keys, 8192-row ticks", 8192, fresh, DEFAULT_RAM_TIER_BYTES),
+        ("8192 hot keys, 16-update ticks, 1 MiB tier", 16, churn, SMALL_TIER),
     ];
 
     let schema = make_schema_u64_i64();
     let counter = Counter::instructions();
     let dir = tempfile::tempdir().unwrap();
-    for (case, (label, per_tick, update, tier, spills)) in cases.into_iter().enumerate() {
+    for (case, (label, per_tick, update, tier)) in cases.into_iter().enumerate() {
         let ticks: Vec<Batch> = (0..UPDATES / per_tick)
             .map(|t| {
                 let rows: Vec<_> = (t * per_tick..(t + 1) * per_tick).flat_map(update).flatten().collect();
@@ -64,7 +57,7 @@ fn table_ingest_bench() {
             rows * 32 > tier || tier == DEFAULT_RAM_TIER_BYTES,
             "{label}: fits the tier"
         );
-        assert_eq!(!table_shards(&table).is_empty(), spills, "{label}: spilled");
+        assert!(table_shards(&table).is_empty(), "{label}: spilled");
         println!(
             "table_ingest_bench {label:<44} {:8.1} instr/row",
             instructions as f64 / rows as f64
