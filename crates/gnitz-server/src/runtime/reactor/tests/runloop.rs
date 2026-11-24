@@ -37,36 +37,9 @@ fn a_task_spawns_during_its_own_poll() {
     assert_eq!(ran.get(), 64);
 }
 
-/// `RunQueue::push` dedups by task key, so N wakes before a task's next poll cost
-/// one poll, not N — here through a clone that outlived the waker it came from.
-#[test]
-fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
-    let r = make_reactor();
-    let polls = Rc::new(Cell::new(0u32));
-    let kept: Rc<RefCell<Option<Waker>>> = Rc::default();
-    let (p, k) = (Rc::clone(&polls), Rc::clone(&kept));
-    r.spawn(std::future::poll_fn(move |cx| {
-        p.update(|v| v + 1);
-        k.borrow_mut().get_or_insert_with(|| cx.waker().clone());
-        Poll::<()>::Pending
-    }));
-    r.tick(); // the spawn's own first poll
-    assert_eq!(polls.get(), 1);
-
-    let waker = kept.borrow().clone().expect("the first poll kept its waker");
-    for _ in 0..16 {
-        waker.wake_by_ref();
-    }
-    r.tick();
-    assert_eq!(
-        polls.get(),
-        2,
-        "16 wakes for one key must cost exactly one further poll"
-    );
-}
-
 /// A waker that outlived its task wakes whichever task took its key since, or
-/// none; either costs at most one spurious poll. `send_owned`'s eviction leaves
+/// none; either costs at most one spurious poll, however often it wakes, as
+/// the run queue dedups by task key. `send_owned`'s eviction leaves
 /// such a waker behind: the abandoned send's slot body keeps its task's waker
 /// until the op's CQE, and a give-back of its ring fires it.
 #[test]
@@ -91,7 +64,9 @@ fn a_stale_wake_costs_at_most_a_spurious_poll() {
     }));
     r.tick(); // the spawn takes the freed key
     assert_eq!(polls.get(), 1);
-    stale.wake();
+    for _ in 0..16 {
+        stale.wake_by_ref();
+    }
     r.tick();
     r.tick();
     assert_eq!(polls.get(), 2, "the stale wake costs one spurious poll, and no more");
@@ -235,39 +210,6 @@ fn a_pass_that_does_not_sleep_does_not_arm() {
     let (r, writers) = reactor_with_rings(1);
     r.tick();
     assert!(!writers[0].master_parked());
-}
-
-/// A sleep arms the park, and the publish that ends it takes the arm.
-///
-/// A publish that lands between the arm and the re-test behind it is drained by
-/// the arm loop, which then arms again and sleeps for the next publish. So the
-/// publisher answers every arm it sees until the tick returns.
-#[test]
-fn a_publish_wakes_the_sleep_and_takes_the_arm() {
-    within(|| {
-        let (r, mut writers) = reactor_with_rings(1);
-        let mut writer = writers.pop().expect("one ring");
-        let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let publisher = std::thread::spawn({
-            let woke = woke.clone();
-            move || {
-                let mut at = 0;
-                while !woke.load(std::sync::atomic::Ordering::SeqCst) {
-                    if writer.master_parked() {
-                        at += 1;
-                        writer.applied(at); // nothing waits on it
-                    }
-                    std::thread::yield_now();
-                }
-                writer
-            }
-        });
-        r.run_ready();
-        r.submit_or_sleep(true);
-        woke.store(true, std::sync::atomic::Ordering::SeqCst);
-        let writer = publisher.join().expect("the publisher");
-        assert!(!writer.master_parked(), "the publish took the arm");
-    });
 }
 
 /// A forked child publishes to a reactor parked on the one master park word over

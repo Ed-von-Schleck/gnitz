@@ -939,8 +939,6 @@ impl Peer {
     /// W2M slot whose ring was given back; the last is sent with `body`
     /// dropped. Waits out the [`fence`](Self::fence) first.
     async fn send_raw(&self, mut body: SendBody) -> Result<(), PeerGone> {
-        #[cfg(test)]
-        SENDS.update(|n| n + 1);
         if let Some((level, at)) = &self.fence
             && level.get() < *at
         {
@@ -984,12 +982,6 @@ impl Peer {
     pub(crate) fn abort(&self) {
         self.conn.fail();
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Calls of `send_raw` on this thread.
-    static SENDS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(test)]

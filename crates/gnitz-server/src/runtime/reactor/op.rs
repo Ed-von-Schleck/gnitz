@@ -41,6 +41,12 @@ impl Ops {
         self.slots.borrow().len()
     }
 
+    /// Ops pushed so far.
+    #[cfg(test)]
+    pub(super) fn pushed(&self) -> u64 {
+        self.pushed.get()
+    }
+
     /// The CQE of the op `user_data` names came, with `res`.
     pub(super) fn complete(&self, user_data: u64, res: i32) {
         let slot = (user_data & OP_SLOT_MASK) as usize;

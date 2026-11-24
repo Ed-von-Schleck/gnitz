@@ -52,6 +52,14 @@ impl W2mWriter {
         self.send_msg(id, &msg);
         gnitz_wire::framed(&msg.encode_to_vec())
     }
+
+    /// Publish one frame whose blob is `pad` patterned bytes, and read it back
+    /// off `receiver`, as this writer's ring `worker`, as a slot.
+    pub(crate) fn publish_slot(&mut self, receiver: &W2mReceiver, worker: usize, pad: usize) -> W2mSlot {
+        let blob: Vec<u8> = (0..pad).map(|i| (i % 251) as u8).collect();
+        self.send_msg(id(1), &WireMsg { blob: &blob, ..Default::default() });
+        receiver.try_read_slot(worker).expect("a frame")
+    }
 }
 
 impl W2mReceiver {
@@ -69,19 +77,21 @@ impl W2mReceiver {
         self.header(worker).write.load(Ordering::Acquire)
     }
 
+    /// Every frame `worker` has published is released.
+    pub(crate) fn released(&self, worker: usize) -> bool {
+        self.release_cursor(worker) == self.write_cursor(worker)
+    }
+
     /// The publishes that took the master's arm, each one `FUTEX_WAKE`.
     pub(crate) fn wakes(&self) -> u64 {
         self.master.value()
     }
 }
 
-/// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
-/// slot.
+/// A fresh ring holding one frame [`W2mWriter::publish_slot`] publishes, read
+/// back as a slot.
 pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
     let (mut writers, receiver) = test_rings(1, 256 * 1024);
-    let text = vec![0x42u8; pad];
-    let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
-    writers[0].send_msg(id(1), &msg);
-    let slot = receiver.try_read_slot(0).expect("a frame");
+    let slot = writers[0].publish_slot(&receiver, 0, pad);
     (receiver, slot)
 }

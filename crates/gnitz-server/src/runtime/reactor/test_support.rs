@@ -9,7 +9,9 @@ use super::op::Op;
 use super::*;
 use crate::runtime::park::WorkerSet;
 pub(super) use crate::runtime::sync::{Either, oneshot, select2};
-pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within, yield_once};
+pub(super) use crate::runtime::test_support::{
+    read_nonblocking, spawn_drain, spawn_read, try_poll_once, within, yield_once,
+};
 use crate::runtime::w2m::W2mWriter;
 pub(super) use crate::runtime::w2m::fixtures::ring_slot;
 use crate::runtime::w2m::fixtures::test_rings;
@@ -37,8 +39,8 @@ pub(super) fn make_reactor_with(limits: Limits) -> Reactor {
     Reactor::new(limits, test_rings(1, 64 * 1024).1).expect("reactor")
 }
 
-/// The drivers every reactor suite runs on. An inherent impl here rather than in
-/// `runloop`, so production code carries no test-only method.
+/// The drivers every reactor suite runs on, kept here so `runloop` carries no
+/// test-only method.
 impl Reactor {
     /// Tick until no task is left. Bounded as [`poll_until`] is: the tests that
     /// use this guard against lost wakes and lock deadlocks, which an unbounded

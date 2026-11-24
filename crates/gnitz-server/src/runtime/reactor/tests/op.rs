@@ -1,13 +1,12 @@
 //! One-shot ops: the slot an op's CQE and its awaiter meet in, freed by the
-//! later of the two, and `fsync`, which submits at its first poll and yields
-//! its CQE.
+//! later of the two; `fsync`, which submits at its first poll; and `read`.
 
+use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
-use crate::runtime::signals::Signals;
 
 /// `fsync` submits its SQE at its first poll, so its CQE arrives with no tick
 /// driven, and resolves to the CQE `res` verbatim: 0, or a socket's `-EINVAL`.
@@ -47,52 +46,38 @@ fn a_reused_slot_gives_its_next_op_another_id() {
     r.block_on(second);
 }
 
-/// Submit what is queued, then dispatch every CQE that arrived.
-fn complete_queued(r: Reactor) {
+/// An op dropped before its CQE leaves what its SQE names in its slot until
+/// the CQE, which frees both; an op dropped after its CQE frees its slot in
+/// the drop.
+#[test]
+fn a_dropped_op_keeps_its_carry_until_its_cqe() {
+    let r = make_reactor();
+    let carry = Rc::new(());
+    // SAFETY: the SQE names no memory.
+    drop(unsafe { r.push_op(opcode::Nop::new().build(), Rc::clone(&carry)) });
+    let done = nop(r);
+    assert_eq!(
+        (Rc::strong_count(&carry), r.ops.len()),
+        (2, 2),
+        "the slot keeps the abandoned carry"
+    );
     r.submit();
     r.run_ready();
+    assert_eq!(
+        (Rc::strong_count(&carry), r.ops.len()),
+        (1, 1),
+        "its CQE frees it; the other's result waits"
+    );
+    drop(done);
+    assert_eq!(r.ops.len(), 0, "the drop frees the completed slot");
 }
 
-/// An op dropped before its CQE keeps its slot until the CQE, which frees it;
-/// the freed slot serves the next op.
+/// `read` fills its buffer from the fd and hands it back with the CQE `res`.
 #[test]
-fn an_op_dropped_before_its_cqe_is_freed_by_the_cqe() {
+fn read_fills_its_buffer_and_yields_the_cqe_res() {
     let r = make_reactor();
-    drop(nop(r));
-    assert_eq!(r.ops.len(), 1, "the slot outlives its dropped awaiter");
-    complete_queued(r);
-    assert_eq!(r.ops.len(), 0, "the CQE freed the abandoned slot");
-    assert_eq!(r.block_on(nop(r)).0, 0);
-    assert_eq!(r.ops.len(), 0);
-}
-
-/// An op whose CQE came after its one pending poll, and which is then dropped
-/// unpolled, frees its slot in the drop; the freed slot serves the next op.
-#[test]
-fn an_op_dropped_after_its_cqe_frees_its_slot() {
-    let r = make_reactor();
-    let mut op = nop(r);
-    assert!(try_poll_once(&mut op).is_none());
-    complete_queued(r);
-    assert_eq!(r.ops.len(), 1, "the CQE leaves the result in the slot");
-    drop(op);
-    assert_eq!(r.ops.len(), 0, "the drop freed the completed slot");
-    assert_eq!(r.block_on(nop(r)).0, 0);
-    assert_eq!(r.ops.len(), 0);
-}
-
-/// `read` of the master's signalfd yields a signal the reading thread holds
-/// blocked: the signal is dequeued from the thread that submitted the read.
-#[test]
-fn read_takes_a_blocked_signal_off_a_signalfd() {
-    within(|| {
-        let r = make_reactor();
-        // Masks the signals on this thread alone, which the signal is sent to,
-        // so no other thread can take it.
-        let mut signals = Signals::open();
-        let mut next = std::pin::pin!(signals.next(r));
-        assert!(try_poll_once(next.as_mut()).is_none(), "no signal yet");
-        assert_eq!(unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGHUP) }, 0);
-        assert_eq!(r.block_on(next), libc::SIGHUP);
-    });
+    let (rd, wr) = std::io::pipe().expect("pipe");
+    (&wr).write_all(b"bytes").expect("write");
+    let (res, buf) = r.block_on(r.read(leaked(OwnedFd::from(rd)), vec![0; 16].into()));
+    assert_eq!((res, &buf[..5]), (5, &b"bytes"[..]));
 }

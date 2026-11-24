@@ -125,6 +125,16 @@ pub(crate) fn spawn_drain(s: UnixStream, expect: usize) -> std::thread::JoinHand
     std::thread::spawn(move || std::io::copy(&mut (&s).take(expect as u64), &mut std::io::sink()).expect("drain"))
 }
 
+/// Read exactly `n` bytes off `s` on a thread of their own, for a send too
+/// large for the socket buffers to finish unread.
+pub(crate) fn spawn_read(s: UnixStream, n: usize) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut wire = vec![0u8; n];
+        (&s).read_exact(&mut wire).expect("read");
+        wire
+    })
+}
+
 /// One non-blocking read of up to `cap` bytes off `s`: empty at EOF, `None` when
 /// nothing is readable yet. `s` stays blocking for its other readers.
 pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {

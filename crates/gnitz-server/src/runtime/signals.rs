@@ -101,3 +101,7 @@ pub(super) fn detach_worker(master_pid: i32) {
     // pending even while ignored, so unblocking lets the kernel discard it.
     mask(libc::SIG_UNBLOCK, &sigs);
 }
+
+#[cfg(test)]
+#[path = "tests/signals.rs"]
+mod tests;

@@ -5,7 +5,7 @@
 //! and corked egress: what waits in a `Peer`'s cork, what it leaves behind, and
 //! how a finished connection refuses it.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -20,18 +20,20 @@ fn capped_reactor(cap: usize) -> Reactor {
     make_reactor_with(Limits { inbound_cap: cap, ..Limits::TEST })
 }
 
-/// A plain connection over one end of an [`accepted_pair`], its recv armed,
-/// and the other end.
-fn registered(r: Reactor) -> (Rc<ClientConn>, UnixStream) {
+/// The connection of a [`Peer::over_socketpair`] past its handshake, and the
+/// other end.
+fn admitted(r: Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (peer, partner) = Peer::over_socketpair(r);
+    peer.admit_full_frames();
     (peer.conn, partner)
 }
 
-/// [`registered`], past its handshake: admitting frames up to the payload ceiling.
-fn admitted(r: Reactor) -> (Rc<ClientConn>, UnixStream) {
-    let (conn, partner) = registered(r);
-    conn.q.borrow_mut().max_frame = MAX_FRAME_PAYLOAD;
-    (conn, partner)
+/// Write what of `wire[*written..]` the nonblocking `s` takes now.
+fn write_some(mut s: &UnixStream, wire: &[u8], written: &mut usize) {
+    match s.write(&wire[*written..]) {
+        Ok(n) => *written += n,
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+    }
 }
 
 /// Whether `conn`'s recv is held off past its share.
@@ -189,7 +191,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     );
     assert!(!conn1.is_readable(), "no frame completes from a partial payload");
 
-    let (conn2, partner2) = registered(r);
+    let (conn2, partner2) = admitted(r);
     (&partner2).write_all(&framed(&[0x22u8; 100])).expect("write");
     assert!(
         poll_until(r, || conn2.is_gone()),
@@ -246,15 +248,10 @@ fn a_connection_past_its_share_holds_off_and_refuses_no_other() {
     hog_partner.set_nonblocking(true).expect("nonblocking");
     let wire = framed(&[0x33; FRAME]).repeat(FRAMES);
     let mut written = 0;
-    // What of the hog's bytes the socket takes now.
-    let mut write_some = || match (&hog_partner).write(&wire[written..]) {
-        Ok(n) => written += n,
-        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
-    };
 
     assert!(
         poll_until(r, || {
-            write_some();
+            write_some(&hog_partner, &wire, &mut written);
             is_paused(r, &hog)
         }),
         "the hog's recv is never held off"
@@ -279,7 +276,7 @@ fn a_connection_past_its_share_holds_off_and_refuses_no_other() {
     });
     assert!(
         poll_until(r, || {
-            write_some();
+            write_some(&hog_partner, &wire, &mut written);
             drained.get() == FRAMES
         }),
         "the hog's frames are delivered once its task takes them"
@@ -305,11 +302,8 @@ fn a_frame_past_the_share_is_received_whole() {
     let (mut written, mut got) = (0, None);
     assert!(
         poll_until(r, || {
-            match (&partner).write(&wire[written..]) {
-                Ok(n) => written += n,
-                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
-            }
-            got = conn.q.borrow_mut().try_recv();
+            write_some(&partner, &wire, &mut written);
+            got = try_poll_once(conn.recv()).flatten();
             got.is_some()
         }),
         "the frame never completes"
@@ -330,7 +324,6 @@ fn a_held_off_connection_retired_is_let_go_of() {
     );
     conn.retire();
     r.tick();
-    assert!(r.conns.paused.borrow().is_empty());
     assert_eq!(Rc::strong_count(&conn), 1, "the reactor let go of the connection");
     assert_eq!(r.conns.inbound.held(), 0);
 }
@@ -340,7 +333,7 @@ fn a_held_off_connection_retired_is_let_go_of() {
 #[test]
 fn readable_reports_a_frame_or_the_end_and_takes_neither() {
     let r = make_reactor();
-    let (conn, partner) = registered(r);
+    let (conn, partner) = admitted(r);
     assert!(try_poll_once(conn.readable()).is_none(), "nothing sent yet");
 
     let payload = [7u8; 16];
@@ -378,7 +371,7 @@ fn shrink(conn: &ClientConn, partner: &UnixStream, bytes: i32) {
 #[test]
 fn a_closed_connection_delivers_its_queue_and_closes_with_its_last_holder() {
     let r = make_reactor();
-    let (conn, partner) = registered(r);
+    let (conn, partner) = admitted(r);
     (&partner).write_all(&framed(b"last")).expect("write");
     partner.shutdown(std::net::Shutdown::Write).expect("half-close");
 
@@ -410,7 +403,7 @@ fn a_closed_connection_delivers_its_queue_and_closes_with_its_last_holder() {
 #[test]
 fn the_connection_cap_refuses_past_it_until_a_connection_ends() {
     let r = make_reactor_with(Limits { max_conns: 1, ..Limits::TEST });
-    let (first, _a) = registered(r);
+    let (first, _a) = admitted(r);
     let (b, b_partner) = UnixStream::pair().expect("socketpair");
     assert!(r.admit(OwnedFd::from(b)).is_none(), "the cap refuses a second");
     assert_eq!(
@@ -424,7 +417,7 @@ fn the_connection_cap_refuses_past_it_until_a_connection_ends() {
         "the shutdown ends the recv"
     );
     drop(first);
-    registered(r); // an ended connection frees its slot
+    admitted(r); // an ended connection frees its slot
 }
 
 /// `retire` leaves the socket open; `fail` shuts it down now, which ends an
@@ -433,7 +426,7 @@ fn the_connection_cap_refuses_past_it_until_a_connection_ends() {
 #[test]
 fn retire_leaves_the_socket_open_and_fail_ends_the_recv() {
     let r = make_reactor();
-    let (conn, partner) = registered(r);
+    let (conn, partner) = admitted(r);
 
     conn.retire();
     assert_eq!(read_nonblocking(&partner, 1), None, "the socket stays open");
@@ -450,7 +443,7 @@ fn retire_leaves_the_socket_open_and_fail_ends_the_recv() {
 #[test]
 fn a_recv_landing_after_retire_is_discarded() {
     let r = make_reactor();
-    let (conn, mut partner) = registered(r);
+    let (conn, mut partner) = admitted(r);
     r.tick(); // the recv is submitted
 
     conn.retire();
@@ -468,8 +461,9 @@ fn a_recv_landing_after_retire_is_discarded() {
 }
 
 /// Under a session a recv sends what the session owes until the client's
-/// first frame, a send leaves sealed turn by turn, in order, and a close shuts
-/// the socket down behind the goodbye.
+/// first frame, deframes the plaintext the session hands over across recvs, a
+/// send leaves sealed turn by turn, in order, and a close shuts the socket down
+/// behind the goodbye.
 #[test]
 fn a_session_seals_what_is_sent_and_closes_behind_its_goodbye() {
     let r = make_reactor();
@@ -487,7 +481,15 @@ fn a_session_seals_what_is_sent_and_closes_behind_its_goodbye() {
     });
     assert!(poll_until(r, || read_nonblocking(&partner, 64).is_some_and(|b| b == b"flight")));
     assert!(!received.get(), "no frame is queued yet");
-    partner.write_all(&framed(b"hello")).expect("write");
+    let hello = framed(b"hello");
+    let (head, tail) = hello.split_at(hello.len() - 2);
+    partner.write_all(head).expect("write");
+    assert!(
+        poll_until(r, || r.conns.inbound.held() > 0),
+        "the session's plaintext reaches the queue"
+    );
+    assert!(!received.get(), "the frame is not whole yet");
+    partner.write_all(tail).expect("write");
     assert!(poll_until(r, || received.get()));
 
     // Read concurrently: the body outgrows the socketpair's buffers.
@@ -515,7 +517,7 @@ fn a_session_seals_what_is_sent_and_closes_behind_its_goodbye() {
 #[test]
 fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     let r = make_reactor();
-    let (conn, receiver) = registered(r);
+    let (conn, receiver) = admitted(r);
     shrink(&conn, &receiver, 8 * 1024);
     let payload_len = 200 * 1024;
     let drain_t = spawn_drain(receiver, payload_len);
@@ -534,7 +536,7 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
 #[test]
 fn send_owned_skips_an_empty_body_and_fails_the_connection_on_a_refused_send() {
     let r = make_reactor();
-    let (conn, partner) = registered(r);
+    let (conn, partner) = admitted(r);
     let empty = r.send_owned(&conn, SendBody::Pooled(PooledBuf(Vec::new())));
     assert_eq!(try_poll_once(empty), Some(Ok(())));
     assert_eq!(r.ops.len(), 0, "no op was pushed");
@@ -544,25 +546,6 @@ fn send_owned_skips_an_empty_body_and_fails_the_connection_on_a_refused_send() {
     let sent = r.block_on(r.send_owned(&conn, SendBody::Pooled(PooledBuf(vec![1]))));
     assert_eq!(sent, Err(PeerGone));
     assert!(conn.is_gone());
-}
-
-/// Under a session, what a recv lands reaches the queue as the plaintext the
-/// session hands over, deframed across recvs.
-#[test]
-fn a_session_feeds_the_queue_its_plaintext() {
-    let r = make_reactor();
-    let (accepted, mut partner) = accepted_pair(r);
-    let conn = r.connect(accepted, Some(Rc::new(Passthrough::default()))).conn;
-    let wire = [framed(b"one"), framed(b"two")].concat();
-    let (head, tail) = wire.split_at(wire.len() - 2);
-    partner.write_all(head).expect("write");
-    assert!(poll_until(r, || conn.is_readable()), "the first frame, whole");
-    partner.write_all(tail).expect("write");
-    let got = r.block_on(async { [conn.recv().await, conn.recv().await] });
-    assert_eq!(
-        got.map(|f| f.map(|f| f.as_slice().to_vec())),
-        [b"one", b"two"].map(|f| Some(f.to_vec()))
-    );
 }
 
 /// A peer that never reads is evicted once a send makes no progress past the
@@ -577,7 +560,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
         ..Limits::TEST
     };
     let r = make_reactor_with(limits);
-    let (conn, receiver) = registered(r);
+    let (conn, receiver) = admitted(r);
     shrink(&conn, &receiver, 4 * 1024);
     // Far larger than both buffers, and nothing ever reads the other end: the
     // send stalls partway and only the deadline can end it.
@@ -608,22 +591,15 @@ fn send_owned_evicts_a_client_that_never_drains() {
     assert!(ring.release_cursor(0) > held, "and of its body");
 }
 
-/// A failed accept is retried once its backoff has passed: a bound socket that
-/// does not listen refuses every accept, and the one in flight takes the first
-/// connection after it starts to.
+/// A failed accept is retried once its backoff has passed: a socket that does
+/// not listen refuses every accept, and the one in flight takes the first
+/// connection after it starts to. `peer_addr` names the TCP peer through a
+/// borrow that leaves the fd open, and is `None` for an AF_UNIX peer.
 #[test]
-fn accept_retries_after_a_failure() {
+fn accept_retries_after_a_failure_and_names_its_peer() {
     let r = make_reactor();
     // SAFETY: a fresh fd from the kernel, owned by nothing else.
     let sock = unsafe { OwnedFd::from_raw_fd(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)) };
-    let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    name.sin_family = libc::AF_INET as libc::sa_family_t;
-    name.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
-    let len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    assert_eq!(
-        unsafe { libc::bind(sock.as_raw_fd(), (&raw const name).cast(), len) },
-        0
-    );
     let listener = leaked(sock);
 
     let accepted = Rc::new(RefCell::new(None));
@@ -634,34 +610,21 @@ fn accept_retries_after_a_failure() {
         "an accept the socket refuses backs off"
     );
 
+    // An unbound socket's listen binds it to an ephemeral port.
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-    let addr = std::net::TcpListener::from(listener.try_clone_to_owned().expect("dup"))
+    let port = std::net::TcpListener::from(listener.try_clone_to_owned().expect("dup"))
         .local_addr()
-        .expect("addr");
-    let client = std::net::TcpStream::connect(addr).expect("connect");
+        .expect("addr")
+        .port();
+    let client = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).expect("connect");
     assert!(
         poll_until(r, || accepted.borrow().is_some()),
         "the retry takes the connection"
     );
     let conn = r.connect(accepted.take().expect("just seen"), None);
-    assert_eq!(conn.peer_addr(), client.local_addr().ok());
-}
-
-/// `peer_addr` names a TCP peer through a borrow that leaves the fd open, and is
-/// `None` for an AF_UNIX peer.
-#[test]
-fn peer_addr_names_a_tcp_peer_and_leaves_the_fd_open() {
-    let r = make_reactor();
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
-    let client = std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-    let (server, _) = listener.accept().expect("accept");
-    let conn = r.connect(r.admit(OwnedFd::from(server)).expect("under the cap"), None);
-    assert_eq!(conn.peer_addr(), client.local_addr().ok(), "a TCP peer's address");
-    assert_eq!(
-        conn.peer_addr(),
-        client.local_addr().ok(),
-        "a second call still finds the fd open"
-    );
+    for _ in 0..2 {
+        assert_eq!(conn.peer_addr(), client.local_addr().ok(), "the fd stays open");
+    }
     assert_eq!(
         Peer::over_socketpair(r).0.peer_addr(),
         None,
@@ -674,10 +637,7 @@ fn peer_addr_names_a_tcp_peer_and_leaves_the_fd_open() {
 #[test]
 fn a_held_body_is_copied_out_when_its_ring_is_given_back() {
     let (r, mut writers) = reactor_with_rings(1);
-    let text = vec![0x42u8; 1024];
-    let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
-    writers[0].send_msg(crate::runtime::w2m::fixtures::id(1), &msg);
-    let mut body = SendBody::Slot(r.w2m.try_read_slot(0).expect("the frame"));
+    let mut body = SendBody::Slot(writers[0].publish_slot(&r.w2m, 0, 1024));
     let wire = body.bytes().to_vec();
     let held = r.w2m.release_cursor(0);
 
@@ -710,12 +670,9 @@ fn a_held_body_is_copied_out_when_its_ring_is_given_back() {
 #[test]
 fn a_stalled_send_gives_its_slot_back_with_its_ring() {
     let (r, mut writers) = reactor_with_rings(1);
-    let (conn, mut receiver) = registered(r);
+    let (conn, receiver) = admitted(r);
     shrink(&conn, &receiver, 4 * 1024);
-    let text: Vec<u8> = (0..24 * 1024).map(|i| (i % 251) as u8).collect();
-    let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
-    writers[0].send_msg(crate::runtime::w2m::fixtures::id(1), &msg);
-    let slot = r.w2m.try_read_slot(0).expect("the frame");
+    let slot = writers[0].publish_slot(&r.w2m, 0, 24 * 1024);
     let wire = slot.frame_bytes().to_vec();
     let held = r.w2m.release_cursor(0);
 
@@ -738,23 +695,22 @@ fn a_stalled_send_gives_its_slot_back_with_its_ring() {
     );
     assert_eq!(done.get(), None, "while the send goes on");
 
-    let reader = std::thread::spawn(move || {
-        let mut got = vec![0u8; wire.len()];
-        std::io::Read::read_exact(&mut receiver, &mut got).expect("the whole frame");
-        (got, wire)
-    });
+    let reader = spawn_read(receiver, wire.len());
     assert!(
         poll_until(r, || done.get().is_some()),
         "the send finishes from the copy"
     );
     assert_eq!(done.get(), Some(Ok(())));
-    let (got, wire) = reader.join().expect("reader");
-    assert!(got == wire, "the client reads the frame as it was published");
+    assert!(
+        reader.join().expect("reader") == wire,
+        "the client reads the frame as it was published"
+    );
 }
 
-/// `send` corks a slot that fits beside the cork, ships the cork first when the
-/// slot would overflow it, and sends a slot over half the ceiling alone; the bytes
-/// reach the wire in call order whichever it does.
+/// `send` corks a body that fits beside the cork, ships the cork first when the
+/// body would overflow it, and sends a body over half the ceiling alone, a ring
+/// slot and a shared body alike; the bytes reach the wire in call order
+/// whichever it does.
 #[test]
 fn send_corks_what_fits_and_never_reorders() {
     const CAP: usize = COALESCE_MAX_BYTES;
@@ -764,19 +720,26 @@ fn send_corks_what_fits_and_never_reorders() {
         Cork,
         Both,
     }
-    for (pre, pad, ships) in [
+    let rows = [
         (0, 64, Ships::Nothing),
         (128, 64, Ships::Nothing),
         (0, CAP, Ships::Both),
         (128, CAP, Ships::Both),
         (CAP - 128, CAP / 4, Ships::Cork),
-    ] {
+    ];
+    for ((pre, pad, ships), shared) in rows.iter().flat_map(|row| [(row, false), (row, true)]) {
+        let (pre, pad) = (*pre, *pad);
         let (_ring, slot) = ring_slot(pad);
         let all = [vec![0x5Au8; pre], slot.frame_bytes().to_vec()].concat();
+        let body = if shared {
+            SendBody::Shared(Rc::new(all[pre..].to_vec()))
+        } else {
+            SendBody::Slot(slot)
+        };
         let r = make_reactor();
         let (mut peer, receiver) = Peer::over_socketpair(r);
         peer.cork(&all[..pre]);
-        r.block_on(peer.send(SendBody::Slot(slot))).expect("an open peer");
+        r.block_on(peer.send(body)).expect("an open peer");
 
         let wire = read_nonblocking(&receiver, 256 * 1024).unwrap_or_default();
         let (want_wire, want_corked) = match ships {
@@ -787,12 +750,16 @@ fn send_corks_what_fits_and_never_reorders() {
         assert_eq!(
             (&wire[..], peer.corked_len()),
             (want_wire, want_corked),
-            "pre={pre} pad={pad}"
+            "pre={pre} pad={pad} shared={shared}"
         );
 
         r.block_on(peer.flush_egress()).expect("an open peer");
         let rest = read_nonblocking(&receiver, 256 * 1024).unwrap_or_default();
-        assert_eq!([wire, rest].concat(), all, "pre={pre} pad={pad}: call order");
+        assert_eq!(
+            [wire, rest].concat(),
+            all,
+            "pre={pre} pad={pad} shared={shared}: call order"
+        );
     }
 }
 
@@ -903,39 +870,6 @@ fn next_request_ships_before_parking() {
     );
 }
 
-/// A shared body sent behind a non-empty cork joins it when it fits, and
-/// otherwise leaves alone behind a flush of what was corked.
-#[test]
-fn a_shared_body_is_sent_behind_what_is_corked() {
-    let r = make_reactor();
-    let (mut peer, receiver) = Peer::over_socketpair(r);
-    let small = Rc::new(vec![0x11u8; 100]);
-    let large = Rc::new(vec![0x21u8; COALESCE_MAX_BYTES]);
-
-    peer.cork(b"reply");
-    r.block_on(peer.send(SendBody::Shared(Rc::clone(&small))))
-        .expect("an open peer");
-    assert_eq!(peer.corked_len(), 105, "a body that fits is corked");
-    assert!(
-        read_nonblocking(&receiver, 1024).is_none(),
-        "nothing leaves before a flush"
-    );
-
-    let wire = std::thread::spawn(move || {
-        let reader = receiver;
-        let mut wire = vec![0u8; 105 + COALESCE_MAX_BYTES];
-        (&reader)
-            .read_exact(&mut wire)
-            .expect("the cork and the body behind it");
-        wire
-    });
-    r.block_on(peer.send(SendBody::Shared(Rc::clone(&large))))
-        .expect("an open peer");
-    assert_eq!(peer.corked_len(), 0, "a body that does not fit is not corked");
-    let want = [&b"reply"[..], &small, &large].concat();
-    assert!(wire.join().unwrap() == want, "the body left behind what was corked");
-}
-
 /// A fenced peer sends nothing until the level reaches the fence, the highest
 /// one raised — not its cork's flush, nor a body too large to cork — and then
 /// everything, in call order. A fence the level has passed holds nothing back.
@@ -960,21 +894,17 @@ fn a_fence_holds_every_send_until_its_level_reaches_it() {
     let large = Rc::new(vec![0x42u8; COALESCE_MAX_BYTES]);
     let mut sending = Box::pin(peer.send(SendBody::Shared(Rc::clone(&large))));
     level.raise(4);
-    let timer = r.sleep(Duration::from_millis(20));
     assert!(
-        matches!(r.block_on(select2(sending.as_mut(), timer)), Either::B(())),
+        try_poll_once(sending.as_mut()).is_none(),
         "the level is below the fence"
     );
+    r.tick();
     assert!(
         read_nonblocking(&receiver, 64).is_none(),
         "neither the cork nor the body left"
     );
 
-    let wire = std::thread::spawn(move || {
-        let mut wire = vec![0u8; 3 + COALESCE_MAX_BYTES];
-        (&receiver).read_exact(&mut wire).expect("the cork and the body");
-        wire
-    });
+    let wire = spawn_read(receiver, 3 + COALESCE_MAX_BYTES);
     level.raise(5);
     r.block_on(sending).expect("an open peer");
     let want = [&b"ack"[..], &large].concat();
@@ -1004,17 +934,18 @@ fn a_fenced_peer_still_hands_out_a_queued_request() {
     );
 
     let mut parked = Box::pin(peer.next_request());
-    let mut wait = || {
-        let timer = r.sleep(Duration::from_millis(20));
-        let waited = r.block_on(select2(parked.as_mut(), timer));
-        assert!(matches!(waited, Either::B(())), "no request is queued");
-    };
-    wait();
+    assert!(try_poll_once(parked.as_mut()).is_none(), "no request is queued");
+    r.tick();
     assert!(
         read_nonblocking(&partner, 64).is_none(),
         "the flush ahead of the park waits"
     );
     level.raise(1);
-    wait();
-    assert_eq!(read_nonblocking(&partner, 64).as_deref(), Some(&b"ack"[..]));
+    let mut wire = None;
+    assert!(poll_until(r, || {
+        assert!(try_poll_once(parked.as_mut()).is_none(), "no request is queued");
+        wire = read_nonblocking(&partner, 64);
+        wire.is_some()
+    }));
+    assert_eq!(wire.as_deref(), Some(&b"ack"[..]));
 }

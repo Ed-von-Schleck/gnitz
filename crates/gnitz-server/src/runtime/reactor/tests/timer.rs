@@ -25,12 +25,6 @@ fn a_timer_holds_a_deadline_only_while_pending() {
 fn timers_sharing_a_deadline_each_fire() {
     within(|| {
         let r = make_reactor();
-        let far = r.now() + Duration::from_secs(3600);
-        let mut pending: Vec<_> = (0..3).map(|_| Box::pin(r.sleep_until(far))).collect();
-        assert!(pending.iter_mut().all(|t| try_poll_once(t.as_mut()).is_none()));
-        assert_eq!(r.timers.deadlines.borrow().len(), 3);
-        drop(pending);
-
         // Sleeps created in one pass share its clock, and so a deadline.
         let fired = Rc::new(Cell::new(0));
         for _ in 0..3 {

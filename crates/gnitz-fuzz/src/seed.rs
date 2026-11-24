@@ -82,9 +82,9 @@ impl Seeds {
     }
 }
 
-/// The one access token the in-process HELLO target's server holds, in the
-/// minted shape; the HELLO starts carry it, so an input can be admitted.
+/// The access token the HELLO starts carry, in the minted shape.
 pub const HELLO_TOKEN: &str = "gnitz_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const _: () = assert!(HELLO_TOKEN.len() <= gnitz_wire::MAX_TOKEN_BYTES);
 
 /// Write every target's starting inputs for `seeds` into `starts/<target>`:
 /// one per seed for the traffic targets, every expression program the seeds

@@ -1,4 +1,4 @@
-use std::io::Read;
+use crate::runtime::test_support::spawn_read;
 
 use super::*;
 use crate::runtime::reactor::test_support::make_reactor;
@@ -25,11 +25,7 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
     assert_eq!(subs.out.unsynced(), queued);
 
     peer.cork(b"reply");
-    let wire = std::thread::spawn(move || {
-        let mut wire = vec![0u8; 5 + queued];
-        (&receiver).read_exact(&mut wire).expect("the reply and every train");
-        wire
-    });
+    let wire = spawn_read(receiver, 5 + queued);
     r.block_on(async {
         subs.ship(&mut peer).await.expect("an open peer");
         peer.flush_egress().await.expect("an open peer");
@@ -66,11 +62,7 @@ fn a_second_ship_sends_only_the_trains_queued_since() {
     assert!(subs.out.is_empty());
     subs.out.send(9, id(3), Rc::new(vec![0x31; 30]));
     let len = 3 * HEAD_FRAME_BYTES + 60;
-    let wire = std::thread::spawn(move || {
-        let mut wire = vec![0u8; len];
-        (&receiver).read_exact(&mut wire).expect("every train");
-        wire
-    });
+    let wire = spawn_read(receiver, len);
     r.block_on(async {
         subs.ship(&mut peer).await.expect("an open peer");
         peer.flush_egress().await.expect("an open peer");

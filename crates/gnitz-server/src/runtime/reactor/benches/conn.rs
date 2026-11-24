@@ -1,12 +1,46 @@
+use gnitz_foundation::perf::{Counters, Event};
+
 use super::*;
 use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::test_support::spawn_drain;
-use std::time::{Duration, Instant};
 
-/// W frames as W sends versus `Peer` corking them into one send, by frame
-/// size: the trade `COALESCE_MAX_BYTES` is set from. Wall clock, because the
-/// sends a cork saves are kernel work that an instruction count of this thread
-/// leaves out; only the ratio is meaningful.
+/// The cost on the reactor thread of the two arms of `round`, `false` and
+/// `true`, each run `rounds` times, the arm that goes first alternating:
+/// `[arm][kernel sends, user instr, user+kernel instr, user+kernel cycles]`.
+fn cost_of_arms(r: Reactor, rounds: usize, mut round: impl AsyncFnMut(bool)) -> [[u64; 4]; 2] {
+    let counters = Counters::open([
+        Event::INSTRUCTIONS,
+        Event::INSTRUCTIONS.with_kernel(),
+        Event::CYCLES.with_kernel(),
+    ]);
+    let mut cost = [[0u64; 4]; 2];
+    for i in 0..2 * rounds {
+        let arm = matches!(i % 4, 1 | 2);
+        let before = r.ops.pushed();
+        let ((), counted) = counters.measure(|| r.block_on(round(arm)));
+        let c = &mut cost[usize::from(arm)];
+        c[0] += r.ops.pushed() - before;
+        for (c, k) in c[1..].iter_mut().zip(counted) {
+            *c += k;
+        }
+    }
+    cost
+}
+
+/// One arm's cost over `units`.
+fn per(c: [u64; 4], units: usize) -> String {
+    let per = |x: u64| x as f64 / units as f64;
+    format!(
+        "{:.2} sends, {:>6.0} user, {:>6.0} user+kernel instr, {:>6.0} cycles",
+        per(c[0]),
+        per(c[1]),
+        per(c[2]),
+        per(c[3])
+    )
+}
+
+/// W frames as W sends against `Peer` corking them into one send, by frame
+/// size: the trade `COALESCE_MAX_BYTES` is set from.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn fanout_coalesced_egress_bench() {
@@ -15,75 +49,48 @@ fn fanout_coalesced_egress_bench() {
 
     for w in [2usize, 8] {
         for frame_len in [CAP / 32, CAP / 8, CAP / 2, CAP, 2 * CAP] {
-            let total = w * frame_len;
             let r = make_reactor();
             let (mut peer, receiver) = Peer::over_socketpair(r);
             // The reader keeps the socket buffers from ever stalling a send, so
-            // the timed region is kernel-op cost, not backpressure.
-            let expect = 2 * ROUNDS * total;
+            // what is counted is kernel-op cost, not backpressure.
+            let expect = 2 * ROUNDS * w * frame_len;
             let drain = spawn_drain(receiver, expect);
-
-            let frame = vec![0xA5u8; frame_len];
-            let [per_frame, corked] = r.block_on(async move {
-                let mut spent = [Duration::ZERO; 2];
-                // Each round runs both arms, the one that goes first alternating.
-                // Every buffer is taken before its arm's clock starts, the cork's
-                // at the size it will hold: the copy into it is what is timed.
-                for i in 0..2 * ROUNDS {
-                    if matches!(i % 4, 1 | 2) {
-                        peer.egress = Some(PooledBuf::with_capacity(total));
-                        let t = Instant::now();
-                        for _ in 0..w {
-                            peer.cork(&frame);
-                        }
-                        peer.flush_egress().await.expect("an open peer");
-                        spent[1] += t.elapsed();
+            let frame = Rc::new(vec![0xA5u8; frame_len]);
+            let [per_frame, corked] = cost_of_arms(r, ROUNDS, async |corked| {
+                for _ in 0..w {
+                    if corked {
+                        peer.cork(&frame);
                     } else {
-                        let bufs: Vec<PooledBuf> = (0..w)
-                            .map(|_| {
-                                let mut buf = PooledBuf::with_capacity(frame_len);
-                                buf.extend_from_slice(&frame);
-                                buf
-                            })
-                            .collect();
-                        let t = Instant::now();
-                        for buf in bufs {
-                            peer.send_raw(SendBody::Pooled(buf)).await.expect("an open peer");
-                        }
-                        spent[0] += t.elapsed();
+                        let body = SendBody::Shared(Rc::clone(&frame));
+                        peer.send_raw(body).await.expect("an open peer");
                     }
                 }
-                spent
+                peer.flush_egress().await.expect("an open peer");
             });
-
-            let seen = drain.join().expect("drain thread");
-            assert_eq!(seen, expect as u64, "the reader saw every byte of both arms");
+            drop(peer);
+            assert_eq!(
+                drain.join().expect("drain thread"),
+                expect as u64,
+                "the reader saw every byte of both arms"
+            );
             println!(
-                "fanout_coalesced_egress_bench w={w} frame={frame_len:>5}B corked {:+6.1}% ({:?} against {:?} a round)",
-                (corked.as_secs_f64() / per_frame.as_secs_f64() - 1.0) * 100.0,
-                corked / ROUNDS as u32,
-                per_frame / ROUNDS as u32,
+                "fanout_coalesced_egress_bench w={w} frame={frame_len:>5}B | a send each: {} | corked: {}  (per round)",
+                per(per_frame, ROUNDS),
+                per(corked, ROUNDS),
             );
         }
     }
 }
 
 /// One pushed train to `n` connections sharing its body: a flush and a lone
-/// send of the body against `Peer::send` behind the corked head. Sends and
-/// instructions, user and kernel, of the reactor thread alone.
+/// send of the body against `Peer::send` behind the corked head.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pushed_train_band_bench() {
-    use gnitz_foundation::perf::{Counters, Event};
     const ROUNDS: usize = 2000;
     const CAP: usize = COALESCE_MAX_BYTES;
     const HEAD: usize = 64;
     const ANSWER: usize = 64;
-    let counters = Counters::open([
-        Event::INSTRUCTIONS,
-        Event::INSTRUCTIONS.with_kernel(),
-        Event::CYCLES.with_kernel(),
-    ]);
 
     for n in [1usize, 8] {
         for body_len in [
@@ -97,43 +104,27 @@ fn pushed_train_band_bench() {
         ] {
             let r = make_reactor();
             let per_peer = 2 * ROUNDS * (HEAD + body_len + ANSWER);
-            let mut peers = Vec::new();
-            let mut drains = Vec::new();
-            for _ in 0..n {
-                let (peer, receiver) = Peer::over_socketpair(r);
-                peers.push(peer);
-                drains.push(spawn_drain(receiver, per_peer));
-            }
+            let (mut peers, drains): (Vec<_>, Vec<_>) = (0..n)
+                .map(|_| {
+                    let (peer, receiver) = Peer::over_socketpair(r);
+                    (peer, spawn_drain(receiver, per_peer))
+                })
+                .unzip();
             let body = Rc::new(vec![0xA5u8; body_len]);
-            let head = [0x11u8; HEAD];
-            let answer = [0x22u8; ANSWER];
-
-            // [arm][0 = sends, 1 = user instr, 2 = user+kernel instr, 3 = cycles]
-            let mut cost = [[0u64; 4]; 2];
-            for i in 0..2 * ROUNDS {
-                let arm = usize::from(matches!(i % 4, 1 | 2));
-                let before = SENDS.with(Cell::get);
-                let ((), counted) = counters.measure(|| {
-                    r.block_on(async {
-                        for peer in &mut peers {
-                            peer.cork(&head);
-                            let body = SendBody::Shared(Rc::clone(&body));
-                            if arm == 0 && body_len > CAP / 2 {
-                                peer.flush_egress().await.expect("an open peer");
-                                peer.send_raw(body).await.expect("an open peer");
-                            } else {
-                                peer.send(body).await.expect("an open peer");
-                            }
-                            peer.cork(&answer);
-                            peer.flush_egress().await.expect("an open peer");
-                        }
-                    })
-                });
-                cost[arm][0] += SENDS.with(Cell::get) - before;
-                for (c, k) in cost[arm][1..].iter_mut().zip(counted) {
-                    *c += k;
+            let [lone, sent] = cost_of_arms(r, ROUNDS, async |through_send| {
+                for peer in &mut peers {
+                    peer.cork(&[0x11u8; HEAD]);
+                    let body = SendBody::Shared(Rc::clone(&body));
+                    if !through_send && body_len > CAP / 2 {
+                        peer.flush_egress().await.expect("an open peer");
+                        peer.send_raw(body).await.expect("an open peer");
+                    } else {
+                        peer.send(body).await.expect("an open peer");
+                    }
+                    peer.cork(&[0x22u8; ANSWER]);
+                    peer.flush_egress().await.expect("an open peer");
                 }
-            }
+            });
             drop(peers);
             for d in drains {
                 assert_eq!(
@@ -142,20 +133,10 @@ fn pushed_train_band_bench() {
                     "a reader saw every byte of both arms"
                 );
             }
-            let per = |x: u64| x as f64 / (ROUNDS as u64 * n as u64) as f64;
-            let arm = |c: [u64; 4]| {
-                format!(
-                    "{:.2} sends, {:>6.0} user, {:>6.0} user+kernel instr, {:>6.0} cycles",
-                    per(c[0]),
-                    per(c[1]),
-                    per(c[2]),
-                    per(c[3])
-                )
-            };
             println!(
                 "pushed_train_band_bench n={n} body={body_len:>6}B | flush and lone send: {} | Peer::send: {}  (per train per connection)",
-                arm(cost[0]),
-                arm(cost[1]),
+                per(lone, ROUNDS * n),
+                per(sent, ROUNDS * n),
             );
         }
     }
