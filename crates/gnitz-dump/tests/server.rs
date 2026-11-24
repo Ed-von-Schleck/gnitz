@@ -7,9 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gnitz_core::{Catalog, GnitzClient, RelName, ZSetBatch, block_on};
+use gnitz_dump::Summary;
 use gnitz_sql::SqlResult;
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::{Circuit, OpNode, ReadBound, RelClass, WireConflictMode};
+use gnitz_wire::{RelClass, WireConflictMode};
+use gnitz_zset_testkit::cell;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -101,18 +103,9 @@ fn rows(client: &mut GnitzClient, sql: &str) -> Vec<(Vec<Option<Vec<u8>>>, i64)>
         .map(|i| {
             let cells = schema
                 .visible_columns()
-                .map(|(ci, c)| {
-                    let loc = schema.layout().locate(ci);
-                    (!loc.is_null(batch, i)).then(|| match c.ty.tc.is_german_string() {
-                        true => loc.content(batch, i).into_owned(),
-                        false => {
-                            let mut scratch = [0u8; 16];
-                            loc.native_le_bytes(batch, i, &mut scratch).to_vec()
-                        }
-                    })
-                })
+                .map(|(ci, _)| cell(batch, schema.layout().locate(ci), i))
                 .collect();
-            (cells, reply.batch.view().get_weight(i))
+            (cells, batch.get_weight(i))
         })
         .collect();
     out.sort();
@@ -131,33 +124,12 @@ fn props(catalog: &Catalog) -> Vec<(String, gnitz_core::RelProps)> {
     out
 }
 
-fn dump(client: &mut GnitzClient, dir: &Path) {
-    block_on(gnitz_dump::dump(client, dir)).unwrap();
+fn dump(client: &mut GnitzClient, dir: &Path) -> Summary {
+    block_on(gnitz_dump::dump(client, dir)).unwrap()
 }
 
 fn restore_err(client: &mut GnitzClient, dir: &Path) -> String {
     block_on(gnitz_dump::restore(client, dir)).unwrap_err().0
-}
-
-/// Whether the circuit of view `view` reads its source through a bound.
-fn scans_bounded(client: &mut GnitzClient, view: &RelName) -> bool {
-    let catalog = block_on(client.catalog()).unwrap();
-    let id = catalog.get(view).unwrap().id;
-    let found = rows(
-        client,
-        &format!("SELECT circuit FROM _system.circuits WHERE view_id = {id}"),
-    );
-    let [(cells, 1)] = &found[..] else {
-        panic!("{view}: {} circuit rows", found.len())
-    };
-    let circuit = Circuit::decode(cells[0].as_deref().unwrap()).unwrap();
-    let mut bounds = circuit.ops().filter_map(|(_, op)| match op {
-        OpNode::ScanDelta { bound, .. } => Some(bound),
-        _ => None,
-    });
-    let bound = bounds.next().expect("a scan");
-    assert!(bounds.next().is_none(), "{view}: one scan");
-    *bound != ReadBound::None
 }
 
 /// A restore recreates every relation, index, property and SERIAL position,
@@ -172,8 +144,16 @@ fn a_restored_database_is_the_dumped_one() {
     push_files(&mut a);
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
-    dump(&mut a, dir);
-    assert!(restore_err(&mut a, dir).contains("already holds schema sales"));
+    let dumped = dump(&mut a, dir);
+    let summary = Summary {
+        schemas: 1,
+        tables: 9,
+        views: 10,
+        rows: 23,
+    };
+    assert_eq!(dumped, summary);
+    let err = restore_err(&mut a, dir);
+    assert!(err.contains("already holds schema sales"), "{err}");
     let err = block_on(gnitz_dump::dump(&mut a, dir)).unwrap_err();
     assert!(err.0.contains("not empty"), "{err}");
 
@@ -198,14 +178,22 @@ fn a_restored_database_is_the_dumped_one() {
         assert!(err.contains(refusal), "{err}");
         exec(&mut b, drop);
     }
-    block_on(gnitz_dump::restore(&mut b, dir)).unwrap();
+    assert_eq!(block_on(gnitz_dump::restore(&mut b, dir)).unwrap(), summary);
 
     let again = tempfile::tempdir().unwrap();
-    dump(&mut b, again.path());
+    assert_eq!(dump(&mut b, again.path()), summary);
+    let read = |d: &Path, file| std::fs::read_to_string(d.join(file)).unwrap();
     for file in ["schema.sql", "post-data.sql", "manifest.json"] {
-        let read = |d: &Path| std::fs::read_to_string(d.join(file)).unwrap();
-        assert_eq!(read(dir), read(again.path()), "{file}");
+        assert_eq!(read(dir, file), read(again.path(), file), "{file}");
     }
+    // The tables' indexes are created ahead of the views, so a view is planned
+    // with every index its sources have.
+    let post = read(dir, "post-data.sql");
+    let at = |s| post.find(s).unwrap_or_else(|| panic!("{s} in {post}"));
+    assert!(
+        at("CREATE INDEX orders_by_customer") < at("CREATE VIEW sales.by_one"),
+        "{post}"
+    );
     let (ca, cb) = (block_on(a.catalog()).unwrap(), block_on(b.catalog()).unwrap());
     assert_eq!(props(&ca), props(&cb));
     for r in ca.relations.iter() {
@@ -230,10 +218,6 @@ fn a_restored_database_is_the_dumped_one() {
             }
         }
     }
-    // The tables' indexes are created ahead of the views, so a view is planned
-    // with the index bound it was planned with first.
-    let by_one = RelName::new("sales", "by_one").unwrap();
-    assert!(scans_bounded(&mut a, &by_one) && scans_bounded(&mut b, &by_one));
     // Writes and cascades work as they did.
     exec(&mut b, "INSERT INTO sales.orders (customer) VALUES (2)");
     exec(&mut b, "DELETE FROM sales.customers WHERE id = 1");
@@ -242,37 +226,41 @@ fn a_restored_database_is_the_dumped_one() {
 
 /// A file no dump writes is refused by what its rows leave or what its push is
 /// refused for: a key held twice, which a restore pushes without a
-/// duplicate-key check, by the rows the table holds after; TEXT that is not
-/// UTF-8 by the push.
+/// duplicate-key check, by the rows the table holds after; rows the manifest
+/// does not count by their count; TEXT that is not UTF-8 by the push.
 #[test]
 fn a_file_of_rows_no_table_holds_is_refused() {
     let server = ServerHandle::start_n(2);
     let mut a = GnitzClient::connect(server.sock_path()).unwrap();
+    exec(
+        &mut a,
+        "CREATE TABLE d (id BIGINT PRIMARY KEY, v TEXT NOT NULL); INSERT INTO d VALUES (1, 'x')",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    dump(&mut a, dir.path());
+    exec(&mut a, "DROP TABLE d");
+
+    let file = dir.path().join("data/0.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&file).unwrap()).unwrap();
+    let meta = reader.metadata().file_metadata();
+    let root = Arc::new(meta.schema().clone());
+    let props = Arc::new(
+        WriterProperties::builder()
+            .set_key_value_metadata(meta.key_value_metadata().cloned())
+            .build(),
+    );
+    drop(reader);
     for (keys, texts, refusal) in [
         (
             &[1i64, 2, 1][..],
             &[&b"a"[..], b"b", b"c"][..],
             "3 rows, of which 2 have distinct keys",
         ),
+        (&[1, 2], &[b"a", b"b"], "2 rows, the manifest 1"),
         (&[1], &[&[0xff][..]], "not UTF-8"),
     ] {
-        exec(
-            &mut a,
-            "CREATE TABLE d (id BIGINT PRIMARY KEY, v TEXT NOT NULL); INSERT INTO d VALUES (1, 'x')",
-        );
-        let dir = tempfile::tempdir().unwrap();
-        dump(&mut a, dir.path());
-        exec(&mut a, "DROP TABLE d");
-
-        let file = dir.path().join("data/0.parquet");
-        let reader = SerializedFileReader::new(std::fs::File::open(&file).unwrap()).unwrap();
-        let meta = reader.metadata().file_metadata();
-        let root = Arc::new(meta.schema().clone());
-        let props = WriterProperties::builder()
-            .set_key_value_metadata(meta.key_value_metadata().cloned())
-            .build();
-        drop(reader);
-        let mut w = SerializedFileWriter::new(std::fs::File::create(&file).unwrap(), root, Arc::new(props)).unwrap();
+        let mut w =
+            SerializedFileWriter::new(std::fs::File::create(&file).unwrap(), root.clone(), props.clone()).unwrap();
         let mut group = w.next_row_group().unwrap();
         let mut col = group.next_column().unwrap().unwrap();
         col.typed::<Int64Type>().write_batch(keys, None, None).unwrap();
@@ -331,7 +319,7 @@ fn tables_larger_than_a_push_restore() {
         for id in 0..ROWS {
             let r = app.begin_row(id as u128, 1);
             match parent(id) {
-                Some(p) => r.put_int((i128::from(p)) as u128),
+                Some(p) => r.put_int(p as u128),
                 None => r.put_null(),
             };
             r.put_string(&format!("{id:0>1000}"));

@@ -44,16 +44,16 @@ fn columns_bench() {
     type Fill = fn(&mut BatchBuilder<&mut Batch>, usize);
     let cases: [(&str, ColType, bool, Fill); 9] = [
         ("BOOLEAN", ColType::of(TypeCode::Bool), false, |r, i| {
-            r.put_int((i128::from(mix(i as u64) & 1)) as u128);
+            r.put_int(u128::from(mix(i as u64) & 1));
         }),
         ("SMALLINT", ColType::of(TypeCode::I16), false, |r, i| {
-            r.put_int((i128::from(mix(i as u64) as i16)) as u128);
+            r.put_int(mix(i as u64) as i16 as u128);
         }),
         ("INT", ColType::of(TypeCode::I32), false, |r, i| {
-            r.put_int((i128::from(mix(i as u64) as i32)) as u128);
+            r.put_int(mix(i as u64) as i32 as u128);
         }),
         ("BIGINT", ColType::of(TypeCode::I64), false, |r, i| {
-            r.put_int((i128::from(mix(i as u64) as i64)) as u128);
+            r.put_int(mix(i as u64) as i64 as u128);
         }),
         ("DOUBLE", ColType::of(TypeCode::F64), false, |r, i| {
             r.put_float(mix(i as u64) as f64 / 3.0);
@@ -64,11 +64,11 @@ fn columns_bench() {
         ("BIGINT NULL", ColType::of(TypeCode::I64), true, |r, i| {
             match i % 10 {
                 0 => r.put_null(),
-                _ => r.put_int((i128::from(mix(i as u64) as i64)) as u128),
+                _ => r.put_int(mix(i as u64) as i64 as u128),
             };
         }),
         ("DECIMAL", ColType::decimal(2), false, |r, i| {
-            r.put_int((i128::from((mix(i as u64) >> 8) as i64)) as u128);
+            r.put_int((mix(i as u64) >> 8) as i64 as u128);
         }),
         ("UUID", ColType::of(TypeCode::UUID), false, |r, i| {
             r.put_int(u128::from(mix(i as u64)) << 64 | u128::from(mix(i as u64 + 1)));

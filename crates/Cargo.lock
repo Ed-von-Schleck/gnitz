@@ -782,6 +782,7 @@ dependencies = [
  "gnitz-test-harness",
  "gnitz-wire",
  "gnitz-zset",
+ "gnitz-zset-testkit",
  "parquet",
  "serde",
  "serde_json",

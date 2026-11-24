@@ -27,15 +27,27 @@ fn sample() -> Manifest {
     }
 }
 
+/// A manifest of another format or version, or one whose body a version-1
+/// reader cannot parse, is refused in its own words.
 #[test]
 fn another_format_or_version_is_refused() {
-    let text = sample().to_json();
-    for version in [0, VERSION + 1] {
-        let other = text.replace(&format!("\"version\": {VERSION}"), &format!("\"version\": {version}"));
-        assert!(Manifest::from_json(&other).unwrap_err().0.contains("format version"));
+    let body_less = r#"{"format": "gnitz-dump", "version": 1}"#;
+    for (text, refusal) in [
+        (
+            V1.replace("\"version\": 1", "\"version\": 0"),
+            "format version 0, this build restores 1",
+        ),
+        (
+            V1.replace("\"version\": 1", "\"version\": 2"),
+            "format version 2, this build restores 1",
+        ),
+        (V1.replace("gnitz-dump", "pg_dump"), "not a gnitz dump"),
+        (body_less.into(), "missing field `schemas` at line 1 column 38"),
+        ("{".into(), "EOF while parsing an object at line 1 column 1"),
+    ] {
+        let err = Manifest::from_json(&text).unwrap_err();
+        assert_eq!(err.0, format!("manifest.json: {refusal}"));
     }
-    assert!(Manifest::from_json(&text.replace("gnitz-dump", "pg_dump")).is_err());
-    assert!(Manifest::from_json("{").is_err());
 }
 
 /// A version 1 manifest as a release wrote it, which every build restoring

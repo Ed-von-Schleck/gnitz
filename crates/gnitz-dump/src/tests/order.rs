@@ -2,10 +2,10 @@ use super::*;
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// `(id PK, p0 NULL, p1 NULL, …)` rows, one `p` column per parent cell given.
-fn tree(rows: &[(u64, &[Option<u64>])]) -> ZSetBatch {
-    let mut cols = vec![ColumnDef::new("id", TypeCode::U64, false)];
+fn tree(rows: &[(i64, &[Option<i64>])]) -> ZSetBatch {
+    let mut cols = vec![ColumnDef::new("id", TypeCode::I64, false)];
     for i in 0..rows[0].1.len() {
-        cols.push(ColumnDef::new(format!("p{i}"), TypeCode::U64, true));
+        cols.push(ColumnDef::new(format!("p{i}"), TypeCode::I64, true));
     }
     let schema = std::sync::Arc::new(gnitz_core::Schema::from_parts(cols, &[0]).unwrap());
     let mut batch = ZSetBatch::new(&schema);
@@ -14,7 +14,7 @@ fn tree(rows: &[(u64, &[Option<u64>])]) -> ZSetBatch {
         let r = app.begin_row(id as u128, 1);
         for parent in parents {
             match parent {
-                Some(p) => r.put_int((*p) as u128),
+                Some(p) => r.put_int(*p as u128),
                 None => r.put_null(),
             };
         }
@@ -22,22 +22,24 @@ fn tree(rows: &[(u64, &[Option<u64>])]) -> ZSetBatch {
     batch
 }
 
-/// Every row after its parents, the rows that reference one another round a
-/// cycle together with no push ending among them, and every other row free to
-/// end a push.
+/// Every row once and after its parents, the rows that reference one another
+/// round a cycle together with no push ending among them, and every other row
+/// free to end a push.
 #[test]
 fn every_row_comes_after_its_parents() {
     /// Rows `(id, parents)`, and the sets of ids that reference one another round a cycle.
-    type Case = (&'static [(u64, &'static [Option<u64>])], &'static [&'static [u64]]);
-    let cases: [Case; 5] = [
-        // Children listed ahead of their parents, a row referencing itself and
-        // one referencing no row of the table.
+    type Case = (&'static [(i64, &'static [Option<i64>])], &'static [&'static [i64]]);
+    let cases: [Case; 6] = [
+        // No referencing column.
+        (&[(2, &[]), (1, &[]), (3, &[])], &[]),
+        // Children listed ahead of their parents, a negative key, a row
+        // referencing itself and one referencing no row of the table.
         (
             &[
                 (4, &[Some(3)]),
-                (3, &[Some(1)]),
-                (2, &[Some(1)]),
-                (1, &[None]),
+                (3, &[Some(-1)]),
+                (2, &[Some(-1)]),
+                (-1, &[None]),
                 (5, &[Some(5)]),
                 (6, &[Some(99)]),
             ],
@@ -95,19 +97,21 @@ fn every_row_comes_after_its_parents() {
         let batch = tree(rows);
         let refs: Vec<usize> = (1..=rows[0].1.len()).collect();
         let order = order(&batch, &refs);
-        assert_eq!(order.len(), rows.len(), "{rows:?}");
+        let mut emitted: Vec<u32> = order.iter().map(|&(r, _)| r).collect();
+        emitted.sort_unstable();
+        assert!(emitted.into_iter().eq(0..rows.len() as u32), "{order:?}");
         assert!(order.last().unwrap().1, "the last row may end a push: {order:?}");
         // The rows between one push end and the next.
-        let sets: Vec<Vec<u64>> = order
+        let sets: Vec<Vec<i64>> = order
             .split_inclusive(|&(_, may_end)| may_end)
-            .map(|s| s.iter().map(|&(r, _)| batch.pk(r as usize) as u64).collect())
+            .map(|s| s.iter().map(|&(r, _)| batch.pk(r as usize) as i64).collect())
             .collect();
-        let set_of: HashMap<u64, usize> = sets
+        let set_of: HashMap<i64, usize> = sets
             .iter()
             .enumerate()
             .flat_map(|(i, s)| s.iter().map(move |&id| (id, i)))
             .collect();
-        let mut together: Vec<Vec<u64>> = sets.into_iter().filter(|s| s.len() > 1).collect();
+        let mut together: Vec<Vec<i64>> = sets.into_iter().filter(|s| s.len() > 1).collect();
         together.iter_mut().for_each(|s| s.sort_unstable());
         together.sort();
         assert_eq!(together, cycles, "{rows:?}");
@@ -117,11 +121,4 @@ fn every_row_comes_after_its_parents() {
             }
         }
     }
-}
-
-/// With no referencing column, the rows in their own order, each free to end a push.
-#[test]
-fn rows_with_no_reference_keep_their_order() {
-    let batch = tree(&[(2, &[]), (1, &[]), (3, &[])]);
-    assert_eq!(order(&batch, &[]), [(0, true), (1, true), (2, true)]);
 }
