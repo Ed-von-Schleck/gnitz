@@ -8,9 +8,9 @@ use crate::test_support::{
 };
 use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, pk_keys_of_images};
 use std::num::NonZeroU64;
 
 /// Write `batch` to `log` as the master's push of it to relation 16, placed by
@@ -217,12 +217,7 @@ pub(super) fn registry(schema: SchemaDescriptor, placement: Placement) -> Relati
 
 /// `keys` of `stride`-byte big-endian ids, as a `PkSet` bound.
 pub(super) fn pk_set(stride: usize, keys: &[u64]) -> ReadBound {
-    ReadBound::PkSet(pk_keys(stride, keys))
-}
-
-fn pk_keys(stride: usize, keys: &[u64]) -> PkKeys {
-    let keys: Vec<Vec<u8>> = keys.iter().map(|k| k.to_be_bytes()[8 - stride..].to_vec()).collect();
-    gnitz_zset::schema::pk_keys(stride, keys.iter().map(Vec::as_slice))
+    ReadBound::PkSet(pk_keys_of_images(stride, keys.iter().map(|&k| k.into())))
 }
 
 /// A read reaches exactly the workers its bound names: a replicated relation's
@@ -314,7 +309,7 @@ fn a_probe_routes_by_the_store_it_reads() {
     let full = Placement::full_pk(&schema);
     let owner = |k: u64| full.owner(&k.to_be_bytes(), NW).unwrap();
     let b = (1..).find(|&k| owner(k) != owner(0)).expect("keys spread");
-    let keys = pk_keys(8, &[0, b]).encode_probe();
+    let keys = pk_keys_of_images(8, [0, b.into()]).encode_probe();
     let probe = |probe| Read::HasPk { tid: 16, probe, keys: &keys[..] };
     let index = Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::MAX);
 
@@ -324,7 +319,7 @@ fn a_probe_routes_by_the_store_it_reads() {
         assert_eq!(set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
         assert!(per_worker.is_some(), "{own:?}: each worker is sent its own keys");
     }
-    let one = pk_keys(8, &[b]).encode_probe();
+    let one = pk_keys_of_images(8, [b.into()]).encode_probe();
     let r = route_read(
         &Read::HasPk {
             tid: 16,

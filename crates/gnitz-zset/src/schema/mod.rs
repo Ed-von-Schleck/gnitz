@@ -16,16 +16,14 @@ mod sort_key;
 /// The schema descriptor, homed in `gnitz-expr` because its evaluator reads
 /// through it. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{SchemaColumn, SchemaDescriptor};
-pub use key::{
-    PROBE_KEY_INJECTIVE_BYTES, band, compare_pk_ordering, group_band, group_floor, key_above, probe_key, range_band,
-};
+pub use key::{PROBE_KEY_INJECTIVE_BYTES, band, group_band, group_floor, key_above, probe_key, range_band};
 pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
 pub(crate) use radix::stable_radix_sort_by_key;
 pub use radix::{RadixKey, radix_sort_by_key};
 pub(crate) use reduce_out::natural_key;
 pub use reduce_out::{ReduceOutSlot, reduce_out_layout};
 pub(crate) use sort_key::{PkSortKey, pack_pk_be, pk_width_dispatch};
-pub use sort_key::{pk_keys, pk_keys_of_images};
+pub use sort_key::{compare_pk_ordering, pk_keys, pk_keys_of_images};
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record, named or shape:
 /// nothing engine-side reads a name, a hidden flag or a scale.
@@ -86,22 +84,21 @@ impl DerivedSchema {
     }
 }
 
-/// `schema`'s PK columns, then the payload columns `project` names, in that
-/// order. `Err` for an entry that names no payload column, and for a list
-/// overflowing the column limit — `project` may repeat an index.
-pub fn project_schema(schema: &SchemaDescriptor, project: &[u32]) -> Result<SchemaDescriptor, String> {
+/// `schema`'s PK columns, then the payload columns of the slots `read` names,
+/// in slot order. `Err` for a bit past `schema`'s payload slots.
+pub fn project_schema(schema: &SchemaDescriptor, read: u64) -> Result<SchemaDescriptor, String> {
+    if read & !schema.payload_slots() != 0 {
+        return Err(format!(
+            "payload bits {read:#x} past a {}-column schema",
+            schema.num_columns()
+        ));
+    }
     let mut b = DerivedSchema::new();
     b.push_pk_of(schema);
-    for &p in project {
-        if schema.payload_slot(p as usize).is_none() {
-            return Err(format!(
-                "column {p} is not a payload column of a {}-column schema",
-                schema.num_columns()
-            ));
-        }
-        b.push(schema.columns()[p as usize]);
-    }
-    Ok(b.finish()?)
+    (schema.payload_columns())
+        .filter(|&(pi, _)| read >> pi & 1 != 0)
+        .for_each(|(_, c)| b.push(*c));
+    Ok(b.finish().expect("a subset of a schema's columns is a schema"))
 }
 
 #[cfg(test)]

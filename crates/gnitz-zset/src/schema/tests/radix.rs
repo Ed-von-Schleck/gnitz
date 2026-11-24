@@ -1,104 +1,73 @@
 use super::*;
 use gnitz_foundation::rng::splitmix;
 
-/// `v` sorted by `key` is a permutation of `v` whose keys ascend — and the
-/// comparison sort's keys, in every shape of input the radix sort branches on.
-fn check<K: RadixKey + Default + std::fmt::Debug>(v: Vec<(K, u32)>) {
-    let mut sorted = v.clone();
-    radix_sort_by_key(&mut sorted, |e| e.0);
-    let mut want = v.clone();
-    want.sort_unstable();
-    assert!(sorted.is_sorted_by_key(|e| e.0), "keys out of order");
-    assert_eq!(
-        sorted.iter().map(|e| e.0).collect::<Vec<_>>(),
-        want.iter().map(|e| e.0).collect::<Vec<_>>()
+/// Over indices into `keys`: [`stable_radix_sort_by_key`] is the stable
+/// comparison sort, and [`radix_sort_by_key`] a permutation whose keys are that
+/// sort's keys.
+fn check<K: RadixKey + std::fmt::Debug>(keys: &[K]) {
+    let key = |&i: &u32| keys[i as usize];
+    let ids = || (0..keys.len() as u32).collect::<Vec<u32>>();
+    let mut want = ids();
+    want.sort_by_key(key);
+    let mut stable = ids();
+    stable_radix_sort_by_key(&mut stable, key);
+    assert_eq!(stable, want, "stable sort, n {}", keys.len());
+    let mut unstable = ids();
+    radix_sort_by_key(&mut unstable, key);
+    assert!(
+        unstable.iter().map(key).eq(want.iter().map(key)),
+        "keys out of order, n {}",
+        keys.len()
     );
-    sorted.sort_unstable();
-    assert_eq!(sorted, want, "not a permutation");
+    unstable.sort_unstable();
+    assert_eq!(unstable, ids(), "not a permutation");
 }
 
-/// Rows `0..n` whose keys are `key(i)`, each tagged with a scrambled index so
-/// rows of one key stand out of index order.
-fn rows<K>(n: u64, key: impl Fn(u64) -> K) -> Vec<(K, u32)> {
-    (0..n).map(|i| (key(i), splitmix(i) as u32)).collect()
-}
-
-/// Each shape at a key whose varying bytes `spread` places into it.
-fn shapes<K: RadixKey + Default + std::fmt::Debug>(spread: impl Fn(u64) -> K) {
-    for n in [0, 1, 255, 256, 4096, 65536] {
-        check(rows(n, |i| spread(splitmix(i))));
-        check(rows(n, &spread));
-        check(rows(n, |i| spread(n - i)));
-        check(rows(n, |i| spread(if i == n - 1 { 0 } else { i + 1 })));
-        // Every key one: neither ascending nor descending by the tag.
-        check(rows(n, |_| spread(1)));
+/// Each shape of `n` keys the sorts branch on, as the varying value of a key.
+fn shapes(n: u64) -> Vec<Vec<u64>> {
+    let shape = |f: &dyn Fn(u64) -> u64| (0..n).map(f).collect();
+    vec![
+        shape(&splitmix),
+        shape(&|i| i),
+        shape(&|i| n - i),
+        shape(&|i| if i == n - 1 { 0 } else { i + 1 }),
+        // Every key one.
+        shape(&|_| 1),
         // One varying byte, then two, then three: odd and even pass counts.
-        for bits in [8, 16, 24] {
-            check(rows(n, |i| spread(splitmix(i) & ((1 << bits) - 1))));
-        }
+        shape(&|i| splitmix(i) & 0xFF),
+        shape(&|i| splitmix(i) & 0xFFFF),
+        shape(&|i| splitmix(i) & 0xFF_FFFF),
+        // Two varying bytes far apart.
+        shape(&|i| splitmix(i) & 0x0300_00FF),
         // Many varying bytes, found only past the first chunk: the MSD arm.
-        check(rows(n, |i| spread(if i < 1000 { i & 0xFF } else { splitmix(i) })));
+        shape(&|i| if i < 1000 { i & 0xFF } else { splitmix(i) }),
         // Many varying bytes in runs of one key longer than an MSD leaf, which
         // run out of digits that split them.
-        check(rows(n, |i| spread(splitmix(i / 300))));
-    }
+        shape(&|i| splitmix(i / 300)),
+        // Few keys, each tied many times, in no order and descending.
+        shape(&|i| splitmix(i) % 7),
+        shape(&|i| u64::MAX - i / 3),
+    ]
 }
 
+/// Every shape at every key type: a word, a pair of words, a pair of `u128`s,
+/// and a byte string wider than any of them whose varying bytes sit at both ends.
 #[test]
-fn radix_sort_by_key_sorts_every_shape() {
-    shapes(|x| x);
-    shapes(|x| (x as u128) << 40 | x as u128);
-    shapes(|x| [(x as u128) << 70, x as u128]);
-}
-
-/// [`stable_radix_sort_by_key`] keeps the order of elements of one key, in every
-/// shape [`shapes`] takes, which lead it down each of its arms: rows sorted by key
-/// alone come out in the order of the rows sorted by key, then by place.
-#[test]
-fn stable_radix_sort_keeps_ties_in_order() {
-    for n in [255u64, 256, 4096, 65536] {
-        for key in [
-            |i: u64| splitmix(i) % 7,
-            |i: u64| splitmix(i / 300),
-            |i: u64| splitmix(i) & 0xFF00,
-            |i: u64| splitmix(i),
-            |i: u64| u64::MAX - i / 3,
-        ] {
-            let v: Vec<(u64, u32)> = (0..n).map(|i| (key(i), i as u32)).collect();
-            let mut got = v.clone();
-            stable_radix_sort_by_key(&mut got, |e| e.0);
-            let mut want = v;
-            want.sort();
-            assert_eq!(got, want, "n {n}");
-        }
-    }
-}
-
-/// A byte-string key orders as its bytes do, at a width past any integer key:
-/// keys with few varying bytes, with many, and in runs of one key.
-#[test]
-fn radix_sort_by_byte_string_is_the_byte_sort() {
-    const STRIDE: usize = 40;
-    for n in [255u64, 256, 4096, 65536] {
-        for spread in [
-            |i: u64| splitmix(i) & 0x0300_00FF,
-            |i: u64| splitmix(i),
-            |i: u64| splitmix(i / 300),
-        ] {
-            let keys: Vec<[u8; STRIDE]> = (0..n)
-                .map(|i| {
-                    let mut k = [7u8; STRIDE];
-                    let x = spread(i).to_be_bytes();
-                    k[..4].copy_from_slice(&x[..4]);
-                    k[STRIDE - 4..].copy_from_slice(&x[4..]);
+fn radix_sorts_order_every_shape_at_every_key_type() {
+    for n in [0, 1, 255, 256, 4096, 65536] {
+        for raw in shapes(n) {
+            check(&raw);
+            check(&raw.iter().map(|&x| (x as u128) << 40 | x as u128).collect::<Vec<_>>());
+            check(&raw.iter().map(|&x| [(x as u128) << 70, x as u128]).collect::<Vec<_>>());
+            let wide: Vec<[u8; 40]> = (raw.iter())
+                .map(|&x| {
+                    let (mut k, b) = ([7u8; 40], x.to_be_bytes());
+                    k[..4].copy_from_slice(&b[..4]);
+                    k[36..].copy_from_slice(&b[4..]);
                     k
                 })
                 .collect();
-            let mut got: Vec<u32> = (0..n as u32).collect();
-            radix_sort_by_key(&mut got, |&i| &keys[i as usize][..]);
-            assert!(got.is_sorted_by_key(|&i| keys[i as usize]), "n {n}");
-            got.sort();
-            assert!(got.iter().copied().eq(0..n as u32), "not a permutation, n {n}");
+            check(&wide.iter().map(|k| &k[..]).collect::<Vec<_>>());
         }
     }
 }

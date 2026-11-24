@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::keyed_schema;
 
 fn col(tc: TypeCode) -> SchemaColumn {
     SchemaColumn::new(tc, false)
@@ -8,35 +9,29 @@ fn col(tc: TypeCode) -> SchemaColumn {
 /// single NOT NULL PK-eligible column (eligibility is `TypeCode::is_pk_eligible`'s,
 /// swept there); anything else — no column, a nullable, float or string column,
 /// a partial, reordered or wider set — folds into a synthetic key. Each schema
-/// has three columns, the PK ones `U64 NOT NULL` and the rest of the case's type.
+/// has three columns, the leading `pk` of them `U64 NOT NULL` and the rest of
+/// the case's type.
 #[test]
-#[allow(clippy::type_complexity)]
 fn natural_key_picks_the_output_key() {
     use TypeCode as T;
     let (natural, synthetic_fold) = (true, false);
     // (pk, group, (non-PK type code, nullable), natural)
-    let rows: &[(&[u32], &[u32], (TypeCode, bool), bool)] = &[
-        (&[0], &[], (T::U64, false), synthetic_fold),
-        (&[0], &[1], (T::U64, true), synthetic_fold),
-        (&[0], &[1], (T::U64, false), natural),
-        (&[0], &[1], (T::F64, false), synthetic_fold),
-        (&[0], &[1], (T::String, false), synthetic_fold),
-        (&[0], &[0], (T::String, true), natural),
-        (&[0, 1], &[0, 1], (T::String, true), natural),
-        (&[0, 1], &[1, 0], (T::String, true), synthetic_fold),
-        (&[0, 1], &[0], (T::String, true), natural),
-        (&[0, 1], &[0, 1, 2], (T::U64, false), synthetic_fold),
-        (&[0, 1], &[1, 2], (T::U64, false), synthetic_fold),
+    let rows = [
+        (1, &[][..], (T::U64, false), synthetic_fold),
+        (1, &[1], (T::U64, true), synthetic_fold),
+        (1, &[1], (T::U64, false), natural),
+        (1, &[1], (T::F64, false), synthetic_fold),
+        (1, &[1], (T::String, false), synthetic_fold),
+        (1, &[0], (T::String, true), natural),
+        (2, &[0, 1], (T::String, true), natural),
+        (2, &[1, 0], (T::String, true), synthetic_fold),
+        (2, &[0], (T::String, true), natural),
+        (2, &[0, 1, 2], (T::U64, false), synthetic_fold),
+        (2, &[1, 2], (T::U64, false), synthetic_fold),
     ];
-    for &(pk, group, (tc, nullable), want) in rows {
-        let cols: Vec<SchemaColumn> = (0..3)
-            .map(|c| match pk.contains(&c) {
-                true => col(T::U64),
-                false => SchemaColumn::new(tc, nullable),
-            })
-            .collect();
-        let schema = SchemaDescriptor::new(&cols, pk);
-        assert_eq!(natural_key(&schema, group), want, "{pk:?} {group:?} {tc:?} {nullable}");
+    for (pk, group, (tc, nullable), want) in rows {
+        let schema = keyed_schema(&vec![T::U64; pk], &vec![SchemaColumn::new(tc, nullable); 3 - pk]);
+        assert_eq!(natural_key(&schema, group), want, "{pk} {group:?} {tc:?} {nullable}");
     }
 }
 

@@ -59,7 +59,7 @@ impl RelationRegistry {
                 if !relation.kind().nets_unit_per_key() {
                     return Err(format!("probe: PK probe of relation {id}, whose keys may net above 1"));
                 }
-                Ok(project_unique(table, &keys, &read_cols(&schema, read), &out_schema))
+                Ok(project_unique(table, &keys, read, &out_schema))
             }
         }
     }
@@ -70,11 +70,7 @@ impl Relation {
     pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
         let schema = self.schema();
         match probe {
-            Probe::Pk { read } if read & !schema.payload_slots() != 0 => Err(format!(
-                "probe: payload bits {read:#x} past a {}-column schema",
-                schema.num_columns()
-            )),
-            Probe::Pk { read } => project_schema(&schema, &read_cols(&schema, read)),
+            Probe::Pk { read } => project_schema(&schema, read).map_err(|e| format!("probe: {e}")),
             Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.key_spec().index_schema(&schema)),
         }
     }
@@ -319,21 +315,16 @@ impl UniqueGather<'_> {
     }
 }
 
-/// The columns of the payload slots `read` names, in slot order.
-fn read_cols(schema: &SchemaDescriptor, read: u64) -> Vec<u32> {
-    (0..schema.num_payload_cols())
-        .filter(|&pi| read >> pi & 1 != 0)
-        .map(|pi| schema.payload_col_idx(pi) as u32)
-        .collect()
-}
-
 /// Every live row of `keys`, a strictly ascending list of whole PKs of
 /// `table`, probed from it, whose every key nets 0 or 1, at weight 1 and
-/// in `out_schema`, the [`project_schema`] layout of `cols`: the PK, then the
-/// payload columns `cols` names. The probe reads the rows `Cut::Now` reads.
-fn project_unique(table: &Table, keys: &PkKeys, cols: &[u32], out_schema: &SchemaDescriptor) -> Batch {
+/// in `out_schema`, the [`project_schema`] layout of `read`: the PK, then the
+/// payload columns of the slots `read` names. The probe reads the rows `Cut::Now` reads.
+fn project_unique(table: &Table, keys: &PkKeys, read: u64, out_schema: &SchemaDescriptor) -> Batch {
     let schema = table.schema();
-    let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
+    let locs: Vec<ColumnLocator> = (0..schema.num_payload_cols())
+        .filter(|&pi| read >> pi & 1 != 0)
+        .map(|pi| schema.payload_locator(pi))
+        .collect();
     let mut out = Batch::with_capacity(out_schema, keys.len());
     for stored in keys.iter().filter_map(|k| table.unique_live_row_at(k)) {
         let (src, row) = stored.source();

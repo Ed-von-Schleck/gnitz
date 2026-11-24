@@ -2,27 +2,35 @@ use super::*;
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::widen_pk_be;
 
-/// `pack_pk_be` and every [`PkSortKey`] order keys exactly as `memcmp` orders
-/// their bytes, at every PK width and over key pairs sharing a prefix of every
-/// length.
+/// `pack_pk_be` is the leading 16 bytes read big-endian; `compare_pk_ordering`
+/// and every [`PkSortKey`] order keys exactly as `memcmp` orders their bytes, at
+/// every PK width and over key pairs sharing a prefix of every length; and a
+/// sort key puts back the bytes it was built from, then zeros.
 #[test]
 fn sort_keys_agree_with_memcmp_at_every_width() {
     let mut rng = Rng::new(0xB17E5);
     for w in 0..=MAX_PK_BYTES {
         for _ in 0..16 {
             let a: Vec<u8> = (0..w).map(|_| rng.next_u64() as u8).collect();
-            // The leading 16 bytes, zero-padded, read big-endian.
             let mut lead = [0u8; 16];
             lead[..w.min(16)].copy_from_slice(&a[..w.min(16)]);
             assert_eq!(pack_pk_be(&a), u128::from_be_bytes(lead), "w={w}");
+            pk_width_dispatch!(w, |K| {
+                let mut out = vec![0xAA; K::put_width(w)];
+                K::from_opk(&a).put(&mut out);
+                assert_eq!(out[..w], a[..], "w={w}");
+                assert!(out[w..].iter().all(|&b| b == 0), "w={w}");
+            });
             for pos in 0..=w {
                 let mut b = a.clone();
                 if pos < w {
                     b[pos] = rng.next_u64() as u8;
                 }
+                let want = a.cmp(&b);
+                assert_eq!(compare_pk_ordering(&a, &b), want, "w={w} pos={pos}");
                 pk_width_dispatch!(w, |K| assert_eq!(
-                    Ord::cmp(&K::from_opk(&a[..]), &K::from_opk(&b[..])),
-                    a.cmp(&b),
+                    Ord::cmp(&K::from_opk(&a), &K::from_opk(&b)),
+                    want,
                     "w={w} pos={pos}"
                 ));
             }
@@ -30,88 +38,41 @@ fn sort_keys_agree_with_memcmp_at_every_width() {
     }
 }
 
-/// [`pk_keys`] is the one sort: at every stride duplicates collapse and the
-/// list comes out ascending whatever order it went in. At every narrow stride, sorting images builds the same list, both
-/// arms of the integer width included. Keys over a two-letter alphabet tie and
-/// share prefixes, so every byte of a wide key decides somewhere.
+/// [`pk_keys`] is the byte sort with duplicates collapsed, and at a narrow
+/// stride sorting the keys' images builds the same list. Every stride takes
+/// lists of up to a few dozen keys, the inline and empty ones included; the
+/// strides of an image or a pair of them, and two wider ones, take lists long
+/// enough for each arm of the radix sort. Keys over a two-letter alphabet tie
+/// and share prefixes, so every byte of a wide key decides somewhere; keys
+/// varying in only their first and last byte take few radix passes.
 #[test]
 fn pk_keys_is_the_byte_sort() {
     let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
+    let binary = |rng: &mut Rng, stride| (0..stride).map(|_| rng.gen_range(2) as u8).collect();
+    let sparse = |rng: &mut Rng, stride| {
+        let r = rng.next_u64();
+        let mut key = vec![0u8; stride];
+        key[0] |= (r >> 8) as u8 & 3;
+        key[stride - 1] = r as u8;
+        key
+    };
+    let random = |rng: &mut Rng, stride| (0..stride).map(|_| rng.next_u64() as u8).collect();
+    let gens: [fn(&mut Rng, usize) -> Vec<u8>; 3] = [binary, sparse, random];
     for stride in 1..=MAX_PK_BYTES {
-        let mut raw: Vec<Vec<u8>> = (0..64)
-            .map(|_| (0..stride).map(|_| rng.gen_range(2) as u8).collect())
-            .collect();
-        raw.push(raw[3].clone());
-        let mut want = raw.clone();
-        want.sort_unstable();
-        want.dedup();
-        let k = pk_keys(stride, raw.iter().map(|k| &k[..]));
-        assert_eq!(k.as_bytes(), want.concat(), "stride {stride}");
-        if stride <= NARROW_PK_MAX_BYTES {
-            let images = raw.iter().map(|k| widen_pk_be(k));
-            assert_eq!(pk_keys_of_images(stride, images), k, "stride {stride}");
-        }
-    }
-}
-
-/// A single key, by bytes or by image, builds the same list as the multi-key
-/// sort would; so do two and three keys around it.
-#[test]
-fn pk_keys_single_key_matches_the_sort() {
-    for stride in [1usize, 3, 8, 9, 16, 24, 40] {
-        let key: Vec<u8> = (0..stride as u8).map(|b| b.wrapping_mul(37) | 1).collect();
-        let one = pk_keys(stride, [&key[..]]);
-        assert_eq!(one.as_bytes(), key, "stride {stride}");
-        assert_eq!(one.len(), 1, "stride {stride}");
-        assert_eq!(pk_keys(stride, [&key[..], &key[..]]), one, "stride {stride}");
-        let zero = vec![0u8; stride];
-        let two = pk_keys(stride, [&key[..], &zero[..], &key[..]]);
-        assert_eq!(two.as_bytes(), [&zero[..], &key[..]].concat(), "stride {stride}");
-        if stride <= NARROW_PK_MAX_BYTES {
-            let image = widen_pk_be(&key);
-            assert_eq!(pk_keys_of_images(stride, [image]), one, "stride {stride}");
-            assert_eq!(pk_keys_of_images(stride, [image, 0, image]), two, "stride {stride}");
-        }
-    }
-    assert!(pk_keys(8, std::iter::empty()).is_empty());
-    assert!(pk_keys_of_images(8, std::iter::empty()).is_empty());
-}
-
-#[test]
-#[should_panic(expected = "key width")]
-fn pk_keys_single_key_checks_its_width() {
-    pk_keys(8, [&[0u8; 4][..]]);
-}
-
-/// Lists long enough for the radix sort, at every stride of an image or a pair
-/// of them and at two wider ones: over keys whose varying bytes are few and
-/// scattered (the LSD arm) and over random keys (the MSD arm), with duplicates.
-/// Each comes out as the byte sort of its keys, and at a narrow stride sorting
-/// their images agrees.
-#[test]
-fn pk_keys_radix_is_the_byte_sort() {
-    let mut rng = Rng::new(0x2545_F491_4F6C_DD1D);
-    // Past two images, keys sort as byte strings.
-    for stride in (1..=2 * NARROW_PK_MAX_BYTES).chain([40, 64]) {
-        for n in [255usize, 256, 300, 5000] {
-            for sparse in [true, false] {
-                let raw: Vec<Vec<u8>> = (0..n)
-                    .map(|_| match sparse {
-                        // Only the lowest byte and the highest vary.
-                        true => {
-                            let r = rng.next_u64();
-                            let mut key = vec![0u8; stride];
-                            key[0] |= (r >> 8) as u8 & 3;
-                            key[stride - 1] = r as u8;
-                            key
-                        }
-                        false => (0..stride).map(|_| rng.next_u64() as u8).collect(),
-                    })
-                    .collect();
+        let long = stride <= 2 * NARROW_PK_MAX_BYTES || [40, 64].contains(&stride);
+        let ns = [0usize, 1, 2, 3, 64]
+            .into_iter()
+            .chain(long.then_some([255, 256, 5000]).into_iter().flatten());
+        for n in ns {
+            for keygen in gens {
+                let mut raw: Vec<Vec<u8>> = (0..n).map(|_| keygen(&mut rng, stride)).collect();
+                if n >= 2 {
+                    raw.push(raw[0].clone());
+                }
                 let mut want = raw.clone();
                 want.sort_unstable();
                 want.dedup();
-                let got = pk_keys(stride, raw.iter().map(|k| &k[..]));
+                let got = pk_keys(stride, raw.iter().map(Vec::as_slice));
                 assert_eq!(got.as_bytes(), want.concat(), "stride {stride} n {n}");
                 if stride <= NARROW_PK_MAX_BYTES {
                     let images = raw.iter().map(|k| widen_pk_be(k));
@@ -120,4 +81,10 @@ fn pk_keys_radix_is_the_byte_sort() {
             }
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "key width")]
+fn pk_keys_refuses_a_key_of_another_width() {
+    pk_keys(8, [&[0u8; 4][..]]);
 }

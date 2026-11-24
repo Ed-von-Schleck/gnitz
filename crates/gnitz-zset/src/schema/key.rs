@@ -1,29 +1,12 @@
 //! Order-preserving primary-key (OPK) primitives.
 //!
-//! These pure layout/key operations compare two OPK regions in byte order,
-//! fingerprint an OPK span, and derive the half-open key band a `KeyRange`
-//! walks over a store's PK. The per-column codec is `gnitz_wire::pk`'s, shared
-//! with the client; the fixed-width sort keys are `sort_key`'s.
-use std::cmp::Ordering;
+//! These pure layout/key operations fingerprint an OPK span and derive the
+//! half-open key band a `KeyRange` walks over a store's PK. The per-column
+//! codec is `gnitz_wire::pk`'s, shared with the client; the comparator and the
+//! fixed-width sort keys are `sort_key`'s.
+use gnitz_wire::{KeyRange, PkBuf};
 
-use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES, PkBuf};
-
-use crate::schema::{SchemaDescriptor, pack_pk_be};
-
-/// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
-/// comparator of seeks, group walks and probes. Slice order
-/// at every width, settled on the leading-16 `pack_pk_be` image where that
-/// decides: for `len ≤ 16` the image is the *whole* PK and is injective, so a
-/// tie is already a byte-equal PK; only `len > 16` can tie on the prefix while
-/// differing later, and the slice compare runs only there.
-#[inline(always)]
-pub fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
-    debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
-    match pack_pk_be(a).cmp(&pack_pk_be(b)) {
-        Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => a.cmp(b),
-        ord => ord,
-    }
-}
+use crate::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
 // OPK span fingerprint
@@ -96,7 +79,3 @@ pub fn band(start: PkBuf, end: Option<PkBuf>) -> Option<(PkBuf, Option<PkBuf>)> 
 #[cfg(test)]
 #[path = "tests/key.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "benches/key.rs"]
-mod bench;

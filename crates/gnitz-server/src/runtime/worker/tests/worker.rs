@@ -78,8 +78,7 @@ fn delta<'a>(view: u64, schema: &SchemaDescriptor, spec: &'a [u8]) -> Read<'a> {
 /// `ids` as the keys a PK probe of a `U64`-keyed relation carries, encoded by
 /// [`gnitz_wire::PkKeys::encode_probe`].
 pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
-    let keys: Vec<[u8; 8]> = ids.iter().map(|id| id.to_be_bytes()).collect();
-    gnitz_zset::schema::pk_keys(8, keys.iter().map(|k| &k[..])).encode_probe()
+    gnitz_zset::schema::pk_keys_of_images(8, ids.iter().map(|&id| id.into())).encode_probe()
 }
 
 /// A PK probe of `tid` at `keys`.

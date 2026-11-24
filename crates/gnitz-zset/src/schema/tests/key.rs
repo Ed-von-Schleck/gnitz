@@ -1,25 +1,6 @@
 use super::*;
 use gnitz_foundation::rng::Rng;
-use gnitz_wire::MAX_PK_BYTES;
-
-/// `compare_pk_ordering` orders as `memcmp` does, at every PK width and over
-/// key pairs sharing a prefix of every length.
-#[test]
-fn compare_pk_ordering_agrees_with_memcmp_at_every_width() {
-    let mut rng = Rng::new(0xB17E5);
-    for w in 0..=MAX_PK_BYTES {
-        for _ in 0..16 {
-            let a: Vec<u8> = (0..w).map(|_| rng.next_u64() as u8).collect();
-            for pos in 0..=w {
-                let mut b = a.clone();
-                if pos < w {
-                    b[pos] = rng.next_u64() as u8;
-                }
-                assert_eq!(compare_pk_ordering(&a, &b), a.cmp(&b), "w={w} pos={pos}");
-            }
-        }
-    }
-}
+use std::collections::HashMap;
 
 /// Distinct keys of one width at most [`PROBE_KEY_INJECTIVE_BYTES`] never share a
 /// `probe_key`: every key of one and two bytes, and for each wider width the
@@ -44,16 +25,63 @@ fn probe_key_is_injective_up_to_its_injective_width() {
                     .collect()
             }
         };
-        let mut digests: Vec<u64> = keys.iter().map(|k| probe_key(k)).collect();
-        let mut distinct = keys.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        digests.sort_unstable();
-        digests.dedup();
-        assert_eq!(
-            digests.len(),
-            distinct.len(),
-            "stride {stride}: two keys share a probe_key"
-        );
+        let mut seen = HashMap::new();
+        for k in keys {
+            if let Some(other) = seen.insert(probe_key(&k), k.clone()) {
+                assert_eq!(other, k, "stride {stride}: two keys share a probe_key");
+            }
+        }
+    }
+}
+
+/// `group_floor` is a group zero-padded to the stride and `key_above` the group
+/// plus one, padded alike — the carry running left — for every two-byte group,
+/// at strides that pad it by nothing, a byte, and past 16 bytes; no key lies
+/// above an all-`0xFF` or an empty group.
+#[test]
+fn group_floor_and_key_above_are_the_group_and_its_successor_padded() {
+    for stride in [2, 3, 20] {
+        let padded = |g: u16| {
+            let mut k = g.to_be_bytes().to_vec();
+            k.resize(stride, 0);
+            k
+        };
+        for g in 0..=u16::MAX {
+            let group = g.to_be_bytes();
+            assert_eq!(
+                group_floor(&group, stride).pk_bytes(),
+                padded(g),
+                "{g:#x} stride {stride}"
+            );
+            assert_eq!(
+                key_above(&group, stride).map(|k| k.pk_bytes().to_vec()),
+                g.checked_add(1).map(padded),
+                "{g:#x} stride {stride}"
+            );
+        }
+    }
+    assert_eq!(key_above(&[], 4), None);
+}
+
+/// `group_band(first, last)` holds exactly the two-byte keys whose leading byte
+/// is in `[first, last]`, and is `None` when no group is.
+#[test]
+fn group_band_holds_exactly_the_keys_of_its_groups() {
+    let edges = [0u8, 1, 0x7F, 0x80, 0xFE, 0xFF];
+    for first in edges {
+        for last in edges {
+            let band = group_band(&[first], &[last], 2);
+            assert_eq!(band.is_none(), first > last, "[{first:#x}, {last:#x}]");
+            for key in (0..=u16::MAX).map(u16::to_be_bytes) {
+                let inside = band.as_ref().is_some_and(|(start, end)| {
+                    start.pk_bytes() <= &key[..] && end.as_ref().is_none_or(|e| key[..] < *e.pk_bytes())
+                });
+                assert_eq!(
+                    inside,
+                    (first..=last).contains(&key[0]),
+                    "[{first:#x}, {last:#x}] {key:?}"
+                );
+            }
+        }
     }
 }

@@ -75,18 +75,20 @@ fn row_order_is_the_pk_bytes_then_each_typed_payload_cell() {
             0 => random_schema(&mut rng, TypeCode::ALL, true),
             _ => random_schema(&mut rng, &fixed_ints, false),
         };
-        assert!(i % 2 == 0 || s.payload_is_fixed_int_nonnull(), "{s:?}");
         let (a, ma) = random_row(&mut rng, &s);
         let (b, mb) = random_row(&mut rng, &s);
         let payload = Generic.compare(&s, &a, 0, &b, 0);
         assert_eq!(payload, ma.1.cmp(&mb.1), "{s:?}: {ma:?} vs {mb:?}");
         let full = Generic.compare_full(&s, &a, 0, &b, 0);
         assert_eq!(full, ma.cmp(&mb), "{s:?}: {ma:?} vs {mb:?}");
-        assert_eq!(
-            with_payload_cmp!(s, |p| p.compare(&s, &a, 0, &b, 0)),
-            payload,
-            "{s:?}: {ma:?} vs {mb:?}"
-        );
+        if i % 2 == 1 {
+            assert!(s.payload_is_fixed_int_nonnull(), "{s:?}");
+            assert_eq!(
+                FixedIntNonnull.compare(&s, &a, 0, &b, 0),
+                payload,
+                "{s:?}: {ma:?} vs {mb:?}"
+            );
+        }
         assert_eq!(
             full.is_eq(),
             row_key(&a, &s, 0) == row_key(&b, &s, 0),

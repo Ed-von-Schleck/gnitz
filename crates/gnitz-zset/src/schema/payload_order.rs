@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use super::SchemaDescriptor;
-use super::key::compare_pk_ordering;
+use super::sort_key::compare_pk_ordering;
 use gnitz_wire::{RowSource, cmp_col_window, compare_german_strings, native_key_image, null_word_get};
 
 /// A payload row order. Generic over both sources, so one selected order also

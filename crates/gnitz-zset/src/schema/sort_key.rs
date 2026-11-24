@@ -1,5 +1,8 @@
 //! The fixed-width sort keys of an OPK region: the key a merge, a group walk and
-//! a seek order rows by, and the sort that builds a [`PkKeys`] list.
+//! a seek order rows by, the comparator of two OPK regions, and the sort that
+//! builds a [`PkKeys`] list.
+
+use std::cmp::Ordering;
 
 use gnitz_wire::{MAX_PK_BYTES, NARROW_PK_MAX_BYTES, PkKeys};
 use smallvec::SmallVec;
@@ -62,6 +65,21 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
         }
         // Width 0: an empty OPK region packs to zero.
         _ => 0,
+    }
+}
+
+/// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
+/// comparator of seeks, group walks and probes. Slice order
+/// at every width, settled on the leading-16 `pack_pk_be` image where that
+/// decides: for `len ≤ 16` the image is the *whole* PK and is injective, so a
+/// tie is already a byte-equal PK; only `len > 16` can tie on the prefix while
+/// differing later, and the slice compare runs only there.
+#[inline(always)]
+pub fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
+    debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
+    match pack_pk_be(a).cmp(&pack_pk_be(b)) {
+        Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => a.cmp(b),
+        ord => ord,
     }
 }
 
