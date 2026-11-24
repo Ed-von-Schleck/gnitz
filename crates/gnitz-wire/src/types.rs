@@ -411,10 +411,7 @@ impl From<TypeCode> for ColType {
 impl core::fmt::Display for ColType {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.tc {
-            // The precision is the `i64`'s own digit count, not what the column
-            // was declared with: a DECIMAL's value is bounded by the integer
-            // behind its scale, and `ColType` carries no declared precision.
-            TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::MAX_DECIMAL_SCALE, self.scale),
+            TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::DECIMAL_PRECISION, self.scale),
             tc => f.write_str(tc.sql_name()),
         }
     }

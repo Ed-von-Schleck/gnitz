@@ -4,8 +4,12 @@
 
 use crate::VALUE_TEXT_MAX;
 
-/// The largest scale a column may declare: `i64` holds 18 full decimal digits.
-pub const MAX_DECIMAL_SCALE: u8 = 18;
+/// The precision of every DECIMAL column: the most digits an `i64` holds every
+/// value of.
+pub const DECIMAL_PRECISION: u8 = i64::MAX.ilog10() as u8;
+
+/// The largest scale a column may declare.
+pub const MAX_DECIMAL_SCALE: u8 = DECIMAL_PRECISION;
 
 /// The most fractional digits a decimal text may spell: `i128` holds 38 full
 /// decimal digits.

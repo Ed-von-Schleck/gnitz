@@ -103,7 +103,7 @@ fn col_type_display_round_trips() {
         .chain([
             ColType::decimal(0),
             ColType::decimal(2),
-            ColType::decimal(MAX_DECIMAL_SCALE),
+            ColType::decimal(gnitz_wire::MAX_DECIMAL_SCALE),
         ]);
     for ty in types {
         let spelled = ty.to_string();

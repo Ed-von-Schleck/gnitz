@@ -18,8 +18,8 @@
 //!
 //! A 128-bit integer has no Parquet type that holds every value — a
 //! `DECIMAL(38, 0)` stops short of `i128`'s range — so each is its 16 bytes,
-//! and a DECIMAL, which holds any `i64`, is the 9 bytes that hold 19 digits;
-//! both are big-endian two's complement. The file's `gnitz.columns` metadata
+//! big-endian two's complement. A DECIMAL's `i64` may have 19 digits, past
+//! INT64's limit of 18, so it is 9 such bytes. The file's `gnitz.columns` metadata
 //! names each column's gnitz type, which is what tells HUGEINT from UHUGEINT. A
 //! nullable column is OPTIONAL, every other one REQUIRED.
 
@@ -53,11 +53,10 @@ const COLUMNS_KEY: &str = "gnitz.columns";
 /// The zstd level a dump's pages are compressed at.
 const ZSTD_LEVEL: i32 = 3;
 
-/// The digits of every `i64`.
-const DECIMAL_PRECISION: i32 = 19;
+/// The most digits a DECIMAL's `i64` has.
+const DECIMAL_DIGITS: i32 = i64::MIN.unsigned_abs().ilog10() as i32 + 1;
 
-/// The bytes of a DECIMAL cell in the file: the fewest that hold
-/// `DECIMAL_PRECISION` digits.
+/// The bytes of a DECIMAL cell in the file: a sign byte ahead of the `i64`.
 const DECIMAL_BYTES: usize = 9;
 
 /// The Parquet schema of a file of `schema`'s visible columns, and its
@@ -106,10 +105,10 @@ fn file_layout(schema: &Schema) -> Result<(Type, String), DumpError> {
             TypeCode::Timestamp => column(Physical::INT64, Some(LogicalType::timestamp(false, TimeUnit::MICROS))),
             TypeCode::Decimal => column(
                 Physical::FIXED_LEN_BYTE_ARRAY,
-                Some(LogicalType::decimal(scale, DECIMAL_PRECISION)),
+                Some(LogicalType::decimal(scale, DECIMAL_DIGITS)),
             )
             .with_length(DECIMAL_BYTES as i32)
-            .with_precision(DECIMAL_PRECISION)
+            .with_precision(DECIMAL_DIGITS)
             .with_scale(scale),
             TypeCode::Bool => column(Physical::BOOLEAN, None),
         };

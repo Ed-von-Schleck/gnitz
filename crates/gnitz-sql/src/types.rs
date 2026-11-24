@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use gnitz_wire::{ColType, MAX_DECIMAL_SCALE, TypeCode};
+use gnitz_wire::{ColType, DECIMAL_PRECISION, TypeCode};
 use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
 pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
@@ -52,8 +52,8 @@ fn float_type(info: &ExactNumberInfo) -> Result<TypeCode, GnitzSqlError> {
 }
 
 /// `DECIMAL(p, s)` / `NUMERIC(p, s)`: fixed-point at scale `s` (`DECIMAL(p)` is
-/// scale 0), `p` in `1..=MAX_DECIMAL_SCALE`. The precision bounds nothing finer — a value is
-/// bounded by the `i64` behind its scale.
+/// scale 0), `p` in `1..=DECIMAL_PRECISION`. `p` bounds no value; the `i64` behind
+/// the scale does.
 fn decimal_type(info: &ExactNumberInfo) -> Result<ColType, GnitzSqlError> {
     let (p, s) = match *info {
         ExactNumberInfo::PrecisionAndScale(p, s) => (p, s),
@@ -64,9 +64,9 @@ fn decimal_type(info: &ExactNumberInfo) -> Result<ColType, GnitzSqlError> {
             ));
         }
     };
-    if p == 0 || p > MAX_DECIMAL_SCALE as u64 {
+    if p == 0 || p > DECIMAL_PRECISION as u64 {
         return Err(GnitzSqlError::rejected(format!(
-            "DECIMAL({p}, {s}): the precision must be 1..={MAX_DECIMAL_SCALE}"
+            "DECIMAL({p}, {s}): the precision must be 1..={DECIMAL_PRECISION}"
         )));
     }
     if s < 0 || s as u64 > p {
