@@ -1,12 +1,12 @@
 use super::*;
 use crate::access::bound_and_predicate;
+use crate::dml::plan_write;
 use crate::test_support::Cell::{self, F64, Int, Null, Str};
 use crate::test_support::{
     TestCatalog, assert_rejects, batch_of, bind_where, catalog, col, keyed_batch, ncol, parse_stmt, pk_schema, rel,
-    rows_of, schema, table,
+    rows_of, table,
 };
 use gnitz_wire::{ReadBound, RelClass, TypeCode};
-use sqlparser::ast::Statement;
 use std::sync::Arc;
 
 /// | name | shape |
@@ -22,7 +22,12 @@ use std::sync::Arc;
 fn cat() -> TestCatalog {
     let i = TypeCode::I64;
     let idv = || vec![col("id", i), ncol("v", i)];
-    let sr = vec![col("id", TypeCode::I16), ncol("name", TypeCode::String)];
+    let mut sr = table(
+        5,
+        vec![col("id", TypeCode::I16), ncol("name", TypeCode::String)],
+        vec![0],
+    );
+    Arc::get_mut(&mut sr).expect("just built").serial = true;
     catalog(vec![
         (
             "t",
@@ -41,18 +46,7 @@ fn cat() -> TestCatalog {
             "h",
             table(4, vec![col("id", i), col("gone", i).hidden(), ncol("v", i)], vec![0]),
         ),
-        (
-            "sr",
-            Arc::new(RelDescriptor {
-                tid: 5,
-                class: RelClass::Table,
-                pk_repeats: false,
-                serial: true,
-                schema: Arc::new(schema(sr, &[0])),
-                indexes: Vec::new(),
-                token: 0,
-            }),
-        ),
+        ("sr", sr),
         ("st", rel(6, RelClass::Stream, idv(), vec![0], vec![])),
         ("vw", rel(7, RelClass::View, idv(), vec![0], vec![])),
         ("sys", rel(8, RelClass::Catalog, idv(), vec![0], vec![])),
@@ -60,10 +54,7 @@ fn cat() -> TestCatalog {
 }
 
 fn insert(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
-    let Statement::Insert(insert) = parse_stmt(sql) else {
-        panic!("`{sql}` is not an INSERT");
-    };
-    plan_insert(&insert, cat)
+    plan_write(&parse_stmt(sql), cat)
 }
 
 /// The VALUES rows an INSERT plan writes.
@@ -101,11 +92,6 @@ fn values_land_in_the_columns_the_list_names() {
             one(&[Int(2), Str("x")]),
         ),
         ("INSERT INTO t (v, id) VALUES (2, 1)", vec![1], one(&[Int(2), Null])),
-        (
-            "INSERT INTO t VALUES (1, 2, 'x'), (3, 4, NULL)",
-            vec![1, 3],
-            vec![(vec![Int(2), Str("x")], 1), (vec![Int(4), Null], 1)],
-        ),
         ("INSERT INTO h VALUES (1, 5)", vec![1], one(&[Int(0), Int(5)])),
         ("INSERT INTO t VALUES ROW(1, 2, 'x')", vec![1], one(&[Int(2), Str("x")])),
         ("INSERT INTO t VALUE (1, 2, 'x')", vec![1], one(&[Int(2), Str("x")])),
@@ -120,9 +106,15 @@ fn values_land_in_the_columns_the_list_names() {
             vec![(vec![Int(0), Null], 1), (vec![Int(0), Null], 1)],
         ),
         ("INSERT INTO st VALUES (1, 5)", vec![1], one(&[Int(5)])),
-        // A SERIAL key is reserved at execute: planned, it is 0.
+        // A SERIAL key is reserved at execute: planned, it is 0, and ON CONFLICT
+        // does not take two such rows for one key.
         ("INSERT INTO sr VALUES ('x')", vec![0], one(&[Str("x")])),
         ("INSERT INTO sr (name) VALUES ('x')", vec![0], one(&[Str("x")])),
+        (
+            "INSERT INTO sr VALUES ('x'), ('y') ON CONFLICT DO NOTHING",
+            vec![0, 0],
+            vec![(vec![Str("x")], 1), (vec![Str("y")], 1)],
+        ),
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`");
@@ -201,7 +193,7 @@ fn a_refused_insert_names_its_rule() {
         ("INSERT INTO t DEFAULT VALUES", "without VALUES"),
         ("INSERT INTO t SELECT * FROM t", "only supports VALUES"),
         ("INSERT INTO t VALUES (2, 20, 'b') LIMIT 1", "LIMIT/OFFSET"),
-        ("INSERT INTO t VALUES (2, 20, 'b') FOR UPDATE", "FOR UPDATE"),
+        ("INSERT OR REPLACE INTO t VALUES (2, 20, 'b')", "OR (conflict clause)"),
         ("INSERT IGNORE INTO t VALUES (2, 20, 'b')", "IGNORE"),
         ("REPLACE INTO t VALUES (2, 20, 'b')", "REPLACE INTO"),
         // The column list: each name once, unqualified, visible; the key present.
@@ -212,7 +204,10 @@ fn a_refused_insert_names_its_rule() {
         ("INSERT INTO h (id, gone) VALUES (1, 2)", "'gone' not found"),
         // A SERIAL key is never written.
         ("INSERT INTO sr VALUES (1, 'x')", "SERIAL primary key is auto-assigned"),
-        ("INSERT INTO sr (id, name) VALUES (1, 'x')", "SERIAL"),
+        (
+            "INSERT INTO sr (id, name) VALUES (1, 'x')",
+            "cannot supply a value for a SERIAL column",
+        ),
         // RETURNING binds as a SELECT list does, so it refuses what one refuses,
         // and it is not accepted beside ON CONFLICT.
         (
@@ -253,8 +248,7 @@ fn a_refused_insert_names_its_rule() {
             "INSERT INTO t VALUES (2, 20, 'b') ON DUPLICATE KEY UPDATE v = 1",
             "ON DUPLICATE KEY UPDATE",
         ),
-        // DO UPDATE takes a SET list as UPDATE does, each value either computed
-        // from the stored row or one `EXCLUDED` column.
+        // DO UPDATE takes a SET list without a WHERE, and changes each key once.
         (
             "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE v > 5",
             "DO UPDATE: WHERE",
@@ -263,33 +257,14 @@ fn a_refused_insert_names_its_rule() {
             "INSERT INTO t VALUES (1, 20, 'b'), (1, 30, 'c') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
             "second time",
         ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET id = 2",
-            "primary key column in ON CONFLICT DO UPDATE SET",
-        ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = v + EXCLUDED.v",
-            "compound expressions",
-        ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = COALESCE(EXCLUDED.v, 0)",
-            "compound expressions",
-        ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.nope",
-            "EXCLUDED: column 'nope' not found",
-        ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET s = EXCLUDED.v",
-            "cannot assign a value of type BIGINT",
-        ),
-        // A view is read-only, a reserved name is refused before the catalog is
-        // probed, and a stream holds no row to resolve a conflict against.
-        ("INSERT INTO vw VALUES (2, 20)", "is a view"),
+        // A view and the catalog take no INSERT, a reserved name is refused before
+        // the catalog is probed, and a stream holds no row to resolve a conflict
+        // against.
         (
             "INSERT INTO sys VALUES (2, 20)",
-            "'sys' is a system table; INSERT requires",
+            "'sys' is a system table; INSERT requires a base table or a stream",
         ),
+        ("INSERT INTO vw VALUES (2, 20)", "is a view"),
         ("INSERT INTO _seg999999 VALUES (1, 1)", "cannot start with '_'"),
         (
             "INSERT INTO st VALUES (1, 2) ON CONFLICT (id) DO NOTHING",
@@ -300,58 +275,33 @@ fn a_refused_insert_names_its_rule() {
     }
 }
 
-/// RETURNING a relation's own columns replies with the rows written, verbatim, numbered by
-/// the list — wherever the key stands in the relation.
+/// RETURNING a relation's own columns replies with the rows written, verbatim,
+/// numbered by the list under the names it gives — wherever the key stands in the
+/// relation.
 #[test]
 fn returning_a_relations_columns_replies_the_rows_written() {
     let i = TypeCode::I64;
-    let cat = catalog(vec![("m", table(1, vec![col("v", i), col("id", i)], vec![1]))]);
-    for (list, names, key) in [
-        ("v, id", ["v", "id"], 1u32),
-        ("id, v", ["id", "v"], 0),
-        ("*", ["v", "id"], 1),
+    let cat = catalog(vec![
+        ("m", table(1, vec![col("v", i), col("id", i)], vec![1])),
+        ("k", table(2, vec![col("id", i), col("v", i)], vec![0])),
+    ]);
+    for (rel, list, names, key) in [
+        ("m", "v, id", ["v", "id"], 1u32),
+        ("m", "id, v", ["id", "v"], 0),
+        ("m", "*", ["v", "id"], 1),
+        ("k", "*", ["id", "v"], 0),
+        ("k", "id AS a, v", ["a", "v"], 0),
+        ("k", "v, id", ["v", "id"], 1),
     ] {
-        let plan = insert(&cat, &format!("INSERT INTO m VALUES (10, 1) RETURNING {list}")).unwrap();
-        let Write::Insert { rows, returning: Some(mut map) } = plan.write else {
-            panic!("RETURNING {list} has no map")
+        let sql = format!("INSERT INTO {rel} (id, v) VALUES (1, 10) RETURNING {list}");
+        let Write::Insert { rows, returning: Some(mut map) } = insert(&cat, &sql).unwrap().write else {
+            panic!("`{sql}` has no map")
         };
         let out = map.apply(rows.clone());
-        assert_eq!(out, rows, "RETURNING {list}");
+        assert_eq!(out, rows, "`{sql}`");
         let schema = out.schema();
         let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
-        assert_eq!(
-            (got, schema.pk_cols()),
-            (names.to_vec(), &[key][..]),
-            "RETURNING {list}"
-        );
-    }
-}
-
-/// RETURNING over a key-first relation numbers the reply by the list, under the
-/// names it gives.
-#[test]
-fn returning_names_the_reply_by_the_list() {
-    let i = TypeCode::I64;
-    let cat = catalog(vec![("k", table(1, vec![col("id", i), col("v", i)], vec![0]))]);
-    for (list, names, key) in [
-        ("*", ["id", "v"], 0u32),
-        ("id, v", ["id", "v"], 0),
-        ("id AS a, v", ["a", "v"], 0),
-        ("v, id", ["v", "id"], 1),
-    ] {
-        let plan = insert(&cat, &format!("INSERT INTO k VALUES (1, 10) RETURNING {list}")).unwrap();
-        let Write::Insert { rows, returning: Some(mut map) } = plan.write else {
-            panic!("RETURNING {list} has no map")
-        };
-        let out = map.apply(rows.clone());
-        assert_eq!(out, rows, "RETURNING {list}");
-        let schema = out.schema();
-        let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
-        assert_eq!(
-            (got, schema.pk_cols()),
-            (names.to_vec(), &[key][..]),
-            "RETURNING {list}"
-        );
+        assert_eq!((got, schema.pk_cols()), (names.to_vec(), &[key][..]), "`{sql}`");
     }
 }
 
@@ -413,29 +363,22 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
 /// malformed reply: refused, never resolved as a conflict.
 #[test]
 fn on_conflict_refuses_a_reply_outside_the_read_keys() {
-    let cat = cat();
-    for sql in [
-        "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT DO NOTHING",
-        "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
-    ] {
-        let WritePlan {
-            target,
-            write: Write::Upsert { rows, mut set },
-        } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
-        else {
-            panic!("`{sql}` has no ON CONFLICT");
-        };
-        let schema = &target.schema;
-        // Keys 1 and 2; key 2 was never read.
-        let foreign = batch_of(schema, &[&[Int(10), Null], &[Int(20), Null]]);
-        let twice = keyed_batch(schema, &[(&[1], 1, &[Int(10), Null]), (&[1], 1, &[Int(20), Null])]);
-        for (held, what) in [(foreign, "a key that was not read"), (twice, "a key held twice")] {
-            match resolve_conflicts(rows.clone(), held, set.as_deref_mut()) {
-                Err(GnitzSqlError::Client(ClientError::Protocol(e))) => {
-                    assert!(e.to_string().contains(what), "`{sql}`: {e}")
-                }
-                other => panic!("`{sql}`: {what}: {:?}", other.map(|b| b.len())),
-            }
+    let sql = "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v";
+    let WritePlan {
+        target,
+        write: Write::Upsert { rows, mut set },
+    } = insert(&cat(), sql).unwrap()
+    else {
+        panic!("`{sql}` has no ON CONFLICT");
+    };
+    let schema = &target.schema;
+    // Keys 1 and 2; key 2 was never read.
+    let foreign = batch_of(schema, &[&[Int(10), Null], &[Int(20), Null]]);
+    let twice = keyed_batch(schema, &[(&[1], 1, &[Int(10), Null]), (&[1], 1, &[Int(20), Null])]);
+    for (held, what) in [(foreign, "a key that was not read"), (twice, "a key held twice")] {
+        match resolve_conflicts(rows.clone(), held, set.as_deref_mut()) {
+            Err(GnitzSqlError::Client(ClientError::Protocol(e))) => assert!(e.to_string().contains(what), "{e}"),
+            other => panic!("{what}: {:?}", other.map(|b| b.len())),
         }
     }
 }

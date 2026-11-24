@@ -1,11 +1,12 @@
 use super::*;
-use crate::test_support::{col, parse_stmt};
+use crate::test_support::{col, parse_stmt, schema};
 use sqlparser::ast::Statement;
 use std::hint::black_box;
 
 /// Instructions per row `apply_set` rewrites, over `t (id PK, i1..i8 BIGINT, t1, t2 TEXT)`,
 /// for each kind of right-hand side: a copied column, a literal (a string one rebuilds
-/// the other string column onto the new arena), and a computed value.
+/// the other string column onto the new arena), and a computed value; and for three
+/// copies, the cost of each assignment past the first.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn apply_set_bench() {
@@ -14,7 +15,7 @@ fn apply_set_bench() {
     let mut columns = vec![col("id", TypeCode::U64)];
     columns.extend((1..=8).map(|i| col(&format!("i{i}"), TypeCode::I64)));
     columns.extend((1..=2).map(|i| col(&format!("t{i}"), TypeCode::String)));
-    let schema = std::sync::Arc::new(Schema::from_parts(columns, &[0]).unwrap());
+    let schema = std::sync::Arc::new(schema(columns, &[0]));
     let mut rows = ZSetBatch::new(&schema);
     let mut app = rows.builder();
     let mut rng = gnitz_foundation::rng::Rng::new(0x9E37_79B9_7F4A_7C15);
@@ -34,6 +35,7 @@ fn apply_set_bench() {
     }
     for (name, sql) in [
         ("copy a fixed column", "UPDATE t SET i1 = i2"),
+        ("copy a string column", "UPDATE t SET t1 = t2"),
         ("string literal", "UPDATE t SET t1 = 'x'"),
         ("int literal", "UPDATE t SET i1 = 7"),
         ("computed", "UPDATE t SET i1 = i2 + 1"),

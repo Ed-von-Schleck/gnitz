@@ -1,11 +1,10 @@
 use super::*;
 use crate::ir::BoundExpr;
 use crate::test_support::Cell::{Int, Null, Str};
-use crate::test_support::{col, keyed_batch, ncol, rows_of, schema};
+use crate::test_support::{LONG, col, keyed_batch, ncol, rows_of, schema};
 use gnitz_wire::{ColumnDef, TypeCode};
 
-/// A spilled body, and one the map computes.
-const LONG: &str = "a string past the inline prefix";
+/// A spilled body the map computes.
 const FALLBACK: &str = "a computed fallback past the inline prefix";
 
 /// `(k I64 PK, v I64 NULL, s STRING NULL)`.

@@ -259,5 +259,9 @@ pub(super) fn apply_set(
 }
 
 #[cfg(test)]
+#[path = "tests/set.rs"]
+mod tests;
+
+#[cfg(test)]
 #[path = "benches/set.rs"]
 mod bench;

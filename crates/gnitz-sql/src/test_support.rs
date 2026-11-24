@@ -257,6 +257,9 @@ pub(crate) fn holds_exact(ty: ColType, x: i128, op: CmpOp, lit: &str) -> bool {
     )
 }
 
+/// A string past the German string's inline prefix, so its bytes spill to the blob.
+pub(crate) const LONG: &str = "a string past the inline prefix";
+
 /// One payload cell, written into a batch or read back out of a result.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Cell<'a> {
