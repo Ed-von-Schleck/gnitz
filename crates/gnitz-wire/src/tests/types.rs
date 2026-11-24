@@ -34,7 +34,7 @@ fn type_predicates_partition_the_type_table() {
         (F64, 8, false, false, false, true, false, false, false, false, U128),
         (String, 16, false, false, false, false, true, false, false, false, U128),
         (U128, 16, false, false, true, false, false, true, true, false, U128),
-        (UUID, 16, false, false, false, false, false, true, true, false, U128),
+        (UUID, 16, false, false, false, false, false, true, true, false, UUID),
         (Blob, 16, false, false, false, false, true, false, false, false, U128),
         (I128, 16, false, true, true, false, false, true, true, false, I128),
         (Date, 4, true, true, false, false, false, false, true, false, Date),

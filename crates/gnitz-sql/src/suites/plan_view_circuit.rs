@@ -662,6 +662,8 @@ fn a_set_op_is_keyed_by_the_key_its_leaves_carry() {
         "SELECT a, v FROM c EXCEPT SELECT a, v FROM c WHERE v > 3",
         // A widened column.
         "SELECT id, i32c FROM ty EXCEPT SELECT id, v FROM t",
+        // A UUID keys as itself, at the U128 layout it shares.
+        "SELECT uid FROM ty UNION SELECT uid FROM ty WHERE id > 1",
     ] {
         let chain = view(&cat, body);
         let v = final_view(&chain);
@@ -677,10 +679,9 @@ fn a_set_op_is_keyed_by_the_key_its_leaves_carry() {
         // Two elements under one carried key would leave the result's key
         // repeating, and the columns are too wide a key.
         "SELECT * FROM t UNION SELECT * FROM u",
-        // A nullable column, a STRING, a UUID.
+        // A nullable column, a STRING.
         "SELECT k FROM n EXCEPT SELECT g FROM t",
         "SELECT s FROM ty EXCEPT SELECT s FROM ty WHERE id > 1",
-        "SELECT uid FROM ty UNION SELECT uid FROM ty WHERE id > 1",
     ] {
         let chain = view(&cat, body);
         assert!(hashes(&chain), "`{body}` is not hashed");

@@ -130,10 +130,10 @@ def test_a_distinct_tuple_lives_exactly_while_a_row_carries_it(client):
         assert bag(scanned(client, "v"), "a", "b") == dict.fromkeys(want, 1), sql
 
 
-def test_a_uuid_element_is_keyed_by_its_hash(client):
-    """A UUID column packs as no key of its own, so a set op or DISTINCT over one
-    keys its leaves by a hash of the row; both still weigh each UUID at 1 while
-    a row of either side carries it."""
+def test_a_uuid_element_is_keyed_by_its_own_bytes(client):
+    """A UUID column keys as itself, at the 16-byte layout it shares with
+    UINT128, so a set op or DISTINCT over one keys its leaves by the column;
+    both weigh each UUID at 1 while a row of either side carries it."""
     p, q, r = (f"00000000-0000-0000-0000-{n:012x}" for n in (1, 2, 0xffffffffffff))
     client.execute_sql(
         "CREATE TABLE x (pk BIGINT NOT NULL PRIMARY KEY, u UUID NOT NULL); "

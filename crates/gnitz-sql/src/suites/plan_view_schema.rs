@@ -800,28 +800,30 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
 
 // ── joins ────────────────────────────────────────────────────────────────────
 
-/// A key column a join mints from a DECIMAL — an equi join's `_join_pk`, a
-/// range join's source-PK `_pair_pk_*` — keeps its scale, so the stored integer
-/// reads back as the same fixed-point value.
+/// A key column a join mints from a named type — an equi join's `_join_pk`, a
+/// range join's source-PK `_pair_pk_*` — keeps that type: a DECIMAL its scale, a
+/// UUID its being a UUID rather than the U128 it shares a layout with, so the
+/// stored integer reads back as the value it was taken from.
 #[test]
-fn a_synthetic_key_over_a_decimal_keeps_its_scale() {
+fn a_synthetic_key_over_a_named_type_keeps_it() {
     let i = TypeCode::I64;
-    let d = ColType::decimal(2);
-    let cat = catalog(vec![
-        ("a", table(30, vec![col("k", d), col("x", i)], vec![0])),
-        ("b", table(31, vec![col("k", d), col("y", i)], vec![0])),
-    ]);
-    for (body, key) in [
-        ("SELECT a.x, b.y FROM a JOIN b ON a.k = b.k", "_join_pk"),
-        ("SELECT a.x, b.y FROM a JOIN b ON a.x < b.y", "_pair_pk_0"),
-    ] {
-        let chain = view(&cat, body);
-        let cols = final_view(&chain).schema.columns();
-        let c = cols
-            .iter()
-            .find(|c| &*c.name == key)
-            .unwrap_or_else(|| panic!("{body}: no {key}"));
-        assert_eq!(c.ty, ColType::decimal(2), "{body}");
+    for k in [ColType::decimal(2), ColType::of(TypeCode::UUID)] {
+        let cat = catalog(vec![
+            ("a", table(30, vec![col("k", k), col("x", i)], vec![0])),
+            ("b", table(31, vec![col("k", k), col("y", i)], vec![0])),
+        ]);
+        for (body, key) in [
+            ("SELECT a.x, b.y FROM a JOIN b ON a.k = b.k", "_join_pk"),
+            ("SELECT a.x, b.y FROM a JOIN b ON a.x < b.y", "_pair_pk_0"),
+        ] {
+            let chain = view(&cat, body);
+            let cols = final_view(&chain).schema.columns();
+            let c = cols
+                .iter()
+                .find(|c| &*c.name == key)
+                .unwrap_or_else(|| panic!("{body}: no {key}"));
+            assert_eq!(c.ty, k, "{body}");
+        }
     }
 }
 

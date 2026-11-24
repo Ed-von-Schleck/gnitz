@@ -265,14 +265,12 @@ impl TypeCode {
         target.is_fixed_int() && self.int_domain_fits(target)
     }
 
-    /// The key slot type of this column keyed alone.
+    /// The key slot type of this column keyed alone: a key-eligible type keys
+    /// as itself, so a synthetic key reads back as the value it was taken from;
+    /// any other as its 16-byte content hash.
     #[inline]
     pub const fn reindex_output_type(self) -> TypeCode {
-        if self.is_fixed_int() || matches!(self, TypeCode::I128) {
-            self
-        } else {
-            TypeCode::U128
-        }
+        if self.is_pk_eligible() { self } else { TypeCode::U128 }
     }
 
     /// Whether a key column of this type can pack into a `slot`-typed key slot.
