@@ -1,7 +1,8 @@
 use super::*;
 use crate::relation::RelationKind;
 use crate::test_support::{
-    RelationFixture, TID, chunked, id_rows, opk_pk, pk_only_schema, relation_fixture_with, u64_pk_schema,
+    RelationFixture, TID, chunked, id_rows, leading_pk_fixture, opk_pk, pk_only_schema, relation_fixture_with,
+    u64_pk_schema,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::schema::SchemaColumn;
@@ -71,5 +72,19 @@ fn the_index_yields_every_span_in_order() {
     ] {
         let err = got.map(drop).unwrap_err();
         assert!(err.contains(why), "{err}");
+    }
+}
+
+/// Where the columns lead the PK, the spans are read off the owner's rows: one
+/// per live row, its PK's leading columns, in order.
+#[test]
+fn an_index_leading_the_pk_spans_the_owners_rows() {
+    let r = leading_pk_fixture();
+    let rel = r.relation(TID).unwrap();
+    let rows = rel.full_scan();
+    for cols in [&[0u32][..], &[0, 1]] {
+        let k = rel.index_on(cols).unwrap().key_spec().key_size();
+        let want: Vec<Vec<u8>> = (0..rows.len()).map(|i| rows.get_pk_bytes(i)[..k].to_vec()).collect();
+        assert_eq!(drain(r.key_spans(TID, cols).unwrap()).0, want, "{cols:?}");
     }
 }

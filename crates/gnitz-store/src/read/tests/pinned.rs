@@ -64,12 +64,16 @@ fn pages_walk_the_pinned_rows_in_key_order_each_full_but_the_last() {
 }
 
 #[test]
-fn a_page_after_the_greatest_key_is_empty_and_a_short_key_or_another_layout_is_refused() {
+fn a_page_after_the_greatest_key_is_empty_and_one_the_pin_cannot_answer_is_refused() {
     let s = pinned(Slot::SOLO);
     assert!(s.page(TID, &page(7, Some(&[0xff; 8]))).unwrap().is_empty());
     let other_layout = PageRequest { layout: 0, ..page(7, None) };
-    for (req, why) in [(page(7, Some(&[0; 3])), "stride"), (other_layout, "reply schema")] {
-        let err = s.page(TID, &req).map(drop).unwrap_err();
+    for (id, req, why) in [
+        (TID, page(7, Some(&[0; 3])), "stride"),
+        (TID, other_layout, "reply schema"),
+        (TID + 1, page(7, None), "holds no relation"),
+    ] {
+        let err = s.page(id, &req).map(drop).unwrap_err();
         assert!(err.contains(why), "{err}");
     }
 }

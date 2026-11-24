@@ -531,13 +531,13 @@ fn undone_drop_index_refills_the_restored_circuit() {
 
     apply_index_drop_then_refuse(&mut engine, &[idx_id]);
 
-    let index = engine.registry.relation(tid).and_then(|r| r.index_on(&[1]));
-    let entries = index.expect("the drop is undone").cursor().drain_chunk(usize::MAX);
-    let entries = entries.expect("the restored index must hold the flushed row");
-    // A U64's key image is its value: the entry is `val`, then the row's PK.
+    let spans = engine.registry.key_spans(tid, &[1]).expect("the drop is undone");
+    let spans = spans.chunk();
+    // A U64's key image is its value: the span is `val`.
     assert_eq!(
-        (entries.len(), gnitz_wire::widen_pk_be(entries.get_pk_bytes(0))),
-        (1, 200 << 64 | 20)
+        (spans.len(), gnitz_wire::widen_pk_be(spans.get_pk_bytes(0))),
+        (1, 200),
+        "the restored index must hold the flushed row"
     );
 
     engine.close();

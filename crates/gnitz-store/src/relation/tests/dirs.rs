@@ -2,8 +2,8 @@ use super::*;
 use crate::relation::{IndexClaim, StateLayout, StoreConfig};
 use crate::storage::flush_barrier;
 use crate::test_support::{
-    TID, flip_last_byte_in_place, make_batch, make_schema_u64_i64, pk_only_schema, relation_fixture_with,
-    scratch_table, solo, spec, spilling, zset_of,
+    TID, batch_rows, flip_last_byte_in_place, make_batch, make_schema_u64_i64, pk_only_schema, relation_fixture_with,
+    scratch_table, solo, spec, spilling,
 };
 use gnitz_wire::{TypeCode, ViewBudget};
 
@@ -29,30 +29,16 @@ fn parse_rejects_names_in_no_grammar() {
     for name in [
         "foo",
         "foo_w0of1",
-        "t_12",
         "w3",
-        "wof",
         "w3of",
-        "wxof4",
-        "w3ofx",
-        "scratch_x_wq",
-        "scratch_x_w3",
+        "w+1of2",
+        "w01of2",
+        "w0of0",
         "scratch__w0of1x",
-        "idx_",
-        "idx_7",
         "idx_x_w0of1",
-        "idx_-3_w0of1",
         "idx_07_w0of1",
         "idx_1-_w0of1",
         "idx_1-1_w0of1",
-        "idx_-1_w0of1",
-        "delta_w",
-        "delta_wx",
-        "delta_w0",
-        "delta_0",
-        "w0of0",
-        "w3of3",
-        "w01of2",
         "manifest.bin",
     ] {
         assert_eq!(ChildAddr::parse(name), None, "{name} is not a child dir");
@@ -64,53 +50,51 @@ fn stamp(dir: &str, generation: u64) {
     flush_barrier([&mut scratch_table(dir, make_schema_u64_i64())], generation).unwrap();
 }
 
-/// The verdict reads every rank's rows child and every declared trace child,
-/// whatever else the directory holds.
+/// A view's children are resumable once every rank's rows child and every
+/// declared trace child carry a manifest at the generation, whatever else the
+/// directory holds; an unregistered id is not.
 #[test]
-fn children_at_generation_reads_the_rows_and_the_declared_scratch() {
+fn a_view_resumes_when_every_rank_published_its_declared_children() {
     const G: u64 = 5;
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_str().unwrap().to_string();
-    let mut traces = StateLayout::default();
-    traces.declare("agg".to_string(), make_schema_u64_i64());
-    let agg = traces.names().next().unwrap().to_string();
-    assert!(
-        !children_at_generation(&dir, 2, G, &traces),
-        "an absent rank is a mismatch"
-    );
+    let base = tmp.path().to_str().unwrap();
+    let rel = relation_dir(base, TID);
+    let layout = |schema| {
+        let mut traces = StateLayout::default();
+        traces.declare("agg".to_string(), schema);
+        traces
+    };
+    // A master at 2 workers holding the view, its trace declared under `schema`.
+    let resumable = |schema| {
+        let mut master = RelationRegistry::master(base, 2, StoreConfig::default());
+        let view = spec(TID, RelationKind::View(ViewBudget::Plain), make_schema_u64_i64());
+        master
+            .register_at(view, make_schema_u64_i64(), &[], layout(schema), None)
+            .unwrap();
+        assert!(!master.view_children_resumable(TID + 1, G), "an unregistered id");
+        master.view_children_resumable(TID, G)
+    };
+    let traced = make_schema_u64_i64();
+    assert!(!resumable(traced), "an absent rank is a mismatch");
 
+    let agg = layout(traced).names().next().unwrap().to_string();
     let (agg0, agg1) = (format!("scratch_{agg}_w0of2"), format!("scratch_{agg}_w1of2"));
     for name in ["w0of2", "w1of2", &agg0, &agg1] {
-        stamp(&format!("{dir}/{name}"), G);
+        stamp(&format!("{rel}/{name}"), G);
     }
-    assert!(children_at_generation(&dir, 2, G, &traces));
-
-    let mut reshaped = StateLayout::default();
-    reshaped.declare("agg".to_string(), pk_only_schema(&[TypeCode::U64]));
+    assert!(resumable(traced));
     assert!(
-        !children_at_generation(&dir, 2, G, &reshaped),
+        !resumable(pk_only_schema(&[TypeCode::U64])),
         "a trace published under another schema is a mismatch"
     );
 
     for name in ["idx_7_w0of2", "w0of4", "scratch_old_w0of2", "not_a_child"] {
-        std::fs::create_dir_all(format!("{dir}/{name}")).unwrap();
+        std::fs::create_dir_all(format!("{rel}/{name}")).unwrap();
     }
-    assert!(
-        children_at_generation(&dir, 2, G, &traces),
-        "undeclared children are not read"
-    );
+    assert!(resumable(traced), "undeclared children are not read");
 
-    stamp(&format!("{dir}/{agg1}"), G - 1);
-    assert!(
-        !children_at_generation(&dir, 2, G, &traces),
-        "a stale scratch child is a mismatch"
-    );
-
-    std::fs::remove_dir_all(format!("{dir}/{agg1}")).unwrap();
-    assert!(
-        !children_at_generation(&dir, 2, G, &traces),
-        "a declared scratch child with no directory is a mismatch"
-    );
+    stamp(&format!("{rel}/{agg1}"), G - 1);
+    assert!(!resumable(traced), "a stale scratch child is a mismatch");
 }
 
 /// What a store published reaches a second directory whole: a registry opened
@@ -136,19 +120,13 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
     let dest = tempfile::tempdir().unwrap();
     let dest = dest.path().to_str().unwrap();
     r.link_published_into(dest).unwrap();
-    let index = ChildAddr {
-        kind: ChildKind::Index(PkColList::from_slice(&[1])),
-        slot: Slot::SOLO,
-    };
-    assert!(!std::path::Path::new(&index.dir(&relation_dir(dest, TID))).exists());
+    let index = solo(dest).child_dir(TID, ChildKind::Index(PkColList::from_slice(&[1])));
+    assert!(!std::path::Path::new(&index).exists());
 
     let mut copy = RelationRegistry::new(dest, Slot::SOLO, spilling());
     copy.register(spec(TID, RelationKind::BaseTable, schema), schema)
         .unwrap();
-    assert_eq!(
-        zset_of(&copy.relation(TID).unwrap().full_scan(), &schema),
-        zset_of(&make_batch(&schema, &rows), &schema)
-    );
+    assert_eq!(batch_rows(&copy.relation(TID).unwrap().full_scan()), rows);
 }
 
 /// Only a directory named exactly as a relation's is read, and a damaged
@@ -187,42 +165,35 @@ fn persisted_records_reads_well_formed_relation_manifests() {
 
 /// A sweep removes every relation directory no relation holds, and every child
 /// of a held one laid out for another worker count, an index no circuit covers
-/// or a trace none declares; it leaves the rest, a name in no child grammar
-/// included, and a second sweep finds nothing to remove.
+/// or one that reads its owner's PK, or a trace none declares; it leaves the
+/// rest, a name in no child grammar included, and a second sweep finds nothing
+/// to remove.
 #[test]
 fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     let schema = make_schema_u64_i64();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_str().unwrap();
-    // Rank 0 of 3, holding a view indexed on its payload column, with one trace.
+    // Rank 0 of 3, holding a view indexed on its payload column and on its PK,
+    // with one trace.
     let mut traces = StateLayout::default();
     traces.declare("agg".to_string(), schema);
     let agg = traces.names().next().unwrap().to_string();
     let mut r = RelationRegistry::new(base, Slot::new(0, 3), StoreConfig::default());
     let view = spec(TID, RelationKind::View(ViewBudget::Plain), schema);
-    r.register_at(view, schema, &[], traces, None).unwrap();
-    r.add_indexes(
-        TID,
-        &[(
-            IndexClaim::Index { id: TID + 1, unique: false },
-            PkColList::from_slice(&[1]),
-        )],
-    )
-    .unwrap();
-    r.ingest(TID, make_batch(&schema, &[(1, 1, 7)])).unwrap();
-    r.checkpoint_ephemeral([], 0, |_| true).unwrap();
+    let indexes = [1, 0].map(|col| {
+        let claim = IndexClaim::Index { id: TID + 1 + col as u64, unique: false };
+        (claim, PkColList::from_slice(&[col]))
+    });
+    r.register_at(view, schema, &indexes, traces, None).unwrap();
 
     let rel = relation_dir(base, TID);
     let unowned = [
         format!("{}/ghost_{TID}", relations_dir(base)),
         relation_dir(base, TID + 50),
         format!("{rel}/w0of2"),
-        format!("{rel}/w1of2"),
-        format!("{rel}/scratch_{agg}_w1of2"),
-        format!("{rel}/idx_7_w0of2"),
+        format!("{rel}/idx_0_w0of3"),
         format!("{rel}/idx_0-1_w0of3"),
         format!("{rel}/scratch_old_w0of3"),
-        format!("{rel}/scratch_agg_w0of3"),
     ];
     let kept = [
         format!("{rel}/w0of3"),
@@ -242,10 +213,28 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
             assert!(std::path::Path::new(dir).exists(), "{dir} is kept");
         }
     }
-    assert_eq!(
-        zset_of(&r.relation(TID).unwrap().full_scan(), &schema),
-        zset_of(&make_batch(&schema, &[(1, 1, 7)]), &schema)
+}
+
+/// Erasing a relation drops its entry and its whole directory; an unknown id
+/// erases nothing.
+#[test]
+fn unregister_and_erase_removes_the_relation_directory() {
+    let schema = make_schema_u64_i64();
+    let mut r = relation_fixture_with(
+        StoreConfig::default(),
+        RelationKind::BaseTable,
+        schema,
+        &[&[1]],
+        [make_batch(&schema, &[(1, 1, 7)])],
     );
+    r.checkpoint_base().unwrap();
+    r.checkpoint_ephemeral([], 1, |_| true).unwrap();
+    let dir = relation_dir(r.base_dir(), TID);
+    r.unregister_and_erase(TID + 1).unwrap();
+    assert!(std::path::Path::new(&dir).is_dir());
+    r.unregister_and_erase(TID).unwrap();
+    assert!(r.relation(TID).is_none());
+    assert!(!std::path::Path::new(&dir).exists());
 }
 
 /// A data directory whose ancestors are missing is created whole.

@@ -1,8 +1,8 @@
 use super::{admit_fresh, enforce_unique_pk};
-use crate::storage::flush_barrier;
+use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table, flush_barrier};
 use crate::test_support::{
-    certified, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64,
-    pk_payload_schema, scratch_table, table_shards, zset_of,
+    certified, make_batch, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    new_table, opk_pk, payload0_i64, pk_payload_schema, table_shards, zset_of,
 };
 use gnitz_foundation::rng::Rng;
 use gnitz_wire::TypeCode;
@@ -11,6 +11,18 @@ use gnitz_zset::schema::SchemaDescriptor;
 
 /// `(key index, weight, payload)`.
 type Row = (usize, i64, i64);
+
+/// A store under `dir` opened as a base table's is, so its shards carry the PK
+/// filter a probe consults.
+fn base_store(dir: &tempfile::TempDir, schema: SchemaDescriptor) -> Table {
+    new_table(dir.path(), schema, RecoverySource::SalReplay, DEFAULT_RAM_TIER_BYTES)
+}
+
+/// A batch of `rows` over keys `k`.
+fn rows_of(schema: &SchemaDescriptor, k: &[Vec<u8>], rows: &[Row]) -> Batch {
+    let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|&(i, w, v)| (&k[i][..], w, v)).collect();
+    make_batch_opk(schema, &rows)
+}
 
 /// A key's `(key index, net weight, live payload)` after a step.
 type Live = (usize, i64, Option<i64>);
@@ -100,12 +112,9 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
     for ((name, pk_types, key), flushed) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
         let schema = pk_payload_schema(pk_types);
         let dir = tempfile::tempdir().unwrap();
-        let mut pt = scratch_table(dir.path(), schema);
+        let mut pt = base_store(&dir, schema);
         let k: Vec<Vec<u8>> = (0..=10).map(|i| opk_pk(&schema, &key(i))).collect();
-        let batch = |rows: &[Row]| {
-            let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|&(i, w, v)| (&k[i][..], w, v)).collect();
-            make_batch_opk(&schema, &rows)
-        };
+        let batch = |rows: &[Row]| rows_of(&schema, &k, rows);
 
         for &(step, push, want, live) in SCRIPT {
             let what = format!("{name}, flushed {flushed}: {step}");
@@ -137,7 +146,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
 fn enforce_unique_pk_keeps_heap_strings_intact() {
     let schema = make_schema_pk_u64_payload_string();
     let dir = tempfile::tempdir().unwrap();
-    let mut pt = scratch_table(dir.path(), schema);
+    let mut pt = base_store(&dir, schema);
     let long1: &[u8] = b"the stored payload, long enough for the heap";
     let long2: &[u8] = b"the replacing payload, also on the heap";
     let long3: &[u8] = b"a fresh key's payload, on the heap as well";
@@ -173,14 +182,14 @@ fn enforce_unique_pk_keeps_heap_strings_intact() {
 fn enforce_unique_pk_ordered_walk_matches_map() {
     let schema = pk_payload_schema(&[TypeCode::I64]);
     let dir = tempfile::tempdir().unwrap();
-    let mut pt = scratch_table(dir.path(), schema);
+    let mut pt = base_store(&dir, schema);
     let k: Vec<Vec<u8>> = (0..12i64).map(|i| opk_pk(&schema, &[(i - 6) as u64 as u128])).collect();
     let mut rng = Rng::new(0x2545_F491_4F6C_DD1D);
 
     let mut unordered_pushes = 0;
     for round in 0..300 {
         let len = 1 + rng.gen_range(24) as usize;
-        let rows: Vec<(usize, i64, i64)> = (0..len)
+        let rows: Vec<Row> = (0..len)
             .map(|_| {
                 (
                     rng.gen_range(k.len() as u64) as usize,
@@ -191,10 +200,7 @@ fn enforce_unique_pk_ordered_walk_matches_map() {
             .collect();
         let mut sorted = rows.clone();
         sorted.sort_by(|a, b| k[a.0].cmp(&k[b.0]));
-        let batch = |rows: &[(usize, i64, i64)]| {
-            let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|&(i, w, v)| (&k[i][..], w, v)).collect();
-            make_batch_opk(&schema, &rows)
-        };
+        let batch = |rows: &[Row]| rows_of(&schema, &k, rows);
         unordered_pushes += usize::from(rows != sorted);
 
         let from_map = enforce_unique_pk(&pt, batch(&rows));
@@ -219,31 +225,27 @@ fn enforce_unique_pk_ordered_walk_matches_map() {
     assert!(unordered_pushes > 200, "{unordered_pushes} pushes took the map");
 }
 
-/// A store holding keys `0..4`, and the OPK of keys `0..8`.
-fn fresh_fixture() -> (tempfile::TempDir, crate::storage::Table, SchemaDescriptor, Vec<Vec<u8>>) {
-    let schema = pk_payload_schema(&[TypeCode::U64]);
+/// A store of [`make_schema_u64_i64`] holding keys `0..4`.
+fn fresh_fixture() -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
-    let mut pt = scratch_table(dir.path(), schema);
-    let k: Vec<Vec<u8>> = (0..8u128).map(|i| opk_pk(&schema, &[i])).collect();
-    let held: Vec<(&[u8], i64, i64)> = (0..4).map(|i| (&k[i][..], 1, i as i64)).collect();
-    pt.ingest(make_batch_opk(&schema, &held)).unwrap();
-    (dir, pt, schema, k)
-}
-
-/// A batch of `rows`, `(key index, weight, payload)`, over keys `k`.
-fn rows_of(schema: &SchemaDescriptor, k: &[Vec<u8>], rows: &[Row]) -> Batch {
-    let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|&(i, w, v)| (&k[i][..], w, v)).collect();
-    make_batch_opk(schema, &rows)
+    let mut pt = base_store(&dir, make_schema_u64_i64());
+    pt.ingest(make_batch(
+        &make_schema_u64_i64(),
+        &[(0, 1, 0), (1, 1, 1), (2, 1, 2), (3, 1, 3)],
+    ))
+    .unwrap();
+    (dir, pt)
 }
 
 /// On a batch whose keys are distinct, weighted 1 and not held — unsorted
 /// too — the fresh rule's effective batch is the enforced rule's.
 #[test]
 fn fresh_rule_matches_enforce_on_fresh_keys() {
-    let (_dir, pt, schema, k) = fresh_fixture();
+    let (_dir, pt) = fresh_fixture();
+    let schema = make_schema_u64_i64();
     for rows in [&[(6, 1, 60), (4, 1, 40), (7, 1, 70)][..], &[(5, 1, 50)], &[]] {
-        let fresh = admit_fresh(&pt, rows_of(&schema, &k, rows));
-        let enforced = enforce_unique_pk(&pt, rows_of(&schema, &k, rows));
+        let fresh = admit_fresh(&pt, make_batch(&schema, rows));
+        let enforced = enforce_unique_pk(&pt, make_batch(&schema, rows));
         assert_eq!(zset_of(&fresh, &schema), zset_of(&enforced, &schema), "{rows:?}");
         assert_eq!(fresh.len(), rows.len(), "{rows:?}");
     }
@@ -254,8 +256,8 @@ fn fresh_rule_matches_enforce_on_fresh_keys() {
 #[test]
 #[should_panic(expected = "admitted as fresh")]
 fn fresh_rule_refuses_a_held_key() {
-    let (_dir, pt, schema, k) = fresh_fixture();
-    admit_fresh(&pt, rows_of(&schema, &k, &[(5, 1, 50), (2, 1, 20)]));
+    let (_dir, pt) = fresh_fixture();
+    admit_fresh(&pt, make_batch(&make_schema_u64_i64(), &[(5, 1, 50), (2, 1, 20)]));
 }
 
 /// A debug build refuses a batch admitted as fresh that repeats a key.
@@ -263,8 +265,8 @@ fn fresh_rule_refuses_a_held_key() {
 #[test]
 #[should_panic(expected = "admitted as fresh")]
 fn fresh_rule_refuses_a_repeated_key() {
-    let (_dir, pt, schema, k) = fresh_fixture();
-    admit_fresh(&pt, rows_of(&schema, &k, &[(5, 1, 50), (5, 1, 51)]));
+    let (_dir, pt) = fresh_fixture();
+    admit_fresh(&pt, make_batch(&make_schema_u64_i64(), &[(5, 1, 50), (5, 1, 51)]));
 }
 
 /// A debug build refuses a batch admitted as fresh that weighs a row other than 1.
@@ -272,6 +274,6 @@ fn fresh_rule_refuses_a_repeated_key() {
 #[test]
 #[should_panic(expected = "admitted as fresh")]
 fn fresh_rule_refuses_a_weight_other_than_one() {
-    let (_dir, pt, schema, k) = fresh_fixture();
-    admit_fresh(&pt, rows_of(&schema, &k, &[(5, 2, 50)]));
+    let (_dir, pt) = fresh_fixture();
+    admit_fresh(&pt, make_batch(&make_schema_u64_i64(), &[(5, 2, 50)]));
 }

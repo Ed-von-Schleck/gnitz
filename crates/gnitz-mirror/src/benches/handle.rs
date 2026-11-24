@@ -12,7 +12,7 @@ use gnitz_wire::{KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
 use gnitz_zset_testkit::{certified, encode_schema_record, encode_to_wire_vec, make_batch, make_schema_u64_i64};
 
 use super::*;
-use gnitz_foundation::rng::mix;
+use gnitz_foundation::rng::scatter;
 
 /// Rows the copy starts with, at `v = id`.
 const ROWS: u64 = 200_000;
@@ -23,11 +23,6 @@ const ROUNDS: u64 = 100;
 const READS: u64 = 1000;
 /// Rows a read's range of `v` selects.
 const SELECTED: u64 = 16;
-
-/// 40 scattered bits.
-fn scatter(seq: u64) -> u64 {
-    mix(seq) >> 24
-}
 
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]

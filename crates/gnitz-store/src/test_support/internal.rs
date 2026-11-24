@@ -6,7 +6,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::relation::{
-    IndexClaim, Landing, PkRule, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StateLayout, StoreConfig,
+    IndexClaim, Landing, PkRule, Relation, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig,
 };
 use crate::storage::{DEFAULT_RAM_TIER_BYTES, RecoverySource, Table};
 use gnitz_expr::LogicalProgram;
@@ -185,6 +185,33 @@ pub(crate) fn registered_fixture(
     RelationFixture { registry, _dir: dir }
 }
 
+/// `(a I64, b U64) PK | v I64 NULL` holding `(a, b)` for `a in -2..3`,
+/// `b in 0..4`, then a retraction, an update and an insert, as a base table
+/// indexed on `[0]` and `[0, 1]` — both leading its PK — and on `[2]`.
+pub(crate) fn leading_pk_fixture() -> RelationFixture {
+    use gnitz_wire::TypeCode::{I64, U64};
+    let schema = gnitz_zset_testkit::keyed_schema(&[I64, U64], &[gnitz_zset::schema::SchemaColumn::new(I64, true)]);
+    let batch = |rows: &[(i64, u64, u64, i64)]| {
+        let mut bb = BatchBuilder::new(&schema);
+        for &(a, b, v, w) in rows {
+            bb.begin_row_natives(&[a as u64 as u128, b as u128], w);
+            bb.put_int(v as u128);
+            bb.end_row();
+        }
+        bb.finish()
+    };
+    let first: Vec<_> = (-2..3i64)
+        .flat_map(|a| (0..4u64).map(move |b| (a, b, b * 7, 1)))
+        .collect();
+    let second = [(0, 1, 7, -1), (1, 2, 14, -1), (1, 2, 99, 1), (2, 9, 5, 1)];
+    relation_fixture(
+        RelationKind::BaseTable,
+        schema,
+        &[&[0], &[0, 1], &[2]],
+        [batch(&first), batch(&second)],
+    )
+}
+
 /// `v`'s key image in an I64 column.
 pub(crate) fn img(v: i64) -> u128 {
     gnitz_wire::key_image(gnitz_wire::TypeCode::I64, v as u64 as u128)
@@ -236,9 +263,14 @@ pub(crate) fn id_rows(
     bb.finish()
 }
 
-/// Assert `ix` holds exactly the entries `rows` project to, weights included.
-pub(crate) fn assert_index_holds(ix: &SecondaryIndex, rows: &Batch, what: impl std::fmt::Display) {
-    let got = ix.cursor().materialize();
+/// Assert `owner`'s index on `cols` holds exactly the entries `rows` project
+/// to, weights included.
+pub(crate) fn assert_index_holds(owner: &Relation, cols: &[u32], rows: &Batch, what: impl std::fmt::Display) {
+    let ix = owner.index_on(cols).unwrap();
+    let got = ix
+        .entry_store(owner)
+        .open_cursor(crate::relation::Cut::Now)
+        .materialize();
     let schema = *got.schema();
     let want = gnitz_zset::algebra::index_entries(rows, ix.key_spec(), &schema);
     assert_eq!(

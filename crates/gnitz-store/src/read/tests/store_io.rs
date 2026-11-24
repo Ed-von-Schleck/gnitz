@@ -1,8 +1,8 @@
 use super::*;
 use crate::relation::{IndexClaim, Landing, PkRule, RelationKind};
 use crate::test_support::{
-    RelationFixture, TID, assert_skips_as_zeroes, batch_rows, col_range, img, make_batch, make_schema_u64_i64,
-    pk_only_schema, relation_fixture, skipping_rounds, skipping_schema, zset_of,
+    RelationFixture, TID, assert_skips_as_zeroes, batch_rows, col_range, img, leading_pk_fixture, make_batch,
+    make_schema_u64_i64, pk_only_schema, relation_fixture, skipping_rounds, skipping_schema, zset_of,
 };
 use gnitz_foundation::rng::Rng;
 use gnitz_trace::runs::Run;
@@ -463,6 +463,32 @@ fn an_index_probe_answers_each_held_span_up_to_its_cap() {
     let alone: Vec<_> = vals.iter().flat_map(|&v| probe(64, &[v])).collect();
     assert_eq!(probe(64, &vals), alone);
     assert_eq!(alone, entries(2..8));
+}
+
+/// An index whose columns lead the owner's PK answers a probe off the owner's
+/// rows: each row under a probed span, its entry the row's PK.
+#[test]
+fn an_index_leading_the_pk_probes_the_owners_rows() {
+    let r = leading_pk_fixture();
+    let rel = r.relation(TID).unwrap();
+    let owner = rel.full_scan();
+    let entries: Vec<&[u8]> = (0..owner.len()).map(|i| owner.get_pk_bytes(i)).collect();
+    for cols in [&[0u32][..], &[0, 1]] {
+        let key_spec = rel.index_on(cols).unwrap().key_spec();
+        let (k, ix_schema) = (key_spec.key_size(), key_spec.index_schema(&rel.schema()));
+        let mut spans: Vec<&[u8]> = entries.iter().map(|e| &e[..k]).collect();
+        spans.dedup();
+        let picked: Vec<&[u8]> = spans.into_iter().step_by(2).collect();
+        let mut want = Batch::empty_with_schema(&ix_schema);
+        for e in entries.iter().filter(|e| picked.contains(&&e[..k])) {
+            want.push_key_row(e, 1);
+        }
+        let probe = Probe::Index(PkColList::from_slice(cols), std::num::NonZeroU64::MAX);
+        let got = r
+            .probe(TID, probe, gnitz_zset::schema::pk_keys(k, picked.iter().copied()))
+            .unwrap();
+        assert_eq!(zset_of(&got, &ix_schema), zset_of(&want, &ix_schema), "{cols:?}");
+    }
 }
 
 /// A key list at a stride other than the store it reads, an index the relation has not

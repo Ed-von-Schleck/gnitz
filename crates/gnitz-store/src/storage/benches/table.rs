@@ -1,7 +1,7 @@
 use super::{Cut, DEFAULT_RAM_TIER_BYTES, RecoverySource, flush_barrier};
 use crate::test_support::{certified, make_batch, make_schema_u64_i64, new_table, scratch_table, table_shards};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
-use gnitz_foundation::rng::mix;
+use gnitz_foundation::rng::{mix, scatter};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::pk_keys;
 
@@ -196,7 +196,7 @@ fn sealed_read_bench() {
             t.ingest(certified(make_batch(&schema, &rows))).unwrap();
         }
         for from in (0..pending).step_by(per as usize) {
-            let row = |s: u64| ((mix(s) >> 24) % held, 1, -1 - s as i64);
+            let row = |s: u64| (scatter(s) % held, 1, -1 - s as i64);
             let rows: Vec<_> = (from..from + per).map(row).collect();
             t.ingest_pending(make_batch(&schema, &rows));
         }

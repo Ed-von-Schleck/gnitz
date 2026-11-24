@@ -2,7 +2,7 @@ use super::super::table::{DEFAULT_RAM_TIER_BYTES, MEMTABLE_BYTES};
 use super::*;
 use crate::test_support::{certified, make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::{self, Counter, Counters, Event};
-use gnitz_foundation::rng::mix;
+use gnitz_foundation::rng::scatter;
 use gnitz_zset::repr::BatchBuilder;
 use std::rc::Rc;
 
@@ -36,11 +36,6 @@ fn rows_folded(runs_before: &[Rc<Batch>], rows_with_pushed: usize, set: &RunSet)
         true => 0,
         false => rows_with_pushed - runs_before[..kept].iter().map(|r| r.len()).sum::<usize>(),
     }
-}
-
-/// 40 scattered bits, distinct per `seq`.
-fn scatter(seq: u64) -> u64 {
-    mix(seq) >> 24
 }
 
 /// `RunSet::fold` over string payloads: instructions per input row, and the

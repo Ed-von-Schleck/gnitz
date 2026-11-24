@@ -96,12 +96,6 @@ impl SecondaryIndex {
         self.key_spec.leads_pk()
     }
 
-    /// Non-compacting cursor over this index's own store, in the index schema;
-    /// panics on an index that [reads its owner's PK](Self::reads_owner_pk).
-    pub fn cursor(&self) -> ReadCursor {
-        self.table.as_ref().expect(NOT_HELD).open_cursor(Cut::Now)
-    }
-
     /// The store whose row keys are this process's entries of the index, in
     /// entry order: its own, or `owner`'s where they [are its
     /// PKs](Self::reads_owner_pk). Either holds one row per key, so a reader of

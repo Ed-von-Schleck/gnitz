@@ -1,6 +1,6 @@
 use super::*;
-use crate::storage::flush_barrier;
-use crate::test_support::{certified, make_batch, make_schema_u64_i64, scratch_table};
+use crate::storage::{flush_barrier, shard_files};
+use crate::test_support::{certified, make_batch, make_schema_u64_i64, scratch_table, solo};
 use gnitz_zset::algebra::Slot;
 
 /// `(files, rows, bytes)` of relation `id`'s store `store` across its levels.
@@ -10,11 +10,6 @@ fn store(usage: &DiskUsage, id: u64, store: &str) -> (u64, u64, u64) {
         .iter()
         .filter(|((rel, label, _), _)| *rel == id && label == store)
         .fold((0, 0, 0), |(f, r, b), (_, t)| (f + t.files, r + t.rows, b + t.bytes))
-}
-
-/// Relation `id`'s `kind` store under `base`.
-fn store_dir(base: &str, id: u64, kind: ChildKind) -> String {
-    ChildAddr { kind, slot: Slot::SOLO }.dir(&relation_dir(base, id))
 }
 
 /// Publish `rows` as one shard of the store at `dir`.
@@ -31,25 +26,30 @@ fn a_directory_is_summed_by_store_with_identical_shards_named() {
     let base = tmp.path().to_str().unwrap();
     assert_eq!(disk_usage(base).unwrap().shard_total.bytes, 0, "an empty directory");
     let rows: Vec<(u64, i64, i64)> = (1..=50).map(|i| (i, 1, i as i64 * 3)).collect();
-    let view_rows = store_dir(base, 20, ChildKind::Rows);
+    let store_dir = |id, kind| solo(base).child_dir(id, kind);
+    let view_rows = store_dir(20, ChildKind::Rows);
     publish(&view_rows, &rows);
-    publish(&store_dir(base, 20, ChildKind::Scratch("reduce_2")), &rows);
-    publish(&store_dir(base, 21, ChildKind::Rows), &rows[..7]);
+    publish(&store_dir(20, ChildKind::Scratch("reduce_2")), &rows);
+    publish(&store_dir(21, ChildKind::Rows), &rows[..7]);
     std::fs::write(format!("{base}/wal.sal"), [0u8; 100]).unwrap();
     // A system family keeps its one store in its relation directory.
     publish(&relation_dir(base, 3), &rows[..3]);
     // A shard file the manifest does not name, and a second name of one it does.
-    std::fs::copy(format!("{view_rows}/shard_1.db"), format!("{view_rows}/shard_9.db")).unwrap();
+    let [(shard, Some(0))] = &shard_files(&view_rows).unwrap()[..] else {
+        panic!("the view's rows are one published shard")
+    };
+    std::fs::copy(shard, format!("{view_rows}/shard_9.db")).unwrap();
     let linked = ChildAddr {
         kind: ChildKind::Rows,
         slot: Slot::new(1, 2),
     }
     .dir(&relation_dir(base, 20));
     std::fs::create_dir_all(&linked).unwrap();
-    std::fs::hard_link(format!("{view_rows}/shard_1.db"), format!("{linked}/shard_1.db")).unwrap();
+    let name = std::path::Path::new(shard).file_name().unwrap();
+    std::fs::hard_link(shard, std::path::Path::new(&linked).join(name)).unwrap();
 
     let usage = disk_usage(base).unwrap();
-    let one = std::fs::metadata(format!("{view_rows}/shard_1.db")).unwrap().len();
+    let one = std::fs::metadata(shard).unwrap().len();
     assert_eq!(store(&usage, 20, "scratch_reduce_2"), (1, 50, one));
     assert_eq!(store(&usage, 21, "rows").1, 7);
     assert_eq!(store(&usage, 3, "rows").1, 3);

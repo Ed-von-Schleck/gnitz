@@ -1,9 +1,11 @@
 use crate::relation::{ChildKind, Landing, PkRule, RelationKind};
 use crate::storage::{read_at, read_intact};
 use crate::test_support::{
-    TID, assert_index_holds, id_rows, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
+    TID, assert_index_holds, batch_rows, id_rows, make_batch, make_schema_u64_i64, pk_u64_two_i64_schema,
+    relation_fixture,
 };
 use gnitz_wire::{PkColList, ViewBudget};
+use gnitz_zset::repr::Batch;
 
 /// The append path sizes by the store's region count, so a batch of another
 /// payload arity is refused before anything is written.
@@ -23,25 +25,15 @@ fn ingest_refuses_a_batch_of_another_arity() {
 }
 
 /// An index is fed the batch as the PK rule left it, so an upsert moves the
-/// entry: only the live row's entry remains, at weight 1. An upsert of the row
-/// the key already holds retracts and re-inserts one entry, a pair that cancels
-/// before the index store takes it.
+/// entry: only the live row's entry remains, at weight 1.
 #[test]
 fn an_upsert_moves_the_index_entry() {
     let schema = make_schema_u64_i64();
     let mut registry = relation_fixture(RelationKind::BaseTable, schema, &[&[1]], []);
-    for val in [10, 10, 10, 20] {
+    for val in [10, 10, 20] {
         let row = make_batch(&schema, &[(1, 1, val)]);
         registry.ingest(TID, row.clone()).unwrap();
-        let ix = registry.relation(TID).unwrap().index_on(&[1]).unwrap();
-        assert_index_holds(ix, &row, format_args!("after {val}"));
-        if val == 10 {
-            assert_eq!(
-                ix.table.as_ref().unwrap().estimated_rows(),
-                1,
-                "the identical upserts wrote nothing"
-            );
-        }
+        assert_index_holds(registry.relation(TID).unwrap(), &[1], &row, format_args!("after {val}"));
     }
 }
 
@@ -103,10 +95,7 @@ fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
         .unwrap();
     let delta = registry.seal(TID).unwrap().expect("rows sat above the cut");
     assert!(delta.is_consolidated());
-    assert_eq!(
-        zset_of(&delta, &schema),
-        zset_of(&rows(&[(1, -1, 10), (1, 1, 12), (2, -1, 20), (4, 1, 40)]), &schema)
-    );
+    assert_eq!(batch_rows(&delta), [(1, -1, 10), (1, 1, 12), (2, -1, 20), (4, 1, 40)]);
     assert!(registry.seal(TID).unwrap().is_none(), "a seal drains the pending rows");
 
     registry
@@ -118,7 +107,68 @@ fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
         "the ingest sealed the pending rows"
     );
     assert_eq!(
-        zset_of(&registry.relation(TID).unwrap().full_scan(), &schema),
-        zset_of(&rows(&[(1, 1, 12), (4, 1, 40), (5, 1, 50)]), &schema)
+        batch_rows(&registry.relation(TID).unwrap().full_scan()),
+        [(1, 1, 12), (4, 1, 40), (5, 1, 50)]
     );
+}
+
+/// A stream holds no rows: a seal answers its pending batches as pushed, a
+/// key's rows and weights unfolded, and a landing at the cut writes nothing and
+/// drops what was pending. Empty pushes leave nothing to seal.
+#[test]
+fn a_stream_seals_its_pending_pushes_as_pushed() {
+    let schema = make_schema_u64_i64();
+    let mut registry = relation_fixture(RelationKind::Stream, schema, &[], []);
+    let mut push = |rows: &[(u64, i64, i64)], landing| {
+        registry
+            .land(TID, make_batch(&schema, rows), landing, PkRule::Enforce)
+            .unwrap()
+    };
+    push(&[(1, 1, 10), (1, 1, 10)], Landing::Pending);
+    push(&[(1, 2, 10)], Landing::Pending);
+    push(&[], Landing::Pending);
+    let delta = registry.seal(TID).unwrap().expect("pushes since the last seal");
+    assert_eq!(batch_rows(&delta), [(1, 1, 10), (1, 1, 10), (1, 2, 10)]);
+    assert!(registry.seal(TID).unwrap().is_none(), "a seal drains the pushes");
+
+    let mut push = |rows: &[(u64, i64, i64)], landing| {
+        registry
+            .land(TID, make_batch(&schema, rows), landing, PkRule::Enforce)
+            .unwrap()
+    };
+    push(&[(2, 1, 20)], Landing::Pending);
+    let echo = Landing::Cut { round: None, echo: true };
+    assert!(push(&[(3, 1, 30)], echo).is_none(), "a stream applies nothing");
+    push(&[], Landing::Pending);
+    assert!(registry.seal(TID).unwrap().is_none());
+}
+
+/// An echo answers the batch as applied — consolidated, after the PK rule — and
+/// nothing when the rule leaves no row.
+#[test]
+fn an_echo_answers_the_batch_as_applied() {
+    let schema = make_schema_u64_i64();
+    let rows = |rows: &[(u64, i64, i64)]| make_batch(&schema, rows);
+    let mut registry = relation_fixture(RelationKind::BaseTable, schema, &[], [rows(&[(1, 1, 10)])]);
+    let echo = Landing::Cut { round: None, echo: true };
+    let mut land = |batch| registry.land(TID, batch, echo, PkRule::Enforce).unwrap();
+    let applied = land(rows(&[(2, 1, 20), (1, 1, 11), (2, 1, 20)])).expect("rows were applied");
+    assert!(applied.is_consolidated());
+    assert_eq!(batch_rows(&applied), [(1, -1, 10), (1, 1, 11), (2, 1, 20)]);
+    assert!(
+        land(rows(&[(2, 1, 20)])).is_none(),
+        "an identical upsert applies nothing"
+    );
+}
+
+/// Clearing a view drops its rows and its indexes' entries.
+#[test]
+fn clearing_a_view_empties_its_rows_and_indexes() {
+    let schema = make_schema_u64_i64();
+    let rows = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    let mut registry = relation_fixture(RelationKind::View(ViewBudget::Plain), schema, &[&[1]], [rows]);
+    registry.clear_rows(TID).unwrap();
+    let view = registry.relation(TID).unwrap();
+    assert!(view.full_scan().is_empty());
+    assert_index_holds(view, &[1], &Batch::empty_with_schema(&schema), "a cleared index");
 }

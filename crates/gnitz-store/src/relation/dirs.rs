@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use gnitz_foundation::posix_io::{create_dir_all_durable, fsync_dir};
 use gnitz_wire::PkColList;
 
-use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, StateLayout};
+use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex};
 use crate::storage::{link_stores, manifest_path, read_at, read_intact, retire_stores};
 use gnitz_foundation::gnitz_debug;
 use gnitz_zset::algebra::Slot;
@@ -101,18 +101,6 @@ impl<'a> ChildAddr<'a> {
 /// — one per launched rank.
 pub(super) fn cluster_children(kind: ChildKind<'_>, num_workers: u32) -> impl Iterator<Item = ChildAddr<'_>> {
     (0..num_workers).map(move |rank| ChildAddr { kind, slot: Slot::new(rank, num_workers) })
-}
-
-/// Whether, on each of `num_workers` ranks under `rel_dir`, the rows child and
-/// the scratch child of every trace `layout` declares carry a manifest at
-/// `generation`; `false` on any I/O failure. A trace with no directory is a
-/// mismatch: a crash part-way through retiring a view's children can take it
-/// and leave its siblings.
-fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64, layout: &StateLayout) -> bool {
-    let kinds = std::iter::once(ChildKind::Rows).chain(layout.names().map(ChildKind::Scratch));
-    kinds
-        .flat_map(|kind| cluster_children(kind, num_workers))
-        .all(|c| matches!(read_at(&c.dir(rel_dir), generation), Ok(Some(_))))
 }
 
 /// Immediate sub-directory names of `path`, none if it is missing. Collected
@@ -280,21 +268,23 @@ impl RelationRegistry {
 
     /// Whether the rows child and every trace child of view `view_id` carry a
     /// manifest at `generation` on **every launched rank** — the store half of
-    /// the resume verdict. `false` for an unregistered id.
+    /// the resume verdict. `false` for an unregistered id, and on any I/O
+    /// failure. A trace with no directory is a mismatch: a crash part-way
+    /// through retiring a view's children can take it and leave its siblings.
     pub fn view_children_resumable(&self, view_id: u64, generation: u64) -> bool {
         // A worker cannot speak for its peers.
         assert!(
             matches!(self.residency, Residency::Master | Residency::Origin),
             "view_children_resumable reads every rank's children"
         );
-        self.relations.get(&view_id).is_some_and(|view| {
-            children_at_generation(
-                &relation_dir(&self.base_dir, view_id),
-                self.slot.of,
-                generation,
-                &view.traces,
-            )
-        })
+        let Some(view) = self.relations.get(&view_id) else {
+            return false;
+        };
+        let rel_dir = relation_dir(&self.base_dir, view_id);
+        let kinds = std::iter::once(ChildKind::Rows).chain(view.traces.names().map(ChildKind::Scratch));
+        kinds
+            .flat_map(|kind| cluster_children(kind, self.slot.of))
+            .all(|c| matches!(read_at(&c.dir(&rel_dir), generation), Ok(Some(_))))
     }
 
     /// Remove every relation directory and child this registry does not own — a

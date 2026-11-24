@@ -292,7 +292,18 @@ fn held(engine: &CatalogEngine, id: u64) -> (usize, i64) {
 fn index_weight(engine: &CatalogEngine, tid: u64) -> i64 {
     let entry = engine.registry.relation_or_err(tid).unwrap();
     assert_eq!(entry.indexes().len(), 1, "one index circuit");
-    sum_weights(entry.indexes()[0].cursor())
+    let mut spans = engine
+        .registry
+        .key_spans(tid, entry.indexes()[0].cols().as_slice())
+        .unwrap();
+    let mut weight = 0;
+    while !spans.chunk().is_empty() {
+        weight += (0..spans.chunk().len())
+            .map(|i| spans.chunk().get_weight(i))
+            .sum::<i64>();
+        spans.advance();
+    }
+    weight
 }
 
 /// Seal `source` and tick what the seal answers, as a worker's `Tick` does.

@@ -1,7 +1,15 @@
 use super::*;
 use crate::storage::manifest_path;
-use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, solo, spec, zset_of};
+use crate::test_support::{
+    TID, assert_index_holds, batch_rows, make_batch, make_schema_u64_i64, pk_only_schema, relation_fixture, solo, spec,
+};
 use gnitz_wire::TypeCode;
+use gnitz_zset::schema::SchemaColumn;
+use std::path::Path;
+
+fn index(id: u64, unique: bool) -> IndexClaim {
+    IndexClaim::Index { id, unique }
+}
 
 /// A master creates each relation's directory, so it exists once the DDL is
 /// acknowledged, and opens no child store under it.
@@ -9,24 +17,37 @@ use gnitz_wire::TypeCode;
 fn a_master_creates_the_relation_directory_and_no_child() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = RelationRegistry::master(tmp.path().to_str().unwrap(), 1, StoreConfig::default());
+    let schema = make_schema_u64_i64();
+    let indexes = [(index(999, false), PkColList::from_slice(&[1]))];
     registry
-        .register(
-            spec(50, RelationKind::BaseTable, make_schema_u64_i64()),
-            make_schema_u64_i64(),
-        )
-        .unwrap();
-    registry
-        .add_indexes(
-            50,
-            &[(
-                IndexClaim::Index { id: 999, unique: false },
-                PkColList::from_slice(&[1]),
-            )],
+        .register_at(
+            spec(50, RelationKind::BaseTable, schema),
+            schema,
+            &indexes,
+            StateLayout::default(),
+            None,
         )
         .unwrap();
     let dir = relation_dir(registry.base_dir(), 50);
-    assert!(std::path::Path::new(&dir).is_dir());
+    assert!(Path::new(&dir).is_dir());
     assert_eq!(dirs::subdir_names(&dir).unwrap(), Vec::<String>::new());
+}
+
+/// An index whose columns lead the owner's PK reads its entries off the owner's
+/// rows, so it opens no store of its own; any other index does.
+#[test]
+fn an_index_leading_the_pk_keeps_no_store() {
+    let schema = gnitz_zset_testkit::keyed_schema(
+        &[TypeCode::I64, TypeCode::U64],
+        &[SchemaColumn::new(TypeCode::I64, true)],
+    );
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[&[0], &[0, 1], &[2]], []);
+    let rel = r.relation(TID).unwrap();
+    for (cols, leads) in [(&[0u32][..], true), (&[0, 1], true), (&[2], false)] {
+        assert_eq!(rel.index_on(cols).unwrap().reads_owner_pk(), leads, "{cols:?}");
+        let dir = r.child_dir(TID, ChildKind::Index(PkColList::from_slice(cols)));
+        assert_eq!(Path::new(&dir).exists(), !leads, "{cols:?}");
+    }
 }
 
 /// A view told to resume opens only from its manifests: its store from the
@@ -88,21 +109,17 @@ fn a_held_id_is_not_registered_again() {
     registry
         .register(spec(9, RelationKind::BaseTable, schema), schema)
         .unwrap();
-    let rows = make_batch(&schema, &[(1, 1, 10)]);
-    registry.ingest(9, rows.clone()).unwrap();
+    registry.ingest(9, make_batch(&schema, &[(1, 1, 10)])).unwrap();
 
     let err = registry
         .register(spec(9, RelationKind::BaseTable, schema), schema)
         .unwrap_err();
     assert!(err.contains("already registered"), "{err}");
-    assert_eq!(
-        zset_of(&registry.relation(9).unwrap().full_scan(), &schema),
-        zset_of(&rows, &schema)
-    );
+    assert_eq!(batch_rows(&registry.relation(9).unwrap().full_scan()), [(1, 1, 10)]);
 }
 
-/// A registration whose index cannot be entered enters nothing, so the same
-/// relation registers again without it.
+/// A registration or an index addition whose index cannot be entered enters
+/// nothing, so the same relation registers again without it.
 #[test]
 fn a_refused_index_rolls_its_registration_back() {
     let tmp = tempfile::tempdir().unwrap();
@@ -110,14 +127,79 @@ fn a_refused_index_rolls_its_registration_back() {
     let mut registry = solo(tmp.path());
     // A UNIQUE index on a view is refused: its circuit cannot refuse a duplicate.
     let view = spec(9, RelationKind::View(ViewBudget::Plain), schema);
-    let unique = (IndexClaim::Index { id: 10, unique: true }, PkColList::from_slice(&[1]));
+    let (plain, unique) = (
+        (index(10, false), PkColList::from_slice(&[1])),
+        (index(11, true), PkColList::from_slice(&[0])),
+    );
     assert!(
         registry
-            .register_at(view, schema, &[unique], StateLayout::default(), None)
+            .register_at(view, schema, &[plain, unique], StateLayout::default(), None)
             .is_err()
     );
     assert!(registry.relation(9).is_none(), "a refused registration enters nothing");
     registry
         .register(view, schema)
         .expect("the relation registers once its index is gone");
+    assert!(registry.add_indexes(9, &[plain, unique]).is_err());
+    assert!(
+        registry.relation(9).unwrap().indexes().is_empty(),
+        "a refused addition enters nothing"
+    );
+}
+
+/// An index reopened beside its owner resumes from the manifest the owner's
+/// checkpoint published it with, and is filled from the owner when its own
+/// manifest is gone or of another generation — one a release left behind.
+/// Either way it holds the owner's entries.
+#[test]
+fn a_reopened_index_resumes_only_at_its_owners_generation() {
+    let schema = make_schema_u64_i64();
+    let spec = spec(9, RelationKind::View(ViewBudget::Plain), schema);
+    let indexes = [(index(1, false), PkColList::from_slice(&[1]))];
+    let rows = make_batch(&schema, &[(1, 1, 30), (2, 1, 10), (3, 1, 20)]);
+    // A registry over `base` at `generation`, and how many indexes it filled.
+    let reopen = |base: &Path, generation: u64| {
+        let mut r = solo(base);
+        let filled = r
+            .register_at(spec, schema, &indexes, StateLayout::default(), Some(generation))
+            .unwrap();
+        assert_index_holds(
+            r.relation(9).unwrap(),
+            &[1],
+            &rows,
+            format_args!("generation {generation}"),
+        );
+        (r, filled)
+    };
+    for gone in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut origin = solo(tmp.path());
+        origin
+            .register_at(spec, schema, &indexes, StateLayout::default(), None)
+            .unwrap();
+        origin.ingest(9, rows.clone()).unwrap();
+        origin.checkpoint_ephemeral([], 4, |_| true).unwrap();
+        drop(origin);
+        assert_eq!(reopen(tmp.path(), 4).1, 0, "published with its owner");
+
+        let generation = match gone {
+            true => {
+                let dir = solo(tmp.path()).child_dir(9, ChildKind::Index(indexes[0].1));
+                std::fs::remove_file(manifest_path(&dir)).unwrap();
+                4
+            }
+            // The owner alone publishes at 5: the released index keeps its manifest at 4.
+            false => {
+                let (mut r, _) = reopen(tmp.path(), 4);
+                r.release_index(9, indexes[0].0);
+                r.checkpoint_ephemeral([], 5, |_| true).unwrap();
+                5
+            }
+        };
+        assert_eq!(
+            reopen(tmp.path(), generation).1,
+            1,
+            "gone={gone}: filled from the owner"
+        );
+    }
 }

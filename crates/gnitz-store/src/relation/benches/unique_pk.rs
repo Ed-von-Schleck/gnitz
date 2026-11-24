@@ -1,8 +1,9 @@
 //! The base-table write path, in instructions per pushed row: `enforce_unique_pk`
 //! against the store alone, and the registry's whole write of the push — as a
-//! table no view scans takes it, and as a scanned one does, above the cut and
-//! sealed after every push and after every [`TICK_ROWS`]. A fresh arm's pushes
-//! are also written as a table no view scans takes them under [`PkRule::Fresh`].
+//! table no view scans takes it, as a scanned one does, above the cut and
+//! sealed after every push and after every [`TICK_ROWS`], and as an indexed
+//! one does. A fresh arm's pushes are also written as a table no view scans
+//! takes them under [`PkRule::Fresh`].
 //!
 //! `cd crates && cargo test -p gnitz-store --release unique_pk_bench -- --ignored --nocapture --test-threads=1`
 
@@ -12,7 +13,7 @@ use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
     TID, make_schema_pk_u64_payload_string, make_schema_u64_i64, relation_fixture_with, table_shards, u64_pk_schema,
 };
-use gnitz_foundation::rng::mix;
+use gnitz_foundation::rng::scatter;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -28,11 +29,6 @@ const TICK_ROWS: u64 = 10_000;
 
 /// `(pk, weight, payload)` of the `seq`-th pushed row.
 type Row = fn(u64) -> (u64, i64, u64);
-
-/// 40 scattered bits.
-fn scatter(seq: u64) -> u64 {
-    mix(seq) >> 24
-}
 
 /// U64 pk + eight payload columns of mixed widths, one of them a STRING.
 fn wide_schema() -> SchemaDescriptor {
@@ -126,28 +122,35 @@ fn unique_pk_bench() {
 
     let counter = gnitz_foundation::perf::Counter::instructions();
     println!(
-        "{:<26} {:>5} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>11}",
-        "instr/row", "push", "enforce", "write", "enforce", "seal/push", "enforce", "seal/tick", "fresh write"
+        "{:<26} {:>5} | {:>9} {:>9} {:>9} {:>9} {:>9} | {:>11}",
+        "instr/row", "push", "enforce", "write", "seal/push", "seal/tick", "indexed", "fresh write"
     );
     for (label, schema, tier, row, eff_per_row) in arms {
         for per in [1, 1000] {
             let fresh = label.starts_with("fresh");
-            // Rows between two seals, `None` being the table no view scans, and
-            // the PK rule the write is held to.
+            // The first payload column an index can key on, if any.
+            let key_col = (1..schema.num_columns() as u32)
+                .find(|&ci| schema.columns()[ci as usize].type_code != TypeCode::String);
+            // Rows between two seals, `None` being the table no view scans, the
+            // PK rule the write is held to, and the column an index takes it
+            // on. The first cell measures enforce too.
             let cells = [
-                Some((None, PkRule::Enforce)),
-                Some((Some(per), PkRule::Enforce)),
-                Some((Some(TICK_ROWS), PkRule::Enforce)),
-                fresh.then_some((None, PkRule::Fresh)),
-            ]
-            .map(|cell| {
-                let (tick, rule) = cell?;
+                Some((None, PkRule::Enforce, None)),
+                Some((Some(per), PkRule::Enforce, None)),
+                Some((Some(TICK_ROWS), PkRule::Enforce, None)),
+                key_col.map(|c| (None, PkRule::Enforce, Some(c))),
+                fresh.then_some((None, PkRule::Fresh, None)),
+            ];
+            let measured = cells.iter().enumerate().map(|(at, cell)| {
+                let (tick, rule, indexed) = (*cell)?;
                 let config = StoreConfig {
                     ram_tier_bytes: tier,
                     ..StoreConfig::default()
                 };
                 let held = pushes(&schema, 1000, |s| (s, 1, 0));
-                let mut r = relation_fixture_with(config, RelationKind::BaseTable, schema, &[], held);
+                let key = indexed.map(|c| [c]);
+                let indexes: Vec<&[u32]> = key.iter().map(|k| &k[..]).collect();
+                let mut r = relation_fixture_with(config, RelationKind::BaseTable, schema, &indexes, held);
                 let spilled = tier == SPILL_TIER;
                 let in_shards = |r: &crate::test_support::RelationFixture| {
                     !table_shards(r.relation(TID).unwrap().table()).is_empty()
@@ -157,33 +160,38 @@ fn unique_pk_bench() {
                 let landing = tick.map_or(Landing::CUT, |_| Landing::Pending);
                 let (mut enforce, mut write, mut eff_rows) = (0, 0, 0);
                 for (push, b) in (1..).zip(pushes(&schema, per, row)) {
-                    let probe = b.clone();
-                    let table = r.relation(TID).unwrap().table();
-                    let (eff, e) = counter.measure(|| enforce_unique_pk(table, probe));
-                    eff_rows += eff.len() as u64;
-                    drop(eff);
+                    if at == 0 {
+                        let probe = b.clone();
+                        let table = r.relation(TID).unwrap().table();
+                        let (eff, e) = counter.measure(|| enforce_unique_pk(table, probe));
+                        eff_rows += eff.len() as u64;
+                        drop(eff);
+                        enforce += e;
+                    }
                     let ((), w) = counter.measure(|| {
                         r.land(TID, b, landing, rule).unwrap();
                         if tick.is_some_and(|rows| push * per % rows == 0) {
                             black_box(r.seal(TID).unwrap());
                         }
                     });
-                    enforce += e;
                     write += w;
                 }
                 assert_eq!(in_shards(&r), spilled, "{label}: spilled");
                 assert!(
-                    per > 1 || eff_rows == ROWS * eff_per_row,
+                    at != 0 || per > 1 || eff_rows == ROWS * eff_per_row,
                     "{label}: {eff_rows} effective rows"
                 );
                 Some([enforce, write].map(|instructions: u64| instructions as f64 / ROWS as f64))
             });
-            let [Some([e0, s0]), Some([e1, s1]), Some([e2, s2]), fresh_write] = cells else {
+            let [Some([enforce, s0]), Some([_, s1]), Some([_, s2]), indexed, fresh_write] =
+                <[_; 5]>::try_from(measured.collect::<Vec<_>>()).unwrap()
+            else {
                 unreachable!("every arm writes under the enforced rule")
             };
-            let f = fresh_write.map_or("-".to_string(), |[_, w]| format!("{w:.1}"));
+            let [indexed, fresh_write] =
+                [indexed, fresh_write].map(|w| w.map_or("-".to_string(), |[_, w]| format!("{w:.1}")));
             println!(
-                "{label:<26} {per:>5} | {e0:>9.1} {s0:>9.1} | {e1:>9.1} {s1:>9.1} | {e2:>9.1} {s2:>9.1} | {f:>11}"
+                "{label:<26} {per:>5} | {enforce:>9.1} {s0:>9.1} {s1:>9.1} {s2:>9.1} {indexed:>9} | {fresh_write:>11}"
             );
         }
     }

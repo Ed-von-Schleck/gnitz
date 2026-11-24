@@ -36,6 +36,12 @@ pub fn mix(i: u64) -> u64 {
     i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+/// The high 40 bits of [`mix`]: consecutive values land scattered across a
+/// 40-bit range.
+pub fn scatter(i: u64) -> u64 {
+    mix(i) >> 24
+}
+
 /// splitmix64's finalizer: a bijection of `u64` whose every output bit
 /// depends on every input bit.
 pub fn splitmix(i: u64) -> u64 {
