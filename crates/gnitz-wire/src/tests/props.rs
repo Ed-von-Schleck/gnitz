@@ -43,3 +43,23 @@ fn cluster_by_takes_a_prefix_only_on_a_keyed_distribution() {
             .contains("(k=2)")
     );
 }
+
+/// Each budget alone names its view class; both at once are refused.
+#[test]
+fn from_budgets_names_one_view_class() {
+    let n = NonZeroU64::new(7);
+    assert_eq!(ViewBudget::from_budgets(None, None), Ok(ViewBudget::Plain));
+    assert_eq!(
+        ViewBudget::from_budgets(n, None),
+        Ok(ViewBudget::Bounded { capacity_bytes: n.unwrap() })
+    );
+    assert_eq!(
+        ViewBudget::from_budgets(None, n),
+        Ok(ViewBudget::Fed { delta_bytes: n.unwrap() })
+    );
+    assert!(
+        ViewBudget::from_budgets(n, n)
+            .unwrap_err()
+            .contains("cannot carry a delta feed")
+    );
+}

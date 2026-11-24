@@ -261,25 +261,18 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
     Ok(())
 }
 
-/// The distribution prefix length `cluster` declares, or `Err` unless it is
-/// exactly `pk`'s leading prefix, in PK order: the distribution key is a leading
-/// PK prefix so write-side routing is a byte-slice of the OPK region. `cols`
-/// names a column the PK does not hold.
+/// The distribution prefix length `cluster` declares, or `Err` unless it is a
+/// non-empty leading prefix of `pk`, in PK order: the distribution key is a
+/// leading PK prefix so write-side routing is a byte-slice of the OPK region.
+/// `cols` names a column the PK does not hold.
 fn dist_prefix_len(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Result<u8, GnitzSqlError> {
-    if cluster.is_empty() || cluster.len() > pk.len() {
-        return Err(GnitzSqlError::rejected(format!(
-            "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
-            pk.len(),
-            cluster.len()
-        )));
-    }
     if let Some(&c) = cluster.iter().find(|c| !pk.contains(c)) {
         return Err(GnitzSqlError::rejected(format!(
             "CLUSTER BY column '{}' is not a PRIMARY KEY column",
             cols[c as usize].name
         )));
     }
-    if cluster != &pk[..cluster.len()] {
+    if cluster.is_empty() || !pk.starts_with(cluster) {
         return Err(GnitzSqlError::rejected(
             "CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
              in PK order; reorder the PK so the distribution column(s) lead",

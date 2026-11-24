@@ -2,159 +2,135 @@ use super::*;
 use crate::test_support::{assert_rejects, parse_stmt, rejected};
 use sqlparser::ast::Statement;
 
-/// One slot per named key, filled case-insensitively; any other key, a repeat
-/// under any spelling, or any clause form but `WITH (key = value, …)` is refused.
-#[test]
-fn kv_options_fills_named_slots_and_refuses_anything_else() {
-    let decode = |clause: &str| {
-        let sql = format!("CREATE TABLE t (id BIGINT PRIMARY KEY) {clause}");
-        let Statement::CreateTable(c) = parse_stmt(&sql) else {
-            panic!("not a CREATE TABLE: {sql}");
-        };
-        kv_options(&c.table_options, "X", ["a", "b"]).map(|slots| slots.map(|v| v.map(ToString::to_string)))
-    };
-    assert_eq!(decode("").unwrap(), [None, None]);
-    assert_eq!(decode("WITH (B = 2)").unwrap(), [None, Some("2".into())]);
-    assert_eq!(
-        decode("WITH (b = 2, a = 1)").unwrap(),
-        [Some("1".into()), Some("2".into())]
-    );
-    for (clause, needle) in [
-        ("WITH (c = 1)", "unknown X option 'c'"),
-        ("WITH (a = 1, A = 2)", "X option `a` is given more than once"),
-        ("OPTIONS(a = 1)", "OPTIONS (…) is not supported"),
-        ("WITH (HEAP)", "unsupported X option `HEAP` in WITH (…)"),
-        (
-            "WITH (CLUSTERED INDEX (id))",
-            "unsupported X option `CLUSTERED INDEX (id)` in WITH (…)",
-        ),
-    ] {
-        let m = rejected(decode(clause));
-        assert!(m.contains(needle), "{clause}: {m}");
-        assert!(!m.contains("Span"), "{clause}: {m}");
-    }
-}
-
-fn options_of(with: &str) -> Result<ViewProps, GnitzSqlError> {
-    let Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v {with} AS SELECT 1")) else {
-        panic!("not a CREATE VIEW");
-    };
-    parse_view_options(&cv.options)
-}
-
-#[test]
-fn a_size_is_a_positive_integer_and_a_binary_unit() {
-    for (lit, bytes) in [
-        ("16 KB", 16 << 10),
-        ("16KB", 16 << 10),
-        ("4mb", 4 << 20),
-        ("1 GB", 1 << 30),
-        (" 1 gb ", 1 << 30),
-    ] {
-        assert_eq!(parse_size("capacity", lit).unwrap().get(), bytes, "{lit:?}");
-    }
-    for lit in ["lots", "5", "5 TB", "-5 MB", "0 MB", "18446744073709551615 GB", ""] {
-        rejected(parse_size("capacity", lit));
-    }
-}
-
-#[test]
-fn each_budget_decodes_to_its_view_class() {
-    assert_eq!(
-        options_of("WITH (capacity = '1 MB')").unwrap().budget,
-        ViewBudget::Bounded {
-            capacity_bytes: NonZeroU64::new(1 << 20).unwrap()
-        }
-    );
-    assert_eq!(
-        options_of("WITH (delta = '2 KB')").unwrap().budget,
-        ViewBudget::Fed {
-            delta_bytes: NonZeroU64::new(2 << 10).unwrap()
-        }
-    );
-}
-
-#[test]
-fn compress_is_a_boolean_beside_any_budget() {
-    let props = options_of("WITH (capacity = '1 MB', compress = true)").unwrap();
-    assert!(props.compress && matches!(props.budget, ViewBudget::Bounded { .. }));
-    assert!(!options_of("WITH (delta = '2 KB')").unwrap().compress);
-    assert!(options_of("WITH (compress = 1)").is_err(), "not a boolean");
-}
-
-#[test]
-fn with_options_spell_every_budget_a_with_clause_reads_back() {
-    let kb = |n: u64| NonZeroU64::new(n).unwrap();
-    for budget in [
-        ViewBudget::default(),
-        ViewBudget::Bounded { capacity_bytes: kb(4 << 20) },
-        ViewBudget::Bounded { capacity_bytes: kb(1536) },
-        ViewBudget::Bounded { capacity_bytes: kb(7) },
-        ViewBudget::Fed { delta_bytes: kb(1 << 30) },
-        ViewBudget::Fed { delta_bytes: kb(3 << 10) },
-    ] {
-        for compress in [false, true] {
-            let props = ViewProps { budget, compress };
-            let with = with_clause(&RelProps::View(props));
-            assert_eq!(options_of(&with).unwrap(), props, "{with}");
-        }
-    }
-    let props = ViewProps {
-        budget: ViewBudget::Bounded { capacity_bytes: kb(1536) },
-        compress: false,
-    };
-    assert_eq!(with_options(&RelProps::View(props)), ["capacity = '1536 B'"]);
-}
-
-fn table_options_of(with: &str) -> CreateTableOptions {
+/// The `WITH (…)` clause of a `CREATE TABLE`; a `CREATE VIEW`'s parses the same.
+fn options_of(with: &str) -> CreateTableOptions {
     match parse_stmt(&format!("CREATE TABLE t (id BIGINT PRIMARY KEY) {with}")) {
         Statement::CreateTable(c) => c.table_options,
         other => panic!("not a CREATE TABLE: {other}"),
     }
 }
 
+/// Each table property as `with_clause` spells it, read back by the decoder.
 #[test]
-fn with_options_carry_replicated_and_stream_independently() {
-    let (keyed, repl) = (TableDistribution::default(), TableDistribution::Replicated);
-    for (with, stream, distribution) in [
-        ("", false, keyed),
-        ("WITH (replicated = true)", false, repl),
-        ("WITH (stream = true)", true, keyed),
-        ("WITH (stream = true, replicated = false)", true, keyed),
-        ("WITH (stream = true, replicated = true)", true, repl),
+fn table_properties_spell_as_with_entries_that_read_back() {
+    let (p, repl) = (TableProps::default(), TableDistribution::Replicated);
+    for (props, with) in [
+        (p, ""),
+        (TableProps { distribution: repl, ..p }, " WITH (replicated = true)"),
+        (TableProps { stream: true, ..p }, " WITH (stream = true)"),
+        (TableProps { compress: true, ..p }, " WITH (compress = true)"),
+        (
+            TableProps {
+                distribution: repl,
+                stream: true,
+                compress: true,
+                ..p
+            },
+            " WITH (replicated = true, stream = true, compress = true)",
+        ),
     ] {
-        let want = TableProps {
-            stream,
-            distribution,
-            serial: false,
-            compress: false,
-        };
-        assert_eq!(parse_table_options(&table_options_of(with)).unwrap(), want, "{with}");
+        assert_eq!(with_clause(&RelProps::Table(props)), with);
+        assert_eq!(parse_table_options(&options_of(with)).unwrap(), props, "{with}");
     }
-    assert_rejects(
-        "WITH (stream = 1)",
-        parse_table_options(&table_options_of("WITH (stream = 1)")),
-        "WITH (stream = …) expects a boolean",
+    // An explicit `false` is the default; keys read in any order and case.
+    assert_eq!(
+        parse_table_options(&options_of("WITH (STREAM = true, replicated = false)")).unwrap(),
+        TableProps { stream: true, ..p }
     );
 }
 
+/// Each view property as `with_clause` spells it, in every size unit, read
+/// back by the decoder.
 #[test]
-fn with_options_spell_every_table_property_a_with_clause_reads_back() {
-    for replicated in [false, true] {
-        for stream in [false, true] {
-            for compress in [false, true] {
-                let props = TableProps {
-                    stream,
-                    serial: false,
-                    distribution: match replicated {
-                        true => TableDistribution::Replicated,
-                        false => TableDistribution::default(),
-                    },
-                    compress,
-                };
-                let with = with_clause(&RelProps::Table(props));
-                assert_eq!(parse_table_options(&table_options_of(&with)).unwrap(), props, "{with}");
-            }
-        }
+fn view_properties_spell_as_with_entries_that_read_back() {
+    let n = |bytes: u64| NonZeroU64::new(bytes).unwrap();
+    let bounded = |bytes| ViewBudget::Bounded { capacity_bytes: n(bytes) };
+    let fed = |bytes| ViewBudget::Fed { delta_bytes: n(bytes) };
+    let plain = ViewProps::default();
+    for (props, with) in [
+        (plain, ""),
+        (ViewProps { compress: true, ..plain }, " WITH (compress = true)"),
+        (
+            ViewProps { budget: bounded(4 << 20), ..plain },
+            " WITH (capacity = '4 MB')",
+        ),
+        (
+            ViewProps { budget: bounded(1536), compress: true },
+            " WITH (capacity = '1536 B', compress = true)",
+        ),
+        (ViewProps { budget: fed(1 << 30), ..plain }, " WITH (delta = '1 GB')"),
+        (
+            ViewProps { budget: fed(3 << 10), compress: true },
+            " WITH (delta = '3 KB', compress = true)",
+        ),
+    ] {
+        assert_eq!(with_clause(&RelProps::View(props)), with);
+        assert_eq!(parse_view_options(&options_of(with)).unwrap(), props, "{with}");
+    }
+    assert_eq!(
+        with_option_names().collect::<Vec<_>>(),
+        ["replicated", "stream", "compress", "capacity", "delta"]
+    );
+}
+
+/// A size reads leniently in spacing and case; everything else is refused,
+/// malformed apart from out of range.
+#[test]
+fn a_size_is_a_positive_integer_and_a_binary_unit() {
+    for (lit, bytes) in [("16KB", 16 << 10), ("4mb", 4 << 20), (" 1 gb ", 1 << 30)] {
+        assert_eq!(parse_size("capacity", lit).unwrap().get(), bytes, "{lit:?}");
+    }
+    for (lit, needle) in [
+        ("lots", "is not a size"),
+        ("5", "is not a size"),
+        ("5 TB", "is not a size"),
+        ("-5 MB", "is not a size"),
+        ("", "is not a size"),
+        ("0 MB", "out of range"),
+        ("18446744073709551615 GB", "out of range"),
+        ("99999999999999999999 B", "out of range"),
+    ] {
+        assert_rejects(lit, parse_size("capacity", lit), needle);
+    }
+}
+
+/// Any key the list does not name, a repeat under any spelling, any clause form
+/// but `WITH (key = value, …)`, or a value of the wrong kind is refused by name.
+#[test]
+fn a_malformed_option_is_refused_by_name() {
+    let table: fn(&str) -> Result<(), GnitzSqlError> = |w| parse_table_options(&options_of(w)).map(drop);
+    let view: fn(&str) -> Result<(), GnitzSqlError> = |w| parse_view_options(&options_of(w)).map(drop);
+    for (decode, with, needle) in [
+        (table, "WITH (c = 1)", "unknown CREATE TABLE option 'c'"),
+        (
+            table,
+            "WITH (stream = true, STREAM = false)",
+            "CREATE TABLE option `stream` is given more than once",
+        ),
+        (table, "OPTIONS(stream = true)", "OPTIONS (…) is not supported"),
+        (
+            table,
+            "WITH (HEAP)",
+            "unsupported CREATE TABLE option `HEAP` in WITH (…)",
+        ),
+        (
+            table,
+            "WITH (CLUSTERED INDEX (id))",
+            "unsupported CREATE TABLE option `CLUSTERED INDEX (id)` in WITH (…)",
+        ),
+        (table, "WITH (stream = 1)", "WITH (stream = …) expects a boolean"),
+        (
+            view,
+            "WITH (capacity = 5)",
+            "`capacity` takes a single-quoted size string",
+        ),
+        (
+            view,
+            "WITH (capacity = '1 MB', delta = '1 MB')",
+            "CREATE VIEW WITH (capacity …, delta …): a capacity-bounded view cannot carry a delta feed",
+        ),
+    ] {
+        let m = rejected(decode(with));
+        assert!(m.contains(needle) && !m.contains("Span"), "{with}: {m}");
     }
 }

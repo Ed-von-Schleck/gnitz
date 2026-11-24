@@ -28,51 +28,41 @@ fn sample() -> ViewDefinition {
     }
 }
 
+/// Each rule `check` holds a definition to, refused on decode.
 #[test]
-fn a_definition_reads_back_as_it_was_written() {
-    let def = sample();
-    assert_eq!(ViewDefinition::decode(&def.encode()).unwrap(), def);
-}
-
-#[test]
-fn trailing_bytes_are_refused() {
-    let mut bytes = sample().encode();
-    bytes.push(0);
-    assert!(ViewDefinition::decode(&bytes).is_err());
-}
-
-#[test]
-fn references_out_of_order_are_refused() {
-    let mut def = sample();
-    def.refs.swap(0, 1);
-    let err = ViewDefinition::decode(&def.encode()).unwrap_err();
-    assert!(err.contains("out of order"), "{err}");
-}
-
-#[test]
-fn a_reference_inside_a_character_is_refused() {
-    let mut def = sample();
+fn a_malformed_definition_is_refused() {
+    let refused = |mutate: fn(&mut ViewDefinition), needle: &str| {
+        let mut def = sample();
+        mutate(&mut def);
+        let err = ViewDefinition::decode(&def.encode()).unwrap_err();
+        assert!(err.contains(needle), "{def:?}: {err}");
+    };
+    refused(|d| d.refs.swap(0, 1), "out of order");
+    // Starts inside the alias of the reference before it.
+    refused(
+        |d| d.refs[1].name.start = d.refs[0].alias_end.unwrap() - 1,
+        "out of order",
+    );
+    refused(|d| d.refs[1].name.end = d.refs[1].name.start, "out of order");
+    refused(|d| d.refs[0].alias_end = Some(d.refs[0].name.end - 1), "out of order");
     // One byte into the two-byte `ü`.
-    def.refs[1].name.start += 2;
-    let err = ViewDefinition::decode(&def.encode()).unwrap_err();
-    assert!(err.contains("outside the query"), "{err}");
-}
-
-#[test]
-fn a_reference_past_the_query_is_refused() {
-    let mut def = sample();
-    def.refs[1].name.end = def.query.len() as u32 + 1;
-    assert!(ViewDefinition::decode(&def.encode()).is_err());
+    refused(|d| d.refs[1].name.start += 2, "outside the query");
+    // An alias ending one byte into the query's last `ü`.
+    refused(
+        |d| d.refs[1].alias_end = Some(d.query.len() as u32 - 4),
+        "outside the query",
+    );
+    refused(|d| d.refs[1].name.end = d.query.len() as u32 + 1, "outside the query");
 }
 
 /// The bytes version 1 writes. A change to them is a new layout, and bumps
 /// `gnitz_wire::VIEW_DEF_VERSION` with them.
 #[test]
 fn version_1_encodes_these_bytes() {
-    let query = b"SELECT x.a, b FROM s.t AS x JOIN \"\xc3\xbc\" ON x.a = \"\xc3\xbc\".a";
+    let query = sample().query;
     let mut golden = Vec::new();
     golden.extend_from_slice(&(query.len() as u32).to_le_bytes());
-    golden.extend_from_slice(query);
+    golden.extend_from_slice(query.as_bytes());
     golden.extend_from_slice(&[
         2, 0, // body_columns
         1, 0, 0, 0, b'a', //
@@ -89,7 +79,8 @@ fn version_1_encodes_these_bytes() {
     ]);
     assert_eq!(
         (sample().encode(), gnitz_wire::VIEW_DEF_VERSION),
-        (golden, 1),
+        (golden.clone(), 1),
         "the view-definition layout changed: bump VIEW_DEF_VERSION, then re-pin"
     );
+    assert_eq!(ViewDefinition::decode(&golden).unwrap(), sample());
 }

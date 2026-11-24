@@ -125,11 +125,6 @@ fn cluster_by_is_a_leading_pk_prefix() {
     }
     for (sql, needle) in [
         (format!("CREATE TABLE t ({two}) CLUSTER BY b"), "leading prefix"),
-        (format!("CREATE TABLE t ({two}) CLUSTER BY b, a"), "leading prefix"),
-        (
-            format!("CREATE TABLE t ({two}) CLUSTER BY v"),
-            "is not a PRIMARY KEY column",
-        ),
         (format!("CREATE TABLE t ({two}) CLUSTER BY nope"), "not found"),
         (
             format!("CREATE TABLE t ({two}) CLUSTER BY a, a"),
@@ -138,12 +133,6 @@ fn cluster_by_is_a_leading_pk_prefix() {
         (
             format!("CREATE TABLE t ({two}) WITH (replicated = true) CLUSTER BY a"),
             "mutually exclusive",
-        ),
-        (
-            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, PRIMARY KEY (a, b, c)) \
-             CLUSTER BY a, c"
-                .to_string(),
-            "leading prefix",
         ),
     ] {
         assert_rejects(&sql, plan_table(&cat, &sql), needle);

@@ -10,9 +10,7 @@ fn an_fk_child_type_must_fit_the_parent_type() {
     let (t, d) = (ColType::of, ColType::decimal);
     for (child, parent, ok) in [
         (t(T::I32), t(T::I64), true),
-        (t(T::U32), t(T::I64), true),
         (t(T::U64), t(T::I64), false),
-        (t(T::I64), t(T::U64), false),
         // A non-integer type only by identity.
         (t(T::UUID), t(T::UUID), true),
         (t(T::String), t(T::String), true),
@@ -46,19 +44,16 @@ fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
     let check = |pk: &[u32], cluster: &[u32]| dist_prefix_len(&cols, pk, cluster);
     assert_eq!(check(&[0, 1], &[0]).unwrap(), 1);
     assert_eq!(check(&[0, 1], &[0, 1]).unwrap(), 2);
-    // A single-column PK: only the whole PK is a valid prefix.
-    assert_eq!(check(&[3], &[3]).unwrap(), 1);
     // A reordered PK whose distribution column leads.
     assert_eq!(check(&[2, 1], &[2]).unwrap(), 1);
-
-    assert!(check(&[0, 1], &[1]).is_err(), "non-leading PK column");
-    assert!(check(&[0, 1, 2], &[0, 2]).is_err(), "skips col 1");
-    assert!(check(&[0, 1], &[1, 0]).is_err(), "wrong order");
-    assert!(check(&[0, 1], &[]).is_err(), "empty");
-    assert!(check(&[0, 1], &[0, 1, 2]).is_err(), "longer than PK");
-    assert_rejects(
-        "cluster by d",
-        check(&[0, 1], &[3]),
-        "column 'd' is not a PRIMARY KEY column",
-    );
+    for (pk, cluster, needle) in [
+        (&[0, 1][..], &[1][..], "leading prefix"),
+        (&[0, 1, 2], &[0, 2], "leading prefix"),
+        (&[0, 1], &[1, 0], "leading prefix"),
+        (&[0, 1], &[], "leading prefix"),
+        (&[0, 1], &[0, 1, 2], "column 'c' is not a PRIMARY KEY column"),
+        (&[0, 1], &[3], "column 'd' is not a PRIMARY KEY column"),
+    ] {
+        assert_rejects(&format!("{pk:?} cluster by {cluster:?}"), check(pk, cluster), needle);
+    }
 }

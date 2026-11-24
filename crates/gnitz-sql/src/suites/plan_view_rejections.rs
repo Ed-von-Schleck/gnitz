@@ -836,16 +836,6 @@ fn ambiguous_and_hidden_column_rules() {
 #[test]
 fn capacity_rules() {
     let cat = cat();
-    for (clause, needle) in [
-        ("WITH (capacity = 5)", "single-quoted"),
-        ("WITH (capacity = 'lots')", "not a size"),
-    ] {
-        let sql = format!("CREATE VIEW v {clause} AS SELECT id, v FROM t");
-        assert_rejects(&sql, plan(&cat, &sql), needle);
-    }
-    let sql = "CREATE VIEW v WITH (capacity = '1 MB', delta = '1 MB') AS SELECT id, v FROM t";
-    assert_rejects(sql, plan(&cat, sql), "cannot carry a delta feed");
-
     // A filtered derived-table input fuses into the join's circuit, cutting nothing.
     let sql = "CREATE VIEW v WITH (capacity = '1 MB') AS \
                SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k";

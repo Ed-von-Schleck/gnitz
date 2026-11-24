@@ -7,7 +7,7 @@ use crate::ir::BExpr;
 use gnitz_core::RelProps;
 use gnitz_wire::{TableDistribution, TableProps, ViewBudget, ViewProps};
 use sqlparser::ast::CreateTableOptions;
-use std::num::NonZeroU64;
+use std::num::{IntErrorKind, NonZeroU64};
 
 /// Every `WITH (…)` option key a `CREATE TABLE` or `CREATE VIEW` accepts, once.
 pub fn with_option_names() -> impl Iterator<Item = &'static str> {
@@ -187,18 +187,25 @@ fn parse_size(option: &str, text: &str) -> Result<NonZeroU64, GnitzSqlError> {
     let trimmed = text.trim();
     let digits = trimmed.len() - trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     let (num, unit) = trimmed.split_at(digits);
-    let num: u64 = num.parse().map_err(|_| bad())?;
+    // `None` for a count too long for a `u64`, which is out of range, not malformed.
+    let num = match num.parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(e) if *e.kind() == IntErrorKind::PosOverflow => None,
+        Err(_) => return Err(bad()),
+    };
     let unit = unit.trim();
     let mult = SIZE_UNITS
         .iter()
         .find(|(u, _)| unit.eq_ignore_ascii_case(u))
         .map(|&(_, m)| m)
         .ok_or_else(bad)?;
-    num.checked_mul(mult).and_then(NonZeroU64::new).ok_or_else(|| {
-        GnitzSqlError::rejected(format!(
-            "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
-        ))
-    })
+    num.and_then(|n| n.checked_mul(mult))
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            GnitzSqlError::rejected(format!(
+                "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
+            ))
+        })
 }
 
 #[cfg(test)]
