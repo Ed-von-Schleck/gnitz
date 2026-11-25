@@ -1,5 +1,19 @@
 use super::*;
 
+thread_local! {
+    static POOL: Cell<VecDeque<Vec<u8>>> = const { Cell::new(VecDeque::new()) };
+}
+
+fn drain_pool() -> VecDeque<Vec<u8>> {
+    POOL.with(Cell::take)
+}
+
+/// Return `v` to [`POOL`], charged its capacity.
+fn give(v: Vec<u8>) {
+    let cap = v.capacity();
+    recycle(&POOL, v, cap);
+}
+
 #[test]
 fn recycle_admits_only_nonempty_items_within_the_byte_cap() {
     for (offered, pooled) in [
@@ -9,16 +23,14 @@ fn recycle_admits_only_nonempty_items_within_the_byte_cap() {
         (4096, true),
     ] {
         drain_pool();
-        let mut v: Vec<u8> = Vec::with_capacity(offered);
-        v.resize(offered.min(64), 1);
+        let v: Vec<u8> = Vec::with_capacity(offered);
         let cap = v.capacity();
-        drop(PooledBuf(v));
+        give(v);
 
         let got = drain_pool();
         if pooled {
             assert_eq!(got.len(), 1, "capacity {offered} must be pooled");
             assert_eq!(got[0].capacity(), cap);
-            assert!(got[0].is_empty(), "a pooled buffer comes back cleared");
         } else {
             assert!(got.is_empty(), "capacity {offered} must not be pooled");
         }
@@ -29,65 +41,28 @@ fn recycle_admits_only_nonempty_items_within_the_byte_cap() {
 fn full_pool_evicts_its_oldest() {
     drain_pool();
     for cap in 1..=MAX_POOLED + 4 {
-        drop(PooledBuf(Vec::with_capacity(cap)));
+        give(Vec::with_capacity(cap));
     }
     let caps: Vec<usize> = drain_pool().iter().map(Vec::capacity).collect();
     assert_eq!(caps, (5..=MAX_POOLED + 4).collect::<Vec<_>>());
 }
 
-/// A pooled buffer goes to a request it fits — within twice the request for
-/// `with_capacity`, of exactly the request for `exact` — newest first; a 0-byte
-/// request takes nothing.
+/// `take` answers the newest item `fits` accepts, and none when it accepts none.
 #[test]
-fn a_request_takes_the_newest_pooled_buffer_it_fits() {
+fn take_answers_the_newest_item_that_fits() {
     let pooled = |cap: usize| {
         let v = Vec::with_capacity(cap);
         let at = v.as_ptr();
-        drop(PooledBuf(v));
+        give(v);
         at
     };
-    let with_capacity: fn(usize) -> PooledBuf = PooledBuf::with_capacity;
-    let exact: fn(usize) -> PooledBuf = PooledBuf::exact;
-    for (what, get, size, taken) in [
-        ("with_capacity", with_capacity, 1000, false),
-        ("with_capacity", with_capacity, 3000, true),
-        ("with_capacity", with_capacity, 0, false),
-        ("exact", exact, 4095, false),
-        ("exact", exact, 4096, true),
-    ] {
-        drain_pool();
-        pooled(4096);
-        let newest = pooled(4096);
-        assert_eq!(get(size).as_ptr() == newest, taken, "{what}({size})");
-    }
-}
-
-/// A buffer that outgrows its capacity moves into a pooled one of at least
-/// twice it, holding exactly its old bytes, and the outgrown buffer goes back to
-/// the pool; a reserve the capacity covers moves nothing, and a growth past
-/// `MAX_POOLED_BYTES` neither takes from the pool nor returns to it.
-#[test]
-fn reserve_pooled_grows_into_a_pooled_buffer() {
     drain_pool();
-    let mut b = PooledBuf(Vec::with_capacity(100));
-    b.extend_from_slice(&[7; 100]);
-    // A pooled buffer that held other bytes.
-    let pooled = vec![0xEE; 300];
-    let at = pooled.as_ptr();
-    drop(PooledBuf(pooled));
-
-    b.reserve_pooled(1);
-    assert_eq!(b.as_ptr(), at, "the growth takes the pooled buffer");
-    assert_eq!(b.as_slice(), &[7; 100]);
-    b.reserve_pooled(200);
-    assert_eq!(b.as_ptr(), at, "a covered reserve moves nothing");
-    let caps: Vec<usize> = drain_pool().iter().map(Vec::capacity).collect();
-    assert_eq!(caps, [100], "the outgrown buffer is pooled");
-
-    b.reserve_pooled(MAX_POOLED_BYTES);
-    assert!(b.capacity() >= 100 + MAX_POOLED_BYTES);
-    assert_eq!(b.as_slice(), &[7; 100]);
-    assert!(drain_pool().is_empty(), "the outgrown buffer is freed");
+    pooled(4096);
+    let newest = pooled(4096);
+    pooled(100);
+    let got = take(&POOL, |b| b.capacity() >= 1000).expect("a fitting item");
+    assert_eq!(got.as_ptr(), newest);
+    assert!(take(&POOL, |b| b.capacity() >= 5000).is_none());
 }
 
 thread_local! {

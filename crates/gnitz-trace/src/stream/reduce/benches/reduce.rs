@@ -140,7 +140,7 @@ fn reduce_index_entries_bench() {
         delta.certify_consolidated();
         let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
         let plan = plan(&schema, &group_cols, aggs, false);
-        // The first pass takes the pool's first allocations.
+        // The first pass takes the first allocations.
         let [_, (entries, instructions)] = [(); 2].map(|()| counter.measure(|| plan.index_entries(&delta).unwrap()));
         println!(
             "reduce_index_entries_bench {label:<32} {:6.1} instr/row ({} entries)",
@@ -308,7 +308,7 @@ fn op_reduce_multi_run_bench() {
     epoch(&counter, &mut h, &rows(&mut (1..2 * G).step_by(2)));
     epoch(&counter, &mut h, &third);
     let delta = rows(&mut (2 * G..4 * G));
-    // The first pass takes the pool's first allocations.
+    // The first pass takes the first allocations.
     let [_, (out, instructions)] = [(); 2].map(|()| counter.measure(|| h.reduce(&delta)));
     println!(
         "op_reduce_multi_run_bench heap  {:.1} instr/row (out {})",

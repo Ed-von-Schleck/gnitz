@@ -88,7 +88,7 @@ fn scan_spec_bench() {
     // early or walks an index.
     let cell = |label: &str, r: &RelationFixture, spec: ReadSpec, want: u64, per: u64| {
         let layout = layout_of(&r.relation(TID).unwrap().schema(), &spec.sink);
-        // Untimed: the batch pool is warm.
+        // Untimed: the thread's pools and the heap are warm.
         black_box(r.scan_spec(TID, spec.clone(), layout, None).unwrap());
         let (reply, instructions) = counter.measure(|| r.scan_spec(TID, spec, layout, None).unwrap());
         assert_eq!(reply.len() as u64, want, "{label}: reply rows");

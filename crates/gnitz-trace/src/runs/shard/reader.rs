@@ -20,7 +20,7 @@ use gnitz_wire::{
 };
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::DirectWriter;
-use gnitz_zset::repr::PooledBuf;
+use gnitz_zset::repr::uninit_bytes;
 use gnitz_zset::repr::{ColPtr, seek_lower_bound, seek_pk_rows};
 use gnitz_zset::repr::{ColumnarSource, DecodedColumns};
 use gnitz_zset::repr::{StringDest, carried_dead, long_bytes_outside, prorated_blob_cap, row_long_bytes};
@@ -486,7 +486,7 @@ impl MappedShard {
             PackedImage::Seq(seq) => seq.decode(self.heap(), first, out),
             PackedImage::Sparse(sparse) => sparse.decode(first, p.width, out, pi, |rows| {
                 // SAFETY: the decode writes every word of `nulls`.
-                let mut nulls = unsafe { PooledBuf::uninit(rows.len() * FIXED_REGION_BYTES) };
+                let mut nulls = unsafe { uninit_bytes(rows.len() * FIXED_REGION_BYTES) };
                 self.null_bmp.decode(rows.start, &mut nulls);
                 nulls
             }),

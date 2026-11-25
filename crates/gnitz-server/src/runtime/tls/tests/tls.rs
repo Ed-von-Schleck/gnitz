@@ -364,7 +364,7 @@ fn a_send_of_many_seals_reaches_the_client_whole() {
     let sent = body.clone();
     r.spawn(async move {
         peer.next_request().await.expect("the client's first frame");
-        peer.send(SendBody::Pooled(PooledBuf(sent))).await.expect("sent");
+        peer.send(SendBody::Owned(sent)).await.expect("sent");
         peer.flush_egress().await.expect("sent")
     });
     let handshaken = poll_until(r, || {

@@ -54,7 +54,7 @@ fn fixture(keys: usize, string: bool, rounds: u64, per_round: u64) -> (RelationF
 fn delta_read_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     let cell = |label: &str, r: &RelationFixture, spec: ReadSpec, layout: u64, want: u64, band: u64| {
-        // Untimed: the batch pool is warm.
+        // Untimed: the thread's pools and the heap are warm.
         black_box(r.delta_read(TID, 1, spec.clone(), layout).unwrap());
         let (reply, instructions) = counter.measure(|| r.delta_read(TID, 1, spec, layout).unwrap());
         assert_eq!(reply.len() as u64, want, "{label}: reply rows");

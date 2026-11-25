@@ -5,7 +5,6 @@
 use super::batch::Batch;
 use super::batch::MemBatch;
 use super::merge;
-use super::pool::PooledBuf;
 use super::scatter::{copy_ranges, scatter_copy};
 use super::string_heap::{BlobCache, blob_span_key, walk_heap_spans};
 use super::writer::DirectWriter;
@@ -304,7 +303,7 @@ impl<'a> MemBatch<'a> {
         if heap_at > out.len() {
             return None;
         }
-        let mut heap = PooledBuf::with_capacity(heap_bytes);
+        let mut heap = Vec::with_capacity(heap_bytes);
         let mut cache = BlobCache::for_rows(self.schema, count);
         let block = &mut out[wal::WAL_HEADER_SIZE..heap_at];
         let cache = dedup.then_some(&mut cache);

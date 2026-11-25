@@ -1,6 +1,6 @@
 //! Thread-local object pools: take and recycle for a pool of `T`, and the
-//! `Vec<u8>` pool built on them. Each thread has its own pools; nothing is
-//! shared or locked.
+//! scratch list lent to one kernel call. Each thread has its own pools; nothing
+//! is shared or locked.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -69,107 +69,9 @@ pub fn with_scratch<T, R>(slot: &'static LocalKey<Cell<Vec<T>>>, f: impl FnOnce(
     r
 }
 
-thread_local! {
-    static BUF_POOL: Cell<VecDeque<Vec<u8>>> = const { Cell::new(VecDeque::new()) };
-}
-
 /// Whether `capacity` holds at most twice `need`.
 pub(super) fn is_tight(capacity: usize, need: usize) -> bool {
     capacity <= need.saturating_mul(2)
-}
-
-/// A byte buffer from the thread's pool, returned to it on drop.
-#[derive(Default)]
-pub struct PooledBuf(pub Vec<u8>);
-
-impl PooledBuf {
-    /// Empty, with room for `size` bytes: a pooled buffer that [`is_tight`] for
-    /// them, else a fresh one. A zero `size` holds no buffer.
-    pub fn with_capacity(size: usize) -> Self {
-        if size == 0 {
-            return PooledBuf(Vec::new());
-        }
-        PooledBuf(
-            take(&BUF_POOL, |b| b.capacity() >= size && is_tight(b.capacity(), size))
-                .unwrap_or_else(|| Vec::with_capacity(size)),
-        )
-    }
-
-    /// Empty, with capacity exactly `size`: a pooled buffer of that capacity,
-    /// else a fresh one (`Vec::<u8>::with_capacity` allocates exactly `size`).
-    /// A zero `size` holds no buffer, since the pool keeps none of capacity 0.
-    pub(super) fn exact(size: usize) -> Self {
-        PooledBuf(take(&BUF_POOL, |b| b.capacity() == size).unwrap_or_else(|| Vec::with_capacity(size)))
-    }
-
-    /// [`Self::exact`] with `len == size`, the bytes uninitialized.
-    ///
-    /// # Safety
-    /// The caller writes each byte before reading it.
-    #[allow(clippy::uninit_vec)]
-    pub(super) unsafe fn uninit_exact(size: usize) -> Self {
-        let mut buf = Self::exact(size);
-        // SAFETY: `capacity == size`.
-        unsafe { buf.0.set_len(size) };
-        buf
-    }
-
-    /// [`Self::with_capacity`] with `len == size`, the bytes uninitialized.
-    ///
-    /// # Safety
-    /// The caller writes each byte before reading it.
-    #[allow(clippy::uninit_vec)]
-    pub unsafe fn uninit(size: usize) -> Self {
-        let mut buf = Self::with_capacity(size);
-        // SAFETY: `capacity >= size`.
-        unsafe { buf.0.set_len(size) };
-        buf
-    }
-
-    /// Room for `additional` more bytes. A buffer that has to grow moves, bytes
-    /// verbatim, into a pooled one of at least twice its capacity, so repeated
-    /// reserves stay amortised, and the outgrown buffer returns to the pool. Past
-    /// `MAX_POOLED_BYTES` it grows by [`Vec::reserve`].
-    pub(super) fn reserve_pooled(&mut self, additional: usize) {
-        if self.0.capacity() - self.0.len() >= additional {
-            return;
-        }
-        let need = (self.0.len() + additional).max(2 * self.0.capacity());
-        if need > MAX_POOLED_BYTES {
-            self.0.reserve(additional);
-            return;
-        }
-        let mut grown = PooledBuf::with_capacity(need);
-        grown.extend_from_slice(&self.0);
-        *self = grown;
-    }
-}
-
-impl std::ops::Deref for PooledBuf {
-    type Target = Vec<u8>;
-    fn deref(&self) -> &Vec<u8> {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for PooledBuf {
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.0
-    }
-}
-
-impl Drop for PooledBuf {
-    fn drop(&mut self) {
-        let mut buf = std::mem::take(&mut self.0);
-        buf.clear();
-        let cap = buf.capacity();
-        recycle(&BUF_POOL, buf, cap);
-    }
-}
-
-#[cfg(test)]
-pub(super) fn drain_pool() -> VecDeque<Vec<u8>> {
-    BUF_POOL.with(Cell::take)
 }
 
 #[cfg(test)]

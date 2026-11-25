@@ -276,7 +276,7 @@ fn pk_set_gather_drain_bench() {
                 for every in [1u64, 16] {
                     let keys: Vec<u8> = (0..N).step_by(every as usize).flat_map(u64::to_be_bytes).collect();
                     let n_keys = (keys.len() / 8) as f64;
-                    // The first pass takes the pool's first allocations and
+                    // The first pass takes the first allocations and
                     // decodes the shards' blocks.
                     let per_row = |skip: u64| {
                         let [_, instructions] = [(); 2].map(|()| {

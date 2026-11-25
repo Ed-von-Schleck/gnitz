@@ -4,8 +4,8 @@
 //!   over one (`batch_builder`), the direct row writer (`writer`), wire
 //!   serialization (`batch_wire`), and the German-string heap, plain or coded
 //!   under a store's symbol table (`string_heap`).
-//! - The thread-local object pools that batch arenas, send buffers, cursor
-//!   vectors and kernel scratch recycle through (`pool`).
+//! - The thread-local object pools that cursor vectors, blob caches and
+//!   kernel scratch recycle through (`pool`).
 //! - The kernels over batches: the column pointer every kernel reads a region
 //!   through and the row sources whose regions are read so (`columnar`), the
 //!   OPK lower-bound search (`seek`), the column-first row copy (`scatter`),
@@ -32,11 +32,10 @@ mod seek;
 mod string_heap;
 mod writer;
 
-pub use batch::{Batch, MemBatch, RowOrigins};
+pub use batch::{Batch, MemBatch, RowOrigins, uninit_bytes};
 pub use batch_builder::BatchBuilder;
 pub use batch_wire::{CertifiedBlock, WireCut, WireRows};
 pub use merge::merge_consolidated;
-pub use pool::PooledBuf;
 
 pub(crate) use batch::runs_where_zip;
 pub use batch::{range_rows, runs_where};

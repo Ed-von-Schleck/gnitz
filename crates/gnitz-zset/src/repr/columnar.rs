@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use super::batch::MemBatch;
-use super::pool::PooledBuf;
+use super::batch::uninit_bytes;
 use gnitz_wire::RowSource;
 
 /// A column as `base + row * stride`. Stride 0 reads one shared element for
@@ -118,14 +118,14 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 /// The columns a source decoded to be viewed at a window of its rows, freed
 /// with the [`UnifiedSet`](super::UnifiedSet) or the window that views them.
 #[derive(Default)]
-pub struct DecodedColumns(Vec<PooledBuf>);
+pub struct DecodedColumns(Vec<Vec<u8>>);
 
 impl DecodedColumns {
     /// A column of `width`-byte cells readable at `window`, which `decode`
     /// writes whole given the window's bytes.
     pub fn column(&mut self, window: &Range<usize>, width: usize, decode: impl FnOnce(&mut [u8])) -> ColPtr {
         // SAFETY: `decode` writes every cell of `column`.
-        let mut column = unsafe { PooledBuf::uninit(window.len() * width) };
+        let mut column = unsafe { uninit_bytes(window.len() * width) };
         decode(&mut column);
         // Rebased so that row `window.start` reads the column's first cell.
         let base = column.as_ptr().wrapping_sub(window.start * width);

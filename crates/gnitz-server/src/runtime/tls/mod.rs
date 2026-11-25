@@ -12,8 +12,6 @@ use std::cell::RefCell;
 use std::io::{BufRead, ErrorKind, Write};
 use std::rc::Rc;
 
-use gnitz_zset::repr::PooledBuf;
-
 use crate::runtime::reactor::{RecvEnd, Session};
 
 /// The most plaintext one TLS record carries.
@@ -68,20 +66,20 @@ impl Session for RefCell<rustls::ServerConnection> {
         self.borrow().wants_write()
     }
 
-    fn seal(&self, plain: &[u8]) -> PooledBuf {
+    fn seal(&self, plain: &[u8]) -> Vec<u8> {
         let mut sess = self.borrow_mut();
         sess.writer()
             .write_all(plain)
             .expect("rustls takes every byte under no buffer limit");
         let records = plain.len().div_ceil(TLS_MAX_FRAGMENT);
-        let mut out = PooledBuf::with_capacity(plain.len() + records * TLS_RECORD_OVERHEAD);
+        let mut out = Vec::with_capacity(plain.len() + records * TLS_RECORD_OVERHEAD);
         while sess.wants_write() {
-            let _ = sess.write_tls(&mut out.0);
+            let _ = sess.write_tls(&mut out);
         }
         out
     }
 
-    fn close(&self) -> PooledBuf {
+    fn close(&self) -> Vec<u8> {
         self.borrow_mut().send_close_notify();
         self.seal(&[])
     }

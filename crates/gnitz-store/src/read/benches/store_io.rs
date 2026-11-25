@@ -44,7 +44,7 @@ fn keys(schema: &SchemaDescriptor, vals: impl Iterator<Item = u64>) -> PkKeys {
 fn probe_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     let cell = |label: &str, r: &RelationFixture, probe: Probe, keys: PkKeys, want: u64| {
-        // Untimed: the batch pool and the cursor's sources are warm.
+        // Untimed: the thread's pools, the heap and the cursor's sources are warm.
         black_box(r.probe(TID, probe, keys.clone()).unwrap());
         let copy = keys.clone();
         let (reply, instructions) = counter.measure(|| r.probe(TID, probe, copy).unwrap());

@@ -13,7 +13,6 @@ use std::time::Duration;
 use super::super::test_support::*;
 use super::*;
 use gnitz_wire::framed;
-use gnitz_zset::repr::PooledBuf;
 
 /// A reactor over one W2M ring with an inbound cap of `cap`.
 fn capped_reactor(cap: usize) -> Reactor {
@@ -68,14 +67,14 @@ impl Session for Passthrough {
         !self.owed.borrow().is_empty()
     }
 
-    fn seal(&self, plain: &[u8]) -> PooledBuf {
+    fn seal(&self, plain: &[u8]) -> Vec<u8> {
         self.sealed.borrow_mut().push(plain.len());
         let mut records = self.owed.take();
         records.extend_from_slice(plain);
-        PooledBuf(records)
+        records
     }
 
-    fn close(&self) -> PooledBuf {
+    fn close(&self) -> Vec<u8> {
         self.owed.borrow_mut().extend_from_slice(Self::BYE);
         self.seal(&[])
     }
@@ -495,7 +494,7 @@ fn a_session_seals_what_is_sent_and_closes_behind_its_goodbye() {
     // Read concurrently: the body outgrows the socketpair's buffers.
     let body: Vec<u8> = (0..2 * SEAL_TURN_BYTES + 5).map(|i| (i % 251) as u8).collect();
     let (p, sent) = (Rc::clone(&peer), body.clone());
-    r.spawn(async move { p.send_raw(SendBody::Pooled(PooledBuf(sent))).await.expect("sent") });
+    r.spawn(async move { p.send_raw(SendBody::Owned(sent)).await.expect("sent") });
     let mut got = Vec::new();
     assert!(poll_until(r, || {
         while let Some(bytes) = read_nonblocking(&partner, 64 * 1024) {
@@ -522,7 +521,7 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     let payload_len = 200 * 1024;
     let drain_t = spawn_drain(receiver, payload_len);
 
-    let sent = r.block_on(r.send_owned(&conn, SendBody::Pooled(PooledBuf(vec![0x5Au8; payload_len]))));
+    let sent = r.block_on(r.send_owned(&conn, SendBody::Owned(vec![0x5Au8; payload_len])));
     // Shuts the socket down before the join: after a truncated send the
     // drain's blocking `read` would otherwise never return.
     conn.fail();
@@ -537,13 +536,13 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
 fn send_owned_skips_an_empty_body_and_fails_the_connection_on_a_refused_send() {
     let r = make_reactor();
     let (conn, partner) = admitted(r);
-    let empty = r.send_owned(&conn, SendBody::Pooled(PooledBuf(Vec::new())));
+    let empty = r.send_owned(&conn, SendBody::Owned(Vec::new()));
     assert_eq!(try_poll_once(empty), Some(Ok(())));
     assert_eq!(r.ops.len(), 0, "no op was pushed");
     assert_eq!(read_nonblocking(&partner, 1), None, "nothing was sent");
 
     drop(partner);
-    let sent = r.block_on(r.send_owned(&conn, SendBody::Pooled(PooledBuf(vec![1]))));
+    let sent = r.block_on(r.send_owned(&conn, SendBody::Owned(vec![1])));
     assert_eq!(sent, Err(PeerGone));
     assert!(conn.is_gone());
 }

@@ -57,7 +57,6 @@ use super::park::{Park, WorkerParks};
 use crate::runtime::frame::WireMsg;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{DecodedControl, peek_control_block};
-use gnitz_zset::repr::PooledBuf;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -616,7 +615,7 @@ impl InFlightState {
 ///
 /// Dropping a view advances `release_cursor` (possibly past multiple slots when
 /// out-of-order slots complete a contiguous prefix) and wakes a parked writer;
-/// dropping a copy returns its buffer to the pool.
+/// dropping a copy frees it.
 pub struct W2mSlot {
     /// Length prefix and payload: `frame_bytes` hands them to a client send
     /// unchanged, and [`Self::bytes`] is their tail. In the ring while `ring` is
@@ -660,13 +659,13 @@ impl W2mSlot {
         unsafe { &*self.frame }
     }
 
-    /// Copy the message into pooled memory and release its ring space; a no-op
+    /// Copy the message into owned memory and release its ring space; a no-op
     /// on a copy.
     #[cold]
     #[inline(never)]
     pub(crate) fn detach(&mut self) {
         let Some(ring) = self.ring.take() else { return };
-        let mut copy = std::mem::ManuallyDrop::new(PooledBuf::with_capacity(self.frame.len()));
+        let mut copy = std::mem::ManuallyDrop::new(Vec::with_capacity(self.frame.len()));
         copy.extend_from_slice(self.frame_bytes());
         ring.release(self.index());
         self.frame = std::ptr::slice_from_raw_parts(copy.as_ptr(), copy.len());
@@ -718,13 +717,12 @@ impl Drop for W2mSlot {
     }
 }
 
-/// Return [`W2mSlot::detach`]'s copy at `frame`, of capacity `cap`, to the pool.
+/// Free [`W2mSlot::detach`]'s copy at `frame`, of capacity `cap`.
 #[cold]
 #[inline(never)]
 fn drop_copy(frame: *const [u8], cap: u64) {
     // SAFETY: `detach` took the copy's parts from the one buffer it leaked.
-    let buf = unsafe { Vec::from_raw_parts(frame as *mut u8, frame.len(), cap as usize) };
-    drop(PooledBuf(buf));
+    drop(unsafe { Vec::from_raw_parts(frame as *mut u8, frame.len(), cap as usize) });
 }
 
 // ---------------------------------------------------------------------------

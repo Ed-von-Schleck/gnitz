@@ -38,7 +38,7 @@ fn consolidate_bench() {
     ];
     for (label, row, survivors) in shapes {
         let rows: Vec<(u64, i64, i64)> = (0..N).map(row).map(|(pk, v)| (pk, 1, v as i64)).collect();
-        // The first pass takes the pool's first allocations.
+        // The first pass takes the first allocations.
         let [_, (out, instructions)] = [(); 2].map(|()| {
             let batch = make_batch(&schema, &rows);
             counter.measure(|| black_box(batch).into_consolidated())

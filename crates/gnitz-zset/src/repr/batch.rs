@@ -1,13 +1,13 @@
 //! Owned columnar batch type for Z-set rows.
 //!
-//! `Batch` owns its memory (two pooled buffers — data + blob); `MemBatch<'a>`
+//! `Batch` owns its memory (two buffers — data + blob); `MemBatch<'a>`
 //! is its borrowed slice-view counterpart.
 
 use std::ops::Range;
 
 use super::columnar::ColPtr;
 use super::merge;
-use super::pool::{PooledBuf, is_tight};
+use super::pool::is_tight;
 use super::scatter::{Pick, copy_ranges, with_picks};
 use super::string_heap::{self, BlobCache, relocated_cell};
 use super::writer::DirectWriter;
@@ -55,27 +55,23 @@ pub(crate) fn runs_where_zip<A, B>(a: &[A], b: &[B], keep: impl Fn(&A, &B) -> bo
     runs
 }
 
+/// A buffer of exactly `size` bytes from the allocator, uninitialized.
+///
+/// # Safety
+/// The caller writes each byte before reading it.
+#[allow(clippy::uninit_vec)]
+pub unsafe fn uninit_bytes(size: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(size);
+    // SAFETY: `capacity >= size`.
+    unsafe { buf.set_len(size) };
+    buf
+}
+
 /// A fresh arena of `cap` rows under `schema` holding the `count` rows of
 /// `src`, an arena of `src_cap` rows; the rows past `count` are uninitialized.
-/// `exact` sizes the buffer as [`PooledBuf::uninit_exact`] does, else as
-/// [`PooledBuf::uninit`] does.
-fn arena_copy(
-    schema: &SchemaDescriptor,
-    src: &[u8],
-    src_cap: usize,
-    count: usize,
-    cap: usize,
-    exact: bool,
-) -> PooledBuf {
-    let len = cap * schema.row_width();
+fn arena_copy(schema: &SchemaDescriptor, src: &[u8], src_cap: usize, count: usize, cap: usize) -> Vec<u8> {
     // SAFETY: the copies below write the `count` rows a `Batch` reads.
-    let mut dst = unsafe {
-        if exact {
-            PooledBuf::uninit_exact(len)
-        } else {
-            PooledBuf::uninit(len)
-        }
-    };
+    let mut dst = unsafe { uninit_bytes(cap * schema.row_width()) };
     if src_cap == cap {
         // Arenas of one capacity hold every region at the same place, so they
         // copy as one run.
@@ -122,8 +118,8 @@ impl RowOrigins {
 ///
 /// **2 heap allocations**: `data` and `blob`.
 pub struct Batch {
-    data: PooledBuf,
-    blob: PooledBuf,
+    data: Vec<u8>,
+    blob: Vec<u8>,
     /// An upper bound on the bytes of `blob` no string cell references.
     dead_heap: usize,
     /// Rows the arena has room for: region `r` starts at
@@ -146,8 +142,8 @@ impl Batch {
     /// Zero-allocation empty batch under `schema`.
     pub fn empty_with_schema(schema: &SchemaDescriptor) -> Self {
         Batch {
-            data: PooledBuf::default(),
-            blob: PooledBuf::default(),
+            data: Vec::new(),
+            blob: Vec::new(),
             dead_heap: 0,
             capacity: 0,
             count: 0,
@@ -170,7 +166,7 @@ impl Batch {
         let mut b = Self::empty_with_schema(schema);
         b.capacity = schema.arena_rows(rows);
         // SAFETY: a `Batch` reads no row at or past `count`, which is 0.
-        b.data = unsafe { PooledBuf::uninit(b.capacity * schema.row_width()) };
+        b.data = unsafe { uninit_bytes(b.capacity * schema.row_width()) };
         b.debug_poison_rows(0..b.capacity);
         b
     }
@@ -210,17 +206,17 @@ impl Batch {
         }
         b.write_rows(rows, write_fn);
         if b.blob.is_empty() {
-            b.blob = PooledBuf::default();
+            b.blob = Vec::new();
         }
         b
     }
 
-    /// Room for `bytes` more blob heap bytes, grown as [`PooledBuf::reserve_pooled`]
-    /// grows a buffer: the bytes move verbatim, so cell offsets and `dead_heap`
-    /// still hold. A schema with no string column has no heap to reserve.
+    /// Room for `bytes` more blob heap bytes, grown as [`Vec::reserve`] grows a
+    /// buffer: the bytes move verbatim, so cell offsets and `dead_heap` still
+    /// hold. A schema with no string column has no heap to reserve.
     pub fn reserve_blob(&mut self, bytes: usize) {
         if self.schema.has_german_string() {
-            self.blob.reserve_pooled(bytes);
+            self.blob.reserve(bytes);
         }
     }
 
@@ -387,21 +383,7 @@ impl Batch {
         }
         let schema = &self.schema;
         let new_cap = schema.arena_rows((self.capacity * 2).max(8).max(self.count + n));
-        let new_total = new_cap * schema.row_width();
-        if new_total > self.data.capacity() {
-            self.data = arena_copy(schema, &self.data, self.capacity, self.count, new_cap, false);
-        } else {
-            // The arena has room already: shift each region to its new start, last
-            // first, so none lands on one still to move.
-            // SAFETY: `new_total` is within the capacity, and the bytes past the old
-            // length are rows no reader reaches.
-            unsafe { self.data.set_len(new_total) };
-            for r in (0..schema.num_fixed_regions()).rev() {
-                let old = schema.region_start(r, self.capacity);
-                let len = self.count * schema.region_stride(r);
-                self.data.copy_within(old..old + len, schema.region_start(r, new_cap));
-            }
-        }
+        self.data = arena_copy(schema, &self.data, self.capacity, self.count, new_cap);
         self.capacity = new_cap;
         self.debug_poison_rows(self.count..new_cap);
     }
@@ -476,7 +458,7 @@ impl Batch {
         debug_assert!(self.count < self.capacity, "no row is open: `begin_row` makes its room");
         let width = self.schema.region_stride(r);
         let off = self.region_start(r) + self.count * width;
-        (&mut self.data[off..off + width], &mut self.blob.0)
+        (&mut self.data[off..off + width], &mut self.blob)
     }
 
     /// Open a row: its key (exactly `pk_stride` OPK bytes), its weight, and a
@@ -910,7 +892,7 @@ impl Batch {
         out
     }
 
-    /// Reset to empty and return both buffers to the pool, in place. Leaves what
+    /// Reset to empty and free both buffers, in place. Leaves what
     /// [`Self::empty_with_schema`] would build, without `take`'s two moves of the
     /// whole struct — and returns immediately when the batch is already free, which is
     /// what the VM's per-epoch register clear mostly does.
@@ -918,8 +900,8 @@ impl Batch {
         if self.data.capacity() == 0 && self.blob.capacity() == 0 {
             return;
         }
-        self.data = PooledBuf::default();
-        self.blob = PooledBuf::default();
+        self.data = Vec::new();
+        self.blob = Vec::new();
         self.capacity = 0;
         self.count = 0;
         self.dead_heap = 0;
@@ -1128,10 +1110,8 @@ impl Batch {
     }
 
     /// `self` in buffers of exactly what its rows take, with a wasteful heap
-    /// compacted first: each buffer that holds more is copied into one of exactly
-    /// what it takes, a pooled one only when its capacity matches exactly, since
-    /// a tight pooled buffer may hold twice what is asked of it, and one shrunk
-    /// in place keeps its tail resident.
+    /// compacted first. The arena is copied, since its regions start at offsets
+    /// of its capacity; the heap is shrunk in place.
     pub fn shrunk(mut self) -> Batch {
         if self.heap_is_wasteful() {
             self = self.compacted();
@@ -1139,15 +1119,11 @@ impl Batch {
         let cap = self.schema.arena_rows(self.count);
         let need = cap * self.schema.row_width();
         if self.data.capacity() != need {
-            self.data = arena_copy(&self.schema, &self.data, self.capacity, self.count, cap, true);
+            self.data = arena_copy(&self.schema, &self.data, self.capacity, self.count, cap);
             self.capacity = cap;
             self.debug_poison_rows(self.count..cap);
         }
-        if self.blob.capacity() != self.blob.len() {
-            let mut blob = PooledBuf::exact(self.blob.len());
-            blob.extend_from_slice(&self.blob);
-            self.blob = blob;
-        }
+        self.blob.shrink_to_fit();
         self
     }
 
@@ -1173,10 +1149,6 @@ impl Clone for Batch {
     /// An independent copy of the rows and heap, in an arena sized for the
     /// rows, keeping the consolidated claim.
     fn clone(&self) -> Self {
-        // Rebuilt rather than copied through two pooled arenas holding zero bytes.
-        if self.count == 0 && self.blob.is_empty() {
-            return Self::empty_with_schema(&self.schema);
-        }
         let mut b = self.as_mem_batch().to_batch();
         b.consolidated = self.consolidated;
         b
@@ -1267,9 +1239,8 @@ impl<'a> MemBatch<'a> {
         let schema = self.schema;
         let mut b = Batch::empty_with_schema(schema);
         let cap = schema.arena_rows(self.count);
-        b.data = arena_copy(schema, self.data, self.cap, self.count, cap, false);
-        b.blob = PooledBuf::with_capacity(self.blob.len());
-        b.blob.extend_from_slice(self.blob);
+        b.data = arena_copy(schema, self.data, self.cap, self.count, cap);
+        b.blob = self.blob.to_vec();
         b.dead_heap = self.dead_heap;
         b.capacity = cap;
         b.count = self.count;

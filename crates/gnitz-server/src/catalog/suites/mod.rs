@@ -9,6 +9,8 @@ mod ddl_tests;
 mod dir_deletion_tests;
 mod engine_tests;
 mod fk_tests;
+#[path = "benches/heap.rs"]
+mod heap_bench;
 #[path = "benches/hydrate.rs"]
 mod hydrate_bench;
 mod index_tests;

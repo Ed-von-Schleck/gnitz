@@ -388,10 +388,8 @@ fn sparse_decode(
     is_null: impl Fn(usize) -> bool,
 ) {
     sparse.decode(first_row, width, out, 3, |rows| {
-        PooledBuf(
-            rows.flat_map(|row| ((is_null(row) as u64) << 3 | 0b10111).to_le_bytes())
-                .collect(),
-        )
+        rows.flat_map(|row| ((is_null(row) as u64) << 3 | 0b10111).to_le_bytes())
+            .collect()
     });
 }
 

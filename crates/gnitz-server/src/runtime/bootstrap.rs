@@ -251,15 +251,8 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // Ahead of anything a refusal would have to undo: the reactor cannot run
     // without io_uring, and nothing else tells a container why.
     check_host()?;
-    // Keep freed memory in the heap for the next batch: with a fixed mmap
-    // threshold and a trim threshold above any phase's working set, glibc stops
-    // unmapping and trimming on free, which the next allocation would fault in
-    // again. Set before the fork, so every worker inherits it.
-    // SAFETY: mallopt only adjusts glibc's allocator parameters.
-    unsafe {
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
-    }
+    // Before the fork, so every worker inherits it.
+    gnitz_foundation::host::keep_freed_heap();
     signals::catch_reload();
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is

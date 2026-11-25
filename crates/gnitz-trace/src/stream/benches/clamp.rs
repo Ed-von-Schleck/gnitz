@@ -87,7 +87,7 @@ fn weight_clamp_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     for (name, trace, runs, delta, want) in shapes {
         let trace = TestTrace::dealt(&trace, runs);
-        // The first pass takes the pool's first allocations.
+        // The first pass takes the first allocations.
         let [_, (out, instructions)] = [(); 2].map(|()| {
             counter.measure(|| {
                 op_weight_clamp(

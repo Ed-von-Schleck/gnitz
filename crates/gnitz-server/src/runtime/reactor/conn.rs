@@ -9,7 +9,6 @@ use std::mem::MaybeUninit;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 use gnitz_wire::{Deframer, FrameBuf, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD};
-use gnitz_zset::repr::PooledBuf;
 
 use super::*;
 use crate::runtime::sync::{Either, Level, WakeQueue, select2};
@@ -356,9 +355,9 @@ pub(crate) trait Session {
     /// flight, or the alert that refuses what was ingested.
     fn owes(&self) -> bool;
     /// The records of all of `plain`, behind every record owed.
-    fn seal(&self, plain: &[u8]) -> PooledBuf;
+    fn seal(&self, plain: &[u8]) -> Vec<u8>;
     /// The goodbye's records, behind every record owed.
-    fn close(&self) -> PooledBuf;
+    fn close(&self) -> Vec<u8>;
 }
 
 /// The most plaintext one [`Session::seal`] is handed, and so about how much
@@ -424,7 +423,7 @@ struct Outbound {
 
 /// An owned client-bound payload whose bytes stay in place when it moves.
 pub(crate) enum SendBody {
-    Pooled(PooledBuf),
+    Owned(Vec<u8>),
     Slot(W2mSlot),
     /// Bytes several connections are sent.
     Shared(Rc<Vec<u8>>),
@@ -433,7 +432,7 @@ pub(crate) enum SendBody {
 impl SendBody {
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {
-            SendBody::Pooled(b) => &b.0,
+            SendBody::Owned(b) => b,
             SendBody::Slot(s) => s.frame_bytes(),
             SendBody::Shared(b) => b,
         }
@@ -763,7 +762,7 @@ pub(crate) struct Peer {
     conn: Rc<ClientConn>,
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
-    egress: Option<PooledBuf>,
+    egress: Option<Vec<u8>>,
     /// A level, and the value it must reach before this peer sends a byte;
     /// see [`Self::fence`]. Left up once reached, which holds nothing back.
     fence: Option<(&'static Level, u64)>,
@@ -824,9 +823,8 @@ impl Peer {
     /// The cork: replies appended here leave with whatever is corked beside
     /// them.
     pub(crate) fn corked(&mut self) -> &mut Vec<u8> {
-        &mut (self.egress)
-            .get_or_insert_with(|| PooledBuf::with_capacity(COALESCE_MAX_BYTES))
-            .0
+        self.egress
+            .get_or_insert_with(|| Vec::with_capacity(COALESCE_MAX_BYTES))
     }
 
     /// Append `payload` framed: its length prefix, then its bytes.
@@ -843,7 +841,7 @@ impl Peer {
 
     /// Bytes currently corked.
     fn corked_len(&self) -> usize {
-        self.egress.as_ref().map_or(0, |b| b.0.len())
+        self.egress.as_ref().map_or(0, |b| b.len())
     }
 
     /// Ship what is corked once it reaches [`COALESCE_MAX_BYTES`], bounding the
@@ -862,7 +860,7 @@ impl Peer {
         let Some(buf) = self.egress.take() else {
             return Ok(());
         };
-        self.send_raw(SendBody::Pooled(buf)).await
+        self.send_raw(SendBody::Owned(buf)).await
     }
 
     /// Send `body` behind whatever is corked: copied into the cork, or alone
@@ -926,7 +924,7 @@ impl Peer {
             match frame {
                 Some(frame) => return frame,
                 None => {
-                    let flight = SendBody::Pooled(session.seal(&[]));
+                    let flight = SendBody::Owned(session.seal(&[]));
                     self.reactor.send_owned(conn, flight).await.ok()?
                 }
             }
@@ -958,7 +956,7 @@ impl Peer {
             let turn = (len - off).min(SEAL_TURN_BYTES);
             let records = session.seal(&body.bytes()[off..off + turn]);
             off += turn;
-            let sending = self.reactor.send_owned(conn, SendBody::Pooled(records));
+            let sending = self.reactor.send_owned(conn, SendBody::Owned(records));
             if off == len {
                 drop(body);
                 return sending.await;
@@ -973,7 +971,7 @@ impl Peer {
         let conn = &self.conn;
         conn.retire();
         if let Some(session) = &conn.session {
-            let _ = self.reactor.send_owned(conn, SendBody::Pooled(session.close())).await;
+            let _ = self.reactor.send_owned(conn, SendBody::Owned(session.close())).await;
         }
         conn.fail();
     }

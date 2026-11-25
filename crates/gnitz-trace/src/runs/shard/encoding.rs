@@ -14,7 +14,6 @@ use gnitz_wire::{
     CodedHeap, FixedInt, GERMAN_INLINE_OFF, Heap, HeapValue, MAX_PK_COLUMNS, MAX_SYMBOL_LEN, MAX_SYMBOLS,
     SHORT_STRING_THRESHOLD, ScalarKind, SymbolTable, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
 };
-use gnitz_zset::repr::PooledBuf;
 use gnitz_zset::repr::append_value;
 use gnitz_zset::repr::{gallop_by, lower_bound_by};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -1229,7 +1228,7 @@ impl<'a> SparseImage<'a> {
         width: usize,
         out: &mut [u8],
         pi: usize,
-        null_words: impl FnOnce(Range<usize>) -> PooledBuf,
+        null_words: impl FnOnce(Range<usize>) -> Vec<u8>,
     ) {
         // From the block's first row on: its rank counts the values before it.
         let from = first_row - first_row % DECODE_BLOCK_ROWS;

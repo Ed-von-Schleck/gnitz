@@ -1,11 +1,25 @@
 //! Host sensing: what the machine — or the container — will actually give us,
-//! and why it refuses io_uring when it does.
+//! and why it refuses io_uring when it does; and the allocator policy the
+//! server runs under.
 //!
 //! The memory and CPU readings are policy inputs, not syscall wrappers: a
 //! budget expressed as a fraction of them scales with the deployment where a
 //! flat constant cannot.
 
 use std::path::Path;
+
+/// Keep freed memory in the heap for the next allocation: with a fixed mmap
+/// threshold and a trim threshold above any phase's working set, glibc stops
+/// unmapping and trimming on free, which the next allocation would fault in
+/// again. Inherited across a fork.
+#[cfg(target_os = "linux")]
+pub fn keep_freed_heap() {
+    // SAFETY: mallopt only adjusts glibc's allocator parameters.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
+    }
+}
 
 /// Best-effort memory budget for the process, in bytes: the cgroup v2 limit when
 /// there is one, else total physical RAM. `0` if every source fails — callers

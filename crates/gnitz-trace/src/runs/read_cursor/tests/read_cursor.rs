@@ -305,14 +305,12 @@ fn materialize_reserves_for_the_survivors() {
     let inserts = Rc::new(string_run(0..4096, 512, 1));
     let retracts = Rc::new(string_run(1..4096, 512, -1));
     let heap = inserts.blob().len() + retracts.blob().len();
-    assert!(heap > MAX_POOLED_BYTES, "must exceed MAX_POOLED_BYTES: {heap}");
-
     let batch = create_read_cursor(&[inserts, retracts], &[], make_schema_pk_u64_payload_string()).materialize();
     assert_eq!(batch.len(), 1, "all but the first key cancels");
     assert_eq!(batch.blob().len(), 512, "one surviving string");
     assert!(
-        batch.allocated_bytes() <= MAX_POOLED_BYTES,
-        "the reservation must not cover the cancelled rows (MAX_POOLED_BYTES): {}",
+        batch.allocated_bytes() <= heap / 4,
+        "the reservation must not cover the cancelled rows of a {heap}-byte heap: {}",
         batch.allocated_bytes(),
     );
 }
@@ -325,16 +323,14 @@ fn drain_chunk_blob_reservation_stays_o_chunk() {
     let even = Rc::new(string_run((0..4096).map(|i| 2 * i), 512, 1));
     let odd = Rc::new(string_run((0..4096).map(|i| 2 * i + 1), 512, 1));
     let total_blob = even.blob().len() + odd.blob().len();
-    assert!(total_blob > MAX_POOLED_BYTES, "{total_blob}");
-
     let mut cursor = create_read_cursor(&[even, odd], &[], make_schema_pk_u64_payload_string());
     assert!(cursor.mode.is_none(), "both sources must stay live");
     let mut rows = 0usize;
     while let Some(chunk) = cursor.drain_chunk(512) {
         rows += chunk.len();
         assert!(
-            chunk.allocated_bytes() <= MAX_POOLED_BYTES,
-            "chunk reserved {} bytes of a {total_blob}-byte relation (MAX_POOLED_BYTES)",
+            chunk.allocated_bytes() <= total_blob / 4,
+            "chunk reserved {} bytes of a {total_blob}-byte relation",
             chunk.allocated_bytes(),
         );
     }

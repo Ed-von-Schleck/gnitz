@@ -71,7 +71,7 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
 /// cursor inside the counted region: its instructions and its output rows.
 fn probe(counter: &Counter, plan: &JoinPlan, delta: &Batch, trace: &Batch, runs: usize) -> (u64, usize) {
     let trace = TestTrace::dealt(trace, runs);
-    // The first pass takes the pool's first allocations.
+    // The first pass takes the first allocations.
     let [_, (out, instructions)] =
         [(); 2].map(|()| counter.measure(|| op_join_delta_trace(delta, &mut |f, l| trace.cursor_within(f, l), plan)));
     (instructions, out.len())

@@ -1,4 +1,3 @@
-use super::super::pool::drain_pool;
 use super::*;
 use crate::repr::{BatchBuilder, prorated_blob_cap};
 use crate::schema::SchemaColumn;
@@ -97,8 +96,7 @@ fn every_producer_states_its_claim() {
 }
 
 /// Rows appended whole or three at a time under a layout whose regions move
-/// with the capacity read back whole, whether a growth copies onto a fresh
-/// buffer or shifts the regions within the one it has.
+/// with the capacity read back whole.
 #[test]
 fn growth_keeps_every_row_under_a_ragged_layout() {
     let schema = ragged_schema();
@@ -109,26 +107,12 @@ fn growth_keeps_every_row_under_a_ragged_layout() {
         }
     };
 
-    drain_pool();
     let mut whole = Batch::empty_with_schema(&schema);
     whole.append_batch(&src);
     assert_eq!(weighted_rows(&whole), weighted_rows(&src));
     let mut fresh = Batch::empty_with_schema(&schema);
     append_to(&mut fresh, 300);
     assert_eq!(weighted_rows(&fresh), weighted_rows(&src));
-
-    // Eight rows are 280 bytes, so the arena takes this 560-byte buffer, which
-    // then holds sixteen.
-    drain_pool();
-    drop(PooledBuf(Vec::with_capacity(560)));
-    let mut roomy = Batch::with_capacity(&schema, 8);
-    let arena = roomy.data.as_ptr();
-    append_to(&mut roomy, 15);
-    assert_eq!(roomy.capacity, 16);
-    assert_eq!(roomy.data.as_ptr(), arena, "precondition: the growth stays in place");
-    assert_eq!(weighted_rows(&roomy), &weighted_rows(&src)[..15]);
-    append_to(&mut roomy, 300);
-    assert_eq!(weighted_rows(&roomy), weighted_rows(&src));
 }
 
 /// A NULL written into the open row is a zeroed cell under its bit, over an
@@ -154,7 +138,8 @@ fn put_null_leaves_a_zeroed_cell_under_its_bit() {
 }
 
 /// `key_rows` at `-1` is one `-1` row per key, every payload cell a non-NULL
-/// zero, over a recycled buffer and under NOT NULL and string columns.
+/// zero, over an arena a debug build fills with poison, and under NOT NULL and
+/// string columns.
 #[test]
 fn key_rows_at_minus_one_are_minus_one_rows_of_zeroed_non_null_cells() {
     let schema = u64_pk_schema(&[
@@ -162,11 +147,6 @@ fn key_rows_at_minus_one_are_minus_one_rows_of_zeroed_non_null_cells() {
         SchemaColumn::new(TypeCode::I64, true),
         SchemaColumn::new(TypeCode::U16, false),
     ]);
-    // Leave a dirty buffer of the same size in the pool.
-    let mut dirty = Batch::with_capacity(&schema, 3);
-    dirty.data.fill(0xFF);
-    drop(dirty);
-
     let pks: Vec<u8> = [7u64, 3, 9].iter().flat_map(|pk| pk.to_be_bytes()).collect();
     let b = Batch::key_rows(&schema, &pks, -1);
     assert_eq!(b.len(), 3);

@@ -52,7 +52,7 @@ fn page_bench() {
                 after = Some(PkBuf::from_bytes(page.get_pk_bytes(page.len() - 1)));
             }
         };
-        // Untimed: the batch pool is warm.
+        // Untimed: the thread's pools and the heap are warm.
         black_box(walk());
         let ((pages, rows), instructions) = counter.measure(walk);
         assert_eq!(rows, ROWS, "limit {limit}: rows");
