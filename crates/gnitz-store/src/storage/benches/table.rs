@@ -183,7 +183,7 @@ fn sealed_read_bench() {
             "premise: the updates stay in RAM"
         );
         let label = format!("{held} rows, {runs} heap runs");
-        // Each read once unmeasured first, to warm the batch pool.
+        // Each read once unmeasured first, to warm the thread's pools and the heap.
         for n in [1u64, 64, 4096] {
             let step = held / (n + 1);
             let keys = || pk_keys_of_images(8, (1..=n).map(|i| (i * step) as u128));
@@ -362,5 +362,44 @@ fn unique_live_row_bench() {
         });
         assert_eq!(found, if live { keys.len() } else { 0 }, "{label}");
         println!("  {label}: {:.1} instr/probe", instructions as f64 / keys.len() as f64);
+    }
+}
+
+/// Rows landed above the cut as a recovery replays them: `Table::ingest_pending`
+/// of many pushes of keys scattered over the store's span, then the seal that
+/// moves them below it. Cycles and instructions per row of each.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn pending_replay_bench() {
+    const ROWS: u64 = 1_000_000;
+    /// Coprime to `ROWS`, so `s * STRIDE % ROWS` visits each key once.
+    const STRIDE: u64 = 7919;
+    let schema = make_schema_u64_i64();
+    let counters = Counters::open([Event::INSTRUCTIONS, Event::CYCLES]);
+    let dir = tempfile::tempdir().unwrap();
+    for per_push in [100u64, 1000] {
+        let mut t = scratch_table(dir.path().join(per_push.to_string()), schema);
+        let pushes: Vec<Batch> = (0..ROWS / per_push)
+            .map(|p| {
+                let rows: Vec<_> = (p * per_push..(p + 1) * per_push)
+                    .map(|s| (s * STRIDE % ROWS, 1, s as i64))
+                    .collect();
+                make_batch(&schema, &rows)
+            })
+            .collect();
+        let ((), [li, lc]) = counters.measure(|| pushes.into_iter().for_each(|b| t.ingest_pending(b)));
+        let (delta, [si, sc]) = counters.measure(|| t.seal().unwrap());
+        assert_eq!(
+            delta.map_or(0, |d| d.len()) as u64,
+            ROWS,
+            "{per_push}-row pushes: the seal's delta"
+        );
+        println!(
+            "pending_replay_bench {per_push:>4}-row pushes: land {:7.1} cycles/row {:7.1} instr/row; seal {:6.1} cycles/row {:6.1} instr/row",
+            lc as f64 / ROWS as f64,
+            li as f64 / ROWS as f64,
+            sc as f64 / ROWS as f64,
+            si as f64 / ROWS as f64,
+        );
     }
 }

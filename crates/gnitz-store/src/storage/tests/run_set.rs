@@ -111,6 +111,74 @@ fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
     assert_eq!(set.row_count(), 140);
 }
 
+/// A set that is not cancelling folds only its newest runs once it holds
+/// `FOLD_THRESHOLD`: a run holding more than `FOLD_RATIO` times the rows pushed
+/// after it stays as it is, and one that does not is folded in with them.
+#[test]
+fn a_full_set_folds_its_newest_runs() {
+    let schema = make_schema_u64_i64();
+    let mut set = RunSet::new(usize::MAX);
+    let small = 10u64;
+    let large = (FOLD_THRESHOLD as u64 - 1) * small * FOLD_RATIO as u64 + 1;
+    set.push(keyed_run(&schema, 0..large, 1, 0), &schema);
+    let base = Rc::clone(&set.runs[0].batch);
+    let mut next = large;
+    let mut push_small = |set: &mut RunSet| {
+        set.push(keyed_run(&schema, next..next + small, 1, 0), &schema);
+        next += small;
+    };
+    for _ in 1..FOLD_THRESHOLD {
+        push_small(&mut set);
+    }
+    assert_eq!(set.len(), 2, "the newest runs folded into one");
+    assert!(Rc::ptr_eq(&set.runs[0].batch, &base), "the large run was not rewritten");
+    assert_eq!(set.runs[1].batch.len() as u64, (FOLD_THRESHOLD as u64 - 1) * small);
+
+    // The folded run, holding more than a `FOLD_RATIO`th of the large run's
+    // rows, makes the next fold reach it.
+    while set.len() > 2 || Rc::ptr_eq(&set.runs[0].batch, &base) {
+        push_small(&mut set);
+    }
+    assert_eq!(set.row_count() as u64, next, "every pushed row is held");
+    assert!(set.batches().all(|r| r.is_consolidated()));
+}
+
+/// The newest-runs fold stops at the first run, walking back from the newest,
+/// that holds more than `FOLD_RATIO` times the rows taken: a large run shields
+/// the small runs before it.
+#[test]
+fn a_newest_fold_stops_at_a_large_run() {
+    let schema = make_schema_u64_i64();
+    let mut set = RunSet::new(usize::MAX);
+    let mut next = 0u64;
+    let mut push = |set: &mut RunSet, rows: u64| {
+        set.push(keyed_run(&schema, next..next + rows, 1, 0), &schema);
+        next += rows;
+    };
+    push(&mut set, 10);
+    push(&mut set, 10);
+    push(&mut set, 5000);
+    for _ in 3..FOLD_THRESHOLD {
+        push(&mut set, 10);
+    }
+    let lens: Vec<usize> = set.batches().map(|r| r.len()).collect();
+    assert_eq!(lens, [10, 10, 5000, 10 * (FOLD_THRESHOLD - 3)]);
+}
+
+/// A cancelling set's threshold fold takes every run, the large one included.
+#[test]
+fn a_full_cancelling_set_folds_every_run() {
+    let schema = make_schema_u64_i64();
+    let mut set = RunSet::cancelling(usize::MAX);
+    let large = 10_000u64;
+    set.push(keyed_run(&schema, 0..large, 1, 0), &schema);
+    for i in 1..FOLD_THRESHOLD as u64 {
+        set.push(keyed_run(&schema, large + 10 * i..large + 10 * i + 10, 1, 0), &schema);
+    }
+    assert_eq!(set.len(), 1, "every run folded into one");
+    assert_eq!(set.row_count() as u64, large + 10 * (FOLD_THRESHOLD as u64 - 1));
+}
+
 /// A probed set's filter is sized to its rows: a fold that cancels a few rows
 /// keeps it, an overfull push drops it for the next probe to rebuild larger
 /// until the budget caps it, an overfull filter at the cap stays until a fold
@@ -221,7 +289,7 @@ fn churn_value(pk: u64, generation: u64) -> Vec<u8> {
 fn a_fold_under_churn_keeps_every_run_trimmed() {
     let schema = make_schema_pk_u64_payload_string();
     const KEYS: u64 = 1000;
-    let mut set = RunSet::new(usize::MAX);
+    let mut set = RunSet::cancelling(usize::MAX);
     let mut latest = vec![0u64; KEYS as usize];
     let push = |set: &mut RunSet, rows: &[(u64, i64, Vec<u8>)]| {
         set.push(certified(make_batch_bytes(&schema, rows)), &schema);

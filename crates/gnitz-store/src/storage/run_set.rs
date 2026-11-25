@@ -15,6 +15,11 @@ use gnitz_zset::schema::probe_key;
 /// cursor merges and a PK probe walks.
 const FOLD_THRESHOLD: usize = 16;
 
+/// A set that is not [cancelling](RunSet::cancelling) folds, at the threshold,
+/// from its oldest run holding at most this many times the rows of the runs
+/// after it.
+const FOLD_RATIO: usize = 2;
+
 /// A [cancelling](RunSet::cancelling) set merges a run into one at most this
 /// many times its size.
 const CANCEL_MERGE_RATIO: usize = 2;
@@ -70,7 +75,9 @@ impl RunSet {
     }
 
     /// A set that merges each pushed run into the one before it while that run
-    /// is not much larger and holds most of the pushed run's retractions.
+    /// is not much larger and holds most of the pushed run's retractions, and
+    /// whose threshold fold takes every run, so a retraction meets the row it
+    /// cancels however old.
     pub(super) fn cancelling(budget: usize) -> Self {
         RunSet {
             merges_cancelling: true,
@@ -81,7 +88,8 @@ impl RunSet {
     /// Append a consolidated, [trimmed](Batch::trimmed) run, since the set
     /// charges only its rows' bytes: a [cancelling](Self::cancelling) set first
     /// merges it into the runs before it, and the set folds once it holds
-    /// [`FOLD_THRESHOLD`] runs. Empty runs are never stored.
+    /// [`FOLD_THRESHOLD`] runs — a cancelling set all of them, any other its
+    /// [newest](Self::fold_newest). Empty runs are never stored.
     pub(super) fn push_run(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
         debug_assert!(run.is_consolidated(), "RunSet::push_run requires a consolidated run");
         if run.is_empty() {
@@ -108,12 +116,31 @@ impl RunSet {
             {
                 break;
             }
-            let merged = merge_consolidated(&[older.as_mem_batch(), newer.as_mem_batch()], schema);
-            self.replace_from(self.runs.len() - 2, merged);
+            self.fold_from(self.runs.len() - 2, schema);
         }
         if self.runs.len() >= FOLD_THRESHOLD {
-            self.fold(schema);
+            match self.merges_cancelling {
+                true => self.fold(schema),
+                false => self.fold_newest(schema),
+            }
         }
+    }
+
+    /// Fold the newest runs into one: the newest two, and each run before them
+    /// holding at most [`FOLD_RATIO`] times the rows of the runs already taken,
+    /// stopping at the first that holds more. A run grown well past the rows
+    /// pushed after it is not rewritten for them, so a set that is pushed to
+    /// many times before it is drained does not rewrite its rows once per
+    /// [`FOLD_THRESHOLD`] pushes. The folded runs are the newest stretch of the
+    /// set, so the runs stay in age order.
+    fn fold_newest(&mut self, schema: &SchemaDescriptor) {
+        let mut start = self.runs.len() - 2;
+        let mut taken: usize = self.runs[start..].iter().map(|r| r.batch.len()).sum();
+        while start > 0 && self.runs[start - 1].batch.len() <= FOLD_RATIO * taken {
+            start -= 1;
+            taken += self.runs[start].batch.len();
+        }
+        self.fold_from(start, schema);
     }
 
     /// The runs whose PK extent meets the inclusive `bound`, newest first;
@@ -187,12 +214,17 @@ impl RunSet {
     /// Fold every run into one consolidated run, dropping net-zero
     /// (PK, payload) rows.
     pub(super) fn fold(&mut self, schema: &SchemaDescriptor) {
-        if self.runs.len() <= 1 {
-            return;
+        if self.runs.len() > 1 {
+            self.fold_from(0, schema);
         }
-        let views: Vec<MemBatch> = self.batches().map(|r| r.as_mem_batch()).collect();
+    }
+
+    /// Fold the runs from `start` on into one consolidated run, dropping
+    /// net-zero (PK, payload) rows.
+    fn fold_from(&mut self, start: usize, schema: &SchemaDescriptor) {
+        let views: Vec<MemBatch> = self.runs[start..].iter().map(|r| r.batch.as_mem_batch()).collect();
         let merged = merge_consolidated(&views, schema);
-        self.replace_from(0, merged);
+        self.replace_from(start, merged);
     }
 
     /// Replace the runs from `start` on with `merged`, their consolidated sum.
