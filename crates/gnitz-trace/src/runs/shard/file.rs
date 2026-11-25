@@ -203,6 +203,14 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
                 if next > 0 && sharing(firsts.len(), shared).is_none() {
                     break;
                 }
+                // Past a dictionary's limit only Raw is left, which, when every
+                // value is long, loses after as many values as the Seq image's
+                // margin over Raw pays for at `span.0` heap bytes each: the
+                // index is grown to that once rather than doubling up to it.
+                if firsts.len() == DICT_MAX_ENTRIES + 1 && span.0 > gnitz_wire::SHORT_STRING_THRESHOLD {
+                    let most = seq.saturating_sub(raw) / span.0 + 1;
+                    index.reserve(cells.len().min(most).saturating_sub(index.len()));
+                }
             }
             ids.push(id);
         }
@@ -351,3 +359,7 @@ pub(crate) fn write_shard_over(
 #[cfg(test)]
 #[path = "tests/file.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/file.rs"]
+mod bench;
