@@ -446,6 +446,12 @@ impl Mesh {
                 continue;
             }
             let schema = &lane.schema;
+            // A lane that brought this worker nothing gathers an empty batch, as
+            // most lanes of a small tick do.
+            if blocks.is_empty() && lane.saved.is_empty() {
+                gathered.push(Batch::empty_with_schema(schema));
+                continue;
+            }
             let slices: SmallVec<[MemBatch; MAX_WORKERS]> = lane
                 .saved
                 .iter()

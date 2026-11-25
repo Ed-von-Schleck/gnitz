@@ -12,7 +12,8 @@ use gnitz_foundation::perf::Counter;
 /// worker; `fold` gathers by merging the senders' rows, `concat` by appending
 /// them. One row is the round's fixed cost. `lanes` opens one round of that many
 /// one-row scatter-fold lanes, the views a worker's drain exchanges together:
-/// per lane, against one lane per round, it is what sharing a round saves.
+/// per lane, against one lane per round, it is what sharing a round saves; with
+/// no rows, it is what a lane costs a worker that sends and takes in nothing.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn mesh_round_bench() {
@@ -53,8 +54,8 @@ fn mesh_round_bench() {
                 );
             }
         }
-        let parts: Vec<Batch> = (0..nw).map(|w| partition(w, 0, 1)).collect();
-        for lanes in [1, 8] {
+        for (rows, lanes) in [(1, 1), (1, 8), (0, 1), (0, 8)] {
+            let parts: Vec<Batch> = (0..nw).map(|w| partition(w, 0, rows)).collect();
             let mut rounds: Vec<Round> = Vec::with_capacity(nw);
             let mut gathered = Vec::with_capacity(lanes);
             let (got, instructions) = counter.measure(|| {
@@ -78,9 +79,9 @@ fn mesh_round_bench() {
                 }
                 got
             });
-            assert_eq!(got, (lanes as u64) * ROUNDS, "{lanes} lanes at nw={nw}");
+            assert_eq!(got, rows * (lanes as u64) * ROUNDS, "{lanes} lanes at nw={nw}");
             println!(
-                "mesh_round_bench nw={nw} lanes={lanes:<2} {:>10.1} instr/worker-lane",
+                "mesh_round_bench nw={nw} rows={rows} lanes={lanes:<2} {:>10.1} instr/worker-lane",
                 instructions as f64 / (ROUNDS * nw as u64 * lanes as u64) as f64
             );
         }
