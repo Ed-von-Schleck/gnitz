@@ -450,6 +450,11 @@ impl Table {
         from_runs_in_band(runs, schema, start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes))
     }
 
+    /// The net rows of the key band `[start, end)` at [`Cut::Now`].
+    pub(crate) fn band_rows(&self, start: PkBuf, end: PkBuf) -> Rc<Batch> {
+        self.cursor(Some((start, Some(end))), Cut::Now).materialize()
+    }
+
     /// The consolidated batch of all live rows, cached until the row set moves.
     pub(crate) fn full_scan(&self) -> Rc<Batch> {
         let rc = self

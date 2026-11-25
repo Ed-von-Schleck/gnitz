@@ -144,7 +144,7 @@ fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
             BaseTable,
             table,
             partner,
-            |c| rekeyed_join(c, &A, false, JoinKind::Range { rel: gnitz_wire::RangeRel::Lt }),
+            |c| rekeyed_join(c, &A, false, JoinKind::range(gnitz_wire::RangeRel::Lt)),
             false,
         ),
         (

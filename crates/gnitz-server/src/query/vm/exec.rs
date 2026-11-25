@@ -366,8 +366,18 @@ fn run(
                 }
 
                 Op::JoinDT { trace, plan } => {
-                    let mut open = stores.open(stores.trace(*trace)?);
-                    stream::op_join_delta_trace(&batches[in_reg.0], &mut open, plan)
+                    let delta = &batches[in_reg.0];
+                    let out = {
+                        let mut open = stores.open(stores.trace(*trace)?);
+                        stream::op_join_delta_trace(delta, &mut open, plan)
+                    };
+                    // A clock term's trace holds nothing under the clock's time:
+                    // no later walk reads there, and no other operator reads it.
+                    if let (true, Integral::Own(idx), Some(floor)) = (tick, trace, plan.clock_floor(delta)) {
+                        let res = stores.own.raise_floor(*idx, floor);
+                        res.map_err(|e| ingest_err("clock floor", *idx, e))?;
+                    }
+                    out
                 }
 
                 Op::Share(plan) => plan.share(&batches[in_reg.0], stores.registry.slot()),

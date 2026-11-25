@@ -162,6 +162,14 @@ const SHAPES: &[Row] = &[
     // pair-PK output shard; a residual — a constant `ON 1 = 1` included — or a
     // WHERE is one filter. A self product wraps the second copy in a segment,
     // and a third relation is one more keyless step over the cut product.
+    // An operand computed over one side keys the join on a column that side
+    // computes; an operand reading both sides stays a filter over the product.
+    // An equi side scattered by a computed key is a hidden segment computing it.
+    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k + 1", 2, &[], &[(EquiJoin, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k * 2 = b.k - 1", 3, &[], &[(EquiJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w - 5", 1, &[PK, PK, PK], &[(RangeJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a, b WHERE b.w - 5 > a.v", 1, &[PK, PK, PK], &[(RangeJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v + b.w > 5", 1, &[PK, PK, PK], &[(CrossJoin, 1), (Filter, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b", 1, &[PK, PK, PK], &[(CrossJoin, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a, b", 1, &[PK, PK, PK], &[(CrossJoin, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON 1 = 1", 1, &[PK, PK, PK], &[(CrossJoin, 1), (Filter, 1)]),

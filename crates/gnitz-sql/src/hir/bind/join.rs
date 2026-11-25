@@ -109,7 +109,7 @@ pub(super) fn fold_join_step(
     // A later ON, the WHERE and the projection resolve against the widened columns.
     let (l, r) = scope.combined.split_at_mut(split);
     kind.widen_sides(l.iter_mut().map(|c| &mut c.def), r.iter_mut().map(|c| &mut c.def));
-    RelExpr::join(left, right_src, kind, on)
+    RelExpr::join(cx.ids, left, right_src, kind, on)
 }
 
 /// The `(left col, right col)` pair for each merged column name: the left copy

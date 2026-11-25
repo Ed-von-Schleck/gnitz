@@ -164,6 +164,7 @@ pub(super) fn bind_grouped_suffix(
             None => RelExpr::project(input, st.items_for(&reads)),
         };
         RelExpr::filter(
+            ids,
             RelExpr::reduce(input, group_cols.clone(), phys, ReduceKind::Aggregate, "GROUP BY")?,
             having,
         )

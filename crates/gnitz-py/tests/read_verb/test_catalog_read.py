@@ -14,7 +14,7 @@ def test_a_family_reads_as_the_scan_of_its_id(client):
     assert bag(rows(client, "SELECT table_id, name FROM _SYSTEM.Tables")) == want
     assert set(want.values()) == {1}
     assert {name for (tid, name) in want if tid < gnitz.FIRST_USER_TABLE_ID} == {
-        "schemas", "tables", "views", "columns", "indices", "circuits", "sequences"}
+        "schemas", "tables", "views", "columns", "indices", "circuits", "sequences", "clock"}
 
 
 def test_a_family_takes_every_sink(client):

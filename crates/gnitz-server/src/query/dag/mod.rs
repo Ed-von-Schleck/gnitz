@@ -252,9 +252,13 @@ impl DagEngine {
 
     /// The views reached by a relation whose deltas no boot replays into a kept
     /// view. Boot replays a base table's tail alone: a stream's rows are gone, and
-    /// a system family's tail is applied before any view exists.
+    /// a system family's tail is applied before any view exists. The clock's
+    /// steps are not recovered either, and it may stand earlier at this boot
+    /// than at the last, below rows a kept view's traces dropped.
     fn over_unreplayed_sources(&self, registry: &RelationRegistry) -> FxHashSet<u64> {
-        let unreplayed = |root: &u64| registry.relation(*root).is_some_and(|r| !r.kind().is_base_table());
+        let unreplayed = |root: &u64| {
+            *root == gnitz_wire::CLOCK.id || registry.relation(*root).is_some_and(|r| !r.kind().is_base_table())
+        };
         self.views
             .iter()
             .filter(|(_, v)| v.roots.iter().any(unreplayed))

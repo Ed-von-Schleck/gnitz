@@ -17,7 +17,7 @@ fn tables_view(engine: &mut CatalogEngine, name: &str) -> u64 {
 #[test]
 fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
     let (_dir, mut engine) = empty_catalog(1);
-    let seeds = SysFamily::ALL.len();
+    let seeds = crate::catalog::sys_tables::bootstrap_tables().count();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
     let first = tables_view(&mut engine, "v_first");

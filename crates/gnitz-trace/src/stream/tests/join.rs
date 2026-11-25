@@ -1,8 +1,9 @@
 use proptest::prelude::*;
+use std::collections::HashMap;
 
 use super::*;
 use crate::test_support::{
-    TestTrace, certified, join_reference, keyed_schema, make_batch, make_schema_u64_i64, make_schema_u128_i64,
+    RowKey, TestTrace, certified, join_reference, keyed_schema, make_batch, make_schema_u64_i64, make_schema_u128_i64,
     pk_only_schema, pk_payload_schema, rekey_plan, zset_of,
 };
 use gnitz_wire::{NullKeys, TypeCode};
@@ -87,7 +88,7 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
     let signed = pk_payload_schema(&[TypeCode::I64]);
     let unsigned = pk_payload_schema(&[TypeCode::U64]);
     let narrow = pk_payload_schema(&[TypeCode::U32]);
-    for kind in [JoinKind::Equi, JoinKind::Range { rel: RangeRel::Lt }] {
+    for kind in [JoinKind::Equi, JoinKind::range(RangeRel::Lt)] {
         for (a, b) in [(&signed, &unsigned), (&unsigned, &narrow)] {
             let err = JoinPlan::from_wire(kind, false, a, b)
                 .err()
@@ -280,7 +281,7 @@ proptest! {
         (kind, delta_is_right, (d_pk, t_pk), (d_pay, d_wide), (t_pay, t_wide)) in (
             prop_oneof![
                 Just(JoinKind::Equi),
-                prop::sample::select(RangeRel::ALL).prop_map(|rel| JoinKind::Range { rel }),
+                prop::sample::select(RangeRel::ALL).prop_map(JoinKind::range),
                 Just(JoinKind::Cross),
             ],
             any::<bool>(),
@@ -352,8 +353,8 @@ fn a_reused_plan_writes_what_a_fresh_one_writes() {
     ];
     let kinds = [
         JoinKind::Equi,
-        JoinKind::Range { rel: RangeRel::Lt },
-        JoinKind::Range { rel: RangeRel::Ge },
+        JoinKind::range(RangeRel::Lt),
+        JoinKind::range(RangeRel::Ge),
         JoinKind::Cross,
     ];
     for kind in kinds {
@@ -555,4 +556,91 @@ fn over_source_refuses_a_trace_its_source_does_not_prefix() {
     }
     let delta = SchemaDescriptor::new(&[col(0)], &[0]);
     assert!(JoinPlan::over_source(false, &delta, &source, &rekey_plan(&source, &[0], &[2], NullKeys::Drop)).is_ok());
+}
+
+// -----------------------------------------------------------------------
+// The zero-skipping range walk
+// -----------------------------------------------------------------------
+
+/// `z`'s trace payload, every delta column dropped (the key among them: a range
+/// join writes the delta row's key), as a Z-set over that payload alone.
+fn trace_projection(
+    z: HashMap<RowKey, i64>,
+    delta_is_right: bool,
+    d_n: usize,
+    t_n: usize,
+) -> HashMap<Vec<Option<Vec<u8>>>, i64> {
+    // The output payload is the left side's, then the right's.
+    let first = if delta_is_right { 0 } else { d_n };
+    let mut out = HashMap::new();
+    for ((_, vals), w) in z {
+        *out.entry(vals[first..first + t_n].to_vec()).or_insert(0i64) += w;
+    }
+    out.retain(|_, w| *w != 0);
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// Seeking past the trace spans a delta run cancels over writes, once the
+    /// delta's columns are dropped, the Z-set the full walk writes, and never
+    /// more rows.
+    #[test]
+    fn zero_skipping_walk_matches_the_full_walk_under_projection(
+        (rel, delta_is_right, pk, (d_pay, d_wide), (t_pay, t_wide)) in (
+            prop::sample::select(RangeRel::ALL),
+            any::<bool>(),
+            arb_pk_types(1..=3),
+            (arb_payload_type(), any::<bool>()),
+            (arb_payload_type(), any::<bool>()),
+        ),
+        (delta_rows, trace_rows) in (arb_side_rows(3), arb_side_rows(3)),
+    ) {
+        let d_schema = side_schema(&pk, d_pay, d_wide);
+        let t_schema = side_schema(&pk, t_pay, t_wide);
+        let delta = side_batch(&d_schema, &delta_rows).to_consolidated();
+        // Also with each trace row's payload its own, so a weight credited to the
+        // wrong trace row cannot hide behind an equal payload.
+        let unique: Vec<_> = trace_rows.iter().enumerate().map(|(i, (k, w, _))| (k.clone(), *w, i as i64)).collect();
+        for trace_rows in [&trace_rows, &unique] {
+            let trace = side_batch(&t_schema, trace_rows);
+            let full = plan(JoinKind::range(rel), delta_is_right, &d_schema, &t_schema);
+            let skip = plan(JoinKind::range(rel), delta_is_right, &d_schema, &t_schema).weight_only_delta();
+            let (d_n, t_n) = (d_schema.num_payload_cols(), t_schema.num_payload_cols());
+            for runs in [1, 3] {
+                let trace = TestTrace::dealt(&trace, runs);
+                let a = op_join_delta_trace(&delta, &mut |f, l| trace.cursor_within(f, l), &full);
+                let b = op_join_delta_trace(&delta, &mut |f, l| trace.cursor_within(f, l), &skip);
+                prop_assert!(b.len() <= a.len());
+                prop_assert_eq!(
+                    trace_projection(zset_of(&b, &skip.output_schema), delta_is_right, d_n, t_n),
+                    trace_projection(zset_of(&a, &full.output_schema), delta_is_right, d_n, t_n),
+                    "rel={:?} delta_is_right={} runs={}", rel, delta_is_right, runs
+                );
+            }
+        }
+    }
+}
+
+/// A clock tick — its old bound retracted, its new one inserted — against a
+/// window of trace rows, under `trace.ts > clock` (rows expire) and `trace.ts
+/// <= clock` (rows come due): the full walk writes the rows on the far side of
+/// the old bound twice, the zero-skipping walk only the rows between the bounds.
+#[test]
+fn a_clock_tick_writes_only_the_rows_it_crosses() {
+    let schema = make_schema_u64_i64();
+    let trace_rows: Vec<(u64, i64, i64)> = (0..1000).map(|i| (i, 1, i as i64)).collect();
+    let trace = TestTrace::dealt(&make_batch(&schema, &trace_rows), 1);
+    // The clock is the right side: it moves 500 -> 510.
+    let delta = make_batch(&schema, &[(500, -1, 0), (510, 1, 0)]).to_consolidated();
+    for (rel, full_len, weight) in [(RangeRel::Gt, 10 + 2 * 489, -1), (RangeRel::Le, 2 * 501 + 10, 1)] {
+        let full = plan(JoinKind::range(rel), true, &schema, &schema);
+        let skip = plan(JoinKind::range(rel), true, &schema, &schema).weight_only_delta();
+        let a = op_join_delta_trace(&delta, &mut |f, l| trace.cursor_within(f, l), &full);
+        let b = op_join_delta_trace(&delta, &mut |f, l| trace.cursor_within(f, l), &skip);
+        assert_eq!(a.len(), full_len, "{rel:?}");
+        assert_eq!(b.len(), 10, "{rel:?}");
+        assert!((0..b.len()).all(|r| b.get_weight(r) == weight), "{rel:?}");
+    }
 }

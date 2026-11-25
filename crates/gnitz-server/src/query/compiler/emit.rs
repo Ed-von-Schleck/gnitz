@@ -11,7 +11,7 @@ use super::routing::{Dist, shifted};
 use super::*;
 use crate::query::vm::{ClampHistory, HistoryStep, HistoryTerm, Op, ProgramBuilder};
 use gnitz_trace::stream::{JoinPlan, OrderedPlan, ReducePlan};
-use gnitz_wire::ReduceKind;
+use gnitz_wire::{JoinSide, ReduceKind};
 use gnitz_zset::algebra::null_extend_output_schema;
 
 // ---------------------------------------------------------------------------
@@ -490,8 +490,18 @@ fn emit_join_term(
                     _,
                 )) => (Integral::Own(hist), int_reg, Some(clamp), plan.clamped_trace(clamp)),
                 // The child integrating the integrand's register, declared and
-                // scheduled the first time a join asks.
+                // scheduled the first time a join asks. A term whose delta is the
+                // clock walks this trace weight-only, and the VM floors the trace
+                // at the clock's time.
                 _ => {
+                    let clock_delta = match kind {
+                        JoinKind::Range { clock: Some(side), .. } => (side == JoinSide::Right) == delta_is_right,
+                        _ => false,
+                    };
+                    let plan = match clock_delta {
+                        true => plan.weight_only_delta(),
+                        false => plan,
+                    };
                     let trace = match ctx.integrals[integrand] {
                         Some((Integral::Own(trace), ..)) => trace,
                         _ => {

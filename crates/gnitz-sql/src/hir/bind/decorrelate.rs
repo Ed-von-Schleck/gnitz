@@ -2,7 +2,7 @@
 //! Bind reads each subquery through its column ([`SubqueryRef::id`]); its join
 //! produces that column.
 
-use super::super::{ColId, ExistsKind, HirExpr, JoinType, ProjEntry, RelExpr};
+use super::super::{ColId, ColIdGen, ExistsKind, HirExpr, JoinType, ProjEntry, RelExpr};
 use super::subquery::{SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
@@ -11,6 +11,7 @@ use std::rc::Rc;
 /// `Project(items)` over `source`, with every subquery in `subs` that `source`'s
 /// filter or `items` read joined in below it.
 pub(super) fn decorrelate(
+    ids: &ColIdGen,
     source: Rc<RelExpr>,
     items: Vec<ProjEntry>,
     subs: &[SubqueryRef],
@@ -23,6 +24,7 @@ pub(super) fn decorrelate(
         _ => (&[], &source),
     };
     let mut joins = Joins {
+        ids,
         pending: subs.iter().collect(),
         cur: Rc::clone(input),
     };
@@ -72,11 +74,12 @@ pub(super) fn decorrelate(
             out: it.out,
         })
         .collect();
-    Ok(RelExpr::project(RelExpr::filter(joins.cur, kept)?, items))
+    Ok(RelExpr::project(RelExpr::filter(ids, joins.cur, kept)?, items))
 }
 
 /// The relation the subqueries are joined onto, and those not joined yet.
 struct Joins<'s> {
+    ids: &'s ColIdGen,
     pending: Vec<&'s SubqueryRef>,
     cur: Rc<RelExpr>,
 }
@@ -107,7 +110,13 @@ impl<'s> Joins<'s> {
         if let Some(refusal) = refusal {
             return Err(GnitzSqlError::rejected(refusal));
         }
-        self.cur = RelExpr::join(Rc::clone(&self.cur), Rc::clone(&s.rel), kind, s.correlation.clone())?;
+        self.cur = RelExpr::join(
+            self.ids,
+            Rc::clone(&self.cur),
+            Rc::clone(&s.rel),
+            kind,
+            s.correlation.clone(),
+        )?;
         self.pending.retain(|p| p.id != s.id);
         Ok(())
     }

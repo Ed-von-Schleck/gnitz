@@ -202,7 +202,7 @@ pub(super) fn bind_select_list<L: ItemLeaf>(
             .zip(keys)
             .map(|(&k, r)| BExpr::bin(BExpr::ColRef(k), BinOp::Eq, BExpr::ColRef(r)))
             .collect();
-        rows = RelExpr::join(rows, part, JoinType::Inner, on)?;
+        rows = RelExpr::join(ids, rows, part, JoinType::Inner, on)?;
     }
 
     // A placeholder reads its value.
@@ -212,7 +212,7 @@ pub(super) fn bind_select_list<L: ItemLeaf>(
         .into_iter()
         .map(|it| ProjEntry { expr: rewrite(&it.expr), out: it.out })
         .collect();
-    Ok((RelExpr::project(RelExpr::filter(rows, qualify)?, items), order))
+    Ok((RelExpr::project(RelExpr::filter(ids, rows, qualify)?, items), order))
 }
 
 // ── Binding ─────────────────────────────────────────────────────────────────────

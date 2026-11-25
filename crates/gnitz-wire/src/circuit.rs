@@ -48,7 +48,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 21;
+pub(crate) const CIRCUIT_VERSION: u8 = 22;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation
@@ -114,10 +114,30 @@ pub enum JoinKind {
     /// matched for equality; `rel` relates the last.
     Range {
         rel: RangeRel,
+        /// The SQL side that is `_system.clock` read for its range key alone:
+        /// every delta it sends is one time retracted and a later one inserted,
+        /// so its walk skips the trace spans they cancel over, and the other
+        /// side's integral holds nothing below the clock's time.
+        clock: Option<JoinSide>,
     },
     /// Keyless (cross) join: the probe pairs every delta row with every trace
     /// row.
     Cross,
+}
+
+impl JoinKind {
+    /// The range join relating the last key column by `rel`, no side a clock.
+    pub const fn range(rel: RangeRel) -> JoinKind {
+        JoinKind::Range { rel, clock: None }
+    }
+}
+
+wire_enum! {
+    /// One SQL side of a join. Wire values are stable.
+    pub enum JoinSide: u8 {
+        Left = 0,
+        Right = 1,
+    }
 }
 
 /// Which weight clamp an [`OpNode::WeightClamp`] is.
@@ -309,7 +329,7 @@ impl OpNode {
             OpNode::Reduce { group, kind } => w.put(&Opcode::Reduce).put(kind).put(group),
             OpNode::Join(kind) => match kind {
                 JoinKind::Equi => w.put(&Opcode::JoinEqui),
-                JoinKind::Range { rel } => w.put(&Opcode::JoinRange).put(rel),
+                JoinKind::Range { rel, clock } => w.put(&Opcode::JoinRange).put(rel).put(clock),
                 JoinKind::Cross => w.put(&Opcode::JoinCross),
             },
             OpNode::ExchangeShard => w.put(&Opcode::ExchangeShard),
@@ -358,7 +378,7 @@ impl OpNode {
                 OpNode::Reduce { group: r.get()?, kind }
             }
             Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
-            Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: r.get()? }),
+            Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: r.get()?, clock: r.get()? }),
             Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
             Opcode::ExchangeShard => OpNode::ExchangeShard,
             Opcode::NullExtend => {

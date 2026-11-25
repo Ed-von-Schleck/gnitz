@@ -108,13 +108,6 @@ fn cat() -> TestCatalog {
     cat
 }
 
-/// Assert each `(body, substring)` row rejects as `CREATE VIEW v AS body`.
-fn rejects(cat: &TestCatalog, rows: &[(&str, &str)]) {
-    for (body, needle) in rows {
-        assert_rejects(body, plan(cat, &format!("CREATE VIEW v AS {body}")), needle);
-    }
-}
-
 #[test]
 fn join_key_rules() {
     let cat = cat();

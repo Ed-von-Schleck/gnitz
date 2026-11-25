@@ -12,7 +12,7 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
         Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
-        Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: RangeRel::Le }),
+        Opcode::JoinRange => OpNode::Join(JoinKind::range(RangeRel::Le)),
         Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
         // Every aggregate, at a distinct source column.
         Opcode::Reduce => OpNode::Reduce {
@@ -168,7 +168,9 @@ fn every_op_node_variant_roundtrips() {
         });
     }
     for &rel in RangeRel::ALL {
-        nodes.push(OpNode::Join(JoinKind::Range { rel }));
+        for clock in [None, Some(JoinSide::Left), Some(JoinSide::Right)] {
+            nodes.push(OpNode::Join(JoinKind::Range { rel, clock }));
+        }
     }
     for nulls_first in [false, true] {
         nodes.push(OpNode::NullExtend {
@@ -213,7 +215,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (21, 0x7707_331a_f205_255d));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (22, 0xae28_44ba_292a_b08e));
 }
 
 /// Every framing guard, against the forgery that trips it.

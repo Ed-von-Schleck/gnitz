@@ -640,7 +640,7 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
 /// does, with no hand bump.
 ///
 /// The family half is folded straight over [`SysFamily::ALL`], so a family added
-/// there is covered without a second edit. The version consts cover what that
+/// there is covered without a second edit, and over [`CLOCK`]. The version consts cover what that
 /// fold cannot see: a `Blob` column's bytes are as durable as its neighbours',
 /// but its internal layout is invisible to a fold over names and types. They
 /// cover a circuit, the expression programs inside one, and a view's definition.
@@ -651,6 +651,7 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
         h = fold_family(h, SysFamily::ALL[i].def());
         i += 1;
     }
+    h = fold_family(h, &CLOCK);
     h = (h ^ crate::circuit::CIRCUIT_VERSION as u64).wrapping_mul(FNV_PRIME);
     h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(FNV_PRIME);
     h = (h ^ VIEW_DEF_VERSION as u64).wrapping_mul(FNV_PRIME);
@@ -670,6 +671,23 @@ pub const VIEW_DEF_VERSION: u8 = 1;
 // ---------------------------------------------------------------------------
 
 pub const FIRST_USER_TABLE_ID: u64 = 16;
+
+/// `_system.clock`: one row, keyed `0`, holding the server's current time. A
+/// view body's `NOW()` reads its `now` column. It is an ordinary replicated base
+/// table under a bootstrap id, seeded at open beside the families' entries and
+/// written by the server alone.
+pub const CLOCK: WireSysFamily = WireSysFamily {
+    id: 12,
+    name: "clock",
+    cols: &[
+        WireSysCol { name: "id", type_code: TypeCode::I64 },
+        WireSysCol {
+            name: "now",
+            type_code: TypeCode::Timestamp,
+        },
+    ],
+    pk_cols: &[0],
+};
 
 /// A tripwire on catalog object-id allocation, not a live limit: reaching it
 /// needs 2^31 durable CREATEs. Schema, relation and index ids all live below it,

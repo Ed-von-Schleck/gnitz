@@ -27,9 +27,10 @@ use super::{
     hircol_of, schema_cols,
 };
 use crate::ast_util::{
-    body_is_grouped, col_ref_parts, is_agg_call, peel_nested, select_is_distinct, single_part_ident,
+    CallSurface, PlainCall, body_is_grouped, col_ref_parts, is_agg_call, peel_nested, select_is_distinct,
+    single_part_ident,
 };
-use crate::bind::{LeafBinder, bind_conjuncts, bind_structural, unsupported_subquery};
+use crate::bind::{LeafBinder, bind_conjuncts, bind_structural, now_refused, unsupported_subquery};
 use crate::catalog::Catalog;
 use crate::error::{GnitzSqlError, derivation, reject_if, unsupported_clause};
 use crate::ir::{BExpr, BOOL, LeafTyping};
@@ -40,13 +41,13 @@ use crate::rules::{
 };
 use crate::tail::{OrderKey, OrderTarget, extract_limit_offset, parse_order_by, reject_position_out_of_range};
 use crate::validate::{QueryEnvelope, SelectSite, reject_unhonored_query_clauses, reject_unhonored_select_clauses};
-use gnitz_core::Schema;
+use gnitz_core::{RelName, Schema};
 use gnitz_wire::{ColType, ColumnDef, WeightSlots};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
 use sqlparser::ast::{
-    Expr, Ident, InTarget, JoinConstraint, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    SetOperator, SetQuantifier, TableAliasColumnDef, TableFactor,
+    Expr, Function, FunctionArguments, Ident, InTarget, JoinConstraint, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, TableAliasColumnDef, TableFactor,
 };
 use sqlparser::tokenizer::Span;
 use std::cell::RefCell;
@@ -511,13 +512,40 @@ pub(super) fn bind_select(
     // placement is physical, applied at lowering).
     let ctx = &format!("{stmt} projection");
     if let Some(where_expr) = &select.selection {
-        let leaf = ScopeLeaf { scope: &scope, sub };
+        // A view's WHERE reading the current time joins in `_system.clock`, whose
+        // columns no name reaches; NOW() reads its `now`.
+        let now = match surface.is_view() && crate::bind::mentions_now(where_expr) {
+            true => {
+                let (clock, now) = bind_clock(cx)?;
+                left = RelExpr::join(cx.ids, left, clock, JoinType::Inner, Vec::new())?;
+                Some(now)
+            }
+            false => None,
+        };
+        let leaf = ScopeLeaf { scope: &scope, sub, now: now.as_ref() };
         let preds = bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("WHERE"))?;
-        left = RelExpr::filter(left, preds)?;
+        if let Some(now) = &now {
+            let reads_now = |p: &HirExpr| {
+                let mut hit = false;
+                p.for_each_ref(&mut |id| hit |= *id == now.id);
+                hit
+            };
+            let reading = preds.iter().filter(|p| reads_now(p)).count();
+            if reading != 1 {
+                return Err(GnitzSqlError::rejected(format!(
+                    "{stmt}: NOW() may be read by one WHERE conjunct of a SELECT, not {reading}; \
+                     a window bounded on both sides is a view over a view"
+                )));
+            }
+        }
+        left = RelExpr::filter(cx.ids, left, preds)?;
+        if now.is_some() {
+            require_keyed_clock(&left, stmt)?;
+        }
         // A WHERE that narrows an outer join leaves the side it null-filled as declared.
         scope.adopt_nullability(&left.cols());
     }
-    let leaf = ScopeLeaf { scope: &scope, sub };
+    let leaf = ScopeLeaf { scope: &scope, sub, now: None };
     if grouped && !distinct {
         return bind_grouped_suffix(cx, select, left, &leaf, order);
     }
@@ -533,6 +561,31 @@ pub(super) fn bind_select(
         )));
     }
     Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, order))
+}
+
+/// `_system.clock`, which no name in the body reaches, and its `now` column.
+fn bind_clock(cx: &BindCx<'_>) -> Result<(Rc<RelExpr>, HirCol), GnitzSqlError> {
+    let name = RelName::new(gnitz_wire::SYSTEM_SCHEMA, gnitz_wire::CLOCK.name).map_err(GnitzSqlError::Internal)?;
+    let clock = RelExpr::get(cx.ids, cx.cat.probe_relation(&name)?);
+    let now = (clock.cols().iter().find(|c| &*c.def.name == "now").cloned())
+        .ok_or_else(|| GnitzSqlError::Internal("the clock table has no `now` column".into()))?;
+    Ok((clock, now))
+}
+
+/// Refuse a body whose clock join placed no key: a comparison the join cannot
+/// key on would re-read the whole other side at every step of the clock.
+fn require_keyed_clock(rel: &Rc<RelExpr>, stmt: &str) -> Result<(), GnitzSqlError> {
+    let join = match rel.as_ref() {
+        RelExpr::Filter { input, .. } => input,
+        _ => rel,
+    };
+    match join.as_ref() {
+        RelExpr::Join { on, .. } if on.arity() > 0 => Ok(()),
+        _ => Err(GnitzSqlError::rejected(format!(
+            "{stmt}: NOW() must be compared, by =, <, <=, > or >=, against an expression \
+             over one relation's columns, e.g. `ts > NOW() - 3600000000`"
+        ))),
+    }
 }
 
 /// An ad-hoc read reads one relation, and a subquery derives another.
@@ -669,6 +722,8 @@ enum SubPolicy<'a> {
 struct ScopeLeaf<'a> {
     scope: &'a JoinScope,
     sub: SubPolicy<'a>,
+    /// The clock column NOW() reads here; `None` where it is not read.
+    now: Option<&'a HirCol>,
 }
 
 impl<'a> ScopeLeaf<'a> {
@@ -676,6 +731,7 @@ impl<'a> ScopeLeaf<'a> {
     fn plain(scope: &'a JoinScope) -> Self {
         ScopeLeaf {
             scope,
+            now: None,
             sub: SubPolicy::Reject(unsupported_subquery),
         }
     }
@@ -696,7 +752,7 @@ impl ItemLeaf for ScopeLeaf<'_> {
     }
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         match self.sub {
-            SubPolicy::Bind { subs, .. } => decorrelate::decorrelate(source, items, &subs.borrow()),
+            SubPolicy::Bind { cx, subs } => decorrelate::decorrelate(cx.ids, source, items, &subs.borrow()),
             SubPolicy::Reject(_) => Ok(RelExpr::project(source, items)),
         }
     }
@@ -713,12 +769,24 @@ impl LeafTyping<ColId> for ScopeLeaf<'_> {
         match recorded {
             Some(SubqueryKind::Exists { nullable }) => (BOOL, nullable),
             Some(SubqueryKind::Scalar { ty, count }) => (ty, !count),
-            None => self.scope.combined[..].decl(id),
+            None => match self.now {
+                Some(now) if now.id == *id => std::slice::from_ref(now).decl(id),
+                _ => self.scope.combined[..].decl(id),
+            },
         }
     }
 }
 
 impl LeafBinder<ColId> for ScopeLeaf<'_> {
+    fn bind_now(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
+        let now = self.now.ok_or_else(now_refused)?;
+        let call = PlainCall::check(f, CallSurface::Scalar("NOW"))?;
+        if !matches!(f.args, FunctionArguments::None) {
+            call.args("NOW", (0, Some(0)))?;
+        }
+        Ok(BExpr::ColRef(now.id))
+    }
+
     fn bind_column(&self, qual: Option<&str>, name: &str) -> Result<HirExpr, GnitzSqlError> {
         Ok(BExpr::ColRef(self.scope.resolve(qual, name)?))
     }

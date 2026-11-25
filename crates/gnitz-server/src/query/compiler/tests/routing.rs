@@ -43,7 +43,7 @@ fn routes(meta: &ViewMeta) -> [Route; 2] {
 }
 
 /// A range join: a pure range over a one-slot key, a band over a wider one.
-const RANGE: JoinKind = JoinKind::Range { rel: RangeRel::Lt };
+const RANGE: JoinKind = JoinKind::range(RangeRel::Lt);
 
 /// `d ⋈ I(d)`: the smallest circuit in which `d`'s source reaches a join.
 fn join_with_own_trace(c: &mut Circuit, d: NodeId, kind: JoinKind) -> NodeId {

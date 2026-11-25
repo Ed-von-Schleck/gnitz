@@ -1,4 +1,5 @@
 use super::*;
+use crate::catalog::sys_tables::bootstrap_tables;
 use crate::test_support::u64_i64_cols;
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{ColTabRow, ColumnDef};
@@ -65,20 +66,20 @@ fn assert_self_description(engine: &CatalogEngine) {
         c.advance();
     }
 
-    // Driven off `SysFamily::ALL` rather than a hand-written list, so a family
+    // Driven off the bootstrap list rather than a hand-written one, so a family
     // added later is covered without touching this test.
-    for family in SysFamily::ALL {
+    for def in bootstrap_tables() {
         let mut rows = described
-            .remove(&{ family.id() })
-            .unwrap_or_else(|| panic!("family {} describes no columns", family.name()));
+            .remove(&def.id)
+            .unwrap_or_else(|| panic!("{} describes no columns", def.name));
         rows.sort_by_key(|(idx, _)| *idx);
         let names: Vec<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
-        let expected: Vec<&str> = family.def().cols.iter().map(|c| c.name).collect();
-        assert_eq!(names, expected, "family {} self-description", family.name());
+        let expected: Vec<&str> = def.cols.iter().map(|c| c.name).collect();
+        assert_eq!(names, expected, "{} self-description", def.name);
     }
-    // A fresh server holds no user tables, so the system families are the whole
-    // of COL_TAB — anything left over is a row describing a table that is not a
-    // registered family.
+    // A fresh server holds no user tables, so the system families and the clock
+    // are the whole of COL_TAB — anything left over is a row describing a table
+    // that is not one of them.
     assert!(
         described.is_empty(),
         "COL_TAB describes unregistered table ids: {:?}",
@@ -105,11 +106,11 @@ fn an_unpublished_tables_family_is_reseeded_alone() {
     let dir = tmp.path().to_str().unwrap();
     let engine = CatalogEngine::open(dir, 1).unwrap();
 
-    let col_rows: usize = SysFamily::ALL.iter().map(|f| f.def().cols.len()).sum();
+    let col_rows: usize = bootstrap_tables().map(|def| def.cols.len()).sum();
     for (family, rows) in [
         (SysFamily::Schema, 2),
         (SysFamily::Column, col_rows),
-        (SysFamily::Table, SysFamily::COUNT),
+        (SysFamily::Table, bootstrap_tables().count()),
     ] {
         let weights = weights(engine.sys_relation(family).cursor());
         assert_eq!(weights.len(), rows, "{} row count", family.name());

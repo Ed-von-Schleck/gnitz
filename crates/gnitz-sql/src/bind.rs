@@ -55,12 +55,25 @@ pub(crate) trait LeafBinder<R>: LeafTyping<R> {
              CREATE VIEW body, and cannot be nested in another window function's operands",
         ))
     }
+    /// A call of the current time ([`is_now`]). Only a view body's WHERE, which
+    /// reads it off `_system.clock`, admits one.
+    fn bind_now(&self, _f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
+        Err(now_refused())
+    }
     /// A subquery node — `[NOT] EXISTS`, `[NOT] IN (SELECT …)`, a scalar
     /// `(SELECT …)`, or an `ANY`/`ALL`/`SOME` comparison. The default is the
     /// per-kind placement rejection.
     fn bind_subquery(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
         Err(unsupported_subquery(e))
     }
+}
+
+/// The "no current time here" rejection — the [`LeafBinder::bind_now`] default.
+pub(crate) fn now_refused() -> GnitzSqlError {
+    GnitzSqlError::rejected(
+        "NOW(): the current time is read only in a view body's WHERE clause, \
+         compared against an expression over one relation's columns",
+    )
 }
 
 /// The per-kind "no subquery here" rejection — the [`LeafBinder::bind_subquery`]
@@ -199,6 +212,7 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
             None => match single_part_ident(&f.name) {
+                _ if is_now(f) => leaf.bind_now(f),
                 Some(n) if VOLATILE_FNS.iter().any(|v| n.eq_ignore_ascii_case(v)) => {
                     Err(GnitzSqlError::rejected(format!(
                         "{}: a non-deterministic function is not supported",
@@ -608,15 +622,27 @@ pub(crate) fn scalar_call_names() -> impl Iterator<Item = &'static str> {
     scalar_calls().map(|(n, _)| n)
 }
 
-/// The clock and random functions, beside [`SCALAR_CALLS`] so the two name
-/// tables live together. Listed to say *why* they are refused, which the
-/// unknown-name error they would otherwise take cannot: nothing re-evaluates a
-/// clock or a coin flip off an input delta, so they are not pending support.
+/// Whether `f` calls the current time, `NOW()` or `CURRENT_TIMESTAMP`, which a
+/// view body's WHERE reads off `_system.clock` ([`LeafBinder::bind_now`]).
+fn is_now(f: &Function) -> bool {
+    single_part_ident(&f.name)
+        .is_some_and(|n| n.eq_ignore_ascii_case("NOW") || n.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
+}
+
+/// Whether `e` calls the current time outside a subquery's body, where a
+/// subquery's own leaf refuses it.
+pub(crate) fn mentions_now(e: &Expr) -> bool {
+    crate::ast_util::expr_any(e, &|x| matches!(x, Expr::Function(f) if is_now(f)))
+}
+
+/// The clock functions but [`is_now`]'s, and the random functions, beside
+/// [`SCALAR_CALLS`] so the name tables live together. Listed to say *why* they
+/// are refused, which the unknown-name error they would otherwise take cannot:
+/// nothing re-evaluates a coin flip off an input delta, nor a clock off any but
+/// `_system.clock`'s, so they are not pending support.
 const VOLATILE_FNS: &[&str] = &[
-    "NOW",
     "CURRENT_DATE",
     "CURRENT_TIME",
-    "CURRENT_TIMESTAMP",
     "LOCALTIME",
     "LOCALTIMESTAMP",
     "RANDOM",

@@ -8,6 +8,7 @@
 mod plan_create_table;
 mod plan_read;
 mod plan_view_circuit;
+mod plan_view_clock;
 mod plan_view_rejections;
 mod plan_view_schema;
 mod plan_view_window;
@@ -151,4 +152,11 @@ fn resolving<T>(
     let planned = plan(known);
     let asked = known.take_asked();
     (planned, asked.iter().map(|n| n.name().to_string()).collect())
+}
+
+/// Assert each `(body, substring)` row rejects as `CREATE VIEW v AS body`.
+fn rejects(cat: &TestCatalog, rows: &[(&str, &str)]) {
+    for (body, needle) in rows {
+        assert_rejects(body, plan(cat, &format!("CREATE VIEW v AS {body}")), needle);
+    }
 }

@@ -393,7 +393,10 @@ fn each_unsupported_form_is_rejected_by_name() {
         // Names.
         ("FOO(c)", "function 'foo' not supported"),
         ("RANDOM()", "RANDOM: a non-deterministic function is not supported"),
-        ("now()", "NOW: a non-deterministic function is not supported"),
+        (
+            "now()",
+            "NOW(): the current time is read only in a view body's WHERE clause",
+        ),
         ("CURRENT_DATE", "non-deterministic"),
         // Only a grouped context admits an aggregate — `ALL` and `DISTINCT` included.
         ("COUNT(*)", AGG),

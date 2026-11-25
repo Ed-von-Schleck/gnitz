@@ -251,7 +251,8 @@ re-keyed onto leading columns of its own PK reads the table's store — **as the
 view last absorbed it** — instead of keeping a copy, and so does a clamp over
 base tables' rows under their own PK. A join side that is a clamp keeping its
 own history reads that history, clamped. A reduce whose output is
-the view's reads the view's own store.
+the view's reads the view's own store. A range join against the clock (see
+*The clock*) holds the other side's trace only above the clock's time.
 
 ## 4. The Region Convention
 
@@ -563,14 +564,36 @@ table. A view may scan one, and is then maintained from catalog deltas as it is
 from a table's: **a DDL's catalog rows have reached every view that scans them
 before the DDL is acknowledged.**
 
-`_system` holds nothing else, and no client write reaches a family but a DDL,
-an id allocation or a SERIAL reservation. `sequences` is read but never
-scanned: it holds the master's positions, not a set, moves with every id
-allocation, SERIAL reservation and checkpoint, and reaches no worker.
+`_system` holds nothing else but `clock` (see *The clock*), and no client
+write reaches a family but a DDL, an id allocation or a SERIAL reservation.
+`sequences` is read but never scanned: it holds the master's positions, not a
+set, moves with every id allocation, SERIAL reservation and checkpoint, and
+reaches no worker.
 
 A view reaching a family is rebuilt at every boot, as one reaching a stream is:
 the catalog's tail is applied before any view exists, so no checkpoint keeps
 such a view.
+
+## The clock
+
+```sql
+CREATE VIEW recent AS SELECT id, body FROM messages WHERE ts > NOW() - 3600000000;
+```
+
+`_system.clock` is a one-row base table holding the server's current time; no
+client writes it. While a view reads it, the server moves it forward at a fixed
+resolution, and never backwards within one process. `NOW()` (or
+`CURRENT_TIMESTAMP`) in a view body reads it, as a join with the clock.
+
+`NOW()` is admitted in exactly one WHERE conjunct of a SELECT, compared by `=`,
+`<`, `<=`, `>` or `>=` against an expression over one relation's columns, so the
+clock join is keyed. Anywhere else it is refused: every row of a projection
+reading the time would change at every step. **A step of the clock costs the
+rows that cross its bound, not the rows the window holds.**
+
+A view reaching the clock is rebuilt at every boot, as one reaching a stream is:
+the clock may stand earlier than at the last boot, and nothing below the time a
+view last read is kept for it.
 
 ## Window functions
 
@@ -648,7 +671,8 @@ Durable operations are atomic: crash recovery applies an operation in full
 or not at all, so a crash never leaves a half-written DDL or push behind.
 They fdatasync before the ACK. Everything else needs no sync: the command-only
 operations — view ticks, scans, seeks, backfills, validation queries — plus a
-push to a **stream**, which upserts nothing that survives a restart. The
+push to a **stream** and a step of the clock, neither of which a restart
+recovers. The
 dichotomy is what must be recovered, not what carries rows.
 
 A SERIAL reservation is ACKed unsynced: a crash may reissue ids no committed row

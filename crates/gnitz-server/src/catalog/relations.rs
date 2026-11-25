@@ -91,8 +91,14 @@ impl CatalogEngine {
             .relations
             .get(&tid)
             .expect("every registered relation has an entry");
+        // Every relation under a bootstrap id is a system table, as gnitz-core
+        // classes a `_system` table, the clock's base table included.
+        let class = match tid < gnitz_wire::FIRST_USER_TABLE_ID {
+            true => gnitz_wire::RelClass::Catalog,
+            false => rel.kind().class(),
+        };
         let desc = RelDescriptorBlob {
-            class: rel.kind().class(),
+            class,
             pk_repeats: rel.pk_repeats(),
             serial: self.is_serial(tid),
             indexes: rel

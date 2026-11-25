@@ -2,7 +2,10 @@
 //! place each conjunct as low as it is exact — in an input, in the join's keys, or
 //! in a `Filter` above the join.
 
-use super::{HirCol, HirExpr, JoinClass, JoinType, KeyPair, RelExpr, Side, col_by_id, cross_comparison, side};
+use super::{
+    ColIdGen, HirCol, HirExpr, JoinClass, JoinType, KeyPair, ProjEntry, RelExpr, Side, col_by_id, cross_comparison,
+    side,
+};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use crate::ir::BinOp;
@@ -20,32 +23,37 @@ enum Origin {
 impl RelExpr {
     /// A join over `on`, each conjunct placed; rejects a key the join cannot build.
     pub(crate) fn join(
+        ids: &ColIdGen,
         left: Rc<RelExpr>,
         right: Rc<RelExpr>,
         kind: JoinType,
         on: Vec<HirExpr>,
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let on = on.into_iter().flat_map(HirExpr::conjuncts).collect();
-        let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
+        let placed = place(ids, &left, &right, kind, JoinClass::default(), on, Origin::On)?;
         reject_arity("join key list", placed.class.arity(), gnitz_wire::PK_LIST_MAX_COLS)?;
         placed.class.admit(kind)?;
         reject_outer_with_residual(kind, &placed.above)?;
-        placed.build(&left, &right)
+        placed.build(ids, &left, &right)
     }
 
     /// `input` filtered by `preds`, each conjunct placed as low as it is exact.
-    pub(crate) fn filter(input: Rc<RelExpr>, preds: Vec<HirExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    pub(crate) fn filter(
+        ids: &ColIdGen,
+        input: Rc<RelExpr>,
+        preds: Vec<HirExpr>,
+    ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         if preds.is_empty() {
             return Ok(input);
         }
         let preds = preds.into_iter().flat_map(HirExpr::conjuncts).collect();
         match input.as_ref() {
             RelExpr::Filter { input: below, preds: first } => {
-                RelExpr::filter(Rc::clone(below), first.iter().cloned().chain(preds).collect())
+                RelExpr::filter(ids, Rc::clone(below), first.iter().cloned().chain(preds).collect())
             }
             // Only an INNER join keys a filter conjunct, and it admits every key.
             RelExpr::Join { left, right, kind, on } => {
-                place(left, right, *kind, on.clone(), preds, Origin::Filter)?.build(left, right)
+                place(ids, left, right, *kind, on.clone(), preds, Origin::Filter)?.build(ids, left, right)
             }
             _ => Ok(Rc::new(RelExpr::Filter { input, preds })),
         }
@@ -53,21 +61,37 @@ impl RelExpr {
 }
 
 /// A join's conjuncts once placed: its kind, its keys, what each input evaluates,
-/// and what stays above it.
+/// the key columns each input computes, and what stays above it.
 struct Placed {
     kind: JoinType,
     class: JoinClass,
     below: [Vec<HirExpr>; 2],
+    computed: [Vec<ProjEntry>; 2],
     above: Vec<HirExpr>,
 }
 
 impl Placed {
     /// The join node.
-    fn build(self, left: &Rc<RelExpr>, right: &Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    fn build(self, ids: &ColIdGen, left: &Rc<RelExpr>, right: &Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let [l, r] = self.below;
+        let [lk, rk] = self.computed;
+        // Each input filtered, then extended by the key columns it computes.
+        let input = |rel: &Rc<RelExpr>, preds, keys: Vec<ProjEntry>| -> Result<Rc<RelExpr>, GnitzSqlError> {
+            let rel = RelExpr::filter(ids, Rc::clone(rel), preds)?;
+            Ok(match keys.is_empty() {
+                true => rel,
+                false => {
+                    let items = ProjEntry::passthroughs(rel.cols().into_owned())
+                        .into_iter()
+                        .chain(keys)
+                        .collect();
+                    RelExpr::project(rel, items)
+                }
+            })
+        };
         let join = Rc::new(RelExpr::Join {
-            left: RelExpr::filter(Rc::clone(left), l)?,
-            right: RelExpr::filter(Rc::clone(right), r)?,
+            left: input(left, l, lk)?,
+            right: input(right, r, rk)?,
             kind: self.kind,
             on: self.class,
         });
@@ -118,6 +142,7 @@ fn admits(kind: JoinType, origin: Origin, side: usize) -> bool {
 /// filter's conjuncts first narrow `kind`. Fails only on an ON comparison whose
 /// column pair cannot be a key.
 fn place(
+    ids: &ColIdGen,
     left: &Rc<RelExpr>,
     right: &Rc<RelExpr>,
     kind: JoinType,
@@ -125,12 +150,13 @@ fn place(
     conjs: Vec<HirExpr>,
     origin: Origin,
 ) -> Result<Placed, GnitzSqlError> {
-    let (lcols, rcols) = (left.cols(), right.cols());
+    let (mut lcols, mut rcols) = (left.cols().into_owned(), right.cols().into_owned());
     let kind = match origin {
         Origin::Filter => narrowed(kind, &conjs, [&lcols, &rcols]),
         Origin::On => kind,
     };
     let (mut below, mut above) = ([Vec::new(), Vec::new()], Vec::new());
+    let mut computed: [Vec<ProjEntry>; 2] = Default::default();
     for conj in conjs {
         let input = match side(&conj, &lcols, &rcols) {
             Side::One(i) => admits(kind, origin, i).then_some(i),
@@ -146,9 +172,53 @@ fn place(
             above.push(conj);
             continue;
         }
+        // A comparison of an expression over each input keys on columns the
+        // inputs compute; one the join cannot key on stays a filter as written.
+        // `key` changes `class` only where it keys the comparison.
+        if let Some((keyed, [lk, rk])) = computed_comparison(ids, &conj, [&lcols, &rcols]) {
+            let (ln, rn) = (lcols.len(), rcols.len());
+            lcols.extend(lk.iter().map(|e| e.out.clone()));
+            rcols.extend(rk.iter().map(|e| e.out.clone()));
+            if let Ok(None) = class.key(keyed, &lcols, &rcols, origin) {
+                computed[0].extend(lk);
+                computed[1].extend(rk);
+                continue;
+            }
+            lcols.truncate(ln);
+            rcols.truncate(rn);
+        }
         above.extend(class.key(conj, &lcols, &rcols, origin)?);
     }
-    Ok(Placed { kind, class, below, above })
+    Ok(Placed { kind, class, below, computed, above })
+}
+
+/// `conj` as a key comparison between columns the inputs compute: an equality or
+/// range comparison whose operands each read one input's columns alone, not
+/// both bare columns. Each operand that is not a bare column becomes a hidden
+/// column of its input; `None` for any other conjunct.
+fn computed_comparison(ids: &ColIdGen, conj: &HirExpr, cols: [&[HirCol]; 2]) -> Option<(HirExpr, [Vec<ProjEntry>; 2])> {
+    let BExpr::BinOp(a, op, b) = conj else { return None };
+    if (*op != BinOp::Eq && op.as_range_rel().is_none()) || (a.as_col().is_some() && b.as_col().is_some()) {
+        return None;
+    }
+    let (l, r, op) = match (side(a, cols[0], cols[1]), side(b, cols[0], cols[1])) {
+        (Side::One(0), Side::One(1)) => (a, b, *op),
+        (Side::One(1), Side::One(0)) => (b, a, op.converse()),
+        _ => return None,
+    };
+    let mut entries: [Vec<ProjEntry>; 2] = Default::default();
+    let mut operand = |e: &HirExpr, s: usize| match e.as_col() {
+        Some(id) => BExpr::ColRef(id),
+        None => {
+            let (ty, nullable) = e.declared(cols[s]);
+            let out = HirCol::new(ids.next(), ColumnDef::new(format!("_key{s}"), ty, nullable).hidden());
+            let col = BExpr::ColRef(out.id);
+            entries[s].push(ProjEntry { expr: e.clone(), out });
+            col
+        }
+    };
+    let keyed = BExpr::BinOp(Box::new(operand(l, 0)), op, Box::new(operand(r, 1)));
+    Some((keyed, entries))
 }
 
 impl JoinClass {

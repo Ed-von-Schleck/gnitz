@@ -1,10 +1,12 @@
 //! The rederived operator state of one compiled circuit: the children its
 //! compile declares, and the stores it opens for them.
 
+use std::rc::Rc;
+
 use super::{ChildKind, RelationRegistry};
 use crate::storage::{Cut, RecoverySource, Table};
 use gnitz_trace::runs::{PkSetGather, ReadCursor, StorageError};
-use gnitz_wire::PkKeys;
+use gnitz_wire::{PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -48,6 +50,8 @@ impl StateLayout {
 pub struct CircuitState {
     /// Every child store, in [`StateIdx`] order.
     pub(super) tables: Vec<Table>,
+    /// Each child's floor, set by [`Self::raise_floor`]: no row under it is held.
+    floors: Vec<Option<PkBuf>>,
 }
 
 impl CircuitState {
@@ -66,7 +70,8 @@ impl CircuitState {
                 reg.open_child(view_id, ChildKind::Scratch(child), *schema, recovery, None, false)
             })
             .collect::<Result<_, _>>()?;
-        Ok(CircuitState { tables })
+        let floors = vec![None; view.traces.children.len()];
+        Ok(CircuitState { tables, floors })
     }
 
     /// Every live row of `keys` in `idx`.
@@ -80,7 +85,38 @@ impl CircuitState {
         self.tables[idx.0].cursor_between(first, last, Cut::Now)
     }
 
+    /// Add `batch` into `idx`, less its rows under the child's floor.
     pub fn ingest(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {
+        let batch = match &self.floors[idx.0] {
+            None => batch,
+            Some(floor) => {
+                let batch = batch.into_consolidated();
+                match batch.seek(floor.pk_bytes(), None) {
+                    0 => batch,
+                    at if at == batch.len() => return Ok(()),
+                    at => Batch::from_ranges(&batch, &[(at, batch.len())], 0),
+                }
+            }
+        };
         self.tables[idx.0].ingest(batch)
+    }
+
+    /// Raise `idx`'s floor to `floor`: retract every row it holds under it, and
+    /// drop the rows a later ingest carries under it. For a child no reader
+    /// reads under the floor again; a floor at or below the current one is a
+    /// no-op. Costs the rows the raise passes.
+    pub fn raise_floor(&mut self, idx: StateIdx, floor: PkBuf) -> Result<(), StorageError> {
+        let table = &mut self.tables[idx.0];
+        let from = match self.floors[idx.0] {
+            Some(cur) if cur >= floor => return Ok(()),
+            Some(cur) => cur,
+            None => PkBuf::zeroed(table.schema().pk_stride()),
+        };
+        let passed = Rc::unwrap_or_clone(table.band_rows(from, floor));
+        if !passed.is_empty() {
+            table.ingest(passed.negated())?;
+        }
+        self.floors[idx.0] = Some(floor);
+        Ok(())
     }
 }

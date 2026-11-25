@@ -15,6 +15,7 @@
 //! queues it: the connection's task ships it between two replies.
 
 mod backup;
+mod clock;
 mod committer;
 mod ddl;
 mod delta;
@@ -131,6 +132,8 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
         (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
     ));
     let patient_gap = Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10));
+    let clock_resolution =
+        Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_CLOCK_RESOLUTION_MS", 1000).max(1));
     let (shared, committer_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
 
     let mut signals = signals::Signals::open();
@@ -145,6 +148,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
         reactor.spawn(accept_loop(shared, listener));
     }
     reactor.spawn(tick::tick_loop(shared, patient_gap));
+    reactor.spawn(clock::clock_loop(shared, clock_resolution));
     reactor.spawn(delta::pump(shared, asks));
 
     // Until SIGTERM/SIGINT: reload the TLS listener on each SIGHUP.
@@ -420,6 +424,9 @@ fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<Re
             cat.qualified_name(target_id)
         )
         .into()),
+        Access::Write if target_id == gnitz_wire::CLOCK.id => {
+            Err(format!("{} is written by the server alone", cat.qualified_name(target_id)).into())
+        }
         Access::Write if !kind.is_ingestion_point() => Err(format!(
             "{} {} is not writable: pushes must target a base table or a stream",
             kind.noun(),

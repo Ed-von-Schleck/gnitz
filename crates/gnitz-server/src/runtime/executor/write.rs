@@ -217,11 +217,22 @@ pub(super) async fn handle_write(
     followed: bool,
 ) -> Result<u64, WireFault> {
     let _catalog = shared.catalog_rwlock.read().await;
-    let (mut families, occ) = admit_write(&shared.cat(), verb, frames)?;
+    let (families, occ) = admit_write(&shared.cat(), verb, frames)?;
     if verb == ClientVerb::Push && families.is_empty() {
         return Ok(0);
     }
+    commit_write(shared, families, occ, followed).await
+}
 
+/// Commit admitted `families`, under the catalog read guard the caller holds:
+/// the table locks, the OCC checks `occ`, the validation of a write that reads
+/// committed state, and the commit.
+pub(super) async fn commit_write(
+    shared: &Shared,
+    mut families: Vec<TxnFamily>,
+    occ: Vec<(u64, u64)>,
+    followed: bool,
+) -> Result<u64, WireFault> {
     let (tids, exclusive, reads_committed) = {
         let cat = shared.cat();
         let reads_committed = families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode));

@@ -144,7 +144,7 @@ impl JoinPlan {
                 same_pk_types(delta, trace)?;
                 Walk::Equi { trace_ordered }
             }
-            JoinKind::Range { rel } => {
+            JoinKind::Range { rel, .. } => {
                 same_pk_types(delta, trace)?;
                 Walk::Range(RangeProbe::new(trace, rel, delta_is_right))
             }
@@ -164,6 +164,31 @@ impl JoinPlan {
             trace_leads: delta_is_right,
             trace_cap: None,
         })
+    }
+
+    /// This plan where nothing above the join reads the delta side's columns, so
+    /// the rows one trace row meets are worth only their summed weight: the
+    /// trace span a delta group's weights cancel over in full is not walked.
+    pub fn weight_only_delta(mut self) -> JoinPlan {
+        if let Walk::Range(p) = &mut self.walk {
+            p.skip_zero = true;
+        }
+        self
+    }
+
+    /// Under [`Self::weight_only_delta`], over a clock's `delta` (consolidated):
+    /// the trace key no later walk of this plan reads under once the clock has
+    /// moved to the time `delta` inserts, as long as the clock only moves
+    /// forward. A walk starts at the split its retracted time induces, which is
+    /// the split the inserted time induces now. `None` for any other plan, a
+    /// delta inserting no time, and a split past the top of the key space.
+    pub fn clock_floor(&self, delta: &Batch) -> Option<PkBuf> {
+        let Walk::Range(probe) = self.walk else { return None };
+        if !probe.skip_zero {
+            return None;
+        }
+        let row = (0..delta.len()).find(|&r| delta.get_weight(r) > 0)?;
+        probe.split(delta.get_pk_bytes(row))
     }
 
     /// This plan over a trace holding `kind`'s input history in place of its
@@ -210,6 +235,9 @@ struct RangeProbe {
     /// The cut falls below the delta row's own slot, so an equal trace slot lies
     /// on the far side of it.
     cuts_below: bool,
+    /// Leave out the trace span every row of a delta group meets when the
+    /// group's weights sum to zero.
+    skip_zero: bool,
 }
 
 impl RangeProbe {
@@ -227,6 +255,7 @@ impl RangeProbe {
             eq_size,
             above: rel.bounds_below(),
             cuts_below: rel.bounds_below() == rel.admits_equal(),
+            skip_zero: false,
         }
     }
 
@@ -234,13 +263,19 @@ impl RangeProbe {
     /// `pk` (`equality prefix ‖ range slot`). `None` when it is provably empty.
     fn cut_points(&self, pk: &[u8]) -> Option<(PkBuf, Option<PkBuf>)> {
         let (group, stride) = (&pk[..self.eq_size], pk.len());
-        let split = match self.cuts_below {
-            true => Some(PkBuf::from_bytes(pk)),
-            false => key_above(pk, stride),
-        };
+        let split = self.split(pk);
         match self.above {
             true => band(split?, key_above(group, stride)),
             false => band(group_floor(group, stride), split),
+        }
+    }
+
+    /// The first trace key at or past the split a delta row whose PK region is
+    /// `pk` induces; `None` past the top of the key space.
+    fn split(&self, pk: &[u8]) -> Option<PkBuf> {
+        match self.cuts_below {
+            true => Some(PkBuf::from_bytes(pk)),
+            false => key_above(pk, pk.len()),
         }
     }
 
@@ -644,12 +679,26 @@ fn range_merge_walk(
         // The group shares one bound, so the row whose other bound spans
         // widest cuts for all of them.
         let cut_row = if above { lo } else { hi - 1 };
-        let Some((start, end)) = probe.cut_points(delta.get_pk_bytes(cut_row)) else {
+        let Some((mut start, mut end)) = probe.cut_points(delta.get_pk_bytes(cut_row)) else {
             // Provably empty, so the cursor never moved here and says nothing
             // about the trace past this group.
             lo = hi;
             continue;
         };
+        // A trace row past the far row's split meets the whole group: weight
+        // only, a group summing to zero writes nothing there. The far split
+        // carries the group's equality prefix, so it stays inside the band.
+        if probe.skip_zero && (lo..hi).map(|i| delta.get_weight(i) as i128).sum::<i128>() == 0 {
+            let far = probe.split(delta.get_pk_bytes(if above { hi - 1 } else { lo }));
+            match (above, far) {
+                (true, far) => end = far.or(end),
+                (false, Some(far)) => start = far,
+                (false, None) => {
+                    lo = hi;
+                    continue;
+                }
+            }
+        }
         // Backward-capable: under `Gt`/`Ge` the start cut can lie below where
         // the last sweep left the cursor.
         cursor.advance_to(start.pk_bytes());

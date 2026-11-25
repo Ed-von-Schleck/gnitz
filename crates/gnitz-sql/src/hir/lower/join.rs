@@ -256,10 +256,12 @@ fn emit_join_inputs(
     }
     let [s0, s1] = keys;
     let pk_repeats = spines.each_ref().map(|s| s.seg.pk_repeats);
+    let reads_clock = spines.each_ref().map(|s| s.seg.tid == gnitz_wire::CLOCK.id);
     // A backfill feeds the sources in scan order, and the first is joined against
-    // nothing: where one side alone outputs its unmatched rows, it goes second.
+    // nothing: where one side alone outputs its unmatched rows, it goes second,
+    // and so does a side the clock floors, so no row under the floor enters it.
     let [l, r] = spines;
-    let [(a, frame_l), (b, frame_r)] = match kind.emits_unmatched(0) && !kind.emits_unmatched(1) {
+    let [(a, frame_l), (b, frame_r)] = match kind.emits_unmatched(0) && !kind.emits_unmatched(1) || reads_clock[1] {
         true => {
             let b = r.emit(cb, Relabel::Slots, Some(s1))?;
             [l.emit(cb, Relabel::Slots, Some(s0))?, b]
@@ -270,17 +272,18 @@ fn emit_join_inputs(
         ],
     };
     let [kept_l, kept_r] = join_keep(refs, class, kind, out_key, [&frame_l, &frame_r])?;
-    let side = |i: usize, input, frame: Frame, keep| -> Result<JoinSide, GnitzSqlError> {
+    let side = |i: usize, input, frame: Frame, keep: Vec<u32>| -> Result<JoinSide, GnitzSqlError> {
         Ok(JoinSide {
             input,
             key: (class.keys())
                 .map(|p| Ok((frame.slot(p.cols[i])? as u32, p.ty.tc)))
                 .collect::<Result<_, GnitzSqlError>>()?,
-            keep,
             pk: pk_slots(&frame.schema),
             unique: unique[i],
             pk_repeats: pk_repeats[i],
             pk_placed: pk_placed[i],
+            clock: reads_clock[i] && keep.iter().all(|c| frame.schema.pk_cols().contains(c)),
+            keep,
             frame,
         })
     };
@@ -308,6 +311,9 @@ struct JoinSide {
     /// This side's delta is scattered by its source PK, so each row is on its
     /// PK's owner already.
     pk_placed: bool,
+    /// This side is `_system.clock` read in place, keeping no column but its
+    /// constant PK: nothing above the join reads which time a row met.
+    clock: bool,
 }
 
 impl JoinSide {
@@ -506,7 +512,7 @@ fn emit_band(cb: &mut Circuit, k: usize, op: RangeRel, kind: JoinType, sides: &[
     let reindex = [sides[0].on_key(cb, NullKeys::Drop), sides[1].on_key(cb, NullKeys::Drop)];
     // The two range terms over `[key region, A, B]`, each carrying the ON clause's
     // left-to-right range relation verbatim.
-    let merged = cb.join(reindex, reindex, JoinKind::Range { rel: op });
+    let merged = cb.join(reindex, reindex, JoinKind::range(op));
     // P = `sides[p]`: P's input and its rows no pair matches, both keyed on P's
     // source PK.
     let split = |cb: &mut Circuit, p: usize| {
@@ -536,8 +542,14 @@ fn emit_band(cb: &mut Circuit, k: usize, op: RangeRel, kind: JoinType, sides: &[
 /// matches.
 fn emit_pure_range(cb: &mut Circuit, op: RangeRel, kind: JoinType, sides: &[JoinSide; 2]) -> Terms {
     let [a, b] = sides;
-    let rel = JoinKind::Range { rel: op };
+    let rel = JoinKind::range(op);
     if kind == JoinType::Inner {
+        let clock = match (a.clock, b.clock) {
+            (true, false) => Some(gnitz_wire::JoinSide::Left),
+            (false, true) => Some(gnitz_wire::JoinSide::Right),
+            _ => None,
+        };
+        let rel = JoinKind::Range { rel: op, clock };
         let reindex = [a.on_key(cb, NullKeys::Drop), b.on_key(cb, NullKeys::Drop)];
         let ints = integrals(cb, sides, reindex);
         let merged = cb.join(reindex, ints, rel);
@@ -623,7 +635,7 @@ fn threshold(cb: &mut Circuit, side_a: &JoinSide, reindex_b: NodeId, int_a: Node
     let reindex_m = cb.map_reindex(red, &[(1, side_a.key[0].1)], &[], NullKeys::Keep);
     // `m` carries no payload, so both terms are `[_join_pk, A]`.
     let deltas = [int_a, reindex_m];
-    let matched = cb.join(deltas, deltas, JoinKind::Range { rel: op });
+    let matched = cb.join(deltas, deltas, JoinKind::range(op));
     rekey_pinned(cb, matched, 1, std::slice::from_ref(side_a))
 }
 

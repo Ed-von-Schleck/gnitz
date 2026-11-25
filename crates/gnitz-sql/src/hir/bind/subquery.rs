@@ -109,6 +109,7 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
         scope.push(&tref.alias, inner_cols.clone())?;
         let leaf = ScopeLeaf {
             scope: &scope,
+            now: None,
             sub: SubPolicy::Reject(|_| {
                 GnitzSqlError::rejected(
                     "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views",
@@ -128,7 +129,7 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
             }
         }
     }
-    let rel = RelExpr::filter(inner_get, local_preds)?;
+    let rel = RelExpr::filter(cx.cx.ids, inner_get, local_preds)?;
     Ok(InnerResolved {
         rel,
         inner: JoinScope::single(tref.alias, inner_cols),

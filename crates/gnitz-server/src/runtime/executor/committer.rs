@@ -392,7 +392,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         // unit's earlier families, which were never published. A family is one
         // group: its target's shape record and its rows routed to the workers
         // that own them. A base table's group rides inside the zone; a
-        // stream's, which no restart recovers, outside. No worker ACKs one: a
+        // stream's and the clock's, which no restart recovers, outside. No worker ACKs one: a
         // read or tick behind it in the SAL reaches its workers after their
         // apply, and a worker that cannot apply it exits.
         let cat = disp.cat();
@@ -404,7 +404,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                     let (rel, record) = cat
                         .shape_target(f.tid)
                         .expect("a push target is registered under the catalog lock");
-                    let recoverable = rel.kind().is_base_table();
+                    let recoverable = rel.kind().is_base_table() && f.tid != gnitz_wire::CLOCK.id;
                     with_routed(f.rows.view(), rel.placement(), disp.sal().num_workers(), |rows| {
                         scope.push(f.tid, f.pk_rule, record, rows, recoverable)
                     })?;

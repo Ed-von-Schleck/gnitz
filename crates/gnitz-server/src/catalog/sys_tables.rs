@@ -405,6 +405,12 @@ pub(crate) trait SysFamilyExt: Copy {
     fn master_only(self) -> bool;
 }
 
+/// Every table a fresh database's TABLE_TAB and COL_TAB describe: the system
+/// families, then the clock.
+pub(super) fn bootstrap_tables() -> impl Iterator<Item = &'static gnitz_wire::WireSysFamily> {
+    SysFamily::ALL.iter().map(|f| f.def()).chain([&gnitz_wire::CLOCK])
+}
+
 impl SysFamilyExt for SysFamily {
     fn schema(self) -> &'static SchemaDescriptor {
         &SCHEMAS[self.index()].0
@@ -432,21 +438,21 @@ impl SysFamilyExt for SysFamily {
                 }
             }
             SysFamily::Table => {
-                for family in SysFamily::ALL {
+                for def in bootstrap_tables() {
                     // Replicated, as registered at open.
                     let props = TableProps {
                         distribution: gnitz_wire::TableDistribution::Replicated,
                         ..Default::default()
                     };
-                    let pk = PkColList::from_slice(family.def().pk_cols);
-                    let row = TableTabRow::of(family.id(), SYSTEM_SCHEMA_ID, family.name(), pk, props);
+                    let pk = PkColList::from_slice(def.pk_cols);
+                    let row = TableTabRow::of(def.id, SYSTEM_SCHEMA_ID, def.name, pk, props);
                     row.write(bb, 1);
                 }
             }
             SysFamily::Column => {
-                for family in SysFamily::ALL {
-                    for (i, def) in family.def().column_defs().enumerate() {
-                        ColTabRow::of(family.id(), i as u64, &def, None).write(bb, 1);
+                for def in bootstrap_tables() {
+                    for (i, col) in def.column_defs().enumerate() {
+                        ColTabRow::of(def.id, i as u64, &col, None).write(bb, 1);
                     }
                 }
             }

@@ -198,7 +198,7 @@ fn join_range_bench() {
         let delta = build(&schema, Payload::Int, &delta_rows);
         let trace = build(&schema, Payload::Int, &trace_rows);
         for rel in [RangeRel::Lt, RangeRel::Gt] {
-            let plan = JoinPlan::from_wire(JoinKind::Range { rel }, true, &schema, &schema).unwrap();
+            let plan = JoinPlan::from_wire(JoinKind::range(rel), true, &schema, &schema).unwrap();
             let [(i1, out), (i4, out4)] = RUNS.map(|runs| probe(&counter, &plan, &delta, &trace, runs));
             assert!(out > 0 && out == out4, "{name} {rel:?}");
             for (runs, instructions) in RUNS.into_iter().zip([i1, i4]) {
@@ -209,6 +209,34 @@ fn join_range_bench() {
                     instructions as f64 / out as f64
                 );
             }
+        }
+    }
+}
+
+/// A clock tick against a window: the trace holds `w` rows, the delta retracts
+/// bound `w/2` and inserts bound `w/2 + 16`, so 16 trace rows cross it.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn join_range_tick_bench() {
+    let schema = schema_for(&[TypeCode::U64], Payload::Int);
+    let counter = Counter::instructions();
+    for w in [1_000u64, 10_000, 100_000, 1_000_000] {
+        let trace_rows: Vec<Row> = (0..w).map(|s| (vec![s as u128], 0)).collect();
+        let trace = build(&schema, Payload::Int, &trace_rows);
+        let mut b = BatchBuilder::new(&schema);
+        for (bound, weight) in [(w / 2, -1), (w / 2 + 16, 1)] {
+            b.begin_row_natives(&[bound as u128], weight);
+            b.put_int(0);
+            b.end_row();
+        }
+        let delta = b.finish().to_consolidated();
+        for skip in [false, true] {
+            let mut plan = JoinPlan::from_wire(JoinKind::range(RangeRel::Gt), true, &schema, &schema).unwrap();
+            if skip {
+                plan = plan.weight_only_delta();
+            }
+            let (instructions, out) = probe(&counter, &plan, &delta, &trace, 1);
+            println!("join_range_tick_bench w={w:>8} skip={skip:<5} out {out:>8}: {instructions:>12} instr");
         }
     }
 }
