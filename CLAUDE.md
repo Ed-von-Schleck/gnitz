@@ -251,8 +251,7 @@ re-keyed onto leading columns of its own PK reads the table's store — **as the
 view last absorbed it** — instead of keeping a copy, and so does a clamp over
 base tables' rows under their own PK. A join side that is a clamp keeping its
 own history reads that history, clamped. A reduce whose output is
-the view's reads the view's own store. A range join against the clock (see
-*The clock*) holds the other side's trace only above the clock's time.
+the view's reads the view's own store.
 
 ## 4. The Region Convention
 
@@ -576,24 +575,11 @@ such a view.
 
 ## The clock
 
-```sql
-CREATE VIEW recent AS SELECT id, body FROM messages WHERE ts > NOW() - 3600000000;
-```
-
-`_system.clock` is a one-row base table holding the server's current time; no
-client writes it. While a view reads it, the server moves it forward at a fixed
-resolution, and never backwards within one process. `NOW()` (or
-`CURRENT_TIMESTAMP`) in a view body reads it, as a join with the clock.
-
-`NOW()` is admitted in exactly one WHERE conjunct of a SELECT, compared by `=`,
-`<`, `<=`, `>` or `>=` against an expression over one relation's columns, so the
-clock join is keyed. Anywhere else it is refused: every row of a projection
-reading the time would change at every step. **A step of the clock costs the
-rows that cross its bound, not the rows the window holds.**
-
-A view reaching the clock is rebuilt at every boot, as one reaching a stream is:
-the clock may stand earlier than at the last boot, and nothing below the time a
-view last read is kept for it.
+`NOW()` in a view body reads `_system.clock`, a one-row table only the server
+writes, moving it forward while a view reads it. It is admitted in one WHERE
+conjunct comparing it against an expression over one relation, and refused
+anywhere else; **a step costs the rows that cross its bound, not the rows the
+window holds.** A view reaching the clock is rebuilt at every boot.
 
 ## Window functions
 
