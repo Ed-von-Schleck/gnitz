@@ -37,8 +37,8 @@ fn plan_insert_bench() {
             insert((0..ROWS).map(|r| r / 2), "short", "ON CONFLICT DO NOTHING"),
         ),
     ] {
-        black_box(plan_insert(&insert, &cat).unwrap());
-        let (plan, total) = counter.measure(|| plan_insert(&insert, &cat).unwrap());
+        black_box(plan_insert(&insert, &cat, false).unwrap());
+        let (plan, total) = counter.measure(|| plan_insert(&insert, &cat, false).unwrap());
         black_box(plan);
         println!(
             "plan_insert_bench {name:<14} {:7.1} instr/row",
@@ -63,7 +63,7 @@ fn resolve_conflicts_bench() {
     let WritePlan {
         target,
         write: Write::Upsert { rows, mut set },
-    } = plan_insert(&insert, &cat()).unwrap()
+    } = plan_insert(&insert, &cat(), false).unwrap()
     else {
         unreachable!("an ON CONFLICT plans an upsert")
     };

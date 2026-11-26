@@ -250,14 +250,15 @@ pub(crate) async fn execute_statement(
             client.txn_rollback()?;
             Ok(SqlResult::TransactionRolledBack)
         }
-        // A write is checked wherever it lands: sent, by its own request;
-        // buffered in a transaction, by the COMMIT that ships it.
+        // A write's rows are checked wherever they land: sent, by its own
+        // request; buffered in a transaction, by the COMMIT that ships it.
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            let in_txn = client.txn_active();
             planned_kept(
                 client,
                 schema_name,
                 Descriptors::KEPT,
-                |cat| dml::plan_write(stmt, cat),
+                |cat| dml::plan_write(stmt, cat, in_txn),
                 |_| true,
                 dml::execute_write,
             )

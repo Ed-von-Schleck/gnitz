@@ -136,10 +136,11 @@ fn admit_push(
         }
     };
     if kind == RelationKind::Stream {
-        let Some(first_row) = stream_rows_from else {
-            return Err(format!("table {tid} is a stream: a stream cannot be written inside a transaction").into());
-        };
-        check_stream_push(tid, family.as_ref().map(|f| f.rows.view()), mode, first_row)?;
+        match stream_rows_from {
+            None => Err("a stream cannot be written inside a transaction".to_owned()),
+            Some(first_row) => check_stream_push(family.as_ref().map(|f| f.rows.view()), mode, first_row),
+        }
+        .map_err(|why| format!("'{}' is a stream: {why}", cat.qualified_name(tid)))?;
     }
     Ok(family)
 }
@@ -321,7 +322,7 @@ pub(super) fn admit_write(
             for item in items {
                 let (basis, tid) = (item.hdr.arg0, item.hdr.target_id);
                 let family = admit_push(cat, &frame, item, None)
-                    .map_err(|e| e.in_context(format_args!("TXN family {tid}")))?
+                    .map_err(|e| e.in_context(format_args!("a transaction's write to relation {tid}")))?
                     .expect("a PUSH_TXN item carries a data block");
                 // A blind family's basis is one no commit exceeds: there is nothing to check.
                 if basis != BLIND {
@@ -352,17 +353,9 @@ pub(super) fn admit_write(
 /// `push_reads_committed_state` false for a stream: its push takes the shared
 /// table lock and skips the validator, which would probe a stream's absent
 /// store.
-fn check_stream_push(
-    target_id: u64,
-    batch: Option<MemBatch<'_>>,
-    mode: WireConflictMode,
-    first_row: usize,
-) -> Result<(), String> {
+fn check_stream_push(batch: Option<MemBatch<'_>>, mode: WireConflictMode, first_row: usize) -> Result<(), String> {
     if mode == WireConflictMode::Error {
-        return Err(format!(
-            "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \
-             uniqueness a stream does not have"
-        ));
+        return Err("conflict mode 'error' asserts a primary-key uniqueness a stream does not have".to_owned());
     }
     let Some(batch) = batch.filter(|b| !b.all_weights_positive()) else {
         return Ok(());
@@ -372,8 +365,7 @@ fn check_stream_push(
         .find(|&i| batch.get_weight(i) <= 0)
         .expect("just found one");
     Err(format!(
-        "table {target_id} is a stream: a stream is append-only, but row {} of this push carries \
-         weight {}",
+        "a stream is append-only, but row {} of this push carries weight {}",
         first_row + i,
         batch.get_weight(i)
     ))

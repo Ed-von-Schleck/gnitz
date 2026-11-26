@@ -44,7 +44,7 @@ def test_a_transaction_writing_a_stream_is_refused_whole(conn):
     ordinary table included, rather than lost after a partial commit."""
     t_tid, t_schema = conn.resolve_table("t")
     s_tid, s_schema = conn.resolve_table("s")
-    with pytest.raises(gnitz.GnitzRefusedError, match="a stream cannot be written inside a transaction"):
+    with pytest.raises(gnitz.GnitzRefusedError, match=r"'[^']*\.s' is a stream: a stream cannot be written inside a transaction"):
         with conn.transaction() as txn:
             txn.push(t_tid, gnitz.ZSetBatch(t_schema).extend([{"id": 1, "kind": 1}]))
             txn.push(s_tid, gnitz.ZSetBatch(s_schema).extend([{"id": 2, "kind": 2, "amount": 2}]))

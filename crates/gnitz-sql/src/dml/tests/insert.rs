@@ -54,7 +54,7 @@ fn cat() -> TestCatalog {
 }
 
 fn insert(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
-    plan_write(&parse_stmt(sql), cat)
+    plan_write(&parse_stmt(sql), cat, false)
 }
 
 /// The VALUES rows an INSERT plan writes.
@@ -273,6 +273,20 @@ fn a_refused_insert_names_its_rule() {
     ] {
         assert_rejects(sql, insert(&cat, sql), needle);
     }
+}
+
+/// Inside a transaction an INSERT takes a base table only: the COMMIT would
+/// refuse a stream's rows, so the statement is refused before it is buffered.
+#[test]
+fn an_insert_inside_a_transaction_refuses_a_stream() {
+    let cat = cat();
+    let in_txn = |sql: &str| plan_write(&parse_stmt(sql), &cat, true);
+    assert_rejects(
+        "a stream",
+        in_txn("INSERT INTO st VALUES (1, 5)"),
+        "'st' is a stream; INSERT inside a transaction requires a base table",
+    );
+    assert!(in_txn("INSERT INTO t VALUES (1, 20, 'b')").is_ok());
 }
 
 /// RETURNING a relation's own columns replies with the rows written, verbatim,

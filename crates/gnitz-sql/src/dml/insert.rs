@@ -27,7 +27,8 @@ use sqlparser::ast::{
     TableObject, Values,
 };
 
-pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePlan, GnitzSqlError> {
+/// Plan an INSERT; `in_txn` when it would be buffered in an open transaction.
+pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog, in_txn: bool) -> Result<WritePlan, GnitzSqlError> {
     const CTX: &str = "INSERT";
     // Every clause the planner does not consume is rejected, as it would otherwise
     // be read as a plain append.
@@ -109,6 +110,17 @@ pub(super) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<WritePla
 
     let target = cat.probe_relation(&table_name)?;
     require_class(&target, &table_name, ClassWant::BaseTableOrStream, CTX)?;
+    // A transaction is recovered whole and a stream's rows never are, so the
+    // COMMIT would refuse a stream write; it is refused here, before the
+    // transaction holds it.
+    if in_txn {
+        require_class(
+            &target,
+            &table_name,
+            ClassWant::BaseTable,
+            "INSERT inside a transaction",
+        )?;
+    }
     let schema = &target.schema;
 
     reject_if(returning.is_some() && on.is_some(), "INSERT … ON CONFLICT", "RETURNING")?;

@@ -54,10 +54,11 @@ pub(super) enum Write {
     Delete { bound: ReadBound, predicate: Vec<u8> },
 }
 
-/// Plan an INSERT, UPDATE or DELETE.
-pub(crate) fn plan_write(stmt: &Statement, cat: &dyn Catalog) -> Result<WritePlan, GnitzSqlError> {
+/// Plan an INSERT, UPDATE or DELETE; `in_txn` when it would be buffered in an
+/// open transaction.
+pub(crate) fn plan_write(stmt: &Statement, cat: &dyn Catalog, in_txn: bool) -> Result<WritePlan, GnitzSqlError> {
     match stmt {
-        Statement::Insert(insert) => plan_insert(insert, cat),
+        Statement::Insert(insert) => plan_insert(insert, cat, in_txn),
         Statement::Update(update) => plan_update(update, cat),
         Statement::Delete(del) => plan_delete(del, cat),
         _ => unreachable!("dispatch routes only INSERT, UPDATE and DELETE here"),

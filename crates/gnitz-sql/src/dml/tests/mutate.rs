@@ -4,7 +4,7 @@ use crate::test_support::{TestCatalog, assert_rejects, catalog, col, ncol, parse
 use gnitz_wire::{ReadBound, RelClass, TypeCode};
 
 fn plan(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
-    plan_write(&parse_stmt(sql), cat)
+    plan_write(&parse_stmt(sql), cat, false)
 }
 
 /// | name | shape |
