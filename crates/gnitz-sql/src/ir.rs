@@ -989,7 +989,15 @@ impl<R> BExpr<R> {
     pub(crate) fn for_each_ref(&self, f: &mut impl FnMut(&R)) {
         match self {
             BExpr::ColRef(r) => f(r),
-            BExpr::LitInt(_)
+            _ => self.for_each_child(&mut |c| c.for_each_ref(&mut *f)),
+        }
+    }
+
+    /// Visit each direct sub-expression, in order.
+    pub(crate) fn for_each_child(&self, f: &mut impl FnMut(&Self)) {
+        match self {
+            BExpr::ColRef(_)
+            | BExpr::LitInt(_)
             | BExpr::LitFloat { .. }
             | BExpr::LitStr(_)
             | BExpr::LitWide(_)
@@ -1002,26 +1010,24 @@ impl<R> BExpr<R> {
             | BExpr::Calendar { arg: e, .. }
             | BExpr::Cast { expr: e, .. }
             | BExpr::TrimCall { s: e, .. }
-            | BExpr::Like { s: e, .. } => e.for_each_ref(f),
+            | BExpr::Like { s: e, .. } => f(e),
             BExpr::MinMaxN { args, .. } | BExpr::StrCall { args, .. } | BExpr::ConcatN { args } => {
-                args.iter().for_each(|a| a.for_each_ref(f))
+                args.iter().for_each(f)
             }
             BExpr::BinOp(l, _, r) => {
-                l.for_each_ref(f);
-                r.for_each_ref(f);
+                f(l);
+                f(r);
             }
             BExpr::Case { branches, else_ } => {
                 for (c, r) in branches {
-                    c.for_each_ref(f);
-                    r.for_each_ref(f);
+                    f(c);
+                    f(r);
                 }
-                else_.for_each_ref(f);
+                f(else_);
             }
             BExpr::InList { inner, items } => {
-                inner.for_each_ref(f);
-                for i in items {
-                    i.for_each_ref(f);
-                }
+                f(inner);
+                items.iter().for_each(f);
             }
         }
     }

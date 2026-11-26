@@ -88,16 +88,10 @@ impl Lowering<'_> {
     }
 
     fn col_ref(&mut self, idx: usize) -> Result<Reg, GnitzSqlError> {
+        // The rejection exists for its wording: the engine refuses these columns
+        // too, but names them by position only.
         let c = &self.cols[idx];
         let col = idx as u32;
-        // Both rejections exist for their wording: the engine refuses these
-        // columns too, but names them by position only.
-        if c.ty.tc.is_wide_int() {
-            return Err(GnitzSqlError::rejected(format!(
-                "column {:?} is {}; 128-bit columns cannot be used in expressions",
-                c.name, c.ty,
-            )));
-        }
         Ok(match c.ty.tc {
             TypeCode::Blob => {
                 return Err(GnitzSqlError::rejected(format!(
@@ -744,6 +738,35 @@ impl Lowering<'_> {
     }
 }
 
+/// Refuse a 128-bit column anywhere in `e` but as the bare operand of
+/// `IS [NOT] NULL`, which reads the null bitmap. The column has no register, and
+/// typing reads it as a BIGINT, so the refusal comes before any lowering: a
+/// later step would refuse the expression under a misleading name. Its wording
+/// is the planner's: the engine refuses these columns too, but names them by
+/// position only.
+fn refuse_wide(e: &BoundExpr, cols: &[ColumnDef]) -> Result<(), GnitzSqlError> {
+    match e {
+        BoundExpr::NullTest { inner, .. } if inner.as_col().is_some() => Ok(()),
+        BoundExpr::ColRef(idx) if cols[*idx].ty.tc.is_wide_int() => {
+            let c = &cols[*idx];
+            Err(GnitzSqlError::rejected(format!(
+                "column {:?} is {}; 128-bit columns cannot be used in expressions \
+                 (a plain SELECT compares one with a value through its primary key or an index)",
+                c.name, c.ty,
+            )))
+        }
+        _ => {
+            let mut r = Ok(());
+            e.for_each_child(&mut |c| {
+                if r.is_ok() {
+                    r = refuse_wide(c, cols);
+                }
+            });
+            r
+        }
+    }
+}
+
 /// Compile a BoundExpr into `eb`, returning the result register — the form for
 /// a caller threading several expressions into one program.
 pub(crate) fn compile_bound_expr(
@@ -751,6 +774,7 @@ pub(crate) fn compile_bound_expr(
     cols: &[ColumnDef],
     eb: &mut ExprBuilder,
 ) -> Result<Reg, GnitzSqlError> {
+    refuse_wide(expr, cols)?;
     Lowering { cols, eb }.lower(expr)
 }
 
@@ -792,6 +816,7 @@ pub(crate) fn compile_filter_program<'a>(
     let mut backend = Lowering { cols, eb: &mut eb };
     let mut acc: Option<Reg> = None;
     for e in conjuncts {
+        refuse_wide(e, cols)?;
         // A conjunct settled true filters nothing, and is still a condition:
         // it is lowered apart for its refusals alone.
         if constant_truth(e) == Some(true) {

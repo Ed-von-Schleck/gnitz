@@ -736,6 +736,23 @@ fn each_refused_form_names_its_rule() {
             vec![t(T::UUID)],
             "column \"c1\" is UUID; 128-bit columns cannot be used",
         ),
+        // Refused before typing, which would read the UUID as a BIGINT or blend
+        // it with a string literal as a string.
+        (
+            "(c1 + 1) = 'x'",
+            vec![t(T::UUID)],
+            "column \"c1\" is UUID; 128-bit columns cannot be used",
+        ),
+        (
+            "c1 = '00000000-0000-0000-0000-000000000001'",
+            vec![t(T::UUID)],
+            "column \"c1\" is UUID; 128-bit columns cannot be used",
+        ),
+        (
+            "'00000000-0000-0000-0000-000000000001' < c1",
+            vec![t(T::UUID)],
+            "column \"c1\" is UUID; 128-bit columns cannot be used",
+        ),
         ("CAST(c1 AS UUID)", vec![t(T::I64)], "CAST to UUID is not supported"),
         (
             "CAST(c1 AS UINT128)",

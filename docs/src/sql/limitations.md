@@ -88,8 +88,26 @@ DISTINCT aggregates: every DISTINCT aggregate of one query must read the same ar
 - **No non-deterministic functions** (`RANDOM()`, `CURRENT_DATE`, …): a view must give
   the same rows each time it is computed. Generate random values in the client.
 - **128-bit columns** (`UUID`, `HUGEINT`, `UHUGEINT`) can be stored, selected,
-  grouped by, joined on and used as keys, but not compared with a value or used
-  in arithmetic. A plain `SELECT` of one row by a `UUID` primary key works.
+  grouped by, joined on and used as keys and indexed, but not used in an
+  expression. A plain `SELECT` still compares one with a value through its
+  primary key or an index: an equality, a range or an `IN` list there reads the
+  key, and needs no expression.
+
+```sql
+CREATE TABLE devices (id UUID PRIMARY KEY, owner UUID, label TEXT);
+CREATE INDEX devices_by_owner ON devices (owner);
+SELECT label FROM devices WHERE id = '6f1c1a8e-3b8e-4c47-9d1e-2f0b6f9a1c2d';
+SELECT label FROM devices WHERE owner = '0b9e7f3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b';
+```
+
+```sql,refused
+CREATE VIEW mine AS
+    SELECT label FROM devices WHERE owner = '0b9e7f3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b';
+```
+
+```text
+column "owner" is UUID; 128-bit columns cannot be used in expressions (a plain SELECT compares one with a value through its primary key or an index)
+```
 
 ## Writes
 
