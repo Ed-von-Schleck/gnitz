@@ -51,7 +51,8 @@ INTEGRATION := --features gnitz-sql/integration --features gnitz-core/integratio
         bench-rust bench bench-full bench-disk bench-profile bench-compare bench-report bench-native \
         profiling-server pyext-profiling \
         fuzz-seeds fuzz-server fuzz fuzz-replay \
-        image image-test container-seccomp
+        image image-test container-seccomp \
+        docs docs-serve
 
 all: test
 
@@ -217,7 +218,7 @@ fuzz-replay: ## Replay one fuzz-server input against its server, every frame tra
 	GNITZ_FUZZ_SEEDS=$(FUZZ)/seeds GNITZ_SERVER_BIN=$(FUZZ_SERVER) $(FUZZ_DRIVER) replay $(IN)
 
 # ---------------------------------------------------------------------------
-# Container image — container/README.md says how to run it
+# Container image — the documentation's Deployment page says how to run it
 # ---------------------------------------------------------------------------
 
 IMAGE_TAG = $(shell git describe --always --dirty)
@@ -232,6 +233,16 @@ image-test: image pyext ## Boot the image as it is deployed and query it over TL
 
 container-seccomp: ## Regenerate container/seccomp.json from the pinned upstream Docker profile
 	python3 -I container/seccomp.py
+
+# ---------------------------------------------------------------------------
+# Documentation — docs/, published by .github/workflows/docs.yml
+# ---------------------------------------------------------------------------
+
+docs: ## Build the documentation site -> docs/book (needs mdbook)
+	mdbook build docs
+
+docs-serve: ## Serve the documentation site on localhost, rebuilt on every change
+	mdbook serve docs
 
 # ---------------------------------------------------------------------------
 # Housekeeping

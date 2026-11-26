@@ -1,0 +1,18 @@
+.gnitz-banner {
+    margin: 0 0 1.5em;
+    padding: 0.6em 1em;
+    border-left: 4px solid var(--links);
+    background: var(--quote-bg);
+    font-size: 0.9em;
+}
+
+/* A `sql,refused` example: one gnitz refuses, as its page says. */
+pre:has(> code.refused) {
+    border-left: 4px solid #c0392b;
+}
+pre:has(> code.refused)::before {
+    content: "refused";
+    float: right;
+    font-size: 0.75em;
+    color: #c0392b;
+}

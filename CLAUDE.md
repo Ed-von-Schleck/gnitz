@@ -307,8 +307,15 @@ list, this is not. The ones whose semantics are not obvious from the name:
 - **`make image`** builds the server's container image, and **`make
   image-test`** boots it as it is deployed. The server refuses to boot without
   io_uring, which every container runtime's default seccomp profile denies, so
-  the image runs only under `container/seccomp.json`; `container/README.md` is
-  the deployment guide.
+  the image runs only under `container/seccomp.json`; the deployment guide is
+  the documentation site's (`docs/`).
+- **`make docs`** builds the user documentation in `docs/` with mdBook, which
+  `.github/workflows/docs.yml` publishes from `main`. Every `sql` block in it
+  (and in `README.md`) runs in `make e2e`, and every `sql,refused` block must be
+  refused there with the error the `text` block after it shows, so a planner
+  change that alters what SQL is accepted, or how it is refused, updates the
+  docs with it. `make test` fails when a function, type, shell meta-command or
+  server option, environment variable or exit code is missing from its page.
 
 The Python extension that ships is the one maturin installs at
 `crates/gnitz-py/python/gnitz/_native*.so`. `crates/target/*/libgnitz.so` is

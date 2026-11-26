@@ -209,3 +209,37 @@ fn every_tls_resolution_refusal_names_what_it_refuses() {
         assert!(e.contains(names), "{flags:?}: {e}");
     }
 }
+
+/// Every option, environment variable and exit code `--help` describes is on
+/// the documentation's configuration page.
+#[test]
+fn the_configuration_page_names_everything_help_does() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/src/ops/configuration.md");
+    let page = std::fs::read_to_string(path).unwrap();
+    let mut section = "";
+    let mut missing = Vec::new();
+    for line in super::HELP_TEXT.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            section = line;
+            continue;
+        }
+        // An entry starts two columns in; a deeper line continues one.
+        let Some(word) = line.strip_prefix("  ").filter(|l| !l.starts_with(' ')) else {
+            continue;
+        };
+        let word = word.split_whitespace().next().unwrap_or("");
+        let named = match section {
+            "Options:" if word.starts_with("--") => word.split(['=', ',']).next().unwrap(),
+            "Environment:" if word.starts_with("GNITZ_") => word,
+            "Exit codes:" if word.parse::<u8>().is_ok() => &format!("| {word} |"),
+            _ => continue,
+        };
+        if !page.contains(named) {
+            missing.push(named.to_string());
+        }
+    }
+    assert!(missing.is_empty(), "{path} does not name {missing:?}");
+}

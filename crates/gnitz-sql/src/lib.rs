@@ -34,6 +34,10 @@ mod test_support;
 mod types;
 mod validate;
 
+#[cfg(test)]
+#[path = "tests/lib.rs"]
+mod tests;
+
 pub use ddl::options::{with_option_names, with_options};
 pub use ddl::render::{
     create_index_statements, create_schema_statement, create_table_statement, create_view_statement, qualified_name,

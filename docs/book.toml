@@ -1,0 +1,10 @@
+[book]
+title = "gnitz"
+description = "A SQL database whose views are always materialized and incrementally maintained."
+
+[output.html]
+git-repository-url = "https://github.com/Ed-von-Schleck/gnitz"
+edit-url-template = "https://github.com/Ed-von-Schleck/gnitz/edit/main/docs/src/{path}"
+site-url = "/gnitz/"
+additional-css = ["assets/gnitz.css"]
+additional-js = ["assets/gnitz.js"]

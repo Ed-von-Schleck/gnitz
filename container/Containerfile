@@ -2,7 +2,8 @@
 #
 # The gnitz server image. Build it from the repository root (`make image`), and
 # run it under `container/seccomp.json`: a runtime's default profile denies the
-# io_uring syscalls the server cannot boot without. See container/README.md.
+# io_uring syscalls the server cannot boot without. The documentation's
+# Deployment page says how to run it.
 
 ARG RUST_IMAGE=docker.io/library/rust:1-trixie
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot

@@ -42,3 +42,16 @@ fn a_synopsis_out_of_brackets_is_an_argument_the_command_needs() {
         assert!(!needs(name), "{name}");
     }
 }
+
+#[test]
+fn the_shell_page_names_every_command() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/src/clients/shell.md");
+    let page = std::fs::read_to_string(path).unwrap();
+    let missing: Vec<&str> = COMMANDS
+        .iter()
+        .flat_map(|c| c.names.first())
+        .copied()
+        .filter(|n| !page.contains(&format!("`{n}`")) && !page.contains(&format!("`{n} ")))
+        .collect();
+    assert!(missing.is_empty(), "{path} does not name {missing:?}");
+}

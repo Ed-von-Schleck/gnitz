@@ -175,3 +175,5 @@ benchmarks/results/
 # Generated Rust docs
 crates/doc/
 
+# mdBook output (make docs)
+docs/book/

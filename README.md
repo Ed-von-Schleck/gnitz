@@ -6,6 +6,8 @@ A Gnitz guarantees efficient `VIEW` updates by implementing the **DBSP** (Differ
 
 Gnitz is pre-alpha.
 
+**Documentation: <https://ed-von-schleck.github.io/gnitz/>**
+
 ## Try it
 
 Install the shell, `gnitz`, and the server, `gnitz-server`:
@@ -30,7 +32,7 @@ SELECT * FROM revenue ORDER BY customer;
 ```
 
 The server runs on Linux 6.7 or later, on x86-64 with AVX2 or on aarch64; the
-shell also runs on macOS. On macOS run the server in a container, below; on
+shell also runs on macOS. On macOS run the server [in a container](https://ed-von-schleck.github.io/gnitz/ops/deployment.html#containers); on
 Windows, install both inside WSL 2.
 
 To connect to a running server, give `gnitz` its Unix socket path or a
@@ -61,56 +63,13 @@ fixtures `gnitz_server`, `gnitz_target` and `gnitz_client`, the last a
 connection in a schema of each test's own. For a FastAPI app, see
 [fastapi-gnitz](https://github.com/gnitzlabor/fastapi-gnitz).
 
-## In a container
+## Running a server
 
-The image is `ghcr.io/ed-von-schleck/gnitz-server`. The server runs on io_uring,
-which a container runtime's default seccomp profile denies, so it runs under the
-profile each release carries. On a laptop, with the port published on
-loopback only:
-
-```sh
-curl -LO https://github.com/Ed-von-Schleck/gnitz/releases/latest/download/seccomp.json
-docker run -d --name gnitz --security-opt seccomp=seccomp.json \
-    -v gnitz:/data -p 127.0.0.1:7543:7543 ghcr.io/ed-von-schleck/gnitz-server \
-    --tls-listen=0.0.0.0:7543 --tls-name=localhost --allow-unauthenticated /data /data/gnitz.sock
-docker cp gnitz:/data/tls_cert.pem gnitz-ca.pem
-gnitz "tls://localhost:7543?ca=gnitz-ca.pem"
-```
-
-Docker Desktop 4.42 blocks io_uring whatever the profile; the versions after it
-do not. [`container/README.md`](container/README.md) is the deployment guide:
-access tokens, Docker Compose and Kubernetes.
-
-## In production
-
-On a Linux host, the server's release archive carries `gnitz-server`, the
-systemd unit `gnitz-server.service`, whose header says how to install it, and
-`seccomp.json`. For containers, see [`container/README.md`](container/README.md).
-
-A client and a server must be of the same release. A client that dials another
-release's server is refused, naming both releases.
-
-## Upgrading
-
-A data directory is stamped with the storage format of the release that last
-opened it. A release that keeps that format opens it in place. A release whose
-format moved, which its release notes say, refuses it at boot with exit code 65,
-naming both releases, and changes nothing in it. The data comes across as a
-logical dump: the old release's shell dumps it, with the old release's server
-running on it, and the new release's shell restores it into a new data
-directory.
-
-```sh
-# gnitz and gnitz-server of the old release
-gnitz --data /var/lib/gnitz -c '\dump /srv/gnitz-dump'
-# gnitz and gnitz-server of the new release
-gnitz --data /var/lib/gnitz-new -c '\restore /srv/gnitz-dump'
-```
-
-`gnitz --data` runs the `gnitz-server` installed beside the shell; `\dump` and
-`\restore` also work in a shell connected to a running server, such as a
-container of the old release's image tag. A dump holds the tables' rows and
-every definition; views are rebuilt from their definitions on restore.
+[Deployment](https://ed-von-schleck.github.io/gnitz/ops/deployment.html) covers
+systemd, containers, Docker Compose and Kubernetes;
+[Security](https://ed-von-schleck.github.io/gnitz/ops/security.html) TLS and
+access tokens; and [Backup and upgrades](https://ed-von-schleck.github.io/gnitz/ops/backup.html)
+moving data between releases. A client and a server must be of the same release.
 
 ## From source
 
