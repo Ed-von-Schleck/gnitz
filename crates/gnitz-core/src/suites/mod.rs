@@ -1,6 +1,7 @@
 //! The client against a real `gnitz-server`, one module per surface.
 
 mod base_replay;
+mod data_format;
 mod ddl_txn;
 mod key_reply;
 mod read_modify_write;

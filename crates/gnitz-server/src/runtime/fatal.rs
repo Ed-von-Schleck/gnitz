@@ -15,6 +15,9 @@ pub(crate) enum ServerExit {
     WorkerDied = 2,
     /// `sysexits.h`'s `EX_USAGE`: argv was refused, before anything was created.
     Usage = 64,
+    /// `sysexits.h`'s `EX_DATAERR`: the data directory is in a format this build
+    /// does not read, and was left as it was.
+    DataFormat = 65,
     /// `gnitz_fatal_abort!`: 128 + SIGABRT.
     FailStop = 134,
 }

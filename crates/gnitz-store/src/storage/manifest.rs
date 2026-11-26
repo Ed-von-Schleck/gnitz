@@ -17,7 +17,8 @@ use gnitz_wire::PkBuf;
 use gnitz_wire::{Reader, Writer};
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 17;
+/// Bumped by hand for any change to the bytes [`encode`] writes.
+pub(crate) const VERSION: u64 = 17;
 
 /// What a shard index publishes and reopens from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

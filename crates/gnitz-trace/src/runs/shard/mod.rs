@@ -21,4 +21,5 @@ pub use compact::{GuardMerge, GuardRun, guard_slot};
 pub use error::StorageError;
 pub(crate) use file::write_shard_over;
 pub use file::{ShardWriteOpts, write_shard};
+pub use layout::SHARD_VERSION;
 pub use reader::{MappedShard, ShardDirectory};

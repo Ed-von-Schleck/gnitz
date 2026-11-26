@@ -12,6 +12,7 @@ mod table;
 #[cfg(test)]
 mod suites;
 
+pub(crate) use manifest::VERSION as MANIFEST_VERSION;
 pub(crate) use manifest::{
     RecoverySource, link_stores, manifest_path, read_at, read_intact, retire_stores, shard_files,
 };

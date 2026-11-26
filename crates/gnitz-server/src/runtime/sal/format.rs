@@ -45,7 +45,7 @@ const SAL_LAYOUT: u32 = 2;
 /// The format word beside the anchor: the log's layout, and the
 /// [`WIRE_VERSION`] of the shape records and data blocks its payloads hold.
 /// Never 0, which is a fresh file's.
-pub(super) const SAL_FORMAT: u64 = (SAL_LAYOUT as u64) << 32 | WIRE_VERSION as u64;
+pub(crate) const SAL_FORMAT: u64 = (SAL_LAYOUT as u64) << 32 | WIRE_VERSION as u64;
 
 /// The epoch after `epoch`: what a checkpoint's base round moves the writer and
 /// every reader to, and what a boot starts at above the recovered tail's epoch.

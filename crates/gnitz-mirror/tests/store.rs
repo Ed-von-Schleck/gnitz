@@ -657,7 +657,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
 /// directory it is opened at, as they were.
 #[test]
 fn a_store_leaves_whatever_else_its_directory_holds() {
-    use gnitz_store::relation::{lock_data_dir, relation_dir};
+    use gnitz_store::relation::{STORE_FORMAT, lock_data_dir, relation_dir};
     let dir = tempfile::tempdir().unwrap();
     // A one-worker server's rows for the id the store is about to register, and
     // a relation the store never hears of.
@@ -674,7 +674,7 @@ fn a_store_leaves_whatever_else_its_directory_holds() {
     let mut store = open(&dir);
     seed(&mut store, "v", &desc(TID), &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
-    let _server = lock_data_dir(path(&dir)).expect("the directory's own lock is free");
+    let _server = lock_data_dir(path(&dir), STORE_FORMAT).expect("the directory's own lock is free");
     drop(store);
     let mut store = open(&dir);
     store.forget(TID).unwrap();
@@ -762,6 +762,26 @@ fn a_refill_a_crash_cuts_short_reopens_at_the_last_checkpoint() {
     let mut store = open(&dir);
     assert_eq!(store.cursor_of(TID), Some(cursor(4)));
     assert_eq!(held(&mut store, TID), BTreeMap::from([((1, 10), 1), ((2, 20), 1)]));
+}
+
+/// A store stamped with another format, as another build's is, reopens empty:
+/// every copy bootstraps, and none of the old relation directories is left.
+#[test]
+fn a_store_of_another_format_reopens_empty() {
+    let dir = two_checkpointed_copies();
+    let stamp = format!("{}/FORMAT", root(path(&dir)));
+    let ours = std::fs::read_to_string(&stamp).expect("the store is stamped");
+    gnitz_store::relation::write_stamp(&root(path(&dir)), 1).unwrap();
+
+    let store = open(&dir);
+    assert_eq!(store.cursor_of(TID), None);
+    assert_eq!(store.cursor_of(OTHER_TID), None);
+    assert!(!has_copy(path(&dir), TID) && !has_copy(path(&dir), OTHER_TID));
+    assert_eq!(
+        std::fs::read_to_string(&stamp).unwrap(),
+        ours,
+        "stamped with this build's format again"
+    );
 }
 
 /// A checkpoint publishes the copies that moved and nothing else: not a copy

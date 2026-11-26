@@ -8,10 +8,11 @@ use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Switch;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
-    DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig, lock_data_dir,
+    DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, STORE_FORMAT, StateLayout, StoreConfig,
+    lock_data_dir, reset_data_dir,
 };
 use gnitz_wire::multi_frame::DeltaCursor;
-use gnitz_wire::{PkColList, ViewBudget};
+use gnitz_wire::{PkColList, ViewBudget, WIRE_VERSION, format_digest};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -52,6 +53,10 @@ impl MirrorConfig {
 
 /// The store's directory under the one a host names.
 const ROOT: &str = "_mirror";
+
+/// The format the store's directory is stamped with: the stores', and the
+/// [`WIRE_VERSION`] of the shape records and cursors a copy's record holds.
+const MIRROR_FORMAT: u64 = format_digest(&[STORE_FORMAT, WIRE_VERSION as u64]);
 
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance or a cursor
 /// move. A panic rather than an `Err`: nothing else poisons the client's
@@ -95,7 +100,17 @@ impl Mirror {
     /// process or another, holds it.
     pub fn open(base_dir: &str, config: MirrorConfig) -> Result<Self, String> {
         let root = format!("{base_dir}/{ROOT}");
-        let dir_lock = lock_data_dir(&root)?;
+        let (dir_lock, found) = lock_data_dir(&root, MIRROR_FORMAT)?;
+        // Every copy is the view's, so one this build cannot read is dropped
+        // and bootstraps, as a copy that fails to reopen does.
+        if let Some(foreign) = found {
+            gnitz_debug!(
+                "mirror: '{}' holds another format ({:?}), so every copy bootstraps",
+                root,
+                foreign
+            );
+            reset_data_dir(&dir_lock, &root, MIRROR_FORMAT)?;
+        }
         let registry = RelationRegistry::new(&root, Slot::SOLO, config.store);
         let persisted = registry.persisted_records()?;
         let mut store = Mirror {

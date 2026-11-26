@@ -15,7 +15,7 @@ pub(crate) const SHARD_EPOCH: u64 = 32;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
-const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
+pub const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
 const DIR_ENTRY_SIZE: usize = 16;
 pub(crate) const ALIGNMENT: usize = 64;
 

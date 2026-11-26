@@ -14,6 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use super::Shared;
+use crate::runtime::data_format::DATA_FORMAT;
 use crate::runtime::sal::Read;
 use gnitz_foundation::fault::Switch;
 use gnitz_foundation::posix_io;
@@ -51,7 +52,13 @@ pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault
         Err(e) => return Err(format!("create backup '{partial}': {e}").into()),
     }
     let mut copy_at = partial.as_str();
-    let result = shared.committer.backup(partial.clone()).await.and_then(|()| {
+    // Stamped as a boot stamps a data directory of this build's format, ahead
+    // of the committer's copy, which holds up every write while it runs.
+    let copied = match gnitz_store::relation::write_stamp(&partial, DATA_FORMAT) {
+        Ok(()) => shared.committer.backup(partial.clone()).await,
+        Err(e) => Err(e.into()),
+    };
+    let result = copied.and_then(|()| {
         let synced = |dir: &str| posix_io::fsync_dir(dir).map_err(|e| format!("fsync '{dir}': {e}"));
         // The copy's own entries, durable before the name makes it a backup.
         synced(&partial)?;
@@ -76,7 +83,7 @@ pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault
 /// A backup's copy, run by the committer right behind a checkpoint: every
 /// worker puts the stores it published into the data directory `dir`, then the
 /// master puts its system families', each store with the entries that reach it
-/// durable. `dir` exists; everything under it is made here.
+/// durable. `dir` exists and is stamped; every store under it is made here.
 pub(super) async fn copy_published(shared: &Shared, dir: &str) -> Result<(), WireFault> {
     shared.dispatcher.command(Read::Backup { dir }).await?;
     if BACKUP_ABORT.armed() {

@@ -90,6 +90,28 @@ systemd unit `gnitz-server.service`, whose header says how to install it, and
 A client and a server must be of the same release. A client that dials another
 release's server is refused, naming both releases.
 
+## Upgrading
+
+A data directory is stamped with the storage format of the release that last
+opened it. A release that keeps that format opens it in place. A release whose
+format moved, which its release notes say, refuses it at boot with exit code 65,
+naming both releases, and changes nothing in it. The data comes across as a
+logical dump: the old release's shell dumps it, with the old release's server
+running on it, and the new release's shell restores it into a new data
+directory.
+
+```sh
+# gnitz and gnitz-server of the old release
+gnitz --data /var/lib/gnitz -c '\dump /srv/gnitz-dump'
+# gnitz and gnitz-server of the new release
+gnitz --data /var/lib/gnitz-new -c '\restore /srv/gnitz-dump'
+```
+
+`gnitz --data` runs the `gnitz-server` installed beside the shell; `\dump` and
+`\restore` also work in a shell connected to a running server, such as a
+container of the old release's image tag. A dump holds the tables' rows and
+every definition; views are rebuilt from their definitions on restore.
+
 ## From source
 
 `cargo install gnitz` builds the shell, and `cargo install gnitz-server` the

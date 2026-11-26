@@ -15,6 +15,7 @@ use gnitz_foundation::fault::{Stage, Switch};
 
 use crate::runtime::ServerExit;
 use crate::runtime::affinity;
+use crate::runtime::data_format::{self, DATA_FORMAT};
 use crate::runtime::executor;
 use crate::runtime::listen;
 use crate::runtime::master::{MasterDispatcher, Workers};
@@ -268,7 +269,12 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
 
     // Held for the life of the process, from before any store opens; a forked
     // worker shares it.
-    let _dir_lock = gnitz_store::relation::lock_data_dir(data_dir)?;
+    let (_dir_lock, found) = gnitz_store::relation::lock_data_dir(data_dir, DATA_FORMAT)?;
+    // Ahead of the TLS identity and the SAL, the first files a boot would write.
+    if let Some(foreign) = found {
+        gnitz_error!("{}", data_format::refusal(data_dir, &foreign));
+        return Ok(ServerExit::DataFormat);
+    }
     listen::clear_published(data_dir)?;
     // Ahead of recovery, so an identity that cannot be read or minted refuses
     // the boot before it costs one.

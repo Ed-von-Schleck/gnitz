@@ -17,7 +17,8 @@ mod shard;
 pub use read_cursor::{PkSetGather, ReadCursor, empty_cursor, from_runs, from_runs_at, from_runs_in_band};
 pub use run::{Run, StoredRow};
 pub use shard::{
-    Codebook, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError, guard_slot, write_shard,
+    Codebook, GuardMerge, GuardRun, MappedShard, SHARD_VERSION, ShardDirectory, ShardWriteOpts, StorageError,
+    guard_slot, write_shard,
 };
 
 pub(crate) use read_cursor::GroupProbe;

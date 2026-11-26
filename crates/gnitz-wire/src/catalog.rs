@@ -601,12 +601,30 @@ impl<'a> ViewTabRow<'a> {
 // ---------------------------------------------------------------------------
 
 const FNV_PRIME: u64 = 0x100_0000_01b3;
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// One FNV-1a step over the word `w`.
+const fn fnv_word(h: u64, w: u64) -> u64 {
+    (h ^ w).wrapping_mul(FNV_PRIME)
+}
+
+/// The digest of a durable format that several version words decide together:
+/// one FNV-1a step per word. A word that moves moves the digest.
+pub const fn format_digest(words: &[u64]) -> u64 {
+    let mut h = FNV_BASIS;
+    let mut i = 0;
+    while i < words.len() {
+        h = fnv_word(h, words[i]);
+        i += 1;
+    }
+    h
+}
 
 /// One FNV-1a step per byte of `b`.
 const fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
     let mut i = 0;
     while i < b.len() {
-        h = (h ^ b[i] as u64).wrapping_mul(FNV_PRIME);
+        h = fnv_word(h, b[i] as u64);
         i += 1;
     }
     h
@@ -616,17 +634,17 @@ const fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
 /// column's name and type, and its key columns.
 const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
     let (cols, pk) = (f.cols, f.pk_cols);
-    h = (h ^ f.id).wrapping_mul(FNV_PRIME);
+    h = fnv_word(h, f.id);
     h = fnv_bytes(h, f.name.as_bytes());
     let mut i = 0;
     while i < cols.len() {
         h = fnv_bytes(h, cols[i].name.as_bytes());
-        h = (h ^ cols[i].type_code as u64).wrapping_mul(FNV_PRIME);
+        h = fnv_word(h, cols[i].type_code as u64);
         i += 1;
     }
     let mut k = 0;
     while k < pk.len() {
-        h = (h ^ pk[k] as u64).wrapping_mul(FNV_PRIME);
+        h = fnv_word(h, pk[k] as u64);
         k += 1;
     }
     h
@@ -645,17 +663,16 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
 /// but its internal layout is invisible to a fold over names and types. They
 /// cover a circuit, the expression programs inside one, and a view's definition.
 pub const SYS_SCHEMA_DIGEST: u64 = {
-    let mut h = 0xcbf2_9ce4_8422_2325;
+    let mut h = FNV_BASIS;
     let mut i = 0;
     while i < SysFamily::COUNT {
         h = fold_family(h, SysFamily::ALL[i].def());
         i += 1;
     }
     h = fold_family(h, &CLOCK);
-    h = (h ^ crate::circuit::CIRCUIT_VERSION as u64).wrapping_mul(FNV_PRIME);
-    h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(FNV_PRIME);
-    h = (h ^ VIEW_DEF_VERSION as u64).wrapping_mul(FNV_PRIME);
-    h
+    h = fnv_word(h, crate::circuit::CIRCUIT_VERSION as u64);
+    h = fnv_word(h, EXPR_BLOB_VERSION as u64);
+    fnv_word(h, VIEW_DEF_VERSION as u64)
 };
 
 /// Version of the compiled expression-program blob `gnitz-expr` lays out, folded

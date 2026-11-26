@@ -26,6 +26,7 @@ mod fatal;
 
 mod affinity;
 mod bootstrap;
+mod data_format;
 mod executor;
 mod frame;
 mod listen;

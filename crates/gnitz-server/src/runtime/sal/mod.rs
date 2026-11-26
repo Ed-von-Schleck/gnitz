@@ -39,6 +39,7 @@ mod request;
 mod tail;
 mod writer;
 
+pub(crate) use format::SAL_FORMAT;
 pub(crate) use group::Routed;
 pub(crate) use reader::{Inbound, ReplyRoute, SalReader};
 pub(crate) use request::{Apply, Ingest, KeptRead, Read};

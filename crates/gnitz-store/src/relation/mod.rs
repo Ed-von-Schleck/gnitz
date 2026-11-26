@@ -25,14 +25,16 @@ mod feed;
 mod ingest;
 mod repartition;
 mod snapshot;
+mod stamp;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
-pub use dirs::{ChildAddr, ChildKind, DirLock, lock_data_dir, relation_dir};
+pub use dirs::{ChildAddr, ChildKind, DirLock, lock_data_dir, relation_dir, reset_data_dir};
 pub use disk_usage::{DiskUsage, disk_usage};
 use feed::Feed;
 pub use ingest::Landing;
 pub use snapshot::Snapshot;
+pub use stamp::{Foreign, STORE_FORMAT, write_stamp};
 pub use unique_pk::PkRule;
 
 // ---------------------------------------------------------------------------

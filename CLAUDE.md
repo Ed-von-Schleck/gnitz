@@ -421,6 +421,9 @@ everything: the workspace version, the workspace's exact pins on its own crates
 and the `gnitz[server]` extra's pin on `gnitz-server` change together, and a
 release refuses to build if they disagree.
 
+**A server opens only a data directory of its own storage format**, and refuses
+any other untouched; data crosses a format change by dump and restore.
+
 ## Running E2E tests
 
 **Always run E2E with multiple workers.** Single-worker mode skips

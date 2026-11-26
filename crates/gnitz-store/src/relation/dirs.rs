@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use gnitz_foundation::posix_io::{create_dir_all_durable, fsync_dir};
 use gnitz_wire::PkColList;
 
+use super::stamp::{self, Assessed, Foreign};
 use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex};
 use crate::storage::{link_stores, manifest_path, read_at, read_intact, retire_stores};
 use gnitz_foundation::gnitz_debug;
@@ -169,8 +170,11 @@ pub struct DirLock {
 }
 
 /// Create and lock `base_dir`, retrying a held lock for [`DIR_LOCK_RETRY_FOR`],
-/// then create its [`relations_dir`].
-pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
+/// and read what it holds against `format`. A directory of the host's format
+/// is stamped with this release and gets its [`relations_dir`]; a foreign one
+/// is returned with every file it held untouched, so its lock is all the host
+/// can use it for.
+pub fn lock_data_dir(base_dir: &str, format: u64) -> Result<(DirLock, Option<Foreign>), String> {
     create_dir_all_durable(base_dir).map_err(|e| format!("create directory '{base_dir}': {e}"))?;
     let path = format!("{base_dir}/{DIR_LOCK_FILENAME}");
     let file = fs::OpenOptions::new()
@@ -189,12 +193,43 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
             Err(TryLockError::Error(e)) => return Err(format!("lock data directory '{base_dir}': {e}")),
         }
     }
+    let lock = DirLock { _file: file };
+    match stamp::assess(base_dir, format)? {
+        Assessed::Foreign(foreign) => return Ok((lock, Some(foreign))),
+        Assessed::Owed => open_stamped(base_dir, format)?,
+        Assessed::Current => {
+            ensure_dir(&relations_dir(base_dir))?;
+            // `LOCK` is an entry of `base_dir`, synced every boot: a boot killed
+            // before this sync left it created and unsynced.
+            fsync_dir(base_dir).map_err(|e| format!("fsync '{base_dir}': {e}"))?;
+        }
+    }
+    Ok((lock, None))
+}
+
+/// Erase every relation `base_dir` holds and stamp it with `format`, as
+/// [`lock_data_dir`] leaves a new directory of the host's format.
+pub fn reset_data_dir(_lock: &DirLock, base_dir: &str, format: u64) -> Result<(), String> {
     let root = relations_dir(base_dir);
-    ensure_dir(&root)?;
-    // `LOCK` and `_relations` are entries of `base_dir`, synced every boot: a
-    // boot killed before this sync left them created and unsynced.
+    match fs::remove_dir_all(&root) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("erase directory '{root}': {e}"));
+        }
+        _ => {}
+    }
+    // Durably gone before the stamp names the new format: a stamp over the old
+    // relations would read them in it.
     fsync_dir(base_dir).map_err(|e| format!("fsync '{base_dir}': {e}"))?;
-    Ok(DirLock { _file: file })
+    open_stamped(base_dir, format)
+}
+
+/// Create `base_dir`'s [`relations_dir`], then stamp it: an empty one reads as
+/// new, nothing puts a relation in it before [`lock_data_dir`] returns, and the
+/// stamp's sync of `base_dir` makes `LOCK` and the relations directory durable
+/// with it.
+fn open_stamped(base_dir: &str, format: u64) -> Result<(), String> {
+    ensure_dir(&relations_dir(base_dir))?;
+    stamp::write_stamp(base_dir, format)
 }
 
 /// One relation directory's id, with the generation and caller record its

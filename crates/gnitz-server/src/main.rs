@@ -143,6 +143,8 @@ Exit codes:
   0    clean shutdown
   64   the arguments above are refused; nothing was created, and a restart
        with the same arguments is refused again
+  65   the data directory was written in a storage format this build does not
+       read; nothing in it was changed, and a restart is refused again
   1    boot failure
   2    a worker process died while serving
   134  fail-stop abort (128 + SIGABRT)

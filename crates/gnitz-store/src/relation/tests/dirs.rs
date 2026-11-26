@@ -243,6 +243,6 @@ fn lock_data_dir_creates_missing_ancestors() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("a/b/data");
     let base = base.to_str().unwrap();
-    let _lock = lock_data_dir(base).unwrap();
+    let _lock = lock_data_dir(base, crate::relation::STORE_FORMAT).unwrap();
     assert!(std::path::Path::new(&relations_dir(base)).is_dir());
 }

@@ -29,6 +29,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 TimeoutStopSec=120
 Restart=on-failure
+# A data directory of another release's storage format: every restart is
+# refused the same way.
+RestartPreventExitStatus=65
 StateDirectory=gnitz
 StateDirectoryMode=0700
 RuntimeDirectory=gnitz
