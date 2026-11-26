@@ -60,9 +60,28 @@ discards them. Inside a transaction:
 
 - Only `INSERT`, `UPDATE`, `DELETE` and `SELECT` are allowed; DDL is refused.
 - A `SELECT` sees the state before the transaction, not its own writes.
-- Streams cannot be written.
+- An `INSERT` into a stream is refused, and the transaction stays open.
+
+```sql
+CREATE TABLE clicks (id BIGINT PRIMARY KEY, page BIGINT) WITH (stream = true);
+BEGIN;
+INSERT INTO stock VALUES (6, 'pin', 5);
+```
+
+```sql,refused
+INSERT INTO clicks VALUES (1, 7);
+```
+
+```text
+'clicks' is a stream; INSERT inside a transaction requires a base table
+```
+
+```sql
+COMMIT;
+```
 
 An `UPDATE` or `DELETE` reads the rows it changes. If another client writes
 that table between the read and the `COMMIT`, the `COMMIT` is refused with
 nothing written, and the transaction is yours to run again. Outside a
-transaction the same applies to the single statement.
+transaction the statement runs itself again a few times, and reports the
+conflict only when another client keeps writing the table.

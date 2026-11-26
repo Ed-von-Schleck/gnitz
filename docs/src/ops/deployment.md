@@ -80,7 +80,10 @@ docker run -d --name gnitz \
         /data /data/gnitz.sock
 ```
 
-`podman run` takes the same flags. Without arguments the image runs
+`podman run` takes the same flags. Rootless podman forwards a client that
+dials `localhost` into the container over IPv6, which a listener on
+`0.0.0.0` does not accept: under podman, listen on `--tls-listen=[::]:7543`,
+or have clients dial `127.0.0.1`. Without arguments the image runs
 `--workers=auto /data /data/gnitz.sock`: a Unix socket in the volume and no
 network listener.
 

@@ -21,8 +21,9 @@ DROP VIEW big_orders;
 **Filters and projections** — `WHERE`, expressions, `CASE`, casts and the
 [functions](functions.md).
 
-**Joins** — `INNER`, `LEFT`, `RIGHT` and `FULL` joins on equality, inner joins
-on inequality, cross joins and self-joins:
+**Joins** — `INNER`, `LEFT`, `RIGHT` and `FULL` joins on equality, `INNER` and
+`LEFT` joins on a range alone (`<`, `<=`, `>`, `>=`), cross joins and
+self-joins:
 
 ```sql
 CREATE VIEW order_names AS

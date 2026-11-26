@@ -45,7 +45,7 @@ view first applies any changes to its sources that have not reached it yet.
 ## How a read finds its rows
 
 A `WHERE` naming the whole primary key reads that one row; a condition on a
-leading part of a compound key reads a range; an equality on an
+leading part of a compound key reads a range; an equality or a range on an
 [indexed](tables.md#indexes) column reads through the index. Anything else
 scans the relation. `EXPLAIN` shows which:
 
