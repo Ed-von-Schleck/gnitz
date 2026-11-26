@@ -5,7 +5,8 @@ The refusals themselves, and what each names, are unit-tested
 What only a spawn can show is that a refusal ends the process as a usage error
 with no data directory created — from the argv parser and from the TLS
 resolution that runs after it — and that an environment knob the server cannot
-read stops the boot instead of running at a default nobody asked for.
+read stops the boot instead of running at a default nobody asked for, with the
+same usage-error status, so a supervisor does not restart it.
 """
 
 import os
@@ -50,5 +51,4 @@ def test_a_refused_command_line_is_a_usage_error_that_creates_nothing(own_server
     ("GNITZ_WRITE_SPAN_BYTES", "0"),
 ])
 def test_an_unreadable_environment_knob_stops_the_boot(own_server, var, value):
-    # A knob only a worker reads is refused in that worker's log.
-    own_server.start_expecting_exit(f'{var}="{value}"', extra_env={var: value})
+    assert own_server.start_expecting_exit(f'{var}="{value}"', extra_env={var: value}) == EX_USAGE

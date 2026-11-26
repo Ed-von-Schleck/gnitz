@@ -127,8 +127,8 @@ Signals:
                    keeps what is served and logs why.
 
 Environment:
-  A variable that is set to a value it cannot be read as stops the server;
-  unset takes the default.
+  A variable that is set to a value it cannot be read as stops the server
+  with exit code 64; unset takes the default.
 
   GNITZ_LOG_LEVEL          Same as --log-level; CLI flag takes precedence
   GNITZ_CHECKPOINT_BYTES   SAL checkpoint threshold in bytes (default: 75% of SAL size)
@@ -142,8 +142,9 @@ Environment:
 
 Exit codes:
   0    clean shutdown
-  64   the arguments above are refused; nothing was created, and a restart
-       with the same arguments is refused again
+  64   the arguments above, or a GNITZ_* variable, are refused: a refused
+       argument before anything was created. A restart with the same
+       arguments and environment is refused again
   65   the data directory was written in a storage format this build does not
        read; nothing in it was changed, and a restart is refused again
   1    boot failure
@@ -316,6 +317,9 @@ fn print_listing(out: &mut impl Write, text: &str) -> Result<(), String> {
 
 fn main() {
     abort_on_panic();
+    // A `GNITZ_*` value the server cannot read is a refused configuration, which
+    // a restart refuses again: the status a supervisor does not restart on.
+    gnitz_foundation::env::exit_on_refusal(ServerExit::Usage.code(), "Error: ");
     let args: Vec<String> = env::args().skip(1).collect();
     // The commands that start no server.
     let one_shot = match &args[..] {
@@ -354,7 +358,7 @@ fn main() {
         }
         process::exit(ServerExit::Clean.code());
     }
-    let env_level = env::var("GNITZ_LOG_LEVEL").ok();
+    let env_level = gnitz_foundation::env::raw("GNITZ_LOG_LEVEL");
     let refuse = |e: String| -> ! {
         eprintln!("Error: {e}");
         eprintln!("Try 'gnitz-server --help' for usage information");

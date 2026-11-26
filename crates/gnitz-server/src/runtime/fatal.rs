@@ -13,7 +13,8 @@ pub(crate) enum ServerExit {
     BootFailed = 1,
     /// A worker process died while serving.
     WorkerDied = 2,
-    /// `sysexits.h`'s `EX_USAGE`: argv was refused, before anything was created.
+    /// `sysexits.h`'s `EX_USAGE`: argv was refused, before anything was created,
+    /// or a `GNITZ_*` variable was, at whatever point of the boot read it.
     Usage = 64,
     /// `sysexits.h`'s `EX_DATAERR`: the data directory is in a format this build
     /// does not read, and was left as it was.

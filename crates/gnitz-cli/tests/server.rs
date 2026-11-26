@@ -406,6 +406,22 @@ fn run_at(tmp: &Path, sock: &str, args: &[&str], stdin: &str) -> std::process::O
     child.wait_with_output().unwrap()
 }
 
+/// A `GNITZ_*` value the client cannot read ends the shell as a bad
+/// `GNITZ_TARGET` does: status 2 and a message naming it, not a panic.
+#[test]
+fn an_unreadable_environment_knob_is_refused_without_a_panic() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = gnitz(dir.path(), &[server.sock_path(), "-c", "SELECT 1"])
+        .env("GNITZ_RECORD_FRAMES", "")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(stderr.trim(), r#"gnitz: GNITZ_RECORD_FRAMES="" is not a path"#);
+}
+
 /// A script stops at its first failed statement, and with
 /// `--continue-on-error` runs every other; either way it exits 1, whatever
 /// follows the failure. `-c` and `-f` run in the order given, and a `\i -`

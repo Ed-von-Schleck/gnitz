@@ -71,6 +71,9 @@ enum Input<'a> {
 }
 
 fn main() -> ExitCode {
+    // A `GNITZ_*` value the client cannot read is refused as a bad
+    // `GNITZ_TARGET` is.
+    gnitz_foundation::env::exit_on_refusal(2, "gnitz: ");
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let at = |id| matches.indices_of(id).into_iter().flatten();

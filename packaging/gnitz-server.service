@@ -29,8 +29,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 TimeoutStopSec=120
 Restart=on-failure
-# A refused command line (64) or a data directory of another release's
-# storage format (65): every restart is refused the same way.
+# A refused command line or GNITZ_* variable (64), or a data directory of
+# another release's storage format (65): every restart is refused the same way.
 RestartPreventExitStatus=64 65
 StateDirectory=gnitz
 StateDirectoryMode=0700
