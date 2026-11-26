@@ -14,7 +14,7 @@
 
 [Unit]
 Description=gnitz database server
-Documentation=https://github.com/Ed-von-Schleck/gnitz
+Documentation=https://ed-von-schleck.github.io/gnitz/ops/deployment.html
 After=network-online.target
 Wants=network-online.target
 
@@ -22,22 +22,20 @@ Wants=network-online.target
 Type=exec
 User=gnitz
 Group=gnitz
-ExecStart=/usr/local/bin/gnitz-server --workers=auto /var/lib/gnitz /run/gnitz/gnitz.sock
+ExecStart=/usr/local/bin/gnitz-server --workers=auto --socket-mode=660 /var/lib/gnitz /run/gnitz/gnitz.sock
 # SIGHUP reloads the TLS certificate, the client CA and the token file.
 ExecReload=/bin/kill -HUP $MAINPID
 # SIGTERM drains and checkpoints; the workers exit with the master.
 KillMode=mixed
 TimeoutStopSec=120
 Restart=on-failure
-# A data directory of another release's storage format: every restart is
-# refused the same way.
-RestartPreventExitStatus=65
+# A refused command line (64) or a data directory of another release's
+# storage format (65): every restart is refused the same way.
+RestartPreventExitStatus=64 65
 StateDirectory=gnitz
 StateDirectoryMode=0700
 RuntimeDirectory=gnitz
 RuntimeDirectoryMode=0750
-# The socket is created group-writable, so the `gnitz` group may connect.
-UMask=0007
 Environment=GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 # Confinement that leaves io_uring alone: a SystemCallFilter would have to
 # allow io_uring_setup, io_uring_enter and io_uring_register.
