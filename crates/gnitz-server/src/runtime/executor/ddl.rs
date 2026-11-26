@@ -57,6 +57,13 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, frame: &[u8], body: Range<us
     // Decoded up front, before any lock.
     let families = decode_bundle(frame, body)?;
     let unique_creates = families.unique_index_creates();
+    // A view reading the clock is computed against the time of its creation,
+    // not the one the clock held when nothing read it, or no time at all.
+    // Ahead of the catalog write: a step takes the catalog read, and the tick
+    // below takes the step before the view exists.
+    if families.circuit_scans(gnitz_wire::CLOCK.id) {
+        super::clock::advance(shared).await?;
+    }
 
     // A checkpoint already queued, or due before the writes queued with this
     // settle, finishes before the catalog write holds off readers.

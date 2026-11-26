@@ -72,8 +72,8 @@ enum CatalogLock {}
 /// Shared executor state held by every task. Never freed, as the tasks that
 /// hold it never end.
 ///
-/// Lock order: the catalog, then a table lock, then the apply lock, then the
-/// SAL writer.
+/// Lock order: the clock, then the catalog, then a table lock, then the apply
+/// lock, then the SAL writer.
 struct Shared {
     dispatcher: MasterDispatcher,
     committer: Committer,
@@ -89,6 +89,7 @@ struct Shared {
     /// The directory BACKUP writes its entries into (`--backup-dir`); `None`
     /// refuses BACKUP.
     backup_dir: Option<String>,
+    clock: clock::Clock,
 }
 
 impl Shared {
@@ -111,6 +112,7 @@ impl Shared {
             hello_timeout,
             last_snapshot: Cell::new(0),
             backup_dir,
+            clock: clock::Clock::default(),
         }));
         (shared, committer_rx, asks)
     }
@@ -137,13 +139,21 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     let (shared, committer_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
 
     let mut signals = signals::Signals::open();
+    reactor.spawn(shared.dispatcher.sal().run_syncs(reactor));
+    reactor.spawn(committer::run(committer_rx, shared));
+    // The views reaching the clock were rebuilt against the time it held
+    // before this process, or none: they read this process's time from the
+    // first request on.
+    if shared.cat().dag.is_scanned(gnitz_wire::CLOCK.id)
+        && let Err(e) = clock::advance(shared).await
+    {
+        gnitz_warn!("clock: the boot step failed: {e}");
+    }
     // Past the last env knob the boot reads, so one it refuses stops the
     // server before it reports ready.
     gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
 
     let tls = listeners.iter().find_map(|l| l.tls);
-    reactor.spawn(shared.dispatcher.sal().run_syncs(reactor));
-    reactor.spawn(committer::run(committer_rx, shared));
     for listener in listeners {
         reactor.spawn(accept_loop(shared, listener));
     }

@@ -101,3 +101,25 @@ def test_a_view_over_the_clock_is_rebuilt_at_boot(own_server):
         _settles(c, "recent", _ids(3, 4))
         _settles(c, "due", _ids(1, 2, 3, 4))
         _settles(c, "band", _ids(3, 4))
+
+
+def test_a_view_reads_the_clock_at_its_creation_and_boot(own_server):
+    # A resolution no test outlasts: only the creation and the boot step it.
+    own_server.extra_env = {"GNITZ_CLOCK_RESOLUTION_MS": "600000"}
+    own_server.start(workers=MULTI)
+    t0 = time.time()
+    # 1 expired before it arrives, 2 expiring 1.5 s from now, 3 inside the window.
+    stamps = {1: t0 - 2 * _W, 2: t0 - _W + 1.5, 3: t0}
+    with gnitz.connect(own_server.target) as c:
+        c.execute_sql("CREATE TABLE ev (id BIGINT PRIMARY KEY, ts TIMESTAMP, v BIGINT)")
+        c.execute_sql("INSERT INTO ev VALUES " + ", ".join(f"({i}, {_ts(t)}, {i})" for i, t in stamps.items()))
+        # The first view over the clock, over rows already there: read once,
+        # with no step of the clock but the one its creation made.
+        c.execute_sql(f"CREATE VIEW recent AS SELECT id, v FROM ev WHERE ts > NOW() - {_W * 1_000_000}")
+        assert bag(rows(c, "SELECT id FROM recent"), "id") == _ids(2, 3)
+    own_server.stop_graceful()
+    # Booted past row 2's expiry, the rebuilt view read once: no step but the
+    # boot's has moved the clock past the time the last process left in it.
+    time.sleep(2)
+    with gnitz.connect(own_server.start().target) as c:
+        assert bag(rows(c, "SELECT id FROM recent"), "id") == _ids(3)

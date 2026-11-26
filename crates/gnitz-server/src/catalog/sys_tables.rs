@@ -287,6 +287,19 @@ impl DdlBundle {
         sigs.iter().filter(|s| s.shape() == PkShape::Create).map(|s| s.leading)
     }
 
+    /// Whether a circuit the bundle leaves live scans relation `id`, read before
+    /// the precheck. A row that does not decode is skipped; the precheck refuses
+    /// the bundle over it.
+    pub(crate) fn circuit_scans(&self, id: u64) -> bool {
+        let Some(Block { batch, sigs }) = self.get(SysFamily::Circuit) else {
+            return false;
+        };
+        sigs.iter().filter_map(|s| s.pos).any(|pos| {
+            let Ok(row) = gnitz_wire::CircuitRow::read(batch, pos);
+            gnitz_wire::Circuit::decode(&row.circuit).is_ok_and(|c| c.sources().any(|src| src == id))
+        })
+    }
+
     /// The distinct `(owner, cols)` of every unique index the bundle's IDX_TAB
     /// block creates: the DDL driver's pre-flight input, read before the
     /// precheck. A row that does not decode is skipped; the precheck refuses the
