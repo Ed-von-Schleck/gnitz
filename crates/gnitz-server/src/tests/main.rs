@@ -243,3 +243,27 @@ fn the_configuration_page_names_everything_help_does() {
     }
     assert!(missing.is_empty(), "{path} does not name {missing:?}");
 }
+
+/// A writer whose every write fails with `kind`.
+struct Failing(std::io::ErrorKind);
+
+impl std::io::Write for Failing {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(self.0.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_listing_cut_short_by_its_reader_is_no_failure() {
+    use super::print_listing;
+    use std::io::ErrorKind;
+    let mut out = Vec::new();
+    assert_eq!(print_listing(&mut out, "rows\n"), Ok(()));
+    assert_eq!(out, b"rows\n");
+    assert_eq!(print_listing(&mut Failing(ErrorKind::BrokenPipe), "rows\n"), Ok(()));
+    let full = print_listing(&mut Failing(ErrorKind::StorageFull), "rows\n");
+    assert!(full.is_err_and(|e| e.starts_with("stdout: ")));
+}

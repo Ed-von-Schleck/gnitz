@@ -34,6 +34,7 @@ use gnitz_foundation::log::Level;
 use runtime::ServerExit;
 use rustls::pki_types::ServerName;
 use std::env;
+use std::io::{self, Write};
 use std::process;
 
 const HELP_TEXT: &str = "\
@@ -297,25 +298,53 @@ fn abort_on_panic() {
     }));
 }
 
+/// Write `text` and flush it. `print!` panics on a write error, which the
+/// panic hook turns into a fail-stop abort.
+fn write_flushed(out: &mut impl Write, text: &str) -> io::Result<()> {
+    out.write_all(text.as_bytes())?;
+    out.flush()
+}
+
+/// Write a listing: a reader that closed its end early (`| head`) has all it
+/// wanted.
+fn print_listing(out: &mut impl Write, text: &str) -> Result<(), String> {
+    match write_flushed(out, text) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(format!("stdout: {e}")),
+        _ => Ok(()),
+    }
+}
+
 fn main() {
     abort_on_panic();
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print!("{HELP_TEXT}");
-        process::exit(0);
-    }
     // The commands that start no server.
     let one_shot = match &args[..] {
-        [flag, data_dir] if flag == "--disk-usage" => {
-            Some(gnitz_store::relation::disk_usage(data_dir).map(|usage| print!("{usage}")))
+        _ if args.iter().any(|a| a == "--help" || a == "-h") => {
+            Some(print_listing(&mut io::stdout().lock(), HELP_TEXT))
         }
-        [flag, token_file, name] if flag == "--new-token" => Some(runtime::mint_token(token_file, name).map(|token| {
-            println!("{token}");
-            eprintln!(
-                "Minted access token {name:?} into {token_file}. It is shown once and kept nowhere: \
-                 store it where its client reads it. Revoke it by deleting its line, then SIGHUP the server."
-            );
-        })),
+        [flag, data_dir] if flag == "--disk-usage" => Some(
+            gnitz_store::relation::disk_usage(data_dir)
+                .and_then(|usage| print_listing(&mut io::stdout().lock(), &usage.to_string())),
+        ),
+        [flag, token_file, name] if flag == "--new-token" => {
+            Some(runtime::mint_token(token_file, name).and_then(|token| {
+                // The token's hash is in the file already: one nobody saw must be deleted.
+                write_flushed(&mut io::stdout().lock(), &format!("{token}\n")).map_err(|e| {
+                    format!(
+                        "the token {name:?} was minted into {token_file} but could not be printed \
+                         (stdout: {e}); delete its line and mint it again"
+                    )
+                })?;
+                // Best effort: `eprintln!` would abort on a closed stderr after the
+                // token was delivered.
+                let _ = writeln!(
+                    io::stderr(),
+                    "Minted access token {name:?} into {token_file}. It is shown once and kept nowhere: \
+                     store it where its client reads it. Revoke it by deleting its line, then SIGHUP the server."
+                );
+                Ok(())
+            }))
+        }
         _ => None,
     };
     if let Some(done) = one_shot {
