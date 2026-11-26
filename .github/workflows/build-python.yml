@@ -2,7 +2,8 @@
 # archives: the client's wheels, the server's wheels (the binary alone, which
 # `gnitz[server]` installs), both sdists, and the seccomp profile a container
 # runs the server under. Each is uploaded as an `artifacts-*` artifact, which
-# the release attaches; publish-pypi.yml uploads the Python ones to PyPI.
+# the release attaches; publish-pypi.yml uploads the Python ones from the
+# release to PyPI.
 #
 # release.yml, which dist generates, calls this as a global-artifacts job.
 name: build-python

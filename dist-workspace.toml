@@ -25,13 +25,13 @@ precise-builds = true
 # The x86-64 Linux binaries' CPU floor, which dist's RUSTFLAGS would drop.
 github-build-setup = "../build-setup.yml"
 # The wheels, the sdists and the container profile, each attached to the
-# release; then the image and the PyPI upload, once the release exists.
+# release; then the image, once the release exists. The PyPI upload is
+# publish-pypi.yml, a workflow of its own that runs after this one.
 global-artifacts-jobs = ["./build-python"]
-publish-jobs = ["./publish-image", "./publish-pypi"]
+publish-jobs = ["./publish-image"]
 
 [dist.github-custom-job-permissions]
 "publish-image" = { packages = "write", contents = "read" }
-"publish-pypi" = { id-token = "write", contents = "read" }
 
 # The Linux binaries link against manylinux_2_28's glibc, the floor the Python
 # wheels hold too, so they run on every distribution with a kernel the server

@@ -44,6 +44,15 @@ def wait_ready(name: str, timeout: float = 60.0) -> str:
     sys.exit(f"{name} not ready after {timeout}s:\n{run('logs', name).stderr}")
 
 
+def physical_cores() -> int:
+    """The host's physical cores, which a container shares: SMT siblings count once."""
+    return len({
+        (cpu / "topology" / "thread_siblings_list").read_text().strip()
+        for cpu in Path("/sys/devices/system/cpu").glob("cpu[0-9]*")
+        if (cpu / "topology").is_dir()
+    })
+
+
 def serve(name: str, volume: str) -> str:
     """Boot the server, and return the TLS target the host dials."""
     run(
@@ -58,8 +67,10 @@ def serve(name: str, volume: str) -> str:
         "/data", "/data/gnitz.sock",
     )
     logs = wait_ready(name)
-    # A quota of 3 CPUs below the host's: unpinned, and 2 workers beside the master.
-    for line in ("workers: 2 (auto)", "affinity: not applied (a CPU quota of 3"):
+    # A quota of 3 CPUs below the host's: unpinned, and a worker per physical
+    # core or quota CPU, whichever is fewer, beside the master.
+    workers = max(1, min(physical_cores(), CPUS) - 1)
+    for line in (f"workers: {workers} (auto)", f"affinity: not applied (a CPU quota of {CPUS}"):
         assert line in logs, f"{line!r} not in:\n{logs}"
     host_port = run("port", name, f"{PORT}/tcp").stdout.split()[0].rsplit(":", 1)[1]
     return f"127.0.0.1:{host_port}"

@@ -1,15 +1,22 @@
 # The Python packages of a release, uploaded to PyPI by trusted publishing: the
-# wheels and sdists build-python.yml built for `gnitz` and `gnitz-server`.
+# wheels and sdists build-python.yml built for `gnitz` and `gnitz-server`, taken
+# from the GitHub release they are attached to.
 #
-# release.yml, which dist generates, calls this as a publish job, once the
-# GitHub release exists. PyPI admits the upload from the `pypi` environment of
-# release.yml, the trusted publisher each of the two projects names.
+# It runs once release.yml has run for a pushed tag, or by hand for a tag whose
+# release exists. It is a workflow of its own rather than a publish job of
+# release.yml because PyPI's trusted publishing does not admit an upload from a
+# reusable workflow. Each of the two PyPI projects names this file and the
+# `pypi` environment as its trusted publisher.
 name: publish-pypi
 
 on:
-  workflow_call:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
     inputs:
-      plan:
+      tag:
+        description: The release tag to upload, such as v0.1.9
         required: true
         type: string
 
@@ -18,21 +25,40 @@ permissions:
   id-token: write
 
 jobs:
+  # The tag whose release is uploaded: none for a Release run of a pull request,
+  # and none for a prerelease.
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'push' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+    steps:
+      - id: release
+        run: |
+          prerelease=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)
+          echo "publish=$([ "$prerelease" = false ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   pypi:
+    needs: release
+    if: ${{ needs.release.outputs.publish == 'true' }}
     runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/project/gnitz/
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: artifacts-wheels-*
-          path: dist
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
-          name: artifacts-sdists
-          path: dist
+      - name: Download the release's wheels and sdists
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern '*.whl' --pattern 'gnitz-[0-9]*.tar.gz' --pattern 'gnitz_server-[0-9]*.tar.gz'
+          ls dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
