@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "clap",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bolero",
  "gnitz-expr",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-dump"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bytes",
  "gnitz-core",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-expr"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bolero",
  "fearless_simd",
@@ -802,14 +802,14 @@ dependencies = [
 
 [[package]]
 name = "gnitz-foundation"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "gnitz-fuzz"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-core",
  "gnitz-expr",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-mirror"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-core",
  "gnitz-foundation",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-py"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-core",
  "gnitz-expr",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bolero",
  "gnitz-expr",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-sql"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-core",
  "gnitz-expr",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-store"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-expr",
  "gnitz-foundation",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-test-harness"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-foundation",
  "libc",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-tokio"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-core",
  "gnitz-mirror",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-trace"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "fsst-rs",
  "gnitz-expr",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-wire"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-foundation",
  "smallvec",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-zset"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-expr",
  "gnitz-foundation",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "gnitz-zset-testkit"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gnitz-expr",
  "gnitz-foundation",
