@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.100"
 authors = ["Christian Schramm"]
@@ -65,15 +65,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # The workspace's own crates, as the published ones depend on each other. The
 # pin is exact: client and engine must agree on the wire protocol, so a release
 # resolves only against its own siblings. Bump these with `version` above.
-gnitz-foundation = { path = "gnitz-foundation", version = "=0.1.9" }
-gnitz-wire = { path = "gnitz-wire", version = "=0.1.9" }
-gnitz-expr = { path = "gnitz-expr", version = "=0.1.9" }
-gnitz-core = { path = "gnitz-core", version = "=0.1.9" }
-gnitz-zset = { path = "gnitz-zset", version = "=0.1.9" }
-gnitz-trace = { path = "gnitz-trace", version = "=0.1.9" }
-gnitz-store = { path = "gnitz-store", version = "=0.1.9" }
-gnitz-sql = { path = "gnitz-sql", version = "=0.1.9" }
-gnitz-dump = { path = "gnitz-dump", version = "=0.1.9" }
+gnitz-foundation = { path = "gnitz-foundation", version = "=0.1.10" }
+gnitz-wire = { path = "gnitz-wire", version = "=0.1.10" }
+gnitz-expr = { path = "gnitz-expr", version = "=0.1.10" }
+gnitz-core = { path = "gnitz-core", version = "=0.1.10" }
+gnitz-zset = { path = "gnitz-zset", version = "=0.1.10" }
+gnitz-trace = { path = "gnitz-trace", version = "=0.1.10" }
+gnitz-store = { path = "gnitz-store", version = "=0.1.10" }
+gnitz-sql = { path = "gnitz-sql", version = "=0.1.10" }
+gnitz-dump = { path = "gnitz-dump", version = "=0.1.10" }
 
 # Release: panic aborts the process so reactor-task panics surface as a
 # backtrace on stderr instead of being silently dropped.  Dev keeps unwind

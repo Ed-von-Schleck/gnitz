@@ -28,7 +28,7 @@ Repository = "https://github.com/Ed-von-Schleck/gnitz"
 [project.optional-dependencies]
 # The server of this release, for `gnitz.local_server` and the `gnitz.testing`
 # fixtures. Its pin moves with the workspace version.
-server = ["gnitz-server==0.1.9"]
+server = ["gnitz-server==0.1.10"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
