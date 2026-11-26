@@ -56,6 +56,9 @@ for row in result["rows"]:
     print(row._asdict())
 ```
 
+A row a view holds more than once (a `UNION ALL`, say) comes back once, with
+its count in `row._weight`.
+
 ## Pushing rows
 
 For loading data, push batches of rows instead of building `INSERT` text:

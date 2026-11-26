@@ -23,7 +23,7 @@ server before it creates anything.
 | `--auth-tokens=FILE` | none | Require an access token on TLS connections. |
 | `--tls-client-ca=PEM` | none | Require client certificates signed by this CA. |
 | `--allow-unauthenticated` | off | Permit a non-loopback TLS bind without authentication. |
-| `--backup-dir=DIR` | none | Where `BACKUP` writes; without it backups are refused. |
+| `--backup-dir=DIR` | none | Where [`\backup`](backup.md#backups) writes; without it backups are refused. |
 
 [Security](security.md) covers the TLS options and
 [Backup and upgrades](backup.md) the backup directory.

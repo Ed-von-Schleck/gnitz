@@ -62,6 +62,28 @@ one of them; the planner does not let the inner name shadow the outer one.
 ## Aggregates and windows
 
 - **`FILTER (WHERE …)`** on an aggregate: use `SUM(CASE WHEN … THEN x END)`.
+- **`COUNT(DISTINCT x)` beside a plain aggregate** in one query, other than
+  `MIN(x)` or `MAX(x)`: compute each in a view of its own and join them.
+
+```sql,refused
+CREATE VIEW stats AS
+    SELECT customer, COUNT(DISTINCT amount) AS amounts, SUM(amount) AS total
+    FROM orders GROUP BY customer;
+```
+
+```text
+DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the DISTINCT argument
+```
+
+```sql
+CREATE VIEW amounts AS
+    SELECT customer, COUNT(DISTINCT amount) AS amounts FROM orders GROUP BY customer;
+CREATE VIEW totals AS SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer;
+CREATE VIEW stats AS
+    SELECT a.customer, a.amounts, t.total
+    FROM amounts a JOIN totals t ON a.customer = t.customer;
+```
+
 - **`STRING_AGG`, `ARRAY_AGG`, `BOOL_AND`/`BOOL_OR`, percentiles, `STDDEV`**
   are not available.
 - **`LAG`, `LEAD`, `NTILE`, `FIRST_VALUE`, `LAST_VALUE`, `PERCENT_RANK`,

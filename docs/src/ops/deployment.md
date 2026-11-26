@@ -23,9 +23,9 @@ release's server is refused, naming both. Pin versions together.
 
 `--workers=N` runs `N` worker processes; `--workers=auto` runs one per physical
 core the server may use, less one for the master, and pins each to its core.
-Under a CPU quota narrower than the cores (a container's `--cpus`, a Kubernetes
-`limits.cpu` without exclusive cores) it runs one per whole CPU of the quota,
-unpinned. The log names the count and placement at boot.
+Under a CPU quota narrower than the cores, such as a container's `--cpus`, it
+runs one per whole CPU of the quota, less one for the master, unpinned. The
+log names the count and placement at boot.
 
 Changing the worker count is safe: a boot at a different count first
 redistributes the stored data onto the new count.
@@ -87,17 +87,16 @@ network listener.
 - **Data.** Mount a volume at `/data`; never use the container's writable layer.
 - **Logs.** The master logs to stderr (`docker logs`); each worker to
   `/data/worker_<N>.log`.
-- **Unix socket.** A client container sharing the volume can dial
-  `/data/gnitz.sock` if the [socket's mode](security.md#the-unix-socket) lets
-  its user in: run it as the server's user (`--user`, plus `--userns=keep-id`
-  under rootless podman), or start the server with `--socket-mode=660`.
+- **Unix socket.** The server runs as the image's `nonroot` user (65532), and
+  the [socket](security.md#the-unix-socket) admits only its owner. A client
+  container sharing the volume can dial `/data/gnitz.sock` when it runs as that
+  user (`--user 65532`), or in its group (`--user <uid>:65532`) when the server
+  is started with `--socket-mode=660`. For a client on the host, run the server
+  as the host user (`--user "$(id -u):$(id -g)"`, plus `--userns=keep-id` under
+  rootless podman) on a host directory mounted at `/data`.
 - **Memory.** The image sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` so the heap
   uses transparent huge pages where the host allows them; `-e GLIBC_TUNABLES=`
   turns it off.
-
-Docker Desktop 4.42 blocks io_uring whatever the profile; later versions do
-not. gVisor does not support the io_uring the server needs, so the server does
-not run under it.
 
 ### Docker Compose
 
@@ -115,43 +114,10 @@ volumes:
   gnitz:
 ```
 
-### Kubernetes
+The server refuses to start without the token file, so mint a token into the
+volume first:
 
-Put `seccomp.json` on every node under the kubelet's seccomp root
-(`/var/lib/kubelet/seccomp/`) and reference it explicitly, so the server's
-confinement does not depend on how a node is configured. A managed node image
-may set `kernel.io_uring_disabled`; check the node pool before scheduling.
-
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata: { name: gnitz }
-spec:
-  serviceName: gnitz
-  selector: { matchLabels: { app: gnitz } }
-  template:
-    metadata: { labels: { app: gnitz } }
-    spec:
-      terminationGracePeriodSeconds: 120
-      securityContext:
-        seccompProfile: { type: Localhost, localhostProfile: gnitz-seccomp.json }
-      containers:
-        - name: gnitz
-          image: ghcr.io/ed-von-schleck/gnitz-server
-          args: [--workers=auto, --tls-listen=0.0.0.0:7543, --tls-name=gnitz.default.svc,
-                 --auth-tokens=/data/tokens, /data, /data/gnitz.sock]
-          ports: [{ containerPort: 7543 }]
-          readinessProbe: { tcpSocket: { port: 7543 } }
-          resources:
-            requests: { cpu: "4", memory: 8Gi }
-            limits: { cpu: "4", memory: 8Gi }
-          volumeMounts: [{ name: data, mountPath: /data }]
-  volumeClaimTemplates:
-    - metadata: { name: data }
-      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 50Gi } } }
+```sh
+docker compose run --rm gnitz --new-token /data/tokens app
+docker compose up -d
 ```
-
-## macOS and Windows
-
-The server runs on Linux only. On macOS run it in a container, or in a Linux
-VM such as [Lima](https://lima-vm.io); on Windows, inside WSL 2.

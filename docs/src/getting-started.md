@@ -9,12 +9,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Ed-von-Schleck/gnitz/re
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Ed-von-Schleck/gnitz/releases/latest/download/gnitz-server-installer.sh | sh
 ```
 
-The server runs on Linux 6.7 or later, on x86-64 with AVX2 or on aarch64; the
-shell also runs on macOS. On macOS run the server [in a
-container](ops/deployment.md#containers); on Windows, install both inside WSL 2.
-
-`cargo install gnitz gnitz-server` builds both from source instead, for the
-baseline of the machine's architecture.
+The server runs on Linux 6.7 or later, on x86-64 with AVX2 or on aarch64.
 
 ## A first view
 

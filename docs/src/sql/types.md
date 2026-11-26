@@ -41,6 +41,8 @@ SELECT * FROM payments;
   precision.
 - **`TIMESTAMP`** carries no time zone; store UTC.
 - **`SERIAL`** columns take the next number when an `INSERT` leaves them out.
+  A `SERIAL` column must be the table's single-column primary key, so a table
+  has at most one.
 - **Literals.** Dates, timestamps and UUIDs are written as strings
   (`'2026-11-26'`, `'2026-11-26 10:30:00'`); `TRUE` and `FALSE` are booleans.
 

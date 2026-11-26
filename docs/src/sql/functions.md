@@ -18,8 +18,9 @@ INSERT INTO t VALUES (1, 2.5, 7, ' Hello ', '2026-11-26', '2026-11-26 10:30:00')
 | Null tests | `IS NULL`, `IS NOT NULL` |
 | Text | `\|\|` (concatenation), `LIKE`, `ILIKE` |
 
-Integer division truncates. `DATE + n` adds `n` days; subtracting two
-timestamps or dates gives microseconds.
+Integer division truncates. `DATE + n` adds `n` days, and subtracting two
+dates gives days; subtracting a timestamp or a date from a timestamp gives
+microseconds.
 
 ```sql
 SELECT n / 2, n % 3, d + 1, ts - d, s || '!', s ILIKE '%ell%' FROM t;
@@ -29,6 +30,7 @@ SELECT n / 2, n % 3, d + 1, ts - d, s || '!', s ILIKE '%ell%' FROM t;
 
 `CASE`, `COALESCE(a, b, …)`, `NULLIF(a, b)`, `IFNULL(a, b)` (also `NVL`),
 `IF(condition, then, else)`, `GREATEST(a, b, …)`, `LEAST(a, b, …)`.
+`GREATEST` and `LEAST` skip `NULL` arguments.
 
 ```sql
 SELECT CASE WHEN n > 5 THEN 'big' ELSE 'small' END, COALESCE(NULL, n), IF(n > 1, 'y', 'n') FROM t;
@@ -79,8 +81,8 @@ SELECT EXTRACT(YEAR FROM d), DATE_PART('hour', ts), DATE_TRUNC('month', ts) FROM
 
 ## Casts
 
-`CAST(x AS type)`, and `TRY_CAST(x AS type)` (also `SAFE_CAST`), which gives
-`NULL` where the cast fails. A float cast to an integer is truncated.
+`CAST(x AS type)` gives `NULL` where the cast fails; `TRY_CAST` and
+`SAFE_CAST` are the same. A float cast to an integer is truncated.
 
 ```sql
 SELECT CAST(n AS TEXT), CAST('12' AS BIGINT), TRY_CAST('twelve' AS BIGINT), CAST(ts AS DATE) FROM t;

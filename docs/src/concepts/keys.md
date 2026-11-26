@@ -67,6 +67,7 @@ columns, not by a key, and a view's result may hold the same row more than
 once — a `UNION ALL` of two copies of a table holds each row twice. Each row
 carries a count of its copies, called its *weight*.
 
-A plain `SELECT` returns a row once per copy, so weights are mostly invisible.
-They appear in a view's [delta feed](../sql/views.md#delta-feeds), where a
-removed row arrives with a negative weight.
+The shell prints a row once per copy, and the Python client returns it once
+with its weight as `row._weight`, so weights are mostly invisible. They
+matter in a view's [delta feed](../sql/views.md#delta-feeds), where a removed
+row arrives with a negative weight.
