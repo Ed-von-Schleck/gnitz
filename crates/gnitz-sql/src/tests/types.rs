@@ -30,7 +30,7 @@ fn each_accepted_spelling_declares_its_type() {
         ("FLOAT(25)", t(F64)),
         ("FLOAT(53)", t(F64)),
         ("DOUBLE PRECISION", t(F64)),
-        ("REAL", t(F64)),
+        ("REAL", t(F32)),
         ("VARCHAR", t(String)),
         ("CHAR", t(String)),
         ("BYTEA", t(Blob)),

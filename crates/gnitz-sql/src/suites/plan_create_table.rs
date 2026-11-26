@@ -98,7 +98,7 @@ fn primary_key_admission() {
         ),
         (
             "CREATE TABLE t (id REAL PRIMARY KEY)",
-            "primary key column 'id' has type DOUBLE",
+            "primary key column 'id' has type FLOAT",
         ),
         (
             "CREATE TABLE t (id DOUBLE PRIMARY KEY)",
