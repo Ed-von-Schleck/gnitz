@@ -8,8 +8,9 @@ use gnitz_foundation::rng::PATTERNS;
 use gnitz_wire::{KeyRange, PkColList, TypeCode, image_mask, key_image};
 
 /// A walk pinning one column and bounding the next admits exactly the rows
-/// within its bounds, every image masked to its column's width — over every key
-/// type, walked through the key and through payload columns.
+/// within its bounds, every image masked to its column's width and an inverted
+/// interval admitting nothing — over every key type, walked through the key and
+/// through payload columns.
 #[test]
 fn every_walk_admits_exactly_the_rows_within_its_bounds() {
     const N: usize = 130;
@@ -50,6 +51,7 @@ fn every_walk_admits_exactly_the_rows_within_its_bounds() {
                             !null(row, pin_col)
                                 && !null(row, range_col)
                                 && pinned(row) == 7
+                                && first <= last
                                 && first & mask <= img(row)
                                 && img(row) <= last & mask
                         })
@@ -76,4 +78,40 @@ fn a_malformed_walk_is_refused() {
     };
     assert!(matches!(walk(1), Some(ExprValidateErr::BadWalk(_))));
     assert!(matches!(walk(3), Some(ExprValidateErr::BadWalk(_))));
+}
+
+/// A walk of several intervals admits the rows any of them admits, its null
+/// exclusion included, over the key column and a payload column.
+#[test]
+fn a_walk_of_several_intervals_admits_their_union() {
+    const N: usize = 200;
+    // A U64 PK, then a nullable U32: each image is its value.
+    let schema = schema_pk(&[TypeCode::U32], true);
+    let null = |row: usize| row.is_multiple_of(9);
+    let mut v = TestView::new(&schema, N);
+    for row in 0..N {
+        v.set(row, 0, row as u128);
+        v.set(row, 1, (row % 50) as u128);
+        if null(row) {
+            v.set_null(row, 1);
+        }
+    }
+    for (col, img) in [
+        (0, (|row| row as u128) as fn(usize) -> u128),
+        (1, |row| (row % 50) as u128),
+    ] {
+        let cols = PkColList::from_slice(&[col]);
+        let spans = [(3, 3), (10, 12), (40, 41)];
+        let range = KeyRange::with_spans(cols, &[], spans).unwrap();
+        let mut f = RowFilter::for_read(&[], Some(&range), &schema).unwrap();
+        let want: Vec<bool> = (0..N)
+            .map(|row| (col == 0 || !null(row)) && spans.iter().any(|&(a, b)| (a..=b).contains(&img(row))))
+            .collect();
+        assert!(
+            want.iter().filter(|&&w| w).count() > spans.len(),
+            "column {col}: the intervals admit rows"
+        );
+        assert_eq!(filter_verdicts(&mut f, &v), want, "column {col}");
+        assert_windows_match_whole(&mut f, &v);
+    }
 }

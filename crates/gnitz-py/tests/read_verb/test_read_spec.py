@@ -17,7 +17,7 @@ import signal
 
 import gnitz
 import pytest
-from _read import access, bag, plan_line, reply, rows
+from _read import access, bag, ordered, plan_line, reply, rows
 from _serverproc import TINY_REPLY_FRAMES, join_or_fail, spawn
 from _sql import insert
 
@@ -127,6 +127,63 @@ def test_a_pk_set_gathers_every_named_key(indexed):
     q = f"SELECT id, v FROM t WHERE id IN ({in_list})"
     assert access(indexed, q) == f"pk set gather ({len(wanted) + 1} keys)"
     assert bag(rows(indexed, q)) == {(i, i * 10): 1 for i in wanted}
+
+
+def test_an_index_set_gathers_every_listed_key(indexed):
+    """`v IN (…)` on an indexed column walks the index at each listed key on
+    every worker, each gathering its own source rows. Every listed key comes back
+    once at weight 1 — a repeated key or two workers claiming one show up as
+    weight 2 — absent keys miss silently, and the set serves a cut and a fold as
+    the scan it replaces would."""
+    wanted = list(range(0, NROWS, 7))
+    in_list = ",".join(str(i * 10) for i in wanted + wanted[:3]) + ",7,-10"
+    q = f"SELECT id, v FROM t WHERE v IN ({in_list})"
+    assert access(indexed, q) == f"index set on (v) ({len(wanted) + 2} keys)"
+    assert plan_line(indexed, q, "predicate") == "none"
+    assert bag(rows(indexed, q)) == {(i, i * 10): 1 for i in wanted}
+    top = sorted(wanted, reverse=True)[1:4]
+    got = ordered(rows(indexed, f"{q} ORDER BY v DESC LIMIT 3 OFFSET 1"), "id", "v")
+    assert got == [((i, i * 10), 1) for i in top]
+    total = rows(indexed, f"SELECT COUNT(*) AS n, SUM(v) AS s FROM t WHERE v IN ({in_list})")
+    assert bag(total) == {(len(wanted), sum(i * 10 for i in wanted)): 1}
+    # The other conjuncts on the column narrow the list; the rest filter it.
+    narrowed = f"SELECT id FROM t WHERE v IN ({in_list}) AND v > 100 AND id % 2 = 0"
+    assert bag(rows(indexed, narrowed)) == {(i,): 1 for i in wanted if i > 10 and i % 2 == 0}
+
+
+def test_an_index_set_reads_what_a_scan_does(client):
+    """An `IN` list through an index — on a 128-bit column, which no expression
+    reads, and after a pinned prefix of a compound index — reads the rows the
+    same list reads through a scan of an unindexed copy, over a non-unique column
+    and across updates and deletes that move rows between keys. The copy holds
+    each UUID as the number it was made from."""
+    def uuid(k):
+        return f"'00000000-0000-0000-0000-{k:012x}'"
+    client.execute_sql(
+        "CREATE TABLE ix (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, k BIGINT, u UUID); "
+        "CREATE TABLE plain (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, k BIGINT, u BIGINT)")
+    client.execute_sql("CREATE INDEX ix_u ON ix (u); CREATE INDEX ix_gk ON ix (g, k)")
+    rows_of = [(i, i % 3, i % 11, i % 13) for i in range(300)]
+    client.execute_sql("INSERT INTO ix VALUES " + ",".join(f"({i}, {g}, {k}, {uuid(u)})" for i, g, k, u in rows_of))
+    client.execute_sql("INSERT INTO plain VALUES " + ",".join(f"({i}, {g}, {k}, {u})" for i, g, k, u in rows_of))
+
+    def agree(ix_where, plain_where, walk):
+        q = "SELECT id, g, k FROM {} WHERE {}"
+        assert access(client, q.format("ix", ix_where)) == walk, ix_where
+        got = bag(rows(client, q.format("ix", ix_where)))
+        assert got and got == bag(rows(client, q.format("plain", plain_where))), ix_where
+
+    keys = (0, 4, 12, 99)
+    for step in range(3):
+        agree(f"u IN ({','.join(uuid(k) for k in keys)})", f"u IN ({','.join(map(str, keys))})",
+              "index set on (u) (4 keys)")
+        agree("g = 2 AND k IN (1, 5, 10, 40)", "g = 2 AND k IN (1, 5, 10, 40)", "index set on (g, k) (4 keys)")
+        for t, four, pair in (("ix", uuid(4), f"{uuid(0)}, {uuid(12)}"), ("plain", "4", "0, 12")):
+            client.execute_sql(f"UPDATE {t} SET u = {four}, k = 5 WHERE id % 7 = {step}")
+            client.execute_sql(f"DELETE FROM {t} WHERE id % 17 = {step}")
+            # A write's read through the set, in a transaction and out of one.
+            client.execute_sql(f"DELETE FROM {t} WHERE u IN ({pair}) AND id % 5 = {step}")
+            client.execute_sql(f"BEGIN; UPDATE {t} SET k = 1 WHERE u IN ({pair}) AND id % 4 = {step}; COMMIT")
 
 
 def test_an_empty_indexed_read_keeps_the_column_metadata(indexed):

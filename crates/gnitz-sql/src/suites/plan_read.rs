@@ -327,6 +327,67 @@ fn explain_names_every_decision() {
     }
 }
 
+/// An `IN` list on an indexed column walks the index at each listed key the
+/// column's other bounds admit, and leaves no predicate; a PK key set still
+/// ranks above it.
+#[test]
+fn an_in_list_on_an_indexed_column_walks_its_keys() {
+    let cat = cat();
+    for (sql, access, predicate) in [
+        (
+            "SELECT * FROM t WHERE v IN (3, 1, 3)",
+            "access: index set on (v) (2 keys)",
+            "predicate: none",
+        ),
+        (
+            "SELECT * FROM t WHERE w IN (1, 2, 3)",
+            "access: index set on (w) (3 keys)",
+            "predicate: none",
+        ),
+        (
+            "SELECT * FROM t WHERE v IN (1, 5, 9) AND v > 4",
+            "access: index set on (v) (2 keys)",
+            "predicate: none",
+        ),
+        // One key, or none, the bounds admit: one range.
+        (
+            "SELECT * FROM t WHERE v IN (1, 5) AND v >= 5",
+            "access: index range on (v)",
+            "predicate: none",
+        ),
+        (
+            "SELECT * FROM t WHERE v IN (1, 5) AND v > 9",
+            "access: index range on (v)",
+            "predicate: none",
+        ),
+        // A point on another index walks one key, not two.
+        (
+            "SELECT * FROM t WHERE v IN (1, 2) AND w = 4",
+            "access: index range on (w)",
+            "predicate: server-side",
+        ),
+        (
+            "SELECT * FROM t WHERE v IN (1, 2) AND w > 4",
+            "access: index set on (v) (2 keys)",
+            "predicate: server-side",
+        ),
+        (
+            "SELECT * FROM t WHERE id IN (1, 2) AND v IN (3, 4)",
+            "access: pk set gather (2 keys)",
+            "predicate: server-side",
+        ),
+        // No index on the column: a scan under the list.
+        (
+            "SELECT * FROM u WHERE k IN (1, 2)",
+            "access: full scan",
+            "predicate: server-side",
+        ),
+    ] {
+        let lines = explain(&cat, sql);
+        assert_eq!((lines[1].as_str(), lines[2].as_str()), (access, predicate), "{sql}");
+    }
+}
+
 /// EXPLAIN plans the identical read — same sink, same encoded spec — so a query
 /// it cannot describe returns exactly the rejection executing it returns.
 #[test]

@@ -33,6 +33,14 @@ fn roundtrips_every_bound_against_every_sink() {
         ReadBound::Range(KeyRange::new(PkColList::from_slice(&[1, 2]), &[7], 1, u128::MAX - 1)),
         ReadBound::PkSet(keys(8)),
         ReadBound::PkSet(keys(crate::MAX_PK_BYTES)),
+        ReadBound::Range(
+            KeyRange::with_spans(
+                PkColList::from_slice(&[1, 2]),
+                &[7],
+                [(1, 1), (5, 9), (u128::MAX, u128::MAX)],
+            )
+            .unwrap(),
+        ),
     ];
     let maps = [
         None,
@@ -274,7 +282,7 @@ fn peek_bound_reads_only_the_routing_bounds() {
     };
 
     let range = KeyRange::new(PkColList::from_slice(&[0, 1]), &[4], 2, 8);
-    match peek_bound(&with(ReadBound::Range(range))) {
+    match peek_bound(&with(ReadBound::Range(range.clone()))) {
         Some(BoundPeek::Range(got)) => assert_eq!(got, range),
         _ => panic!("a Range peeks as itself"),
     }
@@ -342,4 +350,41 @@ fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
             }
         }
     }
+}
+
+/// A range's intervals are ascending and disjoint, and at most
+/// `MAX_RANGE_SPANS`, so no row lies in two of them. A forged blob breaking any
+/// of that is refused at decode.
+#[test]
+fn a_range_is_refused_unless_its_intervals_are_disjoint() {
+    let cols = PkColList::from_slice(&[1, 2]);
+    let refused: [(Vec<(u128, u128)>, &str); 4] = [
+        (vec![(1, 4), (4, 9)], "overlap"),
+        (vec![(5, 5), (1, 1)], "out of order"),
+        (vec![(3, 2)], "inverted"),
+        ((0..=crate::MAX_RANGE_SPANS as u128).map(|v| (v, v)).collect(), "exceed"),
+    ];
+    for (spans, why) in refused {
+        let n = spans.len();
+        assert!(
+            KeyRange::with_spans(cols, &[7], spans.iter().copied())
+                .unwrap_err()
+                .contains(why),
+            "{n} intervals: {why}"
+        );
+        // The same intervals, forged onto the wire past the constructor.
+        let mut w = Writer::new();
+        w.put(&BoundTag::Range).put(&cols).u8(1).u128(7).count(n);
+        spans.iter().for_each(|&(first, last)| {
+            w.u128(first).u128(last);
+        });
+        let spec = [w.into_vec(), ReadSpec::all_rows(ReadBound::None).encode()[1..].to_vec()].concat();
+        assert!(
+            ReadSpec::decode(&spec).unwrap_err().contains(why),
+            "{n} intervals on the wire: {why}"
+        );
+    }
+    // Intervals touching end to start are still disjoint, and none walks nothing.
+    assert!(KeyRange::with_spans(cols, &[7], [(1, 4), (5, 9)]).is_ok());
+    assert!(KeyRange::with_spans(cols, &[7], []).is_ok());
 }

@@ -384,6 +384,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
     let rows: &[(&TestCatalog, &str, &[&str])] = &[
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &["[2]"]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", &["[2]"]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind IN (5, 9) GROUP BY g", &["[2]"]),
         (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", &["[2, 3]"]),
         (&on_ind, "SELECT g, other FROM t WHERE ind = 5", &["[2]"]),
         (&on_ind, "WITH c AS (SELECT * FROM t) SELECT g, COUNT(*) AS n FROM c WHERE ind = 5 GROUP BY g", &["[2]"]),

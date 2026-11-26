@@ -42,7 +42,7 @@ use gnitz_trace::runs::{Run, StoredRow};
 use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
-use gnitz_zset::schema::{group_band, probe_key, range_band};
+use gnitz_zset::schema::{group_band, probe_key, range_band, span_band};
 
 /// Ingest runs fold into the RAM tier once they pass this.
 pub(super) const MEMTABLE_BYTES: usize = 192 << 10;
@@ -404,9 +404,16 @@ impl Table {
         self.cursor(group_band(first, last, self.schema().pk_stride()), cut)
     }
 
-    /// A cursor positioned on the key band `r` walks, over the rows `cut` reads.
+    /// A cursor positioned on the key band `r` walks, over the rows `cut` reads:
+    /// the hull of its intervals.
     pub(crate) fn range_cursor(&self, r: &KeyRange, cut: Cut) -> ReadCursor {
         self.cursor(range_band(&self.shard_index.schema, r), cut)
+    }
+
+    /// A cursor positioned on the key band of `r`'s interval `span`, over the
+    /// rows `cut` reads.
+    pub(crate) fn span_cursor(&self, r: &KeyRange, span: (u128, u128), cut: Cut) -> ReadCursor {
+        self.cursor(span_band(&self.shard_index.schema, r, span), cut)
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of

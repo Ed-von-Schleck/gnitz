@@ -29,22 +29,34 @@ pub const PROBE_KEY_INJECTIVE_BYTES: usize = 8;
 
 /// The half-open OPK key band `[start, end)` `range` walks over a store keyed by
 /// `schema`, whose leading PK columns are `range`'s columns at their own widths:
-/// every key from the group of `eq ‖ first` through the group of `eq ‖ last`.
+/// every key from the group of `eq ‖ first` through the group of `eq ‖ last`,
+/// `first` and `last` the ends of its first and last interval — the hull of the
+/// intervals, exact for one.
 ///
 /// `None` = provably empty.
 pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
+    let (&(first, _), &(_, last)) = (range.spans().first()?, range.spans().last()?);
+    span_band(schema, range, (first, last))
+}
+
+/// [`range_band`] of the interval `[first, last]` on `range`'s range column.
+pub fn span_band(
+    schema: &SchemaDescriptor,
+    range: &KeyRange,
+    (first, last): (u128, u128),
+) -> Option<(PkBuf, Option<PkBuf>)> {
     let mut widths = schema.pk_columns().map(|c| c.size());
-    let mut first = PkBuf::zeroed(0);
+    let mut lo = PkBuf::zeroed(0);
     for (&image, w) in range.eq_vals().iter().zip(&mut widths) {
-        first.push(w, image);
+        lo.push(w, image);
     }
     let w = widths
         .next()
         .expect("range_band: the range lists more columns than the PK");
-    let mut last = first;
-    first.push(w, range.first);
-    last.push(w, range.last);
-    group_band(first.pk_bytes(), last.pk_bytes(), schema.pk_stride())
+    let mut hi = lo;
+    lo.push(w, first);
+    hi.push(w, last);
+    group_band(lo.pk_bytes(), hi.pk_bytes(), schema.pk_stride())
 }
 
 /// The half-open band `[start, end)` of every `stride`-wide key beginning with a

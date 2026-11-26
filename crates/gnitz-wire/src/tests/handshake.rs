@@ -150,6 +150,8 @@ fn wire_layout_samples() -> Vec<u8> {
     out.extend(rows.encode());
     out.extend(fold.encode());
     out.extend(ReadSpec::all_rows(ReadBound::None).encode());
+    let set = KeyRange::with_spans(cols, &[1], [(2, 2), (3, 3)]).unwrap();
+    out.extend(ReadSpec::all_rows(ReadBound::Range(set)).encode());
 
     // A data block: a compound (I16, U8) key, a weight, a null word, a STRING
     // column's heap-backed cell and the heap, part of it dead.
@@ -203,7 +205,7 @@ fn wire_layout_samples() -> Vec<u8> {
 fn the_wire_layouts_are_pinned_to_the_epoch() {
     assert_eq!(
         (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
-        (41, 0x16ae_ab76_47ea_eb0b),
+        (42, 0xc283_a799_cc30_cb09),
         "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
     );
 }

@@ -2,44 +2,41 @@
 
 use crate::codec::{Reader, Wire, Writer};
 use crate::{PK_LIST_MAX_COLS, PkColList};
+use smallvec::SmallVec;
+
+/// The most intervals a [`KeyRange`] admits on its range column: a worker walking
+/// an index opens a cursor per interval.
+pub const MAX_RANGE_SPANS: usize = 4096;
 
 /// A range walk over the key list `cols`: the leading `eq_vals()` columns pinned to one
-/// key image ([`crate::key_image`]) each, the next bounded by the inclusive
-/// `[first, last]`. An inverted interval walks nothing.
+/// key image ([`crate::key_image`]) each, the next admitting the inclusive
+/// intervals `spans()`, ascending and disjoint — one for a comparison, a point per
+/// key for an `IN` list. No interval walks nothing.
 ///
-/// Wire layout (`9 + 16·(n_eq + 2)` bytes):
+/// Wire layout (`11 + 16·n_eq + 32·n_spans` bytes):
 ///
 /// | bytes        | content                                                  |
 /// |--------------|----------------------------------------------------------|
 /// | 0            | `cols`, packed by `PkColList::pack`                     |
 /// | 8            | `n_eq` — count of equality-pinned leading columns        |
 /// | 9 + 16·i     | i-th equality image, LE `u128`                           |
-/// | then 16      | `first` image, LE `u128`                                 |
-/// | then 16      | `last` image, LE `u128`                                  |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// | then 2       | `n_spans`, LE `u16`                                      |
+/// | then 32 each | an interval's `first` and `last` images, LE `u128`       |
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRange {
     cols: PkColList,
     eq: [u128; PK_LIST_MAX_COLS],
     n_eq: usize,
-    pub first: u128,
-    pub last: u128,
+    spans: SmallVec<[(u128, u128); 1]>,
 }
 
 impl KeyRange {
-    /// Panics when `eq` leaves no column of `cols` for the range.
+    /// The walk admitting `[first, last]` on the range column; an inverted
+    /// interval admits nothing. Panics when `eq` leaves no column of `cols` for
+    /// the range.
     pub fn new(cols: PkColList, eq: &[u128], first: u128, last: u128) -> Self {
-        if let Err(e) = check_eq_count(eq.len(), &cols) {
-            panic!("KeyRange: {e}");
-        }
-        let mut vals = [0u128; PK_LIST_MAX_COLS];
-        vals[..eq.len()].copy_from_slice(eq);
-        KeyRange {
-            cols,
-            eq: vals,
-            n_eq: eq.len(),
-            first,
-            last,
-        }
+        let spans = (first <= last).then_some((first, last));
+        KeyRange::with_spans(cols, eq, spans).unwrap_or_else(|e| panic!("KeyRange: {e}"))
     }
 
     /// The walk pinning the leading `vals.len()` columns of `cols` to `vals`.
@@ -47,6 +44,30 @@ impl KeyRange {
     pub fn point(cols: PkColList, vals: &[u128]) -> Self {
         let (&v, eq) = vals.split_last().expect("KeyRange::point: no value");
         KeyRange::new(cols, eq, v, v)
+    }
+
+    /// The walk admitting each interval of `spans` on the range column; `Err`
+    /// when `eq` leaves no column of `cols` for the range, or the intervals are
+    /// more than [`MAX_RANGE_SPANS`], inverted, out of order or overlapping.
+    pub fn with_spans(
+        cols: PkColList,
+        eq: &[u128],
+        spans: impl IntoIterator<Item = (u128, u128)>,
+    ) -> Result<Self, String> {
+        check_eq_count(eq.len(), &cols)?;
+        let spans: SmallVec<[(u128, u128); 1]> = spans.into_iter().collect();
+        if spans.len() > MAX_RANGE_SPANS {
+            return Err(format!("{} intervals exceed {MAX_RANGE_SPANS}", spans.len()));
+        }
+        if spans.iter().any(|(first, last)| first > last) {
+            return Err("an interval is inverted".into());
+        }
+        if spans.windows(2).any(|w| w[0].1 >= w[1].0) {
+            return Err("the intervals overlap or are out of order".into());
+        }
+        let mut vals = [0u128; PK_LIST_MAX_COLS];
+        vals[..eq.len()].copy_from_slice(eq);
+        Ok(KeyRange { cols, eq: vals, n_eq: eq.len(), spans })
     }
 
     pub fn cols(&self) -> PkColList {
@@ -57,6 +78,12 @@ impl KeyRange {
     /// list position `eq_vals().len()`.
     pub fn eq_vals(&self) -> &[u128] {
         &self.eq[..self.n_eq]
+    }
+
+    /// The range column's admitted intervals `(first, last)`, inclusive,
+    /// ascending and disjoint.
+    pub fn spans(&self) -> &[(u128, u128)] {
+        &self.spans
     }
 
     /// Whether the walk is every row its bounds admit. It holds no row NULL in a column
@@ -88,7 +115,10 @@ impl Wire for KeyRange {
         for v in self.eq_vals() {
             w.u128(*v);
         }
-        w.u128(self.first).u128(self.last);
+        w.count(self.spans.len());
+        for &(first, last) in &self.spans {
+            w.u128(first).u128(last);
+        }
     }
 
     fn read(r: &mut Reader) -> Result<KeyRange, String> {
@@ -99,8 +129,8 @@ impl Wire for KeyRange {
         for slot in &mut eq[..n_eq] {
             *slot = r.u128()?;
         }
-        let (first, last) = (r.u128()?, r.u128()?);
-        Ok(KeyRange { cols, eq, n_eq, first, last })
+        let spans = r.items("range intervals", MAX_RANGE_SPANS, |r| Ok((r.u128()?, r.u128()?)))?;
+        KeyRange::with_spans(cols, &eq[..n_eq], spans)
     }
 }
 

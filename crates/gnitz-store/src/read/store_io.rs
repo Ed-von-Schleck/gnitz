@@ -13,6 +13,7 @@ use gnitz_trace::runs::{PkSetGather, ReadCursor, StoredRow, empty_cursor};
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{SchemaDescriptor, pk_keys, project_schema};
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
 /// One `HasPk` probe: the store it reads, and what it answers each matched key
@@ -127,29 +128,35 @@ impl Relation {
             ReadBound::Range(r) if r.walks_pk(schema.pk_cols()) => {
                 let mut cursor = table.range_cursor(&r, cut);
                 cursor.skip_payload(self.unread(read));
-                return Ok((whole(cursor), None));
+                // The cursor walks the intervals' hull: several leave the reader
+                // to apply them.
+                let unapplied = (r.spans().len() > 1).then_some(r);
+                return Ok((whole(cursor), unapplied));
             }
             ReadBound::Range(r) => {
                 // An index holds a pending row's entry from its ingest on, so it is
                 // walked only where the store's two cuts read the same rows.
                 let index = self.index_on(r.cols().as_slice());
-                match index
-                    .filter(|_| cut == Cut::Now || !table.has_pending())
-                    .map(|ix| ix.entry_store(self).range_cursor(&r, Cut::Now))
-                {
-                    // No entry in the range: no store cursor to open.
-                    Some(idx) if !idx.is_valid() => return Ok((whole(empty_cursor(schema)), None)),
-                    Some(idx) if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO => {
-                        let stride = schema.pk_stride();
-                        let walk = IndexWalk { idx, stride, pks: Vec::new() };
-                        (PkKeys::from_sorted(stride, Vec::new()), Some(Box::new(walk)))
-                    }
-                    _ => {
-                        // The reader applies the range, so it reads the range's columns.
-                        let walked = schema.payload_bits(r.cols().as_slice().iter().copied());
-                        return Ok((whole(self.open_cursor(cut, read | walked)), Some(r)));
-                    }
+                let Some(ix) = index.filter(|_| cut == Cut::Now || !table.has_pending()) else {
+                    return Ok(self.scan_under(cut, read, r));
+                };
+                let entries = ix.entry_store(self);
+                let walked: VecDeque<ReadCursor> = (r.spans().iter())
+                    .map(|&span| entries.span_cursor(&r, span, Cut::Now))
+                    .filter(ReadCursor::is_valid)
+                    .collect();
+                // No entry in the range: no store cursor to open.
+                if walked.is_empty() {
+                    return Ok((whole(empty_cursor(schema)), None));
                 }
+                if walked.iter().map(ReadCursor::estimated_length).sum::<usize>()
+                    > table.estimated_rows() / INDEX_SCAN_RATIO
+                {
+                    return Ok(self.scan_under(cut, read, r));
+                }
+                let stride = schema.pk_stride();
+                let walk = IndexWalk { spans: walked, stride, pks: Vec::new() };
+                (PkKeys::from_sorted(stride, Vec::new()), Some(Box::new(walk)))
             }
         };
         // A key this worker holds no row for copies nothing.
@@ -166,6 +173,17 @@ impl Relation {
             None => Source::Merge(self.gather(keys, cut, read)),
         };
         Ok((SourceCursor { source, walk }, None))
+    }
+
+    /// The whole store over the rows `cut` reads, for a reader that applies
+    /// `range` itself, and so reads its columns too.
+    fn scan_under(&self, cut: Cut, read: u64, range: KeyRange) -> (SourceCursor<'static>, Option<KeyRange>) {
+        let walked = self.schema().payload_bits(range.cols().as_slice().iter().copied());
+        let source = SourceCursor {
+            source: Source::Cursor(self.open_cursor(cut, read | walked)),
+            walk: None,
+        };
+        (source, Some(range))
     }
 }
 
@@ -246,15 +264,17 @@ impl SourceCursor<'_> {
     }
 }
 
-/// The walk of one secondary-index key range, feeding each entry's source PK
-/// to a key list over the relation it indexes, over one snapshot of each.
-/// The key list's source returns every row under an entry's source PK, so the
-/// walk is exact only over rows unique on their PK: a source PK then has one
-/// live row and at most one live index entry.
+/// The walk of a secondary-index key range, one interval after another, feeding
+/// each entry's source PK to a key list over the relation it indexes, over one
+/// snapshot of each. The key list's source returns every row under an entry's
+/// source PK, so the walk is exact only over rows unique on their PK: a source
+/// PK then has one live row and at most one live index entry, and lies in at
+/// most one of the disjoint intervals.
 struct IndexWalk {
-    /// Positioned on the index range and clamped at its end; an entry is a
-    /// leading span followed by the source PK.
-    idx: ReadCursor,
+    /// The intervals not yet spent, the first walked first: each positioned on
+    /// its band of the index and clamped at its end; an entry is a leading span
+    /// followed by the source PK.
+    spans: VecDeque<ReadCursor>,
     /// The source PK's width: the relation's `pk_stride`.
     stride: usize,
     /// A refill's source PKs in index order, flat at `stride`.
@@ -263,15 +283,25 @@ struct IndexWalk {
 
 impl IndexWalk {
     /// The source PKs of the next `max_rows` index entries, ascending; `None`
-    /// once the index range is spent.
+    /// once every interval is spent.
     fn refill(&mut self, max_rows: usize) -> Option<PkKeys> {
-        let span = self.idx.schema().pk_stride() - self.stride;
         self.pks.clear();
-        for _ in 0..max_rows {
-            let Some(pk) = self.idx.current_pk() else { break };
-            debug_assert!(self.idx.current_weight() > 0, "an index entry at a non-positive weight");
-            self.pks.extend_from_slice(&pk[span..]);
-            self.idx.advance();
+        let mut room = max_rows;
+        while room > 0
+            && let Some(idx) = self.spans.front_mut()
+        {
+            let span = idx.schema().pk_stride() - self.stride;
+            while room > 0
+                && let Some(pk) = idx.current_pk()
+            {
+                debug_assert!(idx.current_weight() > 0, "an index entry at a non-positive weight");
+                self.pks.extend_from_slice(&pk[span..]);
+                idx.advance();
+                room -= 1;
+            }
+            if idx.current_pk().is_none() {
+                self.spans.pop_front();
+            }
         }
         (!self.pks.is_empty()).then(|| pk_keys(self.stride, self.pks.chunks_exact(self.stride)))
     }

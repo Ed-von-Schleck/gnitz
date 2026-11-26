@@ -125,17 +125,30 @@ fn a_wide_key_pins_and_any_other_shape_is_no_term() {
         (U128, "c1 >= -5", Some(0..=u128::MAX)),
         (I32, "c1 <= -340282366920938463463374607431768211455", Some(NOTHING)),
         (UUID, &uuid_eq, Some(UUID_VALUE..=UUID_VALUE)),
-        // No term: a float column, `<>`, a computed operand, a negated range, and
-        // a list on a column that is no PK column.
+        // No term: a float column, `<>`, a computed operand, a negated range.
         (F64, "c1 = 1", None),
         (F64, "c1 < 5", None),
         (I64, "c1 <> 5", None),
         (I64, "c1 + 1 > 3", None),
         (I64, "c1 NOT BETWEEN 1 AND 2", None),
-        (I64, "c1 IN (1, 2)", None),
     ] {
         assert_eq!(pin(&typed_schema(&[tc]), sql), want, "{tc:?}: {sql}");
     }
+    // A list pins its keys in key order, once each, on any column with a key
+    // image, a PK column or not; on a float column it is no term.
+    let list = |tc, sql| {
+        let s = typed_schema(&[tc]);
+        let [c] = &bind_where(sql, &s)[..] else {
+            panic!("{sql}: one conjunct")
+        };
+        term(c, &s).map(|(col, pin)| match pin {
+            Pin::In(keys) => (col, keys),
+            Pin::Range(_) => panic!("{sql}: a range pin"),
+        })
+    };
+    let img = |v| gnitz_wire::key_image(I64, v);
+    assert_eq!(list(I64, "c1 IN (2, 1, 2)"), Some((1, vec![img(1), img(2)])));
+    assert_eq!(list(F64, "c1 IN (1, 2)"), None);
 }
 
 // ------------------------------------------------------------------

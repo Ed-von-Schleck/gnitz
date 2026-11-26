@@ -48,7 +48,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 22;
+pub(crate) const CIRCUIT_VERSION: u8 = 23;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation

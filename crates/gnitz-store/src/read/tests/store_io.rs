@@ -63,6 +63,15 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     let anti = |id: u64| (NBASE - id) as i64 * 10;
     let point = ReadBound::Range(KeyRange::point(PkColList::from_slice(&[1]), &[img(730)]));
     let inverted = col_range(1, img(901), img(299));
+    // An IN list on the indexed column: a point per key, one absent.
+    let set = ReadBound::Range(
+        KeyRange::with_spans(
+            PkColList::from_slice(&[1]),
+            &[],
+            [520, 730, 735, 990].map(|v| (img(v), img(v))),
+        )
+        .unwrap(),
+    );
     // (val_of, indexed, bound, walks the index, ids).
     let x10: fn(u64) -> i64 = x10;
     let cases = [
@@ -71,7 +80,10 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
         (x10, true, inverted, true, vec![]),
         (anti, true, val_range(10, 110), true, (190..200).collect()),
         (x10, true, val_range(0, i64::MAX), false, (0..NBASE).collect()),
+        (x10, true, set.clone(), true, vec![52, 73, 99]),
+        (anti, true, set.clone(), true, vec![101, 127, 148]),
         (x10, false, point, false, (0..NBASE).collect()),
+        (x10, false, set, false, (0..NBASE).collect()),
     ];
     for (val_of, indexed, bound, walks, ids) in cases {
         let mut r = fixture(RelationKind::BaseTable, val_of);
@@ -82,7 +94,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
         for chunk in [1, 3, 7, 64, usize::MAX] {
             let relation = r.relation(TID).unwrap();
             let (read, unapplied) = relation.open_read(bound.clone(), u64::MAX).unwrap();
-            assert_eq!(unapplied.map(ReadBound::Range), (!walks).then(|| bound.clone()));
+            assert_eq!(unapplied.as_ref(), bound.range().filter(|_| !walks), "{bound:?}");
             for mut cur in [relation.open_sealed(bound.clone(), u64::MAX).unwrap(), read] {
                 assert_eq!(cur.walks_index(), walks && !want.is_empty(), "{bound:?}");
                 assert_eq!(drain_all(&mut cur, chunk), want, "{bound:?} chunk {chunk}");
@@ -337,7 +349,7 @@ fn a_composite_range_reads_exactly_the_rows_its_bounds_admit() {
                 .map(|row| (row.clone(), 1))
                 .collect();
 
-            let bound = ReadBound::Range(range);
+            let bound = ReadBound::Range(range.clone());
             match r
                 .relation(TID)
                 .unwrap()

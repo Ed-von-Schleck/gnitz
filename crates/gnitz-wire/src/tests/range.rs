@@ -26,7 +26,7 @@ fn roundtrips_every_shape() {
         KeyRange::point(cols(&[4, 5]), &[u128::MAX, 0]),
     ];
     for r in shapes {
-        assert_eq!(dec(&enc(&r)), Ok(r), "{r:?}");
+        assert_eq!(dec(&enc(&r)), Ok(r.clone()), "{r:?}");
     }
 }
 

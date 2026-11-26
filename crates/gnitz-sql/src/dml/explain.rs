@@ -127,10 +127,17 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
         ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
         // The keys ship deduplicated, so this is the distinct key count.
         ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
-        ReadBound::Range(r) => format!(
-            "index range on ({})",
-            column_names(schema.columns(), r.cols().as_slice())
-        ),
+        ReadBound::Range(r) => match r.spans().len() {
+            // An `IN` list: a point per key.
+            n @ 2.. => format!(
+                "index set on ({}) ({n} keys)",
+                column_names(schema.columns(), r.cols().as_slice())
+            ),
+            _ => format!(
+                "index range on ({})",
+                column_names(schema.columns(), r.cols().as_slice())
+            ),
+        },
     };
     let predicate = match (read.spec.predicate.is_empty(), local) {
         (true, _) => "none",

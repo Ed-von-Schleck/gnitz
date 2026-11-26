@@ -11,7 +11,7 @@ use crate::ir::{BExpr, BoundExpr};
 use crate::literal::{Compared, Placed, place};
 use gnitz_core::Schema;
 use gnitz_expr::CmpOp;
-use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, image_mask, key_image};
+use gnitz_wire::{KeyRange, MAX_RANGE_SPANS, PkColList, PkKeys, ReadBound, image_mask, key_image};
 use gnitz_wire::{PK_LIST_MAX_COLS, RelIndex, TypeCode};
 use std::cmp::Reverse;
 use std::ops::RangeInclusive;
@@ -65,10 +65,7 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
         let BExpr::ColRef(col) = inner.as_ref() else {
             return None;
         };
-        // Only a PK key set consumes a list; an index bound is one interval.
-        if !schema.layout().is_pk_col(*col) {
-            return None;
-        }
+        // A PK key set consumes a list, and so does an index walk.
         let c = &schema.columns()[*col];
         image_max(c.ty.tc)?;
         // A NULL member never makes the conjunct true, and a placement other
@@ -145,20 +142,31 @@ fn fold(col: u32, terms: &[Term], schema: &Schema) -> Option<Folded> {
     (!f.consumed.is_empty()).then_some(f)
 }
 
+/// The `IN` list naming `col` first, in key order, and its conjunct.
+fn list_on(col: u32, terms: &[Term]) -> Option<(usize, &[u128])> {
+    terms.iter().find_map(|t| match &t.pin {
+        Pin::In(keys) if t.col as u32 == col => Some((t.conjunct, keys.as_slice())),
+        _ => None,
+    })
+}
+
 /// A key list bounded by the WHERE.
 struct ListBound {
     range: KeyRange,
     consumed: Vec<usize>,
-    /// Leading columns pinned to one value.
+    /// Leading columns pinned to one value, or, the last of them, to a list.
     pinned: usize,
+    /// The last pinned column is pinned to a list.
+    listed: bool,
     /// How many ends of the range column's interval the WHERE bounds; 0 for a point.
     bounded_sides: u32,
 }
 
 /// Bound the key list `cols` — a PK or an index — by its leading point columns and
-/// the next column's interval. `None` when nothing bounds it, or when an uncovered
-/// trailing column is nullable.
-fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option<ListBound> {
+/// the next column's interval, or, with `lists`, an `IN` list on it: a point per
+/// listed key the interval admits. `None` when nothing bounds it, or when an
+/// uncovered trailing column is nullable.
+fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema, lists: bool) -> Option<ListBound> {
     let mut eq = [0u128; PK_LIST_MAX_COLS];
     let mut pinned = 0;
     let mut consumed = Vec::new();
@@ -180,14 +188,32 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
         }
     }
     let eq = &eq[..pinned];
-    let (range, bounded_sides) = match next {
-        Some(f) => {
+    let list = (cols.as_slice().get(pinned))
+        .filter(|_| lists)
+        .and_then(|&col| list_on(col, terms))
+        .filter(|(_, keys)| keys.len() <= MAX_RANGE_SPANS);
+    let listed = list.is_some();
+    let (range, bounded_sides) = match (list, next) {
+        (Some((conjunct, keys)), next) => {
+            consumed.push(conjunct);
+            // The column's interval narrows the list, and is applied with it.
+            let admits = next.map_or(0..=u128::MAX, |f| {
+                consumed.extend(f.consumed);
+                f.admits
+            });
+            let points = keys.iter().filter(|k| admits.contains(k)).map(|&k| (k, k));
+            (
+                KeyRange::with_spans(cols, eq, points).expect("a point per distinct key, ascending"),
+                0,
+            )
+        }
+        (None, Some(f)) => {
             consumed.extend(f.consumed);
             let (&first, &last) = (f.admits.start(), f.admits.end());
             let sides = (first != 0) as u32 + (last != f.max) as u32;
             (KeyRange::new(cols, eq, first, last), sides)
         }
-        None => {
+        (None, None) => {
             if pinned == 0 {
                 return None;
             }
@@ -196,7 +222,13 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
     };
     range
         .is_exact(|c| schema.columns()[c as usize].is_nullable)
-        .then_some(ListBound { range, consumed, pinned, bounded_sides })
+        .then_some(ListBound {
+            range,
+            consumed,
+            pinned: pinned + listed as usize,
+            listed,
+            bounded_sides,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -231,10 +263,7 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<PkKeySet> {
             continue;
         }
         // A non-point fold on a list column stays residual.
-        let (conjunct, keys) = terms.iter().find_map(|t| match &t.pin {
-            Pin::In(keys) if t.col as u32 == col => Some((t.conjunct, keys.as_slice())),
-            _ => None,
-        })?;
+        let (conjunct, keys) = list_on(col, terms)?;
         lists[k] = Some(keys);
         consumed.push(conjunct);
     }
@@ -371,7 +400,8 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
     let pk_range = if pk_all_points {
         None
     } else {
-        bound_column_list(PkColList::from_slice(schema.pk_cols()), &terms, schema)
+        // The key set serves a list on a PK column.
+        bound_column_list(PkColList::from_slice(schema.pk_cols()), &terms, schema, false)
     }
     .filter(|b| b.pinned < schema.pk_cols().len());
     if let Some(b) = pk_range {
@@ -400,7 +430,7 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
         },
     ));
     for meta in indexes {
-        let Some(b) = bound_column_list(meta.cols, &terms, schema) else {
+        let Some(b) = bound_column_list(meta.cols, &terms, schema, true) else {
             continue;
         };
         let n_cols = meta.cols.as_slice().len();
@@ -413,6 +443,7 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
         };
         let rank = IndexRank {
             pinned: b.pinned,
+            point: !b.listed,
             bounded_sides: b.bounded_sides,
             narrower: Reverse(n_cols),
         };
@@ -434,6 +465,8 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexRank {
     pinned: usize,
+    /// The last pinned column holds one key, not a list of them.
+    point: bool,
     bounded_sides: u32,
     narrower: Reverse<usize>,
 }

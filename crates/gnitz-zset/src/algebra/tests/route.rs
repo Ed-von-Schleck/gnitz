@@ -189,7 +189,8 @@ fn pk_range_and_confinement_follow_key_membership() {
         for k0 in probes {
             for k1 in probes {
                 let img = [k0 as u128, k1 as u128];
-                let admitted = img[..n] == r.eq_vals()[..] && r.first <= img[n] && img[n] <= r.last;
+                let admitted = img[..n] == r.eq_vals()[..]
+                    && r.spans().iter().any(|&(first, last)| first <= img[n] && img[n] <= last);
                 let k = u32::from(u16::from_be_bytes([k0, k1]));
                 assert_eq!((lo..hi).contains(&k), admitted, "{r:?}: key ({k0:#x}, {k1:#x})");
             }

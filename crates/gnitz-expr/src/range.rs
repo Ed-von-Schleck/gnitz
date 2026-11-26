@@ -14,9 +14,12 @@ use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaDescriptor};
 pub(crate) struct RangeMembership {
     /// The null-word bits of the list's payload columns: no index entry holds a NULL.
     null_mask: u64,
-    /// Per bounded column, its admitted key images `lo ..= lo + span`: an equality
-    /// column is a span of 0. Empty when the range admits nothing.
+    /// Per bounded column, its admitted key images `lo ..= lo + span`: each equality
+    /// column a span of 0, then the range column where it admits one interval.
     bounds: Vec<(ColumnLocator, u128, u128)>,
+    /// The range column where it admits no interval or several: its intervals'
+    /// `(first, last)` images, ascending and disjoint.
+    spans: Option<(ColumnLocator, Vec<(u128, u128)>)>,
     /// The instruction set the null exclusion's kernel runs at.
     pub(crate) level: Level,
 }
@@ -34,31 +37,47 @@ impl RangeMembership {
         }
         let range_col = locs[range.eq_vals().len()];
         let null_mask = locs.iter().fold(0, |m, l| m | l.null_bit());
+        // Each interval's ends masked to the column's width; one inverted so
+        // admits nothing.
         let mask = image_mask(range_col.size());
-        let (lo, hi) = (range.first & mask, range.last & mask);
-        let bounds = match lo <= hi {
-            true => locs
-                .iter()
-                .zip(range.eq_vals())
-                .map(|(&l, &v)| (l, v & image_mask(l.size()), 0))
-                .chain([(range_col, lo, hi - lo)])
-                .collect(),
-            false => Vec::new(),
+        let spans: Vec<(u128, u128)> = (range.spans().iter())
+            .map(|&(first, last)| (first & mask, last & mask))
+            .filter(|(first, last)| first <= last)
+            .collect();
+        let mut bounds: Vec<_> = (locs.iter().zip(range.eq_vals()))
+            .map(|(&l, &v)| (l, v & image_mask(l.size()), 0))
+            .collect();
+        let spans = match spans[..] {
+            [(first, last)] => {
+                bounds.push((range_col, first, last - first));
+                None
+            }
+            _ => Some((range_col, spans)),
         };
-        Ok(RangeMembership { null_mask, bounds, level: Level::new() })
+        Ok(RangeMembership {
+            null_mask,
+            bounds,
+            spans,
+            level: Level::new(),
+        })
     }
 
     /// Clear the bit of every row of `rows` of `mb` outside the walk in `words`, one
     /// bit per row, bit `i` for row `rows.start + i`.
     pub(crate) fn and_into(&self, mb: &dyn BatchView, rows: Range<usize>, words: &mut [u64]) {
         debug_assert_eq!(words.len(), rows.len().div_ceil(64), "and_into: one bit per row");
-        if self.bounds.is_empty() {
+        if self.spans.as_ref().is_some_and(|(_, s)| s.is_empty()) {
             words.fill(0);
             return;
         }
         #[cfg(debug_assertions)]
         if !rows.is_empty() {
-            let reads = self.bounds.iter().filter_map(|&(loc, ..)| match loc {
+            let cols = self
+                .bounds
+                .iter()
+                .map(|&(loc, ..)| loc)
+                .chain(self.spans.iter().map(|&(loc, _)| loc));
+            let reads = cols.filter_map(|loc| match loc {
                 ColumnLocator::Payload { slot, size, .. } => Some((slot as usize, size as usize)),
                 ColumnLocator::Pk { .. } => None,
             });
@@ -95,6 +114,31 @@ impl RangeMembership {
                         let lo = lo.wrapping_sub(gnitz_wire::opk_bias(type_code)) as T;
                         let region = &mb.col_data(slot as usize, W)[rows.start * W..rows.end * W];
                         and_cells::<W>(words, region, W, 0, |c| T::from_le_bytes(c).wrapping_sub(lo) <= span)
+                    }
+                }
+            })
+        }
+        // Clear the bit of every row whose image lies in none of the intervals.
+        if let Some((loc, spans)) = &self.spans {
+            gnitz_wire::by_cell_width!(loc.size(), |T| {
+                const W: usize = size_of::<T>();
+                // The intervals are masked to the column's images, so each fits `T`.
+                let admits = |image: T| {
+                    let i = spans.partition_point(|&(first, _)| first as T <= image);
+                    i > 0 && image <= spans[i - 1].1 as T
+                };
+                match *loc {
+                    ColumnLocator::Pk { byte_off, .. } => {
+                        let (region, stride) = mb.pk_region();
+                        let region = &region[rows.start * stride..rows.end * stride];
+                        and_cells::<W>(words, region, stride, byte_off as usize, |c| {
+                            admits(T::from_be_bytes(c))
+                        })
+                    }
+                    ColumnLocator::Payload { slot, type_code, .. } => {
+                        let bias = gnitz_wire::opk_bias(type_code) as T;
+                        let region = &mb.col_data(slot as usize, W)[rows.start * W..rows.end * W];
+                        and_cells::<W>(words, region, W, 0, |c| admits(T::from_le_bytes(c).wrapping_add(bias)))
                     }
                 }
             })

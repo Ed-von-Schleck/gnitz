@@ -129,7 +129,8 @@ impl ReadSpec {
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
         let keys = match &self.bound {
             ReadBound::PkSet(k) => k.as_bytes().len(),
-            ReadBound::None | ReadBound::Range(_) => 0,
+            ReadBound::Range(r) => 32 * r.spans().len(),
+            ReadBound::None => 0,
         };
         let mut w = Writer::with_capacity(64 + self.predicate.len() + keys + map);
 

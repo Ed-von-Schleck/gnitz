@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn data_format_is_pinned() {
     assert_eq!(
-        DATA_FORMAT, 0x19cc_28b0_cdcc_b37e,
+        DATA_FORMAT, 0x8f8f_d964_9691_5b7b,
         "the data directory format moved: {DATA_FORMAT:#018x}"
     );
 }

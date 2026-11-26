@@ -16,7 +16,7 @@ mod sort_key;
 /// The schema descriptor, homed in `gnitz-expr` because its evaluator reads
 /// through it. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{SchemaColumn, SchemaDescriptor};
-pub use key::{PROBE_KEY_INJECTIVE_BYTES, band, group_band, group_floor, key_above, probe_key, range_band};
+pub use key::{PROBE_KEY_INJECTIVE_BYTES, band, group_band, group_floor, key_above, probe_key, range_band, span_band};
 pub use payload_order::{FixedIntNonnull, Generic, PayloadOrder, with_payload_cmp};
 pub(crate) use radix::stable_radix_sort_by_key;
 pub use radix::{RadixKey, radix_sort_by_key};
