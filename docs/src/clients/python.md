@@ -95,7 +95,8 @@ run the transaction again.
 
 ## Errors
 
-Every exception derives from `gnitz.GnitzError`:
+A failed request raises a `gnitz.GnitzError`; an argument the client rejects
+before sending raises a `TypeError` or `ValueError`:
 
 | Exception | Meaning |
 |---|---|
@@ -111,8 +112,8 @@ Every exception derives from `gnitz.GnitzError`:
 ## asyncio
 
 `gnitz.aio.connect` returns a client with the same methods, each returning an
-awaitable. Calls that are one request each — `push`, `delete`, `scan`, `seek` —
-share a round trip when started together:
+awaitable, and `aclose()` for `close()`. Calls that are one request each —
+`push`, `delete`, `scan`, `seek` — share a round trip when started together:
 
 ```python
 from gnitz import aio

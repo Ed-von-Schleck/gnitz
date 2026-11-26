@@ -45,9 +45,10 @@ view first applies any changes to its sources that have not reached it yet.
 
 ## How a read finds its rows
 
-A `WHERE` naming the whole primary key reads that one row; a condition on a
-leading part of a compound key reads a range; an equality, a range or an `IN`
-list on an [indexed](tables.md#indexes) column reads through the index. Anything else
+A `WHERE` naming the whole primary key reads that one row, and an `IN` list on
+it those rows; a range on the key, or a condition on a leading part of a
+compound key, reads a range; an equality, a range or an `IN` list on an
+[indexed](tables.md#indexes) column reads through the index. Anything else
 scans the relation. `EXPLAIN` shows which:
 
 ```sql

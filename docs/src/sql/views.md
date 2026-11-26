@@ -90,8 +90,11 @@ CREATE VIEW running_total AS
 
 A window with an `ORDER BY` costs, per change, a pass over the changed row's
 partition — the rows before it are read and those after it are emitted again —
-so keep partitions small where rows change often.
-A window with no `ORDER BY` needs its `PARTITION BY` columns to be `NOT NULL`.
+so keep partitions small where rows change often. A `QUALIFY` that bounds a
+`ROW_NUMBER` nothing else reads is the exception: it keeps the top rows of each
+partition instead.
+An aggregate over a window with no `ORDER BY` needs its `PARTITION BY` columns
+to be `NOT NULL`.
 
 **The current time** — `NOW()` (or `CURRENT_TIMESTAMP`) is allowed in a view's
 `WHERE`, compared with an expression over one relation's columns. The view moves
@@ -114,7 +117,7 @@ What is refused is listed under [Limitations](limitations.md).
 |---|---|
 | `delta = '<size>'` | Keep the view's recent changes, up to the size, as a [delta feed](#delta-feeds). |
 | `capacity = '<size>'` | Bound the view's stored rows on each worker; see below. |
-| `compress = true` | Dictionary-code the view's text columns on disk. |
+| `compress = true` | The view's text and byte values are compressed on disk, where that saves space. |
 
 Sizes are written `'512 KB'`, `'32 MB'`, `'1 GB'`.
 

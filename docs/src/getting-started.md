@@ -19,7 +19,7 @@ Start the shell:
 gnitz
 ```
 
-Given no server to connect to, the shell runs a `gnitz-server` for the session
+Given no server to connect to — no target argument and no `GNITZ_TARGET` — the shell runs a `gnitz-server` for the session
 and deletes its data when you exit. `gnitz --data DIR` keeps the data in `DIR`
 for the next session.
 

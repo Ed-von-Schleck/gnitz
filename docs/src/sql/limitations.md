@@ -1,8 +1,7 @@
 # Limitations
 
 What gnitz refuses today that no other page covers, and what to do instead.
-Each reference page states what it refuses beside what it accepts. The planner
-refuses each of these with an error naming it.
+The planner refuses each of these with an error naming it.
 
 ```sql
 CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT, region TEXT);
@@ -54,8 +53,9 @@ CREATE VIEW idle AS
     SELECT id FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer = c.id);
 ```
 
-**The same relation in a query and its subquery** needs an alias on at least
-one of them; the planner does not let the inner name shadow the outer one.
+**The same name in a query and its subquery.** The planner does not let an
+inner name shadow an outer one: give the same relation an alias in at least one
+of them, and qualify a column name both of them have.
 
 **`LATERAL` and `WITH RECURSIVE`** are not supported.
 
@@ -85,8 +85,8 @@ DISTINCT aggregates: every DISTINCT aggregate of one query must read the same ar
 
 - **No regular expressions** (`SIMILAR TO`, `REGEXP_*`) and **no bitwise
   operators**.
-- **No non-deterministic functions** (`RANDOM()`, `CURRENT_DATE`, …): a view must give
-  the same rows each time it is computed. Generate random values in the client.
+- **No non-deterministic functions** (`RANDOM()`, `CURRENT_DATE`, …) other
+  than `NOW()` in a view's `WHERE`. Generate random values in the client.
 - **128-bit columns** (`UUID`, `HUGEINT`, `UHUGEINT`) can be stored, selected,
   grouped by, joined on and used as keys and indexed, but not used in an
   expression. A plain `SELECT` still compares one with a value through its

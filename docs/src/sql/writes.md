@@ -58,7 +58,7 @@ COMMIT;
 A transaction's writes become visible together at `COMMIT`, and `ROLLBACK`
 discards them. Inside a transaction:
 
-- Only `INSERT`, `UPDATE`, `DELETE` and `SELECT` are allowed; DDL is refused.
+- DDL is refused; `INSERT`, `UPDATE`, `DELETE`, `SELECT` and `EXPLAIN` run.
 - A `SELECT` sees the state before the transaction, not its own writes.
 - An `INSERT` into a stream is refused, and the transaction stays open.
 

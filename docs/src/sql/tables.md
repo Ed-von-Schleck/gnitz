@@ -57,10 +57,10 @@ There are no column defaults and no `CHECK` constraints.
 |---|---|
 | `stream = true` | The table is a [stream](../concepts/relations.md#streams): it keeps no rows. |
 | `replicated = true` | Every worker holds a full copy. For small tables that many views join against. |
-| `compress = true` | Text columns are dictionary-coded on disk, where that saves space. |
+| `compress = true` | Text and byte values are compressed on disk, where that saves space. |
 
-`CLUSTER BY col` names a leading prefix of a compound primary key to
-distribute rows by, so that rows sharing it live on the same worker:
+`CLUSTER BY a, b, …` names a leading prefix of the primary key to distribute
+rows by, so that rows sharing it live on the same worker:
 
 ```sql
 CREATE TABLE readings (sensor INT, at TIMESTAMP, value DOUBLE, PRIMARY KEY (sensor, at))

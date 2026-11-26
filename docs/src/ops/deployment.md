@@ -7,8 +7,9 @@ processes, a data directory, a Unix socket, and optionally a TLS listener.
 gnitz-server --workers=auto /var/lib/gnitz /run/gnitz/gnitz.sock
 ```
 
-A client and a server must be of the same release; a client that dials another
-release's server is refused, naming both. Pin versions together.
+A client and a server must be of the same release; a client speaking another
+wire version than the server is refused, the refusal naming both releases. Pin
+versions together.
 
 ## Host requirements
 
@@ -21,10 +22,11 @@ release's server is refused, naming both. Pin versions together.
 ## Workers
 
 `--workers=N` runs `N` worker processes; `--workers=auto` runs one per physical
-core the server may use, less one for the master, and pins each to its core.
-Under a CPU quota narrower than the cores, such as a container's `--cpus`, it
-runs one per whole CPU of the quota, less one for the master, unpinned. The
-log names the count and placement at boot.
+core the server may use, less one for the master, and pins each to a core of
+its own. Under a CPU quota narrower than the cores, such as a container's
+`--cpus`, it runs one per whole CPU of the quota, less one for the master. A
+quota below the CPUs the server may run on turns pinning off. The log names
+the count and placement at boot.
 
 Changing the worker count is safe: a boot at a different count first
 redistributes the stored data onto the new count.
@@ -59,10 +61,10 @@ Each release publishes `ghcr.io/ed-von-schleck/gnitz-server` for amd64 and
 arm64, tagged with its version, and attaches the seccomp profile it runs under.
 Pin the version tag rather than `latest`, since clients must match it.
 
-The default seccomp profile of Docker, podman, containerd and CRI-O denies
-io_uring, so the server runs under `seccomp.json`: Docker's default profile
-with the three io_uring calls allowed, otherwise as confined as any container.
-It needs no capability and no `--privileged`.
+The default seccomp profiles of Docker and podman deny io_uring, so the server
+runs under `seccomp.json`: Docker's default profile with the three io_uring
+calls allowed, otherwise as confined as any container. It needs no capability
+and no `--privileged`.
 
 ```sh
 curl -LO https://github.com/Ed-von-Schleck/gnitz/releases/latest/download/seccomp.json
@@ -92,10 +94,9 @@ network listener.
 - **Unix socket.** The server runs as the image's `nonroot` user (65532), and
   the [socket](security.md#the-unix-socket) admits only its owner. A client
   container sharing the volume can dial `/data/gnitz.sock` when it runs as that
-  user (`--user 65532`), or in its group (`--user <uid>:65532`) when the server
-  is started with `--socket-mode=660`. For a client on the host, run the server
-  as the host user (`--user "$(id -u):$(id -g)"`, plus `--userns=keep-id` under
-  rootless podman) on a host directory mounted at `/data`.
+  user (`--user 65532`). For a client on the host, run the server as the host
+  user (`--user "$(id -u):$(id -g)"`, plus `--userns=keep-id` under rootless
+  podman) on a host directory mounted at `/data`.
 - **Memory.** The image sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` so the heap
   uses transparent huge pages where the host allows them; `-e GLIBC_TUNABLES=`
   turns it off.

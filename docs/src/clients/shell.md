@@ -40,14 +40,14 @@ Statements end with `;`. Tab completes keywords, names and meta-commands.
 | `\d [NAME]` | List relations, or describe `NAME`; `\d+ NAME` also shows hidden columns and a view's definition. |
 | `\dt`, `\dv`, `\ds`, `\di`, `\dS` `[PATTERN]` | List tables, views, streams, indexes or system relations, those matching `PATTERN` if given. |
 | `\dn` | List schemas. |
-| `\watch VIEW`, `\watch SELECT …` | Print a [delta-fed](../sql/views.md#delta-feeds) view's changes, or those a `SELECT` over it keeps, as they happen, weights included, until Ctrl-C. |
+| `\watch VIEW`, `\watch SELECT …` | Print a [delta-fed](../sql/views.md#delta-feeds) view whole, then its changes, or those a `SELECT` over it keeps, as they happen, weights included, until Ctrl-C. |
 | `\x [on\|off\|auto]` | Expanded output. |
 | `\a` | Toggle aligned and unaligned output. |
 | `\pset [OPTION [VALUE]]` | Show or set output options. |
 | `\timing [on\|off]` | Time each statement. |
 | `\o [FILE]` | Send results to `FILE`, or back to the terminal. |
 | `\i FILE` | Run the commands in `FILE`. |
-| `\e [FILE]` | Edit the last statement, or `FILE`, in `$EDITOR`. |
+| `\e [FILE]` | Edit the last statement, or `FILE`, in `$VISUAL`, else `$EDITOR`, else `vi`. |
 | `\echo [TEXT]` | Print `TEXT`. |
 | `\! [COMMAND]` | Run a shell command. |
 | `\dump DIR`, `\restore DIR` | Dump the database into `DIR`, or restore a dump; see [Backup and upgrades](../ops/backup.md#dumps). |
@@ -60,7 +60,7 @@ CREATE TABLE orders (id BIGINT PRIMARY KEY, customer TEXT, amount BIGINT);
 CREATE VIEW big WITH (delta = '16 MB') AS SELECT id, amount FROM orders WHERE amount > 100;
 ```
 
-`\watch big` then prints each change to `big` as it is made from another
-session: inserted rows with weight `+1`, deleted ones with `-1`, and an update
-as one of each. Changes made in quick succession may arrive as one, already
-summed.
+`\watch big` then prints `big` whole, then each change to it as it is made
+from another session: inserted rows with weight `+1`, deleted ones with `-1`,
+and an update as one of each. Changes made in quick succession may arrive as
+one, already summed.

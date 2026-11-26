@@ -11,9 +11,9 @@
 | Date | `DATE` | days since 1970-01-01 | yes |
 | Timestamp | `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE`, `TIMESTAMP_NTZ`, `DATETIME` | microseconds since 1970-01-01, no time zone | yes |
 | UUID | `UUID` | 16 bytes | yes |
-| Floating point | `FLOAT`/`REAL` (32-bit), `DOUBLE`/`DOUBLE PRECISION` (64-bit); `FLOAT(p)` is 32-bit for `p` ≤ 24 and 64-bit for `p` ≤ 53 | 4, 8 bytes | no |
-| Text | `TEXT`, `VARCHAR(n)`, `CHAR(n)` | UTF-8, any length | no |
-| Bytes | `BLOB`, `BYTEA` | any length | no |
+| Floating point | `FLOAT`/`REAL` (32-bit), `DOUBLE`/`DOUBLE PRECISION` (64-bit); `FLOAT(p)` is 32-bit for `p` ≤ 24 and 64-bit for 25 ≤ `p` ≤ 53 | 4, 8 bytes | no |
+| Text | `TEXT`, `VARCHAR(n)`, `CHAR(n)` | UTF-8 | no |
+| Bytes | `BLOB`, `BYTEA` | bytes | no |
 
 "Key" says whether the type can be a primary-key, `UNIQUE` or indexed column;
 see [Keys and identity](../concepts/keys.md).

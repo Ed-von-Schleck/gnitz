@@ -59,7 +59,7 @@ relation and store; it reads only the files, so it runs beside a live server.
 | 1 | Boot failure. |
 | 2 | A worker process died while serving. |
 | 64 | The command line, or a `GNITZ_*` variable, was refused. A refused option stops the server before it creates anything. |
-| 65 | The data directory is of another release's storage format; nothing in it was changed. See [upgrades](backup.md#upgrading). |
+| 65 | The data directory is of another release's storage format; none of its files was changed. See [upgrades](backup.md#upgrading). |
 | 134 | Fail-stop abort (128 + `SIGABRT`). |
 
 Exit codes 64 and 65 repeat on every restart with the same arguments and

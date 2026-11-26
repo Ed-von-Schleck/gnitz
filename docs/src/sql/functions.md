@@ -1,6 +1,7 @@
 # Functions and operators
 
-Every function here works in a plain `SELECT` and in a view body. A function
+Every function here works in a plain `SELECT` and in a view body, unless it
+says otherwise. A function
 of a `NULL` argument is `NULL` unless it says otherwise.
 
 ```sql
@@ -49,14 +50,14 @@ SELECT ROUND(x, 1), FLOOR(x), POWER(x, 2), MOD(n, 3) FROM t;
 
 | Function | Result |
 |---|---|
-| `UPPER(s)`, `LOWER(s)` | case-converted text |
+| `UPPER(s)`, `LOWER(s)` | `s` with its ASCII letters case-converted |
 | `LENGTH(s)` (`CHAR_LENGTH`, `CHARACTER_LENGTH`), `OCTET_LENGTH(s)` | length in characters, in bytes |
 | `TRIM(s)`, `LTRIM(s)`, `RTRIM(s)` | `s` without surrounding spaces |
 | `SUBSTRING(s, start[, len])` (`SUBSTR`), `LEFT(s, n)`, `RIGHT(s, n)` | part of `s`; positions start at 1 |
 | `STRPOS(s, sub)`, `POSITION(sub IN s)` | position of `sub` in `s`, 0 if absent |
 | `REPLACE(s, from, to)` | `s` with every `from` replaced |
 | `REVERSE(s)` | `s` backwards |
-| `LPAD(s, n, fill)`, `RPAD(s, n, fill)` | `s` padded to `n` characters |
+| `LPAD(s, n, fill)`, `RPAD(s, n, fill)` | `s` padded, or cut, to `n` characters |
 | `SPLIT_PART(s, sep, i)` | the `i`-th field of `s` split at `sep` |
 | `CONCAT(a, b, …)` | the arguments joined, `NULL`s skipped |
 
@@ -90,8 +91,9 @@ SELECT CAST(n AS TEXT), CAST('12' AS BIGINT), TRY_CAST('twelve' AS BIGINT), CAST
 
 ## Aggregates
 
-`COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `SUM`, `MIN`, `MAX`, `AVG`. In a
-view they are maintained incrementally: `COUNT` and `SUM` by adding the change,
+`COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `SUM`, `MIN`, `MAX`, `AVG`. A
+`DISTINCT` aggregate works only in a view body. In a view they are maintained
+incrementally: `COUNT` and `SUM` by adding the change,
 `MIN` and `MAX` through an index of each group's values, so deleting the current
 minimum does not rescan the group.
 
@@ -102,4 +104,4 @@ Use `DECIMAL` or integers where exact totals matter.
 ## Window functions
 
 In a view body only: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, and the aggregates
-above with `OVER (…)`. See [Views](views.md#what-a-view-body-can-contain).
+above, without `DISTINCT`, with `OVER (…)`. See [Views](views.md#what-a-view-body-can-contain).

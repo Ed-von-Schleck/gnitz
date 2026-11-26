@@ -68,6 +68,7 @@ read only at boot.
 
 ## Target syntax
 
-A client target is either a Unix socket path or
-`tls://HOST:PORT[?ca=PATH][&cert=PATH&key=PATH][&token_file=PATH]`. Without
-`ca=`, the server's certificate is checked against the public web roots.
+A client target is either a Unix socket path or `tls://HOST:PORT`, optionally
+followed by `?` and `&`-separated `ca=PATH`, `cert=PATH&key=PATH` and
+`token_file=PATH`. Without `ca=`, the server's certificate is checked against
+the public web roots.

@@ -95,7 +95,7 @@ A stream differs from a table in three more ways:
 
 The schema `_system` holds the catalog as ordinary relations: `schemas`,
 `tables`, `views`, `columns`, `indices`, `circuits` and `sequences`. A `SELECT`
-reads them like any table, and a view may read them too:
+reads them like any table, and a view may read any of them but `sequences`:
 
 ```sql
 SELECT name, stream FROM _system.tables WHERE schema_id > 1;

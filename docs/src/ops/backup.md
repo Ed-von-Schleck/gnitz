@@ -7,7 +7,7 @@ gnitz has two ways to copy a database:
 | What it is | A copy of the data directory | The schema as SQL and the tables' rows as Parquet |
 | Made by | The server, into its `--backup-dir` | The shell, over a connection |
 | Restored by | Starting a server on the copy | `\restore` into a running server |
-| Views | Kept as they are | Rebuilt from their definitions |
+| Views | Kept at the same worker count, rebuilt at another | Rebuilt from their definitions |
 | Across releases | Same storage format only | Any later release |
 
 ## Backups
@@ -19,8 +19,9 @@ gnitz-server --backup-dir=/srv/gnitz-backups /var/lib/gnitz /run/gnitz/gnitz.soc
 gnitz /run/gnitz/gnitz.sock -c '\backup nightly-2026-11-26'
 ```
 
-The server checkpoints and copies the data directory into
-`/srv/gnitz-backups/nightly-2026-11-26`. The copy holds every write
+The server checkpoints and copies the data directory's stores into
+`/srv/gnitz-backups/nightly-2026-11-26`; its log, its minted TLS certificate and
+its workers' logs are not copied. The copy holds every write
 acknowledged before the request, as one consistent cut; DDL waits while it is
 made. Where the backup directory is on the same filesystem as the data
 directory, files are hard-linked rather than copied, so a backup is fast and
@@ -55,11 +56,12 @@ target database must not already hold the dump's names.
 
 A data directory is stamped with the storage format of the release that last
 opened it. A release with the same format opens it in place; just install the
-new binaries, and new clients with them, since a client talks only to a server
-of its own release.
+new binaries, and new clients with them, since a server refuses a client of
+another protocol version.
 
 A release whose format changed refuses an older data directory at boot with
-exit code 65, naming both releases, and changes nothing in it. Move the data with a dump, using each release's own
+exit code 65, naming both releases, and changes none of its files. Move the
+data with a dump, using each release's own
 shell and server:
 
 ```sh
