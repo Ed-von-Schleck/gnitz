@@ -25,6 +25,10 @@ pub(crate) enum AggArg<T> {
 }
 
 impl<T> AggArg<T> {
+    pub(crate) const fn is_distinct(&self) -> bool {
+        matches!(self, AggArg::Distinct(_))
+    }
+
     /// The argument of a call whose DISTINCT the caller honours, or has refused.
     pub(crate) fn ignoring_distinct(self) -> Option<T> {
         match self {

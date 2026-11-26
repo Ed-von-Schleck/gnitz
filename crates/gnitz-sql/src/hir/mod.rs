@@ -442,6 +442,7 @@ impl HirAgg {
         is_global: bool,
         prior: &[HirAgg],
     ) -> Result<Self, GnitzSqlError> {
+        let arg_distinct = arg.is_distinct();
         let read = arg.ignoring_distinct();
         let arg_def = read.map(|id| &hircol_of(env, id).def);
         let (value, count) = crate::agg::agg_ops(func, arg_def, is_global)?;
@@ -449,8 +450,11 @@ impl HirAgg {
             // COUNT(*) reads no column, whatever argument the aggregate names.
             let arg = read.filter(|_| op != WireAggFunc::Count);
             let def = crate::agg::agg_col_def(op, arg.and(arg_def), is_global);
+            // A DISTINCT call's columns are reduced over another set than a plain
+            // call's, so the two share none.
             match prior
                 .iter()
+                .filter(|p| p.arg.is_distinct() == arg_distinct)
                 .flat_map(HirAgg::cols)
                 .find(|c| c.op == op && c.arg == arg && c.col.def == def)
             {

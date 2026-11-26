@@ -2,7 +2,7 @@
 //! the leaf its HAVING and SELECT list bind through.
 
 use super::super::{
-    ColId, ColIdGen, HirAgg, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, col_by_id, hircol_of, reduce_reads,
+    AggCol, ColId, ColIdGen, HirAgg, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, col_by_id, hircol_of, reduce_reads,
 };
 use super::{BindCx, ItemLeaf, ScopeLeaf, window};
 use crate::agg::{AggArg, AggFunc};
@@ -130,46 +130,87 @@ pub(super) fn bind_grouped_suffix(
             None => Vec::new(),
         };
         let st = &*grouped.state.borrow();
-        // A DISTINCT aggregate is the plain aggregate over `Distinct(group cols,
-        // arg)`, so every aggregate of the reduce reads that one set, and must read
-        // the same value from it as from the raw input.
-        let distinct = st.aggs.iter().find_map(|c| match c.arg {
+        let (input, aggs) = match st.aggs.iter().find_map(|c| match c.arg {
             AggArg::Distinct(a) => Some(a),
             _ => None,
-        });
-        if let Some(d) = distinct {
-            if st.aggs.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != d)) {
-                return Err(GnitzSqlError::rejected(
-                    "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument",
-                ));
+        }) {
+            Some(d) => {
+                if st.aggs.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != d)) {
+                    return Err(GnitzSqlError::rejected(
+                        "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument",
+                    ));
+                }
+                per_distinct_value(ids, st, input, &group_cols, d)?
             }
-            let survives =
-                |c: &HirAgg| c.arg == AggArg::Distinct(d) || c.arg == AggArg::All(d) && dedup_is_inert(c.func);
-            if !st.aggs.iter().all(survives) {
-                return Err(GnitzSqlError::rejected(
-                    "DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the \
-                     DISTINCT argument",
-                ));
+            None if st.extra.is_empty() => (input, HirAgg::physical(&st.aggs)),
+            None => {
+                let phys = HirAgg::physical(&st.aggs);
+                (
+                    RelExpr::project(input, st.items_for(&reduce_reads(&group_cols, &phys))),
+                    phys,
+                )
             }
-        }
-        let phys = HirAgg::physical(&st.aggs);
-        // What the reduce reads, and under a DISTINCT aggregate the set it reduces over.
-        let mut reads = reduce_reads(&group_cols, &phys);
-        if let Some(d) = distinct.filter(|d| !reads.contains(d)) {
-            reads.push(d);
-        }
-        let input = match distinct {
-            Some(_) => RelExpr::distinct(RelExpr::project(input, st.items_for(&reads)), "DISTINCT aggregate")?,
-            None if st.extra.is_empty() => input,
-            None => RelExpr::project(input, st.items_for(&reads)),
         };
         RelExpr::filter(
             ids,
-            RelExpr::reduce(input, group_cols.clone(), phys, ReduceKind::Aggregate, "GROUP BY")?,
+            RelExpr::reduce(input, group_cols.clone(), aggs, ReduceKind::Aggregate, "GROUP BY")?,
             having,
         )
     };
     window::bind_select_list(cx, select, rel, &grouped, "GROUP BY", order)
+}
+
+/// The input and the aggregates of the reduce over `group_cols` that computes
+/// `st`'s aggregates when some are DISTINCT over `d`. Its input holds one row per
+/// distinct `(group_cols, d)`: a DISTINCT aggregate is the plain one over those
+/// rows, and so is a `MIN`/`MAX` of `d`, and every aggregate when the input
+/// already holds one such row each. Any other aggregate reads the raw rows, so
+/// the input is then a reduce over `(group_cols, d)` folding its columns into one
+/// partial per distinct value, and the outer aggregate folds the partials with
+/// its op's [`gnitz_wire::AggFunc::merge_op`], under the id the SELECT list and
+/// HAVING bound to. With no such partial the input is the distinct set.
+fn per_distinct_value(
+    ids: &ColIdGen,
+    st: &Grouping,
+    input: Rc<RelExpr>,
+    group_cols: &[ColId],
+    d: ColId,
+) -> Result<(Rc<RelExpr>, Vec<AggCol>), GnitzSqlError> {
+    let mut keys = group_cols.to_vec();
+    if !keys.contains(&d) {
+        keys.push(d);
+    }
+    let is_set = RelExpr::project(Rc::clone(&input), st.items_for(&keys))
+        .unique_key()
+        .is_some();
+    // A MIN/MAX column is never a DISTINCT call's (binding drops its DISTINCT),
+    // so the two sides share no column.
+    let on_set = |c: &HirAgg| is_set || c.arg.is_distinct() || c.arg == AggArg::All(d) && dedup_is_inert(c.func);
+    let (on_set, raw): (Vec<HirAgg>, Vec<HirAgg>) = st.aggs.iter().cloned().partition(on_set);
+    let mut outer = HirAgg::physical(&on_set);
+    if raw.is_empty() {
+        let set = RelExpr::project(input, st.items_for(&reduce_reads(&keys, &outer)));
+        return Ok((RelExpr::distinct(set, "DISTINCT aggregate")?, outer));
+    }
+    let mut partials = Vec::new();
+    for c in HirAgg::physical(&raw) {
+        let src = c.arg.map(|a| &hircol_of(&st.env, a).def);
+        let partial = HirCol::new(ids.next(), crate::agg::agg_col_def(c.op, src, false));
+        let merged = AggCol {
+            op: c.op.merge_op(),
+            arg: Some(partial.id),
+            col: c.col,
+        };
+        debug_assert!(
+            crate::agg::agg_col_def(merged.op, Some(&partial.def), group_cols.is_empty()) == merged.col.def,
+            "a merged partial is declared as the column it replaces"
+        );
+        outer.push(merged);
+        partials.push(AggCol { op: c.op, arg: c.arg, col: partial });
+    }
+    let set = RelExpr::project(input, st.items_for(&reduce_reads(&keys, &partials)));
+    let set = RelExpr::reduce(set, keys, partials, ReduceKind::Aggregate, "DISTINCT aggregate")?;
+    Ok((set, outer))
 }
 
 /// The leaf for an expression over the grouped relation — the SELECT list, the

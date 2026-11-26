@@ -309,6 +309,48 @@ def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client):
             for k, (rs, us) in by_k.items()}, sql
 
 
+def test_a_plain_aggregate_beside_a_distinct_one_folds_per_distinct_value(client):
+    """A plain aggregate beside `agg(DISTINCT x)` reads the raw rows, not the
+    distinct set: a reduce over `(group cols, x)` folds it once per distinct
+    value, and the reduce above counts those values and folds the partials. A
+    NULL group key is one group at both levels, a NULL `x` one partial the
+    DISTINCT aggregate skips, and the ungrouped form over no rows is the one row
+    of zero counts."""
+    client.execute_sql(
+        "CREATE TABLE ev (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT, u BIGINT, f DOUBLE); "
+        "CREATE VIEW mixed AS SELECT k, COUNT(DISTINCT u) AS d, COUNT(*) AS c, COUNT(u) AS cu, "
+        "SUM(u) AS su, SUM(DISTINCT u) AS sd, MIN(u) AS lo, MAX(f) AS hf FROM ev GROUP BY k; "
+        "CREATE VIEW overall AS SELECT COUNT(DISTINCT u) AS d, COUNT(*) AS c, SUM(u) AS su FROM ev; "
+        "CREATE VIEW in_having AS SELECT k, COUNT(DISTINCT u) AS d FROM ev GROUP BY k "
+        "HAVING SUM(u) > 10")
+    assert bag(scanned(client, "overall"), "d", "c", "su") == {(0, 0, None): 1}
+
+    rows = {}
+    for sql in churn(client, {"ev": rows}, [
+        inserting("ev", {1: (10, 7, 0.5), 2: (10, 7, None), 3: (10, 8, 2.0), 4: (None, 7, 1.0),
+                         5: (None, None, None), 6: (20, None, 4.0)}),
+        ("DELETE FROM ev WHERE pk = 1", "ev", {1: None}),
+        ("UPDATE ev SET u = 9 WHERE pk = 2", "ev", {2: (10, 9, None)}),
+        ("UPDATE ev SET k = 20 WHERE pk = 3", "ev", {3: (20, 8, 2.0)}),
+        inserting("ev", {7: (None, 7, -1.0)}),
+        ("DELETE FROM ev WHERE pk = 6", "ev", {6: None}),
+    ]):
+        by_k = groups(rows.values(), lambda r: r[0])
+        want = {}
+        for k, rs in by_k.items():
+            us = [r[1] for r in rs if r[1] is not None]
+            fs = [r[2] for r in rs if r[2] is not None]
+            want[(k, len(set(us)), len(rs), len(us), sum(us) if us else None,
+                  sum(set(us)) if us else None, min(us, default=None), max(fs, default=None))] = 1
+        assert bag(scanned(client, "mixed"), "k", "d", "c", "cu", "su", "sd", "lo", "hf") == want, sql
+        us = [r[1] for r in rows.values() if r[1] is not None]
+        assert bag(scanned(client, "overall"), "d", "c", "su") == {
+            (len(set(us)), len(rows), sum(us) if us else None): 1}, sql
+        assert bag(scanned(client, "in_having"), "k", "d") == {
+            (k, len({r[1] for r in rs} - {None})): 1 for k, rs in by_k.items()
+            if sum(r[1] for r in rs if r[1] is not None) > 10}, sql
+
+
 def test_a_compound_group_key_is_emitted_in_source_key_order(client):
     """The grouping *list* is not the output key order: a reduce over a whole
     compound source key emits it in the key's declared order, whatever order the

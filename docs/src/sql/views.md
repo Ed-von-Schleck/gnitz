@@ -32,13 +32,16 @@ CREATE VIEW customers_and_orders AS
     SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer = c.id;
 ```
 
-**Aggregation** — `GROUP BY` and `HAVING` with `COUNT`, `COUNT(DISTINCT …)`,
-`SUM`, `MIN`, `MAX` and `AVG`:
+**Aggregation** — `GROUP BY` and `HAVING` with `COUNT`, `SUM`, `MIN`, `MAX`
+and `AVG`, each also as `DISTINCT`:
 
 ```sql
 CREATE VIEW per_customer AS
     SELECT customer, COUNT(*) AS n, SUM(amount) AS total, MAX(amount) AS largest
     FROM orders GROUP BY customer HAVING COUNT(*) > 1;
+CREATE VIEW amounts AS
+    SELECT customer, COUNT(DISTINCT amount) AS distinct_amounts, SUM(amount) AS total
+    FROM orders GROUP BY customer;
 ```
 
 **Set operations** — `UNION`, `INTERSECT` and `EXCEPT`, each with or without

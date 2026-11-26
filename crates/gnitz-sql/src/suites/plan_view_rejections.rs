@@ -433,6 +433,11 @@ fn grouped_body_rules() {
         // An aggregate under an IS test is the reduce's, and groups its body.
         "SELECT g, (SUM(v) > 0) IS TRUE AS p FROM t GROUP BY g",
         "SELECT (SUM(v) > 0) IS NOT FALSE AS p FROM t",
+        // A plain aggregate beside a DISTINCT one folds per distinct value first.
+        "SELECT COUNT(DISTINCT a) AS d, COUNT(*) AS n FROM m",
+        "SELECT COUNT(DISTINCT a) AS d, SUM(a) AS s, COUNT(a) AS c FROM m",
+        "SELECT COUNT(DISTINCT a) AS d, MAX(b) AS x FROM m",
+        "SELECT a, COUNT(DISTINCT b) AS d, AVG(b) AS av FROM m GROUP BY a HAVING SUM(b) > 0",
     ] {
         view(&cat, body);
     }
@@ -523,11 +528,6 @@ fn grouped_body_rules() {
             ("SELECT v FROM t GROUP BY ALL", "GROUP BY"),
             // Every DISTINCT aggregate of a body rides one distinct set.
             ("SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM m", "same argument"),
-            ("SELECT COUNT(DISTINCT a), COUNT(*) FROM m", "plain aggregate"),
-            ("SELECT COUNT(DISTINCT a), SUM(a) FROM m", "plain aggregate"),
-            ("SELECT COUNT(DISTINCT a), COUNT(a) FROM m", "plain aggregate"),
-            // MIN/MAX rides the set only for the argument the set is built from.
-            ("SELECT COUNT(DISTINCT a), MAX(b) FROM m", "plain aggregate"),
             ("SELECT COUNT(DISTINCT f) FROM m", "cannot be a key"),
             ("SELECT COUNT(DISTINCT *) FROM m", "needs a column argument"),
         ],

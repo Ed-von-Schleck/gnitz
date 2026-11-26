@@ -203,15 +203,13 @@ pub(crate) fn lower_read(
     let (desc, source) = match lin.base.as_ref() {
         RelExpr::Get { desc, cols } => (desc, cols),
         // What the CTE or derived table derives under its grouping is named first.
-        RelExpr::Reduce { input, .. } => {
+        // The fold is one stateless pass over one scan, so a DISTINCT aggregate's
+        // set, or the reduce under one beside a plain aggregate, is a grouping too.
+        RelExpr::Reduce { input, .. } | RelExpr::Distinct { input } => {
             linear(input)?;
-            return Err(derivation("an aggregate over a grouped CTE or derived table"));
-        }
-        // A DISTINCT CTE or derived table, or a DISTINCT aggregate's set: the
-        // fold is one stateless pass over one scan.
-        RelExpr::Distinct { input } => {
-            linear(input)?;
-            return Err(derivation("a grouping over a DISTINCT set"));
+            return Err(derivation(
+                "a grouping over a grouping: a grouped or DISTINCT CTE or derived table, or a DISTINCT aggregate",
+            ));
         }
         // A DISTINCT over no relation is a set already, so only an aggregate meets it.
         _ => {

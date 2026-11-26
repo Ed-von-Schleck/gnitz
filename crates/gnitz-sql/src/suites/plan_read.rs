@@ -634,7 +634,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ),
         (
             "WITH x AS (SELECT DISTINCT v, w FROM t) SELECT DISTINCT v FROM x",
-            "(a grouping over a DISTINCT set)",
+            "(a grouping over a grouping",
         ),
         (
             "WITH x AS (SELECT v FROM t UNION SELECT w FROM t) SELECT v FROM x",
@@ -684,7 +684,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
         // The fold is one stateless pass over one scan: no DISTINCT segment.
         (
             "SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v",
-            "(a grouping over a DISTINCT set)",
+            "(a grouping over a grouping",
         ),
     ] {
         assert_rejects(sql, read(&cat, sql), msg);
@@ -829,7 +829,11 @@ fn a_cte_expands_to_the_flat_query() {
         ),
         (
             "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT n, COUNT(*) FROM x GROUP BY n",
-            "derives a new one (an aggregate over a grouped CTE or derived table)",
+            "derives a new one (a grouping over a grouping",
+        ),
+        (
+            "SELECT g, COUNT(DISTINCT v), SUM(v) FROM t GROUP BY g",
+            "(a grouping over a grouping",
         ),
         (
             "WITH x AS (SELECT t.id FROM t JOIN u ON t.g = u.g) SELECT id FROM x",
