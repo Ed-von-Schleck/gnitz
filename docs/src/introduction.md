@@ -27,3 +27,4 @@ a single server; client and server must be of the same release.
   and what it computes.
 - [Limitations](sql/limitations.md) lists what the SQL planner refuses today,
   and how to work around it.
+- [Deployment](ops/deployment.md) runs the server as a service or a container.
