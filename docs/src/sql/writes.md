@@ -1,7 +1,7 @@
 # Writing data
 
-Every write is durable when it is acknowledged, and every view reading the
-written table reflects it in the next read of that view.
+Every write to a table is durable when it is acknowledged, and every view
+reading the written table reflects it in the next read of that view.
 
 ```sql
 CREATE TABLE stock (id BIGINT PRIMARY KEY, item TEXT, qty BIGINT);

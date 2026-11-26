@@ -95,6 +95,10 @@ DROP INDEX wallets_by_owner;
 
 `CREATE UNIQUE INDEX` also enforces uniqueness, as `UNIQUE` does.
 
+Index names are global rather than per schema: an index name takes no schema
+qualifier, and two schemas cannot each hold an index of the same name. An index
+created without a name is named after its schema, table and columns.
+
 ## `DROP`
 
 ```sql

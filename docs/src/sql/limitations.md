@@ -2,7 +2,7 @@
 
 What gnitz refuses today that no other page covers, and what to do instead.
 Each reference page states what it refuses beside what it accepts. The planner
-refuses each of these with an error naming it; nothing is silently ignored.
+refuses each of these with an error naming it.
 
 ```sql
 CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT, region TEXT);
@@ -98,6 +98,8 @@ CREATE TABLE devices (id UUID PRIMARY KEY, owner UUID, label TEXT);
 CREATE INDEX devices_by_owner ON devices (owner);
 SELECT label FROM devices WHERE id = '6f1c1a8e-3b8e-4c47-9d1e-2f0b6f9a1c2d';
 SELECT label FROM devices WHERE owner = '0b9e7f3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b';
+SELECT label FROM devices
+    WHERE owner IN ('0b9e7f3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b', '6f1c1a8e-3b8e-4c47-9d1e-2f0b6f9a1c2d');
 ```
 
 ```sql,refused
@@ -117,5 +119,5 @@ column "owner" is UUID; 128-bit columns cannot be used in expressions (a plain S
 
 gnitz is a single server: there is no replication or failover. Access control
 is all-or-nothing: an authenticated client may run any statement (see
-[Security](../ops/security.md)). There is no metrics endpoint yet; the server
-logs to stderr.
+[Security](../ops/security.md)). There is no metrics endpoint; the master logs
+to stderr, and each worker to a file in the data directory.

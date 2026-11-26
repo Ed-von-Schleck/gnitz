@@ -1,8 +1,8 @@
 # Gnitz
 
-`Gnitz` is a SQL database. What makes it different from most other SQL databases is that `VIEW`s are all _materialized and incrementally updated_, meaning: They never go stale, and they are updated _efficiently_ – the cost to update a `VIEW` is always proportional to the size of the _changed_ data, regardless of how much _existing_ data there is. It intentionally restricts `SELECT` statements to the bare minimum so that queries are _always fast, no footguns_. `Gnitz` spills these `VIEW`s to disk, so it trades disk-space for latency.
+`Gnitz` is a SQL database. What makes it different from most other SQL databases is that `VIEW`s are all _materialized and incrementally updated_, meaning: They never go stale, and they are updated _efficiently_ – the cost to update a `VIEW` is proportional to the size of the _changed_ data, regardless of how much _existing_ data there is. It intentionally restricts `SELECT` statements to reading one table or view, so that any query that derives something new is a `VIEW` the engine maintains. `Gnitz` spills these `VIEW`s to disk, so it trades disk-space for latency.
 
-A Gnitz guarantees efficient `VIEW` updates by implementing the **DBSP** (Differential Dataflow) formal model, treating all data as **Z-Sets** – multisets where every record has an associated integer weight, enabling algebraic coalescing of updates.
+Gnitz guarantees efficient `VIEW` updates by implementing the **DBSP** formal model of incremental computation, treating all data as **Z-Sets** – multisets where every record has an associated integer weight, enabling algebraic coalescing of updates.
 
 Gnitz is pre-alpha.
 
@@ -32,8 +32,7 @@ SELECT * FROM revenue ORDER BY customer;
 ```
 
 The server runs on Linux 6.7 or later, on x86-64 with AVX2 or on aarch64; the
-shell also runs on macOS. On macOS run the server [in a container](https://ed-von-schleck.github.io/gnitz/ops/deployment.html#containers); on
-Windows, install both inside WSL 2.
+shell also runs on macOS.
 
 To connect to a running server, give `gnitz` its Unix socket path or a
 `tls://host:port` target, or set `GNITZ_TARGET`.
@@ -66,7 +65,7 @@ connection in a schema of each test's own. For a FastAPI app, see
 ## Running a server
 
 [Deployment](https://ed-von-schleck.github.io/gnitz/ops/deployment.html) covers
-systemd, containers, Docker Compose and Kubernetes;
+systemd, containers and Docker Compose;
 [Security](https://ed-von-schleck.github.io/gnitz/ops/security.html) TLS and
 access tokens; and [Backup and upgrades](https://ed-von-schleck.github.io/gnitz/ops/backup.html)
 moving data between releases. A client and a server must be of the same release.

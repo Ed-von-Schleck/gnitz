@@ -58,9 +58,8 @@ opened it. A release with the same format opens it in place; just install the
 new binaries, and new clients with them, since a client talks only to a server
 of its own release.
 
-A release whose format changed says so in its release notes. It refuses an
-older data directory at boot with exit code 65, naming both releases, and
-changes nothing in it. Move the data with a dump, using each release's own
+A release whose format changed refuses an older data directory at boot with
+exit code 65, naming both releases, and changes nothing in it. Move the data with a dump, using each release's own
 shell and server:
 
 ```sh
@@ -70,7 +69,7 @@ gnitz --data /var/lib/gnitz -c '\dump /srv/gnitz-dump'
 gnitz --data /var/lib/gnitz-new -c '\restore /srv/gnitz-dump'
 ```
 
-`gnitz --data` runs the `gnitz-server` installed beside the shell on that
-directory for the duration of the command. `\dump` and `\restore` also work
+`gnitz --data` runs the `gnitz-server` installed beside the shell, or else the
+one on `PATH`, on that directory for the duration of the command. `\dump` and `\restore` also work
 from a shell connected to a running server, such as a container of the old
 release's image tag.

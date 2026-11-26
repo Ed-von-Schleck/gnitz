@@ -17,8 +17,9 @@ SELECT * FROM orders ORDER BY amount DESC LIMIT 2 OFFSET 1;
 
 It takes `WHERE`, expressions, `GROUP BY` with `HAVING` and aggregates,
 `DISTINCT`, `ORDER BY`, `LIMIT` and `OFFSET`. Joins, set operations,
-subqueries, window functions and aggregates over a `DISTINCT` are refused, with
-a message saying to put the query in a [view](views.md):
+subqueries in `WHERE` or the select list, window functions and `DISTINCT`
+aggregates are refused, with a message saying to put the query in a
+[view](views.md):
 
 ```sql,refused
 SELECT * FROM orders o WHERE customer IN (SELECT customer FROM orders big WHERE big.amount > 6);
@@ -45,8 +46,8 @@ view first applies any changes to its sources that have not reached it yet.
 ## How a read finds its rows
 
 A `WHERE` naming the whole primary key reads that one row; a condition on a
-leading part of a compound key reads a range; an equality or a range on an
-[indexed](tables.md#indexes) column reads through the index. Anything else
+leading part of a compound key reads a range; an equality, a range or an `IN`
+list on an [indexed](tables.md#indexes) column reads through the index. Anything else
 scans the relation. `EXPLAIN` shows which:
 
 ```sql

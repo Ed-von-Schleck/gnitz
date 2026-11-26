@@ -62,4 +62,5 @@ CREATE VIEW big WITH (delta = '16 MB') AS SELECT id, amount FROM orders WHERE am
 
 `\watch big` then prints each change to `big` as it is made from another
 session: inserted rows with weight `+1`, deleted ones with `-1`, and an update
-as one of each.
+as one of each. Changes made in quick succession may arrive as one, already
+summed.

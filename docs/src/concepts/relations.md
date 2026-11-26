@@ -23,8 +23,8 @@ reads those rows.
 A view may read tables, streams and other views. Its cost is paid at write
 time, in proportion to the size of the change; a write that touches one row of
 a large table costs about as much as a write to a small one. In return the
-engine keeps state for a view — a join keeps both of its inputs, an aggregate
-its groups — so views cost disk space.
+engine keeps state for a view — its own rows, and what a join or an aggregate
+needs of its inputs — so views cost disk space.
 
 A view can be created before or after its sources hold data. Creating it over
 existing data computes it from that data first.
@@ -32,7 +32,7 @@ existing data computes it from that data first.
 ## Plain `SELECT`
 
 A plain `SELECT` reads one table or view: it can filter, group, aggregate, sort
-and limit, but it does not join or nest. The idea is that a query worth asking
+and limit, but it does not join. The idea is that a query worth asking
 repeatedly is worth maintaining:
 
 ```sql

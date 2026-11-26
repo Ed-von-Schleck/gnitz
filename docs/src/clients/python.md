@@ -111,7 +111,8 @@ Every exception derives from `gnitz.GnitzError`:
 ## asyncio
 
 `gnitz.aio.connect` returns a client with the same methods, each returning an
-awaitable. Requests issued together share a round trip:
+awaitable. Calls that are one request each — `push`, `delete`, `scan`, `seek` —
+share a round trip when started together:
 
 ```python
 from gnitz import aio

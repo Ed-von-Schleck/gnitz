@@ -88,8 +88,9 @@ CREATE VIEW running_total AS
     FROM orders;
 ```
 
-A window with an `ORDER BY` costs, per change, the rows of its partition that
-come after the changed row, so keep partitions small where rows change often.
+A window with an `ORDER BY` costs, per change, a pass over the changed row's
+partition — the rows before it are read and those after it are emitted again —
+so keep partitions small where rows change often.
 A window with no `ORDER BY` needs its `PARTITION BY` columns to be `NOT NULL`.
 
 **The current time** — `NOW()` (or `CURRENT_TIMESTAMP`) is allowed in a view's

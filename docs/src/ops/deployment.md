@@ -15,9 +15,8 @@ release's server is refused, naming both. Pin versions together.
 | Requirement | Why | If it is missing, the boot says |
 |---|---|---|
 | Linux ≥ 6.7 | The server's event loop needs io_uring's `IORING_OP_FUTEX_WAIT` | `kernel … lacks io_uring IORING_OP_FUTEX_WAIT` |
-| io_uring allowed | `kernel.io_uring_disabled` must be `0`, and a seccomp filter must allow `io_uring_setup`, `io_uring_enter` and `io_uring_register` | `kernel.io_uring_disabled=…`, or `a seccomp filter denies it …` |
+| io_uring allowed | `kernel.io_uring_disabled` must be `0` (or `1` with the server in `kernel.io_uring_group`), and a seccomp filter must allow `io_uring_setup`, `io_uring_enter` and `io_uring_register` | `kernel.io_uring_disabled=…`, or `a seccomp filter denies it …` |
 | x86-64 with AVX2, or aarch64 | The release binaries target x86-64-v3 | the binary dies on an illegal instruction |
-| A local filesystem for the data | The write-ahead log is a memory-mapped file that every write `fdatasync`s | — |
 
 ## Workers
 
@@ -34,8 +33,8 @@ redistributes the stored data onto the new count.
 
 `SIGTERM` or `SIGINT` drains, checkpoints and exits 0. Give the service manager
 a stop timeout longer than the largest checkpoint you expect — two minutes is a
-reasonable start. A `SIGKILL` or a crash loses nothing that was acknowledged;
-the next boot replays the log since the last checkpoint.
+reasonable start. A `SIGKILL` or a crash loses no acknowledged write to a
+table; the next boot replays the log since the last checkpoint.
 
 ## systemd
 

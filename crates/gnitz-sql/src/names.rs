@@ -125,7 +125,7 @@ pub(crate) fn extract_global_name(
     match object_name_parts(name, context)?.as_slice() {
         [n] => canonical_user_name(n),
         _ => Err(GnitzSqlError::rejected(format!(
-            "{context}: a {noun} name is global, so it takes no qualifier"
+            "{context}: {noun} names are global, so one takes no qualifier"
         ))),
     }
 }

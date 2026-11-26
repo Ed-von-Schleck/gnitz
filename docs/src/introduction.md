@@ -4,11 +4,12 @@ gnitz is a SQL database whose views are all **materialized and incrementally
 maintained**. A view is computed once, when it is created, and from then on
 every write to a table it reads updates it by the change alone: the cost of a
 write is proportional to what changed, not to how much data the view covers.
-Reading a view is reading stored rows, so it is always fast and never stale.
+Reading a view reads its stored rows, so it is never stale.
 
 The other side of that trade is that a plain `SELECT` is deliberately small. It
 reads one table or view, with a filter, grouping, ordering and a limit. Anything
-that would derive a new relation — a join, a window function, a subquery — goes
+that would derive a new relation — a join, a window function, an `IN` or
+`EXISTS` subquery — goes
 into a view, where the engine keeps it up to date instead of recomputing it on
 every read.
 
